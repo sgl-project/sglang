@@ -97,6 +97,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_fp32_lm_head",
     "flashinfer_mxfp4_moe_precision",
     "enable_flashinfer_allreduce_fusion",
+    "enable_aiter_allreduce_fusion",
     "moe_dense_tp_size",
     "ep_dispatch_algorithm",
     "ep_num_redundant_experts",

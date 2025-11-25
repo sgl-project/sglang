@@ -61,7 +61,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 
 if _use_aiter:
-    from aiter import rmsnorm2d_fwd_with_dynamicquant, rmsnorm2d_fwd_with_add_dynamicquant
+    from aiter import (
+        rmsnorm2d_fwd_with_add_dynamicquant,
+        rmsnorm2d_fwd_with_dynamicquant,
+    )
 if _use_aiter and _is_gfx95_supported:
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
@@ -253,8 +256,17 @@ class LayerCommunicator:
                             None,
                         )
                     elif _use_aiter and ("fp8_e4m3fnuz" in quant_format):
-                        y_scale = torch.empty(hidden_states.shape[0], 1, dtype=torch.float32, device=hidden_states.device)
-                        output = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fnuz, device=hidden_states.device)
+                        y_scale = torch.empty(
+                            hidden_states.shape[0],
+                            1,
+                            dtype=torch.float32,
+                            device=hidden_states.device,
+                        )
+                        output = torch.empty_like(
+                            hidden_states,
+                            dtype=torch.float8_e4m3fnuz,
+                            device=hidden_states.device,
+                        )
                         rmsnorm2d_fwd_with_dynamicquant(
                             output,
                             hidden_states,
@@ -278,8 +290,17 @@ class LayerCommunicator:
                             residual,
                         )
                     elif _use_aiter and ("fp8_e4m3fnuz" in quant_format):
-                        y_scale = torch.empty(hidden_states.shape[0], 1, dtype=torch.float32, device=hidden_states.device)
-                        output = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fnuz, device=hidden_states.device)
+                        y_scale = torch.empty(
+                            hidden_states.shape[0],
+                            1,
+                            dtype=torch.float32,
+                            device=hidden_states.device,
+                        )
+                        output = torch.empty_like(
+                            hidden_states,
+                            dtype=torch.float8_e4m3fnuz,
+                            device=hidden_states.device,
+                        )
                         residual_out = torch.empty_like(residual)
                         rmsnorm2d_fwd_with_add_dynamicquant(
                             output,
@@ -363,13 +384,20 @@ class LayerCommunicator:
         if batch_size > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
             return False
 
-        static_conditions_met = (
-            (not self.is_last_layer)
-            and (self._context.tp_size > 1)
-            and not is_dp_attention_enabled()
-            and get_global_server_args().enable_flashinfer_allreduce_fusion
-            and _is_flashinfer_available
-        )
+        if _use_aiter:
+            static_conditions_met = (
+                (not self.is_last_layer)
+                and (self._context.tp_size > 1)
+                and get_global_server_args().enable_aiter_allreduce_fusion
+            )
+        else:  # flashinfer allreduce fusion
+            static_conditions_met = (
+                (not self.is_last_layer)
+                and (self._context.tp_size > 1)
+                and not is_dp_attention_enabled()
+                and get_global_server_args().enable_flashinfer_allreduce_fusion
+                and _is_flashinfer_available
+            )
 
         if not static_conditions_met:
             return False
@@ -567,6 +595,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and get_global_server_args().enable_flashinfer_allreduce_fusion
                 and hidden_states.shape[0] <= 4096
+            ):
+                hidden_states, residual = layernorm.forward_with_allreduce_fusion(
+                    hidden_states, residual
+                )
+            elif (
+                _use_aiter
+                and hasattr(layernorm, "forward_with_allreduce_fusion")
+                and get_global_server_args().enable_aiter_allreduce_fusion
+                and hidden_states.shape[0] > 128
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
