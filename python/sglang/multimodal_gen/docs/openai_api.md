@@ -29,6 +29,93 @@ sglang serve "${SERVER_ARGS[@]}"
 
 ## Endpoints
 
+### Image Generation
+
+The server implements an OpenAI-compatible Images API under the `/v1/images` namespace.
+
+#### Create an image
+
+**Endpoint:** `POST /v1/images/generations`
+
+**Python Example (b64_json response):**
+
+```python
+import base64
+from openai import OpenAI
+
+client = OpenAI(api_key="sk-proj-1234567890", base_url="http://localhost:30010/v1")
+
+img = client.images.generate(
+    prompt="A calico cat playing a piano on stage",
+    size="1024x1024",
+    n=1,
+    response_format="b64_json",
+)
+
+image_bytes = base64.b64decode(img.data[0].b64_json)
+with open("output.png", "wb") as f:
+    f.write(image_bytes)
+```
+
+**Curl Example:**
+
+```bash
+curl -sS -X POST "http://localhost:30010/v1/images/generations" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -d '{
+        "prompt": "A calico cat playing a piano on stage",
+        "size": "1024x1024",
+        "n": 1,
+        "response_format": "b64_json"
+      }'
+```
+
+> **Note**
+> The `response_format=url` option is not supported for `POST /v1/images/generations` and will return a `400` error.
+
+#### Edit an image
+
+**Endpoint:** `POST /v1/images/edits`
+
+This endpoint accepts a multipart form upload with an input image and a text prompt. The server can return either a base64-encoded image or a URL to download the image.
+
+**Curl Example (b64_json response):**
+
+```bash
+curl -sS -X POST "http://localhost:30010/v1/images/edits" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -F "image=@input.png" \
+  -F "prompt=A calico cat playing a piano on stage" \
+  -F "size=1024x1024" \
+  -F "response_format=b64_json"
+```
+
+**Curl Example (URL response):**
+
+```bash
+curl -sS -X POST "http://localhost:30010/v1/images/edits" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -F "image=@input.png" \
+  -F "prompt=A calico cat playing a piano on stage" \
+  -F "size=1024x1024" \
+  -F "response_format=url"
+```
+
+#### Download image content
+
+When `response_format=url` is used with `POST /v1/images/edits`, the API returns a relative URL like `/v1/images/<IMAGE_ID>/content`.
+
+**Endpoint:** `GET /v1/images/{image_id}/content`
+
+**Curl Example:**
+
+```bash
+curl -sS -L "http://localhost:30010/v1/images/<IMAGE_ID>/content" \
+  -H "Authorization: Bearer sk-proj-1234567890" \
+  -o output.png
+```
+
 ### Video Generation
 
 The server implements a subset of the OpenAI Videos API under the `/v1/videos` namespace.
