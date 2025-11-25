@@ -31,21 +31,21 @@ pub trait PipelineStage: Send + Sync {
 // Stage Modules (imported here)
 // ============================================================================
 
-mod validation;
-mod discovery;
 mod context_loading;
-mod request_building;
-mod mcp_preparation;
+mod discovery;
 mod execution;
-mod response_processing;
+mod mcp_preparation;
 mod persistence;
+mod request_building;
+mod response_processing;
+mod validation;
 
 // Export stage implementations
-pub use validation::ValidationStage;
-pub use discovery::ModelDiscoveryStage;
 pub use context_loading::ContextLoadingStage;
-pub use request_building::RequestBuildingStage;
-pub use mcp_preparation::McpPreparationStage;
+pub use discovery::ModelDiscoveryStage;
 pub use execution::RequestExecutionStage;
-pub use response_processing::ResponseProcessingStage;
+pub use mcp_preparation::McpPreparationStage;
 pub use persistence::PersistenceStage;
+pub use request_building::RequestBuildingStage;
+pub use response_processing::ResponseProcessingStage;
+pub use validation::ValidationStage;

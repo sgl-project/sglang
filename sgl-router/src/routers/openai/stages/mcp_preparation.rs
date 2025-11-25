@@ -57,10 +57,7 @@ impl McpPreparationStage {
 
             if !tools_json.is_empty() {
                 obj.insert("tools".to_string(), Value::Array(tools_json));
-                obj.insert(
-                    "tool_choice".to_string(),
-                    Value::String("auto".to_string()),
-                );
+                obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
             }
         }
     }

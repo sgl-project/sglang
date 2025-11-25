@@ -29,9 +29,7 @@ use super::{
 };
 use crate::{
     core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
-    data_connector::{
-        ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage,
-    },
+    data_connector::{ConversationItemStorage, ConversationStorage, ResponseId, ResponseStorage},
     mcp::McpManager,
     protocols::{
         chat::ChatCompletionRequest,

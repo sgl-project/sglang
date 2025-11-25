@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use reqwest::StatusCode;
 use serde_json::Value;
 
+use super::mcp::ToolLoopState;
 use crate::{
     core::CircuitBreaker,
     data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
@@ -19,8 +20,6 @@ use crate::{
         responses::{ResponseInputOutputItem, ResponsesRequest},
     },
 };
-
-use super::mcp::ToolLoopState;
 
 // ============================================================================
 // Main Request Context
@@ -253,9 +252,7 @@ impl RequestContext {
     pub fn model(&self) -> &str {
         match &self.input.request_type {
             RequestType::Chat(req) => &req.model,
-            RequestType::Responses(req) => {
-                self.input.model_id.as_deref().unwrap_or(&req.model)
-            }
+            RequestType::Responses(req) => self.input.model_id.as_deref().unwrap_or(&req.model),
         }
     }
 }

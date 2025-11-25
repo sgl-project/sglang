@@ -10,7 +10,10 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use axum::{http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use once_cell::sync::Lazy;
 use serde_json::{to_value, Value};
 
@@ -408,7 +411,10 @@ mod tests {
 
         // First item should be the conversation history
         let first_item = input_arr[0].as_object().unwrap();
-        assert_eq!(first_item.get("role").and_then(|v| v.as_str()), Some("user"));
+        assert_eq!(
+            first_item.get("role").and_then(|v| v.as_str()),
+            Some("user")
+        );
 
         // Second item should be current request
         let second_item = input_arr[1].as_object().unwrap();

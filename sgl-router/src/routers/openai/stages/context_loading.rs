@@ -6,7 +6,11 @@
 //! - Builds conversation context for the request
 
 use async_trait::async_trait;
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde_json::json;
 use tracing::warn;
 
@@ -150,10 +154,7 @@ impl PipelineStage for ContextLoadingStage {
                                         });
                                     }
                                     Err(e) => {
-                                        warn!(
-                                            "Failed to deserialize message content: {}",
-                                            e
-                                        );
+                                        warn!("Failed to deserialize message content: {}", e);
                                     }
                                 }
                             }
@@ -164,10 +165,7 @@ impl PipelineStage for ContextLoadingStage {
                                 ) {
                                     Ok(func_call) => conversation_items.push(func_call),
                                     Err(e) => {
-                                        warn!(
-                                            "Failed to deserialize function_call: {}",
-                                            e
-                                        );
+                                        warn!("Failed to deserialize function_call: {}", e);
                                     }
                                 }
                             }
@@ -180,10 +178,7 @@ impl PipelineStage for ContextLoadingStage {
                                         conversation_items.push(func_output);
                                     }
                                     Err(e) => {
-                                        warn!(
-                                            "Failed to deserialize function_call_output: {}",
-                                            e
-                                        );
+                                        warn!("Failed to deserialize function_call_output: {}", e);
                                     }
                                 }
                             }

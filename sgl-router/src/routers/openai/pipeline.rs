@@ -103,14 +103,9 @@ impl RequestPipeline {
 
         // Return final response
         match ctx.state.final_response {
-            Some(final_resp) => {
-                (StatusCode::OK, Json(final_resp.json_response)).into_response()
-            }
+            Some(final_resp) => (StatusCode::OK, Json(final_resp.json_response)).into_response(),
             None => {
-                error!(
-                    function = "execute",
-                    "No response produced by pipeline"
-                );
+                error!(function = "execute", "No response produced by pipeline");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({

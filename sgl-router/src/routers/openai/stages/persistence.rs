@@ -7,7 +7,11 @@
 //! - Returns final JSON response
 
 use async_trait::async_trait;
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use tracing::warn;
 
 use super::PipelineStage;
@@ -37,7 +41,9 @@ impl PipelineStage for PersistenceStage {
             RequestType::Responses(req) => req,
             RequestType::Chat(_) => {
                 // For chat requests, just return the JSON response
-                return Ok(Some((StatusCode::OK, Json(processed.json_response)).into_response()));
+                return Ok(Some(
+                    (StatusCode::OK, Json(processed.json_response)).into_response(),
+                ));
             }
         };
 
@@ -100,9 +106,7 @@ mod tests {
             chat::{ChatCompletionRequest, ChatMessage, MessageContent},
             responses::{ResponseInput, ResponsesRequest},
         },
-        routers::openai::context::{
-            ProcessedResponse, RequestInput, SharedComponents,
-        },
+        routers::openai::context::{ProcessedResponse, RequestInput, SharedComponents},
     };
 
     async fn create_test_components(worker_urls: Vec<String>) -> Arc<SharedComponents> {

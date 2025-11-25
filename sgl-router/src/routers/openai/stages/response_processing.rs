@@ -7,7 +7,11 @@
 //! - Stores parsed JSON response
 
 use async_trait::async_trait;
-use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use serde_json::{json, Value};
 
 use super::PipelineStage;
@@ -141,7 +145,9 @@ impl PipelineStage for ResponseProcessingStage {
         ctx.components.circuit_breaker.record_success();
 
         // Store processed response
-        ctx.state.processed = Some(ProcessedResponse { json_response: response_json });
+        ctx.state.processed = Some(ProcessedResponse {
+            json_response: response_json,
+        });
 
         Ok(None)
     }
@@ -168,10 +174,10 @@ mod tests {
             chat::{ChatCompletionRequest, ChatMessage, MessageContent},
             responses::{ResponseInput, ResponsesRequest},
         },
-        routers::openai::context::{
-            DiscoveryOutput, McpOutput, PayloadOutput, RequestInput, SharedComponents,
+        routers::openai::{
+            context::{DiscoveryOutput, McpOutput, PayloadOutput, RequestInput, SharedComponents},
+            mcp::ToolLoopState,
         },
-        routers::openai::mcp::ToolLoopState,
     };
 
     async fn create_test_components(worker_urls: Vec<String>) -> Arc<SharedComponents> {

@@ -8,7 +8,10 @@
 use std::time::Instant;
 
 use async_trait::async_trait;
-use axum::{http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 
 use super::PipelineStage;
 use crate::routers::openai::{

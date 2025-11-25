@@ -8,7 +8,10 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use axum::{http::StatusCode, response::{IntoResponse, Response}};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 
 use super::PipelineStage;
 use crate::routers::openai::{
@@ -243,7 +246,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_discovery_stage_cache_hit() {
-        let worker_urls = vec!["http://localhost:8000".to_string(), "http://localhost:8001".to_string()];
+        let worker_urls = vec![
+            "http://localhost:8000".to_string(),
+            "http://localhost:8001".to_string(),
+        ];
         let components = create_test_components(worker_urls.clone()).await;
 
         // Pre-populate cache

@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use super::{
+    context::{RequestType, SharedComponents},
+    pipeline::RequestPipeline,
+};
 use crate::{
     core::CircuitBreaker,
     data_connector::{
@@ -13,11 +17,6 @@ use crate::{
     },
     mcp::{config::McpConfig, McpManager},
     protocols::chat::ChatCompletionRequest,
-};
-
-use super::{
-    context::{RequestType, SharedComponents},
-    pipeline::RequestPipeline,
 };
 
 /// Helper to create test components
@@ -119,12 +118,7 @@ async fn test_pipeline_executes_without_panic() {
     // Execute pipeline (will fail at some stage since we don't have a real server,
     // but should not panic)
     let response = pipeline
-        .execute(
-            RequestType::Chat(Arc::new(request)),
-            None,
-            None,
-            components,
-        )
+        .execute(RequestType::Chat(Arc::new(request)), None, None, components)
         .await;
 
     // Response should be an error (since we're hitting localhost with no server)

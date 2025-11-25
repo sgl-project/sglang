@@ -10,10 +10,7 @@
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    http::{
-        header::CONTENT_TYPE,
-        HeaderValue, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
@@ -89,8 +86,8 @@ impl PipelineStage for RequestExecutionStage {
             }
         };
 
-        let status =
-            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = StatusCode::from_u16(resp.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         // Handle streaming responses - return early
         if payload_output.is_streaming {
@@ -115,8 +112,7 @@ impl PipelineStage for RequestExecutionStage {
                 }
             });
 
-            let mut response =
-                Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
+            let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
             *response.status_mut() = status;
             response
                 .headers_mut()
