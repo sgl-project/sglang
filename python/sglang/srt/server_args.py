@@ -1611,6 +1611,12 @@ class ServerArgs:
             )
 
     def _handle_speculative_decoding(self):
+        if (
+            self.speculative_draft_model_path is not None
+            and self.speculative_draft_model_revision is None
+        ):
+            self.speculative_draft_model_revision = "main"
+
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
@@ -1659,6 +1665,7 @@ class ServerArgs:
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
+                    self.speculative_draft_model_revision = self.revision
                 else:
                     logger.warning(
                         "DeepSeek MTP does not require setting speculative_draft_model_path."
