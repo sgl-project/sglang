@@ -142,7 +142,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_text_models
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_text_models
 
   # VLM accuracy tests
   nightly-test-vlm-accuracy-2-gpu-runner:
@@ -191,7 +191,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_vlms
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_vlms
 
   # diffusion performance tests
   nightly-test-multimodal-server-1-gpu:
@@ -294,7 +294,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
         run: |
-          rm -rf test/srt/performance_profiles_deepseek_v31/
+          rm -rf test/performance_profiles_deepseek_v31/
           cd test
           IS_BLACKWELL=1 python3 nightly/test_deepseek_v31_perf.py
 
@@ -304,7 +304,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v31
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_deepseek_v31
 
       - name: Run DeepSeek v3.2 nightly performance test
         timeout-minutes: 180
@@ -313,7 +313,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
         run: |
-          rm -rf test/srt/performance_profiles_deepseek_v32/
+          rm -rf test/performance_profiles_deepseek_v32/
           cd test
           IS_BLACKWELL=1 python3 nightly/test_deepseek_v32_perf.py
 
@@ -323,7 +323,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
         run: |
-          python3 scripts/ci/publish_traces.py --traces-dir test/srt/performance_profiles_deepseek_v32
+          python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_deepseek_v32
 
   # Final check job
   check-all-jobs:
