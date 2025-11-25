@@ -1,7 +1,7 @@
+use std::{net::Ipv4Addr, str::FromStr};
+
 use super::*;
 use crate::core::ConnectionMode;
-use std::net::Ipv4Addr;
-use std::str::FromStr;
 
 /// Configuration validator
 pub struct ConfigValidator;
@@ -376,7 +376,8 @@ impl ConfigValidator {
             return Err(ConfigError::InvalidValue {
                 field: "trace_config.otlp_traces_endpoint".to_string(),
                 value: endpoint.clone(),
-                reason: "expected format <host>:<port>, e.g., localhost:4317 or 127.0.0.1:4317".to_string(),
+                reason: "expected format <host>:<port>, e.g., localhost:4317 or 127.0.0.1:4317"
+                    .to_string(),
             });
         }
 
@@ -388,7 +389,8 @@ impl ConfigValidator {
             return Err(ConfigError::InvalidValue {
                 field: "trace_config.otlp_traces_endpoint".to_string(),
                 value: endpoint.clone(),
-                reason: "host must be 'localhost' or a valid IPv4 address (e.g., 127.0.0.1)".to_string(),
+                reason: "host must be 'localhost' or a valid IPv4 address (e.g., 127.0.0.1)"
+                    .to_string(),
             });
         }
 

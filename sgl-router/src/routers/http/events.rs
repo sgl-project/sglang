@@ -1,6 +1,6 @@
 //! request events for observability and monitoring
 
-use tracing::{Level, event};
+use tracing::{event, Level};
 
 pub fn get_module_path() -> &'static str {
     module_path!()
@@ -47,9 +47,6 @@ pub struct RequestReceivedEvent {}
 
 impl Event for RequestReceivedEvent {
     fn emit(&self) {
-        event!(
-            Level::DEBUG,
-            "Received concurrent requests"
-        );
+        event!(Level::DEBUG, "Received concurrent requests");
     }
 }

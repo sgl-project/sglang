@@ -14,14 +14,15 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
-use super::events::{self, Event};
 
+use super::events::{self, Event};
 use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
     },
     metrics::RouterMetrics,
+    otel_trace::inject_trace_context_http,
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
@@ -34,7 +35,6 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{header_utils, RouterTrait},
-    otel_trace::inject_trace_context_http,
 };
 
 /// Regular router that uses injected load balancing policies
@@ -212,7 +212,10 @@ impl Router {
                     None
                 };
 
-                events::RequestSentEvent{url: worker.url().to_string()}.emit();
+                events::RequestSentEvent {
+                    url: worker.url().to_string(),
+                }
+                .emit();
                 let mut headers_with_trace = headers.cloned().unwrap_or_default();
                 let headers = match inject_trace_context_http(&mut headers_with_trace) {
                     Ok(()) => Some(&headers_with_trace),
@@ -230,7 +233,7 @@ impl Router {
                     )
                     .await;
 
-                events::RequestReceivedEvent{}.emit();
+                events::RequestReceivedEvent {}.emit();
 
                 worker.record_outcome(response.status().is_success());
 

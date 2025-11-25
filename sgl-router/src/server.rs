@@ -31,8 +31,8 @@ use crate::{
     },
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
-    otel_trace,
     middleware::{self, AuthConfig, QueuedRequest},
+    otel_trace,
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -698,28 +698,34 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
     if let Some(trace_config) = &config.router_config.trace_config {
-        otel_trace::otel_tracing_init(trace_config.enable_trace, Some(&trace_config.otlp_traces_endpoint))?;
+        otel_trace::otel_tracing_init(
+            trace_config.enable_trace,
+            Some(&trace_config.otlp_traces_endpoint),
+        )?;
     }
 
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
-        Some(logging::init_logging(LoggingConfig {
-            level: config
-                .log_level
-                .as_deref()
-                .and_then(|s| match s.to_uppercase().parse::<Level>() {
-                    Ok(l) => Some(l),
-                    Err(_) => {
-                        warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
-                        None
-                    }
-                })
-                .unwrap_or(Level::INFO),
-            json_format: false,
-            log_dir: config.log_dir.clone(),
-            colorize: true,
-            log_file_name: "sgl-router".to_string(),
-            log_targets: None,
-        }, config.router_config.trace_config.clone()))
+        Some(logging::init_logging(
+            LoggingConfig {
+                level: config
+                    .log_level
+                    .as_deref()
+                    .and_then(|s| match s.to_uppercase().parse::<Level>() {
+                        Ok(l) => Some(l),
+                        Err(_) => {
+                            warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
+                            None
+                        }
+                    })
+                    .unwrap_or(Level::INFO),
+                json_format: false,
+                log_dir: config.log_dir.clone(),
+                colorize: true,
+                log_file_name: "sgl-router".to_string(),
+                log_targets: None,
+            },
+            config.router_config.trace_config.clone(),
+        ))
     } else {
         None
     };

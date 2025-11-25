@@ -1,25 +1,29 @@
-use opentelemetry::{global, KeyValue};
-use opentelemetry::trace::TracerProvider as _;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        OnceLock,
+    },
+    time::Duration,
+};
+
+use anyhow::Result;
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
+use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
-    trace::{TracerProvider, BatchSpanProcessor, BatchConfigBuilder, Tracer as SdkTracer},
     runtime,
+    trace::{BatchConfigBuilder, BatchSpanProcessor, Tracer as SdkTracer, TracerProvider},
     Resource,
 };
-use opentelemetry_otlp::WithExportConfig;
-use tracing_opentelemetry::OpenTelemetrySpanExt;
-
-use tracing_subscriber::{
-    layer::{Filter, Context}, Layer
-};
-use tracing_opentelemetry;
 use tracing::{Metadata, Subscriber};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use anyhow::Result;
-use std::time::Duration;
-use std::collections::HashSet;
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use tracing_opentelemetry::{self, OpenTelemetrySpanExt};
+use tracing_subscriber::{
+    layer::{Context, Filter},
+    Layer,
+};
+
 use crate::routers::http::events::get_module_path as http_router_get_module_path;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -37,9 +41,7 @@ impl CustomOtelFilter {
         allowed_targets.insert("sglang_router_rs::otel-trace".to_string());
         allowed_targets.insert(http_router_get_module_path().to_string());
 
-        Self {
-            allowed_targets,
-        }
+        Self { allowed_targets }
     }
 }
 
@@ -51,10 +53,7 @@ where
         self.allowed_targets.contains(meta.target())
     }
 
-    fn callsite_enabled(
-        &self,
-        meta: &'static Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
+    fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> tracing::subscriber::Interest {
         if self.allowed_targets.contains(meta.target()) {
             tracing::subscriber::Interest::always()
         } else {
@@ -70,10 +69,7 @@ impl Default for CustomOtelFilter {
 }
 
 /// init OpenTelemetry connection
-pub fn otel_tracing_init(
-    enable: bool,
-    otlp_endpoint: Option<&str>,
-) -> Result<()> {
+pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()> {
     if !enable {
         ENABLED.store(false, Ordering::Relaxed);
         return Ok(());
@@ -104,9 +100,10 @@ pub fn otel_tracing_init(
             .with_batch_config(batch_config)
             .build();
 
-        let resource = Resource::default().merge(&Resource::new(vec![
-            KeyValue::new("service.name", "sgl-router"),
-        ]));
+        let resource = Resource::default().merge(&Resource::new(vec![KeyValue::new(
+            "service.name",
+            "sgl-router",
+        )]));
 
         let provider = TracerProvider::builder()
             .with_span_processor(span_processor)
@@ -115,9 +112,9 @@ pub fn otel_tracing_init(
 
         let tracer = provider.tracer("sgl-router");
 
-        TRACER.set(tracer).map_err(|_| {
-            anyhow::anyhow!("Tracer already initialized")
-        })?;
+        TRACER
+            .set(tracer)
+            .map_err(|_| anyhow::anyhow!("Tracer already initialized"))?;
 
         let _ = global::set_tracer_provider(provider);
 
@@ -128,7 +125,10 @@ pub fn otel_tracing_init(
 
     match result {
         Ok(Ok(())) => {
-            eprintln!("[tracing] OpenTelemetry initialized successfully, enabled: {}", ENABLED.load(Ordering::Relaxed));
+            eprintln!(
+                "[tracing] OpenTelemetry initialized successfully, enabled: {}",
+                ENABLED.load(Ordering::Relaxed)
+            );
             Ok(())
         }
         Ok(Err(e)) => {
@@ -152,7 +152,8 @@ where
         return Err("OpenTelemetry is not enabled");
     }
 
-    let tracer = TRACER.get()
+    let tracer = TRACER
+        .get()
         .ok_or("Tracer not initialized. Call otel_tracing_init first.")?
         .clone();
 

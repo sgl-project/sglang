@@ -14,14 +14,17 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
-use super::events::{self, Event};
+use super::{
+    events::{self, Event},
+    pd_types::api_path,
+};
 use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
     metrics::RouterMetrics,
+    otel_trace::inject_trace_context_http,
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -34,7 +37,6 @@ use crate::{
         responses::{ResponsesGetParams, ResponsesRequest},
     },
     routers::{header_utils, RouterTrait},
-    otel_trace::inject_trace_context_http,
 };
 
 #[derive(Debug)]
@@ -418,15 +420,16 @@ impl PDRouter {
         );
 
         // Send both requests concurrently and wait for both
-        events::RequestPDSentEvent{
+        events::RequestPDSentEvent {
             prefill_url: prefill.url().to_string(),
             decode_url: decode.url().to_string(),
-        }.emit();
+        }
+        .emit();
 
         let (prefill_result, decode_result) =
             tokio::join!(prefill_request.send(), decode_request.send());
 
-        events::RequestReceivedEvent{}.emit();
+        events::RequestReceivedEvent {}.emit();
 
         let duration = start_time.elapsed();
         RouterMetrics::record_pd_request_duration(context.route, duration);
@@ -885,7 +888,7 @@ impl PDRouter {
                     | "x-request-id"
                     | "x-correlation-id"
                     | "traceparent"      // W3C Trace Context
-                    | "tracestate"       // W3C Trace Context
+                    | "tracestate" // W3C Trace Context
                 ) || name_lc.starts_with("x-request-id-");
                 if forward {
                     if let Ok(val) = value.to_str() {
