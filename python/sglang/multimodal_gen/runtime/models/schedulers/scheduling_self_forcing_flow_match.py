@@ -43,7 +43,6 @@ class SelfForcingFlowMatchScheduler(BaseScheduler, ConfigMixin, SchedulerMixin):
         *args,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
         self.num_train_timesteps = num_train_timesteps
         self.shift = shift
         self.sigma_max = sigma_max
