@@ -203,7 +203,7 @@ class GenerateReqInput(BaseReq):
     # For metrics
     received_time: Optional[float] = None
 
-    # perf_counter equivalents for accurate time calculations
+    # Perf_counter equivalents for accurate time calculations
     received_time_perf: Optional[float] = None
 
     # For data parallel rank routing
