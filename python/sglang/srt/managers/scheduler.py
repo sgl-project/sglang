@@ -453,6 +453,18 @@ class Scheduler(
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
+        # Init the dynamic chunking predictor for PP
+        if self.pp_size > 1 and server_args.enable_dynamic_chunking:
+            self.init_pp_dynamic_chunk_size(server_args)
+            try:
+                self.profile_pp_prefill_latency()
+            except Exception as e:
+                logger.warning(
+                    f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
+                    "Dynamic chunking will be disabled."
+                )
+                self.enable_dynamic_chunking = False
+
         # Init the grammar backend for constrained generation
         self.grammar_queue: List[Req] = []
         if not server_args.skip_tokenizer_init:
@@ -1702,6 +1714,16 @@ class Scheduler(
             # in the waiting queue.
             return None
 
+        # Determine chunked_prefill_size for this batch
+        chunked_prefill_size = self.chunked_prefill_size
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
+            if self.enable_dynamic_chunking:
+                history_len = len(self.chunked_req.prefix_indices)
+                dynamic_size = self.predict_next_chunk_size(history_len)
+                if dynamic_size is not None:
+                    chunked_prefill_size = dynamic_size
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -1710,7 +1732,7 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
         )
