@@ -1517,12 +1517,22 @@ pub(super) async fn handle_streaming_response(
         ensure_request_mcp_client(manager, tools.as_slice()).await;
     }
 
-    // Use the tool loop if the manager has any tools available (static or dynamic).
+    // Use the tool loop if MCP tools are requested (tools may not be loaded yet for dynamic clients)
     let active_mcp = mcp_manager.and_then(|mgr| {
-        if mgr.list_tools().is_empty() {
-            None
-        } else {
+        let has_mcp_tools = original_body
+            .tools
+            .as_ref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
+            })
+            .unwrap_or(false);
+
+        if has_mcp_tools {
             Some(mgr)
+        } else {
+            None
         }
     });
 

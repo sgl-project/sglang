@@ -91,7 +91,54 @@ impl PipelineStage for RequestExecutionStage {
 
         // Handle streaming responses - return early
         if payload_output.is_streaming {
-            // For streaming, we pass the response directly to the client
+            // Check if MCP is active for this request
+            let mcp_active = ctx
+                .state
+                .mcp
+                .as_ref()
+                .map(|m| m.active)
+                .unwrap_or(false);
+
+            if mcp_active {
+                // Use MCP-aware streaming handler
+                use crate::routers::openai::streaming::handle_streaming_response;
+
+                let original_body = match &ctx.input.request_type {
+                    RequestType::Responses(body) => body.as_ref(),
+                    _ => {
+                        return Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Invalid request type for streaming MCP",
+                        )
+                            .into_response())
+                    }
+                };
+
+                let previous_response_id = ctx
+                    .state
+                    .context
+                    .as_ref()
+                    .and_then(|c| c.previous_response_id.clone());
+
+                return Ok(Some(
+                    handle_streaming_response(
+                        &ctx.components.http_client,
+                        &ctx.components.circuit_breaker,
+                        Some(&ctx.components.mcp_manager),
+                        ctx.components.response_storage.clone(),
+                        ctx.components.conversation_storage.clone(),
+                        ctx.components.conversation_item_storage.clone(),
+                        url.clone(),
+                        ctx.input.headers.as_ref(),
+                        payload_output.json_payload.clone(),
+                        original_body,
+                        previous_response_id,
+                    )
+                    .await,
+                ));
+            }
+
+            // Simple passthrough for non-MCP streaming
             let stream = resp.bytes_stream();
             let (tx, rx) = mpsc::unbounded_channel();
 
