@@ -2,6 +2,7 @@ import asyncio
 import ctypes
 import logging
 import multiprocessing as mp
+import os
 import pickle
 import sys
 import time
@@ -30,6 +31,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_loader import get_model
 from sglang.srt.server_args import (
     PortArgs,
@@ -156,6 +158,10 @@ class MMEncoder:
 
         self.context = zmq.asyncio.Context(2)
 
+        embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
+        self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
+        self.mm_cache_lock = asyncio.Lock()
+
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
                 self.context, zmq.PULL, schedule_path, True
@@ -194,19 +200,40 @@ class MMEncoder:
             if k == "pixel_values":
                 continue
             mm_item.set(k, _convert(v))
-        with torch.inference_mode():
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            start_time1 = time.perf_counter()
-            mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            end_time = time.perf_counter()
-            logger.info(
-                f"Vit time : {(end_time - start_time1)*1000:.2f} ms {mm_embedding.shape = }"
-            )
-        if len(mm_embedding.shape) != 2:
-            mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+
+        # support mm_cache
+        mm_embedding = None
+        mm_hash = None
+
+        start_time = time.perf_counter()
+        if self.server_args.enable_prefix_mm_cache:
+            mm_item.set_pad_value()
+            mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+            async with self.mm_cache_lock:
+                mm_cache = self.mm_cache.get([mm_item.hash])
+                if mm_cache is not None:
+                    mm_embedding = mm_cache
+            if mm_cache is not None:
+                mm_embedding = mm_cache
+
+        if mm_embedding is None:
+            with torch.inference_mode():
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            if len(mm_embedding.shape) != 2:
+                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+
+        if self.server_args.enable_prefix_mm_cache:
+            async with self.mm_cache_lock:
+                self.mm_cache.set(mm_hash, mm_embedding.cpu())
+        end_time = time.perf_counter()
+        logger.info(
+            f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
+        )
+
         return _get_image_grid_dim(images_input), mm_embedding.cpu()
 
     async def _send(
