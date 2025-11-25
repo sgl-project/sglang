@@ -318,6 +318,12 @@ class SamplingParams:
 
         return sampling_params
 
+    def output_size_str(self) -> str:
+        return f"{self.width}x{self.height}"
+
+    def seconds(self) -> float:
+        return self.num_frames / self.fps
+
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
         """Add CLI arguments for SamplingParam fields"""
