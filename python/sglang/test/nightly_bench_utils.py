@@ -117,7 +117,7 @@ def generate_markdown_report(trace_dir, results: List[BenchmarkResult]) -> str:
 
 
 def save_results_as_pydantic_models(
-    results: List["BenchOneCaseResult"], pydantic_result_filename: str, model_path: str
+    results: List, pydantic_result_filename: str, model_path: str
 ):
     """Save benchmark results as JSON using Pydantic models."""
     json_results = []
