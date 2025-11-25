@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -5,36 +6,60 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
 TEST_MODEL_MATRIX = {
-    "Qwen/Qwen2.5-7B-Instruct": {
-        "accuracy": 0.84,
-        "latency": 150,
-        "output_throughput": 30,
+    "/root/.cache/modelscope/hub/models/vllm-ascend/DeepSeek-R1-0528-W8A8": {
+        "accuracy": 0.95,
+        "latency": 1000,
+        "output_throughput": 6,
     },
 }
 
 
-class TestAscendTp1Bf16(CustomTestCase):
+class TestAscendDeepSeekMTP(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
         cls.models = TEST_MODEL_MATRIX.keys()
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
+
         cls.common_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
-            "--mem-fraction-static",
-            0.8,
             "--attention-backend",
             "ascend",
+            "--quantization",
+            "w8a8_int8",
+            "--mem-fraction-static",
+            0.8,
+            "--disable-radix-cache",
+            "--chunked-prefill-size",
+            32768,
+            "--tp-size",
+            16,
+            "--dp-size",
+            2,
+            "--enable-dp-attention",
+            "--speculative-algorithm",
+            "NEXTN",
+            "--speculative-num-steps",
+            1,
+            "--speculative-eagle-topk",
+            1,
+            "--speculative-num-draft-tokens",
+            2,
         ]
+
+        cls.extra_envs = {
+            "SGLANG_NPU_USE_MLAPO": "1",
+            "SGLANG_ENABLE_SPEC_V2": "1",
+            "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+        }
+        os.environ.update(cls.extra_envs)
 
     def test_a_gsm8k(self):
         for model in self.models:
@@ -44,7 +69,7 @@ class TestAscendTp1Bf16(CustomTestCase):
                 process = popen_launch_server(
                     model,
                     self.base_url,
-                    timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                    timeout=1500,
                     other_args=[
                         *self.common_args,
                     ],
