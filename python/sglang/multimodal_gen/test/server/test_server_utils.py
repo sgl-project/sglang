@@ -21,11 +21,11 @@ import pytest
 from openai import Client, OpenAI
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
-from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    DiffusionSamplingParams,
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
@@ -469,17 +469,10 @@ VALIDATOR_REGISTRY = {
 
 def get_generate_fn(
     model_path: str,
-    data_type: DataType,
-    sampling_params: SamplingParams,
-    edit_prompt: str | None = None,
+    modality: str,
+    sampling_params: DiffusionSamplingParams,
 ) -> Callable[[str, Client], str]:
     """Return appropriate generation function for the case."""
-    # Reconstruct output size string (e.g. 1024x1024)
-    output_size = f"{sampling_params.width}x{sampling_params.height}"
-    # Calculate video seconds
-    video_seconds = 4  # default
-    if sampling_params.num_frames and sampling_params.fps:
-        video_seconds = int(sampling_params.num_frames / sampling_params.fps)
 
     def _create_and_download_video(
         client,
@@ -530,12 +523,12 @@ def get_generate_fn(
         if not job_completed:
             if is_baseline_generation_mode:
                 logger.warning(
-                    f"{case_id}: video job {video_id} timed out during baseline generation. "
+                    f"{id}: video job {video_id} timed out during baseline generation. "
                     "Attempting to collect performance data anyway."
                 )
                 return video_id
 
-            pytest.fail(f"{case_id}: video job {video_id} did not complete in time")
+            pytest.fail(f"{id}: video job {video_id} did not complete in time")
 
         # download video
         resp = client.videos.download_content(video_id=video_id)  # type: ignore[attr-defined]
@@ -556,16 +549,18 @@ def get_generate_fn(
 
         return video_id
 
+    video_seconds = sampling_params.seconds or 4
+
     def generate_image(case_id, client) -> str:
         """T2I: Text to Image generation."""
         if not sampling_params.prompt:
-            pytest.skip(f"{case_id}: no text prompt configured")
+            pytest.skip(f"{id}: no text prompt configured")
 
         response = client.images.with_raw_response.generate(
             model=model_path,
             prompt=sampling_params.prompt,
             n=1,
-            size=output_size,
+            size=sampling_params.output_size,
             response_format="b64_json",
         )
         result = response.parse()
@@ -587,23 +582,23 @@ def get_generate_fn(
 
     def generate_image_edit(case_id, client) -> str:
         """TI2I: Text + Image ? Image edit."""
-        if not edit_prompt or not sampling_params.image_path:
-            pytest.skip(f"{case_id}: no edit config")
+        if not sampling_params.edit_prompt or not sampling_params.image_path:
+            pytest.skip(f"{id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{case_id}: file missing: {image_path}")
+                pytest.skip(f"{id}: file missing: {image_path}")
 
         with image_path.open("rb") as fh:
             response = client.images.with_raw_response.edit(
                 model=model_path,
                 image=fh,
-                prompt=edit_prompt,
+                prompt=sampling_params.edit_prompt,
                 n=1,
-                size=output_size,
+                size=sampling_params.output_size,
                 response_format="b64_json",
             )
         rid = response.headers.get("x-request-id", "")
@@ -618,7 +613,7 @@ def get_generate_fn(
         upload_file_to_slack(
             case_id=case_id,
             model=model_path,
-            prompt=edit_prompt,
+            prompt=sampling_params.edit_prompt,
             file_path=tmp_path,
             origin_file_path=sampling_params.image_path,
         )
@@ -629,71 +624,71 @@ def get_generate_fn(
     def generate_video(case_id, client) -> str:
         """T2V: Text ? Video."""
         if not sampling_params.prompt:
-            pytest.skip(f"{case_id}: no text prompt configured")
+            pytest.skip(f"{id}: no text prompt configured")
 
         return _create_and_download_video(
             client,
             case_id,
             model=model_path,
             prompt=sampling_params.prompt,
-            size=output_size,
+            size=sampling_params.output_size,
             seconds=video_seconds,
         )
 
     def generate_image_to_video(case_id, client) -> str:
         """I2V: Image ? Video (optional prompt)."""
         if not sampling_params.image_path:
-            pytest.skip(f"{case_id}: no input image configured")
+            pytest.skip(f"{id}: no input image configured")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{case_id}: file missing: {image_path}")
+                pytest.skip(f"{id}: file missing: {image_path}")
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
                 client,
                 case_id,
                 model=model_path,
-                prompt=edit_prompt,
-                size=output_size,
+                prompt=sampling_params.edit_prompt,
+                size=sampling_params.output_size,
                 seconds=video_seconds,
                 input_reference=fh,
             )
 
     def generate_text_image_to_video(case_id, client) -> str:
         """TI2V: Text + Image ? Video."""
-        if not edit_prompt or not sampling_params.image_path:
-            pytest.skip(f"{case_id}: no edit config")
+        if not sampling_params.edit_prompt or not sampling_params.image_path:
+            pytest.skip(f"{id}: no edit config")
 
         if is_image_url(sampling_params.image_path):
             image_path = download_image_from_url(str(sampling_params.image_path))
         else:
             image_path = Path(sampling_params.image_path)
             if not image_path.exists():
-                pytest.skip(f"{case_id}: file missing: {image_path}")
+                pytest.skip(f"{id}: file missing: {image_path}")
 
         with image_path.open("rb") as fh:
             return _create_and_download_video(
                 client,
                 case_id,
                 model=model_path,
-                prompt=edit_prompt,
-                size=output_size,
+                prompt=sampling_params.edit_prompt,
+                size=sampling_params.output_size,
                 seconds=video_seconds,
                 input_reference=fh,
             )
 
-    if data_type == DataType.VIDEO:
-        if sampling_params.image_path and edit_prompt:
+    if modality == "video":
+        if sampling_params.image_path and sampling_params.edit_prompt:
             fn = generate_text_image_to_video
         elif sampling_params.image_path:
             fn = generate_image_to_video
         else:
             fn = generate_video
-    elif edit_prompt and sampling_params.image_path:
+    elif sampling_params.edit_prompt and sampling_params.image_path:
         fn = generate_image_edit
     else:
         fn = generate_image
