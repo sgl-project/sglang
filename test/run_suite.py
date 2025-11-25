@@ -142,7 +142,9 @@ def run_suite(
         print(f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}")
         return
 
-    print(f"Running {len(test_files)} test(s) for hw={hw.name}, suite={suite}, nightly={nightly}")
+    print(
+        f"Running {len(test_files)} test(s) for hw={hw.name}, suite={suite}, nightly={nightly}"
+    )
 
     run_unittest_files(
         test_files,
@@ -186,7 +188,9 @@ def main():
     )
     args = parser.parse_args()
     hw = HW_MAPPING[args.hw]
-    run_suite(hw, args.suite, args.nightly, args.auto_partition_id, args.auto_partition_size)
+    run_suite(
+        hw, args.suite, args.nightly, args.auto_partition_id, args.auto_partition_size
+    )
 
 
 if __name__ == "__main__":

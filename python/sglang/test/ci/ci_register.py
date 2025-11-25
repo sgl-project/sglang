@@ -121,9 +121,7 @@ class RegistryVisitor(ast.NodeVisitor):
                 elif i == 3:
                     disabled = arg.value
 
-        assert (
-            est_time is not None
-        ), "est_time is required and should be a constant"
+        assert est_time is not None, "est_time is required and should be a constant"
         assert suite is not None, "suite is required and should be a constant"
         return CIRegistry(
             backend=hw,
