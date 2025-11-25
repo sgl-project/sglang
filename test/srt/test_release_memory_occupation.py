@@ -45,8 +45,8 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     CustomTestCase,
     empty_gpu_cache,
+    get_gpu_count,
     get_gpu_memory_gb,
-    get_gpu_rank,
 )
 
 # (temporarily) set to true to observe memory usage in nvidia-smi more clearly
@@ -105,7 +105,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
     def test_release_and_resume_occupation(self):
         # Without multi-stage release and resume, we need to carefully control the memory fraction to avoid OOM
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-        assert get_gpu_rank() >= 2, "Need at least 2 GPUs for tensor parallel tests"
+        assert get_gpu_count() >= 2, "Need at least 2 GPUs for tensor parallel tests"
 
         for tp_size in [1, 2]:
 
@@ -215,7 +215,7 @@ class TestReleaseMemoryOccupation(CustomTestCase):
         model_name = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
         for tp_size in [1, 2]:
-            if tp_size == 2 and get_gpu_rank() < 2:
+            if tp_size == 2 and get_gpu_count() < 2:
                 continue
 
             print(f"Testing tp_size={tp_size} for test_multi_stage_release_and_resume")
