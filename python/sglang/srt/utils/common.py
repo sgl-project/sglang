@@ -627,6 +627,11 @@ cmo_stream = None
 
 
 def get_cmo_stream():
+    """
+    Cache Management Operation(CMO).
+    Launch a new stream to prefetch the weight of matmul when running other
+    AIV or communication kernels, aiming to overlap the memory access time.
+    """
     global cmo_stream
     return cmo_stream
 

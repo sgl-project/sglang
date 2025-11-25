@@ -106,7 +106,6 @@ if _use_aiter:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 if _is_npu:
     import torch_npu
-
     from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 # -------------------------------- TopKConfig ---------------------------------------
@@ -365,7 +364,6 @@ class TopK(CustomOp):
                 router_logits,
                 k=self.topk_config.top_k,
             )
-            topk_weights = topk_weights.to(torch.float32)
 
             if renormalize:
                 topk_weights = l1_norm(
@@ -373,6 +371,7 @@ class TopK(CustomOp):
                     if self.topk_config.num_fused_shared_experts == 0
                     else topk_weights[:, :-1]
                 )
+            topk_weights = topk_weights.to(torch.float32)
 
             if expert_location_dispatch_info is not None:
                 topk_ids = topk_ids_logical_to_physical(
