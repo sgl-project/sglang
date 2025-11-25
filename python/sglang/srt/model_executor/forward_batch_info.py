@@ -38,20 +38,20 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.distributed.parallel_state import (
+    get_moe_expert_parallel_world_size,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
+    set_is_extend_in_batch,
 )
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import (
-    flatten_nested_list,
-    get_compiler_backend,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -60,8 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
 
@@ -82,22 +81,58 @@ class ForwardMode(IntEnum):
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
 
-    # A dummy first batch to start the pipeline for overlap scheduler.
-    # It is now used for triggering the sampling_info_done event for the first prefill batch.
-    DUMMY_FIRST = auto()
+    DRAFT_EXTEND_V2 = auto()
+
+    # Used in disaggregated decode worker
+    # Represent a batch of requests having their KV cache ready to start decoding
+    PREBUILT = auto()
 
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+    def __str__(self):
+        if self == ForwardMode.EXTEND:
+            return "EXTEND"
+        elif self == ForwardMode.DECODE:
+            return "DECODE"
+        elif self == ForwardMode.MIXED:
+            return "MIXED"
+        elif self == ForwardMode.IDLE:
+            return "IDLE"
+        elif self == ForwardMode.TARGET_VERIFY:
+            return "TARGET_VERIFY"
+        elif self == ForwardMode.DRAFT_EXTEND:
+            return "DRAFT_EXTEND"
+        elif self == ForwardMode.DRAFT_EXTEND_V2:
+            return "DRAFT_EXTEND_V2"
+        elif self == ForwardMode.PREBUILT:
+            return "PREBUILT"
+        elif self == ForwardMode.SPLIT_PREFILL:
+            return "SPLIT_PREFILL"
+        return "UNKNOWN"
+
     def is_prefill(self):
         return self.is_extend()
 
-    def is_extend(self):
+    def is_extend(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
+            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.SPLIT_PREFILL
+        )
+
+    def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.MIXED
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
         )
 
     def is_decode(self):
@@ -115,14 +150,22 @@ class ForwardMode(IntEnum):
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
-    def is_draft_extend(self):
-        return self == ForwardMode.DRAFT_EXTEND
+    def is_draft_extend(self, include_v2: bool = False):
+        return self == ForwardMode.DRAFT_EXTEND or (
+            include_v2 and self == ForwardMode.DRAFT_EXTEND_V2
+        )
 
-    def is_extend_or_draft_extend_or_mixed(self):
+    def is_draft_extend_v2(self):
+        # For fixed shape logits output in v2 eagle worker
+        return self == ForwardMode.DRAFT_EXTEND_V2
+
+    def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
+            or self == ForwardMode.SPLIT_PREFILL
+            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
         )
 
     def is_cuda_graph(self):
@@ -132,11 +175,21 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.IDLE
         )
 
-    def is_dummy_first(self):
-        return self == ForwardMode.DUMMY_FIRST
+    def is_cpu_graph(self):
+        return self == ForwardMode.DECODE
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
+
+    def is_extend_without_speculative(self):
+        return (
+            self.is_extend()
+            and not self.is_target_verify()
+            and not self.is_draft_extend()
+        )
+
+    def is_prebuilt(self):
+        return self == ForwardMode.PREBUILT
 
 
 @total_ordering
@@ -183,6 +236,10 @@ class ForwardBatch:
 
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+
+    # The indices of output tokens in the token_to_kv_pool_swa
+    # TODO(shiyang, biao): integrate out_cache_loc_swa into multiple attention backends
+    out_cache_loc_swa: Optional[torch.Tensor] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -241,6 +298,11 @@ class ForwardBatch:
     prefix_chunk_num_tokens: Optional[List[int]] = None
     # KV Indices for each chunk
     prefix_chunk_kv_indices: Optional[List[torch.Tensor]] = None
+    # For MLA chunked prefix cache used in chunked prefill
+    # Tell attention backend whether lse needs to be returned
+    mha_return_lse: Optional[bool] = None
+    mha_one_shot_kv_indices: Optional[torch.Tensor] = None
+    mha_one_shot: Optional[bool] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -286,14 +348,18 @@ class ForwardBatch:
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
 
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
     # Speculative decoding
-    spec_info: Optional[Union[EagleVerifyInput, EagleDraftInput]] = None
+    spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
+    num_token_non_padded_cpu: int = None
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
@@ -302,6 +368,12 @@ class ForwardBatch:
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
+
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+
+    # Record the split metadata of the sequence number of NSA context parallels.
+    nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
     @classmethod
     def init_new(
@@ -332,6 +404,7 @@ class ForwardBatch:
             is_extend_in_batch=batch.is_extend_in_batch,
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
+            is_prefill_only=batch.is_prefill_only,
             lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
@@ -343,6 +416,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            dimensions=batch.dimensions,
         )
         device = model_runner.device
 
@@ -355,36 +429,18 @@ class ForwardBatch:
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True)
+        ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
         if batch.global_num_tokens is not None:
-            from sglang.srt.speculative.eagle_utils import (
-                EagleDraftInput,
-                EagleVerifyInput,
-            )
-
             assert batch.global_num_tokens_for_logprob is not None
+
             # process global_num_tokens and global_num_tokens_for_logprob
             if batch.spec_info is not None:
-                if isinstance(batch.spec_info, EagleDraftInput):
-                    global_num_tokens = [
-                        x * batch.spec_info.num_tokens_per_batch
-                        for x in batch.global_num_tokens
-                    ]
-                    global_num_tokens_for_logprob = [
-                        x * batch.spec_info.num_tokens_for_logprob_per_batch
-                        for x in batch.global_num_tokens_for_logprob
-                    ]
-                else:
-                    assert isinstance(batch.spec_info, EagleVerifyInput)
-                    global_num_tokens = [
-                        x * batch.spec_info.draft_token_num
-                        for x in batch.global_num_tokens
-                    ]
-                    global_num_tokens_for_logprob = [
-                        x * batch.spec_info.draft_token_num
-                        for x in batch.global_num_tokens_for_logprob
-                    ]
+                spec_info: SpecInput = batch.spec_info
+                global_num_tokens, global_num_tokens_for_logprob = (
+                    spec_info.get_spec_adjusted_global_num_tokens(batch)
+                )
             else:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
@@ -414,10 +470,12 @@ class ForwardBatch:
             ret.positions = ret.spec_info.positions
 
         # Init position information
-        if ret.forward_mode.is_decode():
+        if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            assert isinstance(batch.extend_seq_lens, list)
+            assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
@@ -438,7 +496,13 @@ class ForwardBatch:
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.model_is_mrope:
-            ret._compute_mrope_positions(model_runner, batch)
+            if (
+                ret.spec_info is not None
+                and getattr(ret.spec_info, "positions", None) is not None
+            ):
+                ret._compute_spec_mrope_positions(model_runner, batch)
+            else:
+                ret._compute_mrope_positions(model_runner, batch)
 
         # Init lora information
         if model_runner.server_args.enable_lora:
@@ -504,6 +568,71 @@ class ForwardBatch:
             or self.contains_image_inputs()
         )
 
+    def _compute_spec_mrope_positions(
+        self, model_runner: ModelRunner, batch: ModelWorkerBatch
+    ):
+        # TODO support batched deltas
+        batch_size = self.seq_lens.shape[0]
+        device = model_runner.device
+        mm_inputs = batch.multimodal_inputs
+
+        if batch.forward_mode.is_draft_extend():  # draft_extend_after_decode
+            mrope_deltas = []
+            extend_lens = []
+            for batch_idx in range(batch_size):
+                extend_seq_len = batch.extend_seq_lens[batch_idx]
+                extend_lens.append(extend_seq_len)
+                mrope_delta = (
+                    torch.zeros(1, dtype=torch.int64)
+                    if mm_inputs[batch_idx] is None
+                    else mm_inputs[batch_idx].mrope_position_delta.squeeze(0)
+                )
+                mrope_deltas.append(mrope_delta.to(device=device))
+            position_chunks = torch.split(batch.spec_info.positions, extend_lens)
+            mrope_positions_list = [
+                pos_chunk + delta
+                for pos_chunk, delta in zip(position_chunks, mrope_deltas)
+            ]
+            next_input_positions = (
+                torch.cat(mrope_positions_list, dim=0).unsqueeze(0).repeat(3, 1)
+            )
+
+        else:  # target_verify or draft_decode
+            seq_positions = batch.spec_info.positions.view(batch_size, -1)
+            mrope_deltas = [
+                (
+                    torch.tensor([0], dtype=torch.int64)
+                    if mm_inputs[i] is None
+                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+                )
+                for i in range(batch_size)
+            ]
+            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            next_input_positions = (
+                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+            )
+
+        self.mrope_positions = next_input_positions
+
+    def _expand_mrope_from_input(
+        self,
+        mm_input: MultimodalInputs,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if mm_input.mrope_position_delta.device.type != device:
+            # transfer mrope_position_delta to device when the first running,
+            # avoiding successvie host-to-device data transfer
+            mm_input.mrope_position_delta = mm_input.mrope_position_delta.to(
+                device, non_blocking=True
+            )
+
+        mrope_position_deltas = mm_input.mrope_position_delta.flatten()
+        mrope_positions = (
+            (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
+        )
+        return mrope_positions
+
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
@@ -513,24 +642,19 @@ class ForwardBatch:
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
-                mrope_position_deltas = (
-                    [0]
-                    if mm_input is None
-                    else flatten_nested_list(mm_input.mrope_position_delta.tolist())
-                )
-                next_input_positions = []
-                for mrope_position_delta in mrope_position_deltas:
-                    # batched deltas needs to be processed separately
-                    # Convert list of lists to tensor with shape [3, seq_len]
-                    next_input_positions += [
-                        MRotaryEmbedding.get_next_input_positions(
-                            mrope_position_delta,
-                            int(self.seq_lens[batch_idx]) - 1,
-                            int(self.seq_lens[batch_idx]),
-                        )
-                    ]
                 # 3 * N
-                mrope_positions_list[batch_idx] = torch.cat(next_input_positions, dim=1)
+                if mm_input is None:
+                    mrope_positions_list[batch_idx] = torch.full(
+                        (3, 1),
+                        self.seq_lens[batch_idx] - 1,
+                        dtype=torch.int64,
+                        device=model_runner.device,
+                    )
+                else:
+                    mrope_positions = self._expand_mrope_from_input(
+                        mm_input, self.seq_lens[batch_idx], model_runner.device
+                    )
+                    mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
@@ -555,6 +679,10 @@ class ForwardBatch:
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
+                    if mrope_positions.numel() == 0:
+                        mrope_positions = self._expand_mrope_from_input(
+                            mm_input, self.seq_lens[batch_idx], model_runner.device
+                        )
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
@@ -612,9 +740,6 @@ class ForwardBatch:
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
-
-        from sglang.srt.speculative.eagle_utils import EagleDraftInput
-
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -629,7 +754,9 @@ class ForwardBatch:
                 (global_num_tokens[i] - 1) // attn_tp_size + 1
             ) * attn_tp_size
 
-        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(global_num_tokens)
+        dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
+            self.is_extend_in_batch, global_num_tokens
+        )
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
@@ -649,7 +776,10 @@ class ForwardBatch:
             num_tokens = global_num_tokens[0]
 
         self.global_dp_buffer_len = buffer_len
-        set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
+        set_dp_buffer_len(
+            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+        )
+        set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
 
@@ -676,6 +806,13 @@ class ForwardBatch:
                     bs = self.batch_size = num_tokens
 
         # padding
+        self._pad_inputs_to_size(model_runner, num_tokens, bs)
+        self.global_num_tokens_cpu = global_num_tokens
+        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
+        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+
+    def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
+        # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
 
@@ -697,10 +834,6 @@ class ForwardBatch:
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
-        self.global_num_tokens_cpu = global_num_tokens
-        self.global_num_tokens_gpu = self.global_num_tokens_gpu.new_tensor(
-            global_num_tokens
-        )
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
@@ -709,7 +842,8 @@ class ForwardBatch:
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
-        if self.spec_info is not None and isinstance(self.spec_info, EagleDraftInput):
+        if self.spec_info is not None and self.spec_info.is_draft_input():
+            # FIXME(lsyin): remove this isinstance logic
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
@@ -726,6 +860,19 @@ class ForwardBatch:
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
             )
+
+    def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
+        from sglang.srt.layers.communicator import get_attn_tp_context
+
+        attn_tp_context = get_attn_tp_context()
+        input_scattered = attn_tp_context.use_input_scattered(self)
+        if not input_scattered:
+            return
+        assert self.forward_mode.is_extend()
+        tokens = self.input_ids.shape[0]
+        rank_size = get_tensor_model_parallel_world_size()
+        tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
+        self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
@@ -753,6 +900,10 @@ class ForwardBatch:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend():  # draft extend
                 self.spec_info.accept_length = self.spec_info.accept_length[:bs]
+                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                logits_output.hidden_states = logits_output.hidden_states[:bs]
+            elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
+                bs = bs * self.spec_info.num_tokens_per_batch
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
@@ -814,6 +965,10 @@ class ForwardBatch:
             self.token_to_kv_pool, MLATokenToKVPool
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
+        if not any(self.extend_prefix_lens_cpu):
+            self.num_prefix_chunks = 0
+            return
+
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules
             return
@@ -867,6 +1022,34 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+    def fetch_mha_one_shot_kv_indices(self):
+        if self.mha_one_shot_kv_indices is not None:
+            return self.mha_one_shot_kv_indices
+        batch_size = self.batch_size
+        paged_kernel_lens_sum = sum(self.seq_lens_cpu)
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum,
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        kv_indptr = torch.zeros(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        create_flashinfer_kv_indices_triton[(self.batch_size,)](
+            self.req_to_token_pool.req_to_token,
+            self.req_pool_indices,
+            self.seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token_pool.req_to_token.shape[1],
+        )
+        self.mha_one_shot_kv_indices = kv_indices
+        return kv_indices
 
 
 def enable_num_token_non_padded(server_args):

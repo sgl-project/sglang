@@ -1,28 +1,40 @@
-use anyhow::Result;
-use std::ops::Deref;
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
+use anyhow::Result;
+
+pub mod cache;
 pub mod factory;
+pub mod hub;
 pub mod mock;
+pub mod sequence;
 pub mod stop;
 pub mod stream;
 pub mod traits;
 
 // Feature-gated modules
-#[cfg(feature = "huggingface")]
+
+pub mod chat_template;
+
 pub mod huggingface;
+
+pub mod tiktoken;
 
 #[cfg(test)]
 mod tests;
 
 // Re-exports
-pub use factory::{create_tokenizer, create_tokenizer_from_file, TokenizerType};
+pub use cache::{CacheConfig, CacheStats, CachedTokenizer, TokenizerFingerprint};
+pub use factory::{
+    create_tokenizer, create_tokenizer_async, create_tokenizer_async_with_chat_template,
+    create_tokenizer_from_file, create_tokenizer_with_chat_template,
+    create_tokenizer_with_chat_template_blocking, TokenizerType,
+};
+pub use huggingface::HuggingFaceTokenizer;
+pub use sequence::Sequence;
 pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
+pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 pub use traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer as TokenizerTrait};
-
-#[cfg(feature = "huggingface")]
-pub use huggingface::{ChatMessage, HuggingFaceTokenizer};
 
 /// Main tokenizer wrapper that provides a unified interface for different tokenizer implementations
 #[derive(Clone)]
@@ -31,7 +43,18 @@ pub struct Tokenizer(Arc<dyn traits::Tokenizer>);
 impl Tokenizer {
     /// Create a tokenizer from a file path
     pub fn from_file(file_path: &str) -> Result<Tokenizer> {
-        Ok(Tokenizer(factory::create_tokenizer_from_file(file_path)?))
+        Ok(Tokenizer(create_tokenizer_from_file(file_path)?))
+    }
+
+    /// Create a tokenizer from a file path with an optional chat template
+    pub fn from_file_with_chat_template(
+        file_path: &str,
+        chat_template_path: Option<&str>,
+    ) -> Result<Tokenizer> {
+        Ok(Tokenizer(create_tokenizer_with_chat_template(
+            file_path,
+            chat_template_path,
+        )?))
     }
 
     /// Create a tokenizer from an Arc<dyn Tokenizer>

@@ -22,6 +22,13 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -29,17 +36,17 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.layers.utils import is_sm100_supported
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     direct_register_custom_op,
-    get_bool_env_var,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
+    is_sm100_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
-    next_power_of_2,
     round_up,
     set_weight_attrs,
 )
@@ -59,17 +66,26 @@ if is_flashinfer_available():
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 _is_hip = is_hip()
+_is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 if _is_hip:
     # import aiter
-    from aiter import ActivationType, QuantType, dtypes
-    from aiter.fused_moe import fused_moe
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-    from aiter.utility.fp4_utils import e8m0_shuffle
+    try:
+        from aiter import ActivationType, QuantType
+        from aiter.fused_moe import fused_moe
+        from aiter.ops.shuffle import shuffle_weight
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+        from aiter.utility.fp4_utils import e8m0_shuffle
+    except ImportError as err:
+        ActivationType = QuantType = fused_moe = dynamic_mxfp4_quant = e8m0_shuffle = (
+            err
+        )
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -145,27 +161,21 @@ def _quant_dequant_mxfp4_fake(
     return torch.empty_like(x)
 
 
-try:
-    direct_register_custom_op(
-        op_name="dequant_mxfp4",
-        op_func=_dequant_mxfp4,
-        mutates_args=[],
-        fake_impl=_dequant_mxfp4_fake,
-    )
-    dequant_mxfp4 = torch.ops.sglang.dequant_mxfp4
-except AttributeError as error:
-    raise error
+direct_register_custom_op(
+    op_name="dequant_mxfp4",
+    op_func=_dequant_mxfp4,
+    mutates_args=[],
+    fake_impl=_dequant_mxfp4_fake,
+)
+dequant_mxfp4 = torch.ops.sglang.dequant_mxfp4
 
-try:
-    direct_register_custom_op(
-        op_name="quant_dequant_mxfp4",
-        op_func=_quant_dequant_mxfp4,
-        mutates_args=[],
-        fake_impl=_quant_dequant_mxfp4_fake,
-    )
-    quant_dequant_mxfp4 = torch.ops.sglang.quant_dequant_mxfp4
-except AttributeError as error:
-    raise error
+direct_register_custom_op(
+    op_name="quant_dequant_mxfp4",
+    op_func=_quant_dequant_mxfp4,
+    mutates_args=[],
+    fake_impl=_quant_dequant_mxfp4_fake,
+)
+quant_dequant_mxfp4 = torch.ops.sglang.quant_dequant_mxfp4
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -259,29 +269,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
-
-        self.triton_kernel_moe_forward = None
-        self.triton_kernel_moe_with_bias_forward = None
-        if torch.cuda.is_available() and has_triton_kernels:
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_forward as _tk_forward,
-            )
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_with_bias_forward as _tk_with_bias_forward,
-            )
-
-            self.triton_kernel_moe_forward = _tk_forward
-            self.triton_kernel_moe_with_bias_forward = _tk_with_bias_forward
+        self.flashinfer_mxfp4_moe_precision = (
+            get_global_server_args().flashinfer_mxfp4_moe_precision
+        )
 
     def create_weights(
         self,
         layer: torch.nn.Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         with_bias: bool = False,
         **extra_weight_attrs,
@@ -294,19 +294,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
-        intermediate_size_per_partition_after_pad = intermediate_size
+        intermediate_size_per_partition_after_pad = intermediate_size_per_partition
         if _is_sm100_supported:
             if self.use_flashinfer:
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size, 256
+                    intermediate_size_per_partition, 256
                 )
                 hidden_size = round_up(hidden_size, 256)
             else:
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size, 64
+                    intermediate_size_per_partition, 64
                 )
+        elif has_triton_kernels:
+            # TODO: this is a hack to make
+            # intermediate_size_per_partition_after_pad the same as the
+            # per_rank_intermediate_size during weight loading
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, mxfp4_block
+            )
 
-        self.intermediate_size = intermediate_size_per_partition_after_pad
+        self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
 
         self.hidden_size = hidden_size
         # Fused gate_up_proj (column parallel)
@@ -401,31 +408,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             assert (
                 layer.w13_weight.dim() == 3
                 and layer.w13_weight.shape[0] == self.num_experts
-                and layer.w13_weight.shape[1] == self.intermediate_size * 2
+                and layer.w13_weight.shape[1]
+                == self.intermediate_size_per_partition * 2
                 and layer.w13_weight.shape[2] == self.hidden_size // 2
             )
             assert (
                 layer.w13_weight_scale.dim() == 3
                 and layer.w13_weight_scale.shape[0] == self.num_experts
-                and layer.w13_weight_scale.shape[1] == self.intermediate_size * 2
+                and layer.w13_weight_scale.shape[1]
+                == self.intermediate_size_per_partition * 2
                 and layer.w13_weight_scale.shape[2] == self.hidden_size // sf_block_size
             )
             assert (
                 layer.w2_weight.dim() == 3
                 and layer.w2_weight.shape[0] == self.num_experts
                 and layer.w2_weight.shape[1] == self.hidden_size
-                and layer.w2_weight.shape[2] == self.intermediate_size // 2
+                and layer.w2_weight.shape[2]
+                == self.intermediate_size_per_partition // 2
             )
             assert (
                 layer.w2_weight_scale.dim() == 3
                 and layer.w2_weight_scale.shape[1] == self.hidden_size
                 and layer.w2_weight_scale.shape[2]
-                == self.intermediate_size // sf_block_size
+                == self.intermediate_size_per_partition // sf_block_size
             )
             assert (
                 layer.w13_weight_bias.dim() == 2
                 and layer.w13_weight_bias.shape[0] == self.num_experts
-                and layer.w13_weight_bias.shape[1] == self.intermediate_size * 2
+                and layer.w13_weight_bias.shape[1]
+                == self.intermediate_size_per_partition * 2
             )
             assert (
                 layer.w2_weight_bias.dim() == 2
@@ -502,7 +513,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.stack(gemm1_scales_mxfp4_shuffled)
                 .reshape(
                     self.num_experts,
-                    2 * self.intermediate_size,
+                    2 * self.intermediate_size_per_partition,
                     self.hidden_size // sf_block_size,
                 )
                 .view(torch.float8_e4m3fn)
@@ -514,7 +525,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .reshape(
                     self.num_experts,
                     self.hidden_size,
-                    self.intermediate_size // sf_block_size,
+                    self.intermediate_size_per_partition // sf_block_size,
                 )
                 .view(torch.float8_e4m3fn)
             )
@@ -580,52 +591,71 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
-    def _get_tile_tokens_dim(self, x: torch.Tensor, top_k: int):
-        # Number of tokens in the input tensor.
-        num_tokens = x.shape[0]
-        # Factor to account for the imbalance of the experts.
-        # factor equals to the
-        # max_real_num_tokens_per_expert / perfect_num_tokens_per_expert
-        # - 1.0 means perfect expert distribution.
-        # - > 1.0 means some experts have more
-        #     tokens than the perfect distribution.
-        # - < 1.0 does not make sense.
-        imbalance_factor = 1.3
-        # Calculate the number of tokens per expert
-        # assuming perfect distribution.
-        num_tokens_per_expert = (num_tokens * top_k) // self.num_experts
-        # Apply the imbalance factor.
-        num_tokens_per_expert = int(num_tokens_per_expert * imbalance_factor)
-        # And pad the number to the next power of 2.
-        tile_tokens_dim = next_power_of_2(num_tokens_per_expert)
-        # Cap to 8-64 tokens per CTA tile
-        # as it's the range supported by the kernel.
-        tile_tokens_dim = min(max(tile_tokens_dim, 8), 64)
-
-        return tile_tokens_dim
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        backend = (
+            MoeRunnerBackend.TRITON_KERNELS
+            if self.use_triton_kernels
+            else MoeRunnerBackend.TRITON
+        )
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
 
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
         if self.use_flashinfer:
-            # Based on profiling results, we need to quantize x to mxfp8 here to achieve better performance
-            x_quant, x_scale = mxfp8_quantize(
-                x, False, alignment=self.hidden_size
-            )  # to mxfp8
-            x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            # When bf16 mode is enabled, we don't need to quantize the input,
+            # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
+            # which can theoretically improve performance
+            if self.flashinfer_mxfp4_moe_precision == "bf16":
+                assert x.dtype == torch.bfloat16
+                x_quant = x
+                x_scale = None
+
+                # May be fused later if this code branch is frequently needed
+                origin_hidden_states_dim = x_quant.shape[-1]
+                if self.hidden_size != origin_hidden_states_dim:
+                    x_quant = torch.nn.functional.pad(
+                        x_quant,
+                        (0, self.hidden_size - origin_hidden_states_dim),
+                        mode="constant",
+                        value=0.0,
+                    )
+            elif self.flashinfer_mxfp4_moe_precision == "default":
+                x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+            else:
+                raise NotImplementedError()
+
             assert x_quant.shape[-1] == self.hidden_size
             assert TopKOutputChecker.format_is_bypassed(topk_output)
 
             top_k = topk_output.topk_config.top_k
             router_logits = topk_output.router_logits
 
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                num_tokens = x_quant.shape[0]
+                hidden_size = (
+                    x_quant.shape[-1] * 2
+                    if x_quant.dtype == torch.uint8
+                    else x_quant.shape[-1]
+                )
+                symm_output = torch.empty(
+                    num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
+                )
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
@@ -647,52 +677,50 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 top_k,
                 None,  # n_group      # TODO: support n_group
                 None,  # topk_group   # TODO: support topk_group
-                self.intermediate_size,  # padded to multiple of 256
+                self.intermediate_size_per_partition,  # padded to multiple of 256
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
                 None,
-                self._get_tile_tokens_dim(x, top_k),
+                None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
+                output=symm_output,
             )[0]
-            return trtllm_gen_output
+            return StandardCombineInput(hidden_states=trtllm_gen_output)
 
-        if self.use_triton_kernels:
+        backend = self.runner.runner_backend
+        if backend.is_triton_kernels():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
             assert (
                 layer.moe_ep_size == 1
             ), "Expert parallel is not supported when using triton kernels"
-            if self.with_bias:
-                return self.triton_kernel_moe_with_bias_forward(
-                    hidden_states=x,
-                    w1=self.w13_weight_triton_tensor,
-                    w1_pcg=self.w13_precision_config,
-                    w2=self.w2_weight_triton_tensor,
-                    w2_pcg=self.w2_precision_config,
-                    b1=layer.w13_weight_bias,
-                    b2=layer.w2_weight_bias,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
-            else:
-                return self.triton_kernel_moe_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
-        else:
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
-
-            return fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_output=topk_output,
-                moe_runner_config=moe_runner_config,
-                b1=layer.w13_weight_bias,
-                b2=layer.w2_weight_bias,
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=(
+                    self.w13_weight_triton_tensor
+                    if self.w13_weight_triton_tensor is not None
+                    else layer.w13_weight
+                ),
+                w2_weight=(
+                    self.w2_weight_triton_tensor
+                    if self.w2_weight_triton_tensor is not None
+                    else layer.w2_weight
+                ),
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+                w13_precision_config=getattr(self, "w13_precision_config", None),
+                w2_precision_config=getattr(self, "w2_precision_config", None),
             )
+        else:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+            )
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
@@ -771,29 +799,60 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
 
         return w, mx_scales
 
-    def process_weights_after_loading(self, layer: Module) -> None:
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13, w13_mx_scales = self.mxfp4_quantize(layer.w13_weight.data)
         w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
 
+        # Pre-shuffle weight
+        is_shuffled = _is_shuffle_moe_mxfp4
+        if is_shuffled:
+            w13 = shuffle_weight(w13.contiguous(), (16, 16))
+            w2 = shuffle_weight(w2.contiguous(), (16, 16))
+
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w13_weight.is_shuffled = is_shuffled
         layer.w13_weight_scale = torch.nn.Parameter(w13_mx_scales, requires_grad=False)
 
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w2_weight.is_shuffled = is_shuffled
         layer.w2_weight_scale = torch.nn.Parameter(w2_mx_scales, requires_grad=False)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
 
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-        topk_weights, topk_ids, _ = topk_output
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        return fused_moe(
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, _ = topk_output
+        if _is_hip:
+            topk_weights = topk_weights.to(
+                torch.float32
+            )  # aiter's moe_sorting requires topk_weights to be FP32
+
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            w13_weight = layer.w13_weight.view(torch.float4_e2m1fn_x2)
+            w2_weight = layer.w2_weight.view(torch.float4_e2m1fn_x2)
+        else:
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+
+        if hasattr(layer.w13_weight, "is_shuffled"):
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
+
+        output = fused_moe(
             x,
-            layer.w13_weight,
-            layer.w2_weight,
+            w13_weight,
+            w2_weight,
             topk_weights,
             topk_ids,
             quant_type=QuantType.per_1x32,
@@ -801,8 +860,9 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
             activation=(
                 ActivationType.Silu
-                if moe_runner_config.activation == "silu"
+                if self.moe_runner_config.activation == "silu"
                 else ActivationType.Gelu
             ),
             doweight_stage1=False,
         )
+        return StandardCombineInput(hidden_states=output)

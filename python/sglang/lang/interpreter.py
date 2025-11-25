@@ -740,7 +740,7 @@ class StreamExecutor:
             # Execute the stored lazy generation calls
             self.backend.role_end_generate(self)
 
-        from sglang.srt.reasoning_parser import ReasoningParser
+        from sglang.srt.parser.reasoning_parser import ReasoningParser
 
         reasoning_parser = ReasoningParser(expr.model_type)
         other = expr.expr
@@ -792,6 +792,7 @@ class StreamExecutor:
             "n",
             "stop",
             "stop_token_ids",
+            "stop_regex",
             "temperature",
             "top_p",
             "top_k",

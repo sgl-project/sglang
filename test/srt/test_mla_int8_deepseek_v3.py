@@ -22,7 +22,15 @@ class TestMLADeepseekV3ChannelInt8(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
-            other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
+            other_args.extend(
+                [
+                    "--cuda-graph-max-bs",
+                    "16",
+                    "--enable-torch-compile",
+                    "--torch-compile-max-bs",
+                    "2",
+                ]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -50,6 +58,7 @@ class TestMLADeepseekV3ChannelInt8(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.61)
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -60,14 +69,13 @@ class TestDeepseekV3MTPChannelInt8(CustomTestCase):
             other_args.extend(
                 [
                     "--cuda-graph-max-bs",
-                    "2",
-                    "--disable-radix",
+                    "16",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",
-                    "1",
+                    "2",
                     "--speculative-algorithm",
                     "EAGLE",
-                    "--speculative-draft",
+                    "--speculative-draft-model-path",
                     "sgl-project/sglang-ci-dsv3-channel-int8-test-NextN",
                     "--speculative-num-steps",
                     "2",
@@ -121,7 +129,15 @@ class TestMLADeepseekV3BlockInt8(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--trust-remote-code"]
         if torch.cuda.is_available() and torch.version.cuda:
-            other_args.extend(["--enable-torch-compile", "--cuda-graph-max-bs", "2"])
+            other_args.extend(
+                [
+                    "--cuda-graph-max-bs",
+                    "16",
+                    "--enable-torch-compile",
+                    "--torch-compile-max-bs",
+                    "2",
+                ]
+            )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -159,11 +175,10 @@ class TestDeepseekV3MTPBlockInt8(CustomTestCase):
             other_args.extend(
                 [
                     "--cuda-graph-max-bs",
-                    "2",
-                    "--disable-radix",
+                    "16",
                     "--enable-torch-compile",
                     "--torch-compile-max-bs",
-                    "1",
+                    "2",
                     "--speculative-algorithm",
                     "EAGLE",
                     "--speculative-num-steps",

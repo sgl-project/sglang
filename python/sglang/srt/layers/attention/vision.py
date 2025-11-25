@@ -12,15 +12,29 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.utils import is_cuda, print_info_once
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_device_capability,
+    is_blackwell,
+    is_cuda,
+    is_hip,
+    is_npu,
+    print_info_once,
+)
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+_is_hip = is_hip()
 
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
+if _is_npu:
+    import torch_npu
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 from sglang.srt.distributed import (
-    parallel_state,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
@@ -36,7 +50,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 ROTARY_EMBED_CLASSES = {
@@ -327,10 +341,115 @@ class VisionFlash3Attention(nn.Module):
         return output
 
 
+class VisionAiterAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_hip:
+            raise Exception("aiter_attn is only available for AMD")
+        try:
+            from aiter import flash_attn_varlen_func as aiter_flash_attn_varlen_func
+        except ImportError as e:
+            raise ImportError(
+                "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+            ) from e
+
+        self.flash_attn_varlen_func = aiter_flash_attn_varlen_func
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        return self.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+        )
+
+
+class VisionAscendAttention(nn.Module):
+
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_npu:
+            raise Exception("VisionAscendAttention is only available for ascend npu")
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        if seq_lens.is_npu:
+            # cu_seqlens must be on cpu because of operator restriction
+            seq_lens = seq_lens.to("cpu")
+        _, num_heads, head_size = q.shape
+        num_kv_heads = k.shape[1]
+        output = torch.empty_like(q)
+
+        # operator requires pta version >= 2.5.1
+        torch_npu._npu_flash_attention_unpad(
+            query=q,
+            key=k,
+            value=v,
+            seq_len=seq_lens.to(torch.int32),
+            scale_value=head_size**-0.5,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            out=output,
+        )
+
+        return output
+
+
 QKV_BACKEND_IMPL = {
     "triton_attn": VisionTritonAttention,
     "sdpa": VisionSdpaAttention,
     "fa3": VisionFlash3Attention,
+    "ascend_attn": VisionAscendAttention,
+    "aiter_attn": VisionAiterAttention,
 }
 
 
@@ -367,13 +486,12 @@ class VisionAttention(nn.Module):
         customized_position_embedding_applier: Callable[
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
+        use_data_parallel: bool = False,
         **kwargs,
     ):
         super().__init__()
-        attn_tp_rank = get_attention_tp_rank()
-        attn_tp_size = get_attention_tp_size()
-        self.tp_size = attn_tp_size
-        self.tp_rank = attn_tp_rank
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
+        self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.dropout = dropout
         self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
@@ -402,18 +520,14 @@ class VisionAttention(nn.Module):
                 self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
             )
 
-        # priority: server_args > passed qkv_backend > sdpa
-        if global_server_args_dict["mm_attention_backend"] is None:
-            if qkv_backend is None:
-                if is_cuda():
-                    # Double prefill throughput by setting attn backend to Triton on CUDA
-                    qkv_backend = "triton_attn"
-                else:
-                    qkv_backend = "sdpa"
+        # Select attention backend via a unified method
+        _passed_backend = qkv_backend
+        qkv_backend = self._determine_attention_backend(_passed_backend)
+        if (
+            get_global_server_args().mm_attention_backend is None
+            and _passed_backend is None
+        ):
             print_info_once(f"Multimodal attention backend not set. Use {qkv_backend}.")
-        else:
-            qkv_backend = global_server_args_dict["mm_attention_backend"]
-
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
         self.customized_position_embedding_applier = (
@@ -460,6 +574,38 @@ class VisionAttention(nn.Module):
             tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
         )
+
+    def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:
+        """Decide the multimodal attention backend string.
+
+        Priority: server args override > constructor arg > platform default.
+
+        Platform defaults:
+        - CUDA: "triton_attn"
+        - Non-CUDA: "sdpa"
+        """
+        override_backend = get_global_server_args().mm_attention_backend
+        if override_backend is not None:
+            backend = override_backend
+        elif passed_backend is not None:
+            backend = passed_backend
+        elif is_cuda():
+            major, minor = get_device_capability()
+            if major == 9:
+                backend = "fa3"
+            else:
+                backend = "triton_attn"
+        elif _is_hip:
+            if get_device_capability() >= (9, 4) and _use_aiter:
+                backend = "aiter_attn"
+            else:
+                backend = "triton_attn"
+        else:
+            backend = "sdpa"
+        if backend == "fa3" and is_blackwell():
+            raise ValueError("The 'fa3' backend is not supported on Blackwell GPUs")
+
+        return backend
 
     def _apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor):
         """apply qk norm for internvl vit attn"""
