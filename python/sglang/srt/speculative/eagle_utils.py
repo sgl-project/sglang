@@ -338,7 +338,7 @@ class HiddenStateDumper:
         ), "speculative_eagle_hidden_states_dump_path must be set"
 
         if self.server_args.speculative_eagle_dump_accept_rate_threshold < 1.0:
-            acceptance_rate = (req.spec_accepted_tokens + req.spec_verify_ct) / (
+            acceptance_rate = req.spec_accepted_tokens / (
                 req.spec_verify_ct * self.server_args.speculative_num_draft_tokens
             )
             # Skip dump if acceptance rate is higher than threshold
