@@ -207,9 +207,9 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
 The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 
 **Important Notes:**
-- **Mutual Exclusion:** Only one LoRA can be *merged* (active) at a time.
-- **Switching:** To switch LoRAs, you must first `unmerge` the current one, then `set` the new one.
-- **Caching:** The server caches loaded LoRA weights in memory. Switching back to a previously loaded LoRA (same path) is fast.
+- Mutual Exclusion: Only one LoRA can be *merged* (active) at a time
+- Switching: To switch LoRAs, you must first `unmerge` the current one, then `set` the new one
+- Caching: The server caches loaded LoRA weights in memory. Switching back to a previously loaded LoRA (same path) has little cost
 
 #### Set LoRA Adapter
 
@@ -218,8 +218,8 @@ Loads a LoRA adapter and merges its weights into the model.
 **Endpoint:** `POST /v1/set_lora`
 
 **Parameters:**
-- `lora_nickname` (string, required): A unique identifier for this LoRA.
-- `lora_path` (string, optional): Path to the `.safetensors` file or Hugging Face repo ID. Required for the first load; optional if re-activating a cached nickname.
+- `lora_nickname` (string, required): A unique identifier for this LoRA
+- `lora_path` (string, optional): Path to the `.safetensors` file or Hugging Face repo ID. Required for the first load; optional if re-activating a cached nickname
 
 **Curl Example:**
 
@@ -232,18 +232,6 @@ curl -X POST http://localhost:30010/v1/set_lora \
       }'
 ```
 
-#### Unmerge LoRA Weights
-
-Unmerges the currently active LoRA weights from the base model, restoring it to its original state. This **must** be called before setting a different LoRA.
-
-**Endpoint:** `POST /v1/unmerge_lora_weights`
-
-**Curl Example:**
-
-```bash
-curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
-  -H "Content-Type: application/json"
-```
 
 #### Merge LoRA Weights
 
@@ -261,19 +249,33 @@ curl -X POST http://localhost:30010/v1/merge_lora_weights \
   -H "Content-Type: application/json"
 ```
 
-### Example Workflow: Switching LoRAs
 
-1.  **Set LoRA A:**
+#### Unmerge LoRA Weights
+
+Unmerges the currently active LoRA weights from the base model, restoring it to its original state. This **must** be called before setting a different LoRA.
+
+**Endpoint:** `POST /v1/unmerge_lora_weights`
+
+**Curl Example:**
+
+```bash
+curl -X POST http://localhost:30010/v1/unmerge_lora_weights \
+  -H "Content-Type: application/json"
+```
+
+### Example: Switching LoRAs
+
+1.  Set LoRA A:
     ```bash
     curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "style_A", "lora_path": "path/to/A"}'
     ```
-2.  **Generate with LoRA A...**
-3.  **Unmerge LoRA A:**
+2.  Generate with LoRA A...
+3.  Unmerge LoRA A:
     ```bash
     curl -X POST http://localhost:30010/v1/unmerge_lora_weights
     ```
-4.  **Set LoRA B:**
+4.  Set LoRA B:
     ```bash
     curl -X POST http://localhost:30010/v1/set_lora -d '{"lora_nickname": "style_B", "lora_path": "path/to/B"}'
     ```
-5.  **Generate with LoRA B...**
+5.  Generate with LoRA B...
