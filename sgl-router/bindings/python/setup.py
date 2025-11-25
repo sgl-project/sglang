@@ -1,11 +1,13 @@
 import os
+import warnings
 
 from setuptools import setup
 
-no_rust = os.environ.get("SGLANG_ROUTER_BUILD_NO_RUST") == "1"
+with_rust = os.environ.get("SGLANG_ROUTER_BUILD_WITH_RUST", None)
+with_rust = with_rust is None or (not with_rust.lower() in ["0", "false", "no"])
 
 rust_extensions = []
-if not no_rust:
+if with_rust:
     from setuptools_rust import Binding, RustExtension
 
     rust_extensions.append(
@@ -14,6 +16,10 @@ if not no_rust:
             path="Cargo.toml",
             binding=Binding.PyO3,
         )
+    )
+else:
+    warnings.warn(
+        "Building 'sglang-router' without Rust support. Performance may be degraded."
     )
 
 setup(
