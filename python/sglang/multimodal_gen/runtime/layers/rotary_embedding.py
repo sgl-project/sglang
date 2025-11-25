@@ -34,24 +34,7 @@ import torch
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
-from sglang.multimodal_gen.runtime.utils.common import is_npu
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-_is_npu = is_npu()
-if _is_npu:
-
-    def apply_rotary_embedding_native(
-        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
-    ) -> torch.Tensor:
-        cos = cos.unsqueeze(-2).to(x.dtype)
-        sin = sin.unsqueeze(-2).to(x.dtype)
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-        o1 = x1 * cos - x2 * sin
-        o2 = x2 * cos + x1 * sin
-        return torch.stack((o1, o2), dim=-1).flatten(-2)
-
-    apply_rotary_embedding = apply_rotary_embedding_native
 
 logger = init_logger(__name__)
 

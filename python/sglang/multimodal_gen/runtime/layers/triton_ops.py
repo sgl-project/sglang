@@ -8,6 +8,10 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
 
+from sglang.multimodal_gen.runtime.utils.common import is_npu
+
+_is_npu = is_npu()
+
 
 @triton.autotune(
     configs=[
@@ -241,6 +245,20 @@ def fuse_scale_shift_kernel(
     return output
 
 
+if _is_npu:
+    # TODO: remove this when triton ascend bug is fixed
+    def fuse_scale_shift_native(
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        shift: torch.Tensor,
+        block_l: int = 128,
+        block_c: int = 128,
+    ):
+        return x * (1 + scale) + shift
+
+    fuse_scale_shift_kernel = fuse_scale_shift_native
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_HS_HALF": 32}, num_warps=2),
@@ -341,6 +359,22 @@ def apply_rotary_embedding(
     )
 
     return output
+
+
+if _is_npu:
+
+    def apply_rotary_embedding_native(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
+    ) -> torch.Tensor:
+        cos = cos.unsqueeze(-2).to(x.dtype)
+        sin = sin.unsqueeze(-2).to(x.dtype)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    apply_rotary_embedding = apply_rotary_embedding_native
 
 
 # RMSNorm-fp32
