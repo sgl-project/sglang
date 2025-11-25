@@ -99,7 +99,7 @@ class TestServerUpdateWeightsFromDisk(CustomTestCase):
         return response.json()["text"]
 
     def get_model_info(self):
-        response = requests.get(self.base_url + "/get_model_info")
+        response = requests.get(self.base_url + "/model_info")
         model_path = response.json()["model_path"]
         print(json.dumps(response.json()))
         return model_path
@@ -186,7 +186,7 @@ class TestServerUpdateWeightsFromDiskAbortAllRequests(CustomTestCase):
         return response.json()
 
     def get_model_info(self):
-        response = requests.get(self.base_url + "/get_model_info")
+        response = requests.get(self.base_url + "/model_info")
         model_path = response.json()["model_path"]
         print(json.dumps(response.json()))
         return model_path
@@ -318,7 +318,7 @@ class TestUpdateWeightsFromDiskParameterized(CustomTestCase):
             return response.json()["text"]
 
         def get_model_info():
-            response = requests.get(base_url + "/get_model_info")
+            response = requests.get(base_url + "/model_info")
             model_path = response.json()["model_path"]
             print(json.dumps(response.json()))
             return model_path
