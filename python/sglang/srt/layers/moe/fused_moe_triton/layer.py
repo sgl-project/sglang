@@ -160,13 +160,9 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.num_fused_shared_experts = num_fused_shared_experts
 
-        enable_flashinfer_cutlass_moe = get_moe_runner_backend().is_flashinfer_cutlass()
-
-        if enable_flashinfer_cutlass_moe and quant_config is None:
-            logger.warning("Disable flashinfer MoE when quantization config is None.")
-            enable_flashinfer_cutlass_moe = False
-
-        self.enable_flashinfer_cutlass_moe = enable_flashinfer_cutlass_moe
+        self.enable_flashinfer_cutlass_moe = (
+            get_moe_runner_backend().is_flashinfer_cutlass()
+        )
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
@@ -548,9 +544,12 @@ class FusedMoE(torch.nn.Module):
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:
+            require_global_experts = getattr(
+                param, "_sglang_require_global_experts", False
+            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
-                    self.layer_id, expert_id
+                    self.layer_id, expert_id, require_global_experts
                 )
             )
 
@@ -1034,7 +1033,9 @@ class FlashInferFusedMoE(FusedMoE):
         final_hidden_states = self.quant_method.apply_with_router_logits(
             layer=self,
             dispatch_output=StandardDispatchOutput(
-                hidden_states=hidden_states, topk_output=topk_output
+                hidden_states=hidden_states,
+                hidden_states_scale=None,
+                topk_output=topk_output,
             ),
         )
 
