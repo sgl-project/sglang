@@ -435,6 +435,30 @@ class ColumnParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
+    def forward_quant(self, input_: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.quant_method is not None
+        q_input, x_scale = self.quant_method.apply_quant(self, input_)
+        return q_input, x_scale
+
+    def forward_gemm(
+        self, q_input_: torch.Tensor, x_scale_: torch.Tensor, dtype_: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        bias = self.bias if not self.skip_bias_add else None
+
+        # Matrix multiply.
+        assert self.quant_method is not None
+        output_parallel = self.quant_method.apply_gemm(
+            self, q_input_, x_scale_, dtype_, bias
+        )
+
+        if self.gather_output:
+            # All-gather across the partitions.
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
         s += f", output_features={self.output_size_per_partition}"

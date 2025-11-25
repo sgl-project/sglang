@@ -18,6 +18,7 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
+import math
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -33,8 +34,19 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.communicator import (
+    CommunicateContext,
+    CommunicateSimpleFn,
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
+from sglang.srt.layers.dp_attention import _DpGatheredBufferWrapper as dp_buffer_wrapper
+from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -265,6 +277,45 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
+class CustomCommunicateSimpleFn(CommunicateSimpleFn):
+
+    @staticmethod
+    def get_fn(
+        input_mode: ScatterMode,
+        output_mode: ScatterMode,
+        context: CommunicateContext,
+    ):
+        if context.is_same_group_size(input_mode, output_mode):
+            return CommunicateSimpleFn._trivial
+
+        if (input_mode == ScatterMode.SCATTERED) and (
+            output_mode == ScatterMode.TP_ATTN_FULL
+        ):
+            return CommunicateSimpleFn._trivial
+
+        raise NotImplementedError(f"{input_mode=} {output_mode=}")
+
+
+class CustomLayerCommunicator(LayerCommunicator):
+
+    def __init__(self, *args, **kwargs):
+        enable_fp8_quant = kwargs.pop("enable_fp8_quant", False)
+        super().__init__(*args, **kwargs)
+
+        if enable_fp8_quant:
+            self._communicate_simple_fn = CustomCommunicateSimpleFn.get_fn(
+                input_mode=self.layer_scatter_modes.layer_input_mode,
+                output_mode=self.layer_scatter_modes.attn_mode,
+                context=self._context,
+            )
+        else:
+            self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
+                input_mode=self.layer_scatter_modes.layer_input_mode,
+                output_mode=self.layer_scatter_modes.attn_mode,
+                context=self._context,
+            )
+
+
 class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
@@ -282,6 +333,8 @@ class Qwen3MoeAttention(nn.Module):
         prefix: str = "",
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        layer_scatter_modes: Optional[LayerScatterModes] = None,
+        enable_fp8_quant: Optional[bool] = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -358,6 +411,51 @@ class Qwen3MoeAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
 
+        self.enable_fp8_quant = enable_fp8_quant
+        self.block_size = None
+
+        if quant_config is not None and enable_fp8_quant:
+            assert hasattr(quant_config, "weight_block_size")
+            self.block_size = quant_config.weight_block_size[-1]
+
+        assert layer_scatter_modes is not None
+        self.layer_scatter_modes = layer_scatter_modes
+
+    _q_tensor = None
+    _x_scale_tensor = None
+
+    @classmethod
+    def get_local_quant_buffer(cls):
+        local_dp_buffer_len = dp_buffer_wrapper._local_dp_buffer_len
+
+        if cls._q_tensor is None or cls._q_tensor.shape[0] < local_dp_buffer_len:
+            cls._q_tensor = torch.empty(
+                (local_dp_buffer_len, dp_buffer_wrapper._hidden_size),
+                dtype=torch.float8_e4m3fn,
+                device=dp_buffer_wrapper._device,
+            ).contiguous()
+
+        return cls._q_tensor[:local_dp_buffer_len, :].contiguous()
+
+    @classmethod
+    def get_local_scale_buffer(cls, block_size: int):
+        local_dp_buffer_len = dp_buffer_wrapper._local_dp_buffer_len
+
+        if (
+            cls._x_scale_tensor is None
+            or cls._x_scale_tensor.shape[0] < local_dp_buffer_len
+        ):
+            hidden_size = dp_buffer_wrapper._hidden_size
+            last_dim = math.ceil(hidden_size / block_size)
+
+            cls._x_scale_tensor = torch.empty(
+                (local_dp_buffer_len, last_dim),
+                dtype=torch.float32,
+                device=dp_buffer_wrapper._device,
+            ).contiguous()
+
+        return cls._x_scale_tensor[:local_dp_buffer_len, :].contiguous()
+
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -400,7 +498,32 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
+
+        input_mode = self.layer_scatter_modes.layer_input_mode
+        attn_mode = self.layer_scatter_modes.attn_mode
+
+        if (
+            input_mode == ScatterMode.SCATTERED
+            and attn_mode == ScatterMode.TP_ATTN_FULL
+            and self.enable_fp8_quant
+        ):
+            # 1. quant
+            local_q_input, local_x_scale = self.qkv_proj.forward_quant(hidden_states)
+            local_x_scale = local_x_scale.contiguous()
+
+            # 2. allgather
+            gathered_q_input = self.get_local_quant_buffer()
+            attn_tp_all_gather_into_tensor(gathered_q_input, local_q_input)
+            gathered_x_scale = self.get_local_scale_buffer(self.block_size)
+            attn_tp_all_gather_into_tensor(gathered_x_scale, local_x_scale)
+
+            # 3. qkv linear
+            qkv, _ = self.qkv_proj.forward_gemm(
+                gathered_q_input, gathered_x_scale, hidden_states.dtype
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(
@@ -472,6 +595,24 @@ class Qwen3MoeDecoderLayer(nn.Module):
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )
+
+        # Qwen3MoE all layers are sparse and have no nextn now
+        self.is_layer_sparse = True
+        is_previous_layer_sparse = True
+
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=self.is_layer_sparse,
+            is_previous_layer_sparse=is_previous_layer_sparse,
+        )
+
+        enable_fp8_quant = (
+            quant_config is not None
+            and dp_buffer_wrapper._dtype == torch.bfloat16
+            and getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+        )
+
         self.self_attn = Qwen3MoeAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -487,23 +628,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             dual_chunk_attention_config=dual_chunk_attention_config,
             alt_stream=alt_stream,
+            layer_scatter_modes=self.layer_scatter_modes,
+            enable_fp8_quant=enable_fp8_quant,
         )
 
         self.layer_id = layer_id
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-
-        # Qwen3MoE all layers are sparse and have no nextn now
-        self.is_layer_sparse = True
-        is_previous_layer_sparse = True
-
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-        )
 
         if self.is_layer_sparse:
             self.mlp = Qwen3MoeSparseMoeBlock(
@@ -525,12 +657,13 @@ class Qwen3MoeDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.layer_communicator = LayerCommunicator(
+        self.layer_communicator = CustomLayerCommunicator(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(self.layer_id == self.config.num_hidden_layers - 1),
+            enable_fp8_quant=enable_fp8_quant,
         )
 
     def forward(
