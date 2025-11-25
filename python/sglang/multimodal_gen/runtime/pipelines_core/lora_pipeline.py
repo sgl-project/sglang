@@ -142,11 +142,9 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_local_path = maybe_download_lora(lora_path)
         lora_state_dict = load_file(lora_local_path)
 
-        # Clear existing weights for this nickname if they exist (e.g. reloading with new path)
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
 
-        # Map the hf layer names to our custom layer names
         config = self.server_args.pipeline_config.dit_config.arch_config
 
         param_names_mapping_fn = get_param_names_mapping(
@@ -216,10 +214,8 @@ class LoRAPipeline(ComposedPipelineBase):
         adapter_updated = False
         rank = dist.get_rank()
 
-        # Check if we need to load or reload the adapter
         should_load = False
         if lora_path is not None:
-            # If the nickname is not known, or if the path for this nickname has changed
             if lora_nickname not in self.loaded_adapter_paths:
                 should_load = True
             elif self.loaded_adapter_paths[lora_nickname] != lora_path:
