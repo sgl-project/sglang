@@ -235,7 +235,7 @@ class KimiK2Detector(BaseFormatDetector):
             name = tool.function.name
             if not name:
                 continue
-            
+
             begin = f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>"
             end = "<|tool_call_end|><|tool_calls_section_end|>"
             trigger = "<|tool_calls_section_begin|>"

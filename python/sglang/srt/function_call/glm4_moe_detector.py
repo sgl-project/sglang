@@ -594,7 +594,7 @@ class Glm4MoeDetector(BaseFormatDetector):
         return arguments
 
     def supports_structural_tag(self) -> bool:
-        return True
+        return False
 
     def build_structural_tag(
         self,
@@ -602,4 +602,4 @@ class Glm4MoeDetector(BaseFormatDetector):
         at_least_one: bool = False,
         stop_after_first: bool = False,
     ) -> Dict[str, Any]:
-        raise NotImplementedError()        
+        raise NotImplementedError()
