@@ -388,6 +388,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 layer_scatter_modes=self.mlp_layer_scatter_modes[i],
                 input_layernorm=self.input_layernorm[i],
                 post_attention_layernorm=self.post_attention_layernorm[i],
+                qkv_latent_func=self.self_attn[i].prepare_qkv_latent,
             )
             for i in range(2)
         ]
