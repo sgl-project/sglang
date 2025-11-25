@@ -48,10 +48,10 @@ def filter_tests(
     ret = []
     valid_suites = NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
 
-    for t in ci_tests:
-        if t.suite not in valid_suites:
-            print(f"Warning: Unknown suite {t.suite} for backend {hw.name}, nightly={nightly}")
+    if suite not in valid_suites:
+        print(f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}")
 
+    for t in ci_tests:
         if t.disabled is None:
             ret.append(t)
             print(f"Including test {t.filename}")
@@ -156,6 +156,21 @@ def main():
         help="Use auto load balancing. The number of parts.",
     )
     args = parser.parse_args()
+
+    # Validate auto-partition arguments
+    if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):
+        parser.error(
+            "--auto-partition-id and --auto-partition-size must be specified together."
+        )
+    if args.auto_partition_size is not None:
+        if args.auto_partition_size <= 0:
+            parser.error("--auto-partition-size must be positive.")
+        if not 0 <= args.auto_partition_id < args.auto_partition_size:
+            parser.error(
+                f"--auto-partition-id must be in range [0, {args.auto_partition_size}), "
+                f"but got {args.auto_partition_id}"
+            )
+
     exit_code = run_a_suite(args)
     sys.exit(exit_code)
 
