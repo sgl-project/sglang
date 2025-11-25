@@ -38,6 +38,12 @@ class ForwardMetadata:
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
 
+    # prefill prefix cache
+    prefix_lens: Optional[torch.Tensor] = None
+    prefix_len_list: Optional[List[int]] = None
+    prefix_block_tables: Optional[torch.Tensor] = None
+    flatten_block_tables: Optional[torch.Tensor] = None
+
 
 class AscendAttnBackend(AttentionBackend):
 
@@ -50,14 +56,13 @@ class AscendAttnBackend(AttentionBackend):
             mask_value = torch.finfo(torch.float32).min
         else:
             mask_value = 1
-        self.mask = (
+        return (
             torch.masked_fill(
                 torch.zeros(size=(max_seq_len, max_seq_len)), mask_flag, mask_value
             )
             .to(dtype)
             .to(self.device)
         )
-        self.mask_len = max_seq_len
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -81,6 +86,7 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_mla:
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+            self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
             self.q_head_dim = (
                 self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
             )
@@ -91,7 +97,8 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         if not self.use_fia:
-            self.gen_attention_mask(128, model_runner.dtype)
+            self.mask = self.gen_attention_mask(128, model_runner.dtype)
+        self.ringmla_mask = self.gen_attention_mask(512, model_runner.dtype)
         mask_length = 2048
         self.fia_mask = ~torch.tril(
             torch.ones(
@@ -134,6 +141,17 @@ class AscendAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_target_verify():
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
+
+        if forward_batch.forward_mode.is_extend() and sum(forward_batch.extend_prefix_lens_cpu) > 0:
+            self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.int().to("cpu")
+            self.forward_metadata.prefix_len_list = self.forward_metadata.prefix_lens.tolist()
+            seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
+            flatten_tlbs = torch.empty(0, dtype=torch.int32)
+            for req_idx, seq_len in zip (forward_batch.req_pool_indices.tolist(), seq_prefix_lens):
+                indices = forward_batch.req_to_token_pool.req_to_token[req_idx]
+                tlbs = indices[:seq_len][:: self.page_size] // self.page_size
+                flatten_tlbs = torch.cat((flatten_tlbs, torch.flatten(tlbs).to("cpu")))
+            self.forward_metadata.flatten_block_tables = flatten_tlbs.npu()
 
         self.graph_mode = False
 
@@ -442,14 +460,88 @@ class AscendAttnBackend(AttentionBackend):
                         enable_gqa=use_gqa,
                         causal=causal,
                     )
+        elif self.use_mla and sum(forward_batch.extend_prefix_lens_cpu) > 0:
+            q, k, v = [data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]]
+            q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
+            k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
+
+            # 1st, compute extend tokens to get attn_output and attn_lse
+            num_tokens = q_nope.size(0)
+            attn_output = torch.zeros(
+                num_tokens,
+                layer.tp_q_head_num,
+                layer.v_head_dim,
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            attn_lse = torch.zeros(
+                layer.tp_q_head_num,
+                num_tokens,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+            torch_npu.atb.npu_ring_mla(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                k_nope=k_nope,
+                k_rope=k_rope,
+                value=v,
+                mask=self.ringmla_mask,
+                seqlen=self.forward_metadata.extend_seq_lens_cpu_int,
+                head_num=layer.tp_q_head_num,
+                kv_head_num=layer.tp_k_head_num,
+                pre_out=None,
+                prev_lse=None,
+                qk_scale=layer.scaling,
+                kernel_type="kernel_type_high_precision",
+                mask_type='mask_type_triu',
+                calc_type='calc_type_first_ring',
+                output=attn_output,
+                softmax_lse=attn_lse,
+            )
+
+            # 2nd, load history kvcache(kv_a and k_pe), calculate to k and v
+            # TODO support chunked prefill and more models
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            kv_cached = torch.index_select(k_buffer, 0, self.forward_metadata.flatten_block_tables)
+            k_rope_cached = torch.index_select(v_buffer, 0, self.forward_metadata.flatten_block_tables).flatten(0, 1)
+
+            assert layer.kv_b_proj is not None
+            kv = layer.kv_b_proj(kv_cached)[0].view(-1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim)
+            k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
+            k_shape = (k_nope.shape[0], layer.tp_k_head_num, self.qk_nope_head_dim + self.qk_rope_head_dim)
+            k = k_nope.new_empty(*k_shape)
+            k[..., : self.qk_nope_head_dim] = k_nope
+            k[..., self.qk_nope_head_dim :] = k_rope_cached
+
+            # 3rd, compute history attn_out and attn_lse
+            k_nope, k_rope = k.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            seq_len = torch.stack([self.forward_metadata.extend_seq_lens_cpu_int, self.forward_metadata.prefix_lens])
+            torch_npu.atb.npu_ring_mla(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                k_nope=k_nope,
+                k_rope=k_rope,
+                value=v,
+                mask=self.ringmla_mask,
+                seqlen=seq_len,
+                head_num=layer.tp_q_head_num,
+                kv_head_num=layer.tp_k_head_num,
+                pre_out=attn_output,
+                prev_lse=attn_lse,
+                qk_scale=layer.scaling,
+                kernel_type="kernel_type_high_precision",
+                mask_type='no_mask',
+                calc_type='calc_type_default',
+                output=attn_output,
+                softmax_lse=attn_lse
+            )
+            attn_output = attn_output.reshape([-1, layer.tp_q_head_num, layer.v_head_dim])
         else:
             assert (
                 layer.qk_head_dim != layer.v_head_dim
             ), "FIA only supports qk_head_dim != v_head_dim"
-
-            # Wait for the KV transfer to complete before performing attention computation.
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
             num_token_padding = q.shape[0]
             q, k, v = [
