@@ -252,25 +252,8 @@ def copy_trace_files(source_dir, target_base_path):
     return files_to_upload
 
 
-def collect_all_trace_files(traces_dirs, target_base_path):
-    """Collect trace files from multiple directories"""
-    all_files = []
-    for traces_dir in traces_dirs:
-        files = copy_trace_files(traces_dir, target_base_path)
-        if files:
-            print(f"Found {len(files)} files in {traces_dir}")
-        all_files.extend(files)
-    return all_files
-
-
-def publish_traces(traces_dirs, run_id, run_number):
-    """Publish traces to GitHub repository in a single commit
-
-    Args:
-        traces_dirs: A single directory path (str) or list of directory paths
-        run_id: GitHub run ID
-        run_number: GitHub run number
-    """
+def publish_traces(traces_dir, run_id, run_number):
+    """Publish traces to GitHub repository in a single commit"""
     # Get environment variables
     token = os.getenv("GITHUB_TOKEN")
     if not token:
@@ -283,12 +266,8 @@ def publish_traces(traces_dirs, run_id, run_number):
     branch = "main"
     target_base_path = f"traces/{run_id}"
 
-    # Normalize to list
-    if isinstance(traces_dirs, str):
-        traces_dirs = [traces_dirs]
-
-    # Copy trace files from all directories
-    files_to_upload = collect_all_trace_files(traces_dirs, target_base_path)
+    # Copy trace files
+    files_to_upload = copy_trace_files(traces_dir, target_base_path)
 
     if not files_to_upload:
         print("No trace files found to upload")
@@ -323,7 +302,7 @@ def publish_traces(traces_dirs, run_id, run_number):
             print(f"Created new tree: {new_tree_sha}")
 
             # Create commit
-            commit_message = f"Nightly traces for run {run_id} at {run_number} ({len(files_to_upload)} files from {len(traces_dirs)} dirs)"
+            commit_message = f"Nightly traces for run {run_id} at {run_number} ({len(files_to_upload)} files)"
             commit_sha = create_commit(
                 repo_owner,
                 repo_name,
@@ -376,10 +355,8 @@ def main():
     parser.add_argument(
         "--traces-dir",
         type=str,
-        action="append",
         required=True,
-        dest="traces_dirs",
-        help="Traces directory to publish (can be specified multiple times)",
+        help="Traces directory to publish",
     )
     args = parser.parse_args()
 
@@ -393,13 +370,12 @@ def main():
         )
         sys.exit(1)
 
-    # Use traces directories
-    print(f"Processing traces from {len(args.traces_dirs)} directories:")
-    for d in args.traces_dirs:
-        print(f"  - {d}")
+    # Use traces directory
+    traces_dir = args.traces_dir
+    print(f"Processing traces from directory: {traces_dir}")
 
     # Publish traces
-    publish_traces(args.traces_dirs, run_id, run_number)
+    publish_traces(traces_dir, run_id, run_number)
 
 
 if __name__ == "__main__":
