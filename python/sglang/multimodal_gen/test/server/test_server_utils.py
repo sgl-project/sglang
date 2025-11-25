@@ -83,15 +83,10 @@ class ServerContext:
     perf_log_path: Path
     log_dir: Path
     _stdout_fh: Any = field(repr=False)
-    _log_stream_stop: threading.Event | None = field(default=None, repr=False)
-    _log_stream_thread: threading.Thread | None = field(default=None, repr=False)
+    _log_thread: threading.Thread | None = field(default=None, repr=False)
 
     def cleanup(self) -> None:
         """Clean up server resources."""
-        if self._log_stream_stop:
-            self._log_stream_stop.set()
-        if self._log_stream_thread:
-            self._log_stream_thread.join(timeout=1.0)
         try:
             kill_process_tree(self.process.pid)
         except Exception:
@@ -101,25 +96,6 @@ class ServerContext:
             self._stdout_fh.close()
         except Exception:
             pass
-
-    def start_log_streaming(self) -> None:
-        if self._log_stream_thread is not None:
-            return
-
-        self._log_stream_stop = threading.Event()
-
-        def _streamer():
-            with open(self.stdout_file, "r") as f:
-                f.seek(0, 2)
-                while not self._log_stream_stop.is_set():
-                    line = f.readline()
-                    if line:
-                        pass
-                    else:
-                        time.sleep(0.1)
-
-        self._log_stream_thread = threading.Thread(target=_streamer, daemon=True)
-        self._log_stream_thread.start()
 
 
 class ServerManager:
@@ -217,6 +193,7 @@ class ServerManager:
             perf_log_path=perf_log_path,
             log_dir=log_dir,
             _stdout_fh=stdout_fh,
+            _log_thread=log_thread,
         )
 
     def _wait_for_ready(self, process: subprocess.Popen, stdout_path: Path) -> None:
