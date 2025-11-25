@@ -261,7 +261,7 @@ class DiffGenerator:
         data_type = (
             DataType.IMAGE
             if self.server_args.pipeline_config.task_type.is_image_gen()
-            or pretrained_sampling_params.num_frames == 1
+               or pretrained_sampling_params.num_frames == 1
             else DataType.VIDEO
         )
         pretrained_sampling_params.data_type = data_type
@@ -367,31 +367,28 @@ class DiffGenerator:
         """
         return sync_scheduler_client.forward(batch)
 
-
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    MergeLoraWeightsReq,
-    SetLoraReq,
-    UnmergeLoraWeightsReq,
-)
-
-
-class DiffGenerator:
-    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
-        """
-        Set the LoRA adapter.
-        """
-        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
-        # We use the sync client's forward method which sends any object via send_pyobj
+    # LoRA
+    def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
+        """Helper to send a LoRA-related request and handle the response."""
         response = sync_scheduler_client.forward(req)
         if isinstance(response, dict) and response.get("status") == "ok":
-            logger.info(f"Successfully set LoRA adapter: {lora_nickname}")
+            logger.info(success_msg)
         else:
             error_msg = (
                 response.get("message", "Unknown error")
                 if isinstance(response, dict)
                 else "Unknown response format"
             )
-            raise RuntimeError(f"Failed to set LoRA adapter: {error_msg}")
+            raise RuntimeError(f"{failure_msg}: {error_msg}")
+
+    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
+        """Set the LoRA adapter."""
+        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
+        self._send_lora_request(
+            req,
+            f"Successfully set LoRA adapter: {lora_nickname}",
+            "Failed to set LoRA adapter",
+        )
 
     def unmerge_lora_weights(self) -> None:
         """
@@ -399,33 +396,19 @@ class DiffGenerator:
         validation outputs generated during training.
         """
         req = UnmergeLoraWeightsReq()
-        response = sync_scheduler_client.forward(req)
-        if isinstance(response, dict) and response.get("status") == "ok":
-            logger.info("Successfully unmerged LoRA weights")
-        else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
-            raise RuntimeError(f"Failed to unmerge LoRA weights: {error_msg}")
+        self._send_lora_request(
+            req,
+            "Successfully unmerged LoRA weights",
+            "Failed to unmerge LoRA weights",
+        )
         self._is_lora_merged = False
 
     def merge_lora_weights(self) -> None:
-        """
-        Merge LoRA weights.
-        """
+        """Merge LoRA weights."""
         req = MergeLoraWeightsReq()
-        response = sync_scheduler_client.forward(req)
-        if isinstance(response, dict) and response.get("status") == "ok":
-            logger.info("Successfully merged LoRA weights")
-        else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
-            raise RuntimeError(f"Failed to merge LoRA weights: {error_msg}")
+        self._send_lora_request(
+            req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
+        )
         self._is_lora_merged = True
 
     def _ensure_lora_state(

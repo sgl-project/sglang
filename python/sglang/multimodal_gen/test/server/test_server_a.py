@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-
 import pytest
 import requests
 from openai import OpenAI
@@ -30,19 +29,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 logger = init_logger(__name__)
 
 
-def download_lora_weights(url: str, file_name: str) -> str:
-    target_dir: str = "~/.cache"
-    cache_dir = os.path.expanduser(target_dir)
-    os.makedirs(cache_dir, exist_ok=True)
-
-    file_path = os.path.join(cache_dir, file_name)
-    if not os.path.exists(file_path):
-        print(f"Downloading {file_name}...")
-        subprocess.run(["wget", "-O", file_path, url], check=True)
-
-    return os.path.abspath(file_path)
-
-
 class TestDiffusionServerOneGpu(DiffusionServerBase):
     """Performance tests for 1-GPU diffusion cases."""
 
@@ -53,6 +39,8 @@ class TestDiffusionServerOneGpu(DiffusionServerBase):
 
 
 class TestLoraWorkflow:
+    """Functional tests for LoRA workflow on 2 GPUs."""
+
     @pytest.fixture
     def case(self) -> DiffusionTestCase:
         """Define the base model configuration for the LoRA test."""
@@ -96,15 +84,28 @@ class TestLoraWorkflow:
         try:
             print("\n=== Step 1: Download LoRA ===")
 
-            lora_a_path = download_lora_weights(
-                "https://civitai.com/api/download/models/2144921?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b",
-                "Qwen-Image-Lora-EliGen.safetensors",
-            )
+            cache_dir = os.path.expanduser("~/.cache")
+            os.makedirs(cache_dir, exist_ok=True)
 
-            lora_b_path = download_lora_weights(
-                "https://civitai.com/api/download/models/2123706?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b",
-                "Qwen-Image-Lora-Rem-and-Ram-Re:Zero.safetensors",
-            )
+            # wget -O "Qwen-Image-Lora-EliGen.safetensors" "https://civitai.com/api/download/models/2144921?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"
+            lora_a_name = "Qwen-Image-Lora-EliGen.safetensors"
+            lora_a_path = os.path.join(cache_dir, lora_a_name)
+            if not os.path.exists(lora_a_path):
+                print(f"Downloading {lora_a_name}...")
+                subprocess.run(
+                    ["wget", "-O", lora_a_path, "https://civitai.com/api/download/models/2144921?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"],
+                    check=True
+                )
+
+            # wget -O "Qwen-Image-Lora-Rem-and-Ram-Re:Zero.safetensors" "https://civitai.com/api/download/models/2123706?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"
+            lora_b_name = "Qwen-Image-Lora-Rem-and-Ram-Re:Zero.safetensors"
+            lora_b_path = os.path.join(cache_dir, lora_b_name)
+            if not os.path.exists(lora_b_path):
+                print(f"Downloading {lora_b_name}...")
+                subprocess.run(
+                    ["wget", "-O", lora_b_path, "https://civitai.com/api/download/models/2123706?type=Model&format=SafeTensor&token=df1327bc997d334ccb65eee66020f43b"],
+                    check=True
+                )
 
             try:
                 print("\n=== Step 2: Set LoRA A ===")

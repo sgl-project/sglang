@@ -68,6 +68,29 @@ class Scheduler:
         self.gpu_id = gpu_id
         self._running = True
 
+        self.request_handlers = {
+            SetLoraReq: self._handle_set_lora,
+            MergeLoraWeightsReq: self._handle_merge_lora,
+            UnmergeLoraWeightsReq: self._handle_unmerge_lora,
+            Req: self._handle_generation,
+        }
+
+    def _handle_set_lora(self, reqs: List[Any]):
+        req = reqs[0]
+        self.worker.set_lora(req.lora_nickname, req.lora_path)
+        return {"status": "ok"}
+
+    def _handle_merge_lora(self, reqs: List[Any]):
+        self.worker.merge_lora_weights()
+        return {"status": "ok"}
+
+    def _handle_unmerge_lora(self, reqs: List[Any]):
+        self.worker.unmerge_lora_weights()
+        return {"status": "ok"}
+
+    def _handle_generation(self, reqs: List[Req]):
+        return self.worker.execute_forward(reqs)
+
     def return_result(self, output_batch: OutputBatch):
         """
         replies to client, only on rank 0
@@ -150,37 +173,15 @@ class Scheduler:
                 # reqs is guaranteed to be a list by recv_reqs
                 first_req = reqs[0] if reqs else None
 
-                if isinstance(first_req, SetLoraReq):
-                    self.worker.set_lora(first_req.lora_nickname, first_req.lora_path)
-                    output_batch = {"status": "ok"}
-                elif isinstance(first_req, MergeLoraWeightsReq):
-                    self.worker.merge_lora_weights()
-                    output_batch = {"status": "ok"}
-                elif isinstance(first_req, UnmergeLoraWeightsReq):
-                    self.worker.unmerge_lora_weights()
-                    output_batch = {"status": "ok"}
-                elif isinstance(first_req, dict) and "method" in first_req:
-                    # Fallback for legacy dict-based requests (e.g. from DiffGenerator)
-                    method = first_req.get("method")
-                    if method == "set_lora":
-                        self.worker.set_lora(
-                            first_req["lora_nickname"], first_req["lora_path"]
-                        )
-                        output_batch = {"status": "ok"}
-                    elif method == "merge_lora_weights":
-                        self.worker.merge_lora_weights()
-                        output_batch = {"status": "ok"}
-                    elif method == "unmerge_lora_weights":
-                        self.worker.unmerge_lora_weights()
-                        output_batch = {"status": "ok"}
-                    else:
-                        output_batch = {
-                            "status": "error",
-                            "message": f"Unknown method: {method}",
-                        }
+                handler = self.request_handlers.get(type(first_req))
+                if handler:
+                    output_batch = handler(reqs)
                 else:
-                    # Assume standard generation request (list of Reqs)
-                    output_batch = self.worker.execute_forward(reqs)
+                    # Unknown request type
+                    output_batch = {
+                        "status": "error",
+                        "message": f"Unknown request type: {type(first_req)}",
+                    }
             except Exception as e:
                 logger.error(
                     f"Error executing request in scheduler event loop: {e}",
