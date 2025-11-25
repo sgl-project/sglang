@@ -116,6 +116,16 @@ python3 run_suite.py --suite per-commit-1-gpu
        unittest.main()
    ```
 
+## CI Registry Quick Peek
+
+Tests in `test/registered/` declare CI metadata via lightweight markers:
+
+```python
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=80, suite="stage-a-test-1")
+```
+
 ## Writing Elegant Test Cases
 
 - Use smaller models and reuse servers to reduce test time
