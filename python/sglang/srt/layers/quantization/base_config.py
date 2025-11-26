@@ -11,6 +11,7 @@ from torch import nn
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.models.utils import WeightsMapper
 
 
 class QuantizeMethodBase(ABC):
@@ -228,6 +229,15 @@ class QuantizationConfig(ABC):
         For now, this is only used by AWQ.
         """
         raise NotImplementedError()
+
+    def apply_sglang_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):  # noqa: B027
+        """
+        Interface for models to update module names referenced in
+        quantization configs in order to reflect the sglang model structure
+        :param hf_to_sglang_mapper: maps from hf model structure (the assumed
+            structure of the qconfig) to sglang model structure
+        """
+        pass
 
 
 def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:
