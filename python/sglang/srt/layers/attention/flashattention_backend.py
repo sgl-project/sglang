@@ -676,9 +676,17 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
+                        layer.layer_id
+                    ]
+                    if is_swa:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, forward_batch.swa_out_cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
