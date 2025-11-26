@@ -8,7 +8,7 @@ import torch
 from torch.nn import Parameter
 
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import is_cpu, is_xpu
 
 __all__ = [
     "BasevLLMParameter",
@@ -25,6 +25,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 
 
 class BasevLLMParameter(Parameter):
@@ -103,7 +104,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 narrow_padded_param_and_loaded_weight,
             )
 
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,
@@ -145,7 +146,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
             narrow_padded_param_and_loaded_weight,
         )
 
-        if _is_cpu:
+        if _is_cpu or _is_xpu:
             param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 param_data,
                 loaded_weight,
@@ -197,7 +198,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         shard_id = tp_rank if shard_id == "q" else tp_rank // num_heads
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
 
-        if _is_cpu:
+        if _is_cpu or _is_xpu:
             from sglang.srt.model_loader.weight_utils import (
                 narrow_padded_param_and_loaded_weight,
             )
@@ -252,7 +253,7 @@ class RowvLLMParameter(BasevLLMParameter):
                 narrow_padded_param_and_loaded_weight,
             )
 
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                     self.data,
                     loaded_weight,

@@ -77,7 +77,7 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     return model_config
 
 
-def adjust_config_with_unaligned_cpu_tp(
+def adjust_config_with_unaligned_cpu_xpu_tp(
     model_config: ModelConfig, load_config: LoadConfig, tp_size: int
 ) -> ModelConfig:
     # Support the case where the num_attention_heads is not divisible by the TP size.

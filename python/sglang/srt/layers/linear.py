@@ -33,7 +33,14 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+    is_xpu,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import (
@@ -69,6 +76,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
 ]
 
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _is_npu = is_npu()
 
 
@@ -375,7 +383,7 @@ class ColumnParallelLinear(LinearBase):
             shard_size = param_data.shape[output_dim]
             start_idx = self.tp_rank * shard_size
 
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,
                 )
@@ -558,7 +566,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             packed_dim = getattr(param, "packed_dim", None)
 
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 shard_offsets = adjust_shard_offsets(
                     shard_offsets, loaded_weight, output_dim
                 )
@@ -616,7 +624,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             start_idx = self.tp_rank * shard_size
 
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,
                 )
@@ -1045,7 +1053,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             use_bitsandbytes_4bit = getattr(param, "use_bitsandbytes_4bit", False)
 
             packed_dim = getattr(param, "packed_dim", None)
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 shard_offsets = adjust_shard_offsets(
                     shard_offsets, loaded_weight, output_dim
                 )
@@ -1147,7 +1155,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id = self.tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
 
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,
                 )
@@ -1306,7 +1314,7 @@ class RowParallelLinear(LinearBase):
             shard_size = param_data.shape[input_dim]
             start_idx = self.tp_rank * shard_size
 
-            if _is_cpu:
+            if _is_cpu or _is_xpu:
                 from sglang.srt.model_loader.weight_utils import (
                     narrow_padded_param_and_loaded_weight,
                 )

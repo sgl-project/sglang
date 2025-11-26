@@ -54,6 +54,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_flashinfer_available,
     is_hip,
+    is_xpu,
     round_up,
 )
 
@@ -71,6 +72,7 @@ if get_moe_runner_backend().is_flashinfer_trtllm():
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 logger = logging.getLogger(__name__)
@@ -363,7 +365,7 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
-        if _is_cpu:
+        if _is_cpu or _is_xpu:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -432,7 +434,7 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        if _is_cpu:
+        if _is_cpu or _is_xpu:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
