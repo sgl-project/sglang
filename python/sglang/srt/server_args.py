@@ -586,6 +586,13 @@ class ServerArgs:
     # For forward hooks
     hooks: Optional[List[dict[str, Any]]] = None
 
+    # Sparse attention
+    is_sparse_attn: bool = False
+    sparse_attn_algo: str = "lserver"
+    sparse_token_budget: int = 4096
+    sparse_moving_average_factor: float = 0.4
+    sparse_skip_first_n_layers: int = 0
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3829,6 +3836,35 @@ class ServerArgs:
             type=json_list_type,
             default=None,
             help="The hooks to be attached.",
+        )
+        parser.add_argument(
+            "--is-sparse-attn",
+            action="store_true",
+            help="Whether to use sparse attention.",
+        )
+        parser.add_argument(
+            "--sparse-attn-algo",
+            type=str,
+            default=ServerArgs.sparse_attn_algo,
+            help="The algorithm to use for sparse attention.",
+        )
+        parser.add_argument(
+            "--sparse-token-budget",
+            type=int,
+            default=ServerArgs.sparse_token_budget,
+            help="The token budget for sparse attention.",
+        )
+        parser.add_argument(
+            "--sparse-moving-average-factor",
+            type=float,
+            default=ServerArgs.sparse_moving_average_factor,
+            help="The moving average factor for sparse attention.",
+        )
+        parser.add_argument(
+            "--sparse-skip-first-n-layers",
+            type=int,
+            default=ServerArgs.sparse_skip_first_n_layers,
+            help="The number of layers to skip at the beginning of the model for sparse attention.",
         )
 
     @classmethod

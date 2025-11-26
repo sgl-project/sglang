@@ -533,6 +533,8 @@ class ModelRunner:
             self.graph_runner = None
             self.graph_mem_usage = 0
             self.init_attention_backend()
+        if hasattr(self.attn_backend, "sparse_cache_updater"):
+            self.attn_backend.sparse_cache_updater.cache_manager.start_retrive_loop()
 
         if server_args.hooks:
             register_hooks(self.model, server_args.hooks)
