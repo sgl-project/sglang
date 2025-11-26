@@ -44,9 +44,7 @@ DEFAULT_SERVER_ARGS = (
     ]
 )
 
-base_model = (
-    "/root/.cache/modelscope/hub/models/AI-ModelScope/Llama-3.1-8B-Instruct"
-)
+base_model = "/root/.cache/modelscope/hub/models/AI-ModelScope/Llama-3.1-8B-Instruct"
 
 
 @unittest.skipIf(
