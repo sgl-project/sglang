@@ -80,18 +80,18 @@ class RequestTimingMetricsMixin:
     #   - Prefill instance (P): timestamp when prefill forward pass begins
     #   - Decode instance (D): timestamp when decode forward pass begins
     # Note: This is NOT the same as prefill_start_time. There may be a delay between
-    # forward_entry_time and prefill_start_time (see prefill_delay).
+    # forward_entry_time and prefill_start_time (see prefill_launch_delay).
     forward_entry_time: Optional[List[Optional[float]]]
 
-    # Prefill delay: time spent waiting between forward entry and prefill start.
+    # Prefill launch delay: time spent waiting between forward entry and prefill start.
     # Calculated as: prefill_start_time - forward_entry_time
     # This represents the delay between when the request enters the forward stage
     # and when prefill computation actually begins.
-    prefill_delay: Optional[List[Optional[float]]]
+    prefill_launch_delay: Optional[List[Optional[float]]]
 
-    # Prefill latency: time spent during prefill computation.
-    # Calculated as: prefill_end_time - prefill_start_time
-    prefill_latency: Optional[List[Optional[float]]]
+    # Prefill launch latency: time spent during prefill kernel launch.
+    # Calculated as: prefill_end_time_host - prefill_start_time_host
+    prefill_launch_latency: Optional[List[Optional[float]]]
 
 
 @dataclass
@@ -1321,17 +1321,24 @@ class SetInternalStateReqOutput(BaseReq):
 class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None
+    # Specify the steps to start the profiling
+    start_step: Optional[int] = None
     # If set, it profile as many as this number of steps.
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
-    start_step: Optional[int] = None
     num_steps: Optional[int] = None
+    # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
     activities: Optional[List[str]] = None
+    # Whether profile by stages (e.g., prefill and decode) separately
     profile_by_stage: bool = False
+    # Whether to record source information (file and line number) for the ops.
     with_stack: Optional[bool] = None
+    # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    # The prefix of the profile filenames
+    profile_prefix: Optional[str] = None
 
 
 class ProfileReqType(Enum):
@@ -1350,8 +1357,8 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
-    # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    profile_prefix: Optional[str] = None
 
 
 @dataclass

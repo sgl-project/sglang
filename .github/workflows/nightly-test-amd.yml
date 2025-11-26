@@ -39,3 +39,21 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_exec.sh -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" python3 run_suite.py --suite nightly-amd --timeout-per-file 7200
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY
+
+  check-all-jobs:
+    if: always() && (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+    needs:
+      - nightly-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if any job failed
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+            echo "One or more nightly test jobs failed"
+            exit 1
+          fi
+          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "One or more nightly test jobs were cancelled"
+            exit 1
+          fi
+          echo "All nightly test jobs passed"

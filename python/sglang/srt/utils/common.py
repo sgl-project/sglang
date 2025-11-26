@@ -56,6 +56,7 @@ from json import JSONDecodeError
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -69,6 +70,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from urllib.parse import urlparse
 
 import numpy as np
 import orjson
@@ -93,10 +95,23 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
 logger = logging.getLogger(__name__)
 
 show_time_cost = False
 time_infos = {}
+
+
+def get_or_create_event_loop():
+    """Gets the running event loop or creates a new one if it doesn't exist."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
 
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
@@ -266,7 +281,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+    return backend not in ["torch_native", "intel_amx"]
 
 
 try:
@@ -618,38 +633,53 @@ def get_cmo_stream():
     AIV or communication kernels, aiming to overlap the memory access time.
     """
     global cmo_stream
-    if cmo_stream is None:
-        cmo_stream = torch.get_device_module().Stream()
     return cmo_stream
 
 
-def prepare_weight_cache(handle, cache):
+def set_cmo_stream(stream):
+    global cmo_stream
+    cmo_stream = stream
+
+
+def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
+    """
+    PREFETCH_MAX_SIZE: maximum size (bytes) for each prefetch operation.
+    This affects the time spent in prefetch:
+        time ≈ PREFETCH_MAX_SIZE / system_bandwidth
+    """
     import torch_npu
 
-    NPU_PREFETCH_MAX_SIZE_BYTES = (
-        1000000000  # 1GB, a large value to prefetch entire weight
-    )
     stream = get_cmo_stream()
-    stream.wait_stream(torch.npu.current_stream())
-    with torch.npu.stream(stream):
+    if stream is None:
+        stream = torch.get_device_module().Stream()
+        set_cmo_stream(stream)
+    stream.wait_stream(torch.get_device_module().current_stream())
+    with torch.get_device_module().stream(stream):
         if isinstance(cache, list):
             for weight in cache:
                 torch_npu.npu_prefetch(
                     weight,
                     handle,
-                    NPU_PREFETCH_MAX_SIZE_BYTES,
+                    PREFETCH_MAX_SIZE,
                 )
         else:
             torch_npu.npu_prefetch(
                 cache,
                 handle,
-                NPU_PREFETCH_MAX_SIZE_BYTES,
+                PREFETCH_MAX_SIZE,
             )
 
 
 def wait_cmo_stream():
-    cur_stream = torch.get_device_module().current_stream()
-    cur_stream.wait_stream(get_cmo_stream())
+    stream = get_cmo_stream()
+    if stream is not None:
+        cur_stream = torch.get_device_module().current_stream()
+        cur_stream.wait_stream(stream)
+
+
+@lru_cache(maxsize=1)
+def get_device_module():
+    return torch.get_device_module()
 
 
 def set_random_seed(seed: int) -> None:
@@ -945,7 +975,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
-            elif os.path.isfile(video_file):
+            # `urlparse` supports file:// paths, and so does VideoReader
+            elif os.path.isfile(urlparse(video_file).path):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
@@ -1355,6 +1386,29 @@ def get_zmq_socket(
             socket.connect(endpoint)
 
         return socket
+
+
+def get_zmq_socket_on_host(
+    context: zmq.Context,
+    socket_type: zmq.SocketType,
+    host: Optional[str] = None,
+) -> Tuple[int, zmq.Socket]:
+    """Create and configure a ZeroMQ socket.
+
+    Args:
+        context: ZeroMQ context to create the socket from.
+        socket_type: Type of ZeroMQ socket to create.
+        host: Optional host to bind/connect to, without "tcp://" prefix. If None, binds to "tcp://*".
+
+    Returns:
+        Tuple of (port, socket) where port is the randomly assigned TCP port.
+    """
+    socket = context.socket(socket_type)
+    # Bind to random TCP port
+    config_socket(socket, socket_type)
+    bind_host = f"tcp://{host}" if host else "tcp://*"
+    port = socket.bind_to_random_port(bind_host)
+    return port, socket
 
 
 def config_socket(socket, socket_type: zmq.SocketType):
@@ -2684,7 +2738,10 @@ class BumpAllocator:
 def log_info_on_rank0(logger, msg):
     from sglang.srt.distributed import get_tensor_model_parallel_rank
 
-    if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+    try:
+        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+            logger.info(msg)
+    except:
         logger.info(msg)
 
 
@@ -2721,7 +2778,7 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather(server_args):
+def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
@@ -2744,7 +2801,7 @@ def require_mlp_tp_gather(server_args):
         return False
 
 
-def require_attn_tp_gather(server_args):
+def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
@@ -2758,11 +2815,11 @@ def require_attn_tp_gather(server_args):
         return False
 
 
-def require_gathered_buffer(server_args):
+def require_gathered_buffer(server_args: ServerArgs):
     return require_mlp_tp_gather(server_args) or require_attn_tp_gather(server_args)
 
 
-def require_mlp_sync(server_args):
+def require_mlp_sync(server_args: ServerArgs):
     return server_args.enable_dp_attention or require_gathered_buffer(server_args)
 
 
@@ -3600,6 +3657,46 @@ def cached_triton_kernel(key_fn=None):
     return decorator
 
 
+def reserve_rope_cache_for_long_sequences(
+    model, server_args, model_config, logger=None
+):
+    """Pre-expand RoPE cache for long sequences and speculative decoding."""
+    from sglang.srt.environ import envs
+
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
+
+    # 1) Estimate base context upper bound
+    base_ctx = (
+        getattr(server_args, "context_length", None)
+        or getattr(model_config, "context_len", None)
+        or getattr(model_config, "max_model_len", None)
+        or getattr(model_config.hf_text_config, "max_position_embeddings", None)
+        or 2048
+    )
+
+    # 2) Speculative decoding expansion
+    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
+    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+
+    # 3) Align to reduce reallocation frequency
+    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+    # Recursively expand all RoPE layers
+    def reserve_rope_cache_recursive(module):
+        for child in module.children():
+            if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
+                child, "cos_sin_cache"
+            ):
+                child._ensure_cos_sin_cache_length(reserve - 1)
+            else:
+                reserve_rope_cache_recursive(child)
+
+    reserve_rope_cache_recursive(model)
+
+
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
 def calc_diff(x, y):
     x, y = x.double(), y.double()
@@ -3616,3 +3713,13 @@ def get_current_device_stream_fast():
     if cached_device_index == -1:
         cached_device_index = torch.get_device_module().current_device()
     return torch.get_device_module().current_stream(cached_device_index)
+
+
+def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
+    if strict:
+        raise ValueError(message)
+    else:
+        count = getattr(obj, counter_name, 0)
+        if count % log_interval == 0:
+            logger.warning(message)
+        setattr(obj, counter_name, count + 1)
