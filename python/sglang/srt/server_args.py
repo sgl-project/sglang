@@ -1189,12 +1189,19 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
-            if self.model_config.quantization in ["modelopt", "modelopt_fp8", "modelopt_fp4"]:
-                assert (
-                    self.model_config.hf_config.mlp_hidden_act == "relu2"
-                )
+            if self.model_config.quantization in [
+                "modelopt",
+                "modelopt_fp8",
+                "modelopt_fp4",
+            ]:
+                assert self.model_config.hf_config.mlp_hidden_act == "relu2"
                 if self.model_config.quantization == "modelopt":
-                    self.quantization = "modelopt_fp4" if self.model_config.hf_config.quantization_config["quant_algo"] == "NVFP4" else "modelopt_fp8"    
+                    self.quantization = (
+                        "modelopt_fp4"
+                        if self.model_config.hf_config.quantization_config["quant_algo"]
+                        == "NVFP4"
+                        else "modelopt_fp8"
+                    )
                 else:
                     self.quantization = self.model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
@@ -1495,9 +1502,11 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
-            assert (
-                self.quantization in ["modelopt_fp4", "modelopt_fp8", None]
-            ), "modelopt_fp4/8 quantization is required for Flashinfer Cutlass MOE"
+            assert self.quantization in [
+                "modelopt_fp4",
+                "modelopt_fp8",
+                None,
+            ], "modelopt_fp4/8 quantization is required for Flashinfer Cutlass MOE"
             assert self.ep_size in [
                 1,
                 self.tp_size,

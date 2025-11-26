@@ -5,14 +5,13 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
+from flashinfer.fused_moe.core import ActivationType
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from flashinfer.fused_moe.core import ActivationType
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
@@ -147,9 +146,10 @@ FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 ACTIVATION_SCHEMES = ["static"]
 
 ACT_STR_TO_TYPE_MAP = {
-        "silu": ActivationType.Swiglu,  # This is the default
-        "relu2": ActivationType.Relu2,
-        }
+    "silu": ActivationType.Swiglu,  # This is the default
+    "relu2": ActivationType.Relu2,
+}
+
 
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
@@ -449,7 +449,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         )
         weight_loader = extra_weight_attrs.get("weight_loader")
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
-        intermediate_size =  num_shards * intermediate_size_per_partition
+        intermediate_size = num_shards * intermediate_size_per_partition
         w13_weight = ModelWeightParameter(
             data=torch.empty(
                 num_experts,
@@ -536,7 +536,9 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 # w13_weight has shape (num_experts, 2 * intermediate_size_per_partition, hidden_size)
                 # where the first intermediate_size_per_partition rows are w1, the next are w3
                 num_shards = 2 if layer.moe_runner_config.is_gated else 1
-                intermediate_size_per_partition = layer.w13_weight.shape[1] // num_shards
+                intermediate_size_per_partition = (
+                    layer.w13_weight.shape[1] // num_shards
+                )
                 for expert_id in range(layer.w13_weight.shape[0]):
                     start = 0
                     for shard_id in range(num_shards):  # (w1 and w3) or w13
@@ -672,11 +674,16 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             w13_weight_scale = layer.w13_weight_scale.to(torch.float32)
             w2_weight_scale = layer.w2_weight_scale.to(torch.float32)
 
-            layer.fc1_dequant = Parameter(w13_weight_scale * input_scale, requires_grad=False)
-            layer.fc2_quant = Parameter(activation_scale.reciprocal(), requires_grad=False)
-            layer.fc2_dequant = Parameter(activation_scale * w2_weight_scale, requires_grad=False)
+            layer.fc1_dequant = Parameter(
+                w13_weight_scale * input_scale, requires_grad=False
+            )
+            layer.fc2_quant = Parameter(
+                activation_scale.reciprocal(), requires_grad=False
+            )
+            layer.fc2_dequant = Parameter(
+                activation_scale * w2_weight_scale, requires_grad=False
+            )
             layer.fc1_input_dequant = Parameter(input_scale, requires_grad=False)
-
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -775,11 +782,15 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
             return StandardCombineInput(hidden_states=output)
 
-
         if get_moe_runner_backend().is_flashinfer_cutlass():
             activation = ACT_STR_TO_TYPE_MAP[self.moe_runner_config.activation]
             assert (
-                (activation is ActivationType.Relu2 and not self.moe_runner_config.is_gated) or activation is ActivationType.Swiglu and self.moe_runner_config.is_gated
+                (
+                    activation is ActivationType.Relu2
+                    and not self.moe_runner_config.is_gated
+                )
+                or activation is ActivationType.Swiglu
+                and self.moe_runner_config.is_gated
             ), "Only Relu2 non-gated or Swiglu gated are supported for flashinfer cutlass fp8 moe"
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
             x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
@@ -813,7 +824,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=activation
+                activation_type=activation,
             )[0]
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
@@ -1269,7 +1280,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
-        
+
         w13_weight = ModelWeightParameter(
             data=torch.empty(
                 layer.num_local_experts,
@@ -1714,11 +1725,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x_sf = dispatch_output.hidden_states_scale
         topk_output = dispatch_output.topk_output
 
-        activation = self.moe_runner_config.activation 
+        activation = self.moe_runner_config.activation
 
-        assert activation in ACT_STR_TO_TYPE_MAP, (
-            f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
-        )
+        assert (
+            activation in ACT_STR_TO_TYPE_MAP
+        ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
         moe_runner_config = self.moe_runner_config
 
         # Check if this is a FlashInferFP4MoE layer that should handle its own forward
@@ -1742,7 +1753,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
-                    x.shape[0], x.shape[1] * (2 if layer.moe_runner_config.is_gated else 1), dtype=output_dtype, device=x.device
+                    x.shape[0],
+                    x.shape[1] * (2 if layer.moe_runner_config.is_gated else 1),
+                    dtype=output_dtype,
+                    device=x.device,
                 )
 
             output = flashinfer_cutlass_fused_moe(
@@ -1767,7 +1781,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=ACT_STR_TO_TYPE_MAP[activation]
+                activation_type=ACT_STR_TO_TYPE_MAP[activation],
             )[0]
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
