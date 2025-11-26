@@ -3663,11 +3663,6 @@ def reserve_rope_cache_for_long_sequences(
     """Pre-expand RoPE cache for long sequences and speculative decoding."""
     from sglang.srt.environ import envs
 
-    if logger is None:
-        import logging
-
-        logger = logging.getLogger(__name__)
-
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
     ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
@@ -3689,23 +3684,13 @@ def reserve_rope_cache_for_long_sequences(
     # 3) Align to reduce reallocation frequency
     reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
 
-    logger.info(
-        f"RoPE cache reserve={reserve} (cap={base_ctx}, steps={steps}, draft={draft}, k={SAFETY_FACTOR}, margin={MARGIN})"
-    )
-
     # Recursively expand all RoPE layers
     def reserve_rope_cache_recursive(module):
         for child in module.children():
             if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
                 child, "cos_sin_cache"
             ):
-                old_len = child.cos_sin_cache.shape[0]
                 child._ensure_cos_sin_cache_length(reserve - 1)
-                new_len = child.cos_sin_cache.shape[0]
-                if new_len > old_len:
-                    logger.info(
-                        f"Expanded RoPE cache from {old_len} to {new_len} positions"
-                    )
             else:
                 reserve_rope_cache_recursive(child)
 

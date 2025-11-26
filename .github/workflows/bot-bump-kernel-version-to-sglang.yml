@@ -62,7 +62,7 @@ jobs:
   run-nightly-tests:
     needs: bump-kernel-version-to-sglang
     if: needs.bump-kernel-version-to-sglang.outputs.needs_sync == 'true'
-    uses: ./.github/workflows/nightly-test.yml
+    uses: ./.github/workflows/nightly-test-nvidia.yml
     with:
       ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
     secrets: inherit

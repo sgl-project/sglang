@@ -262,7 +262,6 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
-        layer.executed_weight_requant_ue8m0 = False
 
         # WEIGHT
         weight_dtype = (
@@ -300,6 +299,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     output_dim=0,
                     weight_loader=weight_loader,
                 )
+                scale.format_ue8m0 = False
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
@@ -367,14 +367,14 @@ class Fp8LinearMethod(LinearMethodBase):
                         self.w8a8_block_fp8_linear
                         is deepgemm_w8a8_block_fp8_linear_with_fallback
                     )
-                    and (not layer.executed_weight_requant_ue8m0)
+                    and (not layer.weight_scale_inv.format_ue8m0)
                 ):
                     requant_weight_ue8m0_inplace(
                         layer.weight,
                         layer.weight_scale_inv,
                         self.quant_config.weight_block_size,
                     )
-                    layer.executed_weight_requant_ue8m0 = True
+                    layer.weight_scale_inv.format_ue8m0 = True
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
 
             layer.weight.data = weight.data

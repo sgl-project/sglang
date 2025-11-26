@@ -433,18 +433,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        external_trace_header = None
-        if request:
-            if "trace_context" in request.headers:
-                trace_set_remote_propagate_context(request.headers["trace_context"])
-            else:
-                external_trace_header = extract_trace_headers(request.headers)
+        if self.enable_trace:
+            external_trace_header = None
+            if request:
+                if "trace_context" in request.headers:
+                    trace_set_remote_propagate_context(request.headers["trace_context"])
+                else:
+                    external_trace_header = extract_trace_headers(request.headers)
+
+            self._trace_request_start(obj, created_time, external_trace_header)
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
-
-        if self.enable_trace:
-            self._trace_request_start(obj, created_time, external_trace_header)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata

@@ -1321,17 +1321,23 @@ class SetInternalStateReqOutput(BaseReq):
 class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None
+    # Specify the steps to start the profiling
+    start_step: Optional[int] = None
     # If set, it profile as many as this number of steps.
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
-    start_step: Optional[int] = None
     num_steps: Optional[int] = None
+    # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
     activities: Optional[List[str]] = None
+    # Whether profile by stages (e.g., prefill and decode) separately
     profile_by_stage: bool = False
+    # Whether to record source information (file and line number) for the ops.
     with_stack: Optional[bool] = None
+    # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    # The prefix of the profile filenames
     profile_prefix: Optional[str] = None
 
 
@@ -1351,7 +1357,6 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
-    # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
     profile_prefix: Optional[str] = None
 
