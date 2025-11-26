@@ -111,6 +111,7 @@ def _quantized_set_kv_int4_kernel(
     input_offset_base = token_idx * input_stride_token + head_idx * input_stride_head
     
     # Load first and second halves
+    # BUG FIX: Must multiply half_dim by stride to get correct memory offset
     vals1 = tl.load(
         input_ptr + input_offset_base + dim_offsets * input_stride_dim,
         mask=dim_mask,
@@ -118,7 +119,7 @@ def _quantized_set_kv_int4_kernel(
     ).to(tl.float32)
     
     vals2 = tl.load(
-        input_ptr + input_offset_base + dim_offsets * input_stride_dim + half_dim,
+        input_ptr + input_offset_base + (dim_offsets + half_dim) * input_stride_dim,
         mask=dim_mask,
         other=0.0
     ).to(tl.float32)

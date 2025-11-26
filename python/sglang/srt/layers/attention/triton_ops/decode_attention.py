@@ -572,12 +572,12 @@ def _fwd_kernel_stage1_quant_int4(
         
         # Second half: indices [Lv//2, Lv)
         offs_dv_second = tl.arange(0, BLOCK_DV // 2)
-        mask_dv_second = (offs_dv_second + BLOCK_DV // 2) < Lv
+        mask_dv_second = (offs_dv_second + Lv // 2) < Lv
         offs_mid_o_second = (
             cur_batch * stride_mid_ob
             + cur_head * stride_mid_oh
             + split_kv_id * stride_mid_os
-            + offs_dv_second + BLOCK_DV // 2
+            + offs_dv_second + Lv // 2
         )
         tl.store(
             Att_Out + offs_mid_o_second,
@@ -1029,12 +1029,12 @@ def _fwd_grouped_kernel_stage1_quant_int4(
         
         # Second half: indices [Lv//2, Lv)
         offs_dv_second = tl.arange(0, BLOCK_DV // 2)
-        mask_dv_second = (offs_dv_second + BLOCK_DV // 2) < Lv
+        mask_dv_second = (offs_dv_second + Lv // 2) < Lv
         offs_mid_o_second = (
             cur_batch * stride_mid_ob
             + cur_head[:, None] * stride_mid_oh
             + split_kv_id * stride_mid_os
-            + (offs_dv_second + BLOCK_DV // 2)[None, :]
+            + (offs_dv_second + Lv // 2)[None, :]
         )
         tl.store(
             Att_Out + offs_mid_o_second,

@@ -848,20 +848,8 @@ class MHATokenToKVPool(KVCache):
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
-        if self.dtype == "int4":
-            quantized = self.k_buffer[layer_id - self.start_layer]
-            scales_zeros = self.k_scales_zeros[layer_id - self.start_layer]
-            # Dequantize using Triton kernel
-            dequantized = dequantize_kv_int4_triton(quantized, scales_zeros, self.head_dim, self.model_dtype)
-            return dequantized
-            
-        elif self.dtype == "int8":
-            quantized = self.k_buffer[layer_id - self.start_layer]
-            scales_zeros = self.k_scales_zeros[layer_id - self.start_layer]
-            # Dequantize using Triton kernel
-            dequantized = dequantize_kv_int8_triton(quantized, scales_zeros, self.head_dim, self.model_dtype)
-            return dequantized
-            
+        if self.dtype in ("int4", "int8"):
+            return self.k_buffer[layer_id - self.start_layer]
         elif self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
             
@@ -877,23 +865,10 @@ class MHATokenToKVPool(KVCache):
 
     def _get_value_buffer(self, layer_id: int):
         # for internal use of referencing
-        if self.dtype == "int4":
-            quantized = self.v_buffer[layer_id - self.start_layer]
-            scales_zeros = self.v_scales_zeros[layer_id - self.start_layer]
-            # Dequantize using Triton kernel
-            dequantized = dequantize_kv_int4_triton(quantized, scales_zeros, self.head_dim, self.model_dtype)
-            return dequantized
-            
-        elif self.dtype == "int8":
-            quantized = self.v_buffer[layer_id - self.start_layer]
-            scales_zeros = self.v_scales_zeros[layer_id - self.start_layer]
-            # Dequantize using Triton kernel
-            dequantized = dequantize_kv_int8_triton(quantized, scales_zeros, self.head_dim, self.model_dtype)
-            return dequantized
-            
+        if self.dtype in ("int4", "int8"):
+            return self.v_buffer[layer_id - self.start_layer]
         elif self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
-            
         return self.v_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
@@ -927,6 +902,35 @@ class MHATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.v_scales_zeros[layer_id - self.start_layer]
+
+    def get_raw_kv_buffer(self, layer_id: int):
+        """
+        Get raw quantized KV buffer with scales/zeros for efficient dequantization.
+        
+        Returns a dict containing:
+        - k_buffer: Raw quantized K buffer
+        - v_buffer: Raw quantized V buffer
+        - k_scales_zeros: Scales and zeros for K (if quantized)
+        - v_scales_zeros: Scales and zeros for V (if quantized)
+        - dtype: KV cache dtype string
+        """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        
+        result = {
+            'k_buffer': self.k_buffer[layer_id - self.start_layer],
+            'v_buffer': self.v_buffer[layer_id - self.start_layer],
+            'dtype': self.dtype,
+        }
+        
+        if self.dtype in ("int4", "int8"):
+            result['k_scales_zeros'] = self.k_scales_zeros[layer_id - self.start_layer]
+            result['v_scales_zeros'] = self.v_scales_zeros[layer_id - self.start_layer]
+        else:
+            result['k_scales_zeros'] = None
+            result['v_scales_zeros'] = None
+        
+        return result
 
     def set_kv_buffer(
         self,
