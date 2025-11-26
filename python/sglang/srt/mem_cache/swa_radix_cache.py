@@ -541,9 +541,14 @@ class SWARadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(
+        match_result = self.match_prefix(
             RadixKey(page_aligned_token_ids, req.extra_key)
         )
+        (new_indices, new_last_node) = (
+            match_result.device_indices,
+            match_result.last_device_node,
+        )
+
         assert old_prefix_len <= len(
             new_indices
         ), f"{req.prefix_indices=}, {new_indices=}"

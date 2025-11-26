@@ -104,6 +104,16 @@ show_time_cost = False
 time_infos = {}
 
 
+def get_or_create_event_loop():
+    """Gets the running event loop or creates a new one if it doesn't exist."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
@@ -623,38 +633,48 @@ def get_cmo_stream():
     AIV or communication kernels, aiming to overlap the memory access time.
     """
     global cmo_stream
-    if cmo_stream is None:
-        cmo_stream = torch.get_device_module().Stream()
     return cmo_stream
 
 
-def prepare_weight_cache(handle, cache):
+def set_cmo_stream(stream):
+    global cmo_stream
+    cmo_stream = stream
+
+
+def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
+    """
+    PREFETCH_MAX_SIZE: maximum size (bytes) for each prefetch operation.
+    This affects the time spent in prefetch:
+        time ≈ PREFETCH_MAX_SIZE / system_bandwidth
+    """
     import torch_npu
 
-    NPU_PREFETCH_MAX_SIZE_BYTES = (
-        1000000000  # 1GB, a large value to prefetch entire weight
-    )
     stream = get_cmo_stream()
-    stream.wait_stream(torch.npu.current_stream())
-    with torch.npu.stream(stream):
+    if stream is None:
+        stream = torch.get_device_module().Stream()
+        set_cmo_stream(stream)
+    stream.wait_stream(torch.get_device_module().current_stream())
+    with torch.get_device_module().stream(stream):
         if isinstance(cache, list):
             for weight in cache:
                 torch_npu.npu_prefetch(
                     weight,
                     handle,
-                    NPU_PREFETCH_MAX_SIZE_BYTES,
+                    PREFETCH_MAX_SIZE,
                 )
         else:
             torch_npu.npu_prefetch(
                 cache,
                 handle,
-                NPU_PREFETCH_MAX_SIZE_BYTES,
+                PREFETCH_MAX_SIZE,
             )
 
 
 def wait_cmo_stream():
-    cur_stream = torch.get_device_module().current_stream()
-    cur_stream.wait_stream(get_cmo_stream())
+    stream = get_cmo_stream()
+    if stream is not None:
+        cur_stream = torch.get_device_module().current_stream()
+        cur_stream.wait_stream(stream)
 
 
 @lru_cache(maxsize=1)
@@ -3635,6 +3655,46 @@ def cached_triton_kernel(key_fn=None):
             return fn
 
     return decorator
+
+
+def reserve_rope_cache_for_long_sequences(
+    model, server_args, model_config, logger=None
+):
+    """Pre-expand RoPE cache for long sequences and speculative decoding."""
+    from sglang.srt.environ import envs
+
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
+
+    # 1) Estimate base context upper bound
+    base_ctx = (
+        getattr(server_args, "context_length", None)
+        or getattr(model_config, "context_len", None)
+        or getattr(model_config, "max_model_len", None)
+        or getattr(model_config.hf_text_config, "max_position_embeddings", None)
+        or 2048
+    )
+
+    # 2) Speculative decoding expansion
+    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
+    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+
+    # 3) Align to reduce reallocation frequency
+    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+    # Recursively expand all RoPE layers
+    def reserve_rope_cache_recursive(module):
+        for child in module.children():
+            if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
+                child, "cos_sin_cache"
+            ):
+                child._ensure_cos_sin_cache_length(reserve - 1)
+            else:
+                reserve_rope_cache_recursive(child)
+
+    reserve_rope_cache_recursive(model)
 
 
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
