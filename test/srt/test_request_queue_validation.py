@@ -3,7 +3,7 @@ import os
 import re
 import unittest
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -20,7 +20,29 @@ from sglang.test.test_utils import (
 class TestMaxQueuedRequests(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = (
+            "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"
+            if is_npu()
+            else DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        )
+        other_args = (
+            (
+                "--max-running-requests",  # Enforce max request concurrency is 1
+                "1",
+                "--max-queued-requests",  # Enforce max queued request number is 1
+                "1",
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+            )
+            if is_npu()
+            else (
+                "--max-running-requests",  # Enforce max request concurrency is 1
+                "1",
+                "--max-queued-requests",  # Enforce max queued request number is 1
+                "1",
+            )
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
 
         cls.stdout = open(STDOUT_FILENAME, "w")
@@ -31,14 +53,7 @@ class TestMaxQueuedRequests(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=(
-                "--max-running-requests",  # Enforce max request concurrency is 1
-                "1",
-                "--max-queued-requests",  # Enforce max queued request number is 1
-                "1",
-                "--attention-backend",
-                "triton",
-            ),
+            other_args=other_args,
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
 
