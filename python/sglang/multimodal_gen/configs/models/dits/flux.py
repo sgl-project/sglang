@@ -21,6 +21,12 @@ class FluxArchConfig(DiTArchConfig):
     guidance_embeds: bool = False
     axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
 
+    param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"transformer\.(\w*)\.(.*)$": r"\1.\2",
+        }
+    )
+
     def __post_init__(self):
         super().__post_init__()
         self.out_channels = self.out_channels or self.in_channels

@@ -2,10 +2,10 @@ from typing import Optional
 
 import pytest
 import torch
-from sgl_kernel import fused_marlin_moe
 from sgl_kernel.scalar_type import ScalarType, scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
 

@@ -252,7 +252,7 @@ class SelfAttention(nn.Module):
             q = self._apply_rope(q, cos, sin)
             k = self._apply_rope(k, cos, sin)
 
-        output, _ = self.attn(q, k, v)  # [B,heads,S,D]
+        output = self.attn(q, k, v)  # [B,heads,S,D]
 
         output = rearrange(output, "b s h d -> b s (h d)")
         output, _ = self.wo(output)

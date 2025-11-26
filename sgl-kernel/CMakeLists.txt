@@ -74,7 +74,7 @@ FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-triton
     GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        8f9f695ea8fde23a0c7c88e4ab256634ca27789f
+    GIT_TAG        v3.5.1
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-triton)
@@ -269,7 +269,6 @@ set(SOURCES
     "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
-    "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"

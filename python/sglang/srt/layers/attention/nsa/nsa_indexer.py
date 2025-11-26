@@ -169,9 +169,10 @@ class Indexer(CustomOp):
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
-        weights = weights * self.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        # Keep x in original dtype (bfloat16) for projection, then convert to float32
+        weights, _ = self.weights_proj(x)
+        weights = weights.float() * self.n_heads**-0.5
+        weights = weights.unsqueeze(-1) * q_scale.float() * self.softmax_scale
         return weights
 
     def _get_q_k_bf16(

@@ -50,10 +50,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/attention
    */
-  m.def(
-      "lightning_attention_decode(Tensor q, Tensor k, Tensor v, Tensor past_kv, Tensor slope, Tensor! output, Tensor! "
-      "new_kv) -> ()");
-  m.impl("lightning_attention_decode", torch::kCUDA, &lightning_attention_decode);
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state", torch::kCUDA, &merge_state);
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");

@@ -44,6 +44,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -387,10 +388,7 @@ class Qwen2VisionTransformer(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
         # compute cu_seqlens
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
 
         # transformers
         x = x.unsqueeze(1)
