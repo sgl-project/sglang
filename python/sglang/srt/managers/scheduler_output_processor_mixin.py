@@ -311,7 +311,6 @@ class SchedulerOutputProcessorMixin:
                     # spec_verify_ct is already incremented in ngram_info._fill_requests
                     req.spec_accepted_tokens += accept_lens_list[i]
 
-
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
