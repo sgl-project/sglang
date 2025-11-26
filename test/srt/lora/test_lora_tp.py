@@ -14,8 +14,13 @@
 
 import multiprocessing as mp
 import os
+import sys
 import unittest
+from pathlib import Path
 from typing import List
+
+# Add test directory to path for lora_utils import
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from lora_utils import (
     ALL_OTHER_LORA_MODELS,
