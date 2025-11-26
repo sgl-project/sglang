@@ -41,6 +41,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 ## Documentation
 - **User Guide**: [docs.sglang.ai/advanced_features/router.html](https://docs.sglang.ai/advanced_features/router.html)
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
+- **Tokenizer Module**: See [src/tokenizer/README.md](src/tokenizer/README.md) for tokenizer architecture and chat template support.
 
 ## Installation
 ### Prerequisites
