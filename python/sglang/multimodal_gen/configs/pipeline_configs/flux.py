@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import math
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
@@ -317,6 +317,19 @@ def _prepare_image_ids(
     return image_latent_ids
 
 
+def flux_2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+    hidden_states_layers: Tuple[int] = (10, 20, 30)
+
+    out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
+
+    batch_size, num_channels, seq_len, hidden_dim = out.shape
+    prompt_embeds = out.permute(0, 2, 1, 3).reshape(
+        batch_size, seq_len, num_channels * hidden_dim
+    )
+
+    return prompt_embeds
+
+
 @dataclass
 class Flux2PipelineConfig(FluxPipelineConfig):
     task_type: ModelTaskType = ModelTaskType.I2I
@@ -331,7 +344,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (t5_postprocess_text,)
+        default_factory=lambda: (flux_2_postprocess_text,)
     )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
 

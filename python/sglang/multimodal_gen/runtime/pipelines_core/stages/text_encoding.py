@@ -11,6 +11,7 @@ import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -251,8 +252,8 @@ class TextEncodingStage(PipelineStage):
 
             text_inputs = tokenizer(processed_texts, **tok_kwargs).to(target_device)
             input_ids = text_inputs["input_ids"]
-            is_flux = isinstance(server_args.pipeline_config, FluxPipelineConfig)
-            is_flux_t5 = is_flux and i == 1
+            is_flux_v1 = isinstance(server_args.pipeline_config, FluxPipelineConfig) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
+            is_flux_t5 = is_flux_v1 and i == 1
 
             if is_flux_t5:
                 attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
@@ -269,7 +270,7 @@ class TextEncodingStage(PipelineStage):
                 prompt_embeds = prompt_embeds.to(dtype=dtype)
 
             embeds_list.append(prompt_embeds)
-            if is_flux:
+            if is_flux_v1:
                 pooled_embeds_list.append(outputs.pooler_output)
             if return_attention_mask:
                 attn_masks_list.append(attention_mask)

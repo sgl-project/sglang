@@ -149,6 +149,7 @@ class PipelineConfig:
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (preprocess_text,)
     )
+    # get prompt_embeds from encoder output
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (postprocess_text,))
     )

@@ -304,7 +304,6 @@ class TextEncoderLoader(ComponentLoader):
             with target_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
-                print(f"{model_cls=}")
                 model = model_cls(model_config)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
@@ -338,7 +337,8 @@ class TextEncoderLoader(ComponentLoader):
                         cpu_offload=True,
                         reshard_after_forward=True,
                         mesh=mesh["offload"],
-                        fsdp_shard_conditions=model._fsdp_shard_conditions,
+                        fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
+                        or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
             # We only enable strict check for non-quantized models
