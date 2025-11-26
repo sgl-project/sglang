@@ -28,14 +28,16 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
-MODELS = [
-    ("Alibaba-NLP/gte-Qwen2-1.5B-instruct", 1, 1e-5),
-    ("intfloat/e5-mistral-7b-instruct", 1, 1e-5),
-    ("marco/mcdse-2b-v1", 1, 1e-5),
-    ("Qwen/Qwen3-Embedding-8B", 1, 1e-5),
+MODEL_TO_CONFIG = {
+    "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),
+    "intfloat/e5-mistral-7b-instruct": (1, 1e-5),
+    "marco/mcdse-2b-v1": (1, 1e-5),
+    "Qwen/Qwen3-Embedding-8B": (1, 1e-5),
     # Temporarily disable before this model is fixed
-    # ("jason9693/Qwen2.5-1.5B-apeach", 1, 1e-5),
-]
+    # "jason9693/Qwen2.5-1.5B-apeach": (1, 1e-5),
+}
+MODELS = [(key, *MODEL_TO_CONFIG[key]) for key in MODEL_TO_CONFIG]
+
 TORCH_DTYPES = [torch.float16]
 
 
@@ -71,6 +73,8 @@ class TestEmbeddingModels(CustomTestCase):
         torch_dtype,
         prefill_tolerance,
         matryoshka_dim: Optional[int] = None,
+        enable_piecewise_cuda_graph: bool = False,
+        piecewise_cuda_graph_compiler: Optional[str] = None,
     ) -> None:
         truncated_prompts = self._truncate_prompts(prompts, model_path)
 
@@ -92,6 +96,8 @@ class TestEmbeddingModels(CustomTestCase):
             json_model_override_args=(
                 {"matryoshka_dimensions": [matryoshka_dim]} if matryoshka_dim else None
             ),
+            enable_piecewise_cuda_graph=enable_piecewise_cuda_graph,
+            piecewise_cuda_graph_compiler=piecewise_cuda_graph_compiler,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(
                 truncated_prompts, dimensions=matryoshka_dim
@@ -117,17 +123,26 @@ class TestEmbeddingModels(CustomTestCase):
 
         for model, tp_size, prefill_tolerance in models_to_test:
             for torch_dtype in TORCH_DTYPES:
-                self.assert_close_prefill_logits(
-                    DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
-                )
+                for enable_piecewise_cuda_graph_compile in [True]:
+                    self.assert_close_prefill_logits(
+                        DEFAULT_PROMPTS,
+                        model,
+                        tp_size,
+                        torch_dtype,
+                        prefill_tolerance,
+                        enable_piecewise_cuda_graph=enable_piecewise_cuda_graph_compile,
+                        piecewise_cuda_graph_compiler=(
+                            "inductor" if enable_piecewise_cuda_graph_compile else None
+                        ),
+                    )
 
     def test_matryoshka_embedding(self):
         models_to_test = [
-            model
-            for model in MODELS
-            if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == model[0]
+            (
+                "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
+                *MODEL_TO_CONFIG["Alibaba-NLP/gte-Qwen2-1.5B-instruct"],
+            )
         ]
-        assert len(models_to_test) == 1
 
         for model, tp_size, prefill_tolerance in models_to_test:
             for torch_dtype in TORCH_DTYPES:
@@ -138,6 +153,23 @@ class TestEmbeddingModels(CustomTestCase):
                     torch_dtype,
                     prefill_tolerance,
                     matryoshka_dim=128,
+                )
+
+    def test_piecewise_cuda_graph_and_compile(self):
+        models_to_test = [
+            ("Qwen/Qwen3-Embedding-8B", *MODEL_TO_CONFIG["Qwen/Qwen3-Embedding-8B"])
+        ]
+
+        for model, tp_size, prefill_tolerance in models_to_test:
+            for torch_dtype in TORCH_DTYPES:
+                self.assert_close_prefill_logits(
+                    DEFAULT_PROMPTS,
+                    model,
+                    tp_size,
+                    torch_dtype,
+                    prefill_tolerance,
+                    enable_piecewise_cuda_graph=True,
+                    piecewise_cuda_graph_compiler="inductor",
                 )
 
 

@@ -542,6 +542,9 @@ class SRTRunner:
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
+        enable_piecewise_cuda_graph: bool = False,
+        piecewise_cuda_graph_max_tokens: Optional[int] = None,
+        piecewise_cuda_graph_compiler: Optional[str] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -606,6 +609,8 @@ class SRTRunner:
             ),
             lora_eviction_policy=lora_eviction_policy,
             enable_deterministic_inference=enable_deterministic_inference,
+            enable_piecewise_cuda_graph=enable_piecewise_cuda_graph,
+            piecewise_cuda_graph_compiler=piecewise_cuda_graph_compiler,
             **spec_kwargs,
         )
 
