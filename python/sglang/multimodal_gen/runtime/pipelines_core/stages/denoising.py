@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -335,7 +336,7 @@ class DenoisingStage(PipelineStage):
             )
 
         # Handle sequence parallelism AFTER TI2V processing
-        self._preprocess_sp_latents(batch)
+        self._preprocess_sp_latents(batch, server_args)
         latents = batch.latents
 
         # Shard z and reserved_frames_mask for TI2V if SP is enabled
@@ -524,38 +525,29 @@ class DenoisingStage(PipelineStage):
                 torch.mps.current_allocated_memory(),
             )
 
-    def _preprocess_sp_latents(self, batch: Req):
+    def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
-        sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
         if get_sp_world_size() <= 1:
-            batch.did_sp_shard_latents = False
             return
 
-        def _shard_tensor(
-            tensor: torch.Tensor | None,
-        ) -> tuple[torch.Tensor | None, bool]:
-            if tensor is None:
-                return None, False
+        if batch.latents is not None:
+            (
+                batch.latents,
+                did_shard,
+            ) = server_args.pipeline_config.shard_latents_for_sp(batch, batch.latents)
+            batch.did_sp_shard_latents = did_shard
+        else:
+            batch.did_sp_shard_latents = False
 
-            if tensor.dim() == 5:
-                time_dim = tensor.shape[2]
-                if time_dim > 0 and time_dim % sp_world_size == 0:
-                    sharded_tensor = rearrange(
-                        tensor, "b c (n t) h w -> b c n t h w", n=sp_world_size
-                    ).contiguous()
-                    sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
-                    return sharded_tensor, True
-
-            # For 4D image tensors or unsharded 5D tensors, return as is.
-            return tensor, False
-
-        batch.latents, did_shard = _shard_tensor(batch.latents)
-        batch.did_sp_shard_latents = did_shard
-
-        # image_latent is sharded independently, but the decision to all-gather later
-        # is based on whether the main `latents` was sharded.
-        if batch.image_latent is not None:
-            batch.image_latent, _ = _shard_tensor(batch.image_latent)
+        # For I2I tasks like QwenImageEdit, the image_latent (input image) should be
+        # replicated on all SP ranks, not sharded, as it provides global context.
+        if (
+            server_args.pipeline_config.task_type != ModelTaskType.I2I
+            and batch.image_latent is not None
+        ):
+            batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
+                batch, batch.image_latent
+            )
 
     def _postprocess_sp_latents(
         self,
@@ -565,13 +557,20 @@ class DenoisingStage(PipelineStage):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather latents after Sequence Parallelism if they were sharded."""
         if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-            latents = sequence_model_parallel_all_gather(latents, dim=2)
+            latents = self.server_args.pipeline_config.gather_latents_for_sp(latents)
             if trajectory_tensor is not None:
-                # trajectory_tensor shape: [b, num_steps, c, t_local, h, w] -> gather on dim 3
+                # trajectory_tensor shapes:
+                # - video: [b, num_steps, c, t_local, h, w] -> gather on dim=3
+                # - image: [b, num_steps, s_local, d] -> gather on dim=2
                 trajectory_tensor = trajectory_tensor.to(get_local_torch_device())
+                gather_dim = 3 if trajectory_tensor.dim() >= 5 else 2
                 trajectory_tensor = sequence_model_parallel_all_gather(
-                    trajectory_tensor, dim=3
+                    trajectory_tensor, dim=gather_dim
                 )
+                if gather_dim == 2 and hasattr(batch, "raw_latent_shape"):
+                    orig_s = batch.raw_latent_shape[1]
+                    if trajectory_tensor.shape[2] > orig_s:
+                        trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
 
     def start_profile(self, batch: Req):
@@ -584,12 +583,12 @@ class DenoisingStage(PipelineStage):
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-        prof = torch.profiler.profile(
+        self.profiler = torch.profiler.profile(
             activities=activities,
             schedule=torch.profiler.schedule(
                 skip_first=0,
                 wait=0,
-                warmup=5,
+                warmup=1,
                 active=batch.num_profiled_timesteps,
                 repeat=5,
             ),
@@ -599,8 +598,7 @@ class DenoisingStage(PipelineStage):
             record_shapes=True,
             with_stack=True,
         )
-        prof.start()
-        self.profiler = prof
+        self.profiler.start()
 
     def step_profile(self):
         if self.profiler:
@@ -619,11 +617,13 @@ class DenoisingStage(PipelineStage):
                 log_dir = f"./logs"
                 os.makedirs(log_dir, exist_ok=True)
 
+                rank = get_world_rank()
                 trace_path = os.path.abspath(
-                    os.path.join(log_dir, f"{request_id}.trace.json.gz")
+                    os.path.join(log_dir, f"{request_id}-rank{rank}.trace.json.gz")
                 )
                 logger.info(f"Saving profiler traces to: {trace_path}")
                 self.profiler.export_chrome_trace(trace_path)
+                torch.distributed.barrier()
         except Exception as e:
             logger.error(f"{e}")
 
@@ -900,7 +900,7 @@ class DenoisingStage(PipelineStage):
 
         if num_timesteps > 0:
             self.log_info(
-                "Average time per step: %.4f seconds",
+                "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
 
