@@ -6,9 +6,7 @@ pub struct ConfigValidator;
 
 impl ConfigValidator {
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
-        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
-
-        Self::validate_mode(&config.mode, has_service_discovery)?;
+        Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
 
@@ -89,7 +87,7 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_mode(mode: &RoutingMode, has_service_discovery: bool) -> ConfigResult<()> {
+    fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
         match mode {
             RoutingMode::Regular { worker_urls } => {
                 if !worker_urls.is_empty() {
@@ -103,19 +101,8 @@ impl ConfigValidator {
                 prefill_policy,
                 decode_policy,
             } => {
-                if !has_service_discovery {
-                    if prefill_urls.is_empty() {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: "PD mode requires at least one prefill worker URL".to_string(),
-                        });
-                    }
-                    if decode_urls.is_empty() {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: "PD mode requires at least one decode worker URL".to_string(),
-                        });
-                    }
-                }
-
+                // Allow empty URLs even without service discovery to support dynamic worker addition
+                // URLs will be validated if provided
                 if !prefill_urls.is_empty() {
                     let prefill_url_strings: Vec<String> =
                         prefill_urls.iter().map(|(url, _)| url.clone()).collect();
@@ -145,12 +132,11 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
-                if worker_urls.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
-                    });
+                // Allow empty URLs to support dynamic worker addition
+                // URLs will be validated if provided
+                if !worker_urls.is_empty() {
+                    Self::validate_urls(worker_urls)?;
                 }
-                Self::validate_urls(worker_urls)?;
             }
         }
         Ok(())
@@ -886,6 +872,45 @@ mod tests {
             result.is_err(),
             "Decode policy should not be allowed to be bucket"
         );
+    }
+
+    #[test]
+    fn test_validate_empty_urls_allowed_without_service_discovery() {
+        // Test that empty URLs are now allowed in PD mode
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        // Test that empty URLs are allowed in Regular mode
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        // Test that empty URLs are allowed in OpenAI mode
+        let config = RouterConfig::new(
+            RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

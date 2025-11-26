@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -274,9 +275,12 @@ class SchedulerMetricsMixin:
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
-            total_draft_tokens = self.spec_num_forward_ct * (
-                (self.server_args.speculative_num_steps or 0) + 1
+            draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
+            num_draft_tokens = (
+                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
             )
+            total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
+
             spec_accept_rate = (
                 self.spec_num_accepted_tokens / total_draft_tokens
                 if total_draft_tokens > 0
@@ -388,3 +392,31 @@ class SchedulerMetricsMixin:
                     / self.stats.max_running_requests_under_SLO,
                     self.stats.token_usage / 0.9,
                 )
+
+    def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
+        if self.is_hybrid:
+            full_num_used, swa_num_used, *_ = self._get_swa_token_info()
+            num_tokens = max(full_num_used, swa_num_used)
+        elif self.is_hybrid_gdn:
+            num_tokens = self._get_mamba_token_info()[0]
+        else:
+            num_tokens = self._get_token_info()[0]
+
+        # Tokens in waiting queue, bootstrap queue, prealloc queue
+        waiting_queues = [self.waiting_queue]
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
+            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
+            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+
+        num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
+        num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
+
+        return GetLoadReqOutput(
+            dp_rank=self.dp_rank,
+            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            num_tokens=num_tokens,
+        )

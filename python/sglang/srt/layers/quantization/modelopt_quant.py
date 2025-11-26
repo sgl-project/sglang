@@ -12,17 +12,12 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import (
-    get_dp_global_num_tokens,
-    get_local_dp_buffer,
-    is_allocation_symmetric,
-)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
     get_moe_runner_backend,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -48,8 +43,12 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.utils import get_bool_env_var, is_cuda, next_power_of_2
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    is_cuda,
+    is_sm120_supported,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -65,7 +64,6 @@ try:
     else:
         from sgl_kernel import scaled_fp4_quant as fp4_quantize
 
-    from flashinfer import fp4_quantize as fp4_quantize_flashinfer
 except ImportError:
     fp4_quantize = None
 
@@ -92,14 +90,56 @@ except ImportError:
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
 
+
+@torch.library.custom_op("sglang::fp4_gemm", mutates_args=())
+def _sglang_fp4_gemm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_sf: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+    out_features: int,
+) -> torch.Tensor:
+    backend = FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
+    if enable_flashinfer_fp4_gemm:
+        return fp4_gemm(
+            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+        )
+    else:
+        return fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+
+
+@torch.library.register_fake("sglang::fp4_gemm")
+def _sglang_fp4_gemm_fake(
+    input,
+    weight,
+    input_sf,
+    weight_sf,
+    alpha,
+    out_dtype,
+    out_features: int,
+):
+    M = input.shape[-2]
+    N = int(out_features)
+    return input.new_empty((M, N), dtype=out_dtype)
+
+
+if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
+
+    @torch.library.register_fake("sgl_kernel::scaled_fp4_quant")
+    def _sgl_kernel_scaled_fp4_quant_fake(
+        output, input, output_scale, input_global_scale
+    ):
+        return
+
+
 CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
     "SGLANG_CUTEDSL_MOE_SCALAR_INPUT_SCALE", "true"
 )
 
 # TODO make it true by default when the DeepEP PR is merged
-CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
-    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
-)
+MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
@@ -1079,14 +1119,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         backend = (
             FLASHINFER_FP4_GEMM_BACKEND if FLASHINFER_FP4_GEMM_BACKEND else "cutlass"
         )
-        out = fp4_gemm(
+        out = _sglang_fp4_gemm(
             x_fp4,
             w,
             x_scale_interleaved,
             w_scale_interleaved,
             layer.alpha,
             output_dtype,
-            **(dict(backend=backend)),
+            w_n,
         )
         if bias is not None:
             out = out + bias
@@ -1450,7 +1490,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)
 
-            if CUTEDSL_MOE_NVFP4_DISPATCH:
+            if MOE_NVFP4_DISPATCH:
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
         else:
@@ -1476,7 +1516,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant if CUTEDSL_MOE_NVFP4_DISPATCH else None
+                    layer.w13_input_scale_quant if MOE_NVFP4_DISPATCH else None
                 )
             }
         )
@@ -1584,11 +1624,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self,
         layer: FusedMoE,
         dispatch_output: StandardDispatchOutput,
-        forward_shared_experts=None,
-        alt_stream=None,
     ) -> CombineInput:
 
         x = dispatch_output.hidden_states
+        x_sf = dispatch_output.hidden_states_scale
         topk_output = dispatch_output.topk_output
 
         assert (
@@ -1612,39 +1651,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # and fp4 quantized weights loaded from the checkpoint
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
-            output_dtype = x.dtype
-            original_col = x.shape[1]
-            x_sf = None
-
-            if should_use_flashinfer_cutlass_moe_fp4_allgather():
-                from flashinfer import nvfp4_block_scale_interleave
-
-                # Quantize before comm, swizzle after.
-                with use_symmetric_memory(
-                    get_tp_group(), disabled=not is_allocation_symmetric()
-                ):
-                    if x.shape[0] > 0:
-                        x, x_sf = fp4_quantize_flashinfer(
-                            x, layer.w13_input_scale_quant, is_sf_swizzled_layout=False
-                        )
-                    else:
-                        x_col = x.shape[1]
-                        x = torch.zeros(
-                            0, x_col // 2, dtype=torch.uint8, device=x.device
-                        )
-                        x_sf = torch.zeros(
-                            0, x_col // 16, dtype=torch.uint8, device=x.device
-                        )
-                topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
-                    [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
-                )
-                x_sf = nvfp4_block_scale_interleave(x_sf)
+            output_dtype = torch.bfloat16
 
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
-                    x.shape[0], original_col, dtype=output_dtype, device=x.device
+                    x.shape[0], x.shape[1] * 2, dtype=output_dtype, device=x.device
                 )
 
             output = flashinfer_cutlass_fused_moe(
@@ -1670,20 +1683,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
-            if should_use_flashinfer_cutlass_moe_fp4_allgather():
-                output, global_output = get_local_dp_buffer(), output
-
-                if forward_shared_experts is not None:
-                    alt_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(alt_stream):
-                        forward_shared_experts()
-
-                get_tp_group().reduce_scatterv(
-                    global_output, output=output, sizes=get_dp_global_num_tokens()
-                )
-
-                if forward_shared_experts is not None:
-                    torch.cuda.current_stream().wait_stream(alt_stream)
 
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -1718,7 +1717,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         x: tuple[torch.Tensor, Optional[torch.Tensor]],
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
-        down_gemm_overlap_args: Optional["DownGemmOverlapArgs"],
     ) -> torch.Tensor:
         assert (
             moe_runner_config.activation == "silu"
@@ -1733,10 +1731,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             flashinfer_cutedsl_moe_masked,
         )
 
+        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
+            layer, "down_gemm_overlap_args", None
+        )
+
         out = flashinfer_cutedsl_moe_masked(
             hidden_states=x,
             input_global_scale=(
-                None if CUTEDSL_MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
+                None if MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
             ),
             w1=layer.w13_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,
