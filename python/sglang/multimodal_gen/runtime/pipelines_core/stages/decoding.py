@@ -103,11 +103,10 @@ class DecodingStage(PipelineStage):
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
-        vae_arch_config = server_args.pipeline_config.vae_config.arch_config
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)
-        latents = server_args.pipeline_config.pre_decoding(latents)
+        latents = server_args.pipeline_config.preprocess_decoding(latents)
 
         # Decode latents
         with torch.autocast(

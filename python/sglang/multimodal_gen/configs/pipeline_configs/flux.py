@@ -417,16 +417,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {
-            "freqs_cis": self.get_freqs_cis(
-                batch.negative_prompt_embeds[0],
-                batch.width,
-                batch.height,
-                device,
-                rotary_emb,
-                batch,
-            )
-        }
+        return {}
 
     def maybe_pack_latents(self, latents, batch_size, batch):
         batch_size, num_channels, height, width = latents.shape
@@ -453,7 +444,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latents = (image_latents - latents_bn_mean) / latents_bn_std
         return image_latents
 
-    def pre_decoding(self, latents):
+    def preprocess_decoding(self, latents):
         latents = _unpatchify_latents(latents)
         return latents
 

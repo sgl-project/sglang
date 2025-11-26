@@ -1053,7 +1053,7 @@ class DenoisingStage(PipelineStage):
         current_model: torch.nn.Module,
         latent_model_input: torch.Tensor,
         timestep,
-        batch,
+        batch: Req,
         timestep_index: int,
         attn_metadata,
         target_dtype,

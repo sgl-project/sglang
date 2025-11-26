@@ -816,8 +816,6 @@ class Flux2Transformer2DModel(CachableDiT):
         timestep: torch.LongTensor = None,
         guidance: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
-        # img_ids: torch.Tensor = None,
-        # txt_ids: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         """
