@@ -112,6 +112,44 @@ class ExpertLocationMetadata:
         )
 
     @staticmethod
+    def init_round_robin(server_args: ServerArgs, model_config: ModelConfig):
+        """round_robin location - logical expert i corresponds to physical expert i"""
+        """but have static round robin expert placement stragey"""
+
+        common = ExpertLocationMetadata._init_common(server_args, model_config)
+
+        if common is None:
+            return None
+
+        num_physical_experts = common["num_physical_experts"]
+        model_config_for_expert_location = common["model_config_for_expert_location"]
+        num_layers = model_config_for_expert_location.num_layers
+        num_logical_experts = model_config_for_expert_location.num_logical_experts
+        ep_size = common["ep_size"]
+        assert num_physical_experts % ep_size == 0
+        num_local_physical_experts = num_physical_experts // ep_size
+
+        def _round_robin_placement():
+            rr_list = [
+                i + j * ep_size
+                for i in range(ep_size)
+                for j in range(num_local_physical_experts)
+            ]
+            rr_physical_to_logical_map = (
+                torch.tensor(rr_list, dtype=torch.int32).repeat(num_layers, 1)
+                % num_logical_experts
+            )
+            return rr_physical_to_logical_map
+
+        rr_physical_to_logical_map = _round_robin_placement()
+
+        return ExpertLocationMetadata.init_by_mapping(
+            server_args,
+            model_config,
+            physical_to_logical_map=rr_physical_to_logical_map,
+        )
+
+    @staticmethod
     def init_by_mapping(
         server_args: ServerArgs,
         model_config: ModelConfig,
@@ -541,6 +579,8 @@ def compute_initial_expert_location_metadata(
         return ExpertLocationMetadata.init_trivial(
             server_args, model_config, moe_ep_rank
         )
+    if data == "round_robin":
+        return ExpertLocationMetadata.init_round_robin(server_args, model_config)
 
     # TODO unify with the utils function
     if data.endswith(".pt"):

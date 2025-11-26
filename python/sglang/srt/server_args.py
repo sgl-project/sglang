@@ -415,7 +415,7 @@ class ServerArgs:
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
-    init_expert_location: str = "trivial"
+    init_expert_location: Optional[Literal["trivial", "round_robin"]] = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
