@@ -1,28 +1,27 @@
-import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
 
-from sglang.srt.hf_transformers_utils import AutoConfig
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 
 @dataclass
 class LoRABatchInfo:
+    # The forward mode is using CUDA Graph.
+    use_cuda_graph: bool
+
     # Batch size
     bs: int
 
-    # Lengths of each sequence in shape (bs,)
-    seg_lens: torch.Tensor
+    # Number of segments. For triton backend, it is equal to batch size.
+    num_segments: int
 
-    # Indice pointers of each sequence in shape (bs + 1, )
+    # Indice pointers of each segment in shape (num_segments + 1, )
     seg_indptr: torch.Tensor
 
-    # Maximum sequence length of current batch
-    max_len: int
-
-    # The index of lora adapter used by each sequence, in shape (bs,)
+    # The index of lora adapter used by each segment, in shape (num_segments,)
     weight_indices: torch.Tensor
 
     # ranks of each lora adapter, in shape (lora_num,)
@@ -31,31 +30,30 @@ class LoRABatchInfo:
     # scaling of each lora adapter, in shape (lora_num,)
     scalings: torch.Tensor
 
+    # Maximum segment length of current batch
+    max_len: Optional[int]
+
+    # Lengths of each segments in shape (num_segments,)
+    seg_lens: Optional[torch.Tensor]
+
+    # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
+    permutation: Optional[torch.Tensor]
+
 
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
 
 
-def get_layer_id(name: str) -> int:
-    """
-    Extract integer id of layer from its name in string.
-    """
-    match = re.search(r"layers\.(\d+)\.", name)
-    if match is None:
-        return None
-    return int(match.group(1))
-
-
 def get_hidden_dim(
-    module_name: str, config: AutoConfig, base_model: torch.nn.Module
+    module_name: str, config: AutoConfig, base_model: torch.nn.Module, layer_idx: int
 ) -> Tuple[int]:
     """
     Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
     """
 
     if hasattr(base_model, "get_hidden_dim"):
-        return base_model.get_hidden_dim(module_name)
+        return base_model.get_hidden_dim(module_name, layer_idx)
     else:
         """
         WARNING: get_hidden_dim() is not defined,
@@ -89,6 +87,7 @@ def get_normalized_target_modules(
 ) -> set[str]:
     """
     Mapping a list of target module name to names of the normalized LoRA weights.
+    Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
     """
     params_mapping = {
         "q_proj": "qkv_proj",
@@ -100,7 +99,8 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
-        normalized_name = params_mapping.get(name, name)
+        base_name = name.split(".")[-1]
+        normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
 

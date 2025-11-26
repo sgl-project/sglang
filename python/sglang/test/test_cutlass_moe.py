@@ -1,5 +1,4 @@
 import argparse
-import time
 
 import torch
 import triton  # Added import
@@ -8,11 +7,21 @@ from transformers import AutoConfig
 
 from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+
+# Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
+def calc_diff(x, y):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
 
 
 def get_model_config(tp_size: int):
     config = AutoConfig.from_pretrained(
-        "deepseek-ai/deepseek-R1", trust_remote_code=True
+        "deepseek-ai/Deepseek-R1", trust_remote_code=True
     )
     E = config.n_routed_experts
     topk = config.num_experts_per_tok
@@ -24,7 +33,7 @@ def get_model_config(tp_size: int):
         "topk": topk,
         "hidden_size": config.hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
+        "dtype": config.dtype,
         "block_shape": config.quantization_config["weight_block_size"],
     }
 
@@ -69,16 +78,11 @@ def run_test(tp_size, batch_size, model_config, check=False):
 
     # --- Input Data ---
     # Use bf16/fp16 for input activation based on model config
-    x = torch.randn((batch_size, H), device="cuda", dtype=dtype) * 0.0001
+    x = torch.randn((batch_size, H), device="cuda", dtype=dtype)
     # --- Weights (Generate in higher precision, then convert to FP8) ---
     # Generate weights suitable for FP8 conversion (e.g., scaled appropriately)
-    w1_hp = (
-        torch.randn((E, I, H), device="cuda", dtype=torch.float32) * 0.00001 + 0.00001
-    )
-    w2_hp = (
-        torch.randn((E, H, I // 2), device="cuda", dtype=torch.float32) * 0.00001
-        + 0.00001
-    )
+    w1_hp = torch.randn((E, I, H), device="cuda", dtype=torch.float32)
+    w2_hp = torch.randn((E, H, I // 2), device="cuda", dtype=torch.float32)
 
     w1 = to_fp8(w1_hp)
     w2 = to_fp8(w2_hp)
@@ -124,6 +128,12 @@ def run_test(tp_size, batch_size, model_config, check=False):
     problem_sizes1 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
     problem_sizes2 = torch.empty((E, 3), dtype=torch.int32, device="cuda")
 
+    enable_es = (False, False)
+    if torch.cuda.get_device_name(torch.cuda.current_device()) == "NVIDIA H200":
+        enable_es = (False, True)
+    elif torch.cuda.get_device_name(torch.cuda.current_device()) == "NVIDIA H20":
+        enable_es = (True, True)
+
     # --- Lambdas for Benchmarking ---
     cutlass_lambda = lambda: cutlass_fused_experts_fp8(
         x,
@@ -146,6 +156,25 @@ def run_test(tp_size, batch_size, model_config, check=False):
         expert_offsets,
         problem_sizes1,
         problem_sizes2,
+        enable_es=enable_es,
+    )
+
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=torch.randn(
+            (batch_size, topk), device=topk_weights.device, dtype=dtype
+        ),
+    )
+
+    moe_runner_config = MoeRunnerConfig(
+        num_experts=E,
+        top_k=topk,
+        hidden_size=H,
+        intermediate_size_per_partition=I,
+        params_dtype=dtype,
+        activation="silu",
+        inplace=False,
     )
 
     # Note: Triton expects non-transposed weights
@@ -153,9 +182,8 @@ def run_test(tp_size, batch_size, model_config, check=False):
         x,
         w1,
         w2,
-        (topk_weights, topk_ids, "dummy"),
-        inplace=False,
-        activation="silu",  # Assuming SiLU activation common in MoEs
+        topk_output,
+        moe_runner_config,
         use_fp8_w8a8=True,
         w1_scale=w1_scale,
         w2_scale=w2_scale,
@@ -213,6 +241,7 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 expert_offsets,
                 problem_sizes1,
                 problem_sizes2,
+                enable_es=enable_es,
             )
 
             # Run Triton version (requires original shape weights, use inplace=False)
@@ -220,33 +249,20 @@ def run_test(tp_size, batch_size, model_config, check=False):
                 x,
                 w1,  # Original shape
                 w2,  # Original shape
-                (topk_weights, topk_ids, "dummy"),
-                inplace=False,  # Important: Use False to get output tensor
-                activation="silu",
+                topk_output,
+                moe_runner_config,
                 use_fp8_w8a8=True,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
             )
 
-        # Ensure outputs are same dtype for comparison
-        y_cutlass = y_cutlass.to(dtype)
-        y_triton = y_triton.to(dtype)
-
-        abs_error = torch.abs(y_cutlass - y_triton)
-        rel_error = abs_error / torch.clamp(torch.abs(y_triton), min=1e-2)
-
-        max_abs_err = abs_error.max().item()
-        max_rel_err = rel_error.max().item()
-
-        print("y_cutlass:", y_cutlass[:, :10])
-        print("y_triton:", y_triton[:, :10])
-        print(f"Max absolute error: {max_abs_err:.6f}")
-        print(f"Max relative error: {max_rel_err:.6f}")
+        diff = calc_diff(y_cutlass, y_triton)
+        print(f"Diff: {diff:.6f}")
 
         # Tolerance might need adjustment based on FP8 specifics and kernel differences
         # FP8 comparisons often require higher tolerance than FP16/BF16
-        assert max_rel_err < 5e-1, f"Relative error too high! {max_rel_err}"
+        assert diff < 1e-4, f"Diff too high! {diff}"
         print("Correctness check passed.")
 
 
@@ -264,7 +280,21 @@ if __name__ == "__main__":
         "--batch-sizes",
         type=int,
         nargs="+",
-        default=[1, 4, 8, 16, 32, 64, 128, 256, 512, 1024],  # Adjusted default
+        default=[
+            1,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+        ],  # Adjusted default
         help="List of batch sizes to test",
     )
     parser.add_argument("--check", action="store_true", help="Enable check mode")

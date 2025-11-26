@@ -42,17 +42,20 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
+from sglang.srt.utils import is_cuda
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
-
-from sglang.srt.utils import is_cuda
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle
+    from sgl_kernel import gptq_gemm, gptq_marlin_repack, gptq_shuffle
 
 
 logger = logging.getLogger(__name__)
@@ -196,7 +199,6 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
-        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
@@ -838,19 +840,14 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.linear import set_weight_attrs
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
-        intermediate_size = extra_weight_attrs.pop("intermediate_size")
-
-        self.is_k_full = (not self.quant_config.desc_act) or (
-            intermediate_size_per_partition == intermediate_size
-        )
+        self.is_k_full = (not self.quant_config.desc_act) or layer.moe_tp_size == 1
 
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
-            w2_scales_size = (
-                intermediate_size
-                if self.quant_config.desc_act
-                else intermediate_size_per_partition
-            )
+            if self.quant_config.desc_act:
+                w2_scales_size = intermediate_size_per_partition
+            else:
+                w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
@@ -1052,17 +1049,26 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         )
         replace_parameter(layer, "w2_scales", marlin_w2_scales)
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-        # Delay the import to avoid circular dependency
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
         assert (
-            moe_runner_config.activation == "silu"
+            self.moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
 
         # The input must currently be float16
@@ -1071,7 +1077,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 
         topk_weights, topk_ids, router_logits = topk_output
 
-        return fused_marlin_moe(
+        output = fused_marlin_moe(
             x,
             layer.w13_qweight,
             layer.w2_qweight,
@@ -1087,3 +1093,51 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             num_bits=self.quant_config.weight_bits,
             is_k_full=self.is_k_full,
         ).to(orig_dtype)
+        return StandardCombineInput(hidden_states=output)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @register_fake_if_exists("sgl_kernel::gptq_gemm")
+    def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
+        return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
+
+    @register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
+    def _(b_q_weight, perm, size_k, size_n, num_bits):
+        return b_q_weight.new_empty(
+            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
+        )
+
+    @register_fake_if_exists("sgl_kernel::gptq_shuffle")
+    def _(q_weight, q_perm, bit):
+        return
+
+    @register_fake_if_exists("sgl_kernel::moe_wna16_marlin_gemm")
+    def _(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        b_zeros,
+        g_idx,
+        perm,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        is_ep,
+        b_q_type_id,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    ):
+        return c

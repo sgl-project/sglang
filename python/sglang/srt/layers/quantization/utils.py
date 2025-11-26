@@ -11,7 +11,6 @@ import numpy
 import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -77,6 +76,19 @@ def is_layer_skipped(
                 )
     else:
         is_skipped = prefix in ignored_layers
+        if "gate_up_proj" in prefix:
+            prefix_gate = prefix.replace("gate_up_proj", "gate_proj")
+            prefix_up = prefix.replace("gate_up_proj", "up_proj")
+            if prefix_gate in ignored_layers and prefix_up in ignored_layers:
+                is_skipped = True
+        elif "experts" in prefix:
+            is_skipped = any(
+                [
+                    prefix in layer_name
+                    for layer_name in ignored_layers
+                    if "experts" in layer_name
+                ]
+            )
 
     assert is_skipped is not None
     return is_skipped
@@ -174,6 +186,27 @@ def replace_parameter(
         if not isinstance(new, torch.nn.Parameter):
             new = torch.nn.Parameter(new, requires_grad=False)
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
+
+
+def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
+    assert a.shape == b.shape
+    assert a.dtype == b.dtype == torch.float8_e4m3fn
+
+    a_u8 = a.view(torch.uint8)
+    b_u8 = b.view(torch.uint8)
+    diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
+
+    numel = a.numel()
+
+    count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum().item()
+    count_tiny_diff = (diff_u8 >= 1).sum().item()
+    count_large_diff = (diff_u8 >= 2).sum().item()
+
+    assert (
+        (count_diff_sign == 0)
+        and (count_tiny_diff / numel < 0.005)
+        and (count_large_diff == 0)
+    ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=}"
 
 
 # Match dynamic rules with module name (prefix) and override quantize

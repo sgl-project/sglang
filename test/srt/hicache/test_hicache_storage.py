@@ -1,7 +1,8 @@
+import time
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -10,6 +11,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+_is_hip = is_hip()
 
 
 class TestHiCache(CustomTestCase):
@@ -26,7 +29,7 @@ class TestHiCache(CustomTestCase):
                 "--mem-fraction-static",
                 0.7,
                 "--hicache-size",
-                100,
+                100 if not _is_hip else 200,
                 "--page-size",
                 "64",
                 "--hicache-storage-backend",
@@ -37,6 +40,7 @@ class TestHiCache(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        time.sleep(5)
 
     def test_mmlu(self):
         args = SimpleNamespace(

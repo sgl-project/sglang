@@ -1,7 +1,8 @@
 #[cfg(test)]
-use super::*;
-#[cfg(test)]
 use std::sync::Arc;
+
+#[cfg(test)]
+use super::*;
 
 #[test]
 fn test_mock_tokenizer_encode() {
@@ -36,22 +37,17 @@ fn test_tokenizer_wrapper() {
     let mock_tokenizer = Arc::new(mock::MockTokenizer::new());
     let tokenizer = Tokenizer::from_arc(mock_tokenizer);
 
-    // Test encoding
     let encoding = tokenizer.encode("Hello world").unwrap();
     assert_eq!(encoding.token_ids(), &[1, 2]);
 
-    // Test decoding
     let text = tokenizer.decode(&[1, 2], false).unwrap();
     assert_eq!(text, "Hello world");
 
-    // Test vocab size
-    assert_eq!(tokenizer.vocab_size(), 8);
+    assert_eq!(tokenizer.vocab_size(), 14);
 
-    // Test token to ID
     assert_eq!(tokenizer.token_to_id("Hello"), Some(1));
     assert_eq!(tokenizer.token_to_id("unknown"), None);
 
-    // Test ID to token
     assert_eq!(tokenizer.id_to_token(1), Some("Hello".to_string()));
     assert_eq!(tokenizer.id_to_token(9999), None);
 }

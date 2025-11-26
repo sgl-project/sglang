@@ -1,68 +1,40 @@
 import json
 import logging
 import re
-from typing import List
+from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.parser.harmony_parser import HarmonyParser
 
 logger = logging.getLogger(__name__)
 
 
 class GptOssDetector(BaseFormatDetector):
     """
-    Detector for T4-style function calls with channel format.
+    Detector for T4-style function calls using HarmonyParser.
 
-    Supports two formats:
-    1. Direct function call: <|channel|>commentary to={namespace.function}<|constrain|>json<|message|>{args}<|call|>
-    2. Commentary with action plan: <|channel|>commentary<|message|>{content}<|end|>
-
-    For parallel function calls, each call is self-contained and starts with its own channel:
-    <|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location":"SF"}<|call|>
-    <|channel|>commentary to=functions.search<|constrain|>json<|message|>{"query":"SF attractions"}<|call|>
-
-    Examples:
-    Single: <|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location":"San Francisco"}<|call|>commentary
-    Multiple: <|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"location":"Paris"}<|call|>commentary<|channel|>commentary to=functions.search<|constrain|>json<|message|>{"query":"Paris tourism"}<|call|>
-    With Action Plan: <|channel|>commentary<|message|>**Action plan**: 1. Do X 2. Do Y<|end|><|start|>assistant<|channel|>commentary to=functions.x<|constrain|>json<|message|>{"template": "basic_html", "path": "index.html"}<|call|>
+    Handles tool calls in the format:
+    <|channel|>commentary to={namespace.function}<|constrain|>json<|message|>{args}<|call|>
     """
 
     def __init__(self):
         super().__init__()
+        self.harmony_parser = HarmonyParser()
         self.bot_token = "<|start|>assistant<|channel|>commentary"
         self.eot_token = "<|call|>"
-        # TODO: no clear indication how parallel tool call response format is
-        self.tool_call_separator = ""
 
-        # Pattern for complete function calls with to= parameter
-        # Handles both <|call|> and <|call|>commentary endings
-        # Also handles optional <|start|>assistant prefix and whitespace after function name
-        self.function_call_pattern = re.compile(
-            r"(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*"
-            r"<\|constrain\|>json<\|message\|>(.*?)<\|call\|>(?:commentary)?",
+        # Pattern to extract function name and JSON from tool_call event content
+        self.tool_extract_pattern = re.compile(
+            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*<\|constrain\|>json<\|message\|>(.*?)(?:<\|call\|>|$)",
             re.DOTALL,
         )
-
-        # Pattern for streaming function calls (incomplete)
-        # Also handles optional whitespace after function name
-        self.streaming_pattern = re.compile(
-            r"(?:<\|start\|>assistant)?<\|channel\|>commentary to=([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*"
-            r"<\|constrain\|>json<\|message\|>(.*)",
-            re.DOTALL,
-        )
-
-        # Pattern for commentary with action plan (no to= parameter)
-        self.commentary_pattern = re.compile(
-            r"<\|channel\|>commentary<\|message\|>(.*?)<\|end\|>",
-            re.DOTALL,
-        )
-
-        self._last_arguments = ""
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains TypeScript-style function call markers."""
@@ -73,259 +45,197 @@ class GptOssDetector(BaseFormatDetector):
         if not self.has_tool_call(text):
             return StreamingParseResult(normal_text=text, calls=[])
 
-        tool_indices = self._get_tool_indices(tools)
+        # Parse with HarmonyParser
+        events = self.harmony_parser.parse(text)
+        # Flush buffer for complete parsing
+        events += self.harmony_parser.parse("")
 
+        tool_indices = self._get_tool_indices(tools)
         calls = []
+        normal_parts = []
         tool_index = 0
 
-        # Process the entire text to handle mixed commentary and tool calls
-        normal_text_parts = []
-
-        # Find all commentary sections (both with and without to=)
-        all_commentary_pattern = re.compile(
-            r"<\|channel\|>commentary(?:\s+to=[^<]*)?<\|message\|>(.*?)(?:<\|end\|>|<\|call\|>)",
-            re.DOTALL,
-        )
-
-        # Track processed positions to avoid double-processing
-        processed_ranges = []
-
-        # First, extract all tool calls
-        for match in self.function_call_pattern.finditer(text):
-            full_function_name = match.group(1)
-            args_content = match.group(2)
-            processed_ranges.append((match.start(), match.end()))
-
-            function_name = (
-                full_function_name.split(".")[-1]
-                if "." in full_function_name
-                else full_function_name
-            )
-
-            try:
-                arguments = json.loads(args_content) if args_content.strip() else {}
-            except json.JSONDecodeError:
-                continue
-
-            if function_name in tool_indices:
-                calls.append(
-                    ToolCallItem(
-                        tool_index=tool_index,
-                        name=function_name,
-                        parameters=json.dumps(arguments, ensure_ascii=False),
-                    )
+        for event in events:
+            if event.event_type == "tool_call":
+                # Extract tool call from event content
+                tool_call = self._extract_tool_call_from_event(
+                    event.raw_text if event.raw_text else event.content,
+                    tool_indices,
+                    tool_index,
                 )
-                tool_index += 1
+                if tool_call:
+                    calls.append(tool_call)
+                    tool_index += 1
+            elif event.event_type == "normal":
+                normal_parts.append(event.content)
+            # Ignore reasoning events in function call context
 
-        # Then, find non-tool-call commentary sections for normal text
-        for match in all_commentary_pattern.finditer(text):
-            # Check if this match overlaps with any processed tool call
-            match_start, match_end = match.start(), match.end()
-            is_tool_call = any(
-                start <= match_start < end or start < match_end <= end
-                for start, end in processed_ranges
-            )
-
-            # If this commentary is not part of a tool call, include it in normal text
-            if not is_tool_call:
-                content = match.group(1).strip()
-                if content:
-                    normal_text_parts.append(content)
-
-        # Handle remaining text after all matches
-        if processed_ranges:
-            last_match_end = max(end for _, end in processed_ranges)
-            if last_match_end < len(text):
-                remaining_text = text[last_match_end:]
-
-            # Clean up <|start|>assistant prefixes and extract final content
-            # Remove standalone <|start|>assistant prefixes
-            remaining_text = re.sub(r"<\|start\|>assistant(?!\w)", "", remaining_text)
-
-            # Extract content from final channel if present
-            final_pattern = re.compile(
-                r"<\|channel\|>final<\|message\|>(.*?)(?:<\|return\|>|$)", re.DOTALL
-            )
-            final_match = final_pattern.search(remaining_text)
-
-            if final_match:
-                # Get everything before final channel + final channel content
-                before_final = remaining_text[: final_match.start()].strip()
-                final_content = final_match.group(1).strip()
-
-                parts = []
-                if before_final:
-                    parts.append(before_final)
-                if final_content:
-                    parts.append(final_content)
-                remaining_text = " ".join(parts) if parts else ""
-
-            remaining_text = remaining_text.strip()
-
-            if remaining_text:
-                normal_text_parts.append(remaining_text)
-
-        # Combine all normal text parts
-        final_normal_text = " ".join(part for part in normal_text_parts if part).strip()
-        return StreamingParseResult(normal_text=final_normal_text, calls=calls)
+        normal_text = " ".join(normal_parts).strip()
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         """Parse incremental streaming text for TypeScript-style function calls."""
         self._buffer += new_text
-        current_text = self._buffer
 
-        # Check if we have a tool call
-        has_tool_call = "<|channel|>commentary to=" in current_text
+        # Always use HarmonyParser for parsing to ensure proper filtering
+        events = self.harmony_parser.parse(new_text)
 
-        if not has_tool_call and current_text:
-            # Check for commentary without function calls
-            commentary_match = self.commentary_pattern.search(current_text)
-            if commentary_match:
-                commentary_content = commentary_match.group(1)
-                self._buffer = current_text[commentary_match.end() :]
-                return StreamingParseResult(normal_text=commentary_content, calls=[])
-
-            # Check for final channel content
-            final_pattern = re.compile(
-                r"<\|channel\|>final<\|message\|>(.*?)(?:<\|return\|>|$)",
-                re.DOTALL,
+        # If there are no parsed events and the chunk contains no Harmony structural
+        # markers, treat it as plain text and pass it through. This fixes a bug where
+        # normal content was held in the buffer when tools were provided but not used.
+        if not events:
+            has_harmony_markers = any(
+                marker in self._buffer
+                for marker in (
+                    "<|start|>",
+                    "<|channel|>",
+                    "<|message|>",
+                    "<|constrain|>",
+                    "<|end|>",
+                    "<|call|>",
+                    "<|return|>",
+                    "assistantfinal",
+                )
             )
-            final_match = final_pattern.search(current_text)
-            if final_match:
-                final_content = final_match.group(1).strip()
+            if not has_harmony_markers:
+                # Plain text with no tool markers — emit as normal content
+                out = self._buffer
                 self._buffer = ""
-                return StreamingParseResult(normal_text=final_content, calls=[])
+                return StreamingParseResult(normal_text=out, calls=[])
 
-            self._buffer = ""
-            return StreamingParseResult(normal_text=new_text, calls=[])
+        # Quick check if we might have tool calls
+        if (
+            "<|channel|>commentary to=" not in self._buffer
+            and not self.current_tool_name_sent
+        ):
+            # No tool calls detected, check for final content
+            if (
+                "<|channel|>final" in self._buffer
+                or "assistantfinal" in self._buffer.lower()
+            ):
+                # Extract normal text from events
+                normal_text = "".join(
+                    [e.content for e in events if e.event_type == "normal"]
+                )
+                if normal_text:
+                    self._buffer = ""
+                    return StreamingParseResult(normal_text=normal_text, calls=[])
 
+            # For other content, extract normal text from events (with filtering applied)
+            normal_text = "".join(
+                [e.content for e in events if e.event_type == "normal"]
+            )
+            if normal_text or events:
+                self._buffer = ""
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+            else:
+                # No events processed, continue buffering
+                return StreamingParseResult(normal_text="", calls=[])
+
+        if not events:
+            # No complete events yet
+            return StreamingParseResult(normal_text="", calls=[])
+
+        # Initialize state if needed
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
         calls = []
-        try:
-            # Check for streaming function call
-            match = self.streaming_pattern.search(current_text)
-            if match:
-                full_function_name = match.group(1)
-                args_content = match.group(2)
+        normal_text = ""
 
-                function_name = (
-                    full_function_name.split(".")[-1]
-                    if "." in full_function_name
-                    else full_function_name
+        for event in events:
+            if event.event_type == "tool_call":
+                # We got a complete tool call from HarmonyParser
+                tool_call_info = self._extract_tool_call_from_event(
+                    event.raw_text if event.raw_text else event.content,
+                    self._tool_indices,
+                    self.current_tool_id if self.current_tool_id >= 0 else 0,
                 )
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
+                if tool_call_info:
+                    # Initialize state if first tool
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                        self.prev_tool_call_arr = []
+                        self.streamed_args_for_tool = [""]
 
-                # Ensure we have enough entries in tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
+                    # Ensure arrays are large enough
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
 
-                if not self.current_tool_name_sent:
-                    calls.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=function_name,
-                            parameters="",
-                        )
-                    )
-                    self.current_tool_name_sent = True
-                    # Store the tool call info
+                    # Store tool call info
                     self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": function_name,
-                        "arguments": {},
+                        "name": tool_call_info.name,
+                        "arguments": json.loads(tool_call_info.parameters),
                     }
-                    self.streamed_args_for_tool[self.current_tool_id] = ""
 
-                # Check if we have a complete function call
-                complete_match = self.function_call_pattern.search(current_text)
-                if complete_match:
-                    args_content = complete_match.group(2)
+                    # Emit the complete tool call at once
+                    # (Could be modified to emit name first, then args, if needed)
+                    calls.append(tool_call_info)
 
-                    try:
-                        parsed_args = json.loads(args_content)
-                        self.prev_tool_call_arr[self.current_tool_id][
-                            "arguments"
-                        ] = parsed_args
-
-                        # Send complete arguments if we haven't sent them yet
-                        if not self.streamed_args_for_tool[self.current_tool_id]:
-                            # Send the complete arguments as JSON string
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters=json.dumps(
-                                        parsed_args, ensure_ascii=False
-                                    ),
-                                )
-                            )
-                            self.streamed_args_for_tool[self.current_tool_id] = (
-                                json.dumps(parsed_args, ensure_ascii=False)
-                            )
-                    except json.JSONDecodeError:
-                        pass
-
-                    # Remove the completed function call from buffer
-                    remaining_after_call = current_text[complete_match.end() :]
-
-                    # Clean up <|start|>assistant prefixes and extract final content
-                    remaining_after_call = re.sub(
-                        r"<\|start\|>assistant(?!\w)", "", remaining_after_call
+                    # Mark as streamed
+                    self.streamed_args_for_tool[self.current_tool_id] = (
+                        tool_call_info.parameters
                     )
 
-                    # Extract content from final channel if present
-                    final_pattern = re.compile(
-                        r"<\|channel\|>final<\|message\|>(.*?)(?:<\|return\|>|$)",
-                        re.DOTALL,
-                    )
-                    final_match = final_pattern.search(remaining_after_call)
-
-                    if final_match:
-                        before_final = remaining_after_call[
-                            : final_match.start()
-                        ].strip()
-                        final_content = final_match.group(1).strip()
-
-                        parts = []
-                        if before_final:
-                            parts.append(before_final)
-                        if final_content:
-                            parts.append(final_content)
-                        remaining_after_call = " ".join(parts) if parts else ""
-
-                    self._buffer = remaining_after_call.strip()
-
-                    # Reset state for next tool call
-                    self.current_tool_name_sent = False
+                    # Move to next tool
                     self.current_tool_id += 1
+                    self.current_tool_name_sent = False
 
-                    # Return final content if available
-                    final_text = ""
-                    if final_match and final_content:
-                        final_text = final_content
-                    elif remaining_after_call:
-                        final_text = remaining_after_call
+            elif event.event_type == "normal":
+                normal_text += event.content
 
-                    return StreamingParseResult(normal_text=final_text, calls=calls)
+        # Clear buffer since HarmonyParser handles buffering
+        self._buffer = ""
 
-            return StreamingParseResult(normal_text="", calls=calls)
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
-        except Exception as e:
-            logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text, calls=[])
+    def _extract_tool_call_from_event(
+        self, content: str, tool_indices: dict, tool_index: int
+    ) -> Optional[ToolCallItem]:
+        """
+        Extract tool call information from HarmonyParser event content.
+
+        Content format: "commentary to=functions.get_weather<|constrain|>json<|message|>{...}"
+        """
+        match = self.tool_extract_pattern.search(content)
+
+        if not match:
+            logger.debug(f"Could not extract tool call from: {content[:100]}")
+            return None
+
+        full_function_name = match.group(1)
+        json_content = match.group(2)
+
+        # Extract function name (last part after .)
+        function_name = (
+            full_function_name.split(".")[-1]
+            if "." in full_function_name
+            else full_function_name
+        )
+
+        # Check if tool exists
+        if function_name not in tool_indices:
+            logger.debug(f"Function {function_name} not in available tools")
+            if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                return None  # Skip unknown tools (default legacy behavior)
+
+        # Parse JSON arguments
+        try:
+            arguments = json.loads(json_content) if json_content.strip() else {}
+        except json.JSONDecodeError as e:
+            logger.debug(f"Failed to parse JSON arguments: {e}")
+            return None
+
+        return ToolCallItem(
+            tool_index=tool_index,
+            name=function_name,
+            parameters=json.dumps(arguments, ensure_ascii=False),
+        )
 
     def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError()
-
-    def build_ebnf(self, tools: List[Tool]) -> str:
-        raise NotImplementedError()
+        raise NotImplementedError("structure_info not used with HarmonyParser")

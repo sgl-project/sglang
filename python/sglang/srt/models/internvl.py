@@ -1,4 +1,4 @@
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -14,10 +14,7 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
-    general_mm_embed_routine,
-)
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternTokenPairs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -26,8 +23,10 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_janus_pro import DropPath
+from sglang.srt.models.gpt_oss import GptOssForCausalLM
 from sglang.srt.models.internlm2 import InternLM2ForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.utils import logger
 
@@ -46,7 +45,6 @@ class InternAttention(nn.Module):
         self.scale = self.head_dim**-0.5
 
         self.attn = VisionAttention(
-            qkv_backend="fa3",
             embed_dim=self.embed_dim,
             num_heads=self.num_heads,
             projection_size=self.embed_dim,
@@ -445,6 +443,14 @@ class InternVLChatModel(nn.Module):
             self.language_model = Qwen3MoeForCausalLM(
                 config=config.llm_config, quant_config=quant_config
             )
+        elif config.llm_config.architectures[0] == "GptOssForCausalLM":
+            self.language_model = GptOssForCausalLM(
+                config=config.llm_config, quant_config=quant_config
+            )
+        elif config.llm_config.architectures[0] == "Qwen3ForCausalLM":
+            self.language_model = Qwen3ForCausalLM(
+                config=config.llm_config, quant_config=quant_config
+            )
         else:
             raise NotImplementedError(
                 f"{config.llm_config.architectures[0]} is not implemented."
@@ -461,6 +467,12 @@ class InternVLChatModel(nn.Module):
             nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size),
         )
+
+        self.external_mm_data_embedding_funcs = {
+            Modality.IMAGE: self.get_image_feature,
+        }
+
+        self.model = self.language_model.model
 
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
@@ -522,17 +534,25 @@ class InternVLChatModel(nn.Module):
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
 
-        hs = general_mm_embed_routine(
+        input_embeds = forward_batch.input_embeds
+        # It may seem strange to assign input_embeds again even after passing it as an argument.
+        # This is for compatibility considerations.
+        # In the 'extend' scenario, this forward function is called from two places:
+        # 1. model_runner calls forward directly,
+        # 2. piece_wise_cuda_graph_runner calls forward and replay.
+
+        # Currently,
+        # In 'extend', input_embeds is passed in.
+        # In 'decode', input_ids is passed in.
+
+        hidden_states = self.language_model(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            language_model=self.language_model,
-            data_embedding_funcs={
-                Modality.IMAGE: self.get_image_feature,
-            },
+            input_embeds=input_embeds,
             positions=positions,
         )
 
-        return hs
+        return hidden_states
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Get all special token IDs
@@ -577,9 +597,17 @@ class InternVLChatModel(nn.Module):
                 ckpt_up_proj_name="up_proj",
                 num_experts=self.config.num_experts,
             )
+        elif "Qwen3ForCausalLM" in self.config.llm_config.architectures:
+            stacked_params_mapping = [
+                # (param_name, shard_name, shard_id)
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
 
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -658,14 +686,6 @@ class InternVLChatModel(nn.Module):
                                 self.config, name, loaded_weight
                             )
                         weight_loader(param, loaded_weight)
-
-            loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            raise RuntimeError(
-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
-            )
-        return loaded_params
 
 
 EntryClass = InternVLChatModel

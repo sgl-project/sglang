@@ -1,4 +1,4 @@
-# SGLang on Ascend NPUs
+# Ascend NPUs
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
@@ -48,41 +48,23 @@ conda activate sglang_npu
 
 #### MemFabric Adaptor
 
-_TODO: MemFabric is still a working project yet open sourced til August/September, 2025. We will release it as prebuilt wheel package for now._
-
-_Notice: Prebuilt wheel package is based on `aarch64`, please leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) to let us know the requests for `amd64` build._
+_TODO: MemFabric is still a working project yet open sourced til end of year 2025. We will release it as prebuilt wheel package for now._
 
 MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```shell
-MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl"
-MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
-wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
+pip install mf-adapter==1.0.0
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
-Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release by the end of September, 2025.
-
 ```shell
-PYTORCH_VERSION=2.6.0
-TORCHVISION_VERSION=0.21.0
+PYTORCH_VERSION="2.8.0"
+TORCHVISION_VERSION="0.23.0"
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 
-PTA_VERSION="v7.1.0.1-pytorch2.6.0"
-PTA_NAME="torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
-PTA_URL="https://gitee.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
-wget -O "${PTA_NAME}" "${PTA_URL}" && pip install "./${PTA_NAME}"
-```
-
-#### vLLM
-
-vLLM is still a major prerequisite on Ascend NPU. Because of `torch==2.6.0` limitation, only vLLM v0.8.5 is supported.
-
-```shell
-VLLM_TAG=v0.8.5
-git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
-(cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
+PTA_VERSION="2.8.0"
+pip install torch-npu==$PTA_VERSION
 ```
 
 #### Triton on Ascend
@@ -99,10 +81,11 @@ We are also providing a DeepEP-compatible Library as a drop-in replacement of de
 
 ```shell
 # Use the last release branch
-git clone -b v0.5.0rc2 https://github.com/sgl-project/sglang.git
+git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
+rm -vf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]
 ```
 
@@ -118,7 +101,7 @@ git clone https://github.com/sgl-project/sglang.git
 cd sglang/docker
 
 # Build the docker image
-docker build -t sglang-npu:main -f Dockerfile.npu .
+docker build -t <image_name> -f npu.Dockerfile .
 
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -132,7 +115,7 @@ alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-siz
     --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
 
 drun --env "HF_TOKEN=<secret>" \
-    sglang-npu:main \
+    <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
 ```
 
@@ -149,7 +132,7 @@ Prefill:
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 
-drun sglang-npu:main \
+drun <image_name> \
     python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -174,8 +157,9 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 export HCCL_BUFFSIZE=200
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=24
+export SGLANG_NPU_USE_MLAPO=1
 
-drun sglang-npu:main \
+drun <image_name> \
     python3 -m sglang.launch_server --model-path State_Cloud/DeepSeek-R1-bf16-hfd-w8a8 \
     --trust-remote-code \
     --attention-backend ascend \
@@ -198,7 +182,7 @@ drun sglang-npu:main \
 Mini_LB:
 
 ```shell
-drun sglang-npu:main \
+drun <image_name> \
     python -m sglang.srt.disaggregation.launch_lb \
     --prefill http://<PREFILL_HOST_IP>:8000 \
     --decode http://<DECODE_HOST_IP>:8001 \

@@ -72,7 +72,7 @@ struct cutlass_3x_gemm_fp8_blockwise {
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
   using StoreEpilogueCompute = typename cutlass::epilogue::fusion::Sm90EVT<cutlass::epilogue::fusion::Sm90AccFetch>;
 
-  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8BlockScaledAccum;
+  using KernelSchedule = cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8Blockwise;
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,

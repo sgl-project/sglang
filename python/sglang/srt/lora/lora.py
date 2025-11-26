@@ -19,17 +19,18 @@
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
 import logging
-import re
 from typing import Dict, List
 
 import torch
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.hf_transformers_utils import AutoConfig
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class LoRALayer(nn.Module):
 
 
 class LoRAAdapter(nn.Module):
+
     def __init__(
         self,
         uid: str,
@@ -69,8 +71,6 @@ class LoRAAdapter(nn.Module):
             ]
         )
 
-        self.weights: Dict[str, torch.Tensor] = {}
-
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
@@ -81,12 +81,9 @@ class LoRAAdapter(nn.Module):
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
-            match = re.search(r"layers\.(\d+)\.", name)
-            if match is not None:
-                layer_id = int(match.group(1))
+            layer_id = get_layer_id(name)
+            if layer_id is not None:
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
-            else:
-                self.weights[name] = loaded_weight.cpu()
 
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:
@@ -156,8 +153,8 @@ class LoRAAdapter(nn.Module):
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
                 if up_name not in weights:
                     weights[up_name] = torch.zeros_like(weights[weight_name])
-                    assert self.lora_backend.name == "triton", (
-                        f"LoRA weight initialization currently only supported for 'triton' backend. "
+                    assert self.lora_backend.name in LORA_SUPPORTED_BACKENDS, (
+                        f"LoRA weight initialization currently only supported for LoRA backends: {', '.join(b for b in LORA_SUPPORTED_BACKENDS)}"
                         f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
                         f"or consider implementing custom initialization logic for other backends."
                     )

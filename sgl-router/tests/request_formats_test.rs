@@ -1,48 +1,30 @@
 mod common;
 
+use std::sync::Arc;
+
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::config::{
-    CircuitBreakerConfig, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+use sglang_router_rs::{
+    config::{RouterConfig, RoutingMode},
+    routers::{RouterFactory, RouterTrait},
 };
-use sglang_router_rs::routers::{RouterFactory, RouterTrait};
-use std::sync::Arc;
 
 /// Test context that manages mock workers
 struct TestContext {
     workers: Vec<MockWorker>,
-    router: Arc<dyn RouterTrait>,
+    _router: Arc<dyn RouterTrait>,
+    worker_urls: Vec<String>,
 }
 
 impl TestContext {
     async fn new(worker_configs: Vec<MockWorkerConfig>) -> Self {
-        let mut config = RouterConfig {
-            mode: RoutingMode::Regular {
-                worker_urls: vec![],
-            },
-            policy: PolicyConfig::Random,
-            host: "127.0.0.1".to_string(),
-            port: 3003,
-            max_payload_size: 256 * 1024 * 1024,
-            request_timeout_secs: 600,
-            worker_startup_timeout_secs: 1,
-            worker_startup_check_interval_secs: 1,
-            dp_aware: false,
-            api_key: None,
-            discovery: None,
-            metrics: None,
-            log_dir: None,
-            log_level: None,
-            request_id_headers: None,
-            max_concurrent_requests: 64,
-            cors_allowed_origins: vec![],
-            retry: RetryConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            disable_retries: false,
-            disable_circuit_breaker: false,
-            health_check: sglang_router_rs::config::HealthCheckConfig::default(),
-        };
+        let mut config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .port(3003)
+            .worker_startup_timeout_secs(1)
+            .worker_startup_check_interval_secs(1)
+            .build_unchecked();
 
         let mut workers = Vec::new();
         let mut worker_urls = Vec::new();
@@ -58,9 +40,12 @@ impl TestContext {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
 
-        config.mode = RoutingMode::Regular { worker_urls };
+        config.mode = RoutingMode::Regular {
+            worker_urls: worker_urls.clone(),
+        };
 
-        let app_context = common::create_test_context(config);
+        let app_context = common::create_test_context(config.clone()).await;
+
         let router = RouterFactory::create_router(&app_context).await.unwrap();
         let router = Arc::from(router);
 
@@ -68,7 +53,11 @@ impl TestContext {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
-        Self { workers, router }
+        Self {
+            workers,
+            _router: router,
+            worker_urls: worker_urls.clone(),
+        }
     }
 
     async fn shutdown(mut self) {
@@ -90,13 +79,11 @@ impl TestContext {
     ) -> Result<serde_json::Value, String> {
         let client = Client::new();
 
-        // Get any worker URL for testing
-        let worker_urls = self.router.get_worker_urls();
-        if worker_urls.is_empty() {
-            return Err("No available workers".to_string());
-        }
-
-        let worker_url = &worker_urls[0];
+        // Use the first worker URL from the context
+        let worker_url = self
+            .worker_urls
+            .first()
+            .ok_or_else(|| "No workers available".to_string())?;
 
         let response = client
             .post(format!("{}{}", worker_url, endpoint))
@@ -131,7 +118,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test 1: Basic text request
         let payload = json!({
             "text": "Hello, world!",
             "stream": false
@@ -140,7 +126,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test 2: Request with sampling parameters
         let payload = json!({
             "text": "Tell me a story",
             "sampling_params": {
@@ -154,7 +139,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test 3: Request with input_ids
         let payload = json!({
             "input_ids": [1, 2, 3, 4, 5],
             "sampling_params": {
@@ -181,7 +165,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test 1: Basic chat completion
         let payload = json!({
             "model": "test-model",
             "messages": [
@@ -202,7 +185,6 @@ mod request_format_tests {
             Some("chat.completion")
         );
 
-        // Test 2: Chat completion with parameters
         let payload = json!({
             "model": "test-model",
             "messages": [
@@ -231,7 +213,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test 1: Basic completion
         let payload = json!({
             "model": "test-model",
             "prompt": "Once upon a time",
@@ -249,7 +230,6 @@ mod request_format_tests {
             Some("text_completion")
         );
 
-        // Test 2: Completion with array prompt
         let payload = json!({
             "model": "test-model",
             "prompt": ["First prompt", "Second prompt"],
@@ -260,7 +240,6 @@ mod request_format_tests {
         let result = ctx.make_request("/v1/completions", payload).await;
         assert!(result.is_ok());
 
-        // Test 3: Completion with logprobs
         let payload = json!({
             "model": "test-model",
             "prompt": "The capital of France is",
@@ -286,7 +265,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test batch text generation
         let payload = json!({
             "text": ["First text", "Second text", "Third text"],
             "sampling_params": {
@@ -299,7 +277,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test batch with input_ids
         let payload = json!({
             "input_ids": [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
             "stream": false
@@ -322,7 +299,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test with return_logprob
         let payload = json!({
             "text": "Test",
             "return_logprob": true,
@@ -332,7 +308,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test with json_schema
         let payload = json!({
             "text": "Generate JSON",
             "sampling_params": {
@@ -345,7 +320,6 @@ mod request_format_tests {
         let result = ctx.make_request("/generate", payload).await;
         assert!(result.is_ok());
 
-        // Test with ignore_eos
         let payload = json!({
             "text": "Continue forever",
             "sampling_params": {
@@ -373,7 +347,6 @@ mod request_format_tests {
         }])
         .await;
 
-        // Test with empty body - should still work with mock worker
         let payload = json!({});
 
         let result = ctx.make_request("/generate", payload).await;

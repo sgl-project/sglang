@@ -22,7 +22,6 @@ import unittest
 import numpy as np
 import requests
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
@@ -188,6 +187,9 @@ def init_process_hf(
     print(f"[hf] {rank=} {broadcast_time=:.3f}s")
     param_queue.put(("broadcast_time", broadcast_time))
 
+    # Destroy process group and release related resource
+    torch.distributed.destroy_process_group(group)
+
     # Delete the huggingface models to free up memory.
     del hf_instruct_model
     del hf_base_model
@@ -343,6 +345,20 @@ def init_process_sgl(
                 ).json()
             )
     param_queue.put((f"sgl_dp_{rank}_base_params", base_params))
+
+    if backend == "Engine":
+        success, _ = engine.destroy_weights_update_group(
+            group_name="test_parameter_update_group",
+        )
+        assert success is True
+    else:
+        response = requests.post(
+            f"{url}/destroy_weights_update_group",
+            json={
+                "group_name": "test_parameter_update_group",
+            },
+        )
+        assert response.status_code == 200
 
     # Shutdown the engine or terminate the server process.
     if backend == "Engine":

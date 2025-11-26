@@ -5,7 +5,11 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import (
+    direct_register_custom_op,
+    is_flashinfer_available,
+    supports_custom_op,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +160,8 @@ def flashinfer_allreduce_residual_rmsnorm(
         logger.debug("Single GPU, no need for allreduce fusion")
         return None, None
 
+    assert input_tensor.shape[0] <= max_token_num
+
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
@@ -194,6 +200,30 @@ def flashinfer_allreduce_residual_rmsnorm(
     )
 
     return norm_out, residual_out
+
+
+def fake_flashinfer_allreduce_residual_rmsnorm(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 16384,
+    use_oneshot: Optional[bool] = None,
+    trigger_completion_at_end: bool = False,
+    fp32_acc: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    residual_out = torch.empty_like(residual)
+    norm_out = torch.empty_like(input_tensor)
+    return norm_out, residual_out
+
+
+if supports_custom_op():
+    direct_register_custom_op(
+        "flashinfer_allreduce_residual_rmsnorm",
+        flashinfer_allreduce_residual_rmsnorm,
+        mutates_args=["input_tensor", "residual", "weight"],
+        fake_impl=fake_flashinfer_allreduce_residual_rmsnorm,
+    )
 
 
 def cleanup_flashinfer_workspace():

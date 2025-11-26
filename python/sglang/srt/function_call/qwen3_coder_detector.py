@@ -6,13 +6,13 @@ import re
 from typing import Any, Dict, List, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
 logger = logging.getLogger(__name__)
 
@@ -120,45 +120,48 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     function_name = function_match.group(1).strip()
 
                     # Validate function name
-                    if function_name in self._tool_indices:
-                        self._current_function_name = function_name
-                        self._function_name_sent = True
-
-                        # Initialize tool call tracking
-                        if self.current_tool_id == -1:
-                            self.current_tool_id = 0
-
-                        # Ensure tracking arrays are large enough
-                        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                            self.prev_tool_call_arr.append({})
-                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                            self.streamed_args_for_tool.append("")
-
-                        # Store tool call info
-                        self.prev_tool_call_arr[self.current_tool_id] = {
-                            "name": function_name,
-                            "arguments": {},
-                        }
-
-                        # Send tool name with empty parameters
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=function_name,
-                                parameters="",
-                            )
-                        )
-
-                        # Remove the processed function declaration
-                        self._buf = self._buf[function_match.end() :]
-                        continue
-                    else:
-                        # Invalid function name, reset state
+                    is_valid = function_name in self._tool_indices
+                    if not is_valid:
                         logger.warning(f"Invalid function name: {function_name}")
-                        self._reset_streaming_state()
-                        normal += self._buf
-                        self._buf = ""
-                        break
+                        if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                            # Reset state and skip (default legacy behavior)
+                            self._reset_streaming_state()
+                            normal += self._buf
+                            self._buf = ""
+                            break
+
+                    # Process tool call (valid or unknown with env=TRUE)
+                    self._current_function_name = function_name
+                    self._function_name_sent = True
+
+                    # Initialize tool call tracking
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+
+                    # Ensure tracking arrays are large enough
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+
+                    # Store tool call info
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": function_name,
+                        "arguments": {},
+                    }
+
+                    # Send tool name with empty parameters
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=function_name,
+                            parameters="",
+                        )
+                    )
+
+                    # Remove the processed function declaration
+                    self._buf = self._buf[function_match.end() :]
+                    continue
                 else:
                     # Function name not complete yet, wait for more text
                     break
@@ -348,15 +351,3 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
-
-    def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            individual_call_start_token=self.tool_call_start_token.replace("\n", "\\n"),
-            individual_call_end_token=self.tool_call_end_token.replace("\n", "\\n"),
-            tool_call_separator="\\n",
-            function_format="xml",
-            call_rule_fmt='"<function={name}>\\n" {arguments_rule} "\\n</function>"',
-            key_value_rule_fmt='"<parameter={key}>\\n" {valrule} "\\n</parameter>"',
-            key_value_separator="\\n",
-        )
