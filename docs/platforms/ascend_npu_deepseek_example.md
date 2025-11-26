@@ -1,6 +1,5 @@
-## Examples
 
-### Running DeepSeek-V3
+# Running DeepSeek-V3
 
 Running DeepSeek with PD disaggregation on 2 x Atlas 800I A3.
 Model weights could be found [here](https://modelers.cn/models/State_Cloud/Deepseek-R1-bf16-hfd-w8a8).

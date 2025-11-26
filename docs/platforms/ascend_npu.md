@@ -1,5 +1,5 @@
 
-# Ascend NPUs
+# SGLang installation with Ascend NPUs support
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
