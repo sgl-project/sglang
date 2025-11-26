@@ -1031,53 +1031,47 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_val.append([])
                         input_token_ids_logprobs_idx.append([])
 
-                if req.return_logprob:
-                    # Only send logprobs corresponding to the newly sent output ids
-                    num_new_tokens = len(output_ids[-1])
-                    output_token_logprobs_val.append(
-                        req.output_token_logprobs_val[
-                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
-                            + num_new_tokens
-                        ]
-                    )
-                    output_token_logprobs_idx.append(
-                        req.output_token_logprobs_idx[
-                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
-                            + num_new_tokens
-                        ]
-                    )
-                    output_top_logprobs_val.append(
-                        req.output_top_logprobs_val[
-                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
-                            + num_new_tokens
-                        ]
-                    )
-                    output_top_logprobs_idx.append(
-                        req.output_top_logprobs_idx[
-                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
-                            + num_new_tokens
-                        ]
-                    )
-                    output_token_ids_logprobs_val.append(
-                        req.output_token_ids_logprobs_val[
-                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
-                            + num_new_tokens
-                        ]
-                    )
-                    output_token_ids_logprobs_idx.append(
-                        req.output_token_ids_logprobs_idx[
-                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
-                            + num_new_tokens
-                        ]
-                    )
-                    req.send_output_token_logprobs_offset += num_new_tokens
-                else:
-                    output_token_logprobs_val.append([])
-                    output_token_logprobs_idx.append([])
-                    output_top_logprobs_val.append([])
-                    output_top_logprobs_idx.append([])
-                    output_token_ids_logprobs_val.append([])
-                    output_token_ids_logprobs_idx.append([])
+                    if req.return_logprob:
+                        output_token_logprobs_val.append(
+                            req.output_token_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_token_logprobs_idx.append(
+                            req.output_token_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_top_logprobs_val.append(
+                            req.output_top_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_top_logprobs_idx.append(
+                            req.output_top_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_token_ids_logprobs_val.append(
+                            req.output_token_ids_logprobs_val[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        output_token_ids_logprobs_idx.append(
+                            req.output_token_ids_logprobs_idx[
+                                send_output_token_logprobs_offset:
+                            ]
+                        )
+                        req.send_output_token_logprobs_offset = len(
+                            req.output_token_logprobs_val
+                        )
+                    else:
+                        output_token_logprobs_val.append([])
+                        output_token_logprobs_idx.append([])
+                        output_top_logprobs_val.append([])
+                        output_top_logprobs_idx.append([])
+                        output_token_ids_logprobs_val.append([])
+                        output_token_ids_logprobs_idx.append([])
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
