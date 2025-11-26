@@ -15,6 +15,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -137,7 +138,10 @@ class MambaPool:
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
-            return sum(get_tensor_size_bytes(t) for t in vars(self).values())
+            return sum(
+                get_tensor_size_bytes(getattr(self, f.name))
+                for f in dataclasses.fields(self)
+            )
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):

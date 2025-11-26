@@ -277,9 +277,8 @@ class EagleVerifyInputV2Mixin:
         device = batch.input_ids.device
 
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
-        predict = torch.zeros(
-            (bs * (self.spec_steps + 1),), dtype=torch.int32, device=device
-        )
+        predict_shape = list(next_token_logits.shape)[:-1]
+        predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )

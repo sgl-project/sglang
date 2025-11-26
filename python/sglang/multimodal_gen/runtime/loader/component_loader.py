@@ -55,7 +55,7 @@ class skip_init_modules:
             cls.reset_parameters = lambda self: None  # skip init
 
     def __exit__(self, exc_type, exc_value, traceback):
-        # Restore originals
+        # restore originals
         for cls, orig in self._orig_reset.items():
             cls.reset_parameters = orig
 
@@ -199,7 +199,7 @@ class TextEncoderLoader(ComponentLoader):
     def _get_weights_iterator(
         self, source: "Source", to_cpu: bool
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
+        """get an iterator for the model weights based on the load format."""
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.fall_back_to_pt,
@@ -214,7 +214,7 @@ class TextEncoderLoader(ComponentLoader):
 
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
-        # Apply the prefix.
+        # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     def _get_all_weights(
@@ -337,7 +337,8 @@ class TextEncoderLoader(ComponentLoader):
                         cpu_offload=True,
                         reshard_after_forward=True,
                         mesh=mesh["offload"],
-                        fsdp_shard_conditions=model._fsdp_shard_conditions,
+                        fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
+                        or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
             # We only enable strict check for non-quantized models
@@ -346,7 +347,7 @@ class TextEncoderLoader(ComponentLoader):
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
                 raise ValueError(
-                    "Following weights were not initialized from "
+                    "Following model weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
 

@@ -32,6 +32,16 @@ python3 test_choices.py
 - Ensure you added `unittest.main()` for unittest and `pytest.main([__file__])` for pytest in the scripts. The CI run them via `python3 test_file.py`.
 - The CI will run some suites such as `per-commit-1-gpu`, `per-commit-2-gpu`, and `nightly-1-gpu` automatically. If you need special setup or custom test groups, you may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows).
 
+## CI Registry Quick Peek
+
+Tests in `test/registered/` declare CI metadata via lightweight markers:
+
+```python
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=80, suite="stage-a-test-1")
+```
+
 ## Writing Elegant Test Cases
 
 - Learn from existing examples in [sglang/test/srt](https://github.com/sgl-project/sglang/tree/main/test/srt).

@@ -11,28 +11,43 @@ HW_MAPPING = {
     "amd": HWBackend.AMD,
 }
 
-LABEL_MAPPING = {
+PER_COMMIT_SUITES = {
     HWBackend.CPU: ["default"],
     HWBackend.AMD: ["stage-a-test-1"],
     HWBackend.CUDA: ["stage-a-test-1"],
 }
 
 
-def _filter_tests(
-    ci_tests: List[CIRegistry], hw: HWBackend, suite: str
+def filter_tests(
+    ci_tests: List[CIRegistry], hw: HWBackend, suite: str, nightly: bool = False
 ) -> List[CIRegistry]:
-    ci_tests = [t for t in ci_tests if t.backend == hw]
+    ci_tests = [
+        t
+        for t in ci_tests
+        if t.backend == hw and t.suite == suite and t.nightly == nightly
+    ]
+
     ret = []
     for t in ci_tests:
-        assert t.suite in LABEL_MAPPING[hw], f"Unknown stage {t.suite} for backend {hw}"
-        if t.suite == suite:
+        if not nightly:
+            assert (
+                t.suite in PER_COMMIT_SUITES[hw]
+            ), f"Unknown stage {t.suite} for backend {hw}"
+        else:
+            raise NotImplementedError("Nightly tests are not implemented yet.")
+
+        if t.disabled is None:
             ret.append(t)
+            print(f"Including test {t.filename}")
+        else:
+            print(f"Skipping disabled test {t.filename} due to: {t.disabled}")
+
     return ret
 
 
-def run_per_commit(hw: HWBackend, suite: str):
-    files = glob.glob("per_commit/**/*.py", recursive=True)
-    ci_tests = _filter_tests(collect_tests(files), hw, suite)
+def run_a_suite(hw: HWBackend, suite: str, nightly: bool = False):
+    files = glob.glob("registered/**/*.py", recursive=True)
+    ci_tests = filter_tests(collect_tests(files), hw, suite, nightly)
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
     run_unittest_files(
@@ -47,19 +62,15 @@ def main():
     parser.add_argument(
         "--hw",
         type=str,
-        choices=["cpu", "cuda", "amd"],
+        choices=HW_MAPPING.keys(),
         required=True,
         help="Hardware backend to run tests on.",
     )
-    parser.add_argument(
-        "--suite",
-        type=str,
-        required=True,
-        help="Test suite to run.",
-    )
+    parser.add_argument("--suite", type=str, required=True, help="Test suite to run.")
+    parser.add_argument("--nightly", action="store_true")
     args = parser.parse_args()
     hw = HW_MAPPING[args.hw]
-    run_per_commit(hw, args.suite)
+    run_a_suite(hw, args.suite, args.nightly)
 
 
 if __name__ == "__main__":

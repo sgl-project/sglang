@@ -214,6 +214,10 @@ def maybe_download_lora(
     """
 
     local_path = maybe_download_model(model_name_or_path, local_dir, download)
+    # return directly if local_path is a file
+    if os.path.isfile(local_path):
+        return local_path
+
     weight_name = _best_guess_weight_name(
         model_name_or_path, file_extension=".safetensors"
     )

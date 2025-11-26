@@ -269,6 +269,14 @@ impl RouterManager {
         let mut best_router = None;
         let mut best_score = 0.0;
 
+        let num_regular_workers = self
+            .worker_registry
+            .get_all()
+            .iter()
+            .filter(|w| matches!(w.worker_type(), WorkerType::Regular))
+            .count();
+        let num_pd_workers = self.worker_registry.get_all().len() - num_regular_workers;
+
         for router in candidate_routers {
             let mut score = 1.0;
 
@@ -284,7 +292,9 @@ impl RouterManager {
             // - Average worker cost vs max_cost
             // - Current load and health status
 
-            if score > best_score {
+            let valid_router = (router.is_pd_mode() && num_pd_workers > 0)
+                || (!router.is_pd_mode() && num_regular_workers > 0);
+            if score > best_score && valid_router {
                 best_score = score;
                 best_router = Some(router);
             }

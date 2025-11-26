@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 """
@@ -26,7 +27,7 @@ import sys
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -35,7 +36,6 @@ from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
 )
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
@@ -46,7 +46,6 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -187,28 +186,19 @@ def get_child_key(key: RadixKey, page_size: int = 1):
 
 
 class RadixCache(BasePrefixCache):
-    def __init__(
-        self,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        page_size: int,
-        disable: bool = False,
-        enable_metrics: bool = False,
-        enable_kv_cache_events: bool = False,
-        eviction_policy: str = "lru",
-        is_eagle: bool = False,
-        disable_finished_insert: bool = False,
-    ):
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.page_size = page_size
-        self.disable = disable
-        self.enable_kv_cache_events = enable_kv_cache_events
-        self.kv_event_queue = []
-        self.is_eagle = is_eagle
-        self.disable_finished_insert = disable_finished_insert
+    def __init__(self, params: CacheInitParams):
+        self.disable = params.disable
+        self.req_to_token_pool = params.req_to_token_pool
+        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.page_size = params.page_size
+        self.enable_kv_cache_events = params.enable_kv_cache_events
+        self.is_eagle = params.is_eagle
+        self.disable_finished_insert = params.disable_finished_insert
+        self.eviction_policy = params.eviction_policy.lower()
 
-        if enable_metrics:
+        self.kv_event_queue = []
+
+        if params.enable_metrics:
             self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
@@ -220,26 +210,44 @@ class RadixCache(BasePrefixCache):
             self.key_match_fn = _key_match_page_size1
             self.get_child_key_fn = get_child_key
         else:
-            self.key_match_fn = partial(_key_match_paged, page_size=page_size)
-            self.get_child_key_fn = partial(get_child_key, page_size=page_size)
+            self.key_match_fn = partial(_key_match_paged, page_size=self.page_size)
+            self.get_child_key_fn = partial(get_child_key, page_size=self.page_size)
 
-        if eviction_policy.lower() == "lru":
+        if self.eviction_policy == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
-        elif eviction_policy.lower() == "lfu":
+        elif self.eviction_policy == "lfu":
             self.eviction_strategy: EvictionStrategy = LFUStrategy()
-        elif eviction_policy.lower() == "fifo":
+        elif self.eviction_policy == "fifo":
             self.eviction_strategy: EvictionStrategy = FIFOStrategy()
-        elif eviction_policy.lower() == "mru":
+        elif self.eviction_policy == "mru":
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
-        elif eviction_policy.lower() == "filo":
+        elif self.eviction_policy == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
-        elif eviction_policy.lower() == "priority":
+        elif self.eviction_policy == "priority":
             self.eviction_strategy: EvictionStrategy = PriorityStrategy()
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
+                f"Unknown eviction policy: {self.eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority'."
             )
         self.reset()
+
+    @classmethod
+    def create_simulated(
+        self,
+        disable: bool = False,
+        mock_allocator: Optional[Any] = None,
+        page_size: int = 1,
+        enable_kv_cache_events: bool = False,
+    ) -> RadixCache:
+        """Init a radix cache without memory pools for simulation purpose."""
+        params = CacheInitParams(
+            disable=disable,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=mock_allocator,
+            page_size=page_size,
+            enable_kv_cache_events=enable_kv_cache_events,
+        )
+        return RadixCache(params)
 
     ##### Public API #####
 
@@ -428,7 +436,11 @@ class RadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(radix_key)
+        match_result = self.match_prefix(radix_key)
+        (new_indices, new_last_node) = (
+            match_result.device_indices,
+            match_result.last_device_node,
+        )
         assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
 
         self.req_to_token_pool.write(
@@ -743,7 +755,7 @@ class RadixCache(BasePrefixCache):
 
 
 if __name__ == "__main__":
-    tree = RadixCache(None, None, page_size=1, disable=False)
+    tree = RadixCache.create_simulated()
 
     # Example token id sequences (as lists of ints)
     tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key=None))
