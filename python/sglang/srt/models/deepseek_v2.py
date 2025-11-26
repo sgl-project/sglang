@@ -3568,7 +3568,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 self.quant_config, "weight_block_size", None
                             )
                         )
-                        and self_attn.kv_b_proj.executed_weight_requant_ue8m0
+                        and weight_scale.format_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]

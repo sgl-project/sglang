@@ -9,6 +9,13 @@ on:
     paths:
       - "python/sglang/version.py"
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: nightly-test-nvidia-${{ github.ref }}
