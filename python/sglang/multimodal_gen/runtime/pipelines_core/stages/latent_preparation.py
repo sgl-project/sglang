@@ -88,14 +88,17 @@ class LatentPreparationStage(PipelineStage):
                 shape, generator=generator, device=device, dtype=dtype
             )
 
-            latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(latents)
+            latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(
+                latents
+            ).to(device=device)
+
+            if latent_ids is not None:
+                batch.latent_ids = latent_ids
 
             latents = server_args.pipeline_config.maybe_pack_latents(
                 latents, batch_size, batch
             )
 
-            if latent_ids is not None:
-                batch.latent_ids = latent_ids
         else:
             latents = latents.to(device)
 

@@ -1,4 +1,3 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import math
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
@@ -225,6 +224,7 @@ def _unpack_latents_with_ids(
     using position ids to scatter tokens into place
     """
     x_list = []
+    x_ids = x_ids.to(device=x.device)
     for data, pos in zip(x, x_ids):
         _, ch = data.shape  # noqa: F841
         h_ids = pos[:, 1].to(torch.int64)
@@ -375,7 +375,8 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         return width, height
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
-        txt_ids = _prepare_text_ids(prompt_embeds)
+
+        txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
         # print(f"{img_ids=}")
@@ -383,7 +384,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         if batch.image_latent is not None:
             image_latents = [batch.image_latent]
             image_latent_ids = _prepare_image_ids(image_latents)
-            img_ids = torch.cat([img_ids, image_latent_ids], dim=1)
+            img_ids = torch.cat([img_ids, image_latent_ids], dim=1).to(device=device)
 
         if img_ids.ndim == 3:
             img_ids = img_ids[0]

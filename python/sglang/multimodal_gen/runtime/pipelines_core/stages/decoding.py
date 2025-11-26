@@ -107,7 +107,7 @@ class DecodingStage(PipelineStage):
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)
-        latents = self.server_args.pipeline_config.pre_decoding(latents)
+        latents = server_args.pipeline_config.pre_decoding(latents)
 
         # Decode latents
         with torch.autocast(

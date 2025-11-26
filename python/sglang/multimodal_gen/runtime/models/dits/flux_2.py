@@ -31,7 +31,6 @@ from diffusers.models.transformers.transformer_flux2 import Flux2PosEmbed
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.models.dits.flux import FluxPosEmbed
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -583,8 +582,8 @@ class Flux2TransformerBlock(nn.Module):
         # Conditioning txt stream
         norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
         norm_encoder_hidden_states = (
-                                         1 + c_scale_msa
-                                     ) * norm_encoder_hidden_states + c_shift_msa
+            1 + c_scale_msa
+        ) * norm_encoder_hidden_states + c_shift_msa
 
         # Attention on concatenated img + txt stream
         attention_outputs = self.attn(
@@ -706,7 +705,7 @@ class Flux2Modulation(nn.Module):
         mod_params = torch.chunk(mod, 3 * self.mod_param_sets, dim=-1)
         # Return tuple of 3-tuples of modulation params shift/scale/gate
         return tuple(
-            mod_params[3 * i: 3 * (i + 1)] for i in range(self.mod_param_sets)
+            mod_params[3 * i : 3 * (i + 1)] for i in range(self.mod_param_sets)
         )
 
 

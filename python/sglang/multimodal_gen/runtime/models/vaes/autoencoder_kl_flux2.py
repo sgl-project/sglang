@@ -291,10 +291,7 @@ class AutoencoderKLFlux2(nn.Module):
         else:
             decoded = self._decode(z).sample
 
-        if not return_dict:
-            return (decoded,)
-
-        return DecoderOutput(sample=decoded)
+        return decoded
 
     def blend_v(
         self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
