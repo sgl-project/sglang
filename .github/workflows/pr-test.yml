@@ -21,12 +21,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  call-gate:
-    uses: ./.github/workflows/pr-gate.yml
-    secrets: inherit
   # =============================================== check changes ====================================================
   check-changes:
-    needs: [call-gate]
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
@@ -66,6 +62,16 @@ jobs:
             echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel }} |"
             echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen }} |"
           } >> $GITHUB_STEP_SUMMARY
+
+  # =============================================== PR Gate ====================================================
+  call-gate:
+    needs: check-changes
+    if: |
+      needs.check-changes.outputs.main_package == 'true' ||
+      needs.check-changes.outputs.sgl_kernel == 'true' ||
+      needs.check-changes.outputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
 
