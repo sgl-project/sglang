@@ -49,6 +49,7 @@ from sglang.srt.utils.common import (
     is_sm120_supported,
     next_power_of_2,
 )
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -127,7 +128,7 @@ def _sglang_fp4_gemm_fake(
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 
-    @torch.library.register_fake("sgl_kernel::scaled_fp4_quant")
+    @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
     def _sgl_kernel_scaled_fp4_quant_fake(
         output, input, output_scale, input_global_scale
     ):

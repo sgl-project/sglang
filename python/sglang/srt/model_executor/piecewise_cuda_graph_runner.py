@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -584,7 +585,7 @@ class PiecewiseCudaGraphRunner:
         self,
         forward_batch: ForwardBatch,
         **kwargs,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph(), disable_ca_comm(self.model_runner.tp_group):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
@@ -610,6 +611,8 @@ class PiecewiseCudaGraphRunner:
                             else None
                         ),
                     )
+                elif isinstance(output, EmbeddingPoolerOutput):
+                    return output
                 else:
                     assert isinstance(output, PPProxyTensors)
                     # TODO(Yuwei): support PP Support
