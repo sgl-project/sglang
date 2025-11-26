@@ -1,0 +1,130 @@
+name: SGLang Benchmark Workflow
+
+on:
+  pull_request:
+    branches: [ dev/perf ]
+  workflow_dispatch:
+    inputs:
+      model_list:
+        description: 'Model list to benchmark on MI355 (JSON array format, default: ["Qwen3-VL-235B","Qwen3-next"])'
+        required: false
+        default: '["Qwen3-VL-235B","Qwen3-next"]'
+  
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: sglang-mi308-8gpu
+    strategy:
+      fail-fast: false
+      matrix:
+        model: ${{ fromJson(github.event.inputs.model_list || '["Qwen3-VL-235B","Qwen3-next"]') }} 
+        include:
+          - model_name: "Qwen3-VL-235B"
+            model_path: /models/RedHatAI/Qwen3-VL-235B-A22B-Instruct-FP8-dynamic/
+            tp: 8
+            ep: 8
+          - model_name: "Qwen3-next"
+            model_path: /models/Qwen/Qwen3-Next-80B-A3B-Instruct/
+            tp: 4
+            ep: 1
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+    
+      - name: Docker Login
+        run: |
+          docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Download SGLang Image
+        run: |
+          for i in {1..3}; do
+            docker pull rocm/ali-private:ubuntu22.04_rocm7.0.1_sglang_128a20_20251119 && break || {
+              echo "docker pull failed, retrying ($i/3)..."
+              sleep 5
+            }
+          done
+    
+      - name: Generate Dockerfile
+        run: |
+          cat <<'EOF' > Dockerfile.mod
+          FROM rocm/ali-private:ubuntu22.04_rocm7.0.1_sglang_128a20_20251119
+
+          RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
+          RUN pip uninstall -y aiter
+          RUN pip install --upgrade "pybind11>=3.0.1"
+          RUN pip show pybind11
+
+          RUN git clone https://github.com/ROCm/aiter.git /aiter && \
+            cd /aiter && \
+            git checkout dev/perf && \
+            git submodule sync && git submodule update --init --recursive && \
+            python3 setup.py develop
+
+          RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
+
+          RUN git clone -b enable_sglang_ci https://github.com/zejunchen-zejun/sglang.git /sglang-checkout && \
+              cd /sglang-checkout && \
+              pip install --upgrade pip && \
+              pip install "transformers>=4.57.0" && \
+              cd sgl-kernel && \
+              python3 setup_rocm.py install
+          
+          EOF
+
+      - name: Show dockerfile
+        run: |
+          cat Dockerfile.mod 
+
+      - name: Build Docker image
+        run: |
+          docker build --no-cache --network=host -t "sglang_test:ci" -f Dockerfile.mod .
+    
+
+      - name: Start CI container
+        run: |
+          echo "Clean up containers..."
+          docker ps -aq -f name=sglang_test | xargs -r docker stop | xargs -r docker rm
+
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+
+          echo "Starting container: sglang_test:ci"
+          docker run -dt --user root --device=/dev/kfd $DEVICE_FLAG \
+          --ipc=host --group-add video \
+          --shm-size 16g \
+          --network=host \
+          --privileged \
+          --cap-add=SYS_PTRACE \
+          -v /models:/models \
+          --security-opt seccomp=unconfined \
+          -w /sglang-checkout \
+          --name sglang_test \
+          sglang_test:ci
+
+      - name: Show /dev/shm size
+        run: |
+          docker exec sglang_test bash -c "df -h /dev/shm"
+
+      - name: Launch the server
+        timeout-minutes: 60
+        run: |
+          set -ex
+          docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh launch ${{ matrix.model_name }} ${{ matrix.model_path }} ${{ matrix.tp }} ${{ matrix.ep }}"
+      
+      - name: Run vision model evaluation
+        continue-on-error: true
+        timeout-minutes: 60
+        run: |
+          docker exec sglang_test bash -c "scripts/ci/sglang_benchmark_workflow.sh evaluation ${{ matrix.model_name }} ${{ matrix.model_path }}"
+
+      - name: Clean Up
+        if: always()
+        run:
+          docker exec -u root sglang_test bash -c "rm -rf /sglang-checkout/sgl-kernel; rm -rf /sglang-checkout/python"
