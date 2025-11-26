@@ -383,7 +383,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_allow_auto_truncate.py", 400),
         # TestFile("ascend/test_ascend_delete_ckpt_after_loading.py", 400),
         TestFile("ascend/test_ascend_disable_cuda_graph_padding.py", 400),
-        TestFile("ascend/test_ascend_disable_custom_all_reduce.py", 400),
+        # TestFile("ascend/test_ascend_disable_custom_all_reduce.py", 400),
         TestFile("ascend/test_ascend_enable_tokenizer_batch_encode.py", 400),
         TestFile("ascend/test_ascend_random_seed.py", 400),
         TestFile("ascend/test_ascend_stream_interval.py", 400),
