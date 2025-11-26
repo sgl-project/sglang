@@ -489,6 +489,22 @@ class DefaultModelLoader(BaseModelLoader):
             else:
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
+        if self.load_config.draft_model_idx is not None:
+            import re
+            pattern = r"model.mtp.layers.(\d+)."
+            filtered_weights = []
+            for name, tensor in weights_iterator:
+                group = re.match(pattern, name)
+                if group is not None:
+                    idx = int(group.group(1))
+                    if idx != self.load_config.draft_model_idx:
+                        continue
+                    new_name = name.replace(group.group(), "model.mtp.layers.0.")
+                else:
+                    new_name = name
+                filtered_weights.append((source.prefix + new_name, tensor))
+            return tuple(filtered_weights)
+
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 

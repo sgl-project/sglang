@@ -273,6 +273,7 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.enable_mtp = server_args.enable_mtp
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -350,9 +351,22 @@ class Scheduler(
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.is_eagle():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-        self.draft_worker = self.spec_algorithm.create_draft_worker(
-            **draft_worker_kwargs
-        )
+
+        if self.enable_mtp:
+            from sglang.srt.speculative.mtp_worker import MTPWorker
+            self.draft_worker = MTPWorker(
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                server_args=server_args,
+                nccl_port=port_args.nccl_port,
+                target_worker=self.tp_worker,
+                dp_rank=dp_rank,
+            )
+        else:
+            self.draft_worker = self.spec_algorithm.create_draft_worker(
+                **draft_worker_kwargs
+            )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():

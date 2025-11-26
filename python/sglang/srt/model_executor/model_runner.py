@@ -284,6 +284,7 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        draft_model_idx: Optional[int] = None,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -318,6 +319,7 @@ class ModelRunner:
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.kv_cache_memory = 0
+        self.draft_model_idx = draft_model_idx
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -783,6 +785,7 @@ class ModelRunner:
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
+            draft_model_idx=self.draft_model_idx,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(

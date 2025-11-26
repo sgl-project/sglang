@@ -101,6 +101,8 @@ class ModelConfig:
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
         moe_router_dtype: str = "float32",
+        is_mtp: bool = False,
+        draft_model_idx: int = 0,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -110,6 +112,7 @@ class ModelConfig:
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
+        self.is_mtp = is_mtp
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -290,6 +293,7 @@ class ModelConfig:
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
             moe_router_dtype=server_args.moe_router_dtype,
+            is_mtp = server_args.enable_mtp,
             **kwargs,
         )
 

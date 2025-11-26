@@ -216,12 +216,16 @@ class TpModelWorker(BaseTpWorker):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        is_mtp_worker: bool = False,
     ):
         # Parse args
         self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
+
+        # MTP model runners
+        self.model_runner_list = []
 
         # Init model and tokenizer
         self.model_config = ModelConfig.from_server_args(
@@ -261,7 +265,31 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=is_draft_worker,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            draft_model_idx=0,
         )
+        if is_mtp_worker:
+            self.model_runner_list.append(self.model_runner)
+            for i in range(1, server_args.speculative_num_steps):
+                self.model_runner_list.append(
+                    ModelRunner(
+                        model_config=self.model_config,
+                        mem_fraction_static=server_args.mem_fraction_static,
+                        gpu_id=gpu_id,
+                        tp_rank=tp_rank,
+                        tp_size=server_args.tp_size,
+                        moe_ep_rank=moe_ep_rank,
+                        moe_ep_size=server_args.ep_size,
+                        pp_rank=pp_rank,
+                        pp_size=server_args.pp_size,
+                        nccl_port=nccl_port,
+                        dp_rank=dp_rank,
+                        server_args=server_args,
+                        is_draft_worker=is_draft_worker,
+                        req_to_token_pool=req_to_token_pool,
+                        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                        draft_model_idx=i,
+                    )
+                )
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:

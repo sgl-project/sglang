@@ -1192,6 +1192,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
 
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -1982,6 +1985,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            return_hidden_states_before_norm=self.return_hidden_states_before_norm,
         )
 
     def copy(self):
@@ -2104,3 +2108,6 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
