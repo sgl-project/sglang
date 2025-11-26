@@ -53,7 +53,7 @@ if _is_cuda or _is_hip:
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_xpu:
-    from sgl_kernel import silu_and_mul, moe_sum
+    from sgl_kernel import moe_sum, silu_and_mul
 
 
 if _is_cuda or _is_hip or _is_xpu:
