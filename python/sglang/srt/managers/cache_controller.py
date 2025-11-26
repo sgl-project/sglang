@@ -14,7 +14,6 @@ limitations under the License.
 """
 
 import logging
-import os
 import threading
 import time
 from queue import Empty, Full, Queue
