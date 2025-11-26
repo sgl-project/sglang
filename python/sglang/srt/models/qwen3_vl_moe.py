@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -29,7 +30,6 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.utils.hf_transformers_utils import get_processor
-from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 logger = logging.getLogger(__name__)
 
@@ -329,10 +329,11 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
-            return ModelConfigForExpertLocation(
-                num_layers=config.num_hidden_layers,
-                num_logical_experts=config.num_experts,
-                num_groups=None,
-            )
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.num_experts,
+            num_groups=None,
+        )
+
 
 EntryClass = Qwen3VLMoeForConditionalGeneration
