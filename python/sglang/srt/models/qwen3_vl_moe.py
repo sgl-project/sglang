@@ -29,6 +29,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_moe import Qwen3MoeModel
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 
 logger = logging.getLogger(__name__)
 
@@ -326,5 +327,12 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         #     }
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+            return ModelConfigForExpertLocation(
+                num_layers=config.num_hidden_layers,
+                num_logical_experts=config.num_experts,
+                num_groups=None,
+            )
 
 EntryClass = Qwen3VLMoeForConditionalGeneration
