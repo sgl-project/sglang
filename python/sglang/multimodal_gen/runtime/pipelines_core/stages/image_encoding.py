@@ -259,6 +259,119 @@ class ImageVAEEncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
 
+    def _process_single_image(
+        self,
+        image: PIL.Image.Image,
+        num_frames: int,
+        vae_dtype: torch.dtype,
+        vae_autocast_enabled: bool,
+        generator: torch.Generator | None,
+        mode: ExecutionMode,
+        vae_height: int | None = None,
+        vae_width: int | None = None,
+    ) -> torch.Tensor:
+        if vae_height is not None and vae_width is not None:
+            height, width = vae_height, vae_width
+        else:
+            width, height = (
+                image.size if isinstance(image, PIL.Image.Image) else (None, None)
+            )
+
+        processed = self.preprocess(
+            image,
+            vae_scale_factor=self.vae.spatial_compression_ratio,
+            height=height,
+            width=width,
+        ).to(get_local_torch_device(), dtype=torch.float32)
+
+        processed = processed.unsqueeze(2)
+
+        video_condition = torch.cat(
+            [
+                processed,
+                processed.new_zeros(
+                    processed.shape[0],
+                    processed.shape[1],
+                    num_frames - 1,
+                    processed.shape[3],
+                    processed.shape[4],
+                ),
+            ],
+            dim=2,
+        )
+        video_condition = video_condition.to(
+            device=get_local_torch_device(), dtype=torch.float32
+        )
+
+        with torch.autocast(
+            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+        ):
+            if not vae_autocast_enabled:
+                video_condition = video_condition.to(vae_dtype)
+            encoder_output = self.vae.encode(video_condition)
+
+        if mode == ExecutionMode.PREPROCESS:
+            latent_cond = encoder_output.mean
+        else:
+            if generator is None:
+                raise ValueError("Generator must be provided")
+            latent_cond = self.retrieve_latents(encoder_output, generator)
+
+        if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
+            if isinstance(self.vae.shift_factor, torch.Tensor):
+                latent_cond -= self.vae.shift_factor.to(
+                    latent_cond.device, latent_cond.dtype
+                )
+            else:
+                latent_cond -= self.vae.shift_factor
+
+        if isinstance(self.vae.scaling_factor, torch.Tensor):
+            latent_cond = latent_cond * self.vae.scaling_factor.to(
+                latent_cond.device, latent_cond.dtype
+            )
+        else:
+            latent_cond = latent_cond * self.vae.scaling_factor
+
+        return latent_cond
+
+    def _duplicate_and_pack_latents(
+        self,
+        latent_condition: torch.Tensor,
+        batch_size: int,
+        server_args: ServerArgs,
+    ) -> torch.Tensor:
+        num_channels_latents = (
+            server_args.pipeline_config.dit_config.arch_config.in_channels // 4
+        )
+
+        if (
+            batch_size > latent_condition.shape[0]
+            and batch_size % latent_condition.shape[0] == 0
+        ):
+            additional_image_per_prompt = batch_size // latent_condition.shape[0]
+            image_latents = torch.cat(
+                [latent_condition] * additional_image_per_prompt, dim=0
+            )
+        elif (
+            batch_size > latent_condition.shape[0]
+            and batch_size % latent_condition.shape[0] != 0
+        ):
+            raise ValueError(
+                f"Cannot duplicate `image` of batch size {latent_condition.shape[0]} to {batch_size} text prompts."
+            )
+        else:
+            image_latents = torch.cat([latent_condition], dim=0)
+
+        image_latent_height, image_latent_width = image_latents.shape[3:]
+        image_latents = _pack_latents(
+            image_latents,
+            batch_size,
+            num_channels_latents,
+            image_latent_height,
+            image_latent_width,
+        )
+        return image_latents
+
     def forward(
         self,
         batch: Req,
