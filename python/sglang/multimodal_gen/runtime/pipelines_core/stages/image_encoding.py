@@ -286,8 +286,8 @@ class ImageVAEEncodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                                   vae_dtype != torch.float32
+                               ) and not server_args.disable_autocast
 
         # Encode Image
         with torch.autocast(
@@ -332,6 +332,12 @@ class ImageVAEEncodingStage(PipelineStage):
         )
 
         # apply shift & scale if needed
+        if isinstance(shift_factor, torch.Tensor):
+            shift_factor = shift_factor.to(latent_condition.device)
+
+        if isinstance(scaling_factor, torch.Tensor):
+            scaling_factor = scaling_factor.to(latent_condition.device)
+
         latent_condition -= shift_factor
         latent_condition = latent_condition * scaling_factor
 
