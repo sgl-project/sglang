@@ -1,7 +1,6 @@
 import json
-import boto3
-import sagemaker
 
+import boto3
 from sagemaker import serializers
 from sagemaker.model import Model
 from sagemaker.predictor import Predictor
@@ -10,20 +9,22 @@ boto_session = boto3.session.Session()
 sm_client = boto_session.client("sagemaker")
 sm_role = boto_session.resource("iam").Role("SageMakerRole").arn
 
-endpoint_name="<YOUR_ENDPOINT_NAME>"
-image_uri="<YOUR_DOCKER_IMAGE_URI>"
-model_id="<YOUR_MODEL_ID>" # eg: Qwen/Qwen3-0.6B from https://huggingface.co/Qwen/Qwen3-0.6B
-hf_token="<YOUR_HUGGINGFACE_TOKEN>"
-prompt="<YOUR_ENDPOINT_PROMPT>"
+endpoint_name = "<YOUR_ENDPOINT_NAME>"
+image_uri = "<YOUR_DOCKER_IMAGE_URI>"
+model_id = (
+    "<YOUR_MODEL_ID>"  # eg: Qwen/Qwen3-0.6B from https://huggingface.co/Qwen/Qwen3-0.6B
+)
+hf_token = "<YOUR_HUGGINGFACE_TOKEN>"
+prompt = "<YOUR_ENDPOINT_PROMPT>"
 
 model = Model(
-  name=endpoint_name,
-  image_uri=image_uri,
-  role=sm_role,
-  env={
-      "SM_SGLANG_MODEL_PATH": model_id,
-      "HF_TOKEN": hf_token,
-  },
+    name=endpoint_name,
+    image_uri=image_uri,
+    role=sm_role,
+    env={
+        "SM_SGLANG_MODEL_PATH": model_id,
+        "HF_TOKEN": hf_token,
+    },
 )
 print("Model created successfully")
 print("Starting endpoint deployment (this may take 10-15 minutes)...")
@@ -66,4 +67,3 @@ if isinstance(response, str):
         print("Warning: Response is not valid JSON. Returning as string.")
 
 print(f"Received model response: '{response}'")
-
