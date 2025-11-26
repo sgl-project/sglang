@@ -853,7 +853,7 @@ class MiMoV2Model(nn.Module):
                     forward_batch,
                     residual,
                 )
-
+        hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
