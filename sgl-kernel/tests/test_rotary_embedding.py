@@ -47,6 +47,12 @@ from sgl_kernel.testing.rotary_embedding import (
         (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 32, 8, False),
         (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 16, 4, False),
         (512, 128, 311, 10000, False, torch.bfloat16, "cuda", 3, 39, 4, 2, False),
+        (64, 64, 32, 8000, True, torch.float32, "cuda", 32, 32, 1, 1, False),
+        (256, 128, 4096, 10000, True, torch.float32, "cuda", 2, 512, 4, 2, False),
+        (512, 128, 311, 10000, True, torch.float32, "cuda", 3, 39, 4, 2, False),
+        (128, 128, 2048, 10000, False, torch.float32, "cuda", 2, 512, 32, 8, False),
+        (128, 128, 2048, 10000, False, torch.float32, "cuda", 2, 512, 16, 4, False),
+        (512, 128, 311, 10000, False, torch.float32, "cuda", 3, 39, 4, 2, False),
     ],
 )
 def test_correctness(

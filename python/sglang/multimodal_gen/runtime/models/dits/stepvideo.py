@@ -157,7 +157,7 @@ class SelfAttention(nn.Module):
         with_qk_norm: bool = True,
         attn_type: str = "torch",
         supported_attention_backends=(
-            AttentionBackendEnum.FA3,
+            AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
         ),
     ):
@@ -252,7 +252,7 @@ class SelfAttention(nn.Module):
             q = self._apply_rope(q, cos, sin)
             k = self._apply_rope(k, cos, sin)
 
-        output, _ = self.attn(q, k, v)  # [B,heads,S,D]
+        output = self.attn(q, k, v)  # [B,heads,S,D]
 
         output = rearrange(output, "b s h d -> b s (h d)")
         output, _ = self.wo(output)
@@ -269,7 +269,7 @@ class CrossAttention(nn.Module):
         bias=False,
         with_qk_norm=True,
         supported_attention_backends=(
-            AttentionBackendEnum.FA3,
+            AttentionBackendEnum.FA,
             AttentionBackendEnum.TORCH_SDPA,
         ),
     ) -> None:
