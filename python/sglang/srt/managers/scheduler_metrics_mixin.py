@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import GetLoadReqInput, GetLoadReqOutput
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import Req, ScheduleBatch
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
@@ -391,3 +392,52 @@ class SchedulerMetricsMixin:
                     / self.stats.max_running_requests_under_SLO,
                     self.stats.token_usage / 0.9,
                 )
+
+    def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
+        if self.is_hybrid:
+            num_tokens_full = (
+                self.full_tokens_per_layer
+                - self.token_to_kv_pool_allocator.full_available_size()
+                - self.tree_cache.full_evictable_size()
+            )
+            num_tokens_swa = (
+                self.swa_tokens_per_layer
+                - self.token_to_kv_pool_allocator.swa_available_size()
+                - self.tree_cache.swa_evictable_size()
+            )
+            num_tokens = max(num_tokens_full, num_tokens_swa)
+        elif self.is_hybrid_gdn:
+            num_tokens = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+                - self.tree_cache.full_evictable_size()
+            )
+        else:
+            num_tokens = (
+                self.max_total_num_tokens
+                - self.token_to_kv_pool_allocator.available_size()
+                - self.tree_cache.evictable_size()
+            )
+
+        # Tokens in waiting queue, bootstrap queue, prealloc queue
+        num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
+        num_waiting_reqs = len(self.waiting_queue)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            num_tokens += sum(
+                len(req.origin_input_ids)
+                for req in self.disagg_prefill_bootstrap_queue.queue
+            )
+            num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            num_tokens += sum(
+                len(req.req.origin_input_ids)
+                for req in self.disagg_decode_prealloc_queue.queue
+            )
+            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
+
+        return GetLoadReqOutput(
+            dp_rank=self.dp_rank,
+            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
+            num_waiting_reqs=num_waiting_reqs,
+            num_tokens=num_tokens,
+        )
