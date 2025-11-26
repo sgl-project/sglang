@@ -242,10 +242,8 @@ int get_kernel_cache_size(
   int tb_n = th_config.thread_n;
   int tb_m = thread_m_blocks * 16;
 
-  // shm size for block_sorted_ids/block_topk_weights
-  // With padding alignment, we need: moe_block_size/4 + moe_block_size/4 + (moe_block_size/2 + moe_block_size) int4s
-  // = 2 * moe_block_size int4s = 2 * tb_m * 16 bytes = 32 * tb_m bytes
-  int sh_block_meta_size = tb_m * 32;
+  // Fix bug according to https://github.com/sgl-project/sglang/pull/13902#issuecomment-3575498995
+  int sh_block_meta_size = tb_m * 16;
   int sh_a_size = pipe_stages * (tb_m * tb_k) * 2;
   int sh_b_size = pipe_stages * (tb_k * tb_n / pack_factor) * 4;
   int sh_s_size =
