@@ -50,7 +50,7 @@ elif _is_hip:
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 elif _is_xpu:
-    from sgl_kernel import silu_and_mul, moe_sum
+    from sgl_kernel import moe_sum, silu_and_mul
 
 
 if _is_cuda or _is_hip or _is_xpu:

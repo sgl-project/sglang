@@ -12,7 +12,6 @@ from sglang.srt.layers.attention.flashattention_backend import (
     merge_state_v2_wrapper,
     prepare_swa_spec_page_table_triton,
 )
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.managers.schedule_batch import get_global_server_args
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -24,19 +23,9 @@ from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 
-def extract_page_table(
-    batch_size, num_pages, device, req_to_token, req_pool_indices, seq_lens, kv_idptr
-):
-    kv_indices = torch.empty(batch_size * num_pages, dtype=torch.int32, device=device)
-    create_flashinfer_kv_indices_triton[(batch_size,)](
-        req_to_token,
-        req_pool_indices,
-        seq_lens,
-        kv_idptr,
-        None,
-        kv_indices,
-        req_to_token.stride(0),
-    )
+@torch.compile
+def extract_page_table(batch_size, req_to_token, req_pool_indices, seq_lens):
+    kv_indices = req_to_token[req_pool_indices, : seq_lens.max()]
     return kv_indices.view(batch_size, -1)
 
 
@@ -138,12 +127,9 @@ class XPUAttentionBackend(AttentionBackend):
                     )
                     metadata.page_table = extract_page_table(
                         batch_size,
-                        self.max_num_pages_per_req,
-                        device,
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
-                        self.kv_indptr,
                     )
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
@@ -163,12 +149,9 @@ class XPUAttentionBackend(AttentionBackend):
                     )
                     metadata.page_table = extract_page_table(
                         batch_size,
-                        self.max_num_pages_per_req,
-                        device,
                         self.req_to_token,
                         forward_batch.req_pool_indices,
                         forward_batch.seq_lens,
-                        self.kv_indptr,
                     )
 
                     metadata_expand = FlashAttentionMetadata()
@@ -207,21 +190,15 @@ class XPUAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
-                kv_indices = torch.empty(
-                    batch_size * self.max_num_pages_per_req,
-                    dtype=torch.int32,
-                    device=self.device,
+                metadata.cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
-                create_flashinfer_kv_indices_triton[(batch_size,)](
+                metadata.page_table = extract_page_table(
+                    batch_size,
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
-                    self.kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
                 )
-                metadata.page_table = kv_indices.view(batch_size, -1)
             # TODO: we need to test this part for llama 4 eagle case
             self._init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -245,12 +222,9 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 metadata.page_table = extract_page_table(
                     batch_size,
-                    self.max_num_pages_per_req,
-                    device,
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
-                    self.kv_indptr,
                 )
 
                 self._init_local_attn_metadata(forward_batch, metadata, device)
@@ -272,12 +246,9 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 metadata.page_table = extract_page_table(
                     batch_size,
-                    self.max_num_pages_per_req,
-                    device,
                     self.req_to_token,
                     forward_batch.req_pool_indices,
                     forward_batch.seq_lens,
-                    self.kv_indptr,
                 )
 
                 metadata_expand = FlashAttentionMetadata()
@@ -365,12 +336,9 @@ class XPUAttentionBackend(AttentionBackend):
             )
             metadata.page_table = extract_page_table(
                 batch_size,
-                self.max_num_pages_per_req,
-                device,
                 self.req_to_token,
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
-                self.kv_indptr,
             )
 
             if (
@@ -383,7 +351,6 @@ class XPUAttentionBackend(AttentionBackend):
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
-                metadata.max_seq_len_q = metadata.max_seq_len_k
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
             # Setup local attention if enabled
@@ -392,26 +359,17 @@ class XPUAttentionBackend(AttentionBackend):
 
         # Encoder metadata for cross attention
         if forward_batch.encoder_lens is not None:
-            assert (
-                forward_batch.encoder_lens.numel() == 1
-            ), "Only encoder size 1 is supported for now"
-
-            metadata.encoder_lens_int32 = forward_batch.encoder_lens.to(torch.int32)
-            metadata.encoder_cu_seqlens_k = torch.nn.functional.pad(
+            metadata.cache_seqlens_int32 = forward_batch.encoder_lens.to(torch.int32)
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(metadata.encoder_lens_int32, dim=0, dtype=torch.int32),
                 (1, 0),
             )
-            metadata.encoder_page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.encoder_max_seq_len_k
-            ]
-
-            # Currently only support forward_batch.encoder_lens.numel() == 1
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+            metadata.page_table = extract_page_table(
+                batch_size,
+                self.req_to_token,
                 forward_batch.req_pool_indices,
-                metadata.encoder_max_seq_len_k : (
-                    metadata.encoder_max_seq_len_k + metadata.max_seq_len_k
-                ),
-            ]
+                forward_batch.seq_lens,
+            )
 
         # Convert the page table to a strided format which is needed by FA3 API
         if self.page_size > 1:
@@ -539,9 +497,6 @@ class XPUAttentionBackend(AttentionBackend):
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
             if layer.is_cross_attention:
-                page_table = metadata.encoder_page_table
-                cache_seqlens = metadata.encoder_lens_int32
-                cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
             result = flash_attn_with_kvcache(
@@ -829,10 +784,10 @@ class XPUAttentionBackend(AttentionBackend):
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
-                    page_table=metadata.encoder_page_table,
-                    cache_seqlens=metadata.encoder_lens_int32,
+                    page_table=metadata.page_table,
+                    cache_seqlens=metadata.cache_seqlens_int32,
                     cu_seqlens_q=metadata.cu_seqlens_q,
-                    cu_seqlens_k_new=metadata.encoder_cu_seqlens_k,
+                    cu_seqlens_k_new=metadata.cu_seqlens_k,
                     max_seqlen_q=1,
                     softmax_scale=layer.scaling,
                     causal=False,
@@ -1065,9 +1020,7 @@ class XPUAttentionBackend(AttentionBackend):
         )
         bs = cache_seqlens_int32.shape[0]
         page_table = (
-            metadata.page_table.new_zeros(
-                (bs, metadata.max_seq_len_k + metadata_expand.page_table.shape[1])
-            )
+            metadata.page_table.new_zeros((bs, self.max_num_pages_per_req))
             if metadata_swa is None
             else metadata_swa.page_table
         )
