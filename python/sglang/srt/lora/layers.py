@@ -44,9 +44,9 @@ class BaseLayerWithLoRA(nn.Module):
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
         pass
 
-##############################
-##########emb lora############
-##############################
+#############################
+#########emb lora############
+#############################
 # class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 #     """
 #     Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
@@ -65,9 +65,9 @@ class BaseLayerWithLoRA(nn.Module):
 #         self.weight = base_layer.weight
 
 
-# ##### -----
-# ##### -----
-# ##### -----
+##### -----
+##### -----
+##### -----
 # class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 #     """
 #     Vocab parallel embedding layer with support for LoRA (Low-Rank Adaptation).
@@ -109,13 +109,25 @@ class BaseLayerWithLoRA(nn.Module):
 #             input_.shape[0], dtype=torch.int32, device=input_.device
 #         )
 
-#         current_pos = 0
-#         for i in range(batch_info.bs):
-#             seg_len = int(batch_info.seg_lens[i])
-#             weight_idx = int(batch_info.weight_indices[i])
-#             token_weight_indices[current_pos : current_pos+seg_len] = weight_idx
-#             current_pos += seg_len
+#         # current_pos = 0
+#         # for i in range(batch_info.bs):
+#         #     seg_len = int(batch_info.seg_lens[i])
+#         #     weight_idx = int(batch_info.weight_indices[i])
+#         #     token_weight_indices[current_pos : current_pos+seg_len] = weight_idx
+#         #     current_pos += seg_len
 
+#         # Use cumsum for positions - avoid Python loops
+#         seg_lens = batch_info.seg_lens[:batch_info.bs]  # (bs,)
+#         cum_lens = torch.cumsum(seg_lens, dim=0)  # cumulative positions
+#         start_positions = torch.cat([torch.zeros(1, dtype=cum_lens.dtype, device=cum_lens.device), cum_lens[:-1]])
+        
+#         # Vectorized assignment using tensor operations - allow enable cuda-graph
+#         for i in range(batch_info.bs):
+#             start = start_positions[i]
+#             end = cum_lens[i]
+#             weight_idx = batch_info.weight_indices[i]
+#             token_weight_indices[start:end] = weight_idx
+        
 #         return token_weight_indices
 
 #     def _run_lora_a_embedding(
@@ -381,18 +393,35 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             input_.shape[0], dtype=torch.int32, device=input_.device
         )
         
+        ####################### 
+        ####################### 
         current_pos = 0
         for i in range(batch_info.bs):
             seg_len = int(batch_info.seg_lens[i])  # Convert tensor to int
             weight_idx = int(batch_info.weight_indices[i])  # Convert tensor to int
             token_weight_indices[current_pos : current_pos+seg_len] = weight_idx
             current_pos += seg_len
+
+        # -------- #
+        
+        # # Use repeat_interleave to map segment-level indices to token-level indices
+        # # This is CUDA graph compatible
+        # num_segments = batch_info.num_segments
+        # seg_lens = batch_info.seg_lens[:num_segments]
+        # weight_indices = batch_info.weight_indices[:num_segments]
+        
+        # # Vectorized assignment using tensor operations - allow enable cuda-graph
+        # token_weight_indices = weight_indices.repeat_interleave(seg_lens)
+        ####################### 
+        ####################### 
         
         return token_weight_indices
 
     def _run_lora_a_embedding(
         self, input_: torch.Tensor, token_weight_indices: torch.Tensor
     ) -> torch.Tensor:
+        #####################
+        #####################
         """
         Apply LoRA A weights using efficient embedding lookup.
         This avoids creating one-hot vectors.
@@ -405,15 +434,50 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         
         unique_weight_indices = torch.unique(token_weight_indices)
         
+        # to enable cuda-graph - prevent from using int 
         for idx in unique_weight_indices:
-            idx_val = idx.item()  # Convert tensor to int
             token_mask = token_weight_indices == idx
-            lora_a_weights = self.embedding_A_buffer[idx_val]  # (rank, vocab_size)
+            lora_a_weights = self.embedding_A_buffer[idx]  # (rank, vocab_size)
             # Use F.embedding for efficient lookup
             # lora_a_weights.t() gives us (vocab_size, rank)
             lora_a_output[token_mask] = F.embedding(
                 input_[token_mask], lora_a_weights.t()
             )
+
+        # -------- #
+        
+        # num_tokens = input_.shape[0]
+        # rank = self.embedding_A_buffer.shape[1]
+        
+        # # embedding_A_buffer shape: (num_loras, rank, vocab_size)
+        # # token_weight_indices shape: (num_tokens,)
+        # # input_ shape: (num_tokens,)
+        
+        # # Gather LoRA A weights for each token's assigned LoRA adapter
+        # # lora_a_weights shape: (num_tokens, rank, vocab_size)
+        # lora_a_weights = self.embedding_A_buffer[token_weight_indices]
+        
+        # # Now we need to apply embedding lookup for each token
+        # # lora_a_weights[i] is (rank, vocab_size) for token i
+        # # We want to lookup input_[i] in lora_a_weights[i].t() which is (vocab_size, rank)
+        
+        # # Transpose to (num_tokens, vocab_size, rank) for embedding lookup
+        # lora_a_weights_t = lora_a_weights.transpose(1, 2)
+        
+        # # Use batched embedding lookup
+        # # For each token i, lookup input_[i] in lora_a_weights_t[i]
+        # input_expanded = input_.unsqueeze(1)  # (num_tokens, 1)
+        
+        # # Use gather to simulate embedding lookup
+        # # lora_a_weights_t[i, input_[i], :] gives us the embedding for token i
+        # token_indices = input_.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, rank)  # (num_tokens, 1, rank)
+        # lora_a_output = torch.gather(
+        #     lora_a_weights_t, 
+        #     1, 
+        #     token_indices
+        # ).squeeze(1)  # (num_tokens, rank)
+        #####################
+        #####################
         
         return lora_a_output
 
