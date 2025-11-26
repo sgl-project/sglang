@@ -247,6 +247,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
+        output_routed_experts = []
+        if recv_obj.output_routed_experts is not None:
+            output_routed_experts = [
+                (
+                    output_routed_experts.tolist()
+                    if output_routed_experts is not None
+                    else []
+                )
+                for output_routed_experts in recv_obj.output_routed_experts
+            ]
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
@@ -272,6 +282,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
+            output_routed_experts=output_routed_experts,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
