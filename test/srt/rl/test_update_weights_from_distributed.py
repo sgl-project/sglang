@@ -635,11 +635,25 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 pause_generation_mode = None
             load_format = random.choice(["flattened_bucket", None])
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode, pause_generation_mode, load_format),
+                (
+                    1,
+                    1,
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    mode,
+                    pause_generation_mode,
+                    load_format,
+                ),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None, random.choice(["flattened_bucket", None])),
+                (
+                    1,
+                    1,
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "Engine",
+                    None,
+                    random.choice(["flattened_bucket", None]),
+                ),
                 (
                     1,
                     1,
@@ -653,7 +667,14 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             if torch.cuda.device_count() >= 4:
                 test_suits.extend(
                     [
-                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None, random.choice(["flattened_bucket", None]),),
+                        (
+                            2,
+                            1,
+                            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                            "Engine",
+                            None,
+                            random.choice(["flattened_bucket", None]),
+                        ),
                         (
                             1,
                             2,
@@ -668,7 +689,14 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             if torch.cuda.device_count() >= 5:
                 test_suits.extend(
                     [
-                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None, random.choice(["flattened_bucket", None])),
+                        (
+                            2,
+                            2,
+                            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                            "Engine",
+                            None,
+                            random.choice(["flattened_bucket", None]),
+                        ),
                         (
                             2,
                             2,
@@ -712,7 +740,14 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             "lm_head.weight",
         ]
 
-        for tp_size, dp_size, model_name, backend, pause_generation_mode, load_format in test_suits:
+        for (
+            tp_size,
+            dp_size,
+            model_name,
+            backend,
+            pause_generation_mode,
+            load_format,
+        ) in test_suits:
             test_update_weights_from_distributed(
                 tp_size,
                 dp_size,
@@ -724,6 +759,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 load_format,
                 pause_generation_mode,
             )
+
 
 if __name__ == "__main__":
     unittest.main()
