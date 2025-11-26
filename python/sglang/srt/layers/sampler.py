@@ -217,7 +217,7 @@ class Sampler(nn.Module):
             )
 
         return batch_next_token_ids
-    @torch
+
     def compute_logprobs_only(
         self,
         logits_output: LogitsProcessorOutput,
