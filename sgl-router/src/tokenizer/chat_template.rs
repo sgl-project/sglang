@@ -17,7 +17,7 @@ use minijinja::{
     Environment, Error as MinijinjaError, ErrorKind, Value,
 };
 use serde::Serialize;
-use serde_json::{self, Value as JsonValue};
+use serde_json::{self, ser::PrettyFormatter, Value as JsonValue};
 
 /// Chat template content format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -384,10 +384,10 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
         spaces: usize,
     ) -> std::result::Result<String, MinijinjaError> {
         let indent_str = vec![b' '; spaces];
-        let formatter = serde_json::ser::PrettyFormatter::with_indent(&indent_str);
+        let formatter = PrettyFormatter::with_indent(&indent_str);
         let mut buf = Vec::new();
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
-        value.serialize(&mut ser).map_err(|e| {
+        let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        value.serialize(&mut serializer).map_err(|e| {
             MinijinjaError::new(
                 ErrorKind::InvalidOperation,
                 format!("Failed to serialize JSON: {}", e),
