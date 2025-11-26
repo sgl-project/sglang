@@ -55,6 +55,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
+    ContinueGenerationReqInput,
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
@@ -62,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
+    PauseGenerationReqInput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -433,18 +435,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
 
-        external_trace_header = None
-        if request:
-            if "trace_context" in request.headers:
-                trace_set_remote_propagate_context(request.headers["trace_context"])
-            else:
-                external_trace_header = extract_trace_headers(request.headers)
+        if self.enable_trace:
+            external_trace_header = None
+            if request:
+                if "trace_context" in request.headers:
+                    trace_set_remote_propagate_context(request.headers["trace_context"])
+                else:
+                    external_trace_header = extract_trace_headers(request.headers)
+
+            self._trace_request_start(obj, created_time, external_trace_header)
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
-
-        if self.enable_trace:
-            self._trace_request_start(obj, created_time, external_trace_header)
 
         if self.log_requests:
             max_length, skip_names, _ = self.log_request_metadata
@@ -1246,21 +1248,25 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self.metrics_collector.labels
             )
 
-    async def pause_generation(self):
+    async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
-            # we are using the model_update_lock to check if there is still on-going requests.
-            while True:
-                # TODO: maybe make it async instead of fire-and-forget
-                self.abort_request(abort_all=True)
-                is_locked = await self.model_update_lock.is_locked()
-                if not is_locked:
-                    break
-                await asyncio.sleep(1.0)
+            if obj.mode != "abort":
+                await self.send_to_scheduler.send_pyobj(obj)
+            else:
+                # we are using the model_update_lock to check if there is still on-going requests.
+                while True:
+                    # TODO: maybe make it async instead of fire-and-forget
+                    self.abort_request(abort_all=True)
+                    is_locked = await self.model_update_lock.is_locked()
+                    if not is_locked:
+                        break
+                    await asyncio.sleep(1.0)
 
-    async def continue_generation(self):
+    async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
+            await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1277,6 +1283,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
+
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
+                return await self._wait_for_model_update_from_disk(obj)
 
         if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
