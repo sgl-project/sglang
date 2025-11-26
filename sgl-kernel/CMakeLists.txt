@@ -74,7 +74,7 @@ FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-triton
     GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        8f9f695ea8fde23a0c7c88e4ab256634ca27789f
+    GIT_TAG        v3.5.1
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-triton)
