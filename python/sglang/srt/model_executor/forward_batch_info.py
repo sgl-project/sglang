@@ -180,6 +180,8 @@ class ForwardBatch:
     seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
+    # The indices of output tokens in the swa token_to_kv_pool
+    swa_out_cache_loc: torch.Tensor
 
     # The sum of all sequence lengths
     seq_lens_sum: int
@@ -325,7 +327,7 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
-
+        swa_out_cache_loc = model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(batch.out_cache_loc)
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -333,6 +335,7 @@ class ForwardBatch:
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            swa_out_cache_loc=swa_out_cache_loc,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,
@@ -767,6 +770,8 @@ class ForwardBatch:
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
+        self.swa_out_cache_loc = self._pad_tensor_to_size(self.swa_out_cache_loc, num_tokens)
+
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)

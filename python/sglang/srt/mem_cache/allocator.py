@@ -208,7 +208,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             device=device,
         )
         self.clear()
-
         self._kvcache.full_to_swa_index_mapping = self.full_to_swa_index_mapping
 
     def available_size(self):
@@ -241,7 +240,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def alloc(self, need_size: int):
         if need_size > self.full_attn_allocator.available_size():

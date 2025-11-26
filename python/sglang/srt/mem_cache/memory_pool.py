@@ -1157,7 +1157,7 @@ class SWAKVPool(KVCache):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        return self.full_to_swa_index_mapping[kv_indices]
 
     def set_kv_buffer(
         self,
@@ -1172,8 +1172,9 @@ class SWAKVPool(KVCache):
         layer_id = layer.layer_id
         layer_id_pool, is_swa = self.layers_mapping[layer_id]
         if is_swa:
-            if self.full_to_swa_index_mapping is not None:
-                loc = self.translate_loc_from_full_to_swa(loc)
+            #if self.full_to_swa_index_mapping is not None:
+            #    loc = self.translate_loc_from_full_to_swa(loc)
+            #    logger.info(f"set_kv_buffer for swa layer {layer_id}")
             self.swa_kv_pool.set_kv_buffer(
                 None,
                 loc,

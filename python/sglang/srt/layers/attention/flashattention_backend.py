@@ -50,6 +50,8 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    # SWA Page table, the index of KV Cache Tables/Blocks
+    swa_page_table: torch.Tensor = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -650,7 +652,6 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
-
         self.forward_metadata = metadata
 
     def forward_extend(
@@ -762,9 +763,7 @@ class FlashAttentionBackend(AttentionBackend):
                     layer.layer_id
                 ]
                 if is_swa:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        page_table
-                    )
+                    page_table = (metadata.swa_page_table)
                     window_size = (self.attention_chunk_size, 0)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
@@ -1001,9 +1000,17 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
+                        layer.layer_id
+                    ]
+                    if is_swa:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, forward_batch.swa_out_cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
@@ -1116,12 +1123,12 @@ class FlashAttentionBackend(AttentionBackend):
                     _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
                         layer.layer_id
                     ]
-                    if is_swa:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    if layer.layer_id == 0:
+                        metadata.swa_page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 page_table
-                            )
                         )
+                    if is_swa:
+                        page_table = (metadata.swa_page_table)
                         window_size = (self.attention_chunk_size, 0)
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
@@ -1615,6 +1622,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
+                metadata.swa_page_table = self.decode_cuda_graph_metadata["page_table"][
+                    :bs, :
+                ]
                 # Precompute cumulative sequence lengths
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
@@ -1848,7 +1858,6 @@ class FlashAttentionBackend(AttentionBackend):
                     0,
                     self.page_size,
                 )
-
                 self._update_local_attn_metadata_for_replay(
                     metadata,
                     bs,
