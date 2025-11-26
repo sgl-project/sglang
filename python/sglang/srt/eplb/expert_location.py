@@ -113,8 +113,8 @@ class ExpertLocationMetadata:
 
     @staticmethod
     def init_round_robin(server_args: ServerArgs, model_config: ModelConfig):
-        """round_robin location - logical expert i corresponds to physical expert i"""
-        """but have static round robin expert placement stragey"""
+        """Implements a static round-robin expert placement strategy.
+        Logical experts are distributed across physical experts in a round-robin fashion."""
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
@@ -130,10 +130,12 @@ class ExpertLocationMetadata:
         num_local_physical_experts = num_physical_experts // ep_size
 
         def _round_robin_placement():
-            rr_list = [
+            physical_expert_indices_ordered_by_ep_group = [
                 i + j * ep_size
                 for i in range(ep_size)
                 for j in range(num_local_physical_experts)
+            ]
+            rr_physical_to_logical_map = (
             ]
             rr_physical_to_logical_map = (
                 torch.tensor(rr_list, dtype=torch.int32).repeat(num_layers, 1)
