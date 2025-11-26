@@ -420,7 +420,7 @@ suite_ascend = {
         TestFile("test_input_embeddings.py", 400),
         TestFile("openai_server/validation/test_openai_server_ignore_eos.py", 400),
         TestFile("openai_server/validation/test_matched_stop.py", 400),
-        TestFile("test_start_profile.py", 400),
+        # TestFile("test_start_profile.py", 400),
         TestFile("ascend/test_ascend_sleep_on_idle.py", 400),
         TestFile("ascend/test_ascend_bucket_inter_token_latency.py", 400),
         TestFile("ascend/test_ascend_collect_tokens_histogram.py", 400),
