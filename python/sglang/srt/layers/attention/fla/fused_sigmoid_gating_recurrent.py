@@ -13,6 +13,21 @@ from sglang.srt.layers.attention.fla.utils import input_guard
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=2, num_stages=4),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=3),
+
+    ],
+    key=["BK", "BV", "K", "V"],
+)
+
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -72,10 +87,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_A_log = A_log + i_hv
     p_a = a + bos * HV + i_hv
     p_dt_bias = dt_bias + i_hv
-
+    
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
+
+    b_A_log = tl.load(p_A_log).to(tl.float32)
+    b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
+    neg_exp_A = -tl.exp(b_A_log)
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -98,12 +117,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_b = tl.load(p_b).to(tl.float32)
 
         # Compute sigmoid gating
-        # Load gating parameters
-        b_A_log = tl.load(p_A_log).to(tl.float32)
+        # Load time-varying gating parameter
         b_a = tl.load(p_a).to(tl.float32)
-        b_dt_bias = tl.load(p_dt_bias).to(tl.float32)
 
         # Compute g = -exp(A_log) * softplus(a + dt_bias)
+        # Use pre-computed neg_exp_A
         x = b_a + b_dt_bias
         beta_x = softplus_beta * x
         # Apply softplus with numerical stability
@@ -112,29 +130,29 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             (1.0 / softplus_beta) * tl.log(1.0 + tl.exp(beta_x)),
             x,
         )
-        b_g = -tl.exp(b_A_log) * softplus_x
-
-        # Compute beta = sigmoid(b)
-        b_beta = 1.0 / (1.0 + tl.exp(-b_b))
-
+        b_g = neg_exp_A * softplus_x
+        b_beta = tl.sigmoid(b_b)
         # Apply L2 normalization if enabled
         if USE_QK_L2NORM_IN_KERNEL:
-            b_q = b_q / (tl.sqrt(tl.sum(b_q * b_q) + 1e-6))
-            b_k = b_k / (tl.sqrt(tl.sum(b_k * b_k) + 1e-6))
+            q_norm = tl.rsqrt(tl.sum(b_q * b_q) + 1e-6)
+            k_norm = tl.rsqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q = b_q * q_norm
+            b_k = b_k * k_norm
 
         b_q = b_q * scale
-
-        # Apply gating to hidden state: h *= exp(g)
-        b_h *= tl.exp(b_g)
+        # Use fast_exp for potentially faster exponential computation
+        exp_g = tl.exp(b_g)
+        b_h = b_h * exp_g
 
         # Delta rule: v -= sum(h * k, dim=0)
-        b_v -= tl.sum(b_h * b_k[:, None], 0)
+        b_v = b_v - tl.sum(b_h * b_k[:, None], 0)
 
         # Apply beta gating: v *= beta
-        b_v *= b_beta
+        b_v = b_v * b_beta
 
         # Update hidden state: h += k[:, None] * v[None, :]
-        b_h += b_k[:, None] * b_v[None, :]
+        # Use outer product and accumulate
+        b_h = b_h + b_k[:, None] * b_v[None, :]
 
         # Compute output: o = sum(h * q, dim=0)
         b_o = tl.sum(b_h * b_q[:, None], 0)
@@ -187,20 +205,18 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 8)
+    
+    # Use larger block sizes for better performance
+    BK = triton.next_power_of_2(K)
+    BV = min(triton.next_power_of_2(V), 64)  
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 1
-
     if scale is None:
         scale = k.shape[-1] ** -0.5
     else:
         assert scale > 0, "scale must be positive"
-
     o = q.new_empty(NK, *v.shape)
     grid = (NK, NV, N * HV)
-
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
         a=a,
@@ -225,8 +241,6 @@ def fused_sigmoid_gating_delta_rule_update(
         BK=BK,
         BV=BV,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
     o = o.squeeze(0)
     return o
