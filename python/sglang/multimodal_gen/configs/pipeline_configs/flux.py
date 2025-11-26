@@ -463,12 +463,13 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def maybe_resize_condition_image(self, width, height, image):
         target_area: int = 1024 * 1024
 
-        if width * height > target_area:
-            scale = math.sqrt(target_area / (width * height))
-            width = int(width * scale)
-            height = int(height * scale)
-            image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
-            width, height = image.size
+        if width is not None and height is not None:
+            if width * height > target_area:
+                scale = math.sqrt(target_area / (width * height))
+                width = int(width * scale)
+                height = int(height * scale)
+                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+                width, height = image.size
 
         return image, width, height
 
