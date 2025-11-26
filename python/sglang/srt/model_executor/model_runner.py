@@ -1569,11 +1569,6 @@ class ModelRunner:
             )
 
     def can_run_piecewise_cuda_graph(self):
-        if self.server_args.disable_cuda_graph:
-            log_info_on_rank0(
-                logger, "Disable piecewise CUDA graph because disable_cuda_graph is set"
-            )
-            return False
         if self.server_args.enable_torch_compile:
             log_info_on_rank0(
                 logger,
