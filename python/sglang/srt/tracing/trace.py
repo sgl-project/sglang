@@ -291,6 +291,7 @@ class SGLangTraceReqContext:
         role="null",
         tracing_enable=False,
         trace_level=1,
+        module_name="",
     ):
         self.tracing_enable: bool = tracing_enable and opentelemetry_initialized
         self.rid: str = str(rid)
@@ -302,8 +303,8 @@ class SGLangTraceReqContext:
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.role: str = role
 
-        self.tracing_enable: bool = tracing_enable
         self.trace_level = trace_level
+        self.module_name = module_name
 
         # Indicates whether this instance is a replica from the main process.
         # When True, root_span is None and only root_span_context is preserved.
@@ -409,7 +410,7 @@ class SGLangTraceReqContext:
         # Drop the worker_id added by MultiTokenizer
         orig_rid = self.rid.split("_")[-1]
         role = "" if self.role == "null" else self.role
-        attrs = {"rid": orig_rid}
+        attrs = {"rid": orig_rid, "module": f"sglang::{self.module_name}"}
         if self.bootstrap_room:
             attrs["bootstrap_room"] = str(hex(self.bootstrap_room))
         root_span = tracer.start_span(

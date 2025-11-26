@@ -159,7 +159,6 @@ class TraceMetricContext(SGLangTraceReqContext):
         self.last_ts_stack = []
 
         opentelemetry_initialized = get_opentelemetry_initialized()
-        self.module_name = module_name
         trace_level = getattr(server_args, "trace_level", 0)
         tracing_enable = (
             True
@@ -183,6 +182,7 @@ class TraceMetricContext(SGLangTraceReqContext):
             role=role,
             tracing_enable=tracing_enable,
             trace_level=trace_level,
+            module_name=module_name,
         )
 
         if isinstance(propagation_context, dict):
