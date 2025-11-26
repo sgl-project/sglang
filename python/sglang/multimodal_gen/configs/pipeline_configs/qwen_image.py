@@ -190,6 +190,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         return latents
 
 
+@dataclass
 class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     """Configuration for the QwenImageEdit pipeline."""
 
