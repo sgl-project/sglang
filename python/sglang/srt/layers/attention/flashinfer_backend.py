@@ -690,7 +690,7 @@ class FlashInferAttnBackend(AttentionBackend):
             raise ValueError("Invalid forward mode")
 
     def _init_flashinfer_bench(self) -> None:
-        """Initialize FlashInfer-Bench integration if enabled."""
+        """Initialize FlashInfer-Bench integration if enabled"""
         self.flashinfer_bench_enabled = False
 
         if not (envs.FIB_ENABLE_TRACING.get() or envs.FIB_ENABLE_APPLY.get()):
@@ -699,23 +699,14 @@ class FlashInferAttnBackend(AttentionBackend):
         try:
             from sglang.srt.layers.flashinfer_bench_integration import (
                 initialize_flashinfer_bench,
-                wrap_attention_kernel,
             )
 
-            # Initialize the integration
-            initialize_flashinfer_bench()
-            self.flashinfer_bench_enabled = True
+            # Initialize the integration - this automatically patches FlashInfer
+            # functions via install_flashinfer_integrations()
+            self.flashinfer_bench_enabled = initialize_flashinfer_bench()
 
-            # Wrap the forward methods if tracing or kernel substitution is enabled
-            if envs.FIB_ENABLE_TRACING.get() or envs.FIB_ENABLE_APPLY.get():
-                self.forward_extend = wrap_attention_kernel(
-                    "flashinfer_prefill_attention"
-                )(self.forward_extend)
-                self.forward_decode = wrap_attention_kernel(
-                    "flashinfer_decode_attention"
-                )(self.forward_decode)
-
-            logger.info("FlashInfer-Bench integration initialized")
+            if self.flashinfer_bench_enabled:
+                logger.info("FlashInfer-Bench integration initialized")
         except ImportError as e:
             logger.debug(f"FlashInfer-Bench integration not available: {e}")
 

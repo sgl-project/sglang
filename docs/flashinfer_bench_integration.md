@@ -211,9 +211,9 @@ python -m sglang.launch_server --model-path llama-3-8b
 
 ### Automatic Integration
 
-When FlashInfer-Bench is enabled, SGLang automatically:
+When FlashInfer-Bench is enabled, it automatically patches FlashInfer's internal functions:
 
-1. **Wraps Attention Kernels**: `forward_extend` (prefill) and `forward_decode` (generation)
+1. **Patches FlashInfer Wrappers**: `BatchPrefillWithPagedKVCacheWrapper`, `BatchDecodeWithPagedKVCacheWrapper`, etc.
 2. **Collects Workload Data**: Tensor shapes, batch configurations, sequence lengths
 3. **Substitutes Kernels**: Uses the fastest kernel for each workload pattern
 4. **Falls Back Gracefully**: Uses default kernels if no optimization is available
@@ -221,14 +221,18 @@ When FlashInfer-Bench is enabled, SGLang automatically:
 ### Under the Hood
 
 ```python
-# SGLang automatically does this when enabled:
-@wrap_attention_kernel("flashinfer_prefill_attention")
-def forward_extend(self, q, k, v, ...):
-    # FlashInfer-Bench intercepts this call
-    # - Traces workload parameters if tracing enabled
-    # - Substitutes optimized kernel if apply enabled
-    # - Falls back to original if no optimization available
-    return attention_output
+# When you call enable_tracing() or enable_apply(), FlashInfer-Bench
+# automatically patches FlashInfer's internal functions via
+# install_flashinfer_integrations(). This happens inside TracingRuntime
+# and ApplyRuntime initialization.
+
+# The patched functions intercept calls like:
+wrapper.plan(...)  # Captures configuration
+wrapper.run(...)   # Traces workload / applies optimized kernel
+
+# Definition names are computed from tensor shapes, e.g.:
+# "gqa_paged_prefill_causal_h32_kv8_d128_ps1"
+# This allows matching workloads to the right tracing config and solutions.
 ```
 
 ## Monitoring and Debugging
@@ -340,20 +344,52 @@ python -c "from sglang.srt.environ import envs; print(envs.FIB_ENABLE_TRACING.ge
 
 ## Advanced Usage
 
-### Custom Tracing Configuration
+### Programmatic Initialization
 
 ```python
 # In your custom launcher script
-from sglang.srt.layers.flashinfer_bench_integration import initialize_flashinfer_bench
+from sglang.srt.layers.flashinfer_bench_integration import (
+    initialize_flashinfer_bench,
+    shutdown_flashinfer_bench,
+    is_flashinfer_bench_enabled,
+)
 
-# Initialize with custom config
-initialize_flashinfer_bench(
-    enable_tracing=True,
+# Initialize with explicit settings
+success = initialize_flashinfer_bench(
+    tracing=True,
+    apply=False,
     dataset_path="/custom/path",
-    tracing_config={
-        "input_dump_policy": "dump_all",  # Save all tensor data
-        "filter_policy": "keep_all"        # Keep all workloads
-    }
+)
+
+if success:
+    print("FlashInfer-Bench initialized!")
+
+# Check status
+if is_flashinfer_bench_enabled():
+    print("Integration is active")
+
+# Cleanup (flushes traces)
+shutdown_flashinfer_bench()
+```
+
+### Custom Tracing Configuration
+
+For advanced tracing configurations, you can use FlashInfer-Bench's API directly:
+
+```python
+from flashinfer_bench import enable_tracing, TracingConfig
+
+# Custom config for specific definitions
+custom_configs = {
+    "gqa_paged_prefill_causal_h32_kv8_d128_ps1": TracingConfig(
+        input_dump_policy=["qo_indptr", "kv_indptr", "kv_indices", "sm_scale"],
+        filter_policy="keep_first_by_axes",
+    ),
+}
+
+enable_tracing(
+    dataset_path="/custom/path",
+    tracing_configs=custom_configs,
 )
 ```
 
