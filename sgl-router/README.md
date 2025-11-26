@@ -44,6 +44,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 
 ## Installation
 ### Prerequisites
+
 - **Rust and Cargo**
   ```bash
   # Install rustup (Rust installer and version manager)
