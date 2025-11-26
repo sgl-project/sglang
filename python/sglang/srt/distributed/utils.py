@@ -89,9 +89,7 @@ def get_pp_indices(
         if pp_rank >= pp_size - remainder:
             partitions_without_extra_layer = pp_size - remainder
             # This partition gets one extra layer
-            start_layer = partitions_without_extra_layer * base_layers + (
-                pp_rank - partitions_without_extra_layer
-            ) * (base_layers + 1)
+            start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
             end_layer = start_layer + (base_layers + 1)
         else:
             # This partition gets only base layers
