@@ -448,8 +448,8 @@ def test_update_weights_from_distributed(
     state_dict_key_to_shape,
     truncate_size,
     checking_parameters,
-    pause_generation_mode=None,
     load_format=None,
+    pause_generation_mode=None,
 ):
     tie_word_embeddings = (
         True if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else False
@@ -633,31 +633,34 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 pause_generation_mode = random.choice(["in_place", "retract"])
             else:
                 pause_generation_mode = None
+            load_format = random.choice(["flattened_bucket", None])
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode, pause_generation_mode),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, mode, pause_generation_mode, load_format),
             ]
         else:
             test_suits = [
-                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None, random.choice(["flattened_bucket", None])),
                 (
                     1,
                     1,
                     DEFAULT_MODEL_NAME_FOR_TEST,
                     "Sever",
                     random.choice(["in_place", "retract"]),
+                    random.choice(["flattened_bucket", None]),
                 ),
             ]
 
             if torch.cuda.device_count() >= 4:
                 test_suits.extend(
                     [
-                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None),
+                        (2, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None, random.choice(["flattened_bucket", None]),),
                         (
                             1,
                             2,
                             DEFAULT_MODEL_NAME_FOR_TEST,
                             "Server",
                             random.choice(["in_place", "retract"]),
+                            random.choice(["flattened_bucket", None]),
                         ),
                     ]
                 )
@@ -665,13 +668,14 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             if torch.cuda.device_count() >= 5:
                 test_suits.extend(
                     [
-                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None),
+                        (2, 2, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, "Engine", None, random.choice(["flattened_bucket", None])),
                         (
                             2,
                             2,
                             DEFAULT_MODEL_NAME_FOR_TEST,
                             "Server",
                             random.choice(["in_place", "retract"]),
+                            random.choice(["flattened_bucket", None]),
                         ),
                     ]
                 )
@@ -708,7 +712,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             "lm_head.weight",
         ]
 
-        for tp_size, dp_size, model_name, backend, pause_generation_mode in test_suits:
+        for tp_size, dp_size, model_name, backend, pause_generation_mode, load_format in test_suits:
             test_update_weights_from_distributed(
                 tp_size,
                 dp_size,
@@ -717,21 +721,9 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 model_state_dict_shapes[model_name],
                 truncate_size,
                 checking_parameters,
+                load_format,
                 pause_generation_mode,
             )
-
-            # FlattenedTensor
-            test_update_weights_from_distributed(
-                tp_size,
-                dp_size,
-                model_name,
-                backend,
-                model_state_dict_shapes[model_name],
-                truncate_size,
-                checking_parameters,
-                load_format="flattened_bucket",
-            )
-
 
 if __name__ == "__main__":
     unittest.main()
