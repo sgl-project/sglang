@@ -762,6 +762,10 @@ class FlashAttentionBackend(AttentionBackend):
                 _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
                     layer.layer_id
                 ]
+                if layer.layer_id == 0:
+                    metadata.swa_page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            page_table
+                    ).to(torch.int32)
                 if is_swa:
                     page_table = (metadata.swa_page_table)
                     window_size = (self.attention_chunk_size, 0)
@@ -1126,7 +1130,7 @@ class FlashAttentionBackend(AttentionBackend):
                     if layer.layer_id == 0:
                         metadata.swa_page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 page_table
-                        )
+                        ).to(torch.int32)
                     if is_swa:
                         page_table = (metadata.swa_page_table)
                         window_size = (self.attention_chunk_size, 0)
