@@ -136,7 +136,6 @@ class Envs:
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
-    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
     # Test & Debug
     SGLANG_IS_IN_CI = EnvBool(False)
@@ -159,7 +158,8 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
-    SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -194,6 +194,17 @@ class Envs:
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
 
+    # Mooncake Store
+    SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
+    MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
+    MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
+    MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
+    MOONCAKE_PROTOCOL = EnvStr("tcp")
+    MOONCAKE_DEVICE = EnvStr("")
+    MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
+    MOONCAKE_CHECK_SERVER = EnvBool(False)
+
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
@@ -204,6 +215,7 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
@@ -265,11 +277,17 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
+    # RoPE cache configuration
+    SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
+    SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
+
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # VLM
+    SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_USE_OPENCV_VIDEO_BACKEND = EnvBool(False)
@@ -295,6 +313,11 @@ class Envs:
 
     # Health Check
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
+    # External models
+    SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
+    SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
     # fmt: on
 
