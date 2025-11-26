@@ -5,8 +5,6 @@
 //! - Uses caching to avoid repeated endpoint probing
 //! - Handles single endpoint (fast path) vs multiple endpoints
 
-use std::time::{Duration, Instant};
-
 use async_trait::async_trait;
 use axum::{
     http::StatusCode,
@@ -16,8 +14,7 @@ use axum::{
 use super::ChatStage;
 use crate::routers::openai::{
     chat::{ChatRequestContext, DiscoveryOutput},
-    router::CachedEndpoint,
-    utils::probe_endpoint_for_model,
+    utils::discover_model_endpoint,
 };
 
 /// Model discovery stage for chat pipeline
@@ -40,70 +37,25 @@ impl ChatStage for ChatModelDiscoveryStage {
                 .into_response()
         })?;
 
-        // Get model name
-        let model = ctx.model();
-
-        // Fast path: single endpoint
-        if ctx.dependencies.worker_urls.len() == 1 {
-            ctx.state.discovery = Some(DiscoveryOutput {
-                endpoint_url: ctx.dependencies.worker_urls[0].clone(),
-                model: model.to_string(),
-            });
-            return Ok(());
-        }
-
-        // Check cache
-        if let Some(entry) = ctx.dependencies.model_cache.get(model) {
-            if entry.cached_at.elapsed() < Duration::from_secs(Self::MODEL_CACHE_TTL_SECS) {
-                ctx.state.discovery = Some(DiscoveryOutput {
-                    endpoint_url: entry.url.clone(),
-                    model: model.to_string(),
-                });
-                return Ok(());
-            }
-        }
-
-        // Probe all endpoints in parallel
-        let mut handles = vec![];
-        let model_str = model.to_string();
-        let auth = validation.auth_header.clone();
-
-        for url in &ctx.dependencies.worker_urls {
-            let handle = tokio::spawn(probe_endpoint_for_model(
-                ctx.dependencies.http_client.clone(),
-                url.clone(),
-                model_str.clone(),
-                auth.clone(),
-            ));
-            handles.push(handle);
-        }
-
-        // Return first successful endpoint
-        for handle in handles {
-            if let Ok(Ok(url)) = handle.await {
-                // Cache it
-                ctx.dependencies.model_cache.insert(
-                    model_str.clone(),
-                    CachedEndpoint {
-                        url: url.clone(),
-                        cached_at: Instant::now(),
-                    },
-                );
-
-                ctx.state.discovery = Some(DiscoveryOutput {
-                    endpoint_url: url,
-                    model: model_str,
-                });
-                return Ok(());
-            }
-        }
-
-        // Model not found on any endpoint
-        Err((
-            StatusCode::NOT_FOUND,
-            format!("Model '{}' not found on any endpoint", model),
+        // Use shared model discovery logic
+        let discovery_output = discover_model_endpoint(
+            &ctx.dependencies.http_client,
+            &ctx.dependencies.worker_urls,
+            &ctx.dependencies.model_cache,
+            ctx.model(),
+            validation.auth_header.as_deref(),
+            Self::MODEL_CACHE_TTL_SECS,
         )
-            .into_response())
+        .await
+        .map_err(|(status, msg)| (status, msg).into_response())?;
+
+        // Store discovery output in chat-specific format
+        ctx.state.discovery = Some(DiscoveryOutput {
+            endpoint_url: discovery_output.endpoint_url,
+            model: discovery_output.model,
+        });
+
+        Ok(())
     }
 
     fn name(&self) -> &'static str {

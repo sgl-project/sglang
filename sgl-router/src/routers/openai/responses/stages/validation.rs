@@ -5,16 +5,11 @@
 //! - Extracts authorization header
 //! - Validates basic request parameters
 
-use std::time::Instant;
-
 use async_trait::async_trait;
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-};
+use axum::response::{IntoResponse, Response};
 
 use super::ResponsesStage;
-use crate::routers::openai::{responses::ResponsesRequestContext, utils::extract_auth_header};
+use crate::routers::openai::{responses::ResponsesRequestContext, utils::validate_request};
 
 /// Validation and authentication stage for responses pipeline
 pub struct ResponsesValidationStage;
@@ -25,28 +20,18 @@ impl ResponsesStage for ResponsesValidationStage {
         &self,
         ctx: &mut ResponsesRequestContext,
     ) -> Result<Option<Response>, Response> {
-        // 1. Circuit breaker check
-        if !ctx.dependencies.circuit_breaker.can_execute() {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response());
-        }
+        // Use shared validation logic
+        let validation_output = validate_request(
+            &ctx.dependencies.circuit_breaker,
+            ctx.input.headers.as_ref(),
+            ctx.model(),
+        )
+        .map_err(|(status, msg)| (status, msg).into_response())?;
 
-        // 2. Extract authorization header
-        let auth_header = extract_auth_header(ctx.input.headers.as_ref()).map(|s| s.to_string());
-
-        // 3. Validate model is specified
-        let model = ctx.model();
-        if model.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Model parameter is required and cannot be empty",
-            )
-                .into_response());
-        }
-
-        // 4. Store validation output
+        // Store validation output in responses-specific format
         ctx.state.validation = Some(crate::routers::openai::responses::ValidationOutput {
-            auth_header,
-            validated_at: Instant::now(),
+            auth_header: validation_output.auth_header,
+            validated_at: validation_output.validated_at,
         });
 
         Ok(None) // Continue to next stage

@@ -1,8 +1,45 @@
 //! Utility types and constants for OpenAI router
 
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+
+// ============================================================================
+// SGLang-Specific Fields
+// ============================================================================
+
+/// Fields specific to SGLang that should be stripped when forwarding to OpenAI-compatible endpoints
+/// Used by both chat and responses request building stages
+pub static SGLANG_SPECIFIC_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    HashSet::from([
+        "request_id",
+        "priority",
+        "top_k",
+        "min_p",
+        "min_tokens",
+        "regex",
+        "ebnf",
+        "stop_token_ids",
+        "no_stop_trim",
+        "ignore_eos",
+        "continue_final_message",
+        "skip_special_tokens",
+        "lora_path",
+        "session_params",
+        "separate_reasoning",
+        "stream_reasoning",
+        "chat_template_kwargs",
+        "return_hidden_states",
+        "repetition_penalty",
+        "sampling_seed",
+    ])
+});
 
 // ============================================================================
 // SSE Event Type Constants
@@ -180,9 +217,7 @@ pub async fn probe_endpoint_for_model(
     use tracing::debug;
 
     let probe_url = format!("{}/v1/models/{}", url, model);
-    let req = client
-        .get(&probe_url)
-        .timeout(std::time::Duration::from_secs(5));
+    let req = client.get(&probe_url).timeout(Duration::from_secs(5));
 
     // Apply provider-specific headers (handles Anthropic, xAI, OpenAI, etc.)
     let auth_header_value = auth.as_ref().and_then(|a| HeaderValue::from_str(a).ok());
@@ -219,6 +254,136 @@ pub async fn probe_endpoint_for_model(
             Err(())
         }
     }
+}
+
+// ============================================================================
+// Shared Pipeline Stage Utilities
+// ============================================================================
+
+use crate::{core::CircuitBreaker, routers::openai::router::CachedEndpoint};
+
+/// Validation output for both chat and responses pipelines
+#[derive(Clone)]
+pub struct ValidationOutput {
+    pub auth_header: Option<String>,
+    pub validated_at: Instant,
+}
+
+/// Discovery output for both chat and responses pipelines
+#[derive(Clone)]
+pub struct DiscoveryOutput {
+    pub endpoint_url: String,
+    pub model: String,
+}
+
+/// Shared validation logic for both chat and responses pipelines
+///
+/// Returns:
+/// - Ok(ValidationOutput) if validation passed
+/// - Err(StatusCode, message) if validation failed
+pub fn validate_request(
+    circuit_breaker: &CircuitBreaker,
+    headers: Option<&HeaderMap>,
+    model: &str,
+) -> Result<ValidationOutput, (StatusCode, &'static str)> {
+    // 1. Circuit breaker check
+    if !circuit_breaker.can_execute() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open"));
+    }
+
+    // 2. Extract authorization header
+    let auth_header = extract_auth_header(headers).map(|s| s.to_string());
+
+    // 3. Validate model is specified
+    if model.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Model parameter is required and cannot be empty",
+        ));
+    }
+
+    Ok(ValidationOutput {
+        auth_header,
+        validated_at: Instant::now(),
+    })
+}
+
+/// Shared model discovery logic for both chat and responses pipelines
+///
+/// This function:
+/// - Returns immediately if there's only one endpoint (fast path)
+/// - Checks cache for recent model location
+/// - Probes all endpoints in parallel if cache miss
+/// - Updates cache on successful discovery
+///
+/// Returns:
+/// - Ok(DiscoveryOutput) if model found
+/// - Err(StatusCode, message) if model not found on any endpoint
+pub async fn discover_model_endpoint(
+    client: &reqwest::Client,
+    worker_urls: &[String],
+    model_cache: &Arc<DashMap<String, CachedEndpoint>>,
+    model: &str,
+    auth_header: Option<&str>,
+    cache_ttl_secs: u64,
+) -> Result<DiscoveryOutput, (StatusCode, String)> {
+    // Fast path: single endpoint
+    if worker_urls.len() == 1 {
+        return Ok(DiscoveryOutput {
+            endpoint_url: worker_urls[0].clone(),
+            model: model.to_string(),
+        });
+    }
+
+    // Check cache
+    if let Some(entry) = model_cache.get(model) {
+        if entry.cached_at.elapsed() < Duration::from_secs(cache_ttl_secs) {
+            return Ok(DiscoveryOutput {
+                endpoint_url: entry.url.clone(),
+                model: model.to_string(),
+            });
+        }
+    }
+
+    // Probe all endpoints in parallel
+    let mut handles = vec![];
+    let model_str = model.to_string();
+    let auth = auth_header.map(|s| s.to_string());
+
+    for url in worker_urls {
+        let handle = tokio::spawn(probe_endpoint_for_model(
+            client.clone(),
+            url.clone(),
+            model_str.clone(),
+            auth.clone(),
+        ));
+        handles.push(handle);
+    }
+
+    // Return first successful endpoint
+    for handle in handles {
+        if let Ok(Ok(url)) = handle.await {
+            // Cache it
+            model_cache.insert(
+                model_str.clone(),
+                CachedEndpoint {
+                    url: url.clone(),
+                    cached_at: Instant::now(),
+                },
+            );
+
+            return Ok(DiscoveryOutput {
+                endpoint_url: url,
+                model: model_str,
+            });
+        }
+    }
+
+    // Model not found on any endpoint
+    Err((
+        StatusCode::NOT_FOUND,
+        format!("Model '{}' not found on any endpoint", model),
+    ))
 }
 
 // ============================================================================

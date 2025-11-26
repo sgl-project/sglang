@@ -7,7 +7,10 @@
 //! - Initializes tool loop state
 
 use async_trait::async_trait;
-use axum::response::Response;
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use serde_json::Value;
 
 use super::ResponsesStage;
@@ -83,9 +86,13 @@ impl ResponsesStage for ResponsesMcpPreparationStage {
             let tools = ctx.dependencies.mcp_manager.list_tools();
 
             // Get or create payload
-            let payload_output = ctx.state.payload.as_mut().expect(
-                "PayloadOutput must exist before MCP preparation (RequestBuilding stage should run first)",
-            );
+            let payload_output = ctx.state.payload.as_mut().ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Payload building stage not completed before MCP preparation",
+                )
+                    .into_response()
+            })?;
 
             // Transform MCP tools to function format
             Self::prepare_mcp_tools(&mut payload_output.json_payload, &tools);

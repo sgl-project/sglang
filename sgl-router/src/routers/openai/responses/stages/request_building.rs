@@ -7,47 +7,21 @@
 //! - Applies provider-specific transformations (xAI/Grok)
 //! - Serializes to JSON
 
-use std::collections::HashSet;
-
 use async_trait::async_trait;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use once_cell::sync::Lazy;
 use serde_json::{to_value, Value};
 
 use super::ResponsesStage;
 use crate::{
     protocols::responses::{ResponseContentPart, ResponseInput, ResponseInputOutputItem},
-    routers::openai::responses::{PayloadOutput, ResponsesRequestContext},
+    routers::openai::{
+        responses::{PayloadOutput, ResponsesRequestContext},
+        utils::SGLANG_SPECIFIC_FIELDS,
+    },
 };
-
-/// Fields specific to SGLang that should be stripped when forwarding to OpenAI-compatible endpoints
-static SGLANG_RESPONSES_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    HashSet::from([
-        "request_id",
-        "priority",
-        "top_k",
-        "min_p",
-        "min_tokens",
-        "regex",
-        "ebnf",
-        "stop_token_ids",
-        "no_stop_trim",
-        "ignore_eos",
-        "continue_final_message",
-        "skip_special_tokens",
-        "lora_path",
-        "session_params",
-        "separate_reasoning",
-        "stream_reasoning",
-        "chat_template_kwargs",
-        "return_hidden_states",
-        "repetition_penalty",
-        "sampling_seed",
-    ])
-});
 
 /// Request building stage for responses pipeline
 pub struct ResponsesRequestBuildingStage;
@@ -136,7 +110,7 @@ impl ResponsesStage for ResponsesRequestBuildingStage {
 
         // Strip SGLang-specific fields
         if let Some(obj) = payload.as_object_mut() {
-            obj.retain(|k, _| !SGLANG_RESPONSES_FIELDS.contains(&k.as_str()));
+            obj.retain(|k, _| !SGLANG_SPECIFIC_FIELDS.contains(&k.as_str()));
 
             // XAI (Grok models) special handling
             let is_grok_model = obj
