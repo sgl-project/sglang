@@ -402,28 +402,31 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
     }
 
     // Serialize with options
-    let json_str: std::result::Result<String, MinijinjaError> = if sort_keys.unwrap_or(false) {
-        // For sort_keys, we need to recursively sort all objects
-        let sorted = sort_json_keys(&json_value);
-        if let Some(spaces) = indent {
-            serialize_with_indent(&sorted, spaces as usize)
+    let json_str: std::result::Result<String, MinijinjaError> = {
+        let sorted_json;
+        let value_to_serialize = if sort_keys.unwrap_or(false) {
+            sorted_json = sort_json_keys(&json_value);
+            &sorted_json
         } else {
-            serde_json::to_string(&sorted).map_err(|e| {
+            &json_value
+        };
+
+        if let Some(spaces) = indent {
+            if spaces < 0 {
+                return Err(MinijinjaError::new(
+                    ErrorKind::InvalidOperation,
+                    "indent cannot be negative",
+                ));
+            }
+            serialize_with_indent(value_to_serialize, spaces as usize)
+        } else {
+            serde_json::to_string(value_to_serialize).map_err(|e| {
                 MinijinjaError::new(
                     ErrorKind::InvalidOperation,
                     format!("Failed to serialize JSON: {}", e),
                 )
             })
         }
-    } else if let Some(spaces) = indent {
-        serialize_with_indent(&json_value, spaces as usize)
-    } else {
-        serde_json::to_string(&json_value).map_err(|e| {
-            MinijinjaError::new(
-                ErrorKind::InvalidOperation,
-                format!("Failed to serialize JSON: {}", e),
-            )
-        })
     };
 
     json_str.map(Value::from_safe_string)

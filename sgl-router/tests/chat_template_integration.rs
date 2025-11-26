@@ -329,8 +329,11 @@ All: {{ data|tojson(ensure_ascii=False, sort_keys=True, indent=2) }}
     let z_pos = sorted_line.find("z_key").unwrap();
     assert!(a_pos < m_pos && m_pos < z_pos, "Keys should be sorted");
 
-    // Verify indented output contains newlines (pretty printed)
-    assert!(result.contains("Indented:"));
+    // Verify indented output is pretty-printed with newlines
+    assert!(
+        result.contains("Indented: {\n"),
+        "Indented JSON should be pretty-printed with newlines"
+    );
 }
 
 #[test]
