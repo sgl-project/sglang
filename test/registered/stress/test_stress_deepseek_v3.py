@@ -1,19 +1,23 @@
-"""Stress test for Qwen3-235B model."""
+"""Stress test for DeepSeek-V3 model."""
 
 import os
 import unittest
 
-from stress_test_utils import StressTestRunner
+from stress_utils import StressTestRunner
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
-MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-RANDOM_INPUT_LEN = 4096
-RANDOM_OUTPUT_LEN = 512
-OUTPUT_FILE = "stress_test_qwen3_235b.jsonl"
+MODEL_PATH = "deepseek-ai/DeepSeek-V3"
+RANDOM_INPUT_LEN = 16384
+RANDOM_OUTPUT_LEN = 1024
+OUTPUT_FILE = "stress_test_deepseek_v3.jsonl"
+
+# Register for CI - estimated 45 minutes
+register_cuda_ci(est_time=2700, suite="stress")
 
 
-class TestStressQwen3235B(unittest.TestCase):
+class TestStressDeepSeekV3(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL_PATH
@@ -22,13 +26,13 @@ class TestStressQwen3235B(unittest.TestCase):
         cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "45"))
 
         cls.runner = StressTestRunner(
-            test_name="Qwen3-235B Stress Test",
+            test_name="DeepSeek-V3 Stress Test",
             base_url=cls.base_url,
             num_prompts=cls.num_prompts,
             duration_minutes=cls.duration_minutes,
         )
 
-    def test_stress_qwen3_235b(self):
+    def test_stress_deepseek_v3(self):
         try:
             success = self.runner.run_stress_test_for_model(
                 model_path=self.model,

@@ -15,8 +15,7 @@ on:
         type: string
 
 jobs:
-  # DeepSeek-V3 stress test
-  stress-test-deepseek-v3:
+  stress-test:
     if: github.repository == 'sgl-project/sglang'
     runs-on: 8-gpu-h200
     steps:
@@ -27,124 +26,19 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run stress test
-        timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
+      - name: Run stress tests
+        timeout-minutes: 210
         env:
           NUM_PROMPTS: ${{ inputs.num_prompts }}
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
         run: |
           cd test
-          python3 stress/test_stress_deepseek_v3.py
+          python3 run_suite.py --hw cuda --suite stress
 
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stress-test-deepseek-v3
-          path: stress_test_deepseek_v3.jsonl
-
-  # Qwen3-235B stress test
-  stress-test-qwen3-235b:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 8-gpu-h200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run stress test
-        timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
-        env:
-          NUM_PROMPTS: ${{ inputs.num_prompts }}
-          DURATION_MINUTES: ${{ inputs.duration_minutes }}
-        run: |
-          cd test
-          python3 stress/test_stress_qwen3_235b.py
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stress-test-qwen3-235b
-          path: stress_test_qwen3_235b.jsonl
-
-  # Kimi-K2-Thinking stress test
-  stress-test-kimi-k2:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 8-gpu-h200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run stress test
-        timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
-        env:
-          NUM_PROMPTS: ${{ inputs.num_prompts }}
-          DURATION_MINUTES: ${{ inputs.duration_minutes }}
-        run: |
-          cd test
-          python3 stress/test_stress_kimi_k2.py
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stress-test-kimi-k2
-          path: stress_test_kimi_k2.jsonl
-
-  # GLM-4.6 stress test
-  stress-test-glm-4-6:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: 8-gpu-h200
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/ci_install_dependency.sh
-
-      - name: Run stress test
-        timeout-minutes: ${{ fromJSON(inputs.duration_minutes) }}
-        env:
-          NUM_PROMPTS: ${{ inputs.num_prompts }}
-          DURATION_MINUTES: ${{ inputs.duration_minutes }}
-        run: |
-          cd test
-          python3 stress/test_stress_glm_4_6.py
-
-      - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: stress-test-glm-4-6
-          path: stress_test_glm_4_6.jsonl
-
-  # Final check job
-  check-stress-tests:
-    if: github.repository == 'sgl-project/sglang' && always()
-    needs:
-      - stress-test-deepseek-v3
-      - stress-test-qwen3-235b
-      - stress-test-kimi-k2
-      - stress-test-glm-4-6
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check if any stress test failed
-        run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "One or more stress tests failed"
-            exit 1
-          fi
-          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more stress tests were cancelled"
-            exit 1
-          fi
-          echo "All stress tests passed"
+          name: stress-test-results
+          path: |
+            stress_test_*.jsonl
