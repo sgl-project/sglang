@@ -226,6 +226,11 @@ class SamplingParams:
             self.data_type = DataType.IMAGE
         else:
             # Adjust number of frames based on number of GPUs for video task
+
+            self.num_frames = server_args.pipeline_config.adjust_num_frames(
+                self.num_frames
+            )
+
             use_temporal_scaling_frames = (
                 pipeline_config.vae_config.use_temporal_scaling_frames
             )
@@ -274,10 +279,6 @@ class SamplingParams:
                     server_args.num_gpus,
                 )
                 self.num_frames = new_num_frames
-
-            self.num_frames = server_args.pipeline_config.adjust_num_frames(
-                self.num_frames
-            )
 
         self._set_output_file_name()
         self.log(server_args=server_args)
