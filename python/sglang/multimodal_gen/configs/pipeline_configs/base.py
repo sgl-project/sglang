@@ -187,7 +187,7 @@ class PipelineConfig:
         return num_frames
 
     # tokenize the prompt
-    def tokenize_prompt(self, prompt:list[str], tokenizer, tok_kwargs) -> dict:
+    def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
 
     # called in ImageEncodingStage, preprocess the image

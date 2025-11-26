@@ -9,10 +9,15 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
-    T5Config, TextEncoderConfig,
+    T5Config,
+    TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
-from sglang.multimodal_gen.configs.models.encoders.mistral import Mistral3Config, _is_transformer_layer, _is_embeddings
+from sglang.multimodal_gen.configs.models.encoders.mistral import (
+    Mistral3Config,
+    _is_embeddings,
+    _is_transformer_layer,
+)
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -359,7 +364,9 @@ class Flux2MistralTextArchConfig(TextEncoderArchConfig):
 
 @dataclass
 class Flux2MistralTextConfig(TextEncoderConfig):
-    arch_config: TextEncoderArchConfig = field(default_factory=Flux2MistralTextArchConfig)
+    arch_config: TextEncoderArchConfig = field(
+        default_factory=Flux2MistralTextArchConfig
+    )
 
 
 def format_text_input(prompts: List[str], system_message: str = None):
@@ -410,7 +417,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
-        print(f"{prompts=}")
         # flatten to 1-d list
         prompts = [p for prompt in prompts for p in prompt]
         inputs = tokenizer.apply_chat_template(
@@ -425,6 +431,9 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             # max_length=512,
             max_length=2048,
         )
+
+        print(f"{prompts=}")
+        print(f"{inputs=}")
         return inputs
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
@@ -541,5 +550,5 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     def slice_noise_pred(self, noise, latents):
         # remove noise over input image
-        noise = noise[:, : latents.size(1):]
+        noise = noise[:, : latents.size(1) :]
         return noise
