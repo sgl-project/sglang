@@ -99,6 +99,8 @@ class ImageEncodingStage(PipelineStage):
             The batch with encoded prompt embeddings.
         """
 
+        if batch.condition_image is None:
+            return batch
         cuda_device = get_local_torch_device()
         self.move_to_device(cuda_device)
 
@@ -217,7 +219,9 @@ class ImageVAEEncodingStage(PipelineStage):
         Returns:
             The batch with encoded outputs.
         """
-        assert batch.condition_image is not None
+
+        if batch.condition_image is None:
+            return batch
         if server_args.mode == ExecutionMode.INFERENCE:
             assert batch.condition_image is not None and isinstance(
                 batch.condition_image, PIL.Image.Image
@@ -275,8 +279,8 @@ class ImageVAEEncodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                                   vae_dtype != torch.float32
+                               ) and not server_args.disable_autocast
 
         # Encode Image
         with torch.autocast(

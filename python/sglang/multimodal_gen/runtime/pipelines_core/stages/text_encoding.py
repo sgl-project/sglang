@@ -252,7 +252,9 @@ class TextEncodingStage(PipelineStage):
 
             text_inputs = tokenizer(processed_texts, **tok_kwargs).to(target_device)
             input_ids = text_inputs["input_ids"]
-            is_flux_v1 = isinstance(server_args.pipeline_config, FluxPipelineConfig) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
+            is_flux_v1 = isinstance(
+                server_args.pipeline_config, FluxPipelineConfig
+            ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
             is_flux_t5 = is_flux_v1 and i == 1
 
             if is_flux_t5:
