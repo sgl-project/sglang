@@ -591,6 +591,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    @property
+    def model_runner(self):
+        return self.target_worker.model_runner
+
+    def use_scheduler_staging_copy(self):
+        # TODO: EAGLE v2 manages graph running internally via target_worker
+        return False
+
+    def set_hicache_consumer(self, consumer_index: int):
+        self._target_worker.set_hicache_consumer(consumer_index)
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
             model_worker_batch.forward_mode.is_extend()
@@ -669,8 +680,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
-            forward_batch=verify_forward_batch,
+            verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
         )

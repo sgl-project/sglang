@@ -335,6 +335,9 @@ class TpModelWorker(BaseTpWorker):
             return mode_check() and graph_runner.can_run(forward_batch)
         return False
 
+    def use_scheduler_staging_copy(self):
+        return True
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
