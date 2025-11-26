@@ -1,3 +1,5 @@
+import unittest
+
 import openai
 
 from sglang.srt.utils import is_npu, kill_process_tree
