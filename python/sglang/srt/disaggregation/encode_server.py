@@ -466,7 +466,7 @@ async def handle_encode_request(request: dict):
         )
         return ORJSONResponse(content=request)
     elif encoder.server_args.mm_transfer_backend == "zmq_s":
-        logger.info(f"{request["embedding_port"] = }")
+        logger.info(f"{request['embedding_port'] = }")
         if request["embedding_port"] is None:
             await encoder.send_with_url(
                 req_id=request["req_id"],
