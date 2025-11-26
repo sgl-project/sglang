@@ -4,7 +4,17 @@ from __future__ import annotations
 
 import logging
 from contextlib import suppress
-from typing import Any, Dict, List, Literal, NamedTuple, Optional, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+    cast,
+)
 
 import torch
 from compressed_tensors.config import (
@@ -42,6 +52,9 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+if TYPE_CHECKING:
+    from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +122,18 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def apply_sglang_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):
+        self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
+        self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
+        self.sparsity_scheme_map = hf_to_sglang_mapper.apply_dict(
+            self.sparsity_scheme_map
+        )
+        self.sparsity_ignore_list = hf_to_sglang_mapper.apply_list(
+            self.sparsity_ignore_list
+        )
+        if self.kv_cache_scheme is not None:
+            self.kv_cache_scheme = hf_to_sglang_mapper.apply_dict(self.kv_cache_scheme)
 
     def get_quant_method(
         self,
