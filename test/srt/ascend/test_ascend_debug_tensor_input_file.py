@@ -2,9 +2,8 @@ import os
 import unittest
 
 import numpy
-import requests
 
-from sglang.srt.utils import is_npu, kill_process_tree
+from sglang.srt.utils import is_npu
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
