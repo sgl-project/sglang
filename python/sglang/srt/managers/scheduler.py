@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import os
+import queue
 import signal
 import sys
 import threading
@@ -505,6 +506,16 @@ class Scheduler(
         t = threading.Thread(target=self.watchdog_thread, daemon=True)
         t.start()
         self.parent_process = psutil.Process().parent()
+
+        # Init recv thread for tokenizer and rpc requests
+        if self.pp_rank == 0 and self.attn_tp_rank == 0:
+            self.recv_queue = queue.Queue()
+            self.recv_thread_running = True
+            recv_thread = threading.Thread(target=self._recv_thread_func, daemon=True)
+            recv_thread.start()
+        else:
+            self.recv_queue = None
+            self.recv_thread_running = False
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1036,6 +1047,33 @@ class Scheduler(
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
+    def _recv_thread_func(self):
+        """Background thread to receive requests from tokenizer and rpc sockets."""
+        # Use zmq.Poller to wait on multiple sockets
+        poller = zmq.Poller()
+        poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+        poller.register(self.recv_from_rpc, zmq.POLLIN)
+
+        while self.recv_thread_running:
+            try:
+                # Wait for any socket to have data (blocking, with timeout)
+                socks = dict(poller.poll(timeout=100))  # 100ms timeout
+
+                # Receive from tokenizer if ready
+                if self.recv_from_tokenizer in socks:
+                    recv_req = self.recv_from_tokenizer.recv_pyobj()
+                    self.recv_queue.put(recv_req)
+
+                # Receive from rpc if ready
+                if self.recv_from_rpc in socks:
+                    recv_rpc = self.recv_from_rpc.recv_pyobj()
+                    self.recv_queue.put(recv_rpc)
+
+            except Exception as e:
+                if self.recv_thread_running:  # Only log if not intentionally stopped
+                    logger.error(f"Error in recv thread: {e}")
+                break
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1050,21 +1088,14 @@ class Scheduler(
 
         if self.pp_rank == 0:
             if self.attn_tp_rank == 0:
+                # Get all requests from the queue (non-blocking)
                 recv_reqs = []
-
                 while True:
                     try:
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
+                        recv_req = self.recv_queue.get_nowait()
+                        recv_reqs.append(recv_req)
+                    except:  # queue.Empty
                         break
-                    recv_reqs.append(recv_req)
-
-                while True:
-                    try:
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
-                    except zmq.ZMQError:
-                        break
-                    recv_reqs.append(recv_rpc)
             else:
                 recv_reqs = None
         else:
@@ -2213,6 +2244,14 @@ class Scheduler(
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
+
+            # Clear recv queue
+            if self.recv_queue is not None:
+                while True:
+                    try:
+                        self.recv_queue.get_nowait()
+                    except:  # queue.Empty
+                        break
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0
