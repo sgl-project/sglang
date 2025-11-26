@@ -3,9 +3,8 @@
 import os
 import unittest
 
-from stress_utils import StressTestRunner
-
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_stress_utils import StressTestRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"

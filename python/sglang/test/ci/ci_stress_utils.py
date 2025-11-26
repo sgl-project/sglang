@@ -4,17 +4,12 @@ import subprocess
 from typing import List, Optional
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
 )
-
-# Register as disabled so run_suite.py doesn't complain about missing registry
-# This file provides utilities and should not be run as a test
-register_cuda_ci(est_time=0, suite="stress", disabled="Utility file, not a test")
 
 
 class StressTestRunner:
