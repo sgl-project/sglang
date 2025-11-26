@@ -4,15 +4,17 @@ import numpy as np
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_npu
+
+env_type = "npu" if is_npu() else "cuda"
 
 
 class TestCreateKvIndices(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if not torch.cuda.is_available():
-            raise unittest.SkipTest("CUDA is not available")
-        torch.set_default_device("cuda")
+        if not (torch.cuda.is_available() or is_npu()):
+            raise unittest.SkipTest("CUDA or NPU is not available")
+        torch.set_default_device(env_type)
 
     def _run_test(self, batch, max_batch, max_context_len):
         req_to_token = torch.arange(
