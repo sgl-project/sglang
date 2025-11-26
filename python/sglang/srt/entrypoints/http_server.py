@@ -421,7 +421,7 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=503)
 
     if (
-        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
     ):
         return Response(status_code=200)
@@ -1545,7 +1545,6 @@ def _execute_server_warmup(
     try:
         warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
         if server_args.disaggregation_mode == "null":
-            logger.info(f"Start of co-locate warmup ...")
             res = requests.post(
                 url + request_name,
                 json=json_data,
