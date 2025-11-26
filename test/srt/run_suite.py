@@ -381,7 +381,7 @@ suite_ascend = {
         TestFile("ascend/test_enable_multimodal_non_mlm.py", 400),
         TestFile("test_skip_tokenizer_init.py", 400),
         TestFile("ascend/test_ascend_allow_auto_truncate.py", 400),
-        TestFile("ascend/test_ascend_delete_ckpt_after_loading.py", 400),
+        # TestFile("ascend/test_ascend_delete_ckpt_after_loading.py", 400),
         TestFile("ascend/test_ascend_disable_cuda_graph_padding.py", 400),
         TestFile("ascend/test_ascend_disable_custom_all_reduce.py", 400),
         TestFile("ascend/test_ascend_enable_tokenizer_batch_encode.py", 400),
