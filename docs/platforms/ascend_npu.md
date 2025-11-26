@@ -56,14 +56,20 @@ Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kern
 _TODO: MemFabric is still a working project yet open sourced. We will release it as prebuilt wheel package for now._
 
 If you want to use PD disaggregation mode, you need to install MemFabric Adaptor. MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
-PLATFORRM can be "aarch64" or "x86_64"
+PLATFORM can be "aarch64" or "x86_64"
 
 ```shell
 PLATFORM="aarch64"
 MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_${PLATFORM}.whl"
 MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
 wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
-```
+=======
+_TODO: MemFabric is still a working project yet open sourced til end of year 2025. We will release it as prebuilt wheel package for now._
+
+MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
+
+```shell
+pip install mf-adapter==1.0.0
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
