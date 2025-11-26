@@ -50,9 +50,7 @@ class TestSkipTokenizerInit(CustomTestCase):
             ),
         )
         cls.eos_token_id = [119690]
-        cls.tokenizer = AutoTokenizer.from_pretrained(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, use_fast=False
-        )
+        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
 
     @classmethod
     def tearDownClass(cls):
