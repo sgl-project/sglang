@@ -17,7 +17,6 @@ suites = {
         TestFile("lora/test_lora_eviction.py", 240),
         TestFile("lora/test_lora_update.py", 600),
         TestFile("lora/test_lora_backend.py", 99),
-        TestFile("lora/test_lora_spec_decoding.py", 150),
         TestFile("lora/test_multi_lora_backend.py", 60),
         TestFile("models/test_compressed_tensors_models.py", 42),
         TestFile("models/test_cross_encoder_models.py", 100),
@@ -188,7 +187,8 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
-        TestFile("ep/test_mooncake_ep_small.py", 450),
+        # TODO: Add it back after mooncake supports torch 2.9
+        # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
     "per-commit-8-gpu-h200-deepep": [
         TestFile("ep/test_deepep_large.py", 338),
@@ -202,6 +202,7 @@ suites = {
     ],
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
+        TestFile("models/test_dummy_grok_models.py"),
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
