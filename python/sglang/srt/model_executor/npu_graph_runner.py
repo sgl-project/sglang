@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 import sglang.srt.model_executor.cuda_graph_runner
-from sglang.srt.configs.model_config import AttentionArch, 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
