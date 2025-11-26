@@ -246,12 +246,12 @@ servers:
   - name: "github"
     url: "https://api.github.com/mcp"
     token: "ghp_xxxxx"
-    transport: "sse"
+    protocol: "sse"
     required: false
 
   - name: "custom-tools"
     url: "https://tools.example.com/mcp"
-    transport: "streamable"
+    protocol: "streamable"
     required: true
 
 pool:
@@ -276,7 +276,7 @@ inventory:
 - `command` + `args`: For STDIO transport (local process execution)
 - `url`: For SSE or Streamable transports (HTTP/HTTPS endpoints)
 - `token`: Optional authentication token for HTTP-based transports
-- `transport`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
+- `protocol`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
 - `required`: If `true`, router fails to start if server is unreachable (default: `false`)
 - `envs`: Environment variables for STDIO processes (optional)
 - `proxy`: Per-server proxy override (set to `null` to bypass global proxy)
@@ -312,14 +312,14 @@ envs:
 name: "remote-sse"
 url: "https://mcp.example.com/events"
 token: "bearer-token"
-transport: "sse"
+protocol: "sse"
 ```
 
 **Streamable** (Bidirectional Streaming):
 ```yaml
 name: "streaming-tools"
 url: "https://mcp.example.com/stream"
-transport: "streamable"
+protocol: "streamable"
 required: true
 ```
 
