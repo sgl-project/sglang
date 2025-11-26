@@ -204,6 +204,7 @@ class MoriKVManager(CommonKVManager):
             post_batch_size,
             num_worker_threads,
             poll_mode,
+            False,
         )
         engine.create_backend(BackendType.RDMA, rdma_cfg)
         logger.debug(
