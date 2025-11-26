@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
@@ -30,7 +31,6 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
     LoRAType,
-    get_layer_id,
     get_normalized_target_modules,
     get_target_module_name,
 )
@@ -129,16 +129,6 @@ class LoRAManager:
             lora_ref.lora_id not in self.loras
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
-        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
-            return self.create_lora_update_result(
-                success=False,
-                error_message=(
-                    f"Already have {self.num_pinned_loras} pinned adapters, "
-                    f"max allowed is {self.max_loras_per_batch - 1} (reserving 1 slot for dynamic use). "
-                    f"Please unpin some adapters or increase max_loras_per_batch."
-                ),
-            )
-
         try:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
@@ -165,13 +155,17 @@ class LoRAManager:
         """
 
         # Check if this LoRA adapter is already loaded
-        if any(
-            lora_ref.lora_name == existing_lora_ref.lora_name
-            for existing_lora_ref in self.lora_refs.values()
-        ):
-            raise ValueError(
-                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
-            )
+        for existing_lora_ref in self.lora_refs.values():
+            if lora_ref.lora_name == existing_lora_ref.lora_name:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                )
+
+            if lora_ref.lora_path == existing_lora_ref.lora_path:
+                logger.warning(
+                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
