@@ -75,6 +75,11 @@ class EnvField:
         return self.get()
 
 
+class EnvTuple(EnvField):
+    def parse(self, value: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip())
+
+
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
         return value
@@ -125,6 +130,7 @@ class Envs:
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -152,7 +158,8 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
-    SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
@@ -162,6 +169,9 @@ class Envs:
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
@@ -181,8 +191,19 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
 
     # Mooncake KV Transfer
-    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvBool(False)
+    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+
+    # Mooncake Store
+    SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
+    MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
+    MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
+    MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
+    MOONCAKE_PROTOCOL = EnvStr("tcp")
+    MOONCAKE_DEVICE = EnvStr("")
+    MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
+    MOONCAKE_CHECK_SERVER = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
@@ -194,10 +215,11 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
-    SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    SGLANG_ENABLE_FLASHINFER_FP8_GEMM = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
@@ -215,6 +237,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
+    SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -254,26 +277,22 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
+    # RoPE cache configuration
+    SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
+    SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
+
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # VLM
+    SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
-
-    # Ktransformers
-    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
-    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
-    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
-    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
-    SGLANG_KT_AMX_METHOD = EnvStr(None)
-    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
-    SGLANG_KT_MOE_MAX_DEFERRED_EXPERTS_PER_TOKEN = EnvInt(None)
-    SGLANG_KT_MOE_TOTAL_LAYERS = EnvInt(None)
 
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
@@ -284,6 +303,20 @@ class Envs:
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+
+    # Ngram
+    SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+
+    # Warmup
+    SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
+
+    # Health Check
+    SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
+    # External models
+    SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
+    SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
     # fmt: on
 
@@ -301,6 +334,9 @@ def _print_deprecated_env(new_name: str, old_name: str):
 
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
+    _print_deprecated_env(
+        "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
+    )
 
     for key, value in os.environ.items():
         if key.startswith("SGL_"):

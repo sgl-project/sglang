@@ -28,7 +28,6 @@ from numpy import float64
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -37,6 +36,7 @@ from sglang.srt.mem_cache.radix_cache import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
 
@@ -320,25 +320,24 @@ class LRUList:
 
 
 class MambaRadixCache(BasePrefixCache):
-    def __init__(
-        self,
-        req_to_token_pool: HybridReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
-        page_size: int,
-        disable: bool = False,
-    ):
-        assert isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator)
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+    def __init__(self, params: CacheInitParams):
+        assert isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
+        self.req_to_token_pool = params.req_to_token_pool
+        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 
-        assert page_size == 1, "Only support page_size=1 in mamba radix cache now."
-        self.page_size = page_size
-        self.disable = disable
+        assert (
+            params.page_size == 1
+        ), "Only support page_size=1 in mamba radix cache now."
+        self.page_size = params.page_size
+        self.disable = params.disable
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
+
+        if params.enable_metrics:
+            self.init_metrics_collector()
 
         self.key_match_fn = _key_match_page_size1
         self.get_child_key_fn = get_child_key
@@ -426,21 +425,21 @@ class MambaRadixCache(BasePrefixCache):
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         return self._insert_helper(self.root_node, key, value, mamba_value)
 
-    def cache_finished_req(self, req: Req, is_insert=True) -> None:
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
+        kv_committed_len = req.pop_committed_kv_cache()
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx,
-                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
+                req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        cache_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        token_ids = (req.origin_input_ids + req.output_ids)[:cache_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.req_pool_idx, :kv_committed_len
         ]
 
         page_aligned_len = len(kv_indices)
@@ -516,8 +515,12 @@ class MambaRadixCache(BasePrefixCache):
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(
+        match_result = self.match_prefix(
             RadixKey(page_aligned_token_ids, req.extra_key)
+        )
+        (new_indices, new_last_node) = (
+            match_result.device_indices,
+            match_result.last_device_node,
         )
 
         if not mamba_exist:

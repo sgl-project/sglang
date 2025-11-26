@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use tracing::error;
 
 use crate::{
     protocols::{common::InputIds, generate::GenerateRequest},
@@ -44,6 +45,7 @@ impl GeneratePreparationStage {
         let (original_text, token_ids) = match self.resolve_generate_input(ctx, request) {
             Ok(res) => res,
             Err(msg) => {
+                error!(function = "GeneratePreparationStage::execute", error = %msg, "Failed to resolve generate input");
                 return Err(error::bad_request(msg));
             }
         };
