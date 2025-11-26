@@ -83,7 +83,6 @@ pub(crate) mod event_types {
 
 /// Action to take based on streaming event processing
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum StreamAction {
     Forward,      // Pass event to client
     Buffer,       // Accumulate for tool execution

@@ -165,7 +165,6 @@ pub(crate) fn patch_streaming_response_json(
 }
 
 /// Rewrite streaming SSE block to include metadata from original request
-#[allow(dead_code)]
 pub(crate) fn rewrite_streaming_block(
     block: &str,
     original_body: &ResponsesRequest,

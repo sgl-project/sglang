@@ -29,7 +29,6 @@ use crate::{
 // ============================================================================
 
 /// Configuration for MCP tool calling loops
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct McpLoopConfig {
     /// Maximum iterations as safety limit (internal only, default: 10)
@@ -94,7 +93,6 @@ impl ToolLoopState {
 
 /// Represents a function call being accumulated across delta events
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct FunctionCallInProgress {
     pub call_id: String,
     pub name: String,
@@ -104,7 +102,6 @@ pub(crate) struct FunctionCallInProgress {
     pub assigned_output_index: Option<usize>,
 }
 
-#[allow(dead_code)]
 impl FunctionCallInProgress {
     pub fn new(call_id: String, output_index: usize) -> Self {
         Self {
@@ -196,7 +193,6 @@ pub async fn ensure_request_mcp_client(
 
 /// Execute detected tool calls and send completion events to client
 /// Returns false if client disconnected during execution
-#[allow(dead_code)]
 pub(super) async fn execute_streaming_tool_calls(
     pending_calls: Vec<FunctionCallInProgress>,
     active_mcp: &Arc<mcp::McpManager>,
@@ -276,7 +272,6 @@ pub(super) async fn execute_streaming_tool_calls(
 // ============================================================================
 
 /// Transform payload to replace MCP tools with function tools for streaming
-#[allow(dead_code)]
 pub(super) fn prepare_mcp_payload_for_streaming(
     payload: &mut Value,
     active_mcp: &Arc<mcp::McpManager>,
@@ -381,7 +376,6 @@ pub(super) fn build_resume_payload(
 
 /// Send mcp_list_tools events to client at the start of streaming
 /// Returns false if client disconnected
-#[allow(dead_code)]
 pub(super) fn send_mcp_list_tools_events(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     mcp: &Arc<mcp::McpManager>,
@@ -470,7 +464,6 @@ pub(super) fn send_mcp_list_tools_events(
 
 /// Send mcp_call completion events after tool execution
 /// Returns false if client disconnected
-#[allow(dead_code)]
 pub(super) fn send_mcp_call_completion_events_with_error(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     call: &FunctionCallInProgress,
@@ -538,7 +531,6 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 // ============================================================================
 
 /// Inject MCP metadata into a streaming response
-#[allow(dead_code)]
 pub(super) fn inject_mcp_metadata_streaming(
     response: &mut Value,
     state: &ToolLoopState,
