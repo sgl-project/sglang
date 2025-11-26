@@ -25,6 +25,10 @@ class QuarkW4A4MXFP4(QuarkScheme):
     def __init__(
         self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
     ):
+        if not _use_aiter:
+            raise ImportError(
+                "QuarkW4A4MXFP4 requires the 'aiter' package, but it is not installed or not enabled via SGLANG_USE_AITER."
+            )
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
