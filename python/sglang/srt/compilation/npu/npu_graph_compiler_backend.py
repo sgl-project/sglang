@@ -15,7 +15,6 @@
 from typing import Callable
 
 import torch
-from torch._dynamo.eval_frame import DisableContext
 
 from sglang.srt.compilation.npu.pass_manager import PassManager
 from sglang.srt.compilation.npu.passes.w8a8_int8 import (
@@ -30,9 +29,6 @@ class NpuGraphCompilerBackend:
         self.model_type = model_type
 
     def __call__(self, graph: torch.fx.GraphModule, example_inputs) -> Callable:
-        DisableContext.compiled_function_args[DisableContext.batch_size] = (
-            example_inputs
-        )
         if self.model_type == torch.bfloat16:
             NpuGraphCompilerBackend.apply_passes(graph)
         return graph

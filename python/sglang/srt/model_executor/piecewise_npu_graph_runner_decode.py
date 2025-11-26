@@ -25,11 +25,6 @@ import tqdm
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.npu.compilation_context import CompilationContext
-from sglang.srt.compilation.npu.patch_dynamo import (
-    patch_dynamo_context,
-    patch_dynamo_context_call,
-    restore_dynamo_context_call,
-)
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
@@ -55,7 +50,6 @@ torch._dynamo.config.guard_nn_modules = False
 
 import logging
 
-from torch._dynamo.eval_frame import DisableContext
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -93,9 +87,6 @@ class PiecewiseNPUGraphRunnerDecode:
 
     def __init__(self, model_runner: ModelRunner):
         model_runner.attn_backend.enable_piecewise_npu_graph_decode = True
-
-        patch_dynamo_context()
-
         self.inference_counter = 1
         self.init_forward_metadata_was_done = True
 
@@ -416,23 +407,9 @@ class PiecewiseNPUGraphRunnerDecode:
             self.compilation_context,
         )
 
-        patch_dynamo_context_call()
-        DisableContext.batch_size = bs
-
         logits_output_or_pp_proxy_tensors = compiler.compiled_callable(
             forward_batch.input_ids, forward_batch.positions, forward_batch
         )
-
-        try:
-            logits_output_or_pp_proxy_tensors = compiler.compiled_callable(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
-            )
-        finally:
-            DisableContext.batch_size = None
-            restore_dynamo_context_call()
-
-        assert DisableContext.compiled_function
-        assert DisableContext.compiled_function_args
 
         compiled_graph = CompiledGraph(
             bs, forward_batch, None, compiler.compiled_callable
@@ -555,8 +532,10 @@ class PiecewiseNPUGraphRunnerDecode:
 
         self.model_runner.attn_backend.graph_mode = True
 
-        DisableContext.compiled_function[self.bs](
-            *DisableContext.compiled_function_args[self.bs]
+        compiled_graph = self.graphs[self.bs]
+        forward_batch = compiled_graph.forward_batch
+        compiled_graph.callable(
+            forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
         output = self.output_buffers[self.bs]

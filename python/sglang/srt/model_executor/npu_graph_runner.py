@@ -44,18 +44,12 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from torch._dynamo.eval_frame import DisableContext
 
 from sglang.srt.compilation.custom_ops import (
     _set_dp_buffer_len,
     _set_is_extend_in_batch,
 )
 from sglang.srt.compilation.npu.npu_graph_compiler import NpuGraphCompiler
-from sglang.srt.compilation.npu.patch_dynamo import (
-    patch_dynamo_context,
-    patch_dynamo_context_call,
-    restore_dynamo_context_call,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
@@ -74,8 +68,6 @@ class NPUGraphRunner(CudaGraphRunner):
     """A NPUGraphRunner runs the forward pass of a model with npu graph and torch.compile."""
 
     def __init__(self, model_runner: ModelRunner):
-        if model_runner.server_args.enable_torch_compile:
-            patch_dynamo_context()
         sglang.srt.model_executor.cuda_graph_runner.patch_model = patch_model_npu
         model_runner.attn_backend.enable_torch_compile = (
             model_runner.server_args.enable_torch_compile
@@ -123,32 +115,16 @@ class NPUGraphRunner(CudaGraphRunner):
                 get_global_server_args().compilation_config,
             )
 
-            patch_dynamo_context_call()
-            DisableContext.batch_size = bs
-            try:
-                # compilation
-                out = compiler.compiled_callable()
+            # compilation
+            out = compiler.compiled_callable()
 
-                # capture function and args
-                out = compiler.compiled_callable()
-            finally:
-                DisableContext.batch_size = None
-                restore_dynamo_context_call()
-
-            assert bs in DisableContext.compiled_function
-            assert DisableContext.compiled_function[bs]
-            assert bs in DisableContext.compiled_function_args
-            assert DisableContext.compiled_function_args[bs]
-
-            compiled_function = DisableContext.compiled_function[bs]
-            args = DisableContext.compiled_function_args[bs]
             with torch.npu.graph(
                 graph,
                 pool=pool,
                 stream=stream,
                 auto_dispatch_capture=True,
             ):
-                compiled_function(*args)
+                compiler.compiled_callable()
 
         else:
             self.model_runner.attn_backend.enable_torch_compile = False
