@@ -132,6 +132,7 @@ class SchedulerMetricsMixin:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
 
+        self.stats.new_token_ratio = adder.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
 
         f = (
@@ -164,6 +165,8 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid:
                 self.stats.swa_token_usage = swa_token_usage
+            if self.is_hybrid_gdn:
+                self.stats.mamba_usage = mamba_usage
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -271,9 +274,12 @@ class SchedulerMetricsMixin:
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
             )
             # Calculate acceptance rate: accepted tokens / total draft tokens
-            total_draft_tokens = self.spec_num_forward_ct * (
-                (self.server_args.speculative_num_steps or 0) + 1
+            draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
+            num_draft_tokens = (
+                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
             )
+            total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
+
             spec_accept_rate = (
                 self.spec_num_accepted_tokens / total_draft_tokens
                 if total_draft_tokens > 0
@@ -306,6 +312,8 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             if self.is_hybrid:
                 self.stats.swa_token_usage = swa_token_usage
+            if self.is_hybrid_gdn:
+                self.stats.mamba_usage = mamba_usage
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
