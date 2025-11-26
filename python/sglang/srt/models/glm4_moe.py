@@ -463,6 +463,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         if not get_moe_a2a_backend().is_deepep():
             if (
                 self.alt_stream is not None
+                and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
             ):
@@ -485,6 +486,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
+
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
@@ -497,13 +499,12 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
-        if shared_output is not None:
-            with use_symmetric_memory(
-                parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
+        with use_symmetric_memory(
+            parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            final_hidden_states_out = torch.empty_like(final_hidden_states)
+        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+        final_hidden_states = final_hidden_states_out
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
