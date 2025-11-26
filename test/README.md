@@ -1,8 +1,93 @@
-# Run Unit Tests
+# SGLang Test Suite
 
 SGLang uses the built-in library [unittest](https://docs.python.org/3/library/unittest.html) as the testing framework.
 
-## Test Backend Runtime
+## Test Directory Structure
+
+```
+test/
+├── manual/                    # Unofficially maintained tests
+│   └── ...                    # Code references for agents, not guaranteed to run in CI
+│
+├── registered/                # Officially maintained tests (per-commit + nightly)
+│   ├── layers/                # Layer-level tests
+│   │   ├── attention/
+│   │   │   └── mamba/
+│   │   └── mla/
+│   ├── models/                # Model-specific tests
+│   ├── openai_server/         # OpenAI API compatibility tests
+│   │   ├── basic/
+│   │   ├── features/
+│   │   ├── function_call/
+│   │   └── validation/
+│   ├── lora/                  # LoRA tests
+│   ├── quant/                 # Quantization tests
+│   ├── rl/                    # RL/training tests
+│   ├── hicache/               # HiCache tests
+│   ├── ep/                    # Expert parallelism tests
+│   ├── speculative/           # Speculative decoding tests
+│   ├── runtime/               # Runtime tests
+│   ├── cache/                 # Cache tests
+│   ├── scheduler/             # Scheduler tests
+│   ├── sampling/              # Sampling tests
+│   ├── ops/                   # Operator tests
+│   ├── cpu/                   # CPU backend tests
+│   ├── ascend/                # Ascend NPU tests
+│   └── xpu/                   # Intel XPU tests
+│
+├── srt/                       # Legacy test location (being migrated to registered/)
+├── nightly/                   # Legacy nightly tests (being migrated to registered/)
+│
+├── run_suite.py               # Run registered tests by suite
+└── run_suite_nightly.py       # Legacy nightly runner
+```
+
+## CI Registry
+
+Tests in `registered/` use a registry system to declare their CI requirements:
+
+```python
+from sglang.test.ci.ci_register import register_cuda_ci, register_amd_ci
+
+# Per-commit test (runs on every PR)
+register_cuda_ci(est_time=80, suite="stage-a-test-1")
+register_amd_ci(est_time=120, suite="stage-a-test-1")
+
+# Nightly-only test
+register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
+
+# Temporarily disabled test (keeps all metadata for re-enabling)
+register_cuda_ci(est_time=80, suite="stage-a-test-1", disabled="flaky - see #12345")
+```
+
+### Registry Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `est_time` | float | Estimated runtime in seconds |
+| `suite` | str | Test suite name (e.g., "stage-a-test-1", "nightly-1-gpu") |
+| `nightly` | bool | If True, only runs in nightly CI (default: False) |
+| `disabled` | str | If provided, test is skipped with this reason |
+
+## Running Tests
+
+### Run Registered Tests
+
+```bash
+cd sglang/test
+
+# Run per-commit tests for CUDA
+python run_suite.py --hw cuda --suite stage-a-test-1
+
+# Run nightly tests (includes per-commit tests)
+python run_suite.py --hw cuda --suite nightly-1-gpu --nightly
+
+# Run AMD tests
+python run_suite.py --hw amd --suite stage-a-test-1
+```
+
+### Run Legacy Tests (test/srt/)
+
 ```bash
 cd sglang/test/srt
 
@@ -12,25 +97,24 @@ python3 test_srt_endpoint.py
 # Run a single test
 python3 test_srt_endpoint.py TestSRTEndpoint.test_simple_decode
 
-# Run a suite with multiple files
-python3 run_suite.py --suite per-commit
+# Run a suite
+python3 run_suite.py --suite per-commit-1-gpu
 ```
 
-## Test Frontend Language
-```bash
-cd sglang/test/lang
+## Adding New Tests
 
-# Run a single file
-python3 test_choices.py
-```
+1. **Create test file** in the appropriate feature directory under `test/registered/`
+2. **Add CI registry** at the top of the file:
+   ```python
+   from sglang.test.ci.ci_register import register_cuda_ci
 
-## Adding or Updating Tests in CI
-
-- Create new test files under `test/srt` or `test/lang` depending on the type of test.
-- For nightly tests, place them in `test/srt/nightly/`. Use the `NightlyBenchmarkRunner` helper class in `nightly_utils.py` for performance benchmarking tests.
-- Ensure they are referenced in the respective `run_suite.py` (e.g., `test/srt/run_suite.py`) so they are picked up in CI. For most small test cases, they can be added to the `per-commit-1-gpu` suite. Sort the test cases alphabetically by name.
-- Ensure you added `unittest.main()` for unittest and `pytest.main([__file__])` for pytest in the scripts. The CI run them via `python3 test_file.py`.
-- The CI will run some suites such as `per-commit-1-gpu`, `per-commit-2-gpu`, and `nightly-1-gpu` automatically. If you need special setup or custom test groups, you may modify the workflows in [`.github/workflows/`](https://github.com/sgl-project/sglang/tree/main/.github/workflows).
+   register_cuda_ci(est_time=60, suite="stage-a-test-1")
+   ```
+3. **Add `unittest.main()` or `pytest.main()`** at the bottom:
+   ```python
+   if __name__ == "__main__":
+       unittest.main()
+   ```
 
 ## CI Registry Quick Peek
 
@@ -44,17 +128,14 @@ register_cuda_ci(est_time=80, suite="stage-a-test-1")
 
 ## Writing Elegant Test Cases
 
-- Learn from existing examples in [sglang/test/srt](https://github.com/sgl-project/sglang/tree/main/test/srt).
-- Reduce the test time by using smaller models and reusing the server for multiple test cases. Launching a server takes a lot of time.
-- Use as few GPUs as possible. Do not run long tests with 8-gpu runners.
-- If the test cases take too long, considering adding them to nightly tests instead of per-commit tests.
-- Keep each test function focused on a single scenario or piece of functionality.
-- Give tests descriptive names reflecting their purpose.
-- Use robust assertions (e.g., assert, unittest methods) to validate outcomes.
-- Clean up resources to avoid side effects and preserve test independence.
-- Reduce the test time by using smaller models and reusing the server for multiple test cases.
-
+- Use smaller models and reuse servers to reduce test time
+- Use as few GPUs as possible
+- Keep each test function focused on a single scenario
+- Give tests descriptive names reflecting their purpose
+- Clean up resources to avoid side effects
+- For long-running tests, use `nightly=True` in the registry
 
 ## Adding New Models to Nightly CI
-- **For text models**: extend [global model lists variables](https://github.com/sgl-project/sglang/blob/85c1f7937781199203b38bb46325a2840f353a04/python/sglang/test/test_utils.py#L104) in `test_utils.py`, or add more model lists
-- **For vlms**: extend the `MODEL_THRESHOLDS` global dictionary in `test/srt/nightly/test_vlms_mmmu_eval.py`
+
+- **For text models**: extend [global model lists](https://github.com/sgl-project/sglang/blob/main/python/sglang/test/test_utils.py) in `test_utils.py`
+- **For VLMs**: extend the `MODEL_THRESHOLDS` dictionary in `test/srt/nightly/test_vlms_mmmu_eval.py`
