@@ -19,6 +19,7 @@ import unittest
 from pathlib import Path
 
 # Add test directory to path for lora_utils import
+# TODO: can be removed after migration
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from lora_utils import (
