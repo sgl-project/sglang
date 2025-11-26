@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -73,6 +74,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -93,6 +95,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -285,6 +288,9 @@ class Scheduler(
         # Init model config
         self.model_config = ModelConfig.from_server_args(server_args)
 
+        # Init diffusion LLM config
+        self.dllm_config = DllmConfig.from_server_args(server_args)
+
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
 
@@ -443,9 +449,14 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
+        self._engine_paused = False
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
+        if self.dllm_config is not None:
+            # We currently leverage chunked prefill to implement block diffusion
+            # for diffusion LLM.
+            self.chunked_prefill_size = self.dllm_config.block_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
@@ -568,6 +579,8 @@ class Scheduler(
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
+                (PauseGenerationReqInput, self.pause_generation),
+                (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
 
@@ -953,6 +966,9 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            if self._engine_paused:
+                continue
+
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -984,6 +1000,9 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1273,6 +1292,7 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
+                dllm_config=self.dllm_config,
             )
             req.tokenizer = self.tokenizer
 
@@ -1589,6 +1609,10 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if self.dllm_config is not None:
+            if self.chunked_req is not None and self.chunked_req.finished():
+                self.chunked_req = None
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1821,6 +1845,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            dllm_config=self.dllm_config,
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -2053,7 +2078,10 @@ class Scheduler(
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result)
+            if batch.is_dllm():
+                self.process_batch_result_dllm(batch, result)
+            else:
+                self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -2154,8 +2182,7 @@ class Scheduler(
 
     def _is_no_request(self):
         no_request = (
-            len(self.waiting_queue) == 0
-            and self.running_batch.is_empty()
+            self.running_batch.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -2427,6 +2454,29 @@ class Scheduler(
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
+
+    def pause_generation(self, recv_req: PauseGenerationReqInput):
+        self._engine_paused = True
+
+        if self.enable_overlap and self.last_batch:
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+            self.last_batch = None
+            self.cur_batch = None
+
+        if recv_req.mode == "retract":
+            self.running_batch.filter_batch()
+            if len(self.running_batch.reqs) != 0:
+                retracted_reqs = self.running_batch.retract_all(self.server_args)
+                for req in retracted_reqs:
+                    self._add_request_to_queue(req)
+
+            self.running_batch.batch_is_full = False
+            self.chunked_req = None
+
+    def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        self._engine_paused = False
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput

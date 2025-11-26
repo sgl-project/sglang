@@ -240,6 +240,10 @@ class ServerArgs:
     revision: Optional[str] = None
     model_impl: str = "auto"
 
+    # Diffusion LLM
+    dllm_algorithm: Optional[str] = None
+    dllm_block_size: Optional[int] = None
+
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
@@ -404,7 +408,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -662,6 +666,9 @@ class ServerArgs:
 
         # Handle exporting request-level metrics.
         self._handle_request_metrics_exporters()
+
+        # Handle diffusion LLM inference.
+        self._handle_dllm_inference()
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -1110,6 +1117,21 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "Llama4" in model_arch and self.device != "cpu":
+            # Auto-select attention backend for Llama4 if not specified
+            if self.attention_backend is None:
+                if is_sm100_supported():
+                    self.attention_backend, platform = "trtllm_mha", "sm100"
+                elif is_sm90_supported():
+                    self.attention_backend, platform = "fa3", "sm90"
+                elif is_hip():
+                    self.attention_backend, platform = "aiter", "hip"
+                elif self.device == "xpu":
+                    self.attention_backend, platform = "intel_xpu", "xpu"
+                else:
+                    self.attention_backend, platform = "triton", "other platforms"
+                logger.warning(
+                    f"Use {self.attention_backend} as attention backend on {platform} for Llama4 model"
+                )
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
@@ -1117,11 +1139,6 @@ class ServerArgs:
                 "trtllm_mha",
                 "intel_xpu",
             }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
-            if is_sm100_supported() and self.attention_backend is None:
-                self.attention_backend = "trtllm_mha"
-                logger.warning(
-                    "Use trtllm_mha as attention backend on sm100 for Llama4 model"
-                )
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1516,6 +1533,12 @@ class ServerArgs:
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.moe_a2a_backend == "ascend_fuseep":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
@@ -1523,7 +1546,7 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
-        if (self.enable_eplb or (self.init_expert_location is not None)) and (
+        if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
             self.ep_dispatch_algorithm is None
         ):
             self.ep_dispatch_algorithm = "static"
@@ -1704,7 +1727,7 @@ class ServerArgs:
             if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
-                and self.attention_backend != "flashinfer"
+                and self.attention_backend not in ["flashinfer", "fa3"]
             ):
                 raise ValueError(
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
@@ -1958,6 +1981,30 @@ class ServerArgs:
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
 
+    def _handle_dllm_inference(self):
+        if self.dllm_algorithm is None:
+            return
+        if not self.disable_cuda_graph:
+            logger.warning(
+                "Cuda graph is disabled because of using diffusion LLM inference"
+            )
+            self.disable_cuda_graph = True
+        if not self.disable_overlap_schedule:
+            logger.warning(
+                "Overlap schedule is disabled because of using diffusion LLM inference"
+            )
+            self.disable_overlap_schedule = True
+        if not self.disable_radix_cache:
+            logger.warning(
+                "Radix cache is disabled because of using diffusion LLM inference"
+            )
+            self.disable_radix_cache = True
+        if not self.pp_size > 1:
+            logger.warning(
+                "Pipeline parallelism is disabled because of using diffusion LLM inference"
+            )
+            self.pp_size = 1
+
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
@@ -2075,6 +2122,20 @@ class ServerArgs:
             '* "transformers" will use the Transformers model '
             '* "mindspore" will use the MindSpore model '
             "implementation.\n",
+        )
+
+        # Diffusion LLM
+        parser.add_argument(
+            "--dllm-algorithm",
+            type=str,
+            default=ServerArgs.dllm_algorithm,
+            help="The diffusion LLM algorithm.",
+        )
+        parser.add_argument(
+            "--dllm-block-size",
+            type=int,
+            default=ServerArgs.dllm_block_size,
+            help="The number of tokens processed in each iteration of the block diffusion LLM.",
         )
 
         # HTTP server
@@ -2969,7 +3030,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "mooncake"],
+            choices=["none", "deepep", "mooncake", "ascend_fuseep"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
