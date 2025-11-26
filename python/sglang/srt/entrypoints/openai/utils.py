@@ -214,42 +214,33 @@ def normalize_openai_messages_for_mm(
 
 
 def build_mm_inputs_from_openai_messages(messages: List[dict]) -> List[dict]:
-    """
-    从（可能是 dict+Pydantic 混合）的 messages 中提取图片/音频条目，返回统一的 mm_items：
-      - {"format":"image","image":PIL.Image,"model_specific_data":{"original_index":i}}
-      - 或 {"format":"image_url","url":...}
-      - 音频保留为 {"format":"audio","feature":None}
-    """
+    import os
     from io import BytesIO
 
     import requests
-    from PIL import Image  # type: ignore
+    from PIL import Image
 
     mm_items: List[dict] = []
-
-    for msg in messages or []:
-        content = _get(msg, "content", None)
+    for m in messages or []:
+        content = m.get("content", [])
         if not isinstance(content, list):
             continue
 
         local_img_idx = 0
-        for part in content:
+        for part in _iter_structured_content(content):
             ptype = _get(part, "type", None)
 
             if ptype in ("image_url", "input_image"):
                 image_url_obj = _get(part, "image_url", None) or _get(part, "url", None)
                 url = (
                     _get_url_from_image_obj(image_url_obj)
-                    if image_url_obj
+                    if image_url_obj is not None
                     else _get(part, "url", None)
                 )
                 if not url:
                     continue
-                # 优先尝试下载→PIL（离线失败则 URL 透传）
-                try:
-                    resp = requests.get(url, timeout=10)
-                    resp.raise_for_status()
-                    img = Image.open(BytesIO(resp.content)).convert("RGB")
+
+                def _append_image(img):
                     mm_items.append(
                         {
                             "format": "image",
@@ -257,102 +248,102 @@ def build_mm_inputs_from_openai_messages(messages: List[dict]) -> List[dict]:
                             "model_specific_data": {"original_index": local_img_idx},
                         }
                     )
+
+                try:
+                    # 在线下载
+                    resp = requests.get(url, timeout=10)
+                    resp.raise_for_status()
+                    img = Image.open(BytesIO(resp.content)).convert("RGB")
+                    _append_image(img)
                 except Exception:
-                    mm_items.append(
-                        {
-                            "format": "image_url",
-                            "url": url,
-                            "model_specific_data": {"original_index": local_img_idx},
-                        }
-                    )
+                    # 离线回退1：如果 url 看起来是本地路径，直接打开
+                    if os.path.exists(url):
+                        try:
+                            img = Image.open(url).convert("RGB")
+                            _append_image(img)
+                        except Exception:
+                            mm_items.append(
+                                {
+                                    "format": "image_url",
+                                    "url": url,
+                                    "model_specific_data": {
+                                        "original_index": local_img_idx
+                                    },
+                                }
+                            )
+                    else:
+                        # 离线回退2：支持镜像目录，把 URL 文件名映射到本地
+                        mirror = os.getenv("SGLANG_IMAGE_MIRROR_DIR")
+                        fname = os.path.basename(url)
+                        local_path = os.path.join(mirror, fname) if mirror else None
+                        if local_path and os.path.exists(local_path):
+                            try:
+                                img = Image.open(local_path).convert("RGB")
+                                _append_image(img)
+                            except Exception:
+                                mm_items.append(
+                                    {
+                                        "format": "image_url",
+                                        "url": url,
+                                        "model_specific_data": {
+                                            "original_index": local_img_idx
+                                        },
+                                    }
+                                )
+                        else:
+                            # 实在不行，仍保留 URL，但一定要带 original_index
+                            mm_items.append(
+                                {
+                                    "format": "image_url",
+                                    "url": url,
+                                    "model_specific_data": {
+                                        "original_index": local_img_idx
+                                    },
+                                }
+                            )
                 local_img_idx += 1
 
             elif ptype in ("audio_url", "input_audio"):
-                # 不在这里解码音频，交给后端；避免误入 image 分支
                 url = _get_nested(part, "audio_url", "url", default=None) or _get(
                     part, "url", None
                 )
-                if url:
-                    mm_items.append(
-                        {"format": "audio", "feature": None, "model_specific_data": {}}
-                    )
+                mm_items.append(
+                    {
+                        "format": "audio",
+                        "feature": None,
+                        "url": url,
+                    }
+                )
 
     return mm_items
 
 
 def split_text_and_images_messages(messages):
-    """
-    将形如 [{role, content=[{type:text},{type:image_url},...]}, ...]
-    规范化为：每条 user/assistant 消息最多两条：
-      1) 纯文本 message（把所有 text 拼在一起）
-      2) 纯图片 message（把所有 image_url 聚合，保留顺序）
-    其它 role 原样返回。
-    返回：List[dict]，可直接交给 generate_chat_conv 使用。
-    """
+    # 不重排、不合并：仅把 image_url 统一成 {"type":"image_url","image_url":{"url":...}}
     out = []
     for msg in messages or []:
-        role = _get(msg, "role", "user")
-        content = _get(msg, "content", None)
-
-        # 纯文本字符串直接透传
-        if isinstance(content, str):
-            out.append(_ensure_openai_message(role, content))
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            out.append({"role": role, "content": content})
             continue
-
-        # 结构化 content（list）
-        if isinstance(content, list):
-            text_chunks = []
-            image_parts = []
-            local_img_idx = 0
-
-            for part in _iter_structured_content(content):
-                ptype = _get(part, "type", None)
-
-                if ptype == "text":
-                    t = _get(part, "text", "")
-                    if t:
-                        text_chunks.append(t)
-
-                elif ptype in ("image_url", "input_image"):
-                    image_url_obj = _get(part, "image_url", None) or _get(
-                        part, "url", None
-                    )
-                    url = (
-                        _get_url_from_image_obj(image_url_obj)
-                        if image_url_obj
-                        else _get(part, "url", None)
-                    )
-                    if url:
-                        # 保持 openai 结构
-                        image_parts.append(
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": url},
-                                # modalities 字段可选留在 part 上层；这里不强行加
-                            }
-                        )
-                        local_img_idx += 1
+        normalized_parts = []
+        for part in content:
+            if not isinstance(part, dict):
+                normalized_parts.append(part)
+                continue
+            t = part.get("type")
+            if t in ("image_url", "input_image"):
+                url_obj = part.get("image_url") or part.get("url")
+                url = url_obj.get("url") if isinstance(url_obj, dict) else url_obj
+                if url:
+                    p = {"type": "image_url", "image_url": {"url": url}}
+                    normalized_parts.append(p)
                 else:
-                    # 其它类型可以按需扩展；此处忽略
-                    pass
-
-            # 输出顺序：文本在前、图片在后
-            if text_chunks:
-                out.append(_ensure_openai_message(role, "\n".join(text_chunks)))
-            if image_parts:
-                out.append(_ensure_openai_message(role, image_parts))
-            # 如果两者都没有（例如奇怪的空结构），也给一个空文本
-            if not text_chunks and not image_parts:
-                out.append(_ensure_openai_message(role, ""))
-
-        else:
-            # content 既不是 str 也不是 list，尽量 to_dict 再兜底成空文本
-            out.append(
-                _ensure_openai_message(
-                    role, str(content) if content is not None else ""
-                )
-            )
-
+                    normalized_parts.append(part)
+            else:
+                normalized_parts.append(part)
+        out.append({"role": role, "content": normalized_parts})
     return out
 
 

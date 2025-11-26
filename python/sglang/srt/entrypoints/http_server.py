@@ -1288,23 +1288,40 @@ async def sagemaker_chat_completions(
 async def vertex_generate(vertex_req: VertexGenerateReqInput, raw_request: Request):
     if not vertex_req.instances:
         return []
+
+    # 选择输入类型：优先 text，其次 input_ids，再次 input_embeds（且保持“逐实例列表”）
     inputs = {}
-    for input_key in ("text", "input_ids", "input_embeds"):
-        if vertex_req.instances[0].get(input_key):
-            inputs[input_key] = [
-                instance.get(input_key) for instance in vertex_req.instances
-            ]
+    for key in ("text", "input_ids", "input_embeds"):
+        if any(inst.get(key) is not None for inst in vertex_req.instances):
+            inputs[key] = [inst.get(key) for inst in vertex_req.instances]
             break
+
+    # ⚠️ 不要过滤 None，确保与 batch 对齐（长度 == len(instances)）
     image_data = [
-        instance.get("image_data")
-        for instance in vertex_req.instances
-        if instance.get("image_data") is not None
-    ] or None
+        inst.get("image_data") for inst in vertex_req.instances
+    ]  # list[None | list[mm_items]]
+    video_data = [inst.get("video_data") for inst in vertex_req.instances]
+    audio_data = [inst.get("audio_data") for inst in vertex_req.instances]
+    modalities = [
+        inst.get("modalities", []) for inst in vertex_req.instances
+    ]  # 可为 [] / ["image", ...]
+
+    # 如果整个 batch 都没有该模态，可传 None，避免多余字段
+    def _none_if_all_none(lst):
+        return None if all(x is None for x in lst) else lst
+
     req = GenerateReqInput(
-        **inputs,
-        image_data=image_data,
+        **inputs,  # 这里只会有 text / prompt_ids / input_embeds 其中之一（逐实例列表）
+        image_data=_none_if_all_none(
+            image_data
+        ),  # 逐实例 list[None | list[mm_items]] 或 None
+        video_data=_none_if_all_none(video_data),
+        audio_data=_none_if_all_none(audio_data),
+        # modalities：建议传逐实例列表（与 image_data 对齐）。如果端上不传，也可给空列表。
+        modalities=modalities if any(modalities) else [],
         **(vertex_req.parameters or {}),
     )
+
     ret = await generate_request(req, raw_request)
     if isinstance(ret, Response):
         return ret
