@@ -133,7 +133,8 @@ class Qwen2_5_VLAttention(nn.Module):
             head_size=self.head_dim,
             num_kv_heads=self.num_key_value_heads,
             softmax_scale=self.scaling,
-            causal=True,
+            causal=False,
+            # causal=True,
             supported_attention_backends=(
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,

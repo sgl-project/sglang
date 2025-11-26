@@ -267,6 +267,7 @@ class LocalAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Apply local attention between query, key and value tensors.
@@ -275,6 +276,7 @@ class LocalAttention(nn.Module):
             q (torch.Tensor): Query tensor of shape [batch_size, seq_len, num_heads, head_dim]
             k (torch.Tensor): Key tensor of shape [batch_size, seq_len, num_heads, head_dim]
             v (torch.Tensor): Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            attention_mask (torch.Tensor | None): Attention mask tensor.
 
         Returns:
             torch.Tensor: Output tensor after local attention
@@ -285,7 +287,9 @@ class LocalAttention(nn.Module):
         forward_context: ForwardContext = get_forward_context()
         ctx_attn_metadata = forward_context.attn_metadata
 
-        output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
+        output = self.attn_impl.forward(
+            q, k, v, attn_metadata=ctx_attn_metadata, attention_mask=attention_mask
+        )
         return output
 
 

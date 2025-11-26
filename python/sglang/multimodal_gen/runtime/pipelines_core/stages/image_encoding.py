@@ -381,7 +381,7 @@ class ImageVAEEncodingStage(PipelineStage):
                 image_latent_ids = _prepare_image_ids(image_latents)
                 image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
                 image_latent_ids = image_latent_ids.to(get_local_torch_device())
-                batch.image_latent_ids = image_latent_ids
+                batch.condition_image_latent_ids = image_latent_ids
 
                 packed_latents = []
                 for latent in image_latents:

@@ -270,6 +270,7 @@ class TextEncodingStage(PipelineStage):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     output_hidden_states=True,
+                    use_cache=False,
                 )
             prompt_embeds = postprocess_func(outputs, text_inputs)
             if dtype is not None:

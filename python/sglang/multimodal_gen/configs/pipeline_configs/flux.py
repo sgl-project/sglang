@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional
 
 import PIL.Image
 import torch
@@ -326,10 +326,10 @@ def _prepare_image_ids(
 
 
 def flux_2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
-    hidden_states_layers: Tuple[int] = (10, 20, 30)
+    hidden_states_layers: list[int] = [10, 20, 30]
 
     out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
-
+    print(f"{out=}")
     batch_size, num_channels, seq_len, hidden_dim = out.shape
     prompt_embeds = out.permute(0, 2, 1, 3).reshape(
         batch_size, seq_len, num_channels * hidden_dim
@@ -437,8 +437,8 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             padding="max_length",
             truncation=True,
             # 2048 from official github repo, 512 from diffusers
-            # max_length=512,
             max_length=512,
+            # max_length=512,
         )
 
         print(f"{prompts=}")
@@ -479,7 +479,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
         img_ids = batch.latent_ids
         if batch.image_latent is not None:
-            image_latent_ids = batch.image_latent_ids
+            image_latent_ids = batch.condition_image_latent_ids
             img_ids = torch.cat([img_ids, image_latent_ids], dim=1).to(device=device)
 
         if img_ids.ndim == 3:
