@@ -1780,16 +1780,17 @@ __global__ void Marlin(
       init_slice();
       if (slice_iters) {
         a_gl_rd = a_gl_stride * (threadIdx.x / a_gl_rd_delta_o) + (threadIdx.x % a_gl_rd_delta_o);
+        a_gl_rd += a_gl_rd_delta_o * slice_row;
+
 #pragma unroll
-        for (int i = 0; i < b_sh_wr_iters; i++)
-          B_ptr[i] += b_sh_stride - b_gl_rd_delta_o * k_tiles;
-        if (slice_col == 0) {
-#pragma unroll
-          for (int i = 0; i < b_sh_wr_iters; i++)
-            B_ptr[i] -= b_gl_stride;
+        for (int i = 0; i < b_sh_wr_iters; i++) {
+          int b_gl_rd =
+              b_gl_stride * (threadIdx.x / b_sh_stride_threads) + (threadIdx.x % b_sh_stride_threads) * b_thread_vecs;
+          b_gl_rd += b_sh_stride * slice_col;
+          b_gl_rd += b_gl_rd_delta_o * slice_row;
+          B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_rd;
         }
 
-        // Update slice k/n for scales loading
         if constexpr (has_act_order) {
           slice_k_start = tb_k * slice_row;
           slice_k_finish = slice_k_start + tb_k * slice_iters;
@@ -1797,8 +1798,18 @@ __global__ void Marlin(
           slice_n_offset = act_s_col_tb_stride * slice_col;
 
         } else {
-          s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
-          zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
+          if constexpr (group_blocks == -1) {
+            s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
+            if constexpr (has_zp) {
+              zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
+            }
+          } else {
+            int group_id_for_slice = (thread_k_blocks * slice_row) / group_blocks;
+            s_gl_rd = s_gl_stride * group_id_for_slice + s_sh_stride * slice_col + threadIdx.x;
+            if constexpr (has_zp) {
+              zp_gl_rd = zp_gl_stride * group_id_for_slice + zp_sh_stride * slice_col + threadIdx.x;
+            }
+          }
         }
 
         start_pipes();
