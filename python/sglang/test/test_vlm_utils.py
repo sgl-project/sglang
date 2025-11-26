@@ -163,7 +163,7 @@ class TestVLMModels(CustomTestCase):
                     "32",
                     "--enable-multimodal",
                     "--mem-fraction-static",
-                    self..mem_fraction_static,
+                    self.mem_fraction_static,
                     "--log-level",
                     log_level,
                 ]
