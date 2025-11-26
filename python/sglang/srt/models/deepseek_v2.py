@@ -414,43 +414,12 @@ def handle_attention_aiter(attn, forward_batch):
 
 def handle_attention_nsa(attn, forward_batch):
     """
-    Select MHA or MLA based on sequence length for optimal performance.
-
-    - Decode: MLA (avoids per-token decompression)
-    - Prefill <= 2048: MHA (topk ineffective, MHA has lower FLOPs)
-    - Prefill > 2048: MLA (topk filtering reduces computation significantly)
+    Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
+    in init_forward_metadata. Read the decision from backend.use_mha.
     """
-    if forward_batch.forward_mode.is_decode_or_idle():
-        return AttnForwardMethod.MLA
-
-    if forward_batch.forward_mode.is_extend_without_speculative() and (
-        not is_nsa_enable_prefill_cp()
-    ):
-        assert forward_batch.seq_lens_cpu is not None
-        max_kv_len = forward_batch.seq_lens_cpu.max().item()
-
-        # MHA path enabled for both H200 (SM90, FA3) and B200 (SM100, TRTLLm ragged)
-        # B200 uses trtllm_ragged_attention_deepseek kernel instead of FA4
-        supports_mha = _device_sm in [90, 100]
-
-        # MHA supports both BF16 and FP8 KV cache (FP8 will be dequantized on-demand)
-        kv_dtype_supported = forward_batch.token_to_kv_pool.dtype in [
-            torch.bfloat16,
-            torch.float8_e4m3fn,
-        ]
-
-        if (
-            max_kv_len <= attn.indexer.index_topk
-            and supports_mha
-            and kv_dtype_supported
-        ):
-            # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
-            # Check if total sequence length fits in chunk capacity
-            sum_seq_lens = sum(forward_batch.seq_lens_cpu)
-            # Use MHA_ONE_SHOT for best performance
-            if sum_seq_lens <= forward_batch.get_max_chunk_capacity():
-                return AttnForwardMethod.MHA_ONE_SHOT
-
+    backend = forward_batch.attn_backend
+    if hasattr(backend, "use_mha") and backend.use_mha:
+        return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
 
 
@@ -3599,7 +3568,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 self.quant_config, "weight_block_size", None
                             )
                         )
-                        and self_attn.kv_b_proj.executed_weight_requant_ue8m0
+                        and weight_scale.format_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
