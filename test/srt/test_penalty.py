@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_npu, kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -19,12 +19,26 @@ from sglang.test.test_utils import (
 class TestPenalty(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = (
+            "/root/.cache/modelscope/hub/models/LLM-Research/Llama-3.2-1B-Instruct"
+            if is_npu()
+            else DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        )
+        other_args = (
+            [
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+            ]
+            if is_npu()
+            else []
+        )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
         )
 
     @classmethod
