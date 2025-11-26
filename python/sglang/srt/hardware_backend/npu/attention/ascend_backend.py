@@ -239,9 +239,6 @@ class AscendAttnBackend(AttentionBackend):
             self.kv_lora_rank = model_runner.model_config.kv_lora_rank
             self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
             self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
-            self.q_head_dim = (
-                self.qk_rope_head_dim + model_runner.model_config.qk_nope_head_dim
-            )
         self.native_attn = TorchNativeAttnBackend(model_runner)
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
