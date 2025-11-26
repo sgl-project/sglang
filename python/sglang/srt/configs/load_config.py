@@ -78,6 +78,9 @@ class LoadConfig:
     # ModelOpt configuration object
     modelopt_config: Optional[ModelOptConfig] = None
 
+    # MTP model idx
+    draft_model_idx: Optional[int] = None
+
     def __post_init__(self):
         model_loader_extra_config = self.model_loader_extra_config or {}
         if isinstance(model_loader_extra_config, str):

@@ -852,10 +852,12 @@ class HybridSWACompressedModel(nn.Module):
         else:
             if hidden_states.shape[0] > 0:
                 if residual is None:
+                    hidden_states_before_norm = hidden_states
                     hidden_states = self.norm(hidden_states)
                 else:
+                    hidden_states_before_norm = hidden_states + residual
                     hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        return hidden_states, hidden_states_before_norm
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
@@ -971,7 +973,7 @@ class HybridSWACompressedForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(
+        hidden_states, hidden_states_before_norm = self.model(
             input_ids,
             positions,
             forward_batch,
@@ -981,7 +983,7 @@ class HybridSWACompressedForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids, hidden_states, self.lm_head, forward_batch, hidden_states_before_norm=hidden_states_before_norm
             )
         else:
             return hidden_states

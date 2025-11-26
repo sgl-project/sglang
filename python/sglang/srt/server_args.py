@@ -389,6 +389,8 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    # For MTP
+    enable_mtp: bool = False
 
     # Expert parallelism
     ep_size: int = 1
@@ -2834,6 +2836,8 @@ class ServerArgs:
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
         )
+        # MTP
+        parser.add_argument("--enable-mtp", action="store_true")
 
         # Expert parallelism
         parser.add_argument(

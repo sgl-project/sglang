@@ -75,7 +75,6 @@ class HybridSWACompressedMTPLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
         self.is_layer_sparse = False
-        # TODO: 这里只有第一层MTP是Ture，后续应该都是False
         is_previous_layer_sparse = True
 
         if enable_moe_dense_fully_dp():
@@ -205,11 +204,13 @@ class HybridSWACompressedModelNextN(nn.Module):
 
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
+                hidden_states_before_norm = hidden_states + residual
                 hidden_states, _ = self.final_layernorm(hidden_states, residual)
             else:
+                hidden_states_before_norm = hidden_states
                 hidden_states = self.final_layernorm(hidden_states)
 
-        return hidden_states
+        return hidden_states, hidden_states_before_norm
 
 
 class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
@@ -246,9 +247,9 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states, hidden_states_before_norm = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch,  hidden_states_before_norm=hidden_states_before_norm
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
@@ -260,8 +261,6 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
-        expert_params_mapping = []
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
@@ -333,6 +332,9 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import re
 
+        if 'pre_mlp_layernorm' in name:
+            name = name.replace('pre_mlp_layernorm', 'post_attention_layernorm')
+
         name_without_prefix = [
             "enorm",
             "hnorm",
@@ -340,10 +342,6 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
             "final_layernorm",
         ]
         pattern = r"model.mtp.layers.(\d+)."
-        pattern_norm = r"pre_mlp_layernorm"
-        group_norm = re.search(pattern_norm, name)
-        if group_norm is not None:
-            name = name.replace(group_norm.group(), "post_attention_layernorm")
         group = re.match(pattern, name)
         if group is not None:
             for sub_name in name_without_prefix:

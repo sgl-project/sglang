@@ -1081,6 +1081,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -1819,6 +1822,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
+            return_hidden_states_before_norm=self.return_hidden_states_before_norm,
         )
 
     def copy(self):
@@ -1932,3 +1936,6 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False

@@ -320,6 +320,9 @@ class ForwardBatch:
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
+
     @classmethod
     def init_new(
         cls,
@@ -363,6 +366,7 @@ class ForwardBatch:
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
         )
         device = model_runner.device
 
