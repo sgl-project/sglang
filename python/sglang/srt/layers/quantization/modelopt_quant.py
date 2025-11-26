@@ -1351,7 +1351,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
 
-        w13_weight_scale_shape = (layer.num_local_experts, num_shards)
+        w13_weight_scale_shape = (
+            (layer.num_local_experts, 2)
+            if layer.moe_runner_config.is_gated
+            else (layer.num_local_experts,)
+        )
         w13_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
             weight_loader=weight_loader,
