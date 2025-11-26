@@ -7,7 +7,6 @@ vs json_schema vs no constraint.
 
 import time
 import unittest
-from typing import Dict, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -303,6 +302,3 @@ class TestRelativePerformance(PerformanceTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
-
-
