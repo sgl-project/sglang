@@ -258,7 +258,28 @@ class LMCRadixCache(RadixCache):
 
 
 if __name__ == "__main__":
+    from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    model_config = ModelConfig(
+        model_path="Qwen/Qwen3-4B",
+    )
+
+    _kvcache = MHATokenToKVPool(
+        size=256,
+        page_size=1,
+        dtype=torch.bfloat16,
+        layer_num=model_config.num_hidden_layers,
+        enable_memory_saver=False,
+        device=None,
+        head_num=model_config.num_key_value_heads,
+        head_dim=model_config.head_dim,
+    )
+
+    allocator = TokenToKVPoolAllocator(
+        size=128, dtype=torch.bfloat16, device="cpu", kvcache=_kvcache, need_sort=False
+    )
 
     params = CacheInitParams(
         req_to_token_pool=None,
@@ -267,9 +288,10 @@ if __name__ == "__main__":
         disable=False,
         enable_kv_cache_events=False,
     )
+
     cache = LMCRadixCache(
         params=params,
-        model_config=None,
+        model_config=model_config,
         tp_size=1,
         rank=0,
         tp_group=None,
