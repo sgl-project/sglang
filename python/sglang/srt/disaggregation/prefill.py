@@ -200,7 +200,6 @@ class PrefillBootstrapQueue:
         self._process_req(req)
         req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
-        self.scheduler.num_waiting_tokens += len(req.origin_input_ids)
         trace_slice_end(RequestStage.PREFILL_PREPARE, req.rid, auto_next_anon=True)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
@@ -271,8 +270,6 @@ class PrefillBootstrapQueue:
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
-                # update counter for failed bootstrap request
-                self.scheduler.num_waiting_tokens -= len(req.origin_input_ids)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 continue

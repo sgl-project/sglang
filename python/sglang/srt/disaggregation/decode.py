@@ -299,11 +299,6 @@ class DecodePreallocQueue:
 
         if is_retracted:
             self.retracted_queue.append(req)
-            self.scheduler.num_waiting_tokens += (
-                len(req.origin_input_ids)
-                + len(req.output_ids)
-                + self.num_reserved_decode_tokens
-            )
         else:
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
                 kv_receiver_class = get_kv_class(
@@ -326,7 +321,6 @@ class DecodePreallocQueue:
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
-            self.scheduler.num_waiting_tokens += len(req.origin_input_ids)
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
@@ -367,8 +361,6 @@ class DecodePreallocQueue:
             req.is_retracted = False
             self._pre_alloc(req)
             allocatable_tokens -= required_tokens_for_request
-            # update counter for resumed request
-            self.scheduler.num_waiting_tokens -= required_tokens_for_request
 
             # load from cpu, release the cpu copy
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
@@ -544,15 +536,9 @@ class DecodePreallocQueue:
                 RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
             )
 
-        preallocated_queue = []
-
-        for i, entry in enumerate(self.queue):
-            if i not in indices_to_remove:
-                preallocated_queue.append(entry)
-            else:
-                # update counter for allocated or failed request
-                self.scheduler.num_waiting_tokens -= len(entry.req.origin_input_ids)
-        self.queue = preallocated_queue
+        self.queue = [
+            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+        ]
 
         return preallocated_reqs
 

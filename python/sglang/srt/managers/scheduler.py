@@ -427,7 +427,6 @@ class Scheduler(
 
         # Init running status
         self.waiting_queue: List[Req] = []
-        self.num_waiting_tokens = 0
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -1465,7 +1464,6 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
-            self.num_waiting_tokens += len(req.origin_input_ids)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1533,8 +1531,6 @@ class Scheduler(
             if abort_existing_req:
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
-                # update counter for preempted existing request
-                self.num_waiting_tokens -= len(req_to_abort.origin_input_ids)
                 message = "The request is aborted by a higher priority request."
 
         self.send_to_tokenizer.send_output(
@@ -1812,15 +1808,9 @@ class Scheduler(
             for req in can_run_list:
                 req.add_latency(RequestStage.PREFILL_WAITING)
 
-        can_run_set = set(can_run_list)
-        waiting_queue = []
-        for x in self.waiting_queue:
-            if x in can_run_set:
-                self.num_waiting_tokens -= len(x.origin_input_ids)
-            else:
-                waiting_queue.append(x)
-
-        self.waiting_queue = waiting_queue
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -2243,6 +2233,8 @@ class Scheduler(
         return if_success
 
     def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
+        # TODO(lsyin): use dynamically maintained num_waiting_tokens
+
         if self.is_hybrid:
             num_tokens_full = (
                 self.full_tokens_per_layer
@@ -2268,15 +2260,21 @@ class Scheduler(
                 - self.tree_cache.evictable_size()
             )
 
-        # Tokens in waiting queue, bootstrap queue, prealloc/retract queue
-        num_tokens += self.num_waiting_tokens
+        # Tokens in waiting queue, bootstrap queue, prealloc queue
+        num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
         num_waiting_reqs = len(self.waiting_queue)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            num_tokens += sum(
+                len(req.origin_input_ids)
+                for req in self.disagg_prefill_bootstrap_queue.queue
+            )
             num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            num_tokens += sum(
+                len(req.req.origin_input_ids)
+                for req in self.disagg_decode_prealloc_queue.queue
+            )
             num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
-            num_waiting_reqs += len(self.disagg_decode_transfer_queue.queue)
-            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.retracted_queue)
 
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
@@ -2392,9 +2390,6 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
-            else:
-                # update counter for abort request in prealloc and waiting queue
-                self.num_waiting_tokens -= len(req.origin_input_ids)
 
             # For mamba radix cache
             if req.mamba_pool_idx is not None:
