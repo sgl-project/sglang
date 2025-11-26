@@ -2002,8 +2002,12 @@ class Scheduler(
                     # )
 
                     # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    # # new_seq_lens was allocated on forward_stream, protect it from
+                    # # being freed while default_stream uses it
+                    # new_seq_lens = batch_result.next_draft_input.new_seq_lens
+                    # if new_seq_lens is not None:
+                    #     new_seq_lens.record_stream(self.default_stream)
+                    #     batch.seq_lens = new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids

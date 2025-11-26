@@ -498,6 +498,9 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         # Run draft extend batch in the main compute stream
+        # forward_batch.record_stream(
+        #     torch.get_device_module(self.device).current_stream()
+        # )
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
@@ -609,9 +612,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(
-                model_worker_batch
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.target_worker.model_runner
             )
+            batch_output = self.target_worker.forward_batch_generation(forward_batch)
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -679,6 +683,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         # Run target verify batch in the main compute stream
+        # verify_forward_batch.record_stream(
+        #     torch.get_device_module(self.device).current_stream()
+        # )
         forward_batch_output = self.target_worker.forward_batch_generation(
             verify_forward_batch,
             is_verify=True,
