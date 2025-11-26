@@ -46,7 +46,7 @@ _aiter_comm_manager = AiterCommManager()
 
 def ensure_workspace_initialized(dtype):
     """Ensure workspace is initialized"""
-    if not _aiter_comm_manager is None:
+    if _aiter_comm_manager is None:
         return False
 
     world_size = get_tensor_model_parallel_world_size()
