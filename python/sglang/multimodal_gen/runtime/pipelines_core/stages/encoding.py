@@ -93,10 +93,6 @@ class EncodingStage(PipelineStage):
                 latents = latents.to(vae_dtype)
             latents = self.vae.encode(latents).mean
 
-        latents = self.server_args.pipeline_config.post_process_vae_encode(
-            latents, self.vae
-        )
-
         # Update batch with encoded latents
         batch.latents = latents
 

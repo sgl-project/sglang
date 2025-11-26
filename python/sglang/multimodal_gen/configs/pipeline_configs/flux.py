@@ -393,6 +393,14 @@ def flux_2_preprocess_text(prompt: str):
     return format_text_input([prompt], system_message=system_message)
 
 
+# Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._pack_latents
+def flux2_pack_latents(latents):
+    batch_size, num_channels, height, width = latents.shape
+    latents = latents.reshape(batch_size, num_channels, height * width).permute(0, 2, 1)
+
+    return latents
+
+
 @dataclass
 class Flux2PipelineConfig(FluxPipelineConfig):
     embedded_cfg_scale: float = 4.0
@@ -467,8 +475,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
         img_ids = batch.latent_ids
         if batch.image_latent is not None:
-            image_latents = [batch.image_latent]
-            image_latent_ids = _prepare_image_ids(image_latents)
+            image_latent_ids = batch.image_latent_ids
             img_ids = torch.cat([img_ids, image_latent_ids], dim=1).to(device=device)
 
         if img_ids.ndim == 3:
@@ -503,41 +510,28 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         return {}
 
     def maybe_pack_latents(self, latents, batch_size, batch):
-        batch_size, num_channels, height, width = latents.shape
-        latents = latents.reshape(batch_size, num_channels, height * width).permute(
-            0, 2, 1
-        )
-        return latents
+        return flux2_pack_latents(latents)
 
     def maybe_prepare_latent_ids(self, latents):
         return _prepare_latent_ids(latents)
 
     def post_process_vae_encode(self, image_latents, vae):
-        vae_arch_config = self.vae_config.arch_config
-        # 1. patchify
+        # patchify
         image_latents = _patchify_latents(image_latents)
-
-        # 2. scale and shift
-        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(
-            image_latents.device, image_latents.dtype
-        )
-        latents_bn_std = torch.sqrt(
-            vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps
-        )
-        image_latents = (image_latents - latents_bn_mean) / latents_bn_std
         return image_latents
 
     def preprocess_decoding(self, latents):
         latents = _unpatchify_latents(latents)
         return latents
 
-    def calculate_decode_scale_inv_and_shift(self, latents, vae):
-        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(
-            latents.device, latents.dtype
+    def get_decode_scale_and_shift(self, device, dtype, vae):
+        vae_arch_config = self.vae_config.arch_config
+        latents_bn_mean = (
+            vae.bn.running_mean.view(1, -1, 1, 1).to(device=device).to(device, dtype)
         )
         latents_bn_std = torch.sqrt(
-            vae.bn.running_var.view(1, -1, 1, 1) + vae.config.batch_norm_eps
-        ).to(latents.device, latents.dtype)
+            vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps
+        ).to(device, dtype)
         return 1 / latents_bn_std, latents_bn_mean
 
     def post_denoising_loop(self, latents, batch):

@@ -19,9 +19,10 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
+from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 
-class AutoencoderKLFlux2(nn.Module):
+class AutoencoderKLFlux2(nn.Module, ParallelTiledVAE):
     r"""
     A VAE model with KL loss for encoding images into latents and decoding latent representations into images.
 
@@ -223,7 +224,7 @@ class AutoencoderKLFlux2(nn.Module):
 
     def encode(
         self, x: torch.Tensor, return_dict: bool = True
-    ) -> Union[AutoencoderKLOutput, Tuple[DiagonalGaussianDistribution]]:
+    ) -> Union[DiagonalGaussianDistribution]:
         """
         Encode a batch of images into latents.
 
@@ -236,6 +237,11 @@ class AutoencoderKLFlux2(nn.Module):
                 The latent representations of the encoded images. If `return_dict` is True, a
                 [`~models.autoencoder_kl.AutoencoderKLOutput`] is returned, otherwise a plain `tuple` is returned.
         """
+
+        if x.ndim == 5:
+            assert x.shape[2] == 1
+            x = x.squeeze(2)
+
         if self.use_slicing and x.shape[0] > 1:
             encoded_slices = [self._encode(x_slice) for x_slice in x.split(1)]
             h = torch.cat(encoded_slices)
@@ -243,11 +249,7 @@ class AutoencoderKLFlux2(nn.Module):
             h = self._encode(x)
 
         posterior = DiagonalGaussianDistribution(h)
-
-        if not return_dict:
-            return (posterior,)
-
-        return AutoencoderKLOutput(latent_dist=posterior)
+        return posterior
 
     def _decode(
         self, z: torch.Tensor, return_dict: bool = True

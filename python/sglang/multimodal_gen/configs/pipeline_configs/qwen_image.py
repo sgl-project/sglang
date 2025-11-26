@@ -123,15 +123,15 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         # pack latents
         return _pack_latents(latents, batch_size, num_channels_latents, height, width)
 
-    def calculate_decode_scale_inv_and_shift(self, latents, vae):
+    def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
         scaling_factor = 1.0 / torch.tensor(
-            vae_arch_config.latents_std, device=latents.device
-        ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
+            vae_arch_config.latents_std, device=device
+        ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(device, dtype)
         shift_factor = (
             torch.tensor(vae_arch_config.latents_mean)
             .view(1, vae_arch_config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
+            .to(device, dtype)
         )
         return scaling_factor, shift_factor
 

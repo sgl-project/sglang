@@ -68,5 +68,4 @@ class Flux2VAEConfig(FluxVAEConfig):
         self.arch_config.vae_scale_factor = 2 ** (
             len(self.arch_config.block_out_channels) - 1
         )
-
         self.arch_config.spatial_compression_ratio = self.arch_config.vae_scale_factor

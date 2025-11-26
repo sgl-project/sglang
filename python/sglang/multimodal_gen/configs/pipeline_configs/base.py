@@ -212,11 +212,15 @@ class PipelineConfig:
 
         return shape
 
-    def calculate_decode_scale_inv_and_shift(self, latents, vae):
+    def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
-        return vae_arch_config.scaling_factor, getattr(
-            vae_arch_config, "shift_factor", None
+        scaling_factor = vae_arch_config.scaling_factor or getattr(
+            vae, "scaling_factor", None
         )
+        shift_factor = vae_arch_config.shift_factor or getattr(
+            vae, "shift_factor", None
+        )
+        return scaling_factor, shift_factor
 
     # called after latents are prepared
     def maybe_pack_latents(self, latents, batch_size, batch):
@@ -225,6 +229,7 @@ class PipelineConfig:
     def maybe_prepare_latent_ids(self, latents):
         return None
 
+    # called after vae encode
     def post_process_vae_encode(self, image_latents, vae):
         return image_latents
 

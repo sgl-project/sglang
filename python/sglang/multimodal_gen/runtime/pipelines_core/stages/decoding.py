@@ -60,17 +60,17 @@ class DecodingStage(PipelineStage):
         return result
 
     def scale_and_shift(self, latents: torch.Tensor, server_args):
-        scaling_inv, shift_factor = (
-            server_args.pipeline_config.calculate_decode_scale_inv_and_shift(
-                latents, self.vae
+        scaling_factor, shift_factor = (
+            server_args.pipeline_config.get_decode_scale_and_shift(
+                latents.device, latents.dtype, self.vae
             )
         )
 
         # 1. scale
-        if isinstance(scaling_inv, torch.Tensor):
-            latents = latents / scaling_inv.to(latents.device, latents.dtype)
+        if isinstance(scaling_factor, torch.Tensor):
+            latents = latents / scaling_factor.to(latents.device, latents.dtype)
         else:
-            latents = latents / scaling_inv
+            latents = latents / scaling_factor
 
         # 2. apply shifting if needed
         if shift_factor is not None:

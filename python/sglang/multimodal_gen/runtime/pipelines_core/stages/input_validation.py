@@ -116,16 +116,23 @@ class InputValidationStage(PipelineStage):
             else:
                 image = load_image(batch.image_path)
             batch.condition_image = image
+            condition_image_width, condition_image_height = image.width, image.height
+        else:
+            condition_image_width, condition_image_height = None, None
 
         # NOTE: resizing needs to be bring in advance
         if server_args.pipeline_config.task_type == ModelTaskType.I2I:
-            height = None if batch.height_not_provided else batch.height
-            width = None if batch.width_not_provided else batch.width
-            width, height = server_args.pipeline_config.maybe_resize_condition_image(
-                height, width, batch.condition_image
+            resized_width, resized_height = (
+                server_args.pipeline_config.maybe_resize_condition_image(
+                    condition_image_width, condition_image_height, batch.condition_image
+                )
             )
-            batch.width = width
-            batch.height = height
+            print(f"{resized_height=}")
+            print(f"{resized_width=}")
+            print(f"{batch.width_not_provided=}")
+            print(f"{batch.height_not_provided=}")
+            batch.width = resized_width if batch.width_not_provided else batch.width
+            batch.height = resized_height if batch.height_not_provided else batch.height
         elif (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
         ) and batch.condition_image is not None:

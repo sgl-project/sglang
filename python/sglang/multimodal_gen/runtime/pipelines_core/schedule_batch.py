@@ -100,6 +100,7 @@ class Req:
     noise_pred: torch.Tensor | None = None
     # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
+    image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
