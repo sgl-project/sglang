@@ -421,7 +421,7 @@ async def health_generate(request: Request) -> Response:
         return Response(status_code=503)
 
     if (
-        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
     ):
         return Response(status_code=200)
