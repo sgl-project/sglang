@@ -41,12 +41,16 @@ class MatchResult(NamedTuple):
                             this **must** be the same as `last_device_node`.
         host_hit_length :   Length of the KV cache hit on the host, if applicable.
                             0 if HiCache is not enabled.
+        mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
+                                page-aligned position that could've been cache hit if there
+                                exists a mamba state.
     """
 
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
     host_hit_length: int = 0
+    mamba_branching_seqlen: Optional[int] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
