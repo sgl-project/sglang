@@ -585,7 +585,7 @@ class PiecewiseCudaGraphRunner:
         self,
         forward_batch: ForwardBatch,
         **kwargs,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph(), disable_ca_comm(self.model_runner.tp_group):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
