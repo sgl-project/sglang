@@ -419,5 +419,136 @@ class TestConstraintTypeConsistency(ParserIntegrationTestCase):
             )
 
 
+class TestParallelToolCallsMultiDetector(ParserIntegrationTestCase):
+    """Test that parallel_tool_calls works correctly across different detectors."""
+
+    def test_parallel_tool_calls_false_across_detectors_structural_tag(self):
+        """Test that parallel_tool_calls=False sets stop_after_first=True across detectors."""
+        tools = [self.get_simple_tool()]
+        detectors = [
+            "llama3",
+            "mistral",
+            "qwen25",
+            "gpt-oss",
+            "deepseekv3",
+            "qwen3_coder",
+        ]
+
+        for detector_name in detectors:
+            parser = FunctionCallParser(tools=tools, tool_call_parser=detector_name)
+            constraint = parser.get_structure_constraint(
+                tool_choice="auto", parallel_tool_calls=False
+            )
+
+            if constraint is not None and constraint[0] == "structural_tag":
+                tag = constraint[1]
+                self.assertIn("format", tag)
+                # For detectors with nested structures (DeepSeek), check inner tag
+                if "tags" in tag["format"] and len(tag["format"]["tags"]) > 0:
+                    first_tag = tag["format"]["tags"][0]
+                    if "content" in first_tag and "type" in first_tag["content"]:
+                        if first_tag["content"]["type"] == "tags_with_separator":
+                            # DeepSeek nested structure - stop_after_first is in the tags_with_separator content
+                            if "stop_after_first" in first_tag["content"]:
+                                self.assertTrue(
+                                    first_tag["content"]["stop_after_first"],
+                                    f"Detector {detector_name} should have stop_after_first=True in tags_with_separator content",
+                                )
+                                continue  # Skip outer level check for nested structures
+                    # Check outer level stop_after_first for non-nested structures
+                    if "stop_after_first" in tag["format"]:
+                        self.assertTrue(
+                            tag["format"]["stop_after_first"],
+                            f"Detector {detector_name} should have stop_after_first=True",
+                        )
+
+    def test_parallel_tool_calls_true_across_detectors_structural_tag(self):
+        """Test that parallel_tool_calls=True sets stop_after_first=False across detectors."""
+        tools = [self.get_simple_tool()]
+        detectors = [
+            "llama3",
+            "mistral",
+            "qwen25",
+            "gpt-oss",
+            "deepseekv3",
+            "qwen3_coder",
+        ]
+
+        for detector_name in detectors:
+            parser = FunctionCallParser(tools=tools, tool_call_parser=detector_name)
+            constraint = parser.get_structure_constraint(
+                tool_choice="auto", parallel_tool_calls=True
+            )
+
+            if constraint is not None and constraint[0] == "structural_tag":
+                tag = constraint[1]
+                self.assertIn("format", tag)
+                # For detectors with nested structures (DeepSeek), check inner tag
+                if "tags" in tag["format"] and len(tag["format"]["tags"]) > 0:
+                    first_tag = tag["format"]["tags"][0]
+                    if "content" in first_tag and "type" in first_tag["content"]:
+                        if first_tag["content"]["type"] == "tags_with_separator":
+                            # DeepSeek nested structure - stop_after_first is in the tags_with_separator content
+                            if "stop_after_first" in first_tag["content"]:
+                                self.assertFalse(
+                                    first_tag["content"]["stop_after_first"],
+                                    f"Detector {detector_name} should have stop_after_first=False in tags_with_separator content",
+                                )
+                                continue  # Skip outer level check for nested structures
+                    # Check outer level stop_after_first for non-nested structures
+                    if "stop_after_first" in tag["format"]:
+                        self.assertFalse(
+                            tag["format"]["stop_after_first"],
+                            f"Detector {detector_name} should have stop_after_first=False",
+                        )
+
+    def test_parallel_tool_calls_false_across_detectors_json_schema(self):
+        """Test that parallel_tool_calls=False sets maxItems=1 across detectors."""
+        tools = [self.get_simple_tool()]
+        detectors = ["llama3", "mistral", "qwen25", "gpt-oss", "deepseekv3"]
+
+        for detector_name in detectors:
+            parser = FunctionCallParser(tools=tools, tool_call_parser=detector_name)
+            constraint = parser.get_structure_constraint(
+                tool_choice="required", parallel_tool_calls=False
+            )
+
+            self.assertIsNotNone(constraint)
+            self.assertEqual(constraint[0], "json_schema")
+            schema = constraint[1]
+            self.assertIn(
+                "maxItems",
+                schema,
+                f"Detector {detector_name} should have maxItems=1 when parallel_tool_calls=False",
+            )
+            self.assertEqual(
+                schema["maxItems"],
+                1,
+                f"Detector {detector_name} should have maxItems=1 when parallel_tool_calls=False",
+            )
+
+    def test_parallel_tool_calls_true_across_detectors_json_schema(self):
+        """Test that parallel_tool_calls=True does not set maxItems across detectors."""
+        tools = [self.get_simple_tool()]
+        detectors = ["llama3", "mistral", "qwen25", "gpt-oss", "deepseekv3"]
+
+        for detector_name in detectors:
+            parser = FunctionCallParser(tools=tools, tool_call_parser=detector_name)
+            constraint = parser.get_structure_constraint(
+                tool_choice="required", parallel_tool_calls=True
+            )
+
+            self.assertIsNotNone(constraint)
+            self.assertEqual(constraint[0], "json_schema")
+            schema = constraint[1]
+            # maxItems should not be present (or not be 1) when parallel_tool_calls=True
+            if "maxItems" in schema:
+                self.assertNotEqual(
+                    schema["maxItems"],
+                    1,
+                    f"Detector {detector_name} should not have maxItems=1 when parallel_tool_calls=True",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
