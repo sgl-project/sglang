@@ -1355,12 +1355,31 @@ def run_and_check_memory_leak(
     chunked_prefill_size,
     assert_has_abort,
 ):
-    other_args = [
-        "--chunked-prefill-size",
-        str(chunked_prefill_size),
-        "--log-level",
-        "debug",
-    ]
+    model = (
+        "/root/.cache/modelscope/hub/models/AI-ModelScope/Llama-3.1-8B-Instruct"
+        if is_npu()
+        else DEFAULT_MODEL_NAME_FOR_TEST
+    )
+    other_args = (
+        [
+            "--chunked-prefill-size",
+            str(chunked_prefill_size),
+            "--log-level",
+            "debug",
+            "--attention-backend",
+            "ascend",
+            "--disable-cuda-graph",
+            "--mem-fraction-static",
+            0.8,
+        ]
+        if is_npu()
+        else [
+            "--chunked-prefill-size",
+            str(chunked_prefill_size),
+            "--log-level",
+            "debug",
+        ]
+    )
     if disable_radix_cache:
         other_args += ["--disable-radix-cache"]
     if enable_mixed_chunk:
