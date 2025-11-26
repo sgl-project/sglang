@@ -37,7 +37,7 @@ jobs:
           RANDOM_SUFFIX=$(echo $RANDOM | md5sum | head -c 4)
           BRANCH_NAME="bot/bump-kernel-version-${{ github.event.inputs.new_version }}-${RANDOM_SUFFIX}"
           git checkout -b "$BRANCH_NAME"
-          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_ENV"
 
       - name: Run kernel version bump script
         run: |

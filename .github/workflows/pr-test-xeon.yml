@@ -54,22 +54,23 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build and Push
+        env:
+          PR_REPO: ${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF: ${{ github.head_ref }}
         run: |
-          version=$(cat python/sglang/version.py | cut -d'"' -f2)
-          tag=v${version}-xeon
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
+          _version=$(cut -d'"' -f2 < python/sglang/version.py)
+          _tag=v${_version}-xeon
 
           docker build \
-            ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
-            ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
+            ${PR_REPO:+--build-arg SGLANG_REPO="$PR_REPO"} \
+            ${PR_HEAD_REF:+--build-arg VER_SGLANG="$PR_HEAD_REF"} \
             . -f docker/xeon.Dockerfile  -t sglang_xeon --no-cache
 
       - name: Run container
         run: |
           docker run -dt \
-            -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
-            -v ${HF_HOME}:/root/.cache/huggingface \
+            -v "${{ github.workspace }}":/sglang-checkout/ --ipc=host \
+            -v "${HF_HOME}":/root/.cache/huggingface \
             --name ci_sglang_xeon \
             sglang_xeon
 

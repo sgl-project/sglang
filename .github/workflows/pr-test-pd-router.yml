@@ -37,7 +37,7 @@ jobs:
         fetch-depth: 10
 
     - name: Setup Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
@@ -71,7 +71,7 @@ jobs:
         echo "=== System Validation ==="
         nvidia-smi
         echo "GPU count: $(nvidia-smi -L | wc -l)"
-        if [ $(nvidia-smi -L | wc -l) -lt 8 ]; then
+        if [ "$(nvidia-smi -L | wc -l)" -lt 8 ]; then
           echo "Error: This test requires at least 8 GPUs"
           exit 1
         fi
@@ -108,8 +108,8 @@ jobs:
         # Check for active IB devices
         found_active_device=false
         for device in mlx5_{0..11}; do
-            if ibv_devinfo $device >/dev/null 2>&1; then
-                state=$(ibv_devinfo $device | grep "state:" | head -1 | awk '{print $2}')
+            if ibv_devinfo "$device" >/dev/null 2>&1; then
+                state=$(ibv_devinfo "$device" | grep "state:" | head -1 | awk '{print $2}')
                 if [[ "$state" == "PORT_ACTIVE" ]]; then
                     echo "✓ Found active device: $device"
                     found_active_device=true
@@ -159,7 +159,7 @@ jobs:
         rm -f "$READY_FILE"
         DISAGG_READY_FILE="$READY_FILE" bash scripts/ci/ci_start_disaggregation_servers.sh &
         SERVER_PID=$!
-        echo "server_pid=$SERVER_PID" >> $GITHUB_OUTPUT
+        echo "server_pid=$SERVER_PID" >> "$GITHUB_OUTPUT"
 
         # Wait until script signals readiness (8/8 healthy) or timeout
         TIMEOUT=300
@@ -312,7 +312,7 @@ jobs:
 
           if [ -n "$actual_folder" ]; then
             # Extract metrics from the Excel summary or JSON files
-            summary_file="$actual_folder"/*_summary.xlsx
+            _summary_file=("$actual_folder"/*_summary.xlsx)
             json_files=$(find "$actual_folder" -name "*.json" | grep -v experiment_metadata)
 
             echo "Genai-bench results saved in: $actual_folder"
@@ -398,8 +398,8 @@ jobs:
           kill $ROUTER_PID 2>/dev/null || true
 
           # Wait up to 5 seconds for graceful shutdown
-          for i in {1..5}; do
-            if ! ps -p $ROUTER_PID > /dev/null 2>&1; then
+          for _i in {1..5}; do
+            if ! ps -p "$ROUTER_PID" > /dev/null 2>&1; then
               echo "Router stopped gracefully"
               break
             fi
@@ -407,9 +407,9 @@ jobs:
           done
 
           # Force kill if still running
-          if ps -p $ROUTER_PID > /dev/null 2>&1; then
+          if ps -p "$ROUTER_PID" > /dev/null 2>&1; then
             echo "Force killing router..."
-            kill -9 $ROUTER_PID 2>/dev/null || true
+            kill -9 "$ROUTER_PID" 2>/dev/null || true
           fi
 
           # Short delay to ensure port is released
@@ -438,7 +438,7 @@ jobs:
         fi
         pkill -f "sglang.launch_server" || true
         sleep 5
-        remaining=$(ps aux | grep -c "sglang.launch_server" || echo "0")
+        remaining=$(pgrep -c -f "sglang.launch_server" || echo "0")
         echo "Cleanup completed. Remaining processes: $remaining"
 
   summarize-benchmarks:
@@ -470,12 +470,14 @@ jobs:
         find . -name "benchmark_*" -type d
         echo "=========================================="
 
-        echo "## PD Router Genai-Bench Results Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "🚀 **Benchmarked with genai-bench for comprehensive LLM serving performance evaluation**" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "| Policy | Status | TTFT (s) | E2E Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |" >> $GITHUB_STEP_SUMMARY
-        echo "|--------|--------|----------|-----------------|--------------------------|---------------------------|" >> $GITHUB_STEP_SUMMARY
+        {
+          echo "## PD Router Genai-Bench Results Summary"
+          echo ""
+          echo "🚀 **Benchmarked with genai-bench for comprehensive LLM serving performance evaluation**"
+          echo ""
+          echo "| Policy | Status | TTFT (s) | E2E Latency (s) | Input Throughput (tok/s) | Output Throughput (tok/s) |"
+          echo "|--------|--------|----------|-----------------|--------------------------|---------------------------|"
+        } >> "$GITHUB_STEP_SUMMARY"
 
         # First, complete the table with all policies
         for policy in random round_robin cache_aware power_of_two; do
@@ -524,21 +526,23 @@ jobs:
                 output_display="N/A"
               fi
 
-              echo "| ${policy} | ✅ Success | $ttft_display | $e2e_display | $input_display | $output_display |" >> $GITHUB_STEP_SUMMARY
+              echo "| ${policy} | ✅ Success | $ttft_display | $e2e_display | $input_display | $output_display |" >> "$GITHUB_STEP_SUMMARY"
             else
-              echo "| ${policy} | ❌ No Data | N/A | N/A | N/A | N/A |" >> $GITHUB_STEP_SUMMARY
+              echo "| ${policy} | ❌ No Data | N/A | N/A | N/A | N/A |" >> "$GITHUB_STEP_SUMMARY"
             fi
           else
-            echo "| ${policy} | ❌ Failed | N/A | N/A | N/A | N/A |" >> $GITHUB_STEP_SUMMARY
+            echo "| ${policy} | ❌ Failed | N/A | N/A | N/A | N/A |" >> "$GITHUB_STEP_SUMMARY"
           fi
         done
 
         # Add performance validation summary
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 📊 Performance Validation" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**Thresholds:** TTFT ≤ 2.0s | E2E Latency ≤ 8.0s | Input Throughput ≥ 10,000 tok/s | Output Throughput ≥ 100 tok/s" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
+        {
+          echo ""
+          echo "## 📊 Performance Validation"
+          echo ""
+          echo "**Thresholds:** TTFT ≤ 2.0s | E2E Latency ≤ 8.0s | Input Throughput ≥ 10,000 tok/s | Output Throughput ≥ 100 tok/s"
+          echo ""
+        } >> "$GITHUB_STEP_SUMMARY"
 
         validation_summary=""
         for policy in random round_robin cache_aware power_of_two; do
@@ -589,14 +593,16 @@ jobs:
           fi
         done
 
-        echo -e "$validation_summary" >> $GITHUB_STEP_SUMMARY
+        echo -e "$validation_summary" >> "$GITHUB_STEP_SUMMARY"
 
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "## 📊 Genai-Bench Features Used" >> $GITHUB_STEP_SUMMARY
-        echo "- **Token-level Performance**: TTFT, TPOT, End-to-End latency" >> $GITHUB_STEP_SUMMARY
-        echo "- **Throughput Analysis**: Input/Output/Total token throughput" >> $GITHUB_STEP_SUMMARY
-        echo "- **Statistical Analysis**: Percentiles, mean, std dev for all metrics" >> $GITHUB_STEP_SUMMARY
-        echo "- **Visual Reports**: Automated plots and Excel summaries" >> $GITHUB_STEP_SUMMARY
-        echo "- **SGLang Backend**: Native integration with SGLang serving" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "✅ All policies tested successfully with genai-bench!" >> $GITHUB_STEP_SUMMARY
+        {
+          echo ""
+          echo "## 📊 Genai-Bench Features Used"
+          echo "- **Token-level Performance**: TTFT, TPOT, End-to-End latency"
+          echo "- **Throughput Analysis**: Input/Output/Total token throughput"
+          echo "- **Statistical Analysis**: Percentiles, mean, std dev for all metrics"
+          echo "- **Visual Reports**: Automated plots and Excel summaries"
+          echo "- **SGLang Backend**: Native integration with SGLang serving"
+          echo ""
+          echo "✅ All policies tested successfully with genai-bench!"
+        } >> "$GITHUB_STEP_SUMMARY"

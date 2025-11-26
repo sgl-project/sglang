@@ -38,7 +38,7 @@ jobs:
               --json databaseId,status \
               --limit 1000 \
               | jq -r '.[] | select(.status=="queued" or .status=="in_progress") | .databaseId' \
-              | while read run_id; do
+              | while read -r run_id; do
                   echo "Cancelling run ID: $run_id for workflow: $workflow_file"
                   gh run cancel "$run_id" --repo "$REPO"
                 done
