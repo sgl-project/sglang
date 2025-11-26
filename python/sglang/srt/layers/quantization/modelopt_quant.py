@@ -448,7 +448,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             else params_dtype
         )
         weight_loader = extra_weight_attrs.get("weight_loader")
-        intermediate_size =  2 * intermediate_size_per_partition if layer.moe_runner_config.is_gated else intermediate_size_per_partition
+        num_shards = 2 if layer.moe_runner_config.is_gated else 1
+        intermediate_size =  num_shards * intermediate_size_per_partition
         w13_weight = ModelWeightParameter(
             data=torch.empty(
                 num_experts,
@@ -479,7 +480,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             # WEIGHT SCALES - Per-tensor scaling for ModelOpts
             # Allocate 2 scales for w1 and w3 respectively.
             # They will be combined to a single scale after weight loading.
-            w13_scale_shape = (num_experts, 2) if layer.moe_runner_config.is_gated else (num_experts, 1)
+            w13_scale_shape = (num_experts, num_shards)
             w13_weight_scale = PerTensorScaleParameter(
                 data=torch.full(
                     w13_scale_shape,
@@ -534,11 +535,11 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 # Requantize each expert's weights using the combined scale
                 # w13_weight has shape (num_experts, 2 * intermediate_size_per_partition, hidden_size)
                 # where the first intermediate_size_per_partition rows are w1, the next are w3
-                num_weights = 2 if layer.moe_runner_config.is_gated else 1
-                intermediate_size_per_partition = layer.w13_weight.shape[1] // num_weights
+                num_shards = 2 if layer.moe_runner_config.is_gated else 1
+                intermediate_size_per_partition = layer.w13_weight.shape[1] // num_shards
                 for expert_id in range(layer.w13_weight.shape[0]):
                     start = 0
-                    for shard_id in range(num_weights):  # (w1 and w3) or w13
+                    for shard_id in range(num_shards):  # (w1 and w3) or w13
                         # Dequantize using the original scale for this shard
                         dq_weight = per_tensor_dequantize(
                             layer.w13_weight[expert_id][
@@ -1339,7 +1340,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
         )
 
-        w13_weight_scale_shape = (layer.num_local_experts, 2) if layer.moe_runner_config.is_gated else (layer.num_local_experts,)
+        w13_weight_scale_shape = (layer.num_local_experts, num_shards)
         w13_weight_scale_2 = PerTensorScaleParameter(
             data=torch.empty(w13_weight_scale_shape, dtype=torch.float32),
             weight_loader=weight_loader,
@@ -1356,7 +1357,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
 
-        w13_input_scale_shape = (layer.num_experts, 2) if layer.moe_runner_config.is_gated else (layer.num_experts,)
+        w13_input_scale_shape = (layer.num_experts, num_shards)
         w13_input_scale = PerTensorScaleParameter(
             data=torch.empty(w13_input_scale_shape, dtype=torch.float32),
             weight_loader=weight_loader,
@@ -1684,7 +1685,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
             # Set up CUTLASS MoE parameters
-            num_shards = 2 if layer.moe_runner_config.is_gated else 1
             device = layer.w13_weight.device
             layer.cutlass_moe_params = CutlassMoEParams(
                 CutlassMoEType.BlockscaledFP4,
