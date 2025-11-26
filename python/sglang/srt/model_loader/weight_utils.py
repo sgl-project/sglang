@@ -394,7 +394,11 @@ def find_local_hf_snapshot_dir(
             base_name = os.path.basename(f)
             # Check if this is a single model file (not sharded)
             # Include adapter_model.safetensors for LoRA adapters
-            if base_name in ["model.safetensors", "pytorch_model.safetensors", "adapter_model.safetensors"]:
+            if base_name in [
+                "model.safetensors",
+                "pytorch_model.safetensors",
+                "adapter_model.safetensors",
+            ]:
                 if not _validate_safetensors_file(f):
                     logger.info(
                         "Corrupted model file %s for %s. "
