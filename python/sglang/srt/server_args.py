@@ -1512,8 +1512,8 @@ class ServerArgs:
 
         if self.moe_runner_backend == "deep_gemm":
             assert (
-                self.ep_size > 1
-            ), "DeepGemm MoE is only supported when dp attention and ep are both enabled"
+                self.ep_size > 1 and self.moe_a2a_backend == "deepep"
+            ), "DeepGemm MoE runner is only supported when ep is enabled and moe_a2a_backend is deepep"
 
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
