@@ -214,7 +214,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image = batch.pil_image
+        image = batch.condition_image
         image_size = image[0].size if isinstance(image, list) else image.size
         edit_width, edit_height, _ = calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
@@ -279,7 +279,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         image = image_processor.resize(image, calculated_height, calculated_width)
         return image
 
-    def adjust_size(self, width, height, image):
+    def maybe_resize_condition_image(self, width, height, image):
         image_size = image[0].size if isinstance(image, list) else image.size
         calculated_width, calculated_height, _ = calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]

@@ -275,14 +275,14 @@ class DenoisingStage(PipelineStage):
         # FIXME: should probably move to latent preparation stage, to handle with offload
         if (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.pil_image is not None
+            and batch.condition_image is not None
         ):
             # Wan2.2 TI2V directly replaces the first frame of the latent with
             # the image latent instead of appending along the channel dim
             assert batch.image_latent is None, "TI2V task should not have image latents"
             assert self.vae is not None, "VAE is not provided for TI2V task"
-            self.vae = self.vae.to(batch.pil_image.device)
-            z = self.vae.encode(batch.pil_image).mean.float()
+            self.vae = self.vae.to(batch.condition_image.device)
+            z = self.vae.encode(batch.condition_image).mean.float()
             if self.vae.device != "cpu" and server_args.vae_cpu_offload:
                 self.vae = self.vae.to("cpu")
             if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
@@ -342,7 +342,7 @@ class DenoisingStage(PipelineStage):
         # Shard z and reserved_frames_mask for TI2V if SP is enabled
         if (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.pil_image is not None
+            and batch.condition_image is not None
             and get_sp_world_size() > 1
         ):
             sp_world_size = get_sp_world_size()
@@ -689,7 +689,7 @@ class DenoisingStage(PipelineStage):
         # expand timestep
         if (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.pil_image is not None
+            and batch.condition_image is not None
         ):
             # Explicitly cast t_device to the target float type at the beginning.
             # This ensures any precision-based rounding (e.g., float32(999.0) -> bfloat16(1000.0))
@@ -734,7 +734,7 @@ class DenoisingStage(PipelineStage):
         """
         if (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.pil_image is not None
+            and batch.condition_image is not None
         ):
             # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
             # This ensures the first frame is always the condition image after each step.

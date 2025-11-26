@@ -347,7 +347,7 @@ class TextEncoderLoader(ComponentLoader):
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
                 raise ValueError(
-                    "Following weights were not initialized from "
+                    "Following model weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
 

@@ -175,7 +175,7 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def adjust_size(self, width, height, image):
+    def maybe_resize_condition_image(self, width, height, image):
         """
         image: input image
         """
@@ -187,6 +187,9 @@ class PipelineConfig:
     # called in ImageEncodingStage, preprocess the image
     def preprocess_image(self, image, image_processor: VaeImageProcessor):
         return image
+
+    def maybe_resize_condition_image(self, batch, condition_image: torch.Tensor):
+        return condition_image
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio

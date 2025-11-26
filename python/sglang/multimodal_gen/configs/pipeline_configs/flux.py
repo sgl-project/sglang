@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
+import math
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, List, Optional
 
 import torch
 
@@ -123,7 +123,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
 
         return latent_image_ids
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb):
+    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
         txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device)
         img_ids = self._prepare_latent_image_ids(
             original_height=height,
@@ -157,7 +157,12 @@ class FluxPipelineConfig(ImagePipelineConfig):
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {
             "freqs_cis": self.get_freqs_cis(
-                batch.prompt_embeds[1], batch.width, batch.height, device, rotary_emb
+                batch.prompt_embeds[1],
+                batch.width,
+                batch.height,
+                device,
+                rotary_emb,
+                batch,
             ),
             "pooled_projections": (
                 batch.pooled_embeds[0] if batch.pooled_embeds else None
@@ -172,6 +177,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 batch.height,
                 device,
                 rotary_emb,
+                batch,
             ),
             "pooled_projections": (
                 batch.neg_pooled_embeds[0] if batch.neg_pooled_embeds else None
@@ -263,12 +269,125 @@ def _unpatchify_latents(latents):
     return latents
 
 
+def _prepare_text_ids(
+    x: torch.Tensor,  # (B, L, D) or (L, D)
+    t_coord: Optional[torch.Tensor] = None,
+):
+    B, L, _ = x.shape
+    out_ids = []
+
+    for i in range(B):
+        t = torch.arange(1) if t_coord is None else t_coord[i]
+        h = torch.arange(1)
+        w = torch.arange(1)
+        l = torch.arange(L)
+
+        coords = torch.cartesian_prod(t, h, w, l)
+        out_ids.append(coords)
+
+    return torch.stack(out_ids)
+
+
+def _prepare_image_ids(
+    image_latents: List[torch.Tensor],  # [(1, C, H, W), (1, C, H, W), ...]
+    scale: int = 10,
+):
+    if not isinstance(image_latents, list):
+        raise ValueError(
+            f"Expected `image_latents` to be a list, got {type(image_latents)}."
+        )
+
+    # create time offset for each reference image
+    t_coords = [scale + scale * t for t in torch.arange(0, len(image_latents))]
+    t_coords = [t.view(-1) for t in t_coords]
+
+    image_latent_ids = []
+    for x, t in zip(image_latents, t_coords):
+        x = x.squeeze(0)
+        _, height, width = x.shape
+
+        x_ids = torch.cartesian_prod(
+            t, torch.arange(height), torch.arange(width), torch.arange(1)
+        )
+        image_latent_ids.append(x_ids)
+
+    image_latent_ids = torch.cat(image_latent_ids, dim=0)
+    image_latent_ids = image_latent_ids.unsqueeze(0)
+
+    return image_latent_ids
+
+
 @dataclass
-class Flux2PipelineConfig(ImagePipelineConfig):
+class Flux2PipelineConfig(FluxPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.I2I
+
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (Mistral3Config(),)
     )
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
+
+    preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
+        default_factory=lambda: (preprocess_text,),
+    )
+
+    postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
+        default_factory=lambda: (t5_postprocess_text,)
+    )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
+
+    def maybe_resize_condition_image(self, width, height, image):
+        target_area: int = 1024 * 1024
+
+        if width * height > target_area:
+            scale = math.sqrt(target_area / (width * height))
+            width = int(width * scale)
+            height = int(height * scale)
+
+        return width, height
+
+    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+        txt_ids = _prepare_text_ids(prompt_embeds)
+
+        image_latents = [batch.image_latent]
+
+        image_latent_ids = _prepare_image_ids(image_latents)
+
+        img_ids = torch.cat([batch.latent_ids, image_latent_ids], dim=1)
+
+        # NOTE(mick): prepare it here, to avoid unnecessary computations
+        img_cos, img_sin = rotary_emb.forward(img_ids)
+        img_cos = shard_rotary_emb_for_sp(img_cos)
+        img_sin = shard_rotary_emb_for_sp(img_sin)
+
+        txt_cos, txt_sin = rotary_emb.forward(txt_ids)
+
+        cos = torch.cat([txt_cos, img_cos], dim=0).to(device=device)
+        sin = torch.cat([txt_sin, img_sin], dim=0).to(device=device)
+        return cos, sin
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "freqs_cis": self.get_freqs_cis(
+                batch.prompt_embeds[0],
+                batch.width,
+                batch.height,
+                device,
+                rotary_emb,
+                batch,
+            )
+        }
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "freqs_cis": self.get_freqs_cis(
+                batch.negative_prompt_embeds[0],
+                batch.width,
+                batch.height,
+                device,
+                rotary_emb,
+                batch,
+            ),
+        }
 
     def maybe_pack_latents(self, latents, batch_size, batch):
         batch_size, num_channels, height, width = latents.shape

@@ -170,7 +170,7 @@ def benchmark(batch_size, provider, N, K):
 
 def prepare_shapes(args):
     KN_model_names = []
-    models_tps = list(itertools.product(args.models, args.tp_sizes))
+    models_tps = list(itertools.product(args.registered_models, args.tp_sizes))
     for model, tp_size in models_tps:
         assert model in WEIGHT_SHAPES
         for KN, tp_split_dim in copy.deepcopy(WEIGHT_SHAPES[model]):

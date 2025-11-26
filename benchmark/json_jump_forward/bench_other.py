@@ -146,7 +146,7 @@ def bench_character(args):
             states[i] = character_gen(**arguments[i], generate=call_generate)
 
     elif args.backend == "guidance":
-        model = guidance.models.LlamaCpp(
+        model = guidance.registered_models.LlamaCpp(
             args.model_path,
             n_gpu_layers=-1,
             n_ctx=args.n_ctx,
@@ -223,7 +223,7 @@ def bench_city_doc(args):
             states[i] = city_gen(**arguments[i], generate=call_generate)
 
     elif args.backend == "guidance":
-        model = guidance.models.LlamaCpp(
+        model = guidance.registered_models.LlamaCpp(
             args.model_path,
             n_gpu_layers=-1,
             n_ctx=args.n_ctx,

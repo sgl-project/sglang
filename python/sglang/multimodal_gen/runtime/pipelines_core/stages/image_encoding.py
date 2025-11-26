@@ -102,7 +102,7 @@ class ImageEncodingStage(PipelineStage):
         cuda_device = get_local_torch_device()
         self.move_to_device(cuda_device)
 
-        image = batch.pil_image
+        image = batch.condition_image
 
         # preprocess via vae_image_processor
         prompt_image = server_args.pipeline_config.preprocess_image(
@@ -177,9 +177,9 @@ class ImageEncodingStage(PipelineStage):
         """Verify image encoding stage inputs."""
         result = VerificationResult()
         if batch.debug:
-            logger.debug(f"{batch.pil_image=}")
+            logger.debug(f"{batch.condition_image=}")
             logger.debug(f"{batch.image_embeds=}")
-        result.add_check("pil_image", batch.pil_image, V.not_none)
+        result.add_check("pil_image", batch.condition_image, V.not_none)
         result.add_check("image_embeds", batch.image_embeds, V.is_list)
         return result
 
@@ -217,10 +217,10 @@ class ImageVAEEncodingStage(PipelineStage):
         Returns:
             The batch with encoded outputs.
         """
-        assert batch.pil_image is not None
+        assert batch.condition_image is not None
         if server_args.mode == ExecutionMode.INFERENCE:
-            assert batch.pil_image is not None and isinstance(
-                batch.pil_image, PIL.Image.Image
+            assert batch.condition_image is not None and isinstance(
+                batch.condition_image, PIL.Image.Image
             )
             assert batch.height is not None and isinstance(batch.height, int)
             assert batch.width is not None and isinstance(batch.width, int)
@@ -229,8 +229,8 @@ class ImageVAEEncodingStage(PipelineStage):
             width = batch.width
             num_frames = batch.num_frames
         elif server_args.mode == ExecutionMode.PREPROCESS:
-            assert batch.pil_image is not None and isinstance(
-                batch.pil_image, torch.Tensor
+            assert batch.condition_image is not None and isinstance(
+                batch.condition_image, torch.Tensor
             )
             assert batch.height is not None and isinstance(batch.height, list)
             assert batch.width is not None and isinstance(batch.width, list)
@@ -244,7 +244,7 @@ class ImageVAEEncodingStage(PipelineStage):
         latent_height = height // self.vae.spatial_compression_ratio
         latent_width = width // self.vae.spatial_compression_ratio
 
-        image = batch.pil_image
+        image = batch.condition_image
         image = self.preprocess(
             image,
             vae_scale_factor=self.vae.spatial_compression_ratio,

@@ -55,7 +55,7 @@ class Req:
     image_path: str | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
-    pil_image: torch.Tensor | PIL.Image.Image | None = None
+    condition_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
@@ -95,9 +95,10 @@ class Req:
     latents: torch.Tensor | None = None
     # Flux-2
     latent_ids: torch.Tensor | None = None
+
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
-    image_latent: torch.Tensor | None = None
+    image_latent: torch.Tensor | list[torch.Tensor] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -214,8 +215,8 @@ class Req:
 
     def adjust_size(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
-            width, height = server_args.pipeline_config.adjust_size(
-                self.width, self.height, self.pil_image
+            width, height = server_args.pipeline_config.maybe_resize_condition_image(
+                self.width, self.height, self.condition_image
             )
             self.width = width
             self.height = height

@@ -1,4 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+from diffusers.image_processor import VaeImageProcessor
+
 from sglang.multimodal_gen.runtime.pipelines.flux import prepare_mu
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -8,6 +10,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     ConditioningStage,
     DecodingStage,
     DenoisingStage,
+    ImageVAEEncodingStage,
     InputValidationStage,
     LatentPreparationStage,
     TextEncodingStage,
@@ -47,12 +50,21 @@ class Flux2Pipeline(LoRAPipeline, ComposedPipelineBase):
             stage=TextEncodingStage(
                 text_encoders=[
                     self.get_module("text_encoder"),
-                    self.get_module("text_encoder_2"),
                 ],
                 tokenizers=[
                     self.get_module("tokenizer"),
-                    self.get_module("tokenizer_2"),
                 ],
+            ),
+        )
+
+        self.add_stage(
+            stage_name="image_encoding_stage_primary",
+            stage=ImageVAEEncodingStage(
+                vae_image_processor=VaeImageProcessor(
+                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
+                    * 2
+                ),
+                vae=self.get_module("vae"),
             ),
         )
 

@@ -30,7 +30,7 @@ IS_CI = (
 
 
 def get_weight_shapes(args):
-    models_tps = list(itertools.product(args.models, args.tp_sizes))
+    models_tps = list(itertools.product(args.registered_models, args.tp_sizes))
     # NOTE(HandH1998): The weight shapes only works for DeepSeek-V3. Modify them, if you tune for another different model.
     # cannot TP
     total = [
