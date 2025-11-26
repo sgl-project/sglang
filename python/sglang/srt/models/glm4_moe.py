@@ -496,12 +496,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        with use_symmetric_memory(
-            parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            final_hidden_states_out = torch.empty_like(final_hidden_states)
-        torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-        final_hidden_states = final_hidden_states_out
+
+        if shared_output is not None:
+            with use_symmetric_memory(
+                parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                final_hidden_states_out = torch.empty_like(final_hidden_states)
+            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+            final_hidden_states = final_hidden_states_out
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
