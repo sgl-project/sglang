@@ -225,6 +225,13 @@ class SamplingParams:
             self.num_frames = 1
             self.data_type = DataType.IMAGE
         else:
+            # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
+            # If we apply it after, adjust_num_frames might modify the frame count
+            # and break the divisibility constraint (alignment) required by num_gpus.
+            self.num_frames = server_args.pipeline_config.adjust_num_frames(
+                self.num_frames
+            )
+
             # Adjust number of frames based on number of GPUs for video task
             use_temporal_scaling_frames = (
                 pipeline_config.vae_config.use_temporal_scaling_frames
@@ -274,10 +281,6 @@ class SamplingParams:
                     server_args.num_gpus,
                 )
                 self.num_frames = new_num_frames
-
-            self.num_frames = server_args.pipeline_config.adjust_num_frames(
-                self.num_frames
-            )
 
         self._set_output_file_name()
         self.log(server_args=server_args)
