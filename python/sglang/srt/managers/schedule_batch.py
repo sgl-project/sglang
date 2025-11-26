@@ -762,18 +762,24 @@ class Req:
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
+            match_result = tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
                     if isinstance(tree_cache, MambaRadixCache)
                     else {}
                 ),
+            )
+            (
+                self.prefix_indices,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length,
+            ) = (
+                match_result.device_indices,
+                match_result.last_device_node,
+                match_result.last_host_node,
+                match_result.host_hit_length,
             )
             self.cache_protected_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -1506,8 +1512,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
+    def retract_all(self, server_args: ServerArgs):
+        retracted_reqs = self.reqs
+        for idx in range(len(self.reqs)):
+            self.release_req(idx, len(self.reqs) - idx, server_args)
+
+        self.filter_batch(retracted_reqs)
+        return retracted_reqs
+
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
