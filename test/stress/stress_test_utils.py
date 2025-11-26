@@ -1,7 +1,6 @@
 """Utilities for running stress tests with bench_serving."""
 
 import subprocess
-import time
 from typing import List, Optional
 
 from sglang.srt.utils import kill_process_tree
@@ -115,7 +114,9 @@ class StressTestRunner:
         if result.returncode != 0:
             print(f"Error running stress test:")
             print(result.stderr)
-            raise RuntimeError(f"Stress test failed with return code {result.returncode}")
+            raise RuntimeError(
+                f"Stress test failed with return code {result.returncode}"
+            )
 
         return result
 
