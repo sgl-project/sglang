@@ -406,7 +406,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep", "mooncake"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -1115,6 +1115,21 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "Llama4" in model_arch and self.device != "cpu":
+            # Auto-select attention backend for Llama4 if not specified
+            if self.attention_backend is None:
+                if is_sm100_supported():
+                    self.attention_backend, platform = "trtllm_mha", "sm100"
+                elif is_sm90_supported():
+                    self.attention_backend, platform = "fa3", "sm90"
+                elif is_hip():
+                    self.attention_backend, platform = "aiter", "hip"
+                elif self.device == "xpu":
+                    self.attention_backend, platform = "intel_xpu", "xpu"
+                else:
+                    self.attention_backend, platform = "triton", "other platforms"
+                logger.warning(
+                    f"Use {self.attention_backend} as attention backend on {platform} for Llama4 model"
+                )
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
@@ -1122,11 +1137,6 @@ class ServerArgs:
                 "trtllm_mha",
                 "intel_xpu",
             }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
-            if is_sm100_supported() and self.attention_backend is None:
-                self.attention_backend = "trtllm_mha"
-                logger.warning(
-                    "Use trtllm_mha as attention backend on sm100 for Llama4 model"
-                )
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1523,6 +1533,12 @@ class ServerArgs:
                 f"Mooncake MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
+        if self.moe_a2a_backend == "ascend_fuseep":
+            self.ep_size = self.tp_size
+            logger.warning(
+                f"Ascend fused EP MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
             self.expert_distribution_recorder_mode = "stat"
@@ -1530,7 +1546,7 @@ class ServerArgs:
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
 
-        if (self.enable_eplb or (self.init_expert_location is not None)) and (
+        if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
             self.ep_dispatch_algorithm is None
         ):
             self.ep_dispatch_algorithm = "static"
@@ -1711,7 +1727,7 @@ class ServerArgs:
             if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
-                and self.attention_backend != "flashinfer"
+                and self.attention_backend not in ["flashinfer", "fa3"]
             ):
                 raise ValueError(
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
@@ -2991,7 +3007,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "mooncake"],
+            choices=["none", "deepep", "mooncake", "ascend_fuseep"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )

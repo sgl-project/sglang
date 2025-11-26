@@ -1512,8 +1512,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
+    def retract_all(self, server_args: ServerArgs):
+        retracted_reqs = self.reqs
+        for idx in range(len(self.reqs)):
+            self.release_req(idx, len(self.reqs) - idx, server_args)
+
+        self.filter_batch(retracted_reqs)
+        return retracted_reqs
+
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))

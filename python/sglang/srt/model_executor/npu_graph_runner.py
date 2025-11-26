@@ -20,14 +20,15 @@ import os
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import numpy as np
 import torch
 
 import sglang.srt.model_executor.cuda_graph_runner
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.configs.model_config import AttentionArch, 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu, supports_custom_op
@@ -82,6 +83,20 @@ class NPUGraphRunner(CudaGraphRunner):
 
         super().__init__(model_runner)
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        self.update_attr_name = None
+        self.update_attr_type = None
+        self.model_runner = model_runner
+        self._init_arch_map()
+
+    def _init_arch_map(self):
+        self.attr_name: Dict[str, str] = {
+            AttentionArch.MLA: "actual_seq_lengths_kv",
+            AttentionArch.MHA: "context_lens",
+        }
+        self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
+            AttentionArch.MLA: [],
+            AttentionArch.MHA: torch.Tensor(),
+        }
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
@@ -146,6 +161,16 @@ class NPUGraphRunner(CudaGraphRunner):
                 out = run_once_fn()
         return out
 
+    def _get_update_attr_name(self, model_runner):
+        if self.bs < get_attention_tp_size():
+            return self.attr_name[AttentionArch.MLA]
+        return self.attr_name[model_runner.model_config.attention_arch]
+
+    def _get_update_attr_type(self, model_runner):
+        if self.bs < get_attention_tp_size():
+            return self.attr_type[AttentionArch.MLA]
+        return self.attr_type[model_runner.model_config.attention_arch]
+
     def _update_inputs(self, seq_lens):
         if self.enable_torch_compile and (
             not self.compile_bs or self.bs in self.compile_bs
@@ -159,8 +184,11 @@ class NPUGraphRunner(CudaGraphRunner):
                     cpu_update_input=[{"context_lens": seq_lens}]
                 )
         else:
+            if isinstance(self.update_attr_type, torch.Tensor):
+                seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+
             self.graphs[self.bs].update(
-                cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
+                cpu_update_input=[{self.update_attr_name: seq_lens}]
             )
 
     def _cache_loc_dtype(self):
@@ -207,6 +235,8 @@ class NPUGraphRunner(CudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
+        self.update_attr_name = self._get_update_attr_name(self.model_runner)
+        self.update_attr_type = self._get_update_attr_type(self.model_runner)
         # Replay
         if self.enable_torch_compile and (
             not self.compile_bs or self.bs in self.compile_bs
