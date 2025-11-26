@@ -404,7 +404,7 @@ class Qwen2_5_VLTextModel(nn.Module):
                 past_seen_tokens,
                 past_seen_tokens + inputs_embeds.shape[1],
                 device=inputs_embeds.device,
-                )
+            )
 
         # the hard coded `3` is for temporal, height and width.
         if position_ids is None:

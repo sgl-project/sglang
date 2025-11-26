@@ -211,12 +211,13 @@ class PipelineConfig:
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
-        scaling_factor = vae_arch_config.scaling_factor or getattr(
-            vae, "scaling_factor", None
-        )
-        shift_factor = vae_arch_config.shift_factor or getattr(
-            vae, "shift_factor", None
-        )
+        scaling_factor = vae_arch_config.scaling_factor
+        if scaling_factor is None:
+            scaling_factor = getattr(vae, "scaling_factor", None)
+
+        shift_factor = vae_arch_config.shift_factor
+        if shift_factor is None:
+            shift_factor = getattr(vae, "shift_factor", None)
         return scaling_factor, shift_factor
 
     # called after latents are prepared
