@@ -28,7 +28,6 @@ from sglang.srt.utils import (
     next_power_of_2,
     set_weight_attrs,
     use_intel_amx_backend,
-    xpu_has_xmx_support,
 )
 
 if TYPE_CHECKING:
