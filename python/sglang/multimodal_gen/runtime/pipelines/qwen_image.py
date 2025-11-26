@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
+from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -58,7 +59,7 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     return "mu", mu
 
 
-class QwenImagePipeline(ComposedPipelineBase):
+class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImagePipeline"
 
     _required_config_modules = [
@@ -119,7 +120,7 @@ class QwenImagePipeline(ComposedPipelineBase):
         )
 
 
-class QwenImageEditPipeline(ComposedPipelineBase):
+class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImageEditPipeline"
 
     _required_config_modules = [
