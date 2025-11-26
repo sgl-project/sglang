@@ -9,9 +9,10 @@ from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
     CLIPTextConfig,
-    T5Config,
+    T5Config, TextEncoderConfig,
 )
-from sglang.multimodal_gen.configs.models.encoders.mistral import Mistral3Config
+from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
+from sglang.multimodal_gen.configs.models.encoders.mistral import Mistral3Config, _is_transformer_layer, _is_embeddings
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
@@ -332,6 +333,60 @@ def flux_2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.T
 
 
 @dataclass
+class Flux2MistralTextArchConfig(TextEncoderArchConfig):
+    stacked_params_mapping: list[tuple[str, str, str]] = field(
+        default_factory=lambda: [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+    )
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [_is_transformer_layer, _is_embeddings]
+    )
+
+    def __post_init__(self):
+        self.tokenizer_kwargs = {
+            "padding": "max_length",
+            "truncation": True,
+            "max_length": 512,
+            "add_special_tokens": True,
+            "return_attention_mask": True,
+            "return_tensors": "pt",
+        }
+
+
+@dataclass
+class Flux2MistralTextConfig(TextEncoderConfig):
+    arch_config: TextEncoderArchConfig = field(default_factory=Flux2MistralTextArchConfig)
+
+
+def format_text_input(prompts: List[str], system_message: str = None):
+    # Remove [IMG] tokens from prompts to avoid Pixtral validation issues
+    # when truncation is enabled. The processor counts [IMG] tokens and fails
+    # if the count changes after truncation.
+    cleaned_txt = [prompt.replace("[IMG]", "") for prompt in prompts]
+
+    return [
+        [
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": system_message}],
+            },
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        ]
+        for prompt in cleaned_txt
+    ]
+
+
+def flux_2_preprocess_text(prompt: str):
+    print(f"{prompt=}")
+    system_message = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object attribution and actions without speculation."
+    return format_text_input([prompt], system_message=system_message)
+
+
+@dataclass
 class Flux2PipelineConfig(FluxPipelineConfig):
     embedded_cfg_scale: float = 4.0 / 1000.0
 
@@ -342,14 +397,35 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     )
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
+    text_encoder_configs: tuple[EncoderConfig, ...] = field(
+        default_factory=lambda: (Flux2MistralTextConfig(),)
+    )
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (preprocess_text,),
+        default_factory=lambda: (flux_2_preprocess_text,),
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (flux_2_postprocess_text,)
     )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
+
+    def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
+        print(f"{prompts=}")
+        # flatten to 1-d list
+        prompts = [p for prompt in prompts for p in prompt]
+        inputs = tokenizer.apply_chat_template(
+            prompts,
+            add_generation_prompt=False,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            # 2048 from official github repo, 512 from diffusers
+            # max_length=512,
+            max_length=2048,
+        )
+        return inputs
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = 2 * (
@@ -462,3 +538,8 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         latents = _unpack_latents_with_ids(latents, latent_ids)
 
         return latents
+
+    def slice_noise_pred(self, noise, latents):
+        # remove noise over input image
+        noise = noise[:, : latents.size(1):]
+        return noise

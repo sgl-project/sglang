@@ -240,9 +240,10 @@ class TextEncodingStage(PipelineStage):
                 else {}
             )
 
-            processed_texts: list[str] = []
+            processed_text_list: list[str] = []
             for prompt_str in texts:
-                processed_texts.append(preprocess_func(prompt_str))
+                preprocessed = preprocess_func(prompt_str)
+                processed_text_list.append(preprocessed)
 
             # Prepare tokenizer args
             tok_kwargs = self.prepare_tokenizer_kwargs(
@@ -250,7 +251,9 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
-            text_inputs = tokenizer(processed_texts, **tok_kwargs).to(target_device)
+            text_inputs: dict = server_args.pipeline_config.tokenize_prompt(processed_text_list, tokenizer,
+                                                                            tok_kwargs).to(target_device)
+
             input_ids = text_inputs["input_ids"]
             is_flux_v1 = isinstance(
                 server_args.pipeline_config, FluxPipelineConfig
@@ -323,7 +326,7 @@ class TextEncodingStage(PipelineStage):
             "negative_prompt_embeds",
             batch.negative_prompt_embeds,
             lambda x: not batch.do_classifier_free_guidance
-            or V.list_of_tensors_with_min_dims(x, 2),
+                      or V.list_of_tensors_with_min_dims(x, 2),
         )
         if batch.debug:
             logger.debug(f"{batch.prompt_embeds=}")

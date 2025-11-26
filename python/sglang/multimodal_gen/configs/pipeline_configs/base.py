@@ -149,6 +149,7 @@ class PipelineConfig:
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (preprocess_text,)
     )
+
     # get prompt_embeds from encoder output
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (postprocess_text,))
@@ -184,6 +185,10 @@ class PipelineConfig:
 
     def adjust_num_frames(self, num_frames):
         return num_frames
+
+    # tokenize the prompt
+    def tokenize_prompt(self, prompt:list[str], tokenizer, tok_kwargs) -> dict:
+        return tokenizer(prompt, **tok_kwargs)
 
     # called in ImageEncodingStage, preprocess the image
     def preprocess_image(self, image, image_processor: VaeImageProcessor):
