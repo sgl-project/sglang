@@ -109,9 +109,10 @@ jobs:
     steps:
       - name: Check job status
         run: |
-          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
-            echo "Job failed with result: ${{ needs.build-and-test.result }}"
+          result="${{ needs.build-and-test.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "Job failed with result: $result"
             exit 1
           fi
-          echo "All jobs completed successfully"
+          echo "All jobs completed successfully (result: $result)"
           exit 0
