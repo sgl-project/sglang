@@ -1604,15 +1604,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
-
+        assert_dim = 2 if layer.moe_runner_config.is_gated else 1
         # Validate weight scales
         for name, weight_scale in [
             ("w13", layer.w13_weight_scale),
             ("w2", layer.w2_weight_scale),
         ]:
             assert (
-                weight_scale.shape[1] % 16 == 0
-            ), f"Expected {name}_weight_scale.dim(2) to be divisible by 16"
+                weight_scale.shape[assert_dim] % 16 == 0
+            ), f"Expected {name}_weight_scale.dim({assert_dim}) to be divisible by 16"
             assert (
                 weight_scale.dtype == torch.float8_e4m3fn
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
