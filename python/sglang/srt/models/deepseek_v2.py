@@ -1014,9 +1014,10 @@ class DeepseekV2MoE(nn.Module):
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         if sbo_overlap_dispatch_flag:
+            shared_output = None
 
             def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
-                global shared_output
+                nonlocal shared_output
                 shared_output = self._forward_shared_experts(hidden_states)
                 for handle in deepep_dispatch_hook_handle:
                     handle.remove()
