@@ -414,7 +414,6 @@ class ServerArgs:
     moe_dense_tp_size: Optional[int] = None
     elastic_ep_backend: Literal[None, "mooncake"] = None
     mooncake_ib_device: Optional[str] = None
-    ep_dispatch_fake_num_node: int = 1
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -2889,12 +2888,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
             help="The algorithm to choose ranks for redundant experts in expert parallel.",
-        )
-        parser.add_argument(
-            "--ep-dispatch-fake-num-node",
-            type=int,
-            default=ServerArgs.ep_dispatch_fake_num_node,
-            help="Allocate this number of dispatch nodes in fake mode. Useful when --ep-dispatch-algorithm=fake is set.",
         )
         parser.add_argument(
             "--init-expert-location",
