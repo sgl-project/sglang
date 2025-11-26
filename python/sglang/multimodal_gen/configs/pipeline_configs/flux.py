@@ -14,14 +14,16 @@ from sglang.multimodal_gen.configs.models.encoders import (
 )
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ImagePipelineConfig,
     ModelTaskType,
-    PipelineConfig,
     preprocess_text,
+    shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
     clip_preprocess_text,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -29,8 +31,9 @@ def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tenso
 
 
 @dataclass
-class FluxPipelineConfig(PipelineConfig):
-    # FIXME: duplicate with SamplingParams.guidance_scale?
+class FluxPipelineConfig(ImagePipelineConfig):
+    """Configuration for the FLUX pipeline."""
+
     embedded_cfg_scale: float = 3.5
 
     task_type: ModelTaskType = ModelTaskType.T2I
@@ -82,21 +85,14 @@ class FluxPipelineConfig(PipelineConfig):
         shape = (batch_size, num_channels_latents, height, width)
         return shape
 
-    def pack_latents(self, latents, batch_size, batch):
+    def maybe_pack_latents(self, latents, batch_size, batch):
         height = 2 * (
             batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)
         )
         width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
-        latents = latents.view(
-            batch_size, num_channels_latents, height // 2, 2, width // 2, 2
-        )
-        latents = latents.permute(0, 2, 4, 1, 3, 5)
-        latents = latents.reshape(
-            batch_size, (height // 2) * (width // 2), num_channels_latents * 4
-        )
-        return latents
+        return _pack_latents(latents, batch_size, num_channels_latents, height, width)
 
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds[1]
@@ -133,23 +129,27 @@ class FluxPipelineConfig(PipelineConfig):
             original_width=width,
             device=device,
         )
-        ids = torch.cat([txt_ids, img_ids], dim=0).to(device=device)
+
         # NOTE(mick): prepare it here, to avoid unnecessary computations
-        freqs_cis = rotary_emb.forward(ids)
-        return freqs_cis
+        img_cos, img_sin = rotary_emb.forward(img_ids)
+        img_cos = shard_rotary_emb_for_sp(img_cos)
+        img_sin = shard_rotary_emb_for_sp(img_sin)
+
+        txt_cos, txt_sin = rotary_emb.forward(txt_ids)
+
+        cos = torch.cat([txt_cos, img_cos], dim=0).to(device=device)
+        sin = torch.cat([txt_sin, img_sin], dim=0).to(device=device)
+        return cos, sin
 
     def post_denoising_loop(self, latents, batch):
         # unpack latents for flux
-        # VAE applies 8x compression on images but we must also account for packing which requires
-        # latent height and width to be divisible by 2.
-        batch_size = latents.shape[0]
-        channels = latents.shape[-1]
-        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
-        height = 2 * (int(batch.height) // (vae_scale_factor * 2))
-        width = 2 * (int(batch.width) // (vae_scale_factor * 2))
-
-        latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
-        latents = latents.permute(0, 3, 1, 4, 2, 5)
+        (
+            latents,
+            batch_size,
+            channels,
+            height,
+            width,
+        ) = self._unpad_and_unpack_latents(latents, batch)
         latents = latents.reshape(batch_size, channels // (2 * 2), height, width)
         return latents
 

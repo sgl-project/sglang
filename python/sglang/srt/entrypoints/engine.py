@@ -533,8 +533,7 @@ class Engine(EngineBase):
             zmq_handles=zmq_handles,
             flush_cache=flush_cache,
         )
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(
+        return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_ipc(obj, None)
         )
 
@@ -727,7 +726,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if server_args.attention_backend == "flashinfer":
         assert_pkg_version(
             "flashinfer_python",
-            "0.5.2",
+            "0.5.3",
             "Please uninstall the old version and "
             "reinstall the latest version by following the instructions "
             "at https://docs.flashinfer.ai/installation.html.",
@@ -735,7 +734,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.17.post2",
+            "0.3.18.post1",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

@@ -31,17 +31,21 @@ class SchedulerProfilerMixin:
         self.torch_profiler_output_dir: Optional[Path] = None
         self.profiler_activities: Optional[List[str]] = None
         self.profile_id: Optional[str] = None
+
         self.profiler_start_forward_ct: Optional[int] = None
         self.profiler_target_forward_ct: Optional[int] = None
-        self.profiler_target_prefill_ct: Optional[int] = None
-        self.profiler_target_decode_ct: Optional[int] = None
+
         self.profiler_prefill_ct: Optional[int] = None
         self.profiler_decode_ct: Optional[int] = None
+        self.profiler_target_prefill_ct: Optional[int] = None
+        self.profiler_target_decode_ct: Optional[int] = None
+
         self.profile_by_stage: bool = False
-        self.profile_steps: Optional[int] = None
         self.profile_in_progress: bool = False
-        self.rpd_profiler = None
         self.merge_profiles = False
+
+        # For ROCM
+        self.rpd_profiler = None
 
     def init_profile(
         self,
@@ -81,12 +85,11 @@ class SchedulerProfilerMixin:
             self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
 
         if num_steps:
-            self.profile_steps = num_steps
             if self.profile_by_stage:
-                self.profiler_target_prefill_ct = num_steps
-                self.profiler_target_decode_ct = num_steps
                 self.profiler_prefill_ct = 0
                 self.profiler_decode_ct = 0
+                self.profiler_target_prefill_ct = num_steps
+                self.profiler_target_decode_ct = num_steps
             elif start_step:
                 self.profiler_target_forward_ct = (
                     self.profiler_start_forward_ct + num_steps
@@ -119,7 +122,7 @@ class SchedulerProfilerMixin:
             activity_map[a] for a in activities if a in activity_map
         ]
 
-        if "RPD" in activities:
+        if "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl
 
             rpdTracerControl.skipCreate()
@@ -217,6 +220,11 @@ class SchedulerProfilerMixin:
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
 
+        if self.profile_prefix:
+            stage_prefix = self.profile_prefix + "-"
+        else:
+            stage_prefix = ""
+
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
@@ -233,7 +241,12 @@ class SchedulerProfilerMixin:
                 if getattr(self, "moe_ep_size", 1) > 1:
                     filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
 
-                filename = "-".join(filename_parts) + stage_suffix + ".trace.json.gz"
+                filename = (
+                    stage_prefix
+                    + "-".join(filename_parts)
+                    + stage_suffix
+                    + ".trace.json.gz"
+                )
 
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)

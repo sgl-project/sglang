@@ -104,7 +104,7 @@ class ImageEncodingStage(PipelineStage):
 
         image = batch.pil_image
 
-        # preprocess the imag_processor
+        # preprocess via vae_image_processor
         prompt_image = server_args.pipeline_config.preprocess_image(
             image, self.vae_image_processor
         )

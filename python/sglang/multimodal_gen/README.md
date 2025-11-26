@@ -65,7 +65,7 @@ For more usage examples (e.g. OpenAI compatible API, server mode), check [cli.md
 
 ## Contributing
 
-All contributions are welcome.
+All contributions are welcome. The contribution guide is available [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/multimodal_gen/docs/contributing.md).
 
 ## Acknowledgement
 

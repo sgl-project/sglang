@@ -39,6 +39,7 @@ jobs:
               - "test/**"
               - "sgl-kernel/**"
               - ".github/workflows/pr-test-xpu.yml"
+              - "docker/xpu.Dockerfile"
 
   build-and-test:
     needs: [check-changes]
