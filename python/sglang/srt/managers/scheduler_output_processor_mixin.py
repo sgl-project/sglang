@@ -5,10 +5,12 @@ import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -34,6 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_FORCE_STREAM_INTERVAL = 50
+SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 class SchedulerOutputProcessorMixin:
@@ -310,6 +313,137 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+    def _add_eagle_v2_logprobs(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        """Attach output logprobs for EAGLE v2 speculative decoding."""
+
+        if not batch.return_logprob:
+            return
+
+        logits_output = result.logits_output
+        next_token_logits = (
+            None if logits_output is None else logits_output.next_token_logits
+        )
+        if next_token_logits is None or result.next_token_ids is None:
+            return
+
+        accept_lens = result.accept_lens
+        if accept_lens is None:
+            return
+
+        bs = batch.batch_size()
+        if bs == 0:
+            return
+
+        num_draft_tokens = self.draft_worker.speculative_num_draft_tokens
+        device = next_token_logits.device
+
+        # Prepare temperatures using repeat_interleave instead of list expansion
+        temperatures = (
+            torch.tensor(
+                [req.sampling_params.temperature for req in batch.reqs],
+                device=device,
+                dtype=torch.float32,
+            )
+            .repeat_interleave(num_draft_tokens)
+            .unsqueeze(-1)
+        )
+
+        if SGLANG_RETURN_ORIGINAL_LOGPROB:
+            logprobs = F.log_softmax(next_token_logits, dim=-1)
+        else:
+            logprobs = F.log_softmax(next_token_logits / temperatures, dim=-1)
+
+        # Ensure next_token_ids is on the correct device for gathering
+        if result.next_token_ids.device != device:
+            next_token_ids = result.next_token_ids.to(device)
+        else:
+            next_token_ids = result.next_token_ids
+
+        output_token_logprobs_val = logprobs[
+            torch.arange(len(logprobs), device=device),
+            next_token_ids,
+        ].tolist()
+        output_token_logprobs_idx = next_token_ids.tolist()
+
+        top_logprobs_nums = batch.top_logprobs_nums or [0] * bs
+        token_ids_logprobs = batch.token_ids_logprobs or [None] * bs
+
+        # Use repeat_interleave for better performance
+        top_logprobs_nums_repeat_interleaved = []
+        if any(x > 0 for x in top_logprobs_nums):
+            # Convert to tensor for repeat_interleave if needed, but here list is small enough or use loop
+            # For simplicity and speed on CPU lists:
+            for num in top_logprobs_nums:
+                top_logprobs_nums_repeat_interleaved.extend([num] * num_draft_tokens)
+
+        token_ids_logprobs_repeat_interleaved = []
+        if any(x is not None for x in token_ids_logprobs):
+            for token_ids in token_ids_logprobs:
+                token_ids_logprobs_repeat_interleaved.extend(
+                    [token_ids] * num_draft_tokens
+                )
+
+        # Extract logprobs
+        next_token_top_logprobs_val = next_token_top_logprobs_idx = None
+        if top_logprobs_nums_repeat_interleaved:
+            (
+                next_token_top_logprobs_val,
+                next_token_top_logprobs_idx,
+            ) = get_top_logprobs(
+                logprobs,
+                top_logprobs_nums_repeat_interleaved,
+            )
+
+        next_token_token_ids_logprobs_val = next_token_token_ids_logprobs_idx = None
+        if token_ids_logprobs_repeat_interleaved:
+            (
+                next_token_token_ids_logprobs_val,
+                next_token_token_ids_logprobs_idx,
+            ) = get_token_ids_logprobs(
+                logprobs,
+                token_ids_logprobs_repeat_interleaved,
+            )
+
+        accept_lens_cpu = accept_lens.tolist()
+
+        for i, req in enumerate(batch.reqs):
+            if not req.return_logprob:
+                continue
+
+            num_tokens = int(accept_lens_cpu[i])
+            if num_tokens <= 0:
+                continue
+
+            start = i * num_draft_tokens
+            end = start + num_tokens
+
+            req.output_token_logprobs_val.extend(output_token_logprobs_val[start:end])
+            req.output_token_logprobs_idx.extend(output_token_logprobs_idx[start:end])
+
+            # top_logprobs
+            if req.top_logprobs_num > 0 and next_token_top_logprobs_val is not None:
+                req.output_top_logprobs_val.extend(
+                    next_token_top_logprobs_val[start:end]
+                )
+                req.output_top_logprobs_idx.extend(
+                    next_token_top_logprobs_idx[start:end]
+                )
+
+            # token_ids_logprob
+            if (
+                req.token_ids_logprob is not None
+                and next_token_token_ids_logprobs_val is not None
+            ):
+                req.output_token_ids_logprobs_val.extend(
+                    next_token_token_ids_logprobs_val[start:end]
+                )
+                req.output_token_ids_logprobs_idx.extend(
+                    next_token_token_ids_logprobs_idx[start:end]
+                )
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -330,6 +464,9 @@ class SchedulerOutputProcessorMixin:
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_v2_eagle:
+            if batch.return_logprob:
+                self._add_eagle_v2_logprobs(batch, result)
+
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
 
         self.num_generated_tokens += len(batch.reqs)
@@ -894,47 +1031,53 @@ class SchedulerOutputProcessorMixin:
                         input_token_ids_logprobs_val.append([])
                         input_token_ids_logprobs_idx.append([])
 
-                    if req.return_logprob:
-                        output_token_logprobs_val.append(
-                            req.output_token_logprobs_val[
-                                send_output_token_logprobs_offset:
-                            ]
-                        )
-                        output_token_logprobs_idx.append(
-                            req.output_token_logprobs_idx[
-                                send_output_token_logprobs_offset:
-                            ]
-                        )
-                        output_top_logprobs_val.append(
-                            req.output_top_logprobs_val[
-                                send_output_token_logprobs_offset:
-                            ]
-                        )
-                        output_top_logprobs_idx.append(
-                            req.output_top_logprobs_idx[
-                                send_output_token_logprobs_offset:
-                            ]
-                        )
-                        output_token_ids_logprobs_val.append(
-                            req.output_token_ids_logprobs_val[
-                                send_output_token_logprobs_offset:
-                            ]
-                        )
-                        output_token_ids_logprobs_idx.append(
-                            req.output_token_ids_logprobs_idx[
-                                send_output_token_logprobs_offset:
-                            ]
-                        )
-                        req.send_output_token_logprobs_offset = len(
-                            req.output_token_logprobs_val
-                        )
-                    else:
-                        output_token_logprobs_val.append([])
-                        output_token_logprobs_idx.append([])
-                        output_top_logprobs_val.append([])
-                        output_top_logprobs_idx.append([])
-                        output_token_ids_logprobs_val.append([])
-                        output_token_ids_logprobs_idx.append([])
+                if req.return_logprob:
+                    # Only send logprobs corresponding to the newly sent output ids
+                    num_new_tokens = len(output_ids[-1])
+                    output_token_logprobs_val.append(
+                        req.output_token_logprobs_val[
+                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
+                            + num_new_tokens
+                        ]
+                    )
+                    output_token_logprobs_idx.append(
+                        req.output_token_logprobs_idx[
+                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
+                            + num_new_tokens
+                        ]
+                    )
+                    output_top_logprobs_val.append(
+                        req.output_top_logprobs_val[
+                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
+                            + num_new_tokens
+                        ]
+                    )
+                    output_top_logprobs_idx.append(
+                        req.output_top_logprobs_idx[
+                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
+                            + num_new_tokens
+                        ]
+                    )
+                    output_token_ids_logprobs_val.append(
+                        req.output_token_ids_logprobs_val[
+                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
+                            + num_new_tokens
+                        ]
+                    )
+                    output_token_ids_logprobs_idx.append(
+                        req.output_token_ids_logprobs_idx[
+                            send_output_token_logprobs_offset : send_output_token_logprobs_offset
+                            + num_new_tokens
+                        ]
+                    )
+                    req.send_output_token_logprobs_offset += num_new_tokens
+                else:
+                    output_token_logprobs_val.append([])
+                    output_token_logprobs_idx.append([])
+                    output_top_logprobs_val.append([])
+                    output_top_logprobs_idx.append([])
+                    output_token_ids_logprobs_val.append([])
+                    output_token_ids_logprobs_idx.append([])
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
