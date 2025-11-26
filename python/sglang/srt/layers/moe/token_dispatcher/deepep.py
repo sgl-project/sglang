@@ -682,8 +682,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                     src_signal_expect_value=meta_overlap_args["threshold"],
                 )
             else:
-                if meta_overlap_args is not None:
-                    print("keys in meta_overlap_args are:", meta_overlap_args.keys())
                 overlap_args_dict = dict(
                     overlap=True,
                     packed_recv_count=self.packed_recv_count,
