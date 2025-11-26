@@ -29,6 +29,7 @@ jobs:
             main_package:
               - "python/**"
               - "python/sglang/multimodal_gen/**"
+              - "!python/sglang/multimodal_gen/**"
               - "scripts/ci/**"
               - "test/**"
               - "sgl-kernel/**"
