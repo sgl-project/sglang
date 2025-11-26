@@ -348,6 +348,15 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
 
+    def prepare_latent_shape(self, batch, batch_size, num_frames):
+        height = 2 * (
+            batch.height // (self.vae_config.arch_config.vae_scale_factor * 2)
+        )
+        width = 2 * (batch.width // (self.vae_config.arch_config.vae_scale_factor * 2))
+        num_channels_latents = self.dit_config.arch_config.in_channels
+        shape = (batch_size, num_channels_latents, height // 2, width // 2)
+        return shape
+
     def maybe_resize_condition_image(self, width, height, image):
         target_area: int = 1024 * 1024
 
