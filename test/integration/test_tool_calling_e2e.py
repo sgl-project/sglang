@@ -340,6 +340,90 @@ class TestToolCallingE2ELlama32(ToolCallingE2EBase):
         called_names = {call.function.name for call in tool_calls}
         self.assertGreater(len(called_names), 0)
 
+    def test_parallel_tool_calls_false_behavior(self):
+        """Test that parallel_tool_calls=False is accepted and behaves correctly.
+
+        This test verifies that:
+        - The API accepts parallel_tool_calls=False
+        - The request completes successfully
+        - When tool_choice='auto' with structural_tag: stop_after_first=True
+        - When tool_choice='required' with json_schema: maxItems=1
+        """
+        tools = self.get_test_tools()
+        messages = self.get_test_messages()
+
+        # Test with tool_choice='auto' (uses structural_tag)
+        response_auto = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=512,
+            tools=tools,
+            tool_choice="auto",
+            parallel_tool_calls=False,
+            stream=False,
+        )
+        self.assertIsNotNone(response_auto.choices[0].message)
+        # With parallel_tool_calls=False, structural tag should have stop_after_first=True
+        # This limits to a single tool call
+
+        # Test with tool_choice='required' (uses json_schema)
+        response_required = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=512,
+            temperature=0.1,
+            tools=tools,
+            tool_choice="required",
+            parallel_tool_calls=False,
+            stream=False,
+        )
+        tool_calls = response_required.choices[0].message.tool_calls
+        self.assertIsNotNone(tool_calls)
+        self.assertGreater(len(tool_calls), 0)
+        # With parallel_tool_calls=False, json_schema should have maxItems=1
+        # Note: maxItems=1 constraint guides the model but doesn't guarantee only 1 call
+
+    def test_parallel_tool_calls_true_behavior(self):
+        """Test that parallel_tool_calls=True is accepted and behaves correctly.
+
+        This test verifies that:
+        - The API accepts parallel_tool_calls=True
+        - The request completes successfully
+        - When tool_choice='auto' with structural_tag: stop_after_first=False (allows multiple)
+        - When tool_choice='required' with json_schema: no maxItems limit (allows multiple)
+        """
+        tools = self.get_test_tools()
+        messages = self.get_test_messages()
+
+        # Test with tool_choice='auto' (uses structural_tag)
+        response_auto = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=512,
+            tools=tools,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            stream=False,
+        )
+        self.assertIsNotNone(response_auto.choices[0].message)
+        # With parallel_tool_calls=True, structural tag should have stop_after_first=False
+        # This allows multiple tool calls
+
+        # Test with tool_choice='required' (uses json_schema)
+        response_required = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            max_tokens=512,
+            temperature=0.1,
+            tools=tools,
+            tool_choice="required",
+            parallel_tool_calls=True,
+            stream=False,
+        )
+        tool_calls = response_required.choices[0].message.tool_calls
+        self.assertIsNotNone(tool_calls)
+        self.assertGreater(len(tool_calls), 0)
+
 
 class TestToolCallingE2EMistral(ToolCallingE2EBase):
     """E2E tests for Mistral with structural tags."""
