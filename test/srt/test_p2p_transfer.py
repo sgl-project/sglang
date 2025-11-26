@@ -441,8 +441,18 @@ class TrainingWeightSender:
         task_id = message.get("task_id", "")
 
         try:
-            weight_name = list(self.weight_buffers.keys())[0]
-            weight_info = self.weight_buffers[weight_name]
+            # Find the weight with matching length
+            weight_info = None
+            weight_name = None
+            for name, info in self.weight_buffers.items():
+                if info['length'] == rollout_length:
+                    weight_info = info
+                    weight_name = name
+                    break
+
+            if weight_info is None:
+                raise RuntimeError(f"No weight found with length {rollout_length}. Available lengths: {[info['length'] for info in self.weight_buffers.values()]}")
+
             src_ptr = weight_info['ptr']
             src_length = weight_info['length']
 
@@ -459,7 +469,7 @@ class TrainingWeightSender:
             if status != 0:
                 raise RuntimeError(f"RDMA transfer failed with status {status}")
 
-            logger.info(f"[TrainingSender] RDMA completed: task={task_id}, size={src_length/1e6:.2f}MB")
+            logger.info(f"[TrainingSender] RDMA completed: task={task_id}, weight={weight_name}, size={src_length/1e6:.2f}MB")
 
             response_data = zmq.utils.jsonapi.dumps({
                 "type": "transfer_complete",
