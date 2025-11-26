@@ -403,20 +403,14 @@ class SchedulerMetricsMixin:
             num_tokens = self._get_token_info()[0]
 
         # Tokens in waiting queue, bootstrap queue, prealloc queue
-        num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
-        num_waiting_reqs = len(self.waiting_queue)
+        waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            num_tokens += sum(
-                len(req.origin_input_ids)
-                for req in self.disagg_prefill_bootstrap_queue.queue
-            )
-            num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
+            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            num_tokens += sum(
-                len(req.req.origin_input_ids)
-                for req in self.disagg_decode_prealloc_queue.queue
-            )
-            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
+            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
+
+        num_tokens = sum(req.seqlen for queue in waiting_queues for req in queue)
+        num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
 
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
