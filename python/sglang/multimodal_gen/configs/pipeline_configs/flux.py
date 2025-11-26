@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
+import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
@@ -466,8 +467,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             scale = math.sqrt(target_area / (width * height))
             width = int(width * scale)
             height = int(height * scale)
+            image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+            width, height = image.size
 
-        return width, height
+        return image, width, height
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
 

@@ -259,6 +259,7 @@ class DiffGenerator:
         pretrained_sampling_params = SamplingParams.from_pretrained(
             self.server_args.model_path, **kwargs
         )
+        print(f"262 {pretrained_sampling_params.height_not_provided=}")
         pretrained_sampling_params._merge_with_user_params(sampling_params)
         # TODO: simplify
         data_type = (
@@ -270,6 +271,7 @@ class DiffGenerator:
         pretrained_sampling_params.data_type = data_type
         pretrained_sampling_params._set_output_file_name()
         pretrained_sampling_params.adjust(self.server_args)
+        print(f"274 {pretrained_sampling_params.height_not_provided=}")
 
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):

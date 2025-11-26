@@ -181,7 +181,7 @@ class PipelineConfig:
         """
         image: input image
         """
-        return width, height
+        return image, width, height
 
     def adjust_num_frames(self, num_frames):
         return num_frames

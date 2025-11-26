@@ -103,6 +103,7 @@ def generate_cmd(args: argparse.Namespace):
 
     sampling_params = SamplingParams.from_cli_args(args)
     sampling_params.request_id = generate_request_id()
+    print(f"106 {sampling_params.height_not_provided=}")
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args
     )
