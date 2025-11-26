@@ -329,6 +329,16 @@ class Scheduler(
             dp_rank=dp_rank,
         )
 
+        mhmtp_draft_worker_kwargs = dict(
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            server_args=server_args,
+            nccl_port=port_args.nccl_port,
+            target_worker=self.tp_worker,
+            dp_rank=dp_rank,
+            is_mtp=True,
+        )
+
         if server_args.speculative_draft_load_format is not None:
             server_args.load_format = server_args.speculative_draft_load_format
             logger.info(
@@ -339,9 +349,13 @@ class Scheduler(
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.is_eagle():
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
-        self.draft_worker = self.spec_algorithm.create_draft_worker(
-            **draft_worker_kwargs
-        )
+            self.draft_worker = self.spec_algorithm.create_draft_worker(
+                **draft_worker_kwargs
+            )
+        elif self.spec_algorithm.is_mhmtp():
+            self.draft_worker = self.spec_algorithm.create_draft_worker(
+                **mhmtp_draft_worker_kwargs
+            )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():
@@ -1994,6 +2008,12 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+            elif self.spec_algorithm.is_mhmtp():
+                batch_result = self.draft_worker.forward_batch_speculative_generation(
+                    batch
+                )
+                future_indices_or_next_token_ids = batch_result.next_token_ids
+                self.update_cache_from_scheduler(batch, batch_result)
             else:
                 batch_result = self.model_worker.forward_batch_generation(
                     batch_or_worker_batch
@@ -2010,7 +2030,11 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or self.spec_algorithm.is_eagle():
+            if (
+                batch.return_logprob
+                or self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_mhmtp()
+            ):
                 extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
             else:
                 extend_input_len_per_req = None

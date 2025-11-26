@@ -1421,11 +1421,18 @@ class FlashInferMultiStepDraftBackend:
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
         self.attn_backends: List[FlashInferAttnBackend] = []
-        for i in range(self.speculative_num_steps - 1):
+
+        skip_prefill: bool = True
+        speculative_num_steps = self.speculative_num_steps - 1
+        if model_runner.spec_algorithm.is_mhmtp():
+            speculative_num_steps = self.speculative_num_steps
+            skip_prefill = False
+
+        for i in range(speculative_num_steps):
             self.attn_backends.append(
                 FlashInferAttnBackend(
                     model_runner,
-                    skip_prefill=True,
+                    skip_prefill=skip_prefill,
                     kv_indptr_buf=self.kv_indptr[i],
                     kv_last_page_len_buf=self.kv_last_page_len,
                 )
@@ -1465,13 +1472,21 @@ class FlashInferMultiStepDraftBackend:
         )
 
         assert forward_batch.spec_info is not None
-        assert forward_batch.spec_info.is_draft_input()
+        assert (
+            forward_batch.spec_info.is_draft_input()
+            or forward_batch.spec_info.is_mhmtp_draft_input()
+            or forward_batch.spec_info.is_mhmtp_verify_input()
+        )
 
         # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
         indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
         global global_override_indptr_cpu
 
-        for i in range(self.speculative_num_steps - 1):
+        speculative_num_steps = self.speculative_num_steps - 1
+        if forward_batch.spec_info.is_mhmtp_draft_input():
+            speculative_num_steps = self.speculative_num_steps
+
+        for i in range(speculative_num_steps):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
                 : seq_lens_sum * self.topk + bs * (i + 1)

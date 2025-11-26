@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,8 @@ class LogitsMetadata:
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for padding
     padded_static_len: int = -1
+    # Speculative decoding
+    spec_info: Optional[SpecInput] = None
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
@@ -190,6 +193,7 @@ class LogitsMetadata:
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
+            spec_info=forward_batch.spec_info,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
         )
 
@@ -398,25 +402,40 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_extend()
             and not logits_metadata.extend_return_logprob
         ):
-            # Prefill without input logprobs.
-            if logits_metadata.padded_static_len < 0:
-                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            # Different for full hidden layers
+            if (
+                logits_metadata.forward_mode.is_draft_extend()
+                and logits_metadata.spec_info.is_mhmtp_draft_input()
+            ):
+                logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+                return LogitsProcessorOutput(
+                    next_token_logits=logits,
+                    hidden_states=hidden_states,
+                )
             else:
-                # If padding_static length is 5 and extended_seq_lens is [2, 3],
-                # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
-                # and this retrieves t01 and t12, which are the valid last tokens
-                idx = torch.arange(
-                    len(logits_metadata.extend_seq_lens),
-                    device=logits_metadata.extend_seq_lens.device,
-                )
-                last_index = (
-                    idx * logits_metadata.padded_static_len
-                    + logits_metadata.extend_seq_lens
-                    - 1
-                )
-            pruned_states = hidden_states[last_index]
-            if aux_hidden_states is not None:
-                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                # Prefill without input logprobs.
+                if logits_metadata.padded_static_len < 0:
+                    last_index = (
+                        torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+                    )
+                else:
+                    # If padding_static length is 5 and extended_seq_lens is [2, 3],
+                    # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
+                    # and this retrieves t01 and t12, which are the valid last tokens
+                    idx = torch.arange(
+                        len(logits_metadata.extend_seq_lens),
+                        device=logits_metadata.extend_seq_lens.device,
+                    )
+                    last_index = (
+                        idx * logits_metadata.padded_static_len
+                        + logits_metadata.extend_seq_lens
+                        - 1
+                    )
+                pruned_states = hidden_states[last_index]
+                if aux_hidden_states is not None:
+                    aux_pruned_states = [
+                        hidden[last_index] for hidden in aux_hidden_states
+                    ]
             sample_indices = None
             input_logprob_indices = None
         else:

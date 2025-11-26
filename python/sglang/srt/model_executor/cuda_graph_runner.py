@@ -276,6 +276,7 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
+            or model_runner.spec_algorithm.is_mhmtp()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -783,6 +784,26 @@ class CudaGraphRunner:
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
+
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_info is not None
+        ):
+            if bs != raw_bs:
+                pad_len = (
+                    (bs - raw_bs)
+                    * (self.model_runner.server_args.speculative_num_draft_tokens)
+                    * (self.model_runner.server_args.speculative_num_draft_tokens + 1)
+                )
+                pad_part = torch.full(
+                    (pad_len,),
+                    1,
+                    device=forward_batch.spec_info.custom_mask.device,
+                    dtype=forward_batch.spec_info.custom_mask.dtype,
+                )
+                forward_batch.spec_info.custom_mask = torch.cat(
+                    [forward_batch.spec_info.custom_mask, pad_part], dim=0
+                )
         # Attention backend
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
@@ -845,6 +866,7 @@ class CudaGraphRunner:
         if (
             self.model_runner.spec_algorithm.is_eagle()
             or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_mhmtp()
         ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
