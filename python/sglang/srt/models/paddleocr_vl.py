@@ -18,16 +18,15 @@ from collections.abc import Iterable
 from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 from einops import rearrange
+from transformers.activations import GELUActivation
+from transformers.utils import torch_int
+
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -38,8 +37,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM
 from sglang.srt.utils import add_prefix
-from transformers.activations import GELUActivation
-from transformers.utils import torch_int
+
 
 class Projector(nn.Module):
 
@@ -60,9 +58,7 @@ class Projector(nn.Module):
             * self.merge_kernel_size[1]
         )
 
-        self.pre_norm = torch.nn.LayerNorm(
-            self.vision_config.hidden_size, eps=1e-05
-        )
+        self.pre_norm = torch.nn.LayerNorm(self.vision_config.hidden_size, eps=1e-05)
         self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
         self.act = GELUActivation()
         self.linear_2 = nn.Linear(
@@ -106,6 +102,7 @@ class Projector(nn.Module):
         hidden_states = self.linear_2(hidden_states)
 
         return hidden_states.view(*dims, -1)
+
 
 class SiglipVisionEmbeddings(nn.Module):
 
@@ -174,9 +171,7 @@ class SiglipVisionEmbeddings(nn.Module):
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return patch_pos_embed
 
-    def fetch_position_embedding_lfu_cache(
-        self, embeddings, h, w, max_cache: int = 20
-    ):
+    def fetch_position_embedding_lfu_cache(self, embeddings, h, w, max_cache: int = 20):
         grid = (h, w)
         if grid in self.cache_position_embedding:
             self.cache_position_count[grid] += 1
@@ -245,9 +240,7 @@ class SiglipVisionEmbeddings(nn.Module):
                     start = end
                 embeddings = torch.concat(tmp_embeddings, dim=0).unsqueeze(0)
             else:
-                embeddings = embeddings + self.packing_position_embedding(
-                    position_ids
-                )
+                embeddings = embeddings + self.packing_position_embedding(position_ids)
             return embeddings
         else:
             raise ValueError(
@@ -266,8 +259,7 @@ class SigLIPRotaryEmbedding(nn.Module):
 
     def rope_init(self):
         inv_freq = 1.0 / (
-            self.theta
-            ** (torch.arange(0, self.dim, 2, dtype=torch.float) / self.dim)
+            self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float) / self.dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -344,9 +336,7 @@ class SiglipEncoderLayer(nn.Module):
 
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = SiglipMLP(
-            config,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix)
+            config, quant_config=quant_config, prefix=add_prefix("mlp", prefix)
         )
 
     def forward(
@@ -375,6 +365,7 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         return hidden_states
+
 
 class SiglipEncoder(nn.Module):
 
@@ -463,6 +454,7 @@ class SiglipEncoder(nn.Module):
             )
         return hidden_states
 
+
 class SiglipVisionTransformer(nn.Module):
 
     def __init__(
@@ -532,6 +524,7 @@ class SiglipVisionTransformer(nn.Module):
 
         return sample_hidden_state
 
+
 class SiglipVisionModel(nn.Module):
     config_class = "PaddleOCRVisionConfig"
     main_input_name = "pixel_values"
@@ -586,14 +579,19 @@ class SiglipVisionModel(nn.Module):
             cu_seqlens=cu_seqlens,
         )
 
+
 class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
 
     def __init__(self, *, config, quant_config=None, prefix: str = ""):
         super().__init__(config=config, prefix=prefix)
         config = self.config
 
-        self.mlp_AR = Projector(config, config.vision_config, prefix=add_prefix("mlp_AR", prefix))
-        self.visual = SiglipVisionModel(config=config.vision_config, prefix=add_prefix("visual", prefix))
+        self.mlp_AR = Projector(
+            config, config.vision_config, prefix=add_prefix("mlp_AR", prefix)
+        )
+        self.visual = SiglipVisionModel(
+            config=config.vision_config, prefix=add_prefix("visual", prefix)
+        )
         if not hasattr(self.model, "get_input_embeddings"):
             import types
 
@@ -615,8 +613,8 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
         image_grid_hws = list()
         cu_seqlens = [0]
 
-        for idx, thw in enumerate(image_grid_thw):
-            thw_tuple = tuple(thw.detach().cpu().numpy().tolist())
+        for idx, grid_thw in enumerate(image_grid_thw):
+            thw_tuple = tuple(grid_thw.detach().cpu().numpy().tolist())
             numel = np.prod(thw_tuple)
             image_grid_hws.append(thw_tuple)
             image_position_ids = torch.arange(numel) % np.prod(thw_tuple[1:])
@@ -626,9 +624,7 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
         siglip_position_ids = torch.concat(siglip_position_ids, dim=0).to(
             pixel_values.device
         )
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32).to(
-            pixel_values.device
-        )
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32).to(pixel_values.device)
         vision_outputs = self.visual(
             pixel_values=pixel_values,
             image_grid_thw=image_grid_hws,
@@ -647,9 +643,7 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
-        image_grid_thw = torch.concat(
-            [item.image_grid_thw for item in items], dim=0
-        )
+        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         image_embeds = self.encode_image(pixel_values, image_grid_thw)
 
         return image_embeds
@@ -724,8 +718,10 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
                 else:
                     raise KeyError(f"Parameter '{name}' not found in model.")
 
+
 # monkey patch
 def get_input_embeddings(self) -> nn.Embedding:
     return self.embed_tokens
+
 
 EntryClass = [PaddleOCRVLForConditionalGeneration]

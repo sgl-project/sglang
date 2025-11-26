@@ -383,7 +383,9 @@ class Conversation:
                     ret += role + ": "
                     if role == self.roles[0]:
                         if self.image_token in message:
-                            ret += message.replace(self.image_token + "\n", self.image_token)
+                            ret += message.replace(
+                                self.image_token + "\n", self.image_token
+                            )
                         else:
                             ret += message
                         ret += "\n"
