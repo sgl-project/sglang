@@ -5,12 +5,12 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import os.path
 import re
 import time
 import unicodedata
 import uuid
-from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
@@ -137,7 +137,7 @@ class SamplingParams:
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
 
-    def set_output_file_ext(self):
+    def _set_output_file_ext(self):
         # add extension if needed
         if not any(
             self.output_file_name.endswith(ext)
@@ -147,7 +147,7 @@ class SamplingParams:
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
             )
 
-    def set_output_file_name(self):
+    def _set_output_file_name(self):
         # settle output_file_name
         if (
             self.output_file_name is None
@@ -178,7 +178,7 @@ class SamplingParams:
         self.output_file_name = _sanitize_filename(self.output_file_name)
 
         # Ensure a proper extension is present
-        self.set_output_file_ext()
+        self._set_output_file_ext()
 
     def __post_init__(self) -> None:
         assert self.num_frames >= 1
@@ -194,6 +194,96 @@ class SamplingParams:
     def check_sampling_param(self):
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError("prompt_path must be a txt file")
+
+    def adjust(
+        self,
+        server_args: ServerArgs,
+    ):
+        """
+        final adjustment, called after merged with user params
+        """
+        pipeline_config = server_args.pipeline_config
+        if not isinstance(self.prompt, str):
+            raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
+
+        # Process negative prompt
+        if self.negative_prompt is not None and not self.negative_prompt.isspace():
+            # avoid stripping default negative prompt: ' ' for qwen-image
+            self.negative_prompt = self.negative_prompt.strip()
+
+        # Validate dimensions
+        if self.num_frames <= 0:
+            raise ValueError(
+                f"height, width, and num_frames must be positive integers, got "
+                f"height={self.height}, width={self.width}, "
+                f"num_frames={self.num_frames}"
+            )
+
+        if pipeline_config.task_type.is_image_gen():
+            # settle num_frames
+            logger.debug(f"Setting num_frames to 1 because this is a image-gen model")
+            self.num_frames = 1
+            self.data_type = DataType.IMAGE
+        else:
+            # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
+            # If we apply it after, adjust_num_frames might modify the frame count
+            # and break the divisibility constraint (alignment) required by num_gpus.
+            self.num_frames = server_args.pipeline_config.adjust_num_frames(
+                self.num_frames
+            )
+
+            # Adjust number of frames based on number of GPUs for video task
+            use_temporal_scaling_frames = (
+                pipeline_config.vae_config.use_temporal_scaling_frames
+            )
+            num_frames = self.num_frames
+            num_gpus = server_args.num_gpus
+            temporal_scale_factor = (
+                pipeline_config.vae_config.arch_config.temporal_compression_ratio
+            )
+
+            if use_temporal_scaling_frames:
+                orig_latent_num_frames = (num_frames - 1) // temporal_scale_factor + 1
+            else:  # stepvideo only
+                orig_latent_num_frames = self.num_frames // 17 * 3
+
+            if orig_latent_num_frames % server_args.num_gpus != 0:
+                # Adjust latent frames to be divisible by number of GPUs
+                if self.num_frames_round_down:
+                    # Ensure we have at least 1 batch per GPU
+                    new_latent_num_frames = (
+                        max(1, (orig_latent_num_frames // num_gpus)) * num_gpus
+                    )
+                else:
+                    new_latent_num_frames = (
+                        math.ceil(orig_latent_num_frames / num_gpus) * num_gpus
+                    )
+
+                if use_temporal_scaling_frames:
+                    # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
+                    new_num_frames = (
+                        new_latent_num_frames - 1
+                    ) * temporal_scale_factor + 1
+                else:  # stepvideo only
+                    # Find the least common multiple of 3 and num_gpus
+                    divisor = math.lcm(3, num_gpus)
+                    # Round up to the nearest multiple of this LCM
+                    new_latent_num_frames = (
+                        (new_latent_num_frames + divisor - 1) // divisor
+                    ) * divisor
+                    # Convert back to actual frames using the StepVideo formula
+                    new_num_frames = new_latent_num_frames // 3 * 17
+
+                logger.info(
+                    "Adjusting number of frames from %s to %s based on number of GPUs (%s)",
+                    self.num_frames,
+                    new_num_frames,
+                    server_args.num_gpus,
+                )
+                self.num_frames = new_num_frames
+
+        self._set_output_file_name()
+        self.log(server_args=server_args)
 
     def update(self, source_dict: dict[str, Any]) -> None:
         for key, value in source_dict.items():
@@ -220,10 +310,22 @@ class SamplingParams:
             sampling_params = cls(**kwargs)
         return sampling_params
 
-    def from_user_sampling_params(self, user_params):
-        sampling_params = deepcopy(self)
-        sampling_params._merge_with_user_params(user_params)
+    @staticmethod
+    def from_user_sampling_params_args(model_path: str, server_args, *args, **kwargs):
+        sampling_params = SamplingParams.from_pretrained(model_path)
+
+        user_sampling_params = SamplingParams(*args, **kwargs)
+        sampling_params._merge_with_user_params(user_sampling_params)
+
+        sampling_params.adjust(server_args)
+
         return sampling_params
+
+    def output_size_str(self) -> str:
+        return f"{self.width}x{self.height}"
+
+    def seconds(self) -> float:
+        return self.num_frames / self.fps
 
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
@@ -414,6 +516,9 @@ class SamplingParams:
         if user_params is None:
             return
 
+        # user is not allowed to modify any param defined in the SamplingParams subclass
+        subclass_defined_fields = set(type(self).__annotations__.keys())
+
         # Compare against current instance to avoid constructing a default instance
         default_params = SamplingParams()
 
@@ -430,7 +535,7 @@ class SamplingParams:
                 if field_name != "output_file_name"
                 else user_params.output_file_path is not None
             )
-            if is_user_modified:
+            if is_user_modified and field_name not in subclass_defined_fields:
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
 
