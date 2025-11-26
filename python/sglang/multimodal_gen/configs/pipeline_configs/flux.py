@@ -333,6 +333,8 @@ def flux_2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.T
 
 @dataclass
 class Flux2PipelineConfig(FluxPipelineConfig):
+    embedded_cfg_scale: float = 4.0 / 1000.0
+
     task_type: ModelTaskType = ModelTaskType.I2I
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
