@@ -33,6 +33,7 @@ from sglang.global_config import global_config
 from sglang.srt.utils import (
     get_bool_env_var,
     get_device,
+    is_npu,
     is_port_available,
     kill_process_tree,
     retry,
