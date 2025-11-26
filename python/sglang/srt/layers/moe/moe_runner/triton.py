@@ -19,7 +19,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -32,6 +32,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _use_aiter = bool(int(os.getenv("SGLANG_MOE_USE_AITER", "0")))
 _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -48,9 +49,11 @@ elif _is_hip:
             from aiter import moe_sum
         except ImportError:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+elif _is_xpu:
+    from sgl_kernel import silu_and_mul, moe_sum
 
 
-if _is_cuda or _is_hip:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import (  # noqa: F401
         moe_align_block_size as sgl_moe_align_block_size,
     )
@@ -206,7 +209,7 @@ class TritonRunnerCore(MoeRunnerCore):
                     gemm1_alpha,
                     gemm1_limit,
                 )
-            elif _is_cuda:
+            elif _is_cuda or _is_xpu:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.silu_and_mul(
@@ -310,6 +313,11 @@ class TritonRunnerCore(MoeRunnerCore):
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
                 )
+        elif _is_xpu:
+            moe_sum(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states,
+            )
         else:
             vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
