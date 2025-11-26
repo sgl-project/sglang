@@ -10,8 +10,6 @@ from unittest.mock import Mock, patch
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.function_call.json_array_parser import JsonArrayParser
-from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.utils import get_json_schema_constraint
 
 
@@ -280,7 +278,9 @@ class TestDetectorWithoutStructuralTagSupport(ParserIntegrationTestCase):
         tools = [self.get_simple_tool()]
 
         with patch.object(
-            FunctionCallParser, "ToolCallParserEnum", {"test": Mock(return_value=mock_detector)}
+            FunctionCallParser,
+            "ToolCallParserEnum",
+            {"test": Mock(return_value=mock_detector)},
         ):
             # We can't easily test this without modifying the parser,
             # but we can test with JsonArrayParser which doesn't support structural_tag
@@ -421,4 +421,3 @@ class TestConstraintTypeConsistency(ParserIntegrationTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

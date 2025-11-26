@@ -147,7 +147,6 @@ class Llama32Detector(BaseFormatDetector):
             if not name:
                 continue
 
-            # Extract from structure_info() implementation
             begin = '<|python_tag|>{"name":"' + name + '", "arguments":'
             end = "}"
             trigger = "<|python_tag|>"

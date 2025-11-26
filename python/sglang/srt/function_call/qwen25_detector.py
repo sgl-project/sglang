@@ -123,7 +123,6 @@ class Qwen25Detector(BaseFormatDetector):
             if not name:
                 continue
 
-            # Extract from structure_info() implementation
             begin = '<tool_call>\n{"name":"' + name + '", "arguments":'
             end = "}\n</tool_call>"
             trigger = "<tool_call>"
