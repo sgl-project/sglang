@@ -1,11 +1,8 @@
-import gc
-import time
 import unittest
 
 import torch
 
 import sglang as sgl
-from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
