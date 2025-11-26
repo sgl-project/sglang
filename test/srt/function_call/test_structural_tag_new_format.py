@@ -6,7 +6,7 @@ including schema inclusion, parameter handling, and format structure.
 """
 
 import unittest
-from typing import Dict, List
+from typing import Dict
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -15,8 +15,8 @@ from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
-from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 
 
 class StructuralTagFormatTestCase(unittest.TestCase):
@@ -103,7 +103,7 @@ class StructuralTagFormatTestCase(unittest.TestCase):
             self.assertIn("content", tag_item)
             self.assertIn("type", tag_item["content"])
             content_type = tag_item["content"]["type"]
-            
+
             # Handle different content types:
             # - Most detectors use "json_schema"
             # - DeepSeekV3 uses nested "tags_with_separator" (check inner tags)
@@ -379,9 +379,7 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
         tag_true = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=True
         )
-        self.assertFalse(
-            tag_false["format"]["tags"][0]["content"]["stop_after_first"]
-        )
+        self.assertFalse(tag_false["format"]["tags"][0]["content"]["stop_after_first"])
         self.assertTrue(tag_true["format"]["tags"][0]["content"]["stop_after_first"])
 
     def test_multiple_tools(self):
@@ -431,9 +429,7 @@ class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
         tag_true = self.detector.build_structural_tag(
             tools=[tool], at_least_one=True, stop_after_first=False
         )
-        self.assertFalse(
-            tag_false["format"]["tags"][0]["content"]["at_least_one"]
-        )
+        self.assertFalse(tag_false["format"]["tags"][0]["content"]["at_least_one"])
         self.assertTrue(tag_true["format"]["tags"][0]["content"]["at_least_one"])
 
     def test_stop_after_first_parameter(self):
@@ -444,9 +440,7 @@ class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
         tag_true = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=True
         )
-        self.assertFalse(
-            tag_false["format"]["tags"][0]["content"]["stop_after_first"]
-        )
+        self.assertFalse(tag_false["format"]["tags"][0]["content"]["stop_after_first"])
         self.assertTrue(tag_true["format"]["tags"][0]["content"]["stop_after_first"])
 
     def test_multiple_tools(self):
@@ -584,4 +578,3 @@ class TestKimiK2Detector(StructuralTagFormatTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
