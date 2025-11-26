@@ -3,22 +3,23 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId};
+use tracing::error;
 
 use super::HarmonyParserAdapter;
 use crate::{
-    grpc_client::proto,
+    grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
-        common::{ToolCall, Usage},
+        common::{CompletionTokensDetails, ToolCall, Usage},
         responses::{
-            ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
-            ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+            OutputTokensDetails, ResponseContentPart, ResponseOutputItem, ResponseReasoningContent,
+            ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
     },
     routers::grpc::{
+        common::{response_collection, response_formatting},
         context::{DispatchMetadata, ExecutionResult},
-        utils,
+        error,
     },
 };
 
@@ -34,28 +35,6 @@ impl HarmonyResponseProcessor {
         Self
     }
 
-    /// Collect responses from ExecutionResult (similar to regular processor)
-    async fn collect_responses(
-        execution_result: ExecutionResult,
-    ) -> Result<Vec<proto::GenerateComplete>, Response> {
-        match execution_result {
-            ExecutionResult::Single { mut stream } => {
-                let responses = utils::collect_stream_responses(&mut stream, "Single").await?;
-                stream.mark_completed();
-                Ok(responses)
-            }
-            ExecutionResult::Dual { prefill, decode } => {
-                // For Harmony we currently rely only on decode stream for outputs
-                let mut decode_stream = *decode;
-                let responses =
-                    utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
-                prefill.mark_completed();
-                decode_stream.mark_completed();
-                Ok(responses)
-            }
-        }
-    }
-
     /// Process a non-streaming Harmony chat response
     pub async fn process_non_streaming_chat_response(
         &self,
@@ -64,16 +43,18 @@ impl HarmonyResponseProcessor {
         dispatch: DispatchMetadata,
     ) -> Result<ChatCompletionResponse, Response> {
         // Collect all completed responses (one per choice)
-        let all_responses = Self::collect_responses(execution_result).await?;
+        let all_responses = response_collection::collect_responses(execution_result, false).await?;
         if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
+            return Err(error::internal_error("No responses from server"));
         }
 
         // Build choices by parsing output with HarmonyParserAdapter
         let mut choices: Vec<ChatChoice> = Vec::new();
+        let mut total_reasoning_tokens = 0u32;
+
         for (index, complete) in all_responses.iter().enumerate() {
             // Convert matched_stop from proto to JSON
-            let matched_stop = complete.matched_stop.as_ref().map(|m| match m {
+            let matched_stop = complete.matched_stop().map(|m| match m {
                 MatchedTokenId(id) => {
                     serde_json::json!(id)
                 }
@@ -84,18 +65,28 @@ impl HarmonyResponseProcessor {
 
             // Parse Harmony channels with HarmonyParserAdapter
             let mut parser = HarmonyParserAdapter::new().map_err(|e| {
-                utils::internal_error_message(format!("Failed to create Harmony parser: {}", e))
+                error!(
+                    function = "process_non_streaming_chat_response",
+                    error = %e,
+                    "Failed to create Harmony parser"
+                );
+                error::internal_error(format!("Failed to create Harmony parser: {}", e))
             })?;
 
             // Parse Harmony channels with finish_reason and matched_stop
             let parsed = parser
                 .parse_complete(
-                    &complete.output_ids,
-                    complete.finish_reason.clone(),
+                    complete.output_ids(),
+                    complete.finish_reason().to_string(),
                     matched_stop.clone(),
                 )
                 .map_err(|e| {
-                    utils::internal_error_message(format!("Harmony parsing failed: {}", e))
+                    error!(
+                        function = "process_non_streaming_chat_response",
+                        error = %e,
+                        "Harmony parsing failed on complete response"
+                    );
+                    error::internal_error(format!("Harmony parsing failed: {}", e))
                 })?;
 
             // Build response message (assistant)
@@ -108,6 +99,9 @@ impl HarmonyResponseProcessor {
 
             let finish_reason = parsed.finish_reason;
 
+            // Accumulate reasoning tokens across all responses
+            total_reasoning_tokens += parsed.reasoning_token_count;
+
             choices.push(ChatChoice {
                 index: index as u32,
                 message,
@@ -119,30 +113,24 @@ impl HarmonyResponseProcessor {
         }
 
         // Build usage from proto fields
-        let prompt_tokens: u32 = all_responses.iter().map(|r| r.prompt_tokens as u32).sum();
-        let completion_tokens: u32 = all_responses
-            .iter()
-            .map(|r| r.completion_tokens as u32)
-            .sum();
-        let usage = Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            completion_tokens_details: None,
-        };
+        let mut usage = response_formatting::build_usage(&all_responses);
+
+        // Add reasoning token count from parsed analysis/commentary channels
+        if total_reasoning_tokens > 0 {
+            usage.completion_tokens_details = Some(CompletionTokensDetails {
+                reasoning_tokens: Some(total_reasoning_tokens),
+            });
+        }
 
         // Final ChatCompletionResponse
-        let response = ChatCompletionResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion".to_string(),
-            created: dispatch.created,
-            model: chat_request.model.clone(),
-            choices,
-            usage: Some(usage),
-            system_fingerprint: dispatch.weight_version.clone(),
-        };
-
-        Ok(response)
+        Ok(
+            ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
+                .created(dispatch.created)
+                .choices(choices)
+                .usage(usage)
+                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .build(),
+        )
     }
 }
 
@@ -160,8 +148,10 @@ pub enum ResponsesIterationResult {
     /// Tool calls found in commentary channel - continue MCP loop
     ToolCallsFound {
         tool_calls: Vec<ToolCall>,
-        analysis: Option<String>, // For streaming emission
-        partial_text: String,     // For streaming emission
+        analysis: Option<String>, // For streaming emission or reasoning output
+        partial_text: String,     // For streaming emission or message output
+        usage: Usage,             // Token usage from this iteration
+        request_id: String,       // Request ID from dispatch
     },
     /// No tool calls - return final ResponsesResponse
     Completed {
@@ -193,23 +183,28 @@ impl HarmonyResponseProcessor {
         dispatch: DispatchMetadata,
     ) -> Result<ResponsesIterationResult, Response> {
         // Collect all completed responses
-        let all_responses = Self::collect_responses(execution_result).await?;
+        let all_responses = response_collection::collect_responses(execution_result, false).await?;
         if all_responses.is_empty() {
-            return Err(utils::internal_error_static("No responses from server"));
+            return Err(error::internal_error("No responses from server"));
         }
 
         // For Responses API, we only process the first response (n=1)
         let complete = all_responses
             .first()
-            .ok_or_else(|| utils::internal_error_static("No complete response"))?;
+            .ok_or_else(|| error::internal_error("No complete response"))?;
 
         // Parse Harmony channels
         let mut parser = HarmonyParserAdapter::new().map_err(|e| {
-            utils::internal_error_message(format!("Failed to create Harmony parser: {}", e))
+            error!(
+                function = "process_responses_iteration",
+                error = %e,
+                "Failed to create Harmony parser"
+            );
+            error::internal_error(format!("Failed to create Harmony parser: {}", e))
         })?;
 
         // Convert matched_stop from proto to JSON
-        let matched_stop = complete.matched_stop.as_ref().map(|m| match m {
+        let matched_stop = complete.matched_stop().map(|m| match m {
             MatchedTokenId(id) => {
                 serde_json::json!(id)
             }
@@ -220,11 +215,18 @@ impl HarmonyResponseProcessor {
 
         let parsed = parser
             .parse_complete(
-                &complete.output_ids,
-                complete.finish_reason.clone(),
+                complete.output_ids(),
+                complete.finish_reason().to_string(),
                 matched_stop,
             )
-            .map_err(|e| utils::internal_error_message(format!("Harmony parsing failed: {}", e)))?;
+            .map_err(|e| {
+                error!(
+                    function = "process_responses_iteration",
+                    error = %e,
+                    "Harmony parsing failed on complete response"
+                );
+                error::internal_error(format!("Harmony parsing failed: {}", e))
+            })?;
 
         // VALIDATION: Check if model incorrectly generated Tool role messages
         // This happens when the model copies the format of tool result messages
@@ -242,6 +244,16 @@ impl HarmonyResponseProcessor {
             );
         }
 
+        // Build usage (needed for both ToolCallsFound and Completed)
+        let mut usage = response_formatting::build_usage(std::slice::from_ref(complete));
+
+        // Add reasoning token count from parsed analysis/commentary channels
+        if parsed.reasoning_token_count > 0 {
+            usage.completion_tokens_details = Some(CompletionTokensDetails {
+                reasoning_tokens: Some(parsed.reasoning_token_count),
+            });
+        }
+
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {
             // Tool calls found - return for MCP loop execution
@@ -249,6 +261,8 @@ impl HarmonyResponseProcessor {
                 tool_calls,
                 analysis: parsed.analysis,
                 partial_text: parsed.final_text,
+                usage,
+                request_id: dispatch.request_id.clone(),
             });
         }
 
@@ -281,53 +295,25 @@ impl HarmonyResponseProcessor {
             output.push(message_item);
         }
 
-        // Build usage
-        let prompt_tokens = complete.prompt_tokens as u32;
-        let completion_tokens = complete.completion_tokens as u32;
-        let usage = Usage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: prompt_tokens + completion_tokens,
-            completion_tokens_details: None,
-        };
-
         // Build ResponsesResponse with all required fields
-        let response = ResponsesResponse {
-            id: dispatch.request_id.clone(),
-            object: "response".to_string(),
-            created_at: dispatch.created as i64,
-            status: ResponseStatus::Completed,
-            error: None,
-            incomplete_details: None,
-            instructions: responses_request.instructions.clone(),
-            max_output_tokens: responses_request.max_output_tokens,
-            model: responses_request.model.clone(),
-            output,
-            parallel_tool_calls: responses_request.parallel_tool_calls.unwrap_or(true),
-            previous_response_id: responses_request.previous_response_id.clone(),
-            reasoning: None, // Set by caller if needed
-            store: responses_request.store.unwrap_or(true),
-            temperature: responses_request.temperature,
-            text: None,
-            tool_choice: responses_request
-                .tool_choice
-                .as_ref()
-                .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
-                .unwrap_or_else(|| "auto".to_string()),
-            tools: responses_request.tools.clone().unwrap_or_default(),
-            top_p: responses_request.top_p,
-            truncation: None,
-            usage: Some(ResponsesUsage::Modern(ResponseUsage {
-                input_tokens: prompt_tokens,
-                output_tokens: completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
+        let response = ResponsesResponse::builder(&dispatch.request_id, &responses_request.model)
+            .copy_from_request(&responses_request)
+            .created_at(dispatch.created as i64)
+            .status(ResponseStatus::Completed)
+            .output(output)
+            .maybe_text(responses_request.text.clone())
+            .usage(ResponsesUsage::Modern(ResponseUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
                 input_tokens_details: None,
-                output_tokens_details: None,
-            })),
-            user: None,
-            safety_identifier: responses_request.user.clone(),
-            metadata: responses_request.metadata.clone().unwrap_or_default(),
-        };
+                output_tokens_details: usage.completion_tokens_details.as_ref().and_then(|d| {
+                    d.reasoning_tokens.map(|tokens| OutputTokensDetails {
+                        reasoning_tokens: tokens,
+                    })
+                }),
+            }))
+            .build();
 
         Ok(ResponsesIterationResult::Completed {
             response: Box::new(response),

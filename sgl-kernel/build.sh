@@ -22,16 +22,13 @@ fi
 
 if [ ${CUDA_VERSION} = "13.0" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.0 --index-url https://download.pytorch.org/whl/cu130"
-elif [ ${CUDA_VERSION} = "12.9" ]; then
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.1 --index-url https://download.pytorch.org/whl/cu130"
+elif [ ${CUDA_VERSION} = "12.9" || ${CUDA_VERSION} = "12.8" ]; then
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu129"
-elif [ ${CUDA_VERSION} = "12.8" ]; then
-   DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128"
 else
    DOCKER_IMAGE="${BUILDER_NAME}:cuda${CUDA_VERSION}"
-   TORCH_INSTALL="pip install --no-cache-dir torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126"
+   TORCH_INSTALL="pip install --no-cache-dir torch==2.9.1 --index-url https://download.pytorch.org/whl/cu126"
 fi
 
 # Create cache directories for persistent build artifacts in home directory
@@ -48,6 +45,7 @@ echo "Cache Configuration"
 echo "==================================="
 echo "CMake download cache: ${CMAKE_DOWNLOAD_CACHE}"
 echo "ccache directory: ${CCACHE_DIR}"
+echo "ccache enabled: ${USE_CCACHE:-1}"
 echo ""
 
 docker run --rm \
@@ -56,6 +54,7 @@ docker run --rm \
    -v ${CCACHE_DIR}:/ccache \
    -e ENABLE_CMAKE_PROFILE="${ENABLE_CMAKE_PROFILE:-}" \
    -e ENABLE_BUILD_PROFILE="${ENABLE_BUILD_PROFILE:-}" \
+   -e USE_CCACHE="${USE_CCACHE:-1}" \
    ${DOCKER_IMAGE} \
    bash -c "
    set -e
@@ -98,51 +97,58 @@ docker run --rm \
    which cmake
    cmake --version
 
-   echo \"==================================\"
-   echo \"Installing and configuring ccache\"
-   echo \"==================================\"
+   if [ \"${USE_CCACHE}\" = \"1\" ]; then
+      echo \"==================================\"
+      echo \"Installing and configuring ccache\"
+      echo \"==================================\"
 
-   # Install ccache 4.12.1 from source for CUDA support (yum provides old 3.7.7)
-   echo \"Installing ccache 4.12.1 from source...\"
+      # Install ccache 4.12.1 from source for CUDA support (yum provides old 3.7.7)
+      echo \"Installing ccache 4.12.1 from source...\"
 
-   # Install build dependencies
-   yum install -y gcc gcc-c++ make wget tar
+      # Install build dependencies
+      yum install -y gcc gcc-c++ make wget tar
 
-   # Download and build ccache 4.12.1
-   cd /tmp
-   wget -q https://github.com/ccache/ccache/releases/download/v4.12.1/ccache-4.12.1.tar.xz
-   tar -xf ccache-4.12.1.tar.xz
-   cd ccache-4.12.1
+      # Download and build ccache 4.12.1
+      cd /tmp
+      wget -q https://github.com/ccache/ccache/releases/download/v4.12.1/ccache-4.12.1.tar.xz
+      tar -xf ccache-4.12.1.tar.xz
+      cd ccache-4.12.1
 
-   # Build and install (uses already-installed CMake 3.31)
-   mkdir build && cd build
-   /opt/cmake/bin/cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=/usr .. >/dev/null
-   make -j\$(nproc) >/dev/null
-   make install >/dev/null
+      # Build and install (uses already-installed CMake 3.31)
+      mkdir build && cd build
+      /opt/cmake/bin/cmake -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=/usr .. >/dev/null
+      make -j\$(nproc) >/dev/null
+      make install >/dev/null
 
-   # Verify installation
-   ccache --version
-   echo \"ccache 4.12.1 installed successfully\"
-   cd /sgl-kernel
+      # Verify installation
+      ccache --version
+      echo \"ccache 4.12.1 installed successfully\"
+      cd /sgl-kernel
 
-   # Configure ccache
-   export CCACHE_DIR=/ccache
-   export CCACHE_BASEDIR=/sgl-kernel
-   export CCACHE_MAXSIZE=10G
-   export CCACHE_COMPILERCHECK=content
-   export CCACHE_COMPRESS=true
-   export CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime
+      # Configure ccache
+      export CCACHE_DIR=/ccache
+      export CCACHE_BASEDIR=/sgl-kernel
+      export CCACHE_MAXSIZE=10G
+      export CCACHE_COMPILERCHECK=content
+      export CCACHE_COMPRESS=true
+      export CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime
 
-   # Set up ccache as compiler launcher (don't use PATH to avoid -ccbin conflicts)
-   export CMAKE_C_COMPILER_LAUNCHER=ccache
-   export CMAKE_CXX_COMPILER_LAUNCHER=ccache
-   export CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+      # Set up ccache as compiler launcher (don't use PATH to avoid -ccbin conflicts)
+      export CMAKE_C_COMPILER_LAUNCHER=ccache
+      export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+      export CMAKE_CUDA_COMPILER_LAUNCHER=ccache
 
-   # Show ccache stats before build
-   ccache -sV || true
-   echo \"\"
+      # Show ccache stats before build
+      ccache -sV || true
+      echo \"\"
+   else
+      echo \"==================================\"
+      echo \"ccache disabled (USE_CCACHE=0)\"
+      echo \"==================================\"
+      echo \"\"
+   fi
 
-   yum install numactl-devel -y && \
+   yum install numactl-devel -y --nogpgcheck && \
    yum install libibverbs -y --nogpgcheck && \
    ln -sv /usr/lib64/libibverbs.so.1 /usr/lib64/libibverbs.so && \
    ${PYTHON_ROOT_PATH}/bin/${TORCH_INSTALL} && \
@@ -223,10 +229,12 @@ docker run --rm \
    fi
 
    # Show ccache statistics after build
-   echo \"\"
-   echo \"==================================\"
-   echo \"ccache Statistics\"
-   echo \"==================================\"
-   ccache -s
-   echo \"\"
+   if [ \"${USE_CCACHE}\" = \"1\" ]; then
+      echo \"\"
+      echo \"==================================\"
+      echo \"ccache Statistics\"
+      echo \"==================================\"
+      ccache -s
+      echo \"\"
+   fi
    "

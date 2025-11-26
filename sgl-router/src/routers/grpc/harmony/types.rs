@@ -1,5 +1,6 @@
 //! Shared types for Harmony pipeline
 
+use openai_harmony::chat::Content;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -36,8 +37,6 @@ impl HarmonyMessage {
 
     /// Convert from openai_harmony::chat::Message to our simplified HarmonyMessage
     pub fn from_openai_harmony(msg: openai_harmony::chat::Message) -> Self {
-        use openai_harmony::chat::Content;
-
         // Extract role as string
         let role = match msg.author.role {
             openai_harmony::chat::Role::User => "user",
@@ -101,6 +100,9 @@ pub struct HarmonyChannelOutput {
 
     /// Matched stop token (if any)
     pub matched_stop: Option<Value>,
+
+    /// Number of reasoning tokens (from analysis and commentary channels)
+    pub reasoning_token_count: u32,
 }
 
 /// Streaming delta for SSE responses
