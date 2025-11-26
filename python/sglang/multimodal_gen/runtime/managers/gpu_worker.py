@@ -121,14 +121,12 @@ class GPUWorker:
         finally:
             return output_batch
 
-    def set_lora_adapter(
-        self, lora_nickname: str, lora_path: str | None = None
-    ) -> None:
+    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
         """
         Set the LoRA adapter for the pipeline.
         """
         assert self.pipeline is not None
-        self.pipeline.set_lora_adapter(lora_nickname, lora_path)
+        self.pipeline.set_lora(lora_nickname, lora_path)
 
     def merge_lora_weights(self) -> None:
         """
