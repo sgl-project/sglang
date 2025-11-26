@@ -150,13 +150,13 @@ Hooks are registered in `ModelRunner.initialize()`:
 
 ```python
 if server_args.forward_hooks:
-    register_hooks(self.model, server_args.forward_hooks)
+    register_forward_hooks(self.model, server_args.forward_hooks)
 ```
 
-The actual registration logic is implemented by `register_hooks`:
+The actual registration logic is implemented by `register_forward_hooks`:
 
 ```python
-def register_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
+def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
     """
     hook_specs is a list of dicts from server_args.forward_hooks.
     Attaches forward hooks to the matching modules.

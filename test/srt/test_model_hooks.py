@@ -46,7 +46,7 @@ class TinyModel(nn.Module):
 
 
 class TestAttachHooks(CustomTestCase):
-    """Tests for ModelRunner.register_hooks / resolve_callable integration."""
+    """Tests for register_forward_hooks / resolve_callable integration."""
 
     def setUp(self):
         HOOK_CALLS.clear()
@@ -103,7 +103,7 @@ class TestAttachHooks(CustomTestCase):
     def test_cli_hooks_reach_model(self):
         """
         Ensure that when hooks are provided via CLI, they are parsed into
-        ServerArgs, passed to ModelRunner.register_hooks, and actually
+        ServerArgs, passed to register_forward_hooks, and actually
         run during a forward pass.
         """
         parser = argparse.ArgumentParser()
