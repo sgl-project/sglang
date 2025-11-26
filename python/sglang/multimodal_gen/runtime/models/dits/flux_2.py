@@ -13,18 +13,14 @@
 # limitations under the License.
 
 import inspect
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.attention_dispatch import dispatch_attention_fn
-from diffusers.models.embeddings import (
-    TimestepEmbedding,
-    Timesteps,
-    get_1d_rotary_pos_embed,
-)
+from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 from diffusers.models.transformers.transformer_flux2 import Flux2PosEmbed
 
@@ -158,10 +154,10 @@ class Flux2AttnProcessor:
         if freqs_cis is not None:
             cos, sin = freqs_cis
             query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=False
+                query, cos, sin, is_neox_style=False, interleaved=True
             )
             key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=False
+                key, cos, sin, is_neox_style=False, interleaved=True
             )
 
         hidden_states = dispatch_attention_fn(
@@ -326,10 +322,10 @@ class Flux2ParallelSelfAttnProcessor:
         if freqs_cis is not None:
             cos, sin = freqs_cis
             query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=False
+                query, cos, sin, is_neox_style=False, interleaved=True
             )
             key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=False
+                key, cos, sin, is_neox_style=False, interleaved=True
             )
 
         hidden_states = dispatch_attention_fn(
@@ -622,37 +618,6 @@ class Flux2TransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class Flux2PosEmbedA(nn.Module):
-    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
-    def __init__(self, theta: int, axes_dim: List[int]):
-        super().__init__()
-        self.theta = theta
-        self.axes_dim = axes_dim
-
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        # Expected ids shape: [S, len(self.axes_dim)]
-        cos_out = []
-        sin_out = []
-        pos = ids.float()
-        freqs_dtype = torch.float64
-        # Unlike Flux 1, loop over len(self.axes_dim) rather than ids.shape[-1]
-        for i in range(len(self.axes_dim)):
-            print(f"{pos[..., i]=}")
-            cos, sin = get_1d_rotary_pos_embed(
-                self.axes_dim[i],
-                pos[..., i],
-                theta=self.theta,
-                repeat_interleave_real=True,
-                use_real=True,
-                freqs_dtype=freqs_dtype,
-            )
-            cos_out.append(cos)
-            sin_out.append(sin)
-        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
-        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
-        return freqs_cos, freqs_sin
-
-
 class Flux2TimestepGuidanceEmbeddings(nn.Module):
     def __init__(
         self, in_channels: int = 256, embedding_dim: int = 6144, bias: bool = False
@@ -844,8 +809,8 @@ class Flux2Transformer2DModel(CachableDiT):
         num_txt_tokens = encoder_hidden_states.shape[1]
 
         # 1. Calculate timestep embedding and modulation parameters
-        timestep = timestep.to(hidden_states.dtype) * 1000
-        guidance = guidance.to(hidden_states.dtype) * 1000
+        timestep = timestep.to(hidden_states.dtype)
+        guidance = guidance.to(hidden_states.dtype)
 
         temb = self.time_guidance_embed(timestep, guidance)
 

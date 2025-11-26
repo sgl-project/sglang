@@ -24,7 +24,8 @@ from transformers import (
     LlamaConfig,
     LlavaConfig,
     Mistral3Config,
-    MistralConfig, Mistral3Model, PixtralVisionModel,
+    MistralConfig,
+    PixtralVisionModel,
 )
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import (
@@ -39,13 +40,12 @@ from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
 )
 from transformers.models.llava.modeling_llava import LlavaModelOutputWithPast
+from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 from transformers.models.mistral.modeling_mistral import (
     MistralMLP,
     MistralRMSNorm,
     MistralRotaryEmbedding,
-    MistralModel,
 )
-from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalProjector
 from transformers.utils import ModelOutput
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
@@ -108,7 +108,7 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
@@ -429,7 +429,7 @@ class MistralAttention(nn.Module):
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.q_proj = nn.Linear(
@@ -680,28 +680,43 @@ class Mistral3Model(nn.Module):
             image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
         """
         vision_feature_layer = (
-            vision_feature_layer if vision_feature_layer is not None else self.config.vision_feature_layer
+            vision_feature_layer
+            if vision_feature_layer is not None
+            else self.config.vision_feature_layer
         )
 
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         # this is not memory efficient at all (output_hidden_states=True) will save all the hidden states.
-        image_outputs = self.vision_tower(pixel_values, image_sizes=image_sizes, output_hidden_states=True, **kwargs)
+        image_outputs = self.vision_tower(
+            pixel_values, image_sizes=image_sizes, output_hidden_states=True, **kwargs
+        )
         # If we have one vision feature layer, return the corresponding hidden states,
         # otherwise, select the hidden states of each feature layer and concatenate them
         if isinstance(vision_feature_layer, int):
             selected_image_feature = image_outputs.hidden_states[vision_feature_layer]
         else:
-            hs_pool = [image_outputs.hidden_states[layer_idx] for layer_idx in vision_feature_layer]
+            hs_pool = [
+                image_outputs.hidden_states[layer_idx]
+                for layer_idx in vision_feature_layer
+            ]
             selected_image_feature = torch.cat(hs_pool, dim=-1)
 
-        image_features = self.multi_modal_projector(selected_image_feature.squeeze(0), image_sizes)
+        image_features = self.multi_modal_projector(
+            selected_image_feature.squeeze(0), image_sizes
+        )
         downsample_ratio = self.vision_tower.patch_size * self.config.spatial_merge_size
-        split_sizes = [(height // downsample_ratio) * (width // downsample_ratio) for height, width in image_sizes]
+        split_sizes = [
+            (height // downsample_ratio) * (width // downsample_ratio)
+            for height, width in image_sizes
+        ]
         image_features = torch.split(image_features.squeeze(0), split_sizes)
         return image_features
 
     def get_placeholder_mask(
-        self, input_ids: torch.LongTensor, inputs_embeds: torch.FloatTensor, image_features: torch.FloatTensor
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        image_features: torch.FloatTensor,
     ):
         """
         Obtains multimodal placeholder mask from `input_ids` or `inputs_embeds`, and checks that the placeholder token count is
@@ -709,14 +724,22 @@ class Mistral3Model(nn.Module):
         """
         if input_ids is None:
             special_image_mask = inputs_embeds == self.get_input_embeddings()(
-                torch.tensor(self.config.image_token_id, dtype=torch.long, device=inputs_embeds.device)
+                torch.tensor(
+                    self.config.image_token_id,
+                    dtype=torch.long,
+                    device=inputs_embeds.device,
+                )
             )
             special_image_mask = special_image_mask.all(-1)
         else:
             special_image_mask = input_ids == self.config.image_token_id
 
         n_image_tokens = special_image_mask.sum()
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+        special_image_mask = (
+            special_image_mask.unsqueeze(-1)
+            .expand_as(inputs_embeds)
+            .to(inputs_embeds.device)
+        )
         n_image_features = image_features.shape[0] * image_features.shape[1]
         if inputs_embeds[special_image_mask].numel() != image_features.numel():
             raise ValueError(
@@ -890,7 +913,8 @@ class Mistral3ForConditionalGeneration(nn.Module):
                 # "vision" in name_lower
                 # or "multi" in name_lower
                 # or
-                "lm_head" in name_lower
+                "lm_head"
+                in name_lower
             ):
                 continue
             # if "lm_head" in name:
@@ -898,7 +922,9 @@ class Mistral3ForConditionalGeneration(nn.Module):
             # else:
             final_name = name.replace("language_model.model.", "model.language_model.")
             final_name = final_name.replace("vision_tower.", "model.vision_tower.")
-            final_name = final_name.replace("multi_modal_projector.", "model.multi_modal_projector.")
+            final_name = final_name.replace(
+                "multi_modal_projector.", "model.multi_modal_projector."
+            )
 
             if final_name in params_dict:
                 param = params_dict[final_name]

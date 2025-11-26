@@ -395,7 +395,7 @@ def flux_2_preprocess_text(prompt: str):
 
 @dataclass
 class Flux2PipelineConfig(FluxPipelineConfig):
-    embedded_cfg_scale: float = 4.0 / 1000.0
+    embedded_cfg_scale: float = 4.0
 
     task_type: ModelTaskType = ModelTaskType.I2I
 
@@ -429,7 +429,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             truncation=True,
             # 2048 from official github repo, 512 from diffusers
             # max_length=512,
-            max_length=2048,
+            max_length=512,
         )
 
         print(f"{prompts=}")
@@ -466,8 +466,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
-        # print(f"{img_ids=}")
-        # print(f"{img_ids.shape=}")
         if batch.image_latent is not None:
             image_latents = [batch.image_latent]
             image_latent_ids = _prepare_image_ids(image_latents)
