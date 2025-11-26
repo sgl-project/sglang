@@ -2232,9 +2232,7 @@ class Scheduler(
             if_success = False
         return if_success
 
-    def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
-        # TODO(lsyin): use dynamically maintained num_waiting_tokens
-
+    def get_load(self, _: GetLoadReqInput = None) -> GetLoadReqOutput:
         if self.is_hybrid:
             num_tokens_full = (
                 self.full_tokens_per_layer
