@@ -123,18 +123,9 @@ class TestEmbeddingModels(CustomTestCase):
 
         for model, tp_size, prefill_tolerance in models_to_test:
             for torch_dtype in TORCH_DTYPES:
-                for enable_piecewise_cuda_graph_compile in [True]:
-                    self.assert_close_prefill_logits(
-                        DEFAULT_PROMPTS,
-                        model,
-                        tp_size,
-                        torch_dtype,
-                        prefill_tolerance,
-                        enable_piecewise_cuda_graph=enable_piecewise_cuda_graph_compile,
-                        piecewise_cuda_graph_compiler=(
-                            "inductor" if enable_piecewise_cuda_graph_compile else None
-                        ),
-                    )
+                self.assert_close_prefill_logits(
+                    DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
+                )
 
     def test_matryoshka_embedding(self):
         models_to_test = [

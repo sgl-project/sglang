@@ -543,7 +543,6 @@ class SRTRunner:
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
         enable_piecewise_cuda_graph: bool = False,
-        piecewise_cuda_graph_max_tokens: Optional[int] = None,
         piecewise_cuda_graph_compiler: Optional[str] = None,
     ):
         self.model_type = model_type
