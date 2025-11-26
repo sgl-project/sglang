@@ -1,3 +1,4 @@
+
 # Ascend NPUs
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
@@ -46,150 +47,80 @@ conda create --name sglang_npu python=3.11
 conda activate sglang_npu
 ```
 
-#### Installing prerequisites
+#### CANN
 
-<table>
-<tr>
-<th>Prerequisite</th>
-<th>Description</th>
-<th>Installation instruction</th>
-</tr>
-<tr>
-<th>CANN</th>
-<td>Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC1 or higher.</td>
-<td>
-<a href="https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/softwareinst/instg/instg_0008.html?OS=openEuler&Software=cannToolKit">
-installation guide
-</a>
-</td>
-</tr>
-<tr>
-<th>MemFabric Adaptor</th>
-<td><p><i>TODO: MemFabric is still a working project yet open sourced. We will release it as prebuilt wheel package for now.</i></p>
-<p>If you want to use PD disaggregation mode, you need to install MemFabric Adaptor. MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
-PLATFORM can be "aarch64" or "x86_64".</p>
-</td>
-<td>
-<pre>
-<code class="language-shell">
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC1 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/softwareinst/instg/instg_0008.html?OS=openEuler&Software=cannToolKit)
+
+#### MemFabric Adaptor
+
+_TODO: MemFabric is still a working project yet open sourced. We will release it as prebuilt wheel package for now._
+
+If you want to use PD disaggregation mode, you need to install MemFabric Adaptor. MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
+PLATFORRM can be "aarch64" or "x86_64"
+
+```shell
 PLATFORM="aarch64"
 MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_${PLATFORM}.whl"
 MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
 wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
-</code>
-</pre>
-</td>
-</tr>
-<tr>
-<th>
-Pytorch and Pytorch Framework Adaptor on Ascend
-</th>
-<td>
-Only `torch==2.6.0` is supported currently due to NPUgraph limitation.
-</td>
-<td>
-<pre>
-<code class="language-shell">
+```
+
+#### Pytorch and Pytorch Framework Adaptor on Ascend
+
+At the moment NPUGraph optimizations are supported only in `torch_npu==2.6.0.post3` that requires 'torch==2.6.0'.
+_TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0
+
+```shell
 PYTORCH_VERSION=2.6.0
 TORCHVISION_VERSION=0.21.0
 TORCH_NPU_VERSION=2.6.0.post3
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 pip install torch_npu==$TORCH_NPU_VERSION
-</code>
-</pre>
-</td>
-</tr>
-<tr>
-<th>
-vLLM
-</th>
-<td>
-vLLM is still a prerequisite on Ascend NPU.
-</td>
-<td>
-<pre>
-<code class="language-shell">
+```
+If you are using later versions of 'torch' install 'torch_npu' from sources, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
+
+#### vLLM
+
+vLLM is still a prerequisite for SGLang. Due to limitations on 'torch' version it is recommended to use vLLM v0.8.5. If you are using later version of 'torch' you can use latest vLLM version.
+
+```shell
 VLLM_TAG=v0.8.5
 git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
 (cd vllm && python use_existing_torch.py && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
-</code>
-</pre>
-</td>
-</tr>
-<tr>
-<th>
-Triton on Ascend
-</th>
-<td>
+```
+
+#### Triton on Ascend
+
 We provide our own implementation of Triton for Ascend.
-</td>
-<td>
-<pre>
-<code class="language-shell">
+
+```shell
 BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64.run"
 BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${BISHENG_NAME}"
 wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
+```
+```shell
 pip install triton-ascend==3.2.0rc4
-</code>
-</pre>
-<p>
-For installation of Triton on Ascend nightly builds or from sources, follow <a href="https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md">installation guide</a>
-</p>
-</td>
-</tr>
-<tr>
-<th>
-SGLang Kernels NPU
-</th>
-<td>
-We prowide our own set of SGL kernels.
-</td>
-<td>
-<p>
-<a href="https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md">
-installation guide
-</a>
-</p>
-</td>
-</tr>
-<tr>
-<th>
-DeepEP-compatible Library
-</th>
-<td>
-We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library.
-</td>
-<td>
-<p>
-<a href="https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md">
-installation guide
-</a>
-</p>
-</td>
-</tr>
-<tr>
-<th>
-CustomOps
-</th>
-<td>
-<i>TODO: to be removed once merged into sgl-kernel-npu</i>
-Additional package with custom operations.
-DEVICE_TYPE can be "a3" for Atlas A3 server or "910b" for Atlas A2 server.
-</td>
-<td>
-<pre>
-<code class="language-shell">
+```
+For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
+
+#### SGLang Kernels NPU
+We prowide our own set of SGL kernels, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
+
+#### DeepEP-compatible Library
+We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
+
+#### CustomOps
+_TODO: to be removed once merged into sgl-kernel-npu
+Additional package with custom operations. DEVICE_TYPE can be "a3" for Atlas A3 server or "910b" for Atlas A2 server.
+
+```shell
 DEVICE_TYPE="a3"
 wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
 chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run
 ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp
 wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
-</code>
-</pre>
-</td>
-</tr>
-</table>
+```
 
 #### Installing SGLang from source
 
@@ -198,7 +129,6 @@ pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
-
 pip install -e python[srt_npu]
 ```
 
