@@ -383,9 +383,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
-    ##############################
-    ##########emb lora############
-    ##############################
     def _run_lora_a_embedding(
         self, input_: torch.Tensor, batch_info
     ) -> torch.Tensor:
@@ -393,7 +390,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Apply LoRA A weights using efficient embedding lookup.
         Maps tokens to their corresponding LoRA adapters internally.
         """
-        # Get token-to-lora mapping
+        # (Step1) Get token-to-lora mapping
         token_weight_indices = torch.zeros(
             input_.shape[0], dtype=torch.int32, device=input_.device
         )
@@ -405,7 +402,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             token_weight_indices[current_pos : current_pos+seg_len] = weight_idx
             current_pos += seg_len
         
-        # Apply embedding lookup for each LoRA adapter
+        # (Step2) Apply embedding lookup for each LoRA adapter
         lora_a_output = torch.zeros(
             (input_.shape[0], self.embedding_A_buffer.shape[1]),
             dtype=self.embedding_A_buffer.dtype,
@@ -420,11 +417,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             lora_a_output[token_mask] = F.embedding(
                 input_[token_mask], lora_a_weights.t()
             )
-        
         return lora_a_output
-    ##############################
-    ##############################
-    ##############################
 
     def forward(self, input_: torch.Tensor):
         # Get base embedding output

@@ -307,15 +307,15 @@ class LoRAManager:
         # Update embedding layer if present
         if self.embed_tokens_module is not None and hasattr(self.memory_pool, 'embedding_A_buffer') and self.memory_pool.embedding_A_buffer is not None:
             self.embed_tokens_module.set_lora_info(
-                self.memory_pool.embedding_A_buffer,
-                self.memory_pool.embedding_B_buffer,
+                self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_B),
             )
         
         # Update lm_head layer if present
         if self.lm_head_module is not None and hasattr(self.memory_pool, 'lm_head_A_buffer') and self.memory_pool.lm_head_A_buffer is not None:
             self.lm_head_module.set_lora_info(
-                self.memory_pool.lm_head_A_buffer,
-                self.memory_pool.lm_head_B_buffer,
+                self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_A),
+                self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_B),
             )
         ##############################
         ##############################

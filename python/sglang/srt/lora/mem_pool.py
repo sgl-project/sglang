@@ -344,8 +344,10 @@ class LoRAMemoryPool:
             embedding_B = None
             
             # Look for embedding weights in layer 0 (embeddings are usually stored there)
-            if lora_adapter.layers:
-                layer_weights = lora_adapter.layers[0].weights
+            # if lora_adapter.layers:
+            if hasattr(lora_adapter, 'embedding_layer'):
+                # layer_weights = lora_adapter.layers[0].weights
+                layer_weights = lora_adapter.embedding_layer.weights
                 for name, weights in layer_weights.items():
                     if "embed_tokens" in name or "model.embed_tokens" in name:
                         if "lora_A" in name:
@@ -354,17 +356,11 @@ class LoRAMemoryPool:
                             embedding_B = weights
             
             # Load into buffers
-            if embedding_A is not None:
-                buffer_view = self.embedding_A_buffer[buffer_id, :lora_rank, :]
-                buffer_view.copy_(embedding_A)
-            else:
-                self.embedding_A_buffer[buffer_id].zero_()
+            buffer_view = self.embedding_A_buffer[buffer_id, :lora_rank, :]
+            load_lora_weight_tensor(buffer_view, embedding_A)
             
-            if embedding_B is not None:
-                buffer_view = self.embedding_B_buffer[buffer_id, :, :lora_rank]
-                buffer_view.copy_(embedding_B)
-            else:
-                self.embedding_B_buffer[buffer_id].zero_()
+            buffer_view = self.embedding_B_buffer[buffer_id, :, :lora_rank]
+            load_lora_weight_tensor(buffer_view, embedding_B)
         
         # Handle lm_head weights (not per-layer)
         if "lm_head" in self.target_modules:
@@ -372,8 +368,10 @@ class LoRAMemoryPool:
             lm_head_B = None
             
             # Look for lm_head weights
-            if lora_adapter.layers:
-                layer_weights = lora_adapter.layers[0].weights
+            # if lora_adapter.layers:
+            if hasattr(lora_adapter, 'lm_head_layer'):
+                # layer_weights = lora_adapter.layers[0].weights
+                layer_weights = lora_adapter.lm_head_layer.weights
                 for name, weights in layer_weights.items():
                     if "lm_head" in name:
                         if "lora_A" in name:
@@ -382,17 +380,11 @@ class LoRAMemoryPool:
                             lm_head_B = weights
             
             # Load into buffers
-            if lm_head_A is not None:
-                buffer_view = self.lm_head_A_buffer[buffer_id, :lora_rank, :]
-                buffer_view.copy_(lm_head_A)
-            else:
-                self.lm_head_A_buffer[buffer_id].zero_()
-            
-            if lm_head_B is not None:
-                buffer_view = self.lm_head_B_buffer[buffer_id, :, :lora_rank]
-                buffer_view.copy_(lm_head_B)
-            else:
-                self.lm_head_B_buffer[buffer_id].zero_()
+            buffer_view = self.lm_head_A_buffer[buffer_id, :lora_rank, :]
+            load_lora_weight_tensor(buffer_view, lm_head_A)
+
+            buffer_view = self.lm_head_B_buffer[buffer_id, :, :lora_rank]
+            load_lora_weight_tensor(buffer_view, lm_head_B)
         ##############################
         ##############################
         ##############################
@@ -440,10 +432,40 @@ class LoRAMemoryPool:
                 target_buffer = self.B_buffer[name][layer_id]
                 buffer_view = target_buffer[buffer_id, :, :lora_rank]
                 load_lora_weight_tensor(buffer_view, weights)
-
+    
+    def get_embedding_tensor(
+        self, target_module: str, lora_type: LoRAType
+    ) -> Optional[torch.Tensor]:
+        """
+        Get LoRA tensor for non-layer modules (embed_tokens, lm_head).
+        
+        Args:
+            target_module: Module name, either "embed_tokens" or "lm_head"
+            lora_type: Either LoRAType.LORA_A or LoRAType.LORA_B
+            
+        Returns:
+            The corresponding buffer tensor, or None if not available
+        """
+        if target_module == "embed_tokens":
+            if lora_type == LoRAType.LORA_A:
+                return self.embedding_A_buffer
+            return self.embedding_B_buffer
+        
+        if target_module == "lm_head":
+            if lora_type == LoRAType.LORA_A:
+                return self.lm_head_A_buffer
+            return self.lm_head_B_buffer
+        
+        raise ValueError(
+            f"Invalid target_module '{target_module}'. "
+            f"Expected 'embed_tokens' or 'lm_head'."
+        )
+    
+    
     def get_tensor(
         self, target_module: str, layer_id: int, lora_type: LoRAType
     ) -> torch.Tensor:
+    
         if lora_type == LoRAType.LORA_A:
             return self.A_buffer[target_module][layer_id]
 
