@@ -433,6 +433,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_reward_models.py", 400),
         TestFile("models/test_cross_encoder_models.py", 400),
         TestFile("models/test_embedding_models.py", 400),
+        TestFile("ascend/test_ascend_hybrid_attention_backend.py", 400),
     ],
     "nightly-test-npu-2-a3": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
