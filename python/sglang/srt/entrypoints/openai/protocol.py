@@ -477,6 +477,11 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    parallel_tool_calls: bool = Field(
+        default=True,
+        description="Whether to allow multiple tool calls in parallel. When False, "
+        "limits to a single tool call.",
+    )
     return_hidden_states: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",

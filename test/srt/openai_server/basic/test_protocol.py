@@ -188,6 +188,52 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(request.chat_template_kwargs, {"thinking": True})
 
+    def test_parallel_tool_calls_field_exists(self):
+        """Test that parallel_tool_calls field exists in ChatCompletionRequest"""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(model="test-model", messages=messages)
+
+        # Verify field exists in model fields
+        model_fields = request.model_fields
+        self.assertIn(
+            "parallel_tool_calls",
+            model_fields,
+            "parallel_tool_calls field must exist in ChatCompletionRequest",
+        )
+
+    def test_parallel_tool_calls_default_value(self):
+        """Test that parallel_tool_calls defaults to True"""
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(model="test-model", messages=messages)
+
+        # Verify default value is True
+        self.assertTrue(
+            request.parallel_tool_calls,
+            "parallel_tool_calls should default to True",
+        )
+
+    def test_parallel_tool_calls_can_be_set(self):
+        """Test that parallel_tool_calls can be set to both True and False"""
+        messages = [{"role": "user", "content": "Hello"}]
+
+        # Test setting to False
+        request_false = ChatCompletionRequest(
+            model="test-model", messages=messages, parallel_tool_calls=False
+        )
+        self.assertFalse(
+            request_false.parallel_tool_calls,
+            "parallel_tool_calls should be False when set to False",
+        )
+
+        # Test setting to True
+        request_true = ChatCompletionRequest(
+            model="test-model", messages=messages, parallel_tool_calls=True
+        )
+        self.assertTrue(
+            request_true.parallel_tool_calls,
+            "parallel_tool_calls should be True when set to True",
+        )
+
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
         transcript = "Good morning! It's 7:00 AM, and I'm just waking up. Today is going to be a busy day, "

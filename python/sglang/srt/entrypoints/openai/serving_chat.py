@@ -278,10 +278,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.function.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
-                # Default to True for parallel_tool_calls (ChatCompletionRequest doesn't have this field)
-                parallel_tool_calls = getattr(request, "parallel_tool_calls", True)
                 tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice, parallel_tool_calls=parallel_tool_calls
+                    request.tool_choice, parallel_tool_calls=request.parallel_tool_calls
                 )
 
         # Use chat template
