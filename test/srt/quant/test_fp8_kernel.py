@@ -121,6 +121,36 @@ class TestW8A8BlockFP8Matmul(TestFP8Base):
         )
         torch.testing.assert_close(C, C_gt, atol=0.5, rtol=1e-4)
 
+    def test_w8a8_block_fp8_matmul_m_zero(self):
+        """Test M=0 edge case - can happen with Expert Parallelism when some experts have no tokens."""
+        if torch.cuda.get_device_capability()[0] < 9:
+            return
+
+        # Create B matrix normally
+        _, B_quant_gt, B_scale_gt = self._make_B(
+            K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
+        )
+
+        # Create empty A matrix (M=0)
+        A_quant = torch.empty((0, self.K), dtype=self.quant_type, device="cuda")
+        A_scale = torch.empty(
+            (0, self.K // self.group_size), dtype=torch.float32, device="cuda"
+        )
+
+        # Should return empty tensor without error
+        C = w8a8_block_fp8_matmul(
+            A=A_quant,
+            B=B_quant_gt.T.contiguous(),
+            As=A_scale,
+            Bs=B_scale_gt.T.contiguous(),
+            block_size=[128, 128],
+            output_dtype=self.output_type,
+        )
+
+        # Verify output shape is correct (M=0, N=N)
+        self.assertEqual(C.shape, (0, self.N))
+        self.assertEqual(C.dtype, self.output_type)
+
 
 if __name__ == "__main__":
     unittest.main()

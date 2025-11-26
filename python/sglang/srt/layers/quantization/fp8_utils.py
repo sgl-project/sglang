@@ -244,6 +244,13 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
+        # If weight_scale is in UE8M0 packed format (int32), convert back to float32
+        # UE8M0 format has shape (N, K//block_k//4) with dtype int32
+        # Triton expects shape (N//block_n, K//block_k) with dtype float32
+        if weight_scale.dtype == torch.int32:
+            weight_scale = _unpack_ue8m0_scale_for_triton(
+                weight_scale, weight.shape, block_size
+            )
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
@@ -265,6 +272,67 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def _unpack_ue8m0_scale_for_triton(
+    sf_packed: torch.Tensor,
+    weight_shape: Tuple[int, int],
+    block_size: List[int],
+) -> torch.Tensor:
+    """
+    Unpack UE8M0 packed scale tensor back to float32 format for triton kernel.
+
+    The UE8M0 format packs scales as:
+    - Shape: (N, K//block_k//4) with dtype int32
+    - Each int32 contains 4 uint8 scale values
+
+    Triton expects:
+    - Shape: (N//block_n, K//block_k) with dtype float32
+
+    Args:
+        sf_packed: Packed scale tensor with shape (N, packed_k_groups) and dtype int32
+        weight_shape: (N, K) shape of the weight tensor
+        block_size: [block_n, block_k] quantization block size
+
+    Returns:
+        Unpacked scale tensor with shape (n_groups, k_groups) and dtype float32
+    """
+    assert sf_packed.dtype == torch.int32
+    assert len(sf_packed.shape) == 2
+
+    N, K = weight_shape
+    block_n, block_k = block_size
+    n_groups = ceil_div(N, block_n)
+    k_groups = ceil_div(K, block_k)
+
+    mn_repeat, k_div_4 = sf_packed.shape
+    k_packed = k_div_4 * 4
+
+    # Unpack int32 -> 4x uint8 -> float32
+    # Each uint8 represents an exponent in UE8M0 format
+    sf_u8 = sf_packed.contiguous().view(torch.uint8).view(mn_repeat, k_packed)
+    sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
+
+    # Handle row dimension - may have 128x replication or direct mapping
+    if mn_repeat == N:
+        # Rows are replicated 128 times, take every 128th row
+        # sf_fp32 shape: (N, k_packed) -> (n_groups, k_packed)
+        # Select representative rows at indices 0, 128, 256, ...
+        indices = torch.arange(0, N, block_n, device=sf_packed.device)
+        sf_fp32 = sf_fp32.index_select(0, indices)
+    elif mn_repeat == n_groups:
+        # Already in the correct n_groups format
+        pass
+    else:
+        raise ValueError(
+            f"Unexpected scale shape: sf_packed.shape={sf_packed.shape}, "
+            f"weight_shape={weight_shape}, block_size={block_size}"
+        )
+
+    # Crop k dimension to expected size (remove padding if any)
+    sf_fp32 = sf_fp32[:, :k_groups].contiguous()
+
+    return sf_fp32
 
 
 def aiter_w8a8_block_fp8_linear(

@@ -739,9 +739,10 @@ def _w8a8_block_fp8_matmul(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # NOTE: Use int64 for offsets to prevent overflow with large tensors
+    offs_am = ((pid_m * BLOCK_SIZE_M).to(tl.int64) + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = ((pid_n * BLOCK_SIZE_N).to(tl.int64) + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -770,8 +771,9 @@ def _w8a8_block_fp8_matmul(
     else:
         c = accumulator.to(tl.float32)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # NOTE: Use int64 for output offsets to prevent overflow
+    offs_cm = (pid_m * BLOCK_SIZE_M).to(tl.int64) + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = (pid_n * BLOCK_SIZE_N).to(tl.int64) + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
@@ -824,9 +826,10 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    # NOTE: Use int64 for offsets to prevent overflow with large tensors
+    offs_am = ((pid_m * BLOCK_SIZE_M).to(tl.int64) + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = ((pid_n * BLOCK_SIZE_N).to(tl.int64) + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
@@ -929,8 +932,9 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     else:
         c = accumulator.to(tl.float32)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    # NOTE: Use int64 for output offsets to prevent overflow
+    offs_cm = (pid_m * BLOCK_SIZE_M).to(tl.int64) + tl.arange(0, BLOCK_SIZE_M)
+    offs_cn = (pid_n * BLOCK_SIZE_N).to(tl.int64) + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
@@ -1058,6 +1062,11 @@ def w8a8_block_fp8_matmul_deepgemm(
 ) -> torch.Tensor:
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
 
+    # Early exit for empty input - this can happen with EP (Expert Parallelism)
+    # when some experts have no tokens assigned
+    if M == 0:
+        return C
+
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
@@ -1095,6 +1104,11 @@ def w8a8_block_fp8_matmul_triton(
     """
 
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+
+    # Early exit for empty input - this can happen with EP (Expert Parallelism)
+    # when some experts have no tokens assigned
+    if M == 0:
+        return C
 
     block_n, block_k = block_size
 
