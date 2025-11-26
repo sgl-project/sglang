@@ -41,6 +41,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 ## Documentation
 - **User Guide**: [docs.sglang.ai/advanced_features/router.html](https://docs.sglang.ai/advanced_features/router.html)
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
+- **Tokenizer Module**: See [src/tokenizer/README.md](src/tokenizer/README.md) for tokenizer architecture and chat template support.
 
 ## Installation
 ### Prerequisites
@@ -454,6 +455,7 @@ Public health endpoints (`/liveness`, `/readiness`, `/health`, `/health_generate
 - `--history-backend memory` (default) stores responses and conversations in-process.
 - `--history-backend none` disables persistence while keeping APIs.
 - `--history-backend oracle` uses Oracle Autonomous Database; provide credentials via flags or environment variables.
+- `--history-backend postgres` uses PostgreSQL Database.
 - Conversation item storage mirrors the history backend (Oracle or memory). The same storage powers OpenAI `/responses` and conversation APIs.
 
 ### History Backend (OpenAI Router Mode)
@@ -465,6 +467,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 - **Memory** (default): In-memory storage, fast but ephemeral.
 - **None**: No storage, minimal overhead.
 - **Oracle**: Persistent storage backed by Oracle Autonomous Database.
+- **Postgres**: Persistent storage backed by PostgreSQL Database.
 
 ```bash
 # Memory backend (default)
@@ -484,6 +487,12 @@ python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
   --history-backend oracle
+
+# PostgreSQL backend
+python3 -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend postgres
 ```
 
 #### Oracle configuration
