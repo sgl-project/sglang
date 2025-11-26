@@ -20,9 +20,9 @@ except ImportError as e:
         "LMCache is not installed. Please install it by running `pip install lmcache`"
     ) from e
 
-from sglang.srt.configs.model_config import ModelConfig
 
 if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
@@ -258,6 +258,7 @@ class LMCRadixCache(RadixCache):
 
 
 if __name__ == "__main__":
+    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
