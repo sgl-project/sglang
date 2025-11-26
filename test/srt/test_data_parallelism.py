@@ -63,7 +63,7 @@ class TestDataParallelism(CustomTestCase):
     def test_update_weight(self):
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
-            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+            json={"model_path": self.model},
         )
 
         # check if the response is 200
@@ -74,7 +74,7 @@ class TestDataParallelism(CustomTestCase):
 
         response = requests.post(
             self.base_url + "/update_weights_from_disk",
-            json={"model_path": DEFAULT_MODEL_NAME_FOR_TEST},
+            json={"model_path": self.model},
         )
 
         # check if the response is 200
