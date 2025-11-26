@@ -393,8 +393,8 @@ class Glm4MoeDetector(BaseFormatDetector):
             # Check if buffer could be the start of a tool call
             # Keep buffer if it could be a partial match of bot_token
             is_potential_start = any(
-                self.bot_token.startswith(current_text[i:])
-                for i in range(len(current_text))
+                self.bot_token.startswith(current_text[-i:])
+                for i in range(1, min(len(current_text), len(self.bot_token)) + 1)
             )
 
             if not is_potential_start:
