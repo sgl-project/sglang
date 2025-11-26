@@ -26,5 +26,8 @@
     // in the dev docker container. You can remove / comment out these
     // two lines if you prefer to sync code changes manually.
     "workspaceMount": "source=${localWorkspaceFolder},target=/sgl-workspace/sglang,type=bind",
-    "workspaceFolder": "/sgl-workspace/sglang"
+    "workspaceFolder": "/sgl-workspace/sglang",
+    "mounts": [
+        "source=/home/scratch.tbarnatan_gpu/models,target=/models,type=bind"
+]
 }

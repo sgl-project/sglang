@@ -5,6 +5,7 @@ import pytest
 import torch
 from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
 from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+from flashinfer.fused_moe.core import ActivationType
 from sgl_kernel import scaled_fp4_quant, silu_and_mul
 from torch.nn import functional as F
 
@@ -248,13 +249,17 @@ def check_moe(
     dtype: torch.dtype,
     moe_impl: Callable,
     flip_w13: bool,
+    activation: ActivationType = ActivationType.Swiglu,
 ):
+    
+    is_gated = activation is not ActivationType.Relu2 # Relu2 supports only non-gated moe
+    intermediate_size = 2 * n if is_gated else n
     torch.manual_seed(7)
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+    w1 = torch.randn((e, intermediate_size, k), device="cuda", dtype=dtype) / 10
     quant_blocksize = 16
     round_up = lambda x, y: (x + y - 1) // y * y
-    sf_w1_2n = round_up(2 * n, 128)
+    sf_w1_2n = round_up(intermediate_size, 128)
     sf_w1_k = round_up(k // quant_blocksize, 4)
     w1_blockscale = torch.empty(
         (e, sf_w1_2n, sf_w1_k), device="cuda", dtype=torch.float8_e4m3fn
@@ -267,7 +272,7 @@ def check_moe(
         (e, sf_w2_k, sf_w2_n), device="cuda", dtype=torch.float8_e4m3fn
     )
 
-    w1_q = torch.empty((e, 2 * n, k // 2), device="cuda", dtype=torch.uint8)
+    w1_q = torch.empty((e, intermediate_size, k // 2), device="cuda", dtype=torch.uint8)
     w2_q = torch.empty((e, k, n // 2), device="cuda", dtype=torch.uint8)
     w1_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
     w2_gs = torch.empty((e,), device="cuda", dtype=torch.float32)
@@ -412,6 +417,7 @@ def test_cutlass_fp4_moe_no_graph(
 @pytest.mark.parametrize("e", [40, 64, 256])
 @pytest.mark.parametrize("topk", [1, 6, 8])
 @pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@pytest.mark.parametrize("activation", [ActivationType.Swiglu, ActivationType.Relu2])
 @torch.inference_mode()
 def test_flashinfer_fp4_moe_no_graph(
     m: int, n: int, k: int, e: int, topk: int, dtype: torch.dtype
@@ -428,6 +434,7 @@ def test_flashinfer_fp4_moe_no_graph(
         a2_gs,
         w2_blockscale,
         w2_alphas,
+        activation,
     ):
         return flashinfer_cutlass_fused_moe(
             a,
@@ -444,9 +451,10 @@ def test_flashinfer_fp4_moe_no_graph(
                 w2_blockscale.view(torch.int32),
                 w2_alphas,
             ],
+            activation_type=activation
         )[0]
 
-    check_moe(m, n, k, e, topk, dtype, flashinfer_moe_impl, flip_w13=True)
+    check_moe(m, n, k, e, topk, dtype, flashinfer_moe_impl, flip_w13=True, activation=activation)
 
 
 if __name__ == "__main__":

@@ -1742,7 +1742,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
-                    x.shape[0], x.shape[1] * 2, dtype=output_dtype, device=x.device
+                    x.shape[0], x.shape[1] * (2 if layer.moe_runner_config.is_gated else 1), dtype=output_dtype, device=x.device
                 )
 
             output = flashinfer_cutlass_fused_moe(
