@@ -15,7 +15,11 @@
 import multiprocessing as mp
 import unittest
 
-from lora_utils import LoRAAdaptor, LoRAModelCase, run_lora_multiple_batch_on_model_cases
+from lora_utils import (
+    LoRAAdaptor,
+    LoRAModelCase,
+    run_lora_multiple_batch_on_model_cases,
+)
 
 from sglang.test.test_utils import CustomTestCase
 
