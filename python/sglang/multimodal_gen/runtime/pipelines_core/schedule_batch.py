@@ -98,6 +98,7 @@ class Req:
 
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
+    # vae-encoded condition image
     image_latent: torch.Tensor | list[torch.Tensor] | None = None
 
     # Latent dimensions

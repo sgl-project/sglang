@@ -214,6 +214,7 @@ def _prepare_latent_ids(
     # Expand to batch: (B, H*W, 4)
     latent_ids = latent_ids.unsqueeze(0).expand(batch_size, -1, -1)
 
+    print(f"{latent_ids=}")
     return latent_ids
 
 
@@ -357,6 +358,12 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         shape = (batch_size, num_channels_latents, height // 2, width // 2)
         return shape
 
+    def get_pos_prompt_embeds(self, batch):
+        return batch.prompt_embeds[0]
+
+    def get_neg_prompt_embeds(self, batch):
+        return batch.negative_prompt_embeds[0]
+
     def maybe_resize_condition_image(self, width, height, image):
         target_area: int = 1024 * 1024
 
@@ -370,11 +377,18 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
         txt_ids = _prepare_text_ids(prompt_embeds)
 
-        image_latents = [batch.image_latent]
+        img_ids = batch.latent_ids
+        # print(f"{img_ids=}")
+        # print(f"{img_ids.shape=}")
+        if batch.image_latent is not None:
+            image_latents = [batch.image_latent]
+            image_latent_ids = _prepare_image_ids(image_latents)
+            img_ids = torch.cat([img_ids, image_latent_ids], dim=1)
 
-        image_latent_ids = _prepare_image_ids(image_latents)
-
-        img_ids = torch.cat([batch.latent_ids, image_latent_ids], dim=1)
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
 
         # NOTE(mick): prepare it here, to avoid unnecessary computations
         img_cos, img_sin = rotary_emb.forward(img_ids)
@@ -408,7 +422,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
                 device,
                 rotary_emb,
                 batch,
-            ),
+            )
         }
 
     def maybe_pack_latents(self, latents, batch_size, batch):

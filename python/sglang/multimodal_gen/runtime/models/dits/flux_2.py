@@ -26,6 +26,7 @@ from diffusers.models.embeddings import (
     get_1d_rotary_pos_embed,
 )
 from diffusers.models.normalization import AdaLayerNormContinuous
+from diffusers.models.transformers.transformer_flux2 import Flux2PosEmbed
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
@@ -582,8 +583,8 @@ class Flux2TransformerBlock(nn.Module):
         # Conditioning txt stream
         norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
         norm_encoder_hidden_states = (
-            1 + c_scale_msa
-        ) * norm_encoder_hidden_states + c_shift_msa
+                                         1 + c_scale_msa
+                                     ) * norm_encoder_hidden_states + c_shift_msa
 
         # Attention on concatenated img + txt stream
         attention_outputs = self.attn(
@@ -622,7 +623,7 @@ class Flux2TransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class Flux2PosEmbed(nn.Module):
+class Flux2PosEmbedA(nn.Module):
     # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
     def __init__(self, theta: int, axes_dim: List[int]):
         super().__init__()
@@ -634,11 +635,10 @@ class Flux2PosEmbed(nn.Module):
         cos_out = []
         sin_out = []
         pos = ids.float()
-        is_mps = ids.device.type == "mps"
-        is_npu = ids.device.type == "npu"
-        freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
+        freqs_dtype = torch.float64
         # Unlike Flux 1, loop over len(self.axes_dim) rather than ids.shape[-1]
         for i in range(len(self.axes_dim)):
+            print(f"{pos[..., i]=}")
             cos, sin = get_1d_rotary_pos_embed(
                 self.axes_dim[i],
                 pos[..., i],
@@ -706,7 +706,7 @@ class Flux2Modulation(nn.Module):
         mod_params = torch.chunk(mod, 3 * self.mod_param_sets, dim=-1)
         # Return tuple of 3-tuples of modulation params shift/scale/gate
         return tuple(
-            mod_params[3 * i : 3 * (i + 1)] for i in range(self.mod_param_sets)
+            mod_params[3 * i: 3 * (i + 1)] for i in range(self.mod_param_sets)
         )
 
 
@@ -737,7 +737,8 @@ class Flux2Transformer2DModel(CachableDiT):
         self.inner_dim = num_attention_heads * attention_head_dim
 
         # 1. Sinusoidal positional embedding for RoPE on image and text tokens
-        self.rotary_emb = FluxPosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
+        # self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
+        self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
 
         # 2. Combined timestep + guidance embedding
         self.time_guidance_embed = Flux2TimestepGuidanceEmbeddings(
