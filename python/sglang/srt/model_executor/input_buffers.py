@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Self
+from typing import Dict, Optional
 
 import torch
 
@@ -46,7 +46,7 @@ class GraphInputBuffers:
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
-    ) -> Self:
+    ) -> "GraphInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
@@ -187,7 +187,7 @@ class GraphInputBuffers:
         return self.seq_lens_cpu[:bs]
 
     @torch.compile(backend=get_compiler_backend(), fullgraph=True, dynamic=True)
-    def copy_from(self, other: Self):
+    def copy_from(self, other: "GraphInputBuffers"):
         # FIXME(csy): overwrite input_ids will crash
         # self.input_ids.copy_(other.input_ids, non_blocking=True)
         self.req_pool_indices.copy_(other.req_pool_indices, non_blocking=True)
