@@ -619,13 +619,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
 
+        is_target_verify = forward_batch.forward_mode.is_target_verify()
+
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
         retrieve_next_token = self.forward_metadata.retrieve_next_token
         retrieve_next_sibling = self.forward_metadata.retrieve_next_sibling
         retrieve_parent_token = self.forward_metadata.retrieve_parent_token
-        is_target_verify = self.forward_metadata.is_target_verify
-        draft_token_num = self.forward_metadata.draft_token_num
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = mamba_cache_params.conv[0]
@@ -637,7 +637,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 mamba_cache_params.intermediate_conv_window[0]
             )
             has_initial_states = torch.ones(
-                seq_len // draft_token_num,
+                seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
@@ -645,7 +645,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
             has_initial_states = forward_batch.extend_prefix_lens > 0
 
         if is_target_verify:
-            batch_size = seq_len // draft_token_num
+            batch_size = seq_len // forward_batch.spec_info.draft_token_num
+            draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
@@ -707,7 +708,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 use_qk_l2norm_in_kernel=True,
                 disable_state_update=True,
                 intermediate_states_buffer=intermediate_state_cache,
-                cache_steps=draft_token_num,
+                cache_steps=forward_batch.spec_info.draft_token_num,
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
