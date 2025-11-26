@@ -11,9 +11,6 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    QwenImageEditPipelineConfig,
-)
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -29,6 +26,7 @@ logger = init_logger(__name__)
 
 # Alias for convenience
 V = StageValidators
+
 
 # TODO: since this might change sampling params after logging, should be do this beforehand?
 
@@ -117,23 +115,32 @@ class InputValidationStage(PipelineStage):
                 image = load_video(batch.image_path)[0]
             else:
                 image = load_image(batch.image_path)
-            batch.pil_image = image
+            batch.condition_image = image
+            condition_image_width, condition_image_height = image.width, image.height
+        else:
+            condition_image_width, condition_image_height = None, None
 
         # NOTE: resizing needs to be bring in advance
-        if isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
-            height = None if batch.height_not_provided else batch.height
-            width = None if batch.width_not_provided else batch.width
-            width, height = server_args.pipeline_config.adjust_size(
-                height, width, batch.pil_image
-            )
-            batch.width = width
-            batch.height = height
+        if server_args.pipeline_config.task_type == ModelTaskType.I2I:
+            if batch.condition_image is not None:
+                resized_image, resized_width, resized_height = (
+                    server_args.pipeline_config.maybe_resize_condition_image(
+                        condition_image_width,
+                        condition_image_height,
+                        batch.condition_image,
+                    )
+                )
+                batch.condition_image = resized_image
+                batch.width = resized_width if batch.width_not_provided else batch.width
+                batch.height = (
+                    resized_height if batch.height_not_provided else batch.height
+                )
         elif (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            or server_args.pipeline_config.task_type == ModelTaskType.I2I
-        ) and batch.pil_image is not None:
+        ) and batch.condition_image is not None:
+            # duplicate with vae_image_processor
             # further processing for ti2v task
-            img = batch.pil_image
+            img = batch.condition_image
             ih, iw = img.height, img.width
             patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
             vae_stride = (
@@ -159,7 +166,7 @@ class InputValidationStage(PipelineStage):
             batch.height = oh
             batch.width = ow
             # TODO: should we store in a new field: pixel values?
-            batch.pil_image = img
+            batch.condition_image = img
 
         if isinstance(server_args.pipeline_config, WanI2V480PConfig):
             # TODO: could we merge with above?
@@ -173,7 +180,7 @@ class InputValidationStage(PipelineStage):
             height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
             width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-            batch.pil_image = batch.pil_image.resize((width, height))
+            batch.condition_image = batch.condition_image.resize((width, height))
             batch.height = height
             batch.width = width
 
