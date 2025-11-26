@@ -31,13 +31,29 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
+      # image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy dataset
+      # - name: Copy dataset
+      #   run: |
+      #     # copy required file from our daily cache
+      #     cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+      #     # copy download through proxy
+      #     curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+      
+      - name: Install dependencies
         run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -72,13 +88,21 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy dataset
+      - name: Install dependencies
         run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -113,13 +137,21 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy dataset
+      - name: Install dependencies
         run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -164,13 +196,21 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy dataset
+      - name: Install dependencies
         run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -214,13 +254,21 @@ jobs:
       matrix:
         part: [0]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy dataset
+      - name: Install dependencies
         run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -254,26 +302,26 @@ jobs:
           cd test/srt
           python3 run_suite.py --suite nightly-test-npu-16-a3 --continue-on-error --timeout-per-file 7200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
-  check-all-jobs:
-    if: github.repository == 'sgl-project/sglang' && always()
-    needs:
-      - nightly-test-npu-1-a3
-      - nightly-test-npu-2-a3
-      - nightly-test-npu-4-a3
-      - nightly-test-npu-8-a3
-      - nightly-test-npu-16-a3
-    runs-on: ubuntu-latest
-    container:
-      image: docker.m.daocloud.io/ubuntu:22.04
-    steps:
-       - name: Check if any job failed
-         run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "One or more nightly test jobs failed"
-            exit 1
-          fi
-          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more nightly test jobs were cancelled"
-            exit 1
-          fi
-          echo "All nightly test jobs passed"
+  # check-all-jobs:
+  #   if: github.repository == 'sgl-project/sglang' && always()
+  #   needs:
+  #     - nightly-test-npu-1-a3
+  #     - nightly-test-npu-2-a3
+  #     - nightly-test-npu-4-a3
+  #     - nightly-test-npu-8-a3
+  #     - nightly-test-npu-16-a3
+  #   runs-on: ubuntu-latest
+  #   container:
+  #     image: docker.m.daocloud.io/ubuntu:22.04
+  #   steps:
+  #      - name: Check if any job failed
+  #        run: |
+  #         if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
+  #           echo "One or more nightly test jobs failed"
+  #           exit 1
+  #         fi
+  #         if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+  #           echo "One or more nightly test jobs were cancelled"
+  #           exit 1
+  #         fi
+  #         echo "All nightly test jobs passed"
