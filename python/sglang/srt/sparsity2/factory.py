@@ -46,6 +46,7 @@ def _create_sparse_algorithm(
     if factory is None:
         raise ValueError(f"Unknown algorithm: {algorithm_name}")
 
+    logger.info(f"Creating {algorithm_name} algorithm")
     return factory(
         config, device, start_layer=start_layer, end_layer=end_layer, **kwargs
     )
@@ -60,14 +61,17 @@ def _create_backend_adaptor(
 ):
     """Create backend adaptor."""
     sparse_mode = sparse_algorithm.get_sparse_mode()
-    if backend in ["fa3", "flashattention"]:
-        return FlashAttentionAdaptor(device, sparse_mode)
-    elif isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
+    if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
+        logger.info("Creating NSA backend adaptor")
         return NSABackendAdaptor(
             device, sparse_mode, req_to_token_pool, decode_offload_manager
         )
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
+
+    if backend in ["fa3", "flashattention"]:
+        logger.info("Creating FlashAttention backend adaptor")
+        return FlashAttentionAdaptor(device, sparse_mode)
+
+    raise ValueError(f"Unknown backend: {backend}")
 
 
 def _calculate_total_pages(token_to_kv_pool, start_layer: int, page_size: int) -> int:
@@ -85,7 +89,7 @@ def create_sparse_coordinator(
     end_layer: int,
     **kwargs,
 ) -> SparseCoordinator:
-    config = SparseConfig(page_size=page_size, algorithm="fake_random_sparse")
+    config = SparseConfig(page_size=page_size, algorithm="deepseek_nsa")
     algorithm = _create_sparse_algorithm(
         config, device, start_layer, end_layer, **kwargs
     )

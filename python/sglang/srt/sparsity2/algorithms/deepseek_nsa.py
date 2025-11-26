@@ -1,6 +1,7 @@
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
+import nvtx
 import torch
 
 from sglang.srt.sparsity2.algorithms.base_algorithm import (
@@ -29,6 +30,7 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithm):
     def get_representation_storage_shape(self, token_to_kv_pool) -> Dict[str, tuple]:
         return {}
 
+    @nvtx.annotate("DeepSeekNSAAlgorithm.retrieve_topk", color="green")
     def retrieve_topk(
         self,
         queries: torch.Tensor,
@@ -59,13 +61,9 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithm):
             )
 
             if topk_indices is None:
-                if layer_id == 0:
-                    logger.info("NSA indexer returned None")
                 return self._empty_result(queries.shape[0], queries.device)
 
-            valid_lengths = (topk_indices != -1).sum(dim=1).to(torch.int32)
-            return topk_indices, valid_lengths
-
+            return topk_indices, None
         except Exception as e:
             logger.error(f"Layer {layer_id} NSA indexer failed: {e}", exc_info=True)
             return self._empty_result(queries.shape[0], queries.device)

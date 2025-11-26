@@ -2,6 +2,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Optional
 
+import nvtx
 import torch
 
 if TYPE_CHECKING:
@@ -215,6 +216,7 @@ class NSABackendAdaptor(BackendAdaptor):
         self.req_to_token_pool = req_to_token_pool
         self.decode_offload_manager = decode_offload_manager
 
+    @nvtx.annotate("NSABackendAdaptor.adapt_for_attn_metadata", color="green")
     def adapt_for_attn_metadata(
         self,
         selected_indices: torch.Tensor,
@@ -228,38 +230,46 @@ class NSABackendAdaptor(BackendAdaptor):
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """Transform NSA topk indices to physical device indices."""
-        req_pool_indices = forward_batch.req_pool_indices
-        hierarchical_mask = sparse_mask
-        transformed_indices = torch.empty_like(selected_indices, dtype=torch.int32)
+        if forward_batch.forward_mode.is_extend():
+            # Directly return the selected indices for extend mode
+            return selected_indices
 
-        if hierarchical_mask.any():
+        req_pool_indices = forward_batch.req_pool_indices
+
+        transformed_indices = torch.empty_like(selected_indices, dtype=torch.int32)
+        hierarchical_indices = sparse_mask.nonzero(as_tuple=False).squeeze(1)
+        if hierarchical_indices.numel() > 0:
             hierarchical_device_indices = (
                 self.decode_offload_manager.transform_sparse_top_k_cache(
-                    req_pool_indices=req_pool_indices[hierarchical_mask],
-                    top_k_result=selected_indices[hierarchical_mask],
+                    req_pool_indices=req_pool_indices[hierarchical_indices],
+                    top_k_result=selected_indices[hierarchical_indices],
+                    out_cache_loc=forward_batch.out_cache_loc[hierarchical_indices],
+                    seq_lens=forward_batch.seq_lens[hierarchical_indices],
                     layer_id=layer_id,
                 )
             )
-            transformed_indices[hierarchical_mask] = hierarchical_device_indices.to(
+            transformed_indices[hierarchical_indices] = hierarchical_device_indices.to(
                 torch.int32
             )
 
-        if (~hierarchical_mask).any():
+        non_hierarchical_indices = (~sparse_mask).nonzero(as_tuple=False).squeeze(1)
+        if non_hierarchical_indices.numel() > 0:
             from sglang.srt.layers.attention.nsa.transform_index import (
                 transform_index_page_table_decode,
             )
 
-            non_hierarchical_mask = ~hierarchical_mask
             max_seqlen_k = int(forward_batch.seq_lens.max().item())
             page_table = self.req_to_token_pool.req_to_token[
-                req_pool_indices[non_hierarchical_mask], :max_seqlen_k
+                req_pool_indices[non_hierarchical_indices], :max_seqlen_k
             ]
             non_hierarchical_device_indices = transform_index_page_table_decode(
                 page_table=page_table,
-                topk_indices=selected_indices[non_hierarchical_mask],
+                topk_indices=selected_indices[non_hierarchical_indices],
                 page_size=1,
             )
-            transformed_indices[non_hierarchical_mask] = non_hierarchical_device_indices
+            transformed_indices[non_hierarchical_indices] = (
+                non_hierarchical_device_indices
+            )
 
         if layer_id == 0:
             logger.info(

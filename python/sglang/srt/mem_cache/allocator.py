@@ -173,6 +173,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 HIERARCHICAL_NSA_DECODE_MAX_TOKENS = 2048 + 1
+
+
 def is_enable_hierarchical_nsa(allocator):
     """Check if NSA hierarchical allocation is enabled."""
     return isinstance(allocator, NSAHybridTokenToKVPoolAllocator)

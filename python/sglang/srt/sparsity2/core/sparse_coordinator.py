@@ -2,6 +2,7 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+import nvtx
 import torch
 
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
@@ -56,8 +57,12 @@ class RequestTrackers:
             dtype=torch.int64,
             device=device,
         )
-        self.prev_device_indices = torch.zeros(
-            (max_pool_size, num_layers, self.top_k), dtype=torch.int64, device=device
+        #
+        self.prev_device_indices = torch.full(
+            (max_pool_size, num_layers, self.top_k + 1),
+            -1,
+            dtype=torch.int64,
+            device=device,
         )
 
     def register(self, idx: int, prompt_len: int) -> None:
@@ -69,7 +74,7 @@ class RequestTrackers:
             [], dtype=torch.int64, device=self.device
         )
         self.prev_top_k_result[idx].fill_(-1)
-        self.prev_device_indices[idx].fill_(0)
+        self.prev_device_indices[idx].fill_(-1)
 
     def clear(self, idx: int) -> torch.Tensor:
         self.repr_constructed[idx] = False
@@ -82,7 +87,7 @@ class RequestTrackers:
             [], dtype=torch.int64, device=self.device
         )
         self.prev_top_k_result[idx].fill_(-1)
-        self.prev_device_indices[idx].fill_(0)
+        self.prev_device_indices[idx].fill_(-1)
 
         return host_indices
 
@@ -95,7 +100,7 @@ class SparseConfig:
     algorithm: str = "fake_random"
     page_size: int = 64
     sparse_ratio: float = 0.9
-    min_sparse_prompt_len: int = 100
+    min_sparse_prompt_len: int = 2048
 
 
 class SparseCoordinator:
@@ -129,7 +134,7 @@ class SparseCoordinator:
         self.states = RequestTrackers(
             max_pool_size,
             device,
-            end_layer - start_layer,
+            end_layer - start_layer + 1,
             self.config.min_sparse_prompt_len,
         )
         if self.decode_offload_manager is not None:
@@ -158,6 +163,7 @@ class SparseCoordinator:
         if req.req_pool_idx is not None:
             self.states.register(req.req_pool_idx, len(req.origin_input_ids))
 
+    @nvtx.annotate("SparseCoordinator.on_request_prefill_end", color="yellow")
     def on_request_prefill_end(self, req: "Req") -> None:
         """Handle prefill end."""
         if (
@@ -173,7 +179,7 @@ class SparseCoordinator:
 
         # Store previous device indices
         indices_len = self.config.min_sparse_prompt_len
-        self.states.prev_device_indices[req.req_pool_idx] = (
+        self.states.prev_device_indices[req.req_pool_idx][:, :-1] = (
             self.req_to_token_pool.req_to_token[req.req_pool_idx, :indices_len]
         )
 
@@ -196,11 +202,13 @@ class SparseCoordinator:
                 f"Request {req.rid} ended, released {len(host_indices)} host indices"
             )
 
+    @nvtx.annotate("SparseCoordinator.forward_begin", color="yellow")
     def forward_begin(self, forward_batch: "ForwardBatch") -> None:
         """Handle forward begin."""
         if self._should_check_offload(forward_batch):
             self.decode_offload_manager.check_sparse_offload_progress()
 
+    @nvtx.annotate("SparseCoordinator.forward_end", color="yellow")
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
         """Handle forward end."""
         if not self._should_check_offload(forward_batch):
@@ -223,6 +231,7 @@ class SparseCoordinator:
             and self.decode_offload_manager is not None
         )
 
+    @nvtx.annotate("SparseCoordinator.attention_begin", color="green")
     def attention_begin(
         self,
         query: torch.Tensor,
@@ -244,6 +253,7 @@ class SparseCoordinator:
             query, layer, forward_batch, attn_metadata, **kwargs
         )
 
+    @nvtx.annotate("SparseCoordinator.attention_end", color="green")
     def attention_end(
         self,
         output: torch.Tensor,
@@ -262,6 +272,7 @@ class SparseCoordinator:
 
         self._maybe_incremental_update_representations(layer_id, forward_batch)
 
+    @nvtx.annotate("SparseCoordinator._handle_sparse_retrieve", color="yellow")
     def _handle_sparse_retrieve(
         self,
         query: torch.Tensor,
@@ -270,9 +281,6 @@ class SparseCoordinator:
         attn_metadata: Optional[Any],
         **kwargs,
     ) -> Optional[torch.Tensor]:
-        if not forward_batch.forward_mode.is_decode():
-            return None
-
         req_pool_indices = forward_batch.req_pool_indices
         sparse_mode = self.algorithm.get_sparse_mode()
 
@@ -303,19 +311,15 @@ class SparseCoordinator:
 
         return None
 
-    def _compute_sparse_mask(
-        self,
-        req_pool_indices: torch.Tensor,
-        sparse_mode: SparseMode,
-    ) -> Optional[torch.Tensor]:
-        sparse_mask = (
+    @nvtx.annotate("SparseCoordinator._compute_sparse_mask", color="yellow")
+    def _compute_sparse_mask(self, req_pool_indices, sparse_mode):
+        mask = (
             self.states.prompt_lens[req_pool_indices]
             >= self.config.min_sparse_prompt_len
         )
-        if sparse_mode == SparseMode.ORIGINAL_WISE:
-            return sparse_mask
-
-        return self.states.repr_constructed[req_pool_indices] & sparse_mask
+        if sparse_mode != SparseMode.ORIGINAL_WISE:
+            mask &= self.states.repr_constructed[req_pool_indices]
+        return mask
 
     def _maybe_construct_representations(
         self, layer_id: int, forward_batch: "ForwardBatch"

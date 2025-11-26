@@ -24,7 +24,6 @@ from sglang.srt.layers.attention.nsa.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.allocator import (
-    HIERARCHICAL_NSA_DECODE_MAX_TOKENS,
     is_enable_hierarchical_nsa,
 )
 from sglang.srt.mem_cache.memory_pool import NSAReqToTokenPool

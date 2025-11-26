@@ -5,6 +5,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+import nvtx
 import torch
 import triton
 import triton.language as tl
@@ -40,6 +41,7 @@ def sparse_diff_triton_kernel(
     curr_host_indices_ptr,
     full_host_indices_ptr,
     host_start_indices_ptr,
+    seq_lens_ptr,
     prev_top_k_result_stride: tl.constexpr,
     curr_top_k_result_stride: tl.constexpr,
     prev_device_indices_stride: tl.constexpr,
@@ -54,21 +56,34 @@ def sparse_diff_triton_kernel(
         prev_top_k_result_ptr + prev_top_k_result_stride * bid + offset
     )
     max_val = tl.max(prev_top_k_result)
+    seq_len = tl.load(seq_lens_ptr + bid)
     if max_val == -1:
         # After prefilling the first round, the entire cache needs to be loaded.
         no_exist_top_k_result = tl.load(
             curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
         )
+        mask = no_exist_top_k_result < seq_len
         start_index = tl.load(host_start_indices_ptr + bid)
         no_exist_host_indices = tl.load(
-            full_host_indices_ptr + start_index + no_exist_top_k_result
+            full_host_indices_ptr + start_index + no_exist_top_k_result, mask=mask
         )
         tl.store(
             curr_host_indices_ptr + curr_host_indices_stride * bid + offset,
             no_exist_host_indices,
+            mask=mask,
         )
         return
     tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset)
+
+    prev_max_val_index = tl.load(bitmap_ptr + bitmap_stride * bid + seq_len - 1)
+    if prev_max_val_index != -1:
+        tl.store(bitmap_ptr + bitmap_stride * bid + seq_len - 1, -1)
+        tl.store(
+            prev_device_indices_ptr
+            + prev_device_indices_stride * bid
+            + prev_max_val_index,
+            -1,
+        )
 
     curr_top_k_result = tl.load(
         curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
@@ -100,13 +115,15 @@ def sparse_diff_triton_kernel(
         curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
     )
     start_index = tl.load(host_start_indices_ptr + bid)
+    mask1 = no_exist_top_k_result < seq_len
+    host_mask = ~mask & mask1
     no_exist_host_indices = tl.load(
-        full_host_indices_ptr + start_index + no_exist_top_k_result, mask=~mask
+        full_host_indices_ptr + start_index + no_exist_top_k_result, mask=host_mask
     )
     tl.store(
         curr_host_indices_ptr + curr_host_indices_stride * bid + offset,
         no_exist_host_indices,
-        mask=~mask,
+        mask=host_mask,
     )
 
 
@@ -129,6 +146,7 @@ class SparseTopKIndicesHelper:
             device=self.device,
         )
 
+    @nvtx.annotate("SparseTopKIndicesHelper.load_top_k_cache", color="red")
     def load_top_k_cache(
         self,
         prev_top_k_result: torch.Tensor,
@@ -136,12 +154,14 @@ class SparseTopKIndicesHelper:
         prev_device_indices: torch.Tensor,
         full_host_indices: torch.Tensor,
         host_start_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         layer_id: int,
     ):
         bs = prev_top_k_result.shape[0]
         top_k = prev_top_k_result.shape[1]
         curr_device_indices = torch.full(
-            (bs, top_k), -1, dtype=torch.int64, device=self.device
+            (bs, top_k + 1), -1, dtype=torch.int64, device=self.device
         )
         curr_host_indices = torch.full(
             (bs, top_k), -1, dtype=torch.int64, device=self.device
@@ -157,6 +177,7 @@ class SparseTopKIndicesHelper:
             curr_host_indices,
             full_host_indices,
             host_start_indices,
+            seq_lens,
             prev_top_k_result.stride(0),
             curr_top_k_result.stride(0),
             prev_device_indices.stride(0),
@@ -174,10 +195,19 @@ class SparseTopKIndicesHelper:
             curr_host_indices[i][curr_host_indices[i] != -1] for i in range(bs)
         ]
         for i in range(bs):
-            mask = curr_device_indices[i] == -1
+            curr_device_indices[i][:-1][curr_top_k_result[i] == seq_lens[i]] = (
+                out_cache_loc[i].to(dtype=torch.int64)
+            )
+            mask = (curr_device_indices[i] == -1) & (
+                curr_device_indices[i] != out_cache_loc[i]
+            )
             curr_device_indices[i][mask] = should_load_device_indices[i]
+            should_load_device_indices[i] = should_load_device_indices[i][
+                : len(should_load_host_indices[i])
+            ]
         should_load_device_indices = torch.cat(should_load_device_indices)
         should_load_host_indices = torch.cat(should_load_host_indices)
+
         assert len(should_load_device_indices) == len(should_load_host_indices)
         if len(should_load_device_indices) > 0:
             # load cache from cpu
@@ -256,10 +286,15 @@ class DecodeKVCacheOffloadManager:
             self.req_states = None
         logger.info("Enable offload kv cache for decode side")
 
+    @nvtx.annotate(
+        "DecodeKVCacheOffloadManager.transform_sparse_top_k_cache", color="red"
+    )
     def transform_sparse_top_k_cache(
         self,
         req_pool_indices,
         top_k_result,
+        out_cache_loc,
+        seq_lens,
         layer_id,
     ):
 
@@ -294,23 +329,14 @@ class DecodeKVCacheOffloadManager:
         )
         host_start_indices = torch.cumsum(host_indices_lens, dim=-1)
 
-        if layer_id == 0:
-            logger.info(
-                f"shape info: prev topk result shape:{prev_top_k_result.shape}, curr topk result shape:{top_k_result.shape}, device indices shape:{prev_device_indices.shape}, full host indices shape:{full_host_indices.shape}, start indices shape:{host_start_indices.shape}"
-            )
-            logger.info(
-                f"prev topk result:{prev_top_k_result.tolist()}, \n curr topk result:{top_k_result.tolist()}\n"
-            )
-            logger.info(f"device indices: {prev_device_indices.tolist()}")
-            logger.info(
-                f"start indices: {host_start_indices.tolist()}, full host indices: {full_host_indices.tolist()}"
-            )
         curr_device_indices = self.sparse_indices_helper.load_top_k_cache(
             prev_top_k_result=prev_top_k_result,
             curr_top_k_result=top_k_result,
             prev_device_indices=prev_device_indices,
             full_host_indices=full_host_indices,
             host_start_indices=host_start_indices,
+            seq_lens=seq_lens - 1,  # TODO:  FIXME,
+            out_cache_loc=out_cache_loc,
             layer_id=layer_id,
         )
 
@@ -319,7 +345,7 @@ class DecodeKVCacheOffloadManager:
             curr_device_indices
         )
 
-        return curr_device_indices
+        return curr_device_indices[:, :-1]
 
     def offload_sparse_decode_req_tokens(self, req_pool_indices, out_alloc_len):
         """Offload incremental token KV cache for sparse attention."""
