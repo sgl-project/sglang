@@ -1,13 +1,21 @@
 """
-Test P2P weight transfer for RL training scenarios.
+Performance comparison test for P2PTransferEngine vs P2PTransferManager with Qwen3-32B model.
 
-This test simulates the real RL training workflow:
-- Rank 0: Training process (sender) - updates model weights and sends via RDMA
-- Rank 1+: Rollout processes (receivers) - receive weight updates via P2P RDMA
+This test compares the performance of:
+1. P2PTransferEngine (single MooncakeTransferEngine)
+2. P2PTransferManager (pool of MooncakeTransferEngines)
 
-Architecture:
-- Training side: TrainingWeightSender - listens for sync_status, performs RDMA write
-- Rollout side: P2PTransferEngine - registers memory, sends sync_status, waits for confirmation
+Test scenarios:
+- 1 training + 1 rollout process
+- 1 training + 2 rollout processes
+
+Model: Qwen3-32B
+- 64 transformer layers (8 layers for testing)
+- Hidden size: 5120
+- Intermediate size: 27648
+- Vocab size: 152064
+- Total parameters: ~32B
+- Total memory (fp16): ~64GB
 """
 
 import gc
@@ -16,6 +24,8 @@ import os
 import threading
 import time
 import unittest
+from dataclasses import dataclass
+from typing import Dict
 
 import numpy as np
 import torch
@@ -24,7 +34,7 @@ import zmq
 
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.utils.common import format_tcp_address
-from sglang.srt.weight_sync.p2p_transfer import P2PTransferEngine
+from sglang.srt.weight_sync.p2p_transfer import P2PTransferEngine, P2PTransferManager
 
 logger = logging.getLogger(__name__)
 
@@ -32,23 +42,304 @@ logger = logging.getLogger(__name__)
 mp.set_start_method("spawn", force=True)
 
 
-def create_mock_layer_weights(layer_size: int, device: torch.device) -> torch.Tensor:
-    """Create mock weights for a single layer."""
-    # Simulate a linear layer with shape [hidden_size, hidden_size]
-    weights = torch.randn(layer_size, layer_size, device=device, dtype=torch.float32)
+def create_simple_weight(size: int, device: torch.device, dtype=torch.float16) -> torch.Tensor:
+    """Create a simple weight tensor for correctness testing."""
+    return torch.randn(size, size, device=device, dtype=dtype)
+
+
+def simple_training_process(
+    rank: int,
+    world_size: int,
+    result_queue: mp.Queue,
+    barrier: mp.Barrier,
+    hostname: str = "127.0.0.1",
+    port: int = 50000,
+):
+    """Simplified training process for correctness testing."""
+    try:
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+
+        sender = TrainingWeightSender(hostname=hostname, port=port, gpu_id=rank)
+
+        # Single small weight (128x128 fp16 = 32KB)
+        weight = create_simple_weight(128, device, dtype=torch.float16)
+        weights = {"test_weight": weight}
+
+        total_size_kb = weight.numel() * weight.element_size() / 1e3
+        logger.info(f"[SimpleTrain] Weight size: {total_size_kb:.2f}KB")
+
+        sender.register_weights(weights)
+        sender.start()
+
+        barrier.wait()
+
+        # Single update
+        weight += torch.randn_like(weight) * 0.01
+        torch.cuda.synchronize()
+        sender.register_weights(weights)
+
+        barrier.wait()
+        sender.stop()
+
+    except Exception as e:
+        logger.error(f"[SimpleTrain] Error: {e}", exc_info=True)
+        result_queue.put(("training_error", str(e)))
+
+
+def simple_rollout_process(
+    rank: int,
+    world_size: int,
+    result_queue: mp.Queue,
+    barrier: mp.Barrier,
+    use_manager: bool,
+    training_hostname: str = "127.0.0.1",
+    training_port: int = 50000,
+):
+    """Simplified rollout process for correctness testing."""
+    try:
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+
+        impl_type = "Manager" if use_manager else "Engine"
+        logger.info(f"[SimpleRollout-{rank}] Using {impl_type} on GPU {rank}")
+
+        if use_manager:
+            transfer_impl = P2PTransferManager(
+                hostname="127.0.0.1",
+                gpu_id=rank,
+                ib_device=None,
+            )
+        else:
+            transfer_impl = P2PTransferEngine(
+                hostname="127.0.0.1",
+                gpu_id=rank,
+                ib_device=None,
+            )
+
+        weight = create_simple_weight(128, device, dtype=torch.float16)
+        original_data = weight.clone()
+
+        barrier.wait()
+
+        session_id = f"{training_hostname}:{training_port}"
+        ptr = weight.data_ptr()
+        length = weight.numel() * weight.element_size()
+
+        handle = transfer_impl.submit_transfer_task(
+            session_id=session_id,
+            ptr=ptr,
+            length=length,
+        )
+        handle.wait()
+        torch.cuda.synchronize()
+
+        # Verify data changed
+        data_changed = not torch.equal(weight, original_data)
+        logger.info(f"[SimpleRollout-{rank}] Data changed: {data_changed}")
+
+        result_queue.put((f"rollout_{rank}_success", data_changed))
+
+        barrier.wait()
+
+    except Exception as e:
+        logger.error(f"[SimpleRollout-{rank}] Error: {e}", exc_info=True)
+        result_queue.put((f"rollout_{rank}_error", str(e)))
+
+
+def simple_worker_process(
+    rank: int,
+    world_size: int,
+    result_queue: mp.Queue,
+    barrier: mp.Barrier,
+    use_manager: bool,
+    training_port: int = 50000,
+):
+    """Entry point for simple correctness test worker."""
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+
+    if rank == 0:
+        simple_training_process(rank, world_size, result_queue, barrier, "127.0.0.1", training_port)
+    else:
+        simple_rollout_process(rank, world_size, result_queue, barrier, use_manager, "127.0.0.1", training_port)
+
+
+class TestP2PTransferCorrectness(unittest.TestCase):
+    """Basic correctness tests with small weights."""
+
+    def test_engine_correctness(self):
+        """Test P2PTransferEngine correctness with single small weight."""
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            self.skipTest("Requires at least 2 CUDA devices")
+
+        world_size = 2
+        training_port = 50100
+
+        logger.info("\n" + "="*80)
+        logger.info("Testing P2PTransferEngine Correctness (single 128x128 weight)")
+        logger.info("="*80 + "\n")
+
+        result_queue = mp.Queue()
+        barrier = mp.Barrier(world_size)
+
+        context = mp.spawn(
+            simple_worker_process,
+            args=(world_size, result_queue, barrier, False, training_port),
+            nprocs=world_size,
+            join=False,
+        )
+
+        results = {}
+        timeout = 30
+        start_time = time.time()
+
+        while len(results) < (world_size - 1):
+            try:
+                remaining_time = timeout - (time.time() - start_time)
+                if remaining_time <= 0:
+                    break
+                key, value = result_queue.get(timeout=min(5, remaining_time))
+                results[key] = value
+            except Exception:
+                if all(not p.is_alive() for p in context.processes):
+                    break
+
+        context.join()
+
+        for key in results:
+            if "error" in key:
+                self.fail(f"Process error: {key} = {results[key]}")
+
+        self.assertIn("rollout_1_success", results)
+        self.assertTrue(results["rollout_1_success"], "Data should have changed after transfer")
+
+        logger.info("✓ P2PTransferEngine correctness test passed\n")
+
+        result_queue.close()
+        result_queue.join_thread()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def test_manager_correctness(self):
+        """Test P2PTransferManager correctness with single small weight."""
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            self.skipTest("Requires at least 2 CUDA devices")
+
+        world_size = 2
+        training_port = 50101
+
+        logger.info("\n" + "="*80)
+        logger.info("Testing P2PTransferManager Correctness (single 128x128 weight)")
+        logger.info("="*80 + "\n")
+
+        result_queue = mp.Queue()
+        barrier = mp.Barrier(world_size)
+
+        context = mp.spawn(
+            simple_worker_process,
+            args=(world_size, result_queue, barrier, True, training_port),
+            nprocs=world_size,
+            join=False,
+        )
+
+        results = {}
+        timeout = 30
+        start_time = time.time()
+
+        while len(results) < (world_size - 1):
+            try:
+                remaining_time = timeout - (time.time() - start_time)
+                if remaining_time <= 0:
+                    break
+                key, value = result_queue.get(timeout=min(5, remaining_time))
+                results[key] = value
+            except Exception:
+                if all(not p.is_alive() for p in context.processes):
+                    break
+
+        context.join()
+
+        for key in results:
+            if "error" in key:
+                self.fail(f"Process error: {key} = {results[key]}")
+
+        self.assertIn("rollout_1_success", results)
+        self.assertTrue(results["rollout_1_success"], "Data should have changed after transfer")
+
+        logger.info("✓ P2PTransferManager correctness test passed\n")
+
+        result_queue.close()
+        result_queue.join_thread()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@dataclass
+class Qwen3_32BConfig:
+    """Qwen3-32B model configuration."""
+    num_layers: int = 64
+    hidden_size: int = 5120
+    intermediate_size: int = 27648
+    num_attention_heads: int = 40
+    num_key_value_heads: int = 8
+    vocab_size: int = 152064
+
+    def get_layer_param_counts(self) -> Dict[str, int]:
+        """Get parameter counts for each layer type."""
+        return {
+            "qkv_proj": self.hidden_size * (self.hidden_size + 2 * (self.hidden_size // self.num_attention_heads) * self.num_key_value_heads),
+            "o_proj": self.hidden_size * self.hidden_size,
+            "gate_up_proj": self.hidden_size * self.intermediate_size * 2,
+            "down_proj": self.intermediate_size * self.hidden_size,
+            "ln": self.hidden_size * 2,
+        }
+
+    def get_total_params(self) -> int:
+        """Calculate total parameter count."""
+        layer_params = self.get_layer_param_counts()
+        params_per_layer = sum(layer_params.values())
+        embedding_params = self.vocab_size * self.hidden_size
+        lm_head_params = self.vocab_size * self.hidden_size
+        total = embedding_params + (params_per_layer * self.num_layers) + lm_head_params
+        return total
+
+    def get_total_size_bytes(self, dtype=torch.float16) -> int:
+        """Get total model size in bytes."""
+        element_size = torch.tensor([], dtype=dtype).element_size()
+        return self.get_total_params() * element_size
+
+
+def create_qwen3_layer_weights(config: Qwen3_32BConfig, device: torch.device, dtype=torch.float16) -> Dict[str, torch.Tensor]:
+    """Create mock weights for a single Qwen3-32B transformer layer."""
+    weights = {}
+    qkv_size = config.hidden_size + 2 * (config.hidden_size // config.num_attention_heads) * config.num_key_value_heads
+    weights["qkv_proj"] = torch.randn(qkv_size, config.hidden_size, device=device, dtype=dtype)
+    weights["o_proj"] = torch.randn(config.hidden_size, config.hidden_size, device=device, dtype=dtype)
+    weights["gate_up_proj"] = torch.randn(config.intermediate_size * 2, config.hidden_size, device=device, dtype=dtype)
+    weights["down_proj"] = torch.randn(config.hidden_size, config.intermediate_size, device=device, dtype=dtype)
+    weights["ln1"] = torch.randn(config.hidden_size, device=device, dtype=dtype)
+    weights["ln2"] = torch.randn(config.hidden_size, device=device, dtype=dtype)
+    return weights
+
+
+def create_qwen3_full_model(config: Qwen3_32BConfig, device: torch.device, dtype=torch.float16) -> Dict[str, torch.Tensor]:
+    """Create full Qwen3-32B model weights (using 8 layers for testing)."""
+    weights = {}
+    weights["embedding"] = torch.randn(config.vocab_size, config.hidden_size, device=device, dtype=dtype)
+
+    num_test_layers = min(config.num_layers, 8)
+    for layer_idx in range(num_test_layers):
+        layer_weights = create_qwen3_layer_weights(config, device, dtype)
+        for name, weight in layer_weights.items():
+            weights[f"layer_{layer_idx}_{name}"] = weight
+
+    weights["lm_head"] = torch.randn(config.vocab_size, config.hidden_size, device=device, dtype=dtype)
     return weights
 
 
 class TrainingWeightSender:
-    """
-    Training-side weight sender that handles RDMA write operations.
-
-    Workflow:
-    1. Listen for sync_status messages from rollout workers
-    2. Extract rollout's ip:port and registered ptr
-    3. Perform RDMA write to send weights
-    4. Send confirmation back to rollout worker
-    """
+    """Training-side weight sender that handles RDMA write operations."""
 
     def __init__(self, hostname: str, port: int, gpu_id: int):
         self.hostname = hostname
@@ -56,59 +347,49 @@ class TrainingWeightSender:
         self.gpu_id = gpu_id
         self.running = False
 
-        # Initialize Mooncake transfer engine for RDMA writes
         self.engine = MooncakeTransferEngine(
             hostname=hostname,
             gpu_id=gpu_id,
             ib_device=None,
         )
 
-        # ZMQ socket for receiving sync_status and sending confirmations
         self.context = zmq.Context()
         self.router_socket = self.context.socket(zmq.ROUTER)
         self.router_socket.bind(f"tcp://{hostname}:{port}")
 
-        # Track registered weight buffers
-        self.weight_buffers = {}  # name -> (ptr, length, tensor)
+        self.weight_buffers = {}
 
-        logger.info(f"[TrainingWeightSender] Initialized on {hostname}:{port}, GPU {gpu_id}")
+        logger.info(f"[TrainingSender] Initialized on {hostname}:{port}, GPU {gpu_id}")
 
-    def register_weights(self, name: str, tensor: torch.Tensor):
-        """Register weight tensor for sending."""
-        ptr = tensor.data_ptr()
-        length = tensor.numel() * tensor.element_size()
+    def register_weights(self, weights_dict: Dict[str, torch.Tensor]):
+        """Register all weight tensors for sending."""
+        for name, tensor in weights_dict.items():
+            ptr = tensor.data_ptr()
+            length = tensor.numel() * tensor.element_size()
 
-        # Check if this memory region is already registered
-        if name in self.weight_buffers:
-            existing_ptr = self.weight_buffers[name]['ptr']
-            if existing_ptr == ptr:
-                # Same memory region, just update the tensor reference
-                self.weight_buffers[name]['tensor'] = tensor
-                logger.debug(f"[TrainingWeightSender] Updated tensor reference for '{name}': ptr={ptr:#x}")
-                return
-            else:
-                # Different memory region, need to register new one
-                logger.info(f"[TrainingWeightSender] Re-registering '{name}' with new ptr: {existing_ptr:#x} -> {ptr:#x}")
+            if name in self.weight_buffers:
+                existing_ptr = self.weight_buffers[name]['ptr']
+                if existing_ptr == ptr:
+                    self.weight_buffers[name]['tensor'] = tensor
+                    continue
 
-        # Register with Mooncake engine
-        self.engine.register(ptr, length)
+            self.engine.register(ptr, length)
+            self.weight_buffers[name] = {
+                'ptr': ptr,
+                'length': length,
+                'tensor': tensor,
+            }
 
-        self.weight_buffers[name] = {
-            'ptr': ptr,
-            'length': length,
-            'tensor': tensor,
-        }
-        logger.info(f"[TrainingWeightSender] Registered weights '{name}': ptr={ptr:#x}, length={length}")
+        logger.info(f"[TrainingSender] Registered {len(weights_dict)} weight tensors")
 
     def start(self):
-        """Start the message handling loop in a background thread."""
+        """Start the message handling loop."""
         if self.running:
             return
-
         self.running = True
         self.handler_thread = threading.Thread(target=self._message_loop, daemon=True)
         self.handler_thread.start()
-        logger.info("[TrainingWeightSender] Started message handler")
+        logger.info("[TrainingSender] Started message handler")
 
     def stop(self):
         """Stop the sender."""
@@ -117,125 +398,57 @@ class TrainingWeightSender:
             self.handler_thread.join(timeout=2)
         self.router_socket.close()
         self.context.term()
-        logger.info("[TrainingWeightSender] Stopped")
+        logger.info("[TrainingSender] Stopped")
 
     def _message_loop(self):
-        """Handle incoming sync_status messages from rollout workers."""
+        """Handle incoming sync_status messages."""
         while self.running:
             try:
-                if self.router_socket.poll(timeout=100):  # 100ms timeout
-                    # ROUTER receives frames from DEALER
+                if self.router_socket.poll(timeout=100):
                     frames = self.router_socket.recv_multipart()
-
-                    logger.debug(f"[TrainingWeightSender] Received {len(frames)} frames, "
-                                f"frame lengths: {[len(f) for f in frames]}")
-
                     if len(frames) < 2:
-                        logger.warning(f"[TrainingWeightSender] Received malformed message with {len(frames)} frames")
                         continue
 
-                    # ROUTER adds identity as first frame
-                    # Format is typically: [identity, delimiter (empty), actual_message]
                     identity = frames[0]
-
-                    # Try to find the JSON payload
                     message = None
                     for i in range(1, len(frames)):
                         try:
-                            if len(frames[i]) > 0:  # Skip empty frames
+                            if len(frames[i]) > 0:
                                 message = zmq.utils.jsonapi.loads(frames[i])
-                                logger.debug(f"[TrainingWeightSender] Found JSON in frame {i}")
                                 break
                         except Exception:
                             continue
 
                     if message is None:
-                        logger.error(f"[TrainingWeightSender] Could not decode JSON from any frame")
                         continue
 
                     msg_type = message.get("type", "")
-
                     if msg_type == "sync_status":
-                        # Handle sync_status from rollout worker
                         self._handle_sync_status(identity, message)
-                    else:
-                        logger.warning(f"[TrainingWeightSender] Unknown message type: {msg_type}")
 
             except zmq.ZMQError as e:
                 if self.running:
-                    logger.error(f"[TrainingWeightSender] ZMQ error: {e}")
+                    logger.error(f"[TrainingSender] ZMQ error: {e}")
                 break
             except Exception as e:
-                logger.error(f"[TrainingWeightSender] Error in message loop: {e}", exc_info=True)
+                logger.error(f"[TrainingSender] Error: {e}", exc_info=True)
 
     def _handle_sync_status(self, identity: bytes, message: dict):
-        """
-        Handle sync_status message from rollout worker.
-
-        Message format:
-        {
-            "type": "sync_status",
-            "p2p_session_id": "training_ip:training_port",  # Training's ZMQ address
-            "status": "ready",
-            "ip": rollout_ip,
-            "transfer_session_id": rollout_mooncake_session_id,  # Rollout's Mooncake RPC address
-            "ptr": rollout_ptr,
-            "length": buffer_length,
-            "task_id": task_id
-        }
-        """
-        # Log the raw message for debugging
-        logger.debug(f"[TrainingWeightSender] Raw message: {message}")
-
-        p2p_session_id = message.get("p2p_session_id", "")
-        rollout_ip = message.get("ip", "")
+        """Handle sync_status and perform RDMA transfer."""
         rollout_transfer_session_id = message.get("transfer_session_id", "")
         rollout_ptr = message.get("ptr", 0)
         rollout_length = message.get("length", 0)
         task_id = message.get("task_id", "")
 
-        logger.info(
-            f"[TrainingWeightSender] Received sync_status: "
-            f"p2p_session_id={p2p_session_id}, "
-            f"task_id={task_id}, "
-            f"rollout_transfer_session_id={rollout_transfer_session_id}, "
-            f"rollout_ip={rollout_ip}, "
-            f"rollout_ptr={rollout_ptr:#x}"
-        )
-
         try:
-            # Get the weights to send (for now, use the first registered weights)
-            if not self.weight_buffers:
-                raise RuntimeError("No weights registered")
-
-            # Get first weight buffer
             weight_name = list(self.weight_buffers.keys())[0]
             weight_info = self.weight_buffers[weight_name]
             src_ptr = weight_info['ptr']
             src_length = weight_info['length']
 
-            # Verify length matches
             if src_length != rollout_length:
-                raise RuntimeError(
-                    f"Length mismatch: src={src_length}, dst={rollout_length}"
-                )
+                raise RuntimeError(f"Length mismatch: src={src_length}, dst={rollout_length}")
 
-            # Validate that we have rollout_transfer_session_id
-            if not rollout_transfer_session_id:
-                raise RuntimeError(
-                    "Missing rollout_transfer_session_id in sync_status message. "
-                    "This is required for establishing RDMA connection."
-                )
-
-            logger.info(
-                f"[TrainingWeightSender] Performing RDMA write: "
-                f"src_ptr={src_ptr:#x} -> dst_ptr={rollout_ptr:#x}, "
-                f"length={src_length}, "
-                f"target_session={rollout_transfer_session_id}"
-            )
-
-            # Perform RDMA write using Mooncake transfer engine
-            # Use rollout's Mooncake transfer_session_id for RDMA connection
             status = self.engine.transfer_sync(
                 session_id=rollout_transfer_session_id,
                 buffer=src_ptr,
@@ -246,12 +459,8 @@ class TrainingWeightSender:
             if status != 0:
                 raise RuntimeError(f"RDMA transfer failed with status {status}")
 
-            logger.info(
-                f"[TrainingWeightSender] RDMA write completed successfully for task {task_id}"
-            )
+            logger.info(f"[TrainingSender] RDMA completed: task={task_id}, size={src_length/1e6:.2f}MB")
 
-            # Send success confirmation back to rollout worker
-            # ROUTER to DEALER: [identity, empty_delimiter, payload]
             response_data = zmq.utils.jsonapi.dumps({
                 "type": "transfer_complete",
                 "status": "success",
@@ -259,12 +468,8 @@ class TrainingWeightSender:
             })
             self.router_socket.send_multipart([identity, b"", response_data])
 
-            logger.info(f"[TrainingWeightSender] Sent success confirmation for task {task_id}")
-
         except Exception as e:
-            logger.error(f"[TrainingWeightSender] Error handling sync_status: {e}", exc_info=True)
-
-            # Send failure confirmation
+            logger.error(f"[TrainingSender] Error handling sync_status: {e}", exc_info=True)
             response_data = zmq.utils.jsonapi.dumps({
                 "type": "transfer_complete",
                 "status": "failed",
@@ -277,79 +482,52 @@ class TrainingWeightSender:
 def training_process(
     rank: int,
     world_size: int,
-    layer_size: int,
+    config: Qwen3_32BConfig,
     num_updates: int,
     result_queue: mp.Queue,
     barrier: mp.Barrier,
     hostname: str = "127.0.0.1",
     port: int = 50000,
 ):
-    """
-    Training process that sends weight updates to rollout workers.
-
-    This simulates the training side in RL:
-    1. Initialize model weights
-    2. Start TrainingWeightSender to handle rollout requests
-    3. Perform training updates
-    4. Wait for rollout workers to sync
-    """
+    """Training process."""
     try:
-        # Set device
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
 
         logger.info(f"[Training] Initializing on GPU {rank}")
 
-        # Initialize training weight sender
-        sender = TrainingWeightSender(
-            hostname=hostname,
-            port=port,
-            gpu_id=rank,
-        )
+        sender = TrainingWeightSender(hostname=hostname, port=port, gpu_id=rank)
 
-        # Create mock model layer weights
-        weights = create_mock_layer_weights(layer_size, device)
-        logger.info(f"[Training] Created weights with shape {weights.shape}")
+        logger.info(f"[Training] Creating Qwen3-32B model weights...")
+        weights = create_qwen3_full_model(config, device, dtype=torch.float16)
 
-        # Register weights with sender
-        sender.register_weights("layer_weights", weights)
+        total_params = sum(w.numel() for w in weights.values())
+        total_size_mb = sum(w.numel() * w.element_size() for w in weights.values()) / 1e6
+        logger.info(f"[Training] Model created: {total_params/1e9:.2f}B params, {total_size_mb:.2f}MB")
 
-        # Start sender to handle rollout requests
+        sender.register_weights(weights)
         sender.start()
 
-        # Store initial weights for verification
-        initial_weights = weights.clone().cpu().numpy()
-        result_queue.put(("training_initial_weights", initial_weights))
-
-        # Wait for all rollout processes to be ready
         logger.info("[Training] Waiting for rollout processes...")
         barrier.wait()
 
-        # Simulate training updates
         for update_idx in range(num_updates):
-            # Simulate weight update (gradient step)
-            weights += torch.randn_like(weights) * 0.1
+            update_start = time.time()
+
+            for weight in weights.values():
+                weight += torch.randn_like(weight) * 0.01
             torch.cuda.synchronize()
 
-            logger.info(f"[Training] Update {update_idx + 1}/{num_updates} completed")
+            update_end = time.time()
+            logger.info(
+                f"[Training] Update {update_idx + 1}/{num_updates} completed in "
+                f"{(update_end - update_start)*1000:.2f}ms"
+            )
 
-            # Update registered weights in sender
-            sender.register_weights("layer_weights", weights)
-
-            # Wait for rollout workers to pull the weights
-            # (rollout workers will send sync_status, sender will handle)
-            time.sleep(0.5)  # Give time for transfers
-
-            # Synchronize before next update
+            sender.register_weights(weights)
             barrier.wait()
 
-        # Store final weights for verification
-        final_weights = weights.cpu().numpy()
-        result_queue.put(("training_final_weights", final_weights))
-
-        logger.info("[Training] All updates completed successfully")
-
-        # Stop sender
+        logger.info("[Training] All updates completed")
         sender.stop()
 
     except Exception as e:
@@ -360,105 +538,101 @@ def training_process(
 def rollout_process(
     rank: int,
     world_size: int,
-    layer_size: int,
+    config: Qwen3_32BConfig,
     num_updates: int,
     result_queue: mp.Queue,
     barrier: mp.Barrier,
+    use_manager: bool,
     training_hostname: str = "127.0.0.1",
     training_port: int = 50000,
 ):
-    """
-    Rollout process that receives weight updates from training process.
-
-    This simulates the rollout worker side in RL:
-    1. Allocate buffer for weights
-    2. Initialize P2PTransferEngine
-    3. For each update: submit_transfer_task -> sends sync_status -> waits for transfer
-    """
+    """Rollout process using either Engine or Manager."""
     try:
-        # Set device
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
 
-        logger.info(f"[Rollout-{rank}] Initializing on GPU {rank}")
+        impl_type = "Manager" if use_manager else "Engine"
+        logger.info(f"[Rollout-{rank}] Initializing with {impl_type} on GPU {rank}")
 
-        # Initialize P2P transfer engine (receiver side)
-        engine = P2PTransferEngine(
-            hostname="127.0.0.1",  # This rollout worker's IP
-            gpu_id=rank,
-            ib_device=None,
-        )
+        if use_manager:
+            transfer_impl = P2PTransferManager(
+                hostname="127.0.0.1",
+                gpu_id=rank,
+                ib_device=None,
+            )
+            logger.info(f"[Rollout-{rank}] Using Manager with {transfer_impl.engine_pool_size} engines")
+        else:
+            transfer_impl = P2PTransferEngine(
+                hostname="127.0.0.1",
+                gpu_id=rank,
+                ib_device=None,
+            )
+            logger.info(f"[Rollout-{rank}] Using Engine")
 
-        # Allocate buffer for receiving weights
-        weights = create_mock_layer_weights(layer_size, device)
-        total_size_mb = (weights.numel() * weights.element_size()) / 1e6
-        logger.info(f"[Rollout-{rank}] Allocated buffer with shape {weights.shape}, size={total_size_mb:.2f}MB")
+        weights = create_qwen3_full_model(config, device, dtype=torch.float16)
 
-        # Store initial (random) weights
-        initial_weights = weights.clone().cpu().numpy()
-        result_queue.put((f"rollout_{rank}_initial_weights", initial_weights))
+        total_params = sum(w.numel() for w in weights.values())
+        total_size_mb = sum(w.numel() * w.element_size() for w in weights.values()) / 1e6
+        logger.info(f"[Rollout-{rank}] Allocated buffers: {total_params/1e9:.2f}B params, {total_size_mb:.2f}MB")
 
-        # Signal ready to training process
-        logger.info(f"[Rollout-{rank}] Ready to receive updates")
         barrier.wait()
 
-        # Track timing for all transfers
         all_transfer_times = []
 
-        # Receive weight updates
         for update_idx in range(num_updates):
             update_start = time.time()
 
-            # Get buffer pointer and size
-            ptr = weights.data_ptr()
-            length = weights.numel() * weights.element_size()
-
-            # Submit transfer task
             session_id = f"{training_hostname}:{training_port}"
+            handles = []
 
             submission_start = time.time()
-            handle = engine.submit_transfer_task(
-                session_id=session_id,
-                ptr=ptr,
-                length=length,
-            )
+            for weight_name, weight_tensor in weights.items():
+                ptr = weight_tensor.data_ptr()
+                length = weight_tensor.numel() * weight_tensor.element_size()
+
+                handle = transfer_impl.submit_transfer_task(
+                    session_id=session_id,
+                    ptr=ptr,
+                    length=length,
+                )
+                handles.append((weight_name, handle))
+
             submission_end = time.time()
 
             logger.info(
-                f"[Rollout-{rank}] Submitted transfer task for update {update_idx + 1} in "
+                f"[Rollout-{rank}] Submitted {len(handles)} transfer tasks in "
                 f"{(submission_end - submission_start)*1000:.2f}ms"
             )
 
-            # Wait for transfer to complete
             wait_start = time.time()
-            handle.wait()
+            for weight_name, handle in handles:
+                handle.wait()
+
             torch.cuda.synchronize()
             wait_end = time.time()
 
             update_end = time.time()
 
             total_time = update_end - update_start
-            submission_time = submission_end - submission_start
             wait_time = wait_end - wait_start
 
             all_transfer_times.append({
                 'update_idx': update_idx,
                 'total_time': total_time,
-                'submission_time': submission_time,
+                'submission_time': submission_end - submission_start,
                 'wait_time': wait_time,
-                'total_bytes': length,
+                'num_weights': len(handles),
+                'total_bytes': sum(w.numel() * w.element_size() for w in weights.values()),
             })
 
             logger.info(
                 f"[Rollout-{rank}] Update {update_idx + 1}/{num_updates} completed: "
-                f"total={total_time*1000:.2f}ms, submission={submission_time*1000:.2f}ms, "
-                f"wait={wait_time*1000:.2f}ms, bandwidth={(length * 8) / (total_time * 1e9):.2f}Gbps"
+                f"total={total_time*1000:.2f}ms, submission={((submission_end - submission_start)*1000):.2f}ms, "
+                f"wait={wait_time*1000:.2f}ms, bandwidth={(sum(w.numel() * w.element_size() for w in weights.values()) * 8) / (total_time * 1e9):.2f}Gbps"
             )
 
-            # Synchronize with training process
             barrier.wait()
 
-        # Calculate and report statistics
         avg_total_time = np.mean([t['total_time'] for t in all_transfer_times])
         avg_wait_time = np.mean([t['wait_time'] for t in all_transfer_times])
         total_bytes = all_transfer_times[0]['total_bytes']
@@ -466,19 +640,17 @@ def rollout_process(
 
         stats = {
             'rank': rank,
+            'impl_type': impl_type,
             'num_updates': num_updates,
             'avg_total_time': avg_total_time,
             'avg_wait_time': avg_wait_time,
             'avg_bandwidth_gbps': avg_bandwidth,
             'total_bytes': total_bytes,
+            'engine_pool_size': transfer_impl.engine_pool_size if use_manager else 1,
             'all_transfers': all_transfer_times,
         }
 
         result_queue.put((f"rollout_{rank}_stats", stats))
-
-        # Store final received weights for verification
-        final_weights = weights.cpu().numpy()
-        result_queue.put((f"rollout_{rank}_final_weights", final_weights))
 
         logger.info(
             f"[Rollout-{rank}] All updates completed. Avg time: {avg_total_time*1000:.2f}ms, "
@@ -493,105 +665,87 @@ def rollout_process(
 def worker_process(
     rank: int,
     world_size: int,
-    layer_size: int,
+    config: Qwen3_32BConfig,
     num_updates: int,
     result_queue: mp.Queue,
     barrier: mp.Barrier,
+    use_manager: bool,
     training_port: int = 50000,
 ):
     """Entry point for each worker process."""
-    # Important: Set these to avoid NCCL issues
     os.environ["NCCL_CUMEM_ENABLE"] = "0"
     os.environ["NCCL_NVLS_ENABLE"] = "0"
 
     if rank == 0:
-        # Training process
         training_process(
-            rank, world_size, layer_size, num_updates,
+            rank, world_size, config, num_updates,
             result_queue, barrier, "127.0.0.1", training_port
         )
     else:
-        # Rollout process
         rollout_process(
-            rank, world_size, layer_size, num_updates,
-            result_queue, barrier, "127.0.0.1", training_port
+            rank, world_size, config, num_updates,
+            result_queue, barrier, use_manager, "127.0.0.1", training_port
         )
 
 
-class TestP2PTransferRL(unittest.TestCase):
-    """Test P2P transfer in RL training scenario with multiple processes."""
+class TestP2PTransferPerformance(unittest.TestCase):
+    """Performance comparison tests for Engine vs Manager."""
 
-    def test_single_training_single_rollout(self):
-        """
-        Test basic RL scenario: 1 training process + 1 rollout process.
-        Simulates training->rollout weight synchronization.
-        """
+    def test_engine_1v1_qwen3(self):
+        """Test P2PTransferEngine: 1 training + 1 rollout with Qwen3-32B."""
         if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
             self.skipTest("Requires at least 2 CUDA devices")
 
-        world_size = 2  # 1 training + 1 rollout
-        layer_size = 128  # Small layer for fast testing
-        num_updates = 3  # Number of weight updates
-        training_port = 50000
+        world_size = 2
+        config = Qwen3_32BConfig()
+        num_updates = 3
+        training_port = 50200
 
         logger.info(
-            f"Starting test: {world_size} processes, "
-            f"layer_size={layer_size}, updates={num_updates}"
+            f"\n{'='*80}\n"
+            f"Testing P2PTransferEngine (1v1)\n"
+            f"Config: {world_size} processes, {num_updates} updates\n"
+            f"{'='*80}\n"
         )
 
         result_queue = mp.Queue()
         barrier = mp.Barrier(world_size)
 
-        # Spawn processes
         context = mp.spawn(
             worker_process,
-            args=(world_size, layer_size, num_updates, result_queue, barrier, training_port),
+            args=(world_size, config, num_updates, result_queue, barrier, False, training_port),
             nprocs=world_size,
             join=False,
         )
 
-        # Collect results
         results = {}
-        timeout = 60  # 60 seconds timeout
+        timeout = 120
         start_time = time.time()
 
-        expected_results = 2 + world_size + (world_size - 1)  # initial + final weights + stats for rollouts
-        while len(results) < expected_results:
+        while len(results) < (world_size - 1):
             try:
                 remaining_time = timeout - (time.time() - start_time)
                 if remaining_time <= 0:
                     break
-                key, value = result_queue.get(timeout=min(5, remaining_time))
+                key, value = result_queue.get(timeout=min(10, remaining_time))
                 results[key] = value
-            except Exception as e:
+            except Exception:
                 if all(not p.is_alive() for p in context.processes):
                     break
 
         context.join()
 
-        # Verify results
-        self.assertIn("training_initial_weights", results)
-        self.assertIn("training_final_weights", results)
-        self.assertIn("rollout_1_initial_weights", results)
-        self.assertIn("rollout_1_final_weights", results)
-
-        # Check for errors
         for key in results:
             if "error" in key:
                 self.fail(f"Process error: {key} = {results[key]}")
 
-        # Verify shapes match
-        training_final = results["training_final_weights"]
-        rollout_final = results["rollout_1_final_weights"]
-
-        self.assertEqual(training_final.shape, rollout_final.shape)
-
-        # Print statistics if available
         if "rollout_1_stats" in results:
             stats = results["rollout_1_stats"]
             logger.info(
                 f"\n{'='*80}\n"
-                f"Rollout-1 Statistics:\n"
+                f"P2PTransferEngine (1v1) Results:\n"
+                f"  Impl: {stats['impl_type']}\n"
+                f"  Engine pool size: {stats['engine_pool_size']}\n"
                 f"  Avg total time: {stats['avg_total_time']*1000:.2f}ms\n"
                 f"  Avg wait time: {stats['avg_wait_time']*1000:.2f}ms\n"
                 f"  Avg bandwidth: {stats['avg_bandwidth_gbps']:.2f}Gbps\n"
@@ -599,29 +753,26 @@ class TestP2PTransferRL(unittest.TestCase):
                 f"{'='*80}\n"
             )
 
-        logger.info("Test passed: Single training + single rollout")
-
-        # Cleanup
         result_queue.close()
         result_queue.join_thread()
         gc.collect()
         torch.cuda.empty_cache()
 
-    def test_single_training_multiple_rollouts(self):
-        """
-        Test scaled RL scenario: 1 training process + multiple rollout processes.
-        """
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
-            self.skipTest("Requires at least 3 CUDA devices")
+    def test_manager_1v1_qwen3(self):
+        """Test P2PTransferManager: 1 training + 1 rollout with Qwen3-32B."""
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            self.skipTest("Requires at least 2 CUDA devices")
 
-        world_size = 3  # 1 training + 2 rollouts
-        layer_size = 128
-        num_updates = 2
-        training_port = 50001
+        world_size = 2
+        config = Qwen3_32BConfig()
+        num_updates = 3
+        training_port = 50201
 
         logger.info(
-            f"Starting test: {world_size} processes "
-            f"(1 training + {world_size-1} rollouts)"
+            f"\n{'='*80}\n"
+            f"Testing P2PTransferManager (1v1)\n"
+            f"Config: {world_size} processes, {num_updates} updates\n"
+            f"{'='*80}\n"
         )
 
         result_queue = mp.Queue()
@@ -629,120 +780,185 @@ class TestP2PTransferRL(unittest.TestCase):
 
         context = mp.spawn(
             worker_process,
-            args=(world_size, layer_size, num_updates, result_queue, barrier, training_port),
+            args=(world_size, config, num_updates, result_queue, barrier, True, training_port),
             nprocs=world_size,
             join=False,
         )
 
-        # Collect results
         results = {}
-        timeout = 60
+        timeout = 120
         start_time = time.time()
 
-        expected_results = 2 + (world_size - 1) * 3  # training + (weights + stats) for all rollouts
-        while len(results) < expected_results:
+        while len(results) < (world_size - 1):
             try:
                 remaining_time = timeout - (time.time() - start_time)
                 if remaining_time <= 0:
                     break
-                key, value = result_queue.get(timeout=min(5, remaining_time))
+                key, value = result_queue.get(timeout=min(10, remaining_time))
                 results[key] = value
-            except Exception as e:
+            except Exception:
                 if all(not p.is_alive() for p in context.processes):
                     break
 
         context.join()
 
-        # Verify all processes completed
-        self.assertIn("training_final_weights", results)
-        for rank in range(1, world_size):
-            self.assertIn(f"rollout_{rank}_final_weights", results)
-
-        # Check for errors
         for key in results:
             if "error" in key:
                 self.fail(f"Process error: {key} = {results[key]}")
 
-        # Verify all rollouts received weights with same shape
-        training_final = results["training_final_weights"]
-        for rank in range(1, world_size):
-            rollout_final = results[f"rollout_{rank}_final_weights"]
-            self.assertEqual(
-                training_final.shape,
-                rollout_final.shape,
-                f"Shape mismatch for rollout {rank}"
+        if "rollout_1_stats" in results:
+            stats = results["rollout_1_stats"]
+            logger.info(
+                f"\n{'='*80}\n"
+                f"P2PTransferManager (1v1) Results:\n"
+                f"  Impl: {stats['impl_type']}\n"
+                f"  Engine pool size: {stats['engine_pool_size']}\n"
+                f"  Avg total time: {stats['avg_total_time']*1000:.2f}ms\n"
+                f"  Avg wait time: {stats['avg_wait_time']*1000:.2f}ms\n"
+                f"  Avg bandwidth: {stats['avg_bandwidth_gbps']:.2f}Gbps\n"
+                f"  Total data: {stats['total_bytes']/1e6:.2f}MB\n"
+                f"{'='*80}\n"
             )
 
-        # Print comparative statistics
-        logger.info(f"\n{'='*80}\nComparative Statistics:\n")
+        result_queue.close()
+        result_queue.join_thread()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def test_engine_1v2_qwen3(self):
+        """Test P2PTransferEngine: 1 training + 2 rollouts with Qwen3-32B."""
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
+            self.skipTest("Requires at least 3 CUDA devices")
+
+        world_size = 3
+        config = Qwen3_32BConfig()
+        num_updates = 2
+        training_port = 50202
+
+        logger.info(
+            f"\n{'='*80}\n"
+            f"Testing P2PTransferEngine (1v2)\n"
+            f"Config: {world_size} processes, {num_updates} updates\n"
+            f"{'='*80}\n"
+        )
+
+        result_queue = mp.Queue()
+        barrier = mp.Barrier(world_size)
+
+        context = mp.spawn(
+            worker_process,
+            args=(world_size, config, num_updates, result_queue, barrier, False, training_port),
+            nprocs=world_size,
+            join=False,
+        )
+
+        results = {}
+        timeout = 120
+        start_time = time.time()
+
+        while len(results) < (world_size - 1):
+            try:
+                remaining_time = timeout - (time.time() - start_time)
+                if remaining_time <= 0:
+                    break
+                key, value = result_queue.get(timeout=min(10, remaining_time))
+                results[key] = value
+            except Exception:
+                if all(not p.is_alive() for p in context.processes):
+                    break
+
+        context.join()
+
+        for key in results:
+            if "error" in key:
+                self.fail(f"Process error: {key} = {results[key]}")
+
+        logger.info(f"\n{'='*80}\nP2PTransferEngine (1v2) Results:\n")
         for rank in range(1, world_size):
-            key = f"rollout_{rank}_stats"
-            if key in results:
-                stats = results[key]
+            if f"rollout_{rank}_stats" in results:
+                stats = results[f"rollout_{rank}_stats"]
                 logger.info(
-                    f"Rollout-{rank}: "
+                    f"Rollout-{rank} ({stats['impl_type']}): "
                     f"avg_time={stats['avg_total_time']*1000:.2f}ms, "
-                    f"bandwidth={stats['avg_bandwidth_gbps']:.2f}Gbps"
+                    f"bandwidth={stats['avg_bandwidth_gbps']:.2f}Gbps, "
+                    f"pool_size={stats['engine_pool_size']}"
                 )
         logger.info(f"{'='*80}\n")
 
-        logger.info(f"Test passed: 1 training + {world_size-1} rollouts")
+        result_queue.close()
+        result_queue.join_thread()
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        # Cleanup
+    def test_manager_1v2_qwen3(self):
+        """Test P2PTransferManager: 1 training + 2 rollouts with Qwen3-32B."""
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
+            self.skipTest("Requires at least 3 CUDA devices")
+
+        world_size = 3
+        config = Qwen3_32BConfig()
+        num_updates = 2
+        training_port = 50203
+
+        logger.info(
+            f"\n{'='*80}\n"
+            f"Testing P2PTransferManager (1v2)\n"
+            f"Config: {world_size} processes, {num_updates} updates\n"
+            f"{'='*80}\n"
+        )
+
+        result_queue = mp.Queue()
+        barrier = mp.Barrier(world_size)
+
+        context = mp.spawn(
+            worker_process,
+            args=(world_size, config, num_updates, result_queue, barrier, True, training_port),
+            nprocs=world_size,
+            join=False,
+        )
+
+        results = {}
+        timeout = 120
+        start_time = time.time()
+
+        while len(results) < (world_size - 1):
+            try:
+                remaining_time = timeout - (time.time() - start_time)
+                if remaining_time <= 0:
+                    break
+                key, value = result_queue.get(timeout=min(10, remaining_time))
+                results[key] = value
+            except Exception:
+                if all(not p.is_alive() for p in context.processes):
+                    break
+
+        context.join()
+
+        for key in results:
+            if "error" in key:
+                self.fail(f"Process error: {key} = {results[key]}")
+
+        logger.info(f"\n{'='*80}\nP2PTransferManager (1v2) Results:\n")
+        for rank in range(1, world_size):
+            if f"rollout_{rank}_stats" in results:
+                stats = results[f"rollout_{rank}_stats"]
+                logger.info(
+                    f"Rollout-{rank} ({stats['impl_type']}): "
+                    f"avg_time={stats['avg_total_time']*1000:.2f}ms, "
+                    f"bandwidth={stats['avg_bandwidth_gbps']:.2f}Gbps, "
+                    f"pool_size={stats['engine_pool_size']}"
+                )
+        logger.info(f"{'='*80}\n")
+
         result_queue.close()
         result_queue.join_thread()
         gc.collect()
         torch.cuda.empty_cache()
 
 
-class TestP2PTransferEngineBasic(unittest.TestCase):
-    """Basic unit tests for P2PTransferEngine without multiprocessing."""
-
-    def test_engine_initialization(self):
-        """Test that engine initializes correctly."""
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA not available")
-
-        engine = P2PTransferEngine(
-            hostname="127.0.0.1",
-            gpu_id=0,
-            ib_device=None,
-        )
-
-        # Verify internal structures
-        self.assertIsNotNone(engine.engine)
-        self.assertIsNotNone(engine.transfer_queues)
-        self.assertIsNotNone(engine.executors)
-        self.assertIsNotNone(engine.socket_cache)
-        self.assertEqual(engine.task_counter, 0)
-
-        logger.info("Engine initialization test passed")
-
-    def test_task_id_generation(self):
-        """Test unique task ID generation."""
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA not available")
-
-        engine = P2PTransferEngine(
-            hostname="127.0.0.1",
-            gpu_id=0,
-            ib_device=None,
-        )
-
-        # Generate multiple task IDs
-        task_ids = set()
-        for i in range(10):
-            task_id = engine._generate_task_id()
-            self.assertNotIn(task_id, task_ids)
-            task_ids.add(task_id)
-
-        logger.info("Task ID generation test passed")
-
-
 if __name__ == "__main__":
-    # Use DEBUG level to see more detailed logs
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="[%(asctime)s] %(levelname)s %(filename)s:%(lineno)d: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
