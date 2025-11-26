@@ -1,5 +1,5 @@
 from contextlib import ExitStack
-from typing import Any, Callable, Union
+from typing import Any, Callable
 from unittest.mock import patch
 
 import torch
@@ -7,35 +7,10 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
-
-
-def weak_ref_tensor(tensor: Any) -> Any:
-    """
-    Create a weak reference to a tensor.
-    The new tensor will share the same data as the original tensor,
-    but will not keep the original tensor alive.
-    """
-    if isinstance(tensor, torch.Tensor):
-        return torch.ops.jit_weak_ref_tensor_npu.weak_ref_tensor(tensor)
-    else:
-        return tensor
-
-
-def weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]]
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
-    """
-    Convenience function to create weak references to tensors,
-    for single tensor, list of tensors or tuple of tensors.
-    """
-    if isinstance(tensors, torch.Tensor):
-        return weak_ref_tensor(tensors)
-    if isinstance(tensors, list):
-        return [weak_ref_tensor(t) for t in tensors]
-    if isinstance(tensors, tuple):
-        return tuple(weak_ref_tensor(t) for t in tensors)
-    raise ValueError("Invalid type for tensors")
+from sglang.srt.compilation.cuda_piecewise_backend import (
+    CUDAPiecewiseBackend,
+    weak_ref_tensors,
+)
 
 
 class NPUPiecewiseBackend(CUDAPiecewiseBackend):
@@ -79,10 +54,11 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            entry.input_addresses = input_addresses
+            if self.compile_config.get_enable_debug_mode():
+                input_addresses = [
+                    x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+                ]
+                entry.input_addresses = input_addresses
             npugraph = torch.npu.NPUGraph()
 
             with ExitStack() as stack:
@@ -120,7 +96,7 @@ class NPUPiecewiseBackend(CUDAPiecewiseBackend):
             # manage the memory during cuda graph capture
             return output
 
-        if self.is_debugging_mode:
+        if self.compile_config.get_enable_debug_mode():
             # check if the input addresses are the same
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
