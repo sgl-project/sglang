@@ -58,7 +58,7 @@ elif _is_hip:
     else:
         from vllm import _custom_ops as vllm_ops
 elif _is_xpu:
-    from sgl_kernel import silu_and_mul, moe_sum
+    from sgl_kernel import moe_sum, silu_and_mul
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
