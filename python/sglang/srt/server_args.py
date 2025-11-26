@@ -1510,6 +1510,11 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8 Cutlass MoE is only supported with ep_size == 1"
 
+        if self.moe_runner_backend == "deep_gemm":
+            assert (
+                self.ep_size > 1 and self.enable_dp_attention
+            ), "DeepGemm MoE is only supported when dp attention and ep are both enabled"
+
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
