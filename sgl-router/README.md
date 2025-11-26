@@ -42,9 +42,9 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - **User Guide**: [docs.sglang.ai/advanced_features/router.html](https://docs.sglang.ai/advanced_features/router.html)
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
+
 ## Installation
 ### Prerequisites
-
 - **Rust and Cargo**
   ```bash
   # Install rustup (Rust installer and version manager)
