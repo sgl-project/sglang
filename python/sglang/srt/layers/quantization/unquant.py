@@ -487,7 +487,21 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             moe_runner_config.activation == "silu"
         ), f"activation = {moe_runner_config.activation} is not supported."
 
-        if xpu_has_xmx_support():
+        backend = self.runner.runner_backend
+        if backend.is_triton():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        else:
+            # syl-kernel-xpu path
             from sgl_kernel import fused_experts
 
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
