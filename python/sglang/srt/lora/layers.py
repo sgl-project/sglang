@@ -371,11 +371,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         Apply LoRA to base embedding output.
         Formula: output = base_output + lora_B @ lora_A_embedding(input_)
         """
-        # Get token-to-lora mapping
-        token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-        
-        # Efficient embedding lookup for LoRA A
-        lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
+
+        # Efficient embedding lookup for LoRA A (cannot call run_lora_a_sgemm since needing index  lookup)
+        lora_a_output = self._run_lora_a_embedding(input_, batch_info)
         
         # Apply LoRA B weights using backend
         lora_output = self.lora_backend.run_lora_b_sgemm(
@@ -385,47 +383,29 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
-    def _get_token_weight_indices(
+    ##############################
+    ##########emb lora############
+    ##############################
+    def _run_lora_a_embedding(
         self, input_: torch.Tensor, batch_info
     ) -> torch.Tensor:
-        """Map each token position to its corresponding LoRA adapter index."""
+        """
+        Apply LoRA A weights using efficient embedding lookup.
+        Maps tokens to their corresponding LoRA adapters internally.
+        """
+        # Get token-to-lora mapping
         token_weight_indices = torch.zeros(
             input_.shape[0], dtype=torch.int32, device=input_.device
         )
         
-        ####################### 
-        ####################### 
         current_pos = 0
         for i in range(batch_info.bs):
-            seg_len = int(batch_info.seg_lens[i])  # Convert tensor to int
-            weight_idx = int(batch_info.weight_indices[i])  # Convert tensor to int
+            seg_len = int(batch_info.seg_lens[i])
+            weight_idx = int(batch_info.weight_indices[i])
             token_weight_indices[current_pos : current_pos+seg_len] = weight_idx
             current_pos += seg_len
-
-        # -------- #
         
-        # # Use repeat_interleave to map segment-level indices to token-level indices
-        # # This is CUDA graph compatible
-        # num_segments = batch_info.num_segments
-        # seg_lens = batch_info.seg_lens[:num_segments]
-        # weight_indices = batch_info.weight_indices[:num_segments]
-        
-        # # Vectorized assignment using tensor operations - allow enable cuda-graph
-        # token_weight_indices = weight_indices.repeat_interleave(seg_lens)
-        ####################### 
-        ####################### 
-        
-        return token_weight_indices
-
-    def _run_lora_a_embedding(
-        self, input_: torch.Tensor, token_weight_indices: torch.Tensor
-    ) -> torch.Tensor:
-        #####################
-        #####################
-        """
-        Apply LoRA A weights using efficient embedding lookup.
-        This avoids creating one-hot vectors.
-        """
+        # Apply embedding lookup for each LoRA adapter
         lora_a_output = torch.zeros(
             (input_.shape[0], self.embedding_A_buffer.shape[1]),
             dtype=self.embedding_A_buffer.dtype,
@@ -434,52 +414,17 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         
         unique_weight_indices = torch.unique(token_weight_indices)
         
-        # to enable cuda-graph - prevent from using int 
         for idx in unique_weight_indices:
             token_mask = token_weight_indices == idx
             lora_a_weights = self.embedding_A_buffer[idx]  # (rank, vocab_size)
-            # Use F.embedding for efficient lookup
-            # lora_a_weights.t() gives us (vocab_size, rank)
             lora_a_output[token_mask] = F.embedding(
                 input_[token_mask], lora_a_weights.t()
             )
-
-        # -------- #
-        
-        # num_tokens = input_.shape[0]
-        # rank = self.embedding_A_buffer.shape[1]
-        
-        # # embedding_A_buffer shape: (num_loras, rank, vocab_size)
-        # # token_weight_indices shape: (num_tokens,)
-        # # input_ shape: (num_tokens,)
-        
-        # # Gather LoRA A weights for each token's assigned LoRA adapter
-        # # lora_a_weights shape: (num_tokens, rank, vocab_size)
-        # lora_a_weights = self.embedding_A_buffer[token_weight_indices]
-        
-        # # Now we need to apply embedding lookup for each token
-        # # lora_a_weights[i] is (rank, vocab_size) for token i
-        # # We want to lookup input_[i] in lora_a_weights[i].t() which is (vocab_size, rank)
-        
-        # # Transpose to (num_tokens, vocab_size, rank) for embedding lookup
-        # lora_a_weights_t = lora_a_weights.transpose(1, 2)
-        
-        # # Use batched embedding lookup
-        # # For each token i, lookup input_[i] in lora_a_weights_t[i]
-        # input_expanded = input_.unsqueeze(1)  # (num_tokens, 1)
-        
-        # # Use gather to simulate embedding lookup
-        # # lora_a_weights_t[i, input_[i], :] gives us the embedding for token i
-        # token_indices = input_.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, rank)  # (num_tokens, 1, rank)
-        # lora_a_output = torch.gather(
-        #     lora_a_weights_t, 
-        #     1, 
-        #     token_indices
-        # ).squeeze(1)  # (num_tokens, rank)
-        #####################
-        #####################
         
         return lora_a_output
+    ##############################
+    ##############################
+    ##############################
 
     def forward(self, input_: torch.Tensor):
         # Get base embedding output
