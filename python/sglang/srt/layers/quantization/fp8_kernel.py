@@ -1121,7 +1121,6 @@ def w8a8_block_fp8_matmul_triton(
         )
 
     kernel = select_w8a8_block_fp8_matmul_kernel(M, N, config)
-    # logger.warning("[info] call kernel")
 
     kernel[grid](
         A,
