@@ -202,7 +202,7 @@ class PiecewiseCudaGraphRunner:
             )
             self.out_cache_loc_swa = (
                 torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-                if model_runner.swa
+                if model_runner.is_hybrid_swa
                 else None
             )
             self.positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
