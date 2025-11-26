@@ -46,7 +46,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy, WeightsMapper
+from sglang.srt.models.utils import WeightsMapper, compute_cu_seqlens_from_grid_numpy
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 

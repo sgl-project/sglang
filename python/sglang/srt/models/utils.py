@@ -14,9 +14,10 @@
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import Any, Optional
+
 import numpy as np
 import torch
-from typing import Any, Optional
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
