@@ -90,10 +90,10 @@ class LatentPreparationStage(PipelineStage):
 
             latent_ids = server_args.pipeline_config.maybe_prepare_latent_ids(
                 latents
-            ).to(device=device)
+            )
 
             if latent_ids is not None:
-                batch.latent_ids = latent_ids
+                batch.latent_ids = latent_ids.to(device=device)
 
             latents = server_args.pipeline_config.maybe_pack_latents(
                 latents, batch_size, batch
@@ -142,7 +142,7 @@ class LatentPreparationStage(PipelineStage):
             "prompt_or_embeds",
             None,
             lambda _: V.string_or_list_strings(batch.prompt)
-            or V.list_not_empty(batch.prompt_embeds),
+                      or V.list_not_empty(batch.prompt_embeds),
         )
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_of_tensors)
         result.add_check(
