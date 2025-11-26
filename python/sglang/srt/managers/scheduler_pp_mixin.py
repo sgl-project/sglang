@@ -201,38 +201,13 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
-    def init_pp_dynamic_chunk_size(self: "Scheduler", server_args):
-        """Initialize PP dynamic chunk size predictor."""
-        # Initialize attributes to default values
-        # This ensures the attributes exist even when pp_size <= 1
-        self.enable_dynamic_chunking = False
-        self.length_predictor = None
-
-        if self.pp_size <= 1:
-            return
-
-        self.length_predictor = ChunkSizePredictor()
-        # Enable dynamic chunking only if explicitly enabled via server_args
-        # and chunked_prefill_size is set
-        self.enable_dynamic_chunking = (
-            server_args.enable_dynamic_chunking
-            and self.chunked_prefill_size is not None
-            and self.chunked_prefill_size > 0
-        )
-
-    def profile_pp_prefill_latency(self: "Scheduler"):
+    def profile_and_init_predictor(self: Scheduler):
         """
         Profile prefill latency for dynamic chunk sizing.
 
         Only runs on PP0 (first rank), then broadcasts data to all ranks.
         All ranks fit coefficients using the same data.
         """
-        # Early return if PP is not enabled or dynamic chunking is disabled
-        if self.pp_size <= 1:
-            return
-        if not self.enable_dynamic_chunking:
-            return
-
         seq_lens: List[int] = []
         latencies: List[float] = []
 
@@ -348,18 +323,8 @@ class SchedulerPPMixin:
             self.pp_group.broadcast_object_list(data_to_sync, src=0)
             seq_lens, latencies = data_to_sync
 
-        # All ranks fit coefficients using the same data
-        # Use model type specified by server_args
-        # Both models require at least 8 data points
-        if len(seq_lens) < 8:
-            logger.warning(
-                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Not enough profiling data "
-                f"({len(seq_lens)} < 8). Both quadratic and linear models require at least 8 samples. "
-                f"Dynamic chunking disabled."
-            )
-            return
-
         # Quadratic model: f(l) = al^2 + bl + c
+        self.length_predictor = ChunkSizePredictor()
         self.length_predictor.fit(seq_lens, latencies)
         self.length_predictor.set_target_latency(self.chunked_prefill_size)
         self.length_predictor.is_ready = True

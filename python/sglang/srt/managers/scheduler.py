@@ -453,11 +453,14 @@ class Scheduler(
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
 
+        self.enable_dynamic_chunking = (
+            server_args.enable_dynamic_chunking and self.pp_size > 1
+        )
+
         # Init the dynamic chunking predictor for PP
-        if self.pp_size > 1 and server_args.enable_dynamic_chunking:
-            self.init_pp_dynamic_chunk_size(server_args)
+        if self.enable_dynamic_chunking:
             try:
-                self.profile_pp_prefill_latency()
+                self.profile_and_init_predictor()
             except Exception as e:
                 logger.warning(
                     f"[PP Dynamic Chunk] Failed to profile prefill latency: {e}. "
