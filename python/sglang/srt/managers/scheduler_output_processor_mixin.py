@@ -301,15 +301,6 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_v2_eagle:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
-        else:
-            # NGRAM or other speculative decoding algorithms
-            next_token_ids = next_token_ids.tolist()
-            if result.accept_lens is not None:
-                # Update per-request spec_accepted_tokens for NGRAM
-                accept_lens_list = result.accept_lens.tolist()
-                for i, req in enumerate(batch.reqs):
-                    # spec_verify_ct is already incremented in ngram_info._fill_requests
-                    req.spec_accepted_tokens += accept_lens_list[i]
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
