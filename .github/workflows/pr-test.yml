@@ -1040,7 +1040,7 @@ jobs:
         sgl-kernel-unit-test,
         sgl-kernel-mla-test,
         sgl-kernel-benchmark-test,
-        sgl-kernel-b200-test
+        sgl-kernel-b200-test,
 
         multimodal-gen-test-1-gpu,
         multimodal-gen-test-2-gpu,
