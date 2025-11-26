@@ -3562,12 +3562,13 @@ class DeepseekV2ForCausalLM(nn.Module):
                         weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
-                    if should_deepgemm_weight_requant_ue8m0(
-                        weight_block_size=getattr(
-                            self.quant_config, "weight_block_size", None
+                    if (
+                        should_deepgemm_weight_requant_ue8m0(
+                            weight_block_size=getattr(
+                                self.quant_config, "weight_block_size", None
+                            )
                         )
-                    ) and getattr(
-                        self_attn.kv_b_proj, "executed_weight_requant_ue8m0", False
+                        and weight_scale.format_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
