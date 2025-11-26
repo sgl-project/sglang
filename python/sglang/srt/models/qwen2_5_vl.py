@@ -269,7 +269,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.patch_size = vision_config.patch_size
         mlp_hidden_size: int = ((vision_config.intermediate_size + 7) // 8) * 8
         self.use_data_parallel = use_data_parallel
-        self.out_dim = vision_config.out_hidden_size
+        self.out_hidden_size = vision_config.out_hidden_size
         self.patch_embed = Qwen2_5_VisionPatchEmbed(
             patch_size=patch_size,
             temporal_patch_size=temporal_patch_size,

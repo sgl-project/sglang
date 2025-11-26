@@ -580,7 +580,7 @@ def run_dp_sharded_mrope_vision_model(
         else:
             # Handle empty case
             image_embeds_local = torch.empty(
-                (0, vision_model.out_dim),
+                (0, vision_model.out_hidden_size),
                 device=pixel_values.device,
                 dtype=pixel_values.dtype,
             )

@@ -278,7 +278,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.use_data_parallel = use_data_parallel
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
-        self.out_dim = vision_config.out_hidden_size * (
+        self.out_hidden_size = vision_config.out_hidden_size * (
             1 + len(self.deepstack_visual_indexes)
         )
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
