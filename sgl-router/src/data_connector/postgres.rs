@@ -69,7 +69,7 @@ impl PostgresConversationStorage {
     }
 
     async fn initialize_schema(store: PostgresStore) -> Result<(), ConversationStorageError> {
-        let client = store.pool.get().await.unwrap();
+        let client = store.pool.get().await?;
         client
             .batch_execute(
                 "
@@ -79,8 +79,7 @@ impl PostgresConversationStorage {
                 metadata JSON
             );",
             )
-            .await
-            .unwrap();
+            .await?;
 
         Ok(())
     }
