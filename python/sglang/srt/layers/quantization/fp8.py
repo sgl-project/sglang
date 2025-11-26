@@ -797,11 +797,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         layer, DeepEPMoE
                     ), "DeepGemm MoE is only supported with DeepEPMoE"
                     weight_block_size = self.quant_config.weight_block_size
-                    for w in [
-                        (layer.w13_weight, layer.w13_weight_scale_inv),
-                        (layer.w2_weight, layer.w2_weight_scale_inv),
-                    ]:
-                        requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
+                    requant_weight_ue8m0_inplace(
+                        layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
+                    )
+                    requant_weight_ue8m0_inplace(
+                        layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
+                    )
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
