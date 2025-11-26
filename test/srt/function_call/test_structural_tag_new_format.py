@@ -184,6 +184,90 @@ class TestLlama32Detector(StructuralTagFormatTestCase):
         schema = tag["format"]["tags"][0]["content"]["json_schema"]
         self.assertEqual(schema, {})
 
+    def test_structural_tag_matches_realistic_output(self):
+        """Test that structural tag begin/end patterns match realistic model output."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Create realistic output: <|python_tag|>{"name":"get_weather", "arguments":{"city":"Dallas"}}
+        realistic_output = (
+            '<|python_tag|>{"name":"get_weather", "arguments":{"city":"Dallas"}}'
+        )
+
+        # Verify the structural tag's begin pattern matches the output
+        tag_item = tag["format"]["tags"][0]
+        begin = tag_item["begin"]
+        end = tag_item["end"]
+
+        # The begin should be a prefix of the realistic output
+        self.assertTrue(
+            realistic_output.startswith(begin),
+            f"Realistic output should start with begin pattern. Begin: {begin}, Output: {realistic_output}",
+        )
+        # The end should be a suffix after the JSON arguments
+        self.assertTrue(
+            realistic_output.endswith(end),
+            f"Realistic output should end with end pattern. End: {end}, Output: {realistic_output}",
+        )
+
+        # Verify tool name appears in the begin pattern
+        self.assertIn(
+            tool.function.name,
+            begin,
+            f"Tool name '{tool.function.name}' should appear in begin pattern: {begin}",
+        )
+
+        # Verify trigger appears in the realistic output
+        triggers = tag["format"]["triggers"]
+        self.assertTrue(
+            any(trigger in realistic_output for trigger in triggers),
+            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_output}",
+        )
+
+        # Verify that begin + JSON arguments + end forms a complete output
+        # Extract the JSON part from the realistic output
+        json_start = len(begin)
+        json_end = len(realistic_output) - len(end)
+        json_part = realistic_output[json_start:json_end]
+
+        # Verify JSON can be inserted between begin and end
+        reconstructed = begin + json_part + end
+        self.assertEqual(
+            reconstructed,
+            realistic_output,
+            f"Begin + JSON + End should reconstruct the realistic output. "
+            f"Begin: {begin}, JSON: {json_part}, End: {end}",
+        )
+
+    def test_multiple_tools_generate_correct_tags(self):
+        """Test that multiple tools generate separate tags with correct tool names."""
+        tools = [self.get_simple_tool(), self.get_complex_tool()]
+        tag = self.detector.build_structural_tag(
+            tools=tools, at_least_one=False, stop_after_first=False
+        )
+
+        # Verify we have tags for all tools
+        tags_list = tag["format"]["tags"]
+        self.assertGreaterEqual(
+            len(tags_list),
+            len(tools),
+            f"Should have at least {len(tools)} tags for {len(tools)} tools",
+        )
+
+        # Verify each tool name appears in at least one tag's begin pattern
+        tool_names = {tool.function.name for tool in tools}
+        tag_begins = [tag_item["begin"] for tag_item in tags_list]
+
+        for tool_name in tool_names:
+            found = any(tool_name in begin for begin in tag_begins)
+            self.assertTrue(
+                found,
+                f"Tool name '{tool_name}' should appear in at least one tag's begin pattern. "
+                f"Tag begins: {tag_begins}",
+            )
+
 
 class TestMistralDetector(StructuralTagFormatTestCase):
     """Test structural tag generation for MistralDetector."""
@@ -235,6 +319,57 @@ class TestMistralDetector(StructuralTagFormatTestCase):
         self.assert_structural_tag_structure(tag, expected_tools_count=1)
         schema = tag["format"]["tags"][0]["content"]["json_schema"]
         self.assertEqual(schema, {})
+
+    def test_structural_tag_matches_realistic_output(self):
+        """Test that structural tag begin/end patterns match realistic model output."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Create realistic output: [TOOL_CALLS] [{"name":"get_weather", "arguments":{"city":"Dallas"}}]
+        realistic_output = (
+            '[TOOL_CALLS] [{"name":"get_weather", "arguments":{"city":"Dallas"}}]'
+        )
+
+        # Verify the structural tag's begin pattern matches the output
+        tag_item = tag["format"]["tags"][0]
+        begin = tag_item["begin"]
+        end = tag_item["end"]
+
+        self.assertTrue(
+            realistic_output.startswith(begin),
+            f"Realistic output should start with begin pattern. Begin: {begin}, Output: {realistic_output}",
+        )
+        self.assertTrue(
+            realistic_output.endswith(end),
+            f"Realistic output should end with end pattern. End: {end}, Output: {realistic_output}",
+        )
+
+        # Verify tool name appears in the begin pattern
+        self.assertIn(
+            tool.function.name,
+            begin,
+            f"Tool name '{tool.function.name}' should appear in begin pattern: {begin}",
+        )
+
+        # Verify trigger appears in the realistic output
+        triggers = tag["format"]["triggers"]
+        self.assertTrue(
+            any(trigger in realistic_output for trigger in triggers),
+            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_output}",
+        )
+
+        # Verify that begin + JSON arguments + end forms a complete output
+        json_start = len(begin)
+        json_end = len(realistic_output) - len(end)
+        json_part = realistic_output[json_start:json_end]
+        reconstructed = begin + json_part + end
+        self.assertEqual(
+            reconstructed,
+            realistic_output,
+            f"Begin + JSON + End should reconstruct the realistic output",
+        )
 
 
 class TestQwen25Detector(StructuralTagFormatTestCase):
@@ -288,6 +423,44 @@ class TestQwen25Detector(StructuralTagFormatTestCase):
         schema = tag["format"]["tags"][0]["content"]["json_schema"]
         self.assertEqual(schema, {})
 
+    def test_structural_tag_matches_realistic_output(self):
+        """Test that structural tag begin/end patterns match realistic model output."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Create realistic output: <tool_call>\n{"name":"get_weather", "arguments":{"city":"Dallas"}}\n</tool_call>
+        realistic_output = '<tool_call>\n{"name":"get_weather", "arguments":{"city":"Dallas"}}\n</tool_call>'
+
+        # Verify the structural tag's begin pattern matches the output
+        tag_item = tag["format"]["tags"][0]
+        begin = tag_item["begin"]
+        end = tag_item["end"]
+
+        self.assertTrue(
+            realistic_output.startswith(begin),
+            f"Realistic output should start with begin pattern. Begin: {begin}, Output: {realistic_output}",
+        )
+        self.assertTrue(
+            realistic_output.endswith(end),
+            f"Realistic output should end with end pattern. End: {end}, Output: {realistic_output}",
+        )
+
+        # Verify tool name appears in the begin pattern
+        self.assertIn(
+            tool.function.name,
+            begin,
+            f"Tool name '{tool.function.name}' should appear in begin pattern: {begin}",
+        )
+
+        # Verify trigger appears in the realistic output
+        triggers = tag["format"]["triggers"]
+        self.assertTrue(
+            any(trigger in realistic_output for trigger in triggers),
+            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_output}",
+        )
+
 
 class TestQwen3CoderDetector(StructuralTagFormatTestCase):
     """Test structural tag generation for Qwen3CoderDetector."""
@@ -339,6 +512,33 @@ class TestQwen3CoderDetector(StructuralTagFormatTestCase):
         self.assert_structural_tag_structure(tag, expected_tools_count=1)
         schema = tag["format"]["tags"][0]["content"]["json_schema"]
         self.assertEqual(schema, {})
+
+    def test_structural_tag_matches_realistic_output(self):
+        """Test that structural tag begin/end patterns match realistic model output."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Create realistic output: <tool_call>\n<function=get_weather>\n<parameter=city>\nDallas\n</parameter>\n</function>\n</tool_call>
+        realistic_output = (
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nDallas\n</parameter>\n"
+            "<parameter=unit>\nfahrenheit\n</parameter>\n</function>\n</tool_call>"
+        )
+
+        # Verify the structural tag's begin pattern matches the output
+        tag_item = tag["format"]["tags"][0]
+        begin = tag_item["begin"]
+        end = tag_item["end"]
+
+        self.assertTrue(
+            realistic_output.startswith(begin),
+            f"Realistic output should start with begin pattern. Begin: {begin}, Output: {realistic_output}",
+        )
+        self.assertTrue(
+            realistic_output.endswith(end),
+            f"Realistic output should end with end pattern. End: {end}, Output: {realistic_output}",
+        )
 
 
 class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
@@ -404,6 +604,50 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
         schema = inner_tag["content"]["json_schema"]
         self.assertEqual(schema, {})
 
+    def test_structural_tag_matches_realistic_output(self):
+        """Test that structural tag begin/end patterns match realistic model output."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Create realistic output: <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{"city":"Dallas"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>
+        realistic_output = (
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            '```json\n{"city":"Dallas"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        )
+
+        # Verify the structural tag's begin pattern matches the output
+        outer_tag = tag["format"]["tags"][0]
+        inner_tag = outer_tag["content"]["tags"][0]
+        outer_begin = outer_tag["begin"]
+        inner_begin = inner_tag["begin"]
+        inner_end = inner_tag["end"]
+        outer_end = outer_tag["end"]
+
+        self.assertTrue(
+            realistic_output.startswith(outer_begin + inner_begin),
+            f"Realistic output should start with begin patterns. Outer: {outer_begin}, Inner: {inner_begin}, Output: {realistic_output}",
+        )
+        self.assertTrue(
+            realistic_output.endswith(inner_end + outer_end),
+            f"Realistic output should end with end patterns. Inner: {inner_end}, Outer: {outer_end}, Output: {realistic_output}",
+        )
+
+        # Verify tool name appears in the inner begin pattern
+        self.assertIn(
+            tool.function.name,
+            inner_begin,
+            f"Tool name '{tool.function.name}' should appear in inner begin pattern: {inner_begin}",
+        )
+
+        # Verify trigger appears in the realistic output
+        triggers = tag["format"]["triggers"]
+        self.assertTrue(
+            any(trigger in realistic_output for trigger in triggers),
+            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_output}",
+        )
+
 
 class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
     """Test structural tag generation for DeepSeekV31Detector."""
@@ -459,6 +703,50 @@ class TestDeepSeekV31Detector(StructuralTagFormatTestCase):
         inner_tag = tag["format"]["tags"][0]["content"]["tags"][0]
         schema = inner_tag["content"]["json_schema"]
         self.assertEqual(schema, {})
+
+    def test_structural_tag_matches_realistic_output(self):
+        """Test that structural tag begin/end patterns match realistic model output."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Create realistic output: <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city":"Dallas"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>
+        realistic_output = (
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+            '{"city":"Dallas"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        )
+
+        # Verify the structural tag's begin pattern matches the output
+        outer_tag = tag["format"]["tags"][0]
+        inner_tag = outer_tag["content"]["tags"][0]
+        outer_begin = outer_tag["begin"]
+        inner_begin = inner_tag["begin"]
+        inner_end = inner_tag["end"]
+        outer_end = outer_tag["end"]
+
+        self.assertTrue(
+            realistic_output.startswith(outer_begin + inner_begin),
+            f"Realistic output should start with begin patterns. Outer: {outer_begin}, Inner: {inner_begin}, Output: {realistic_output}",
+        )
+        self.assertTrue(
+            realistic_output.endswith(inner_end + outer_end),
+            f"Realistic output should end with end patterns. Inner: {inner_end}, Outer: {outer_end}, Output: {realistic_output}",
+        )
+
+        # Verify tool name appears in the inner begin pattern
+        self.assertIn(
+            tool.function.name,
+            inner_begin,
+            f"Tool name '{tool.function.name}' should appear in inner begin pattern: {inner_begin}",
+        )
+
+        # Verify trigger appears in the realistic output
+        triggers = tag["format"]["triggers"]
+        self.assertTrue(
+            any(trigger in realistic_output for trigger in triggers),
+            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_output}",
+        )
 
 
 class TestGptOssDetector(StructuralTagFormatTestCase):
@@ -518,6 +806,50 @@ class TestGptOssDetector(StructuralTagFormatTestCase):
             schema = tag_item["content"]["json_schema"]
             self.assertEqual(schema, {})
 
+    def test_structural_tag_matches_realistic_output(self):
+        """Test that structural tag begin/end patterns match realistic model output."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Create realistic output: <|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city":"Dallas"}<|call|>
+        # Note: GPT-OSS detector's has_tool_call() checks for "<|start|>assistant<|channel|>commentary"
+        realistic_output = '<|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city":"Dallas"}<|call|>'
+
+        # GPT-OSS has two patterns per tool, check if either matches
+        tag_items = tag["format"]["tags"]
+        found_match = False
+        for tag_item in tag_items:
+            begin = tag_item["begin"]
+            end = tag_item["end"]
+            if realistic_output.startswith(begin):
+                found_match = True
+                # End is empty for GPT-OSS, so just check begin
+                break
+
+        self.assertTrue(
+            found_match,
+            f"Realistic output should match one of the structural tag patterns. Output: {realistic_output}",
+        )
+
+        # For GPT-OSS, verify tool name appears in at least one tag's begin pattern
+        tag_items = tag["format"]["tags"]
+        tool_name_found = any(
+            tool.function.name in tag_item["begin"] for tag_item in tag_items
+        )
+        self.assertTrue(
+            tool_name_found,
+            f"Tool name '{tool.function.name}' should appear in at least one tag's begin pattern",
+        )
+
+        # Verify trigger appears in the realistic output
+        triggers = tag["format"]["triggers"]
+        self.assertTrue(
+            any(trigger in realistic_output for trigger in triggers),
+            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_output}",
+        )
+
 
 class TestKimiK2Detector(StructuralTagFormatTestCase):
     """Test structural tag generation for KimiK2Detector."""
@@ -569,6 +901,46 @@ class TestKimiK2Detector(StructuralTagFormatTestCase):
         self.assert_structural_tag_structure(tag, expected_tools_count=1)
         schema = tag["format"]["tags"][0]["content"]["json_schema"]
         self.assertEqual(schema, {})
+
+    def test_structural_tag_matches_realistic_output(self):
+        """Test that structural tag begin/end patterns match realistic model output."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Create realistic output: <|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city":"Dallas"}<|tool_call_end|><|tool_calls_section_end|>
+        # Note: KimiK2 uses index in the format, so we need to check with index 0
+        realistic_output = '<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city":"Dallas"}<|tool_call_end|><|tool_calls_section_end|>'
+
+        # Verify the structural tag's begin pattern matches the output
+        tag_item = tag["format"]["tags"][0]
+        begin = tag_item["begin"]
+        end = tag_item["end"]
+
+        self.assertTrue(
+            realistic_output.startswith(begin),
+            f"Realistic output should start with begin pattern. Begin: {begin}, Output: {realistic_output}",
+        )
+        self.assertTrue(
+            realistic_output.endswith(end),
+            f"Realistic output should end with end pattern. End: {end}, Output: {realistic_output}",
+        )
+
+        # Verify tool name appears in the begin pattern (may include index for KimiK2)
+        # KimiK2 format includes index like "functions.get_weather:0"
+        tool_name_base = tool.function.name
+        self.assertTrue(
+            tool_name_base in begin or f"functions.{tool_name_base}" in begin,
+            f"Tool name '{tool_name_base}' should appear in begin pattern: {begin}",
+        )
+
+        # Verify trigger appears in the realistic output
+        triggers = tag["format"]["triggers"]
+        self.assertTrue(
+            any(trigger in realistic_output for trigger in triggers),
+            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_output}",
+        )
 
 
 # Note: Glm4MoeDetector, PythonicDetector, Step3Detector, and MinimaxM2Detector
