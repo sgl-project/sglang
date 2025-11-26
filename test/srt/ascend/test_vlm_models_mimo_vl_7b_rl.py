@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.test.test_vlm_utils import TestVLMModels
+from test_vlm_utils import TestVLMModels
 
 
 class TestMIMOModels(TestVLMModels):
