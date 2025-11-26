@@ -408,6 +408,8 @@ class SchedulerMetricsMixin:
             waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
+            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
+            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
 
         num_tokens = sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
