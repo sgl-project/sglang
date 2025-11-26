@@ -629,8 +629,6 @@ class MistralModel(nn.Module):
         if output_hidden_states:
             hidden_states_pool.append(hidden_states)
 
-        print(f"{len(hidden_states_pool)=}")
-
         return BaseModelOutputWithPast(
             hidden_states=hidden_states_pool,
             last_hidden_state=hidden_states,
@@ -800,12 +798,6 @@ class Mistral3ForConditionalGeneration(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # Define mapping for stacked parameters
-        # stacked_params_mapping = [
-        #     # (param_name, shard_name, shard_id)
-        #     ("qkv_proj", "q_proj", "q"),
-        #     ("qkv_proj", "k_proj", "k"),
-        #     ("qkv_proj", "v_proj", "v"),
-        # ]
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:

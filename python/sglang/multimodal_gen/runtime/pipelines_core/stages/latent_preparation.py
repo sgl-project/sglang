@@ -96,7 +96,6 @@ class LatentPreparationStage(PipelineStage):
             latents = server_args.pipeline_config.maybe_pack_latents(
                 latents, batch_size, batch
             )
-
         else:
             latents = latents.to(device)
 

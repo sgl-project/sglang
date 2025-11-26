@@ -744,6 +744,7 @@ class ServerArgs:
                 server_args_kwargs["pipeline_config"] = pipeline_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
+
         return cls(**server_args_kwargs)
 
     @staticmethod

@@ -128,10 +128,6 @@ class InputValidationStage(PipelineStage):
                 )
             )
             batch.condition_image = resized_image
-            print(f"{resized_height=}")
-            print(f"{resized_width=}")
-            print(f"{batch.width_not_provided=}")
-            print(f"{batch.height_not_provided=}")
             batch.width = resized_width if batch.width_not_provided else batch.width
             batch.height = resized_height if batch.height_not_provided else batch.height
         elif (

@@ -316,8 +316,6 @@ class SamplingParams:
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params.width_not_provided = user_sampling_params.width is None
         sampling_params.height_not_provided = user_sampling_params.height is None
-        print(f"{sampling_params.width_not_provided=}")
-        print(f"{sampling_params.height_not_provided=}")
         sampling_params.adjust(server_args)
 
         return sampling_params

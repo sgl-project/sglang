@@ -283,8 +283,6 @@ class ImageVAEEncodingStage(PipelineStage):
             device=get_local_torch_device(), dtype=torch.float32
         )
 
-        print(f"{video_condition.shape=}")
-
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (

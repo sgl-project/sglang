@@ -100,10 +100,8 @@ def generate_cmd(args: argparse.Namespace):
         envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
 
     server_args = ServerArgs.from_cli_args(args)
-
     sampling_params = SamplingParams.from_cli_args(args)
     sampling_params.request_id = generate_request_id()
-    print(f"106 {sampling_params.height_not_provided=}")
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args
     )
