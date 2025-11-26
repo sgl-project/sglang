@@ -97,3 +97,7 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
             "length",
             f"Expected finish_reason='length' for ignore_eos=True, got {response_ignore_eos.choices[0].finish_reason}",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
