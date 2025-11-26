@@ -37,6 +37,7 @@ jobs:
 
   # ==================== PR Gate ==================== #
   pr-gate:
+    needs: check-changes
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/pr-gate.yml
     secrets: inherit
