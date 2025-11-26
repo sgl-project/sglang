@@ -1,5 +1,6 @@
 import unittest
 
+from sglang.srt.utils import is_npu
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -16,11 +17,28 @@ class TestNoChunkedPrefill(CustomTestCase):
         )
 
     def test_no_chunked_prefill_without_radix_cache(self):
+        model = (
+            "/root/.cache/modelscope/hub/models/AI-ModelScope/Llama-3.1-8B-Instruct"
+            if is_npu()
+            else DEFAULT_MODEL_NAME_FOR_TEST
+        )
+        other_args = (
+            [
+                "--disable-radix-cache",
+                "--chunked-prefill-size",
+                "-1",
+                "--attention-backend",
+                "ascend",
+                "--disable-cuda-graph",
+            ]
+            if is_npu()
+            else ["--disable-radix-cache", "--chunked-prefill-size", "-1"]
+        )
         res = run_bench_serving(
-            model=DEFAULT_MODEL_NAME_FOR_TEST,
+            model=model,
             num_prompts=10,
             request_rate=float("inf"),
-            other_server_args=["--disable-radix-cache", "--chunked-prefill-size", "-1"],
+            other_server_args=other_args,
         )
 
         assert res["completed"] == 10
