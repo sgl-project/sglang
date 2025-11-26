@@ -6,9 +6,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 try:
@@ -22,8 +25,9 @@ except ImportError as e:
         "LMCache is not installed. Please install it by running `pip install lmcache`"
     ) from e
 
+from sglang.srt.configs.model_config import ModelConfig
+
 if TYPE_CHECKING:
-    from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
@@ -271,13 +275,30 @@ class LMCRadixCache(RadixCache):
 
 
 if __name__ == "__main__":
+    model_config = ModelConfig(
+        model_path="Qwen/Qwen3-4B",
+    )
+
+    _kvcache = MHATokenToKVPool(
+        size=256,
+        page_size=1,
+        dtype=torch.bfloat16,
+        layer_num=model_config.num_hidden_layers,
+        enable_memory_saver=False,
+        device=None,
+        head_num=model_config.num_key_value_heads,
+        head_dim=model_config.head_dim,
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=128, dtype=torch.bfloat16, device="cpu", kvcache=_kvcache, need_sort=False
+    )
     cache = LMCRadixCache(
         req_to_token_pool=None,
-        token_to_kv_pool_allocator=None,
+        token_to_kv_pool_allocator=allocator,
         page_size=1,
         disable=False,
         enable_kv_cache_events=False,
-        model_config=None,
+        model_config=model_config,
         tp_size=1,
         rank=0,
         tp_group=None,
@@ -287,3 +308,4 @@ if __name__ == "__main__":
         RadixKey([1, 2, 3, 4]), torch.tensor([10, 11, 12, 13], dtype=torch.int64)
     )
     cache.pretty_print()
+    cache.lmcache_connector.close()
