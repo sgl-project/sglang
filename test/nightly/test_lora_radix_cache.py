@@ -16,7 +16,7 @@ import multiprocessing as mp
 import unittest
 
 import torch
-from utils import CI_MULTI_LORA_MODELS, run_lora_test_one_by_one
+from lora_utils import CI_MULTI_LORA_MODELS, run_lora_test_one_by_one
 
 from sglang.test.test_utils import CustomTestCase
 
