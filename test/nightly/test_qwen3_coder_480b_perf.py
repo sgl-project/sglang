@@ -37,6 +37,7 @@ class TestNightlyQwen3Coder480BPerformance(unittest.TestCase):
             input_lens=self.input_lens,
             output_lens=self.output_lens,
             other_args=self.other_args,
+            server_start_timeout=3600,
         )
 
         self.runner.add_report(results)
