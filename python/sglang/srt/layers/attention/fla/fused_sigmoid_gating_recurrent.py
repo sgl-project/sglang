@@ -13,8 +13,6 @@ from sglang.srt.layers.attention.fla.utils import input_guard
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
-
-
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=4, num_stages=2),
@@ -23,11 +21,9 @@ from sglang.srt.layers.attention.fla.utils import input_guard
         triton.Config({}, num_warps=2, num_stages=4),
         triton.Config({}, num_warps=8, num_stages=2),
         triton.Config({}, num_warps=8, num_stages=3),
-
     ],
     key=["BK", "BV", "K", "V"],
 )
-
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -87,7 +83,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     p_A_log = A_log + i_hv
     p_a = a + bos * HV + i_hv
     p_dt_bias = dt_bias + i_hv
-    
+
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_k[:, None] & mask_v[None, :]
@@ -205,10 +201,10 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    
+
     # Use larger block sizes for better performance
     BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), 64)  
+    BV = min(triton.next_power_of_2(V), 64)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     if scale is None:
