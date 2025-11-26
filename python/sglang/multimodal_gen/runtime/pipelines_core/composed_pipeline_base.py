@@ -55,6 +55,12 @@ class ComposedPipelineBase(ABC):
     # the name of the pipeline it associated with, in diffusers
     pipeline_name: str
 
+    def is_lora_effective(self):
+        return False
+
+    def is_lora_set(self):
+        return False
+
     def __init__(
         self,
         model_path: str,
@@ -344,6 +350,11 @@ class ComposedPipelineBase(ABC):
         """
         if not self.post_init_called:
             self.post_init()
+
+        if self.is_lora_set() and not self.is_lora_effective():
+            logger.warning(
+                "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
+            )
 
         # Execute each stage
         logger.info(
