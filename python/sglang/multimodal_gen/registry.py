@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
@@ -393,6 +394,15 @@ def _register_configs():
             "black-forest-labs/FLUX.1-dev",
         ],
         model_detectors=[lambda id: "flux" in id.lower()],
+    )
+    register_configs(
+        model_name="flux-2",
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=Flux2PipelineConfig,
+        model_paths=[
+            "black-forest-labs/FLUX.2-dev",
+        ],
+        model_detectors=[lambda id: "flux.2" in id.lower()],
     )
 
     # Qwen-Image
