@@ -16,7 +16,7 @@ import multiprocessing as mp
 import os
 import unittest
 
-from utils import (
+from lora_utils import (
     ALL_OTHER_MULTI_LORA_MODELS,
     CI_MULTI_LORA_MODELS,
     run_lora_multiple_batch_on_model_cases,
