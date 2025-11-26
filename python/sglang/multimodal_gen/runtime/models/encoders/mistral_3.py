@@ -106,7 +106,7 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
 
@@ -427,7 +427,7 @@ class MistralAttention(nn.Module):
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.q_proj = nn.Linear(
@@ -813,8 +813,7 @@ class Mistral3ForConditionalGeneration(nn.Module):
             if (
                 "vision" in name_lower
                 or "multi" in name_lower
-                or "lm_head"
-                in name_lower
+                or "lm_head" in name_lower
             ):
                 continue
             final_name = name.replace("language_model.model.", "model.language_model.")
