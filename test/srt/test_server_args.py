@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_npu
 
 
 class TestPrepareServerArgs(CustomTestCase):
@@ -11,14 +11,21 @@ class TestPrepareServerArgs(CustomTestCase):
         server_args = prepare_server_args(
             [
                 "--model-path",
-                "meta-llama/Meta-Llama-3.1-8B-Instruct",
+                (
+                    "/root/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
+                    if is_npu()
+                    else "meta-llama/Meta-Llama-3.1-8B-Instruct"
+                ),
                 "--json-model-override-args",
                 '{"rope_scaling": {"factor": 2.0, "rope_type": "linear"}}',
             ]
         )
-        self.assertEqual(
-            server_args.model_path, "meta-llama/Meta-Llama-3.1-8B-Instruct"
+        expected_model_path = (
+            "meta-llama/Meta-Llama-3.1-8B-Instruct"
+            if not is_npu()
+            else "/root/.cache/modelscope/hub/models/LLM-Research/Meta-Llama-3.1-8B-Instruct"
         )
+        self.assertEqual(server_args.model_path, expected_model_path)
         self.assertEqual(
             json.loads(server_args.json_model_override_args),
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
