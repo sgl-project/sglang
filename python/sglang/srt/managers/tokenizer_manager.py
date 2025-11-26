@@ -83,10 +83,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.tracing.trace import (
-    extract_trace_headers,
-    trace_set_remote_propagate_context_batch,
-)
+from sglang.srt.tracing.trace import extract_trace_headers
 from sglang.srt.tracing.trace_metric_wrapper import (
     RequestStage,
     TraceMetricContext,
@@ -435,12 +432,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         external_trace_header = None
         if request:
-            if "trace_context" in request.headers:
-                trace_set_remote_propagate_context_batch(
-                    request.headers["trace_context"]
-                )
-            else:
-                external_trace_header = extract_trace_headers(request.headers)
+            external_trace_header = extract_trace_headers(request.headers)
 
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)

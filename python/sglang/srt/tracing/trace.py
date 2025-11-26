@@ -15,8 +15,6 @@
 
 from __future__ import annotations
 
-import base64
-import json
 import logging
 import os
 import random
@@ -175,7 +173,6 @@ class SGLangTraceCustomIdGenerator(id_generator.IdGenerator):
 
 
 # global variables
-remote_trace_contexts: Dict[str, SGLangTracePropagateContext] = {}
 threads_info: Dict[int, SGLangTraceThreadInfo] = {}
 
 get_cur_time_ns = lambda: int(time.time() * 1e9)
@@ -311,8 +308,6 @@ class SGLangTraceReqContext:
         # Indicates whether this instance is a replica from the main process.
         # When True, root_span is None and only root_span_context is preserved.
         self.is_copy: bool = False
-        self.bootstrap_room_span: Optional[trace.span.Span] = None
-        self.bootstrap_room_span_context: Optional[context.Context] = None
         self.root_span: Optional[trace.span.Span] = None
         self.root_span_context: Optional[context.Context] = None
 
@@ -353,9 +348,7 @@ class SGLangTraceReqContext:
 
         return thread_context
 
-    def trace_get_proc_propagate_context(
-        self, remote_propagate=False
-    ) -> Optional[Dict[str, Any]]:
+    def trace_get_proc_propagate_context(self) -> Optional[Dict[str, Any]]:
         if not self.tracing_enable:
             return None
 
@@ -373,8 +366,6 @@ class SGLangTraceReqContext:
             prev_span_context = self.thread_context.last_span_context
 
         root_span_context = self.root_span_context
-        if remote_propagate:
-            root_span_context = self.bootstrap_room_span_context
 
         trace_context = SGLangTracePropagateContext(
             root_span_context, prev_span_context
@@ -395,8 +386,7 @@ class SGLangTraceReqContext:
             self.root_span_context = trace_context.root_span_context
 
         self.thread_context = self.__create_thread_context(self.start_time_ns)
-        if self.tracing_enable:
-            self.thread_context.last_span_context = trace_context.prev_span_context
+        self.thread_context.last_span_context = trace_context.prev_span_context
 
     def trace_req_start(
         self,
@@ -409,46 +399,24 @@ class SGLangTraceReqContext:
         ts = ts or get_cur_time_ns()
 
         # create req context and root span
-        bootstrap_room = 0 if self.bootstrap_room is None else self.bootstrap_room
         self.start_time_ns = ts
 
-        # create bootstrap room span
         tracer = threads_info[self.pid].tracer
-        if str(bootstrap_room) not in remote_trace_contexts:
-            attrs = {"bootstrap_room": str(hex(bootstrap_room))}
-            external_trace_context = _trace_context_propagator.extract(
-                external_trace_header
-            )
-            bootstrap_room_span = tracer.start_span(
-                name=f"Bootstrap Room {hex(bootstrap_room)}",
-                start_time=ts,
-                attributes=attrs,
-                context=external_trace_context,
-            )
-            self.bootstrap_room_span = bootstrap_room_span
-            self.bootstrap_room_span_context = trace.set_span_in_context(
-                bootstrap_room_span
-            )
-        else:
-            self.bootstrap_room_span_context = remote_trace_contexts[
-                str(bootstrap_room)
-            ].root_span_context
+        external_trace_context = _trace_context_propagator.extract(
+            external_trace_header
+        )
 
         # Drop the worker_id added by MultiTokenizer
         orig_rid = self.rid.split("_")[-1]
         role = "" if self.role == "null" else self.role
         attrs = {"rid": orig_rid}
+        if self.bootstrap_room:
+            attrs["bootstrap_room"] = str(hex(self.bootstrap_room))
         root_span = tracer.start_span(
             name=f"{role} Req {orig_rid[:8]}",
             start_time=ts,
-            context=self.bootstrap_room_span_context,
+            context=external_trace_context,
             attributes=attrs,
-        )
-
-        root_span.set_attributes(
-            {
-                "rid": self.rid,
-            }
         )
 
         self.root_span = root_span
@@ -456,11 +424,6 @@ class SGLangTraceReqContext:
 
         # create thread context and thread span
         self.thread_context = self.__create_thread_context(ts)
-
-        if self.tracing_enable and str(self.bootstrap_room) in remote_trace_contexts:
-            self.thread_context.last_span_context = remote_trace_contexts[
-                str(self.bootstrap_room)
-            ].prev_span_context
 
     def trace_req_finish(
         self, ts: Optional[int] = None, attrs: Optional[Dict[str, Any]] = None
@@ -478,10 +441,6 @@ class SGLangTraceReqContext:
             self.root_span.set_attributes(attrs)
 
         self.root_span.end(end_time=ts)
-        if str(self.bootstrap_room) in remote_trace_contexts:
-            del remote_trace_contexts[str(self.bootstrap_room)]
-        else:
-            self.bootstrap_room_span.end(end_time=ts)
 
     def __create_slice_span(self, _slice: SGLangTraceSliceContext):
         parent_span = self.thread_context.thread_span
@@ -710,46 +669,3 @@ class SGLangTraceReqContext:
             cur_slice.span.set_attributes(attrs)
         else:
             cur_slice.span.attrs.update(attrs)
-
-
-def trace_get_remote_propagate_context_batch(
-    req_context_list: List[SGLangTraceReqContext],
-):
-    if not opentelemetry_initialized:
-        return ""
-
-    reqs_propagate_contexts = {}
-    for req_context in req_context_list:
-        # In the router, rid is also the bootstrap room.
-        bootstrap_room = str(req_context.bootstrap_room)
-
-        if not bootstrap_room:
-            continue
-
-        _context = req_context.trace_get_proc_propagate_context(remote_propagate=True)
-        reqs_propagate_contexts[bootstrap_room] = _context
-
-    json_str = json.dumps(reqs_propagate_contexts, ensure_ascii=False)
-    return base64.b64encode(json_str.encode("utf-8")).decode("utf-8")
-
-
-def trace_set_remote_propagate_context_batch(base64_str):
-    if not opentelemetry_initialized:
-        return
-
-    if base64_str is None or base64_str == "" or base64_str == "None":
-        return
-
-    base64_bytes = base64.b64decode(base64_str)
-    json_str = base64_bytes.decode("utf-8")
-    remote_reqs_propagate_contexts = json.loads(json_str)
-
-    for bootstrap_room in remote_reqs_propagate_contexts:
-        if bootstrap_room in remote_trace_contexts:
-            continue
-
-        remote_trace_contexts[bootstrap_room] = (
-            SGLangTracePropagateContext.instance_from_dict(
-                remote_reqs_propagate_contexts[bootstrap_room]
-            )
-        )
