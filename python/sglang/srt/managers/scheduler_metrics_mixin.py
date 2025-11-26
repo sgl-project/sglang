@@ -395,29 +395,12 @@ class SchedulerMetricsMixin:
 
     def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
         if self.is_hybrid:
-            num_tokens_full = (
-                self.full_tokens_per_layer
-                - self.token_to_kv_pool_allocator.full_available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-            num_tokens_swa = (
-                self.swa_tokens_per_layer
-                - self.token_to_kv_pool_allocator.swa_available_size()
-                - self.tree_cache.swa_evictable_size()
-            )
-            num_tokens = max(num_tokens_full, num_tokens_swa)
+            full_num_used, swa_num_used, *_ = self._get_swa_token_info()
+            num_tokens = max(full_num_used, swa_num_used)
         elif self.is_hybrid_gdn:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.full_evictable_size()
-            )
+            num_tokens = self._get_mamba_token_info()[0]
         else:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.evictable_size()
-            )
+            num_tokens = self._get_token_info()[0]
 
         # Tokens in waiting queue, bootstrap queue, prealloc queue
         num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
