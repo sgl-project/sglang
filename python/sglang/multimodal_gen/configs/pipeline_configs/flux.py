@@ -219,8 +219,6 @@ def _prepare_latent_ids(
 
     # Expand to batch: (B, H*W, 4)
     latent_ids = latent_ids.unsqueeze(0).expand(batch_size, -1, -1)
-
-    print(f"{latent_ids=}")
     return latent_ids
 
 
@@ -329,7 +327,6 @@ def flux_2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.T
     hidden_states_layers: list[int] = [10, 20, 30]
 
     out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
-    print(f"{out=}")
     batch_size, num_channels, seq_len, hidden_dim = out.shape
     prompt_embeds = out.permute(0, 2, 1, 3).reshape(
         batch_size, seq_len, num_channels * hidden_dim
@@ -438,11 +435,8 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             truncation=True,
             # 2048 from official github repo, 512 from diffusers
             max_length=512,
-            # max_length=512,
         )
 
-        print(f"{prompts=}")
-        print(f"{inputs=}")
         return inputs
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
