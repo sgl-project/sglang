@@ -10,13 +10,9 @@
 
 use async_trait::async_trait;
 use axum::{
-    body::Body,
-    http::{header::CONTENT_TYPE, HeaderValue, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
-use futures::StreamExt;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use super::ResponsesStage;
 use crate::routers::{
@@ -55,7 +51,44 @@ impl ResponsesStage for ResponsesRequestExecutionStage {
         // Build URL
         let url = format!("{}/v1/responses", discovery.endpoint_url);
 
-        // Build request
+        // Handle streaming responses early - they make their own request
+        if payload_output.is_streaming {
+            let previous_response_id = ctx
+                .state
+                .context
+                .as_ref()
+                .and_then(|c| c.previous_response_id.clone());
+
+            // Check if MCP is active - if yes, pass mcp_manager; if no, pass None
+            // handle_streaming_response will route to either:
+            // - handle_simple_streaming_passthrough (with persistence), or
+            // - handle_streaming_with_tool_interception (MCP with persistence)
+            let mcp_active = ctx.state.mcp.as_ref().map(|m| m.active).unwrap_or(false);
+            let mcp_manager = if mcp_active {
+                Some(&ctx.dependencies.mcp_manager)
+            } else {
+                None
+            };
+
+            return Ok(Some(
+                handle_streaming_response(
+                    &ctx.dependencies.http_client,
+                    &ctx.dependencies.circuit_breaker,
+                    mcp_manager,
+                    ctx.dependencies.response_storage.clone(),
+                    ctx.dependencies.conversation_storage.clone(),
+                    ctx.dependencies.conversation_item_storage.clone(),
+                    url.clone(),
+                    ctx.input.headers.as_ref(),
+                    payload_output.json_payload.clone(),
+                    ctx.request(),
+                    previous_response_id,
+                )
+                .await,
+            ));
+        }
+
+        // Non-streaming: build and execute request
         let mut request_builder = ctx
             .dependencies
             .http_client
@@ -65,11 +98,6 @@ impl ResponsesStage for ResponsesRequestExecutionStage {
         // Apply headers
         if let Some(headers) = &ctx.input.headers {
             request_builder = apply_request_headers(headers, request_builder, true);
-        }
-
-        // Set Accept header for streaming
-        if payload_output.is_streaming {
-            request_builder = request_builder.header("Accept", "text/event-stream");
         }
 
         // Execute request
@@ -96,68 +124,7 @@ impl ResponsesStage for ResponsesRequestExecutionStage {
             ctx.dependencies.circuit_breaker.record_failure();
         }
 
-        // Handle streaming responses - return early
-        if payload_output.is_streaming {
-            // Check if MCP is active for this request
-            let mcp_active = ctx.state.mcp.as_ref().map(|m| m.active).unwrap_or(false);
-
-            if mcp_active {
-                let previous_response_id = ctx
-                    .state
-                    .context
-                    .as_ref()
-                    .and_then(|c| c.previous_response_id.clone());
-
-                return Ok(Some(
-                    handle_streaming_response(
-                        &ctx.dependencies.http_client,
-                        &ctx.dependencies.circuit_breaker,
-                        Some(&ctx.dependencies.mcp_manager),
-                        ctx.dependencies.response_storage.clone(),
-                        ctx.dependencies.conversation_storage.clone(),
-                        ctx.dependencies.conversation_item_storage.clone(),
-                        url.clone(),
-                        ctx.input.headers.as_ref(),
-                        payload_output.json_payload.clone(),
-                        ctx.request(),
-                        previous_response_id,
-                    )
-                    .await,
-                ));
-            }
-
-            // Simple passthrough for non-MCP streaming
-            let stream = resp.bytes_stream();
-            let (tx, rx) = mpsc::unbounded_channel();
-
-            tokio::spawn(async move {
-                let mut s = stream;
-                while let Some(chunk) = s.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let mut response = Response::new(Body::from_stream(UnboundedReceiverStream::new(rx)));
-            *response.status_mut() = status;
-            response
-                .headers_mut()
-                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            // Early exit for streaming
-            return Ok(Some(response));
-        }
-
-        // Non-streaming: store execution result and continue
+        // Store execution result and continue to next stage
         ctx.state.execution = Some(ExecutionResult {
             response: resp,
             status,
