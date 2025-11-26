@@ -46,10 +46,14 @@ def filter_tests(
     ]
 
     ret = []
-    valid_suites = NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
+    valid_suites = (
+        NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
+    )
 
     if suite not in valid_suites:
-        print(f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}")
+        print(
+            f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}"
+        )
 
     for t in ci_tests:
         if t.disabled is None:
@@ -94,7 +98,9 @@ def run_a_suite(args):
     auto_partition_size = args.auto_partition_size
 
     files = glob.glob("**/*.py", recursive=True)
-    ci_tests = filter_tests(collect_tests(files, sanity_check=False), hw, suite, nightly)
+    ci_tests = filter_tests(
+        collect_tests(files, sanity_check=False), hw, suite, nightly
+    )
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
     if not test_files:
