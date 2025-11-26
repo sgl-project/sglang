@@ -391,7 +391,8 @@ def rollout_process(
 
         # Allocate buffer for receiving weights
         weights = create_mock_layer_weights(layer_size, device)
-        logger.info(f"[Rollout-{rank}] Allocated buffer with shape {weights.shape}")
+        total_size_mb = (weights.numel() * weights.element_size()) / 1e6
+        logger.info(f"[Rollout-{rank}] Allocated buffer with shape {weights.shape}, size={total_size_mb:.2f}MB")
 
         # Store initial (random) weights
         initial_weights = weights.clone().cpu().numpy()
@@ -401,47 +402,88 @@ def rollout_process(
         logger.info(f"[Rollout-{rank}] Ready to receive updates")
         barrier.wait()
 
+        # Track timing for all transfers
+        all_transfer_times = []
+
         # Receive weight updates
         for update_idx in range(num_updates):
+            update_start = time.time()
+
             # Get buffer pointer and size
             ptr = weights.data_ptr()
             length = weights.numel() * weights.element_size()
 
             # Submit transfer task
-            # This will:
-            # 1. Register memory region
-            # 2. Send sync_status to training process
-            # 3. Wait for training to do RDMA write
-            # 4. Wait for confirmation
             session_id = f"{training_hostname}:{training_port}"
 
-            logger.info(
-                f"[Rollout-{rank}] Submitting transfer task for update {update_idx + 1}, "
-                f"session={session_id}, ptr={ptr:#x}"
-            )
-
+            submission_start = time.time()
             handle = engine.submit_transfer_task(
                 session_id=session_id,
                 ptr=ptr,
                 length=length,
             )
-
-            # Wait for transfer to complete
-            handle.wait()
-            torch.cuda.synchronize()
+            submission_end = time.time()
 
             logger.info(
-                f"[Rollout-{rank}] Received update {update_idx + 1}/{num_updates}"
+                f"[Rollout-{rank}] Submitted transfer task for update {update_idx + 1} in "
+                f"{(submission_end - submission_start)*1000:.2f}ms"
+            )
+
+            # Wait for transfer to complete
+            wait_start = time.time()
+            handle.wait()
+            torch.cuda.synchronize()
+            wait_end = time.time()
+
+            update_end = time.time()
+
+            total_time = update_end - update_start
+            submission_time = submission_end - submission_start
+            wait_time = wait_end - wait_start
+
+            all_transfer_times.append({
+                'update_idx': update_idx,
+                'total_time': total_time,
+                'submission_time': submission_time,
+                'wait_time': wait_time,
+                'total_bytes': length,
+            })
+
+            logger.info(
+                f"[Rollout-{rank}] Update {update_idx + 1}/{num_updates} completed: "
+                f"total={total_time*1000:.2f}ms, submission={submission_time*1000:.2f}ms, "
+                f"wait={wait_time*1000:.2f}ms, bandwidth={(length * 8) / (total_time * 1e9):.2f}Gbps"
             )
 
             # Synchronize with training process
             barrier.wait()
 
+        # Calculate and report statistics
+        avg_total_time = np.mean([t['total_time'] for t in all_transfer_times])
+        avg_wait_time = np.mean([t['wait_time'] for t in all_transfer_times])
+        total_bytes = all_transfer_times[0]['total_bytes']
+        avg_bandwidth = (total_bytes * 8) / (avg_total_time * 1e9)
+
+        stats = {
+            'rank': rank,
+            'num_updates': num_updates,
+            'avg_total_time': avg_total_time,
+            'avg_wait_time': avg_wait_time,
+            'avg_bandwidth_gbps': avg_bandwidth,
+            'total_bytes': total_bytes,
+            'all_transfers': all_transfer_times,
+        }
+
+        result_queue.put((f"rollout_{rank}_stats", stats))
+
         # Store final received weights for verification
         final_weights = weights.cpu().numpy()
         result_queue.put((f"rollout_{rank}_final_weights", final_weights))
 
-        logger.info(f"[Rollout-{rank}] All updates received successfully")
+        logger.info(
+            f"[Rollout-{rank}] All updates completed. Avg time: {avg_total_time*1000:.2f}ms, "
+            f"Avg bandwidth: {avg_bandwidth:.2f}Gbps"
+        )
 
     except Exception as e:
         logger.error(f"[Rollout-{rank}] Error: {e}", exc_info=True)
@@ -513,7 +555,7 @@ class TestP2PTransferRL(unittest.TestCase):
         timeout = 60  # 60 seconds timeout
         start_time = time.time()
 
-        expected_results = 2 + world_size  # initial + final weights for each process
+        expected_results = 2 + world_size + (world_size - 1)  # initial + final weights + stats for rollouts
         while len(results) < expected_results:
             try:
                 remaining_time = timeout - (time.time() - start_time)
@@ -543,6 +585,20 @@ class TestP2PTransferRL(unittest.TestCase):
         rollout_final = results["rollout_1_final_weights"]
 
         self.assertEqual(training_final.shape, rollout_final.shape)
+
+        # Print statistics if available
+        if "rollout_1_stats" in results:
+            stats = results["rollout_1_stats"]
+            logger.info(
+                f"\n{'='*80}\n"
+                f"Rollout-1 Statistics:\n"
+                f"  Avg total time: {stats['avg_total_time']*1000:.2f}ms\n"
+                f"  Avg wait time: {stats['avg_wait_time']*1000:.2f}ms\n"
+                f"  Avg bandwidth: {stats['avg_bandwidth_gbps']:.2f}Gbps\n"
+                f"  Total data: {stats['total_bytes']/1e6:.2f}MB\n"
+                f"{'='*80}\n"
+            )
+
         logger.info("Test passed: Single training + single rollout")
 
         # Cleanup
@@ -583,7 +639,7 @@ class TestP2PTransferRL(unittest.TestCase):
         timeout = 60
         start_time = time.time()
 
-        expected_results = 2 + (world_size - 1) * 2  # training + all rollouts
+        expected_results = 2 + (world_size - 1) * 3  # training + (weights + stats) for all rollouts
         while len(results) < expected_results:
             try:
                 remaining_time = timeout - (time.time() - start_time)
@@ -616,6 +672,19 @@ class TestP2PTransferRL(unittest.TestCase):
                 rollout_final.shape,
                 f"Shape mismatch for rollout {rank}"
             )
+
+        # Print comparative statistics
+        logger.info(f"\n{'='*80}\nComparative Statistics:\n")
+        for rank in range(1, world_size):
+            key = f"rollout_{rank}_stats"
+            if key in results:
+                stats = results[key]
+                logger.info(
+                    f"Rollout-{rank}: "
+                    f"avg_time={stats['avg_total_time']*1000:.2f}ms, "
+                    f"bandwidth={stats['avg_bandwidth_gbps']:.2f}Gbps"
+                )
+        logger.info(f"{'='*80}\n")
 
         logger.info(f"Test passed: 1 training + {world_size-1} rollouts")
 
