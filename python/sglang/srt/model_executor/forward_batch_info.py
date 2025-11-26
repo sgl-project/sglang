@@ -492,6 +492,29 @@ class ForwardBatch:
         )
 
         return ret
+    
+    def adjust_num_token_non_padded_for_attn_tp(
+            self,
+            *,
+            attn_tp_rank: int,
+            attn_tp_size: int,
+    ) -> None:
+        """Make num_token_non_padded local to this attention-TP rank."""
+
+        dp_rank = get_attention_dp_rank()
+
+        num_tokens_padded_per_dp = self.global_num_tokens_gpu[dp_rank]
+
+        tokens_per_rank = num_tokens_padded_per_dp // attn_tp_size
+
+        local = torch.clamp(
+            self.num_token_non_padded - tokens_per_rank * attn_tp_rank,
+            min=0,
+            max=tokens_per_rank,
+        )
+
+        self.num_token_non_padded = local
+        self.num_token_non_padded_cpu = int(local.item())
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """

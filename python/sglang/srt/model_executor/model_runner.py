@@ -82,8 +82,10 @@ from sglang.srt.layers.attention.attention_registry import (
     attn_backend_wrapper,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
+    get_attention_tp_rank,
     get_attention_tp_size,
     initialize_dp_attention,
 )
@@ -155,6 +157,7 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
+    require_gathered_buffer,
     reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
@@ -2225,6 +2228,16 @@ class ModelRunner:
         ):
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
+        if forward_batch.num_token_non_padded is not None:
+            attn_tp_size = get_attention_tp_size()
+            attn_tp_rank = get_attention_tp_rank()
+
+            if require_gathered_buffer and not is_nsa_enable_prefill_cp:
+                forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                    attn_tp_rank=attn_tp_rank,
+                    attn_tp_size=attn_tp_size,
+                )
+            
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
