@@ -588,7 +588,7 @@ class ServerArgs:
     mm_enable_dp_encoder: bool = False
 
     # For forward hooks
-    hooks: Optional[List[dict[str, Any]]] = None
+    forward_hooks: Optional[List[dict[str, Any]]] = None
 
     def __post_init__(self):
         """
@@ -3870,10 +3870,10 @@ class ServerArgs:
 
         # For registering hooks
         parser.add_argument(
-            "--hooks",
+            "--forward-hooks",
             type=json_list_type,
-            default=None,
-            help="The hooks to be attached.",
+            default=ServerArgs.forward_hooks,
+            help="JSON-formatted forward hook specifications to attach to the model.",
         )
 
     @classmethod
