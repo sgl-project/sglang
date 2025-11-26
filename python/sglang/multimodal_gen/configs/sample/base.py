@@ -203,8 +203,6 @@ class SamplingParams:
         final adjustment, called after merged with user params
         """
         pipeline_config = server_args.pipeline_config
-        if not isinstance(self.prompt, str):
-            raise TypeError(f"`prompt` must be a string, but got {type(self.prompt)}")
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
