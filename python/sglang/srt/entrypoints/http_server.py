@@ -360,6 +360,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         message = f"{exc_str} {errors_str}"
     else:
         message = exc_str
+    
+    # Filter out bootstrap information from the final message
+    import re
+    message = re.sub(r"'(bootstrap[^']*)':\s*[^,}]*", "", message)
 
     if request.url.path.startswith("/v1/responses"):
         # adapt specially, for v1/responses API only (notice the error key is different)
