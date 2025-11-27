@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -70,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -84,7 +86,6 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
-    GetLoadReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -287,6 +288,9 @@ class Scheduler(
         # Init model config
         self.model_config = ModelConfig.from_server_args(server_args)
 
+        # Init diffusion LLM config
+        self.dllm_config = DllmConfig.from_server_args(server_args)
+
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
 
@@ -449,6 +453,10 @@ class Scheduler(
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
+        if self.dllm_config is not None:
+            # We currently leverage chunked prefill to implement block diffusion
+            # for diffusion LLM.
+            self.chunked_prefill_size = self.dllm_config.block_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
@@ -561,6 +569,7 @@ class Scheduler(
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
+                (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
                 (FreezeGCReq, self.handle_freeze_gc),
@@ -1007,7 +1016,16 @@ class Scheduler(
                 and self.last_batch.forward_mode.is_extend()
             )
 
-            if disable_overlap_for_batch:
+            # FIXME(lsyin): remove this grammar sync
+            need_grammar_sync = (
+                batch is not None
+                and batch.forward_mode.is_decode()
+                and batch.has_grammar
+                and batch.is_v2_eagle
+                and len(self.result_queue) > 0
+            )
+
+            if disable_overlap_for_batch or need_grammar_sync:
                 pop_and_process()
 
             batch_result = None
@@ -1016,7 +1034,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not need_grammar_sync:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -1284,6 +1302,7 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
+                dllm_config=self.dllm_config,
             )
             req.tokenizer = self.tokenizer
 
@@ -1600,6 +1619,10 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if self.dllm_config is not None:
+            if self.chunked_req is not None and self.chunked_req.finished():
+                self.chunked_req = None
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1832,6 +1855,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            dllm_config=self.dllm_config,
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -2064,7 +2088,10 @@ class Scheduler(
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result)
+            if batch.is_dllm():
+                self.process_batch_result_dllm(batch, result)
+            else:
+                self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -2214,57 +2241,6 @@ class Scheduler(
             )
             if_success = False
         return if_success
-
-    def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
-        # TODO(lsyin): use dynamically maintained num_waiting_tokens
-
-        if self.is_hybrid:
-            num_tokens_full = (
-                self.full_tokens_per_layer
-                - self.token_to_kv_pool_allocator.full_available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-            num_tokens_swa = (
-                self.swa_tokens_per_layer
-                - self.token_to_kv_pool_allocator.swa_available_size()
-                - self.tree_cache.swa_evictable_size()
-            )
-            num_tokens = max(num_tokens_full, num_tokens_swa)
-        elif self.is_hybrid_gdn:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-        else:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.evictable_size()
-            )
-
-        # Tokens in waiting queue, bootstrap queue, prealloc queue
-        num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
-        num_waiting_reqs = len(self.waiting_queue)
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            num_tokens += sum(
-                len(req.origin_input_ids)
-                for req in self.disagg_prefill_bootstrap_queue.queue
-            )
-            num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            num_tokens += sum(
-                len(req.req.origin_input_ids)
-                for req in self.disagg_decode_prealloc_queue.queue
-            )
-            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
-
-        return GetLoadReqOutput(
-            dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
-            num_waiting_reqs=num_waiting_reqs,
-            num_tokens=num_tokens,
-        )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = vars(get_global_server_args())

@@ -34,6 +34,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
 )
@@ -122,7 +123,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.hook_manager import register_hooks
+from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.npu_compile_model_runner import NPUCompileModelRunner
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
@@ -173,6 +174,7 @@ from sglang.srt.utils.offloader import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -300,6 +302,7 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = model_config.is_hybrid
+        self.is_hybrid_swa = self.is_hybrid
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
@@ -329,6 +332,8 @@ class ModelRunner:
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+
+        self._weight_checker = WeightChecker(model_runner=self)
 
         if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
             slow_rank_detector.execute()
@@ -540,8 +545,8 @@ class ModelRunner:
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
-        if server_args.hooks:
-            register_hooks(self.model, server_args.hooks)
+        if server_args.forward_hooks:
+            register_forward_hooks(self.model, server_args.forward_hooks)
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -1157,7 +1162,14 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -1173,6 +1185,10 @@ class ModelRunner:
             "Please call `init_weights_update_group` first."
         )
 
+        if load_format == "flattened_bucket":
+            return self._update_bucketed_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
         try:
             weights = []
             handles = []
@@ -1196,6 +1212,37 @@ class ModelRunner:
             self.model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def _update_bucketed_weights_from_distributed(
+        self, names, dtypes, shapes, group_name
+    ):
+        try:
+            named_tensors = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                named_tensors.append(
+                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
+                )
+            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            flattened_tensor = bucket.get_flattened_tensor()
+            torch.distributed.broadcast(
+                flattened_tensor,
+                src=0,
+                group=self._model_update_group[group_name],
+            )
+            reconstructed_tensors = bucket.reconstruct_tensors()
+            self.model.load_weights(reconstructed_tensors)
+            return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -1479,6 +1526,8 @@ class ModelRunner:
         config = self.model_config.hf_config
         if isinstance(config, FalconH1Config | NemotronHConfig):
             return config
+        if isinstance(config, NemotronH_Nano_VL_V2_Config):
+            return config.llm_config
         return None
 
     @property
@@ -1575,11 +1624,6 @@ class ModelRunner:
             )
 
     def can_run_piecewise_cuda_graph(self):
-        if self.server_args.disable_cuda_graph:
-            log_info_on_rank0(
-                logger, "Disable piecewise CUDA graph because disable_cuda_graph is set"
-            )
-            return False
         if self.server_args.enable_torch_compile:
             log_info_on_rank0(
                 logger,
@@ -2487,6 +2531,9 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+
+    def check_weights(self, action: str):
+        self._weight_checker.handle(action=action)
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
