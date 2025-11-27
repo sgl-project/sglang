@@ -1856,17 +1856,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         meta_info["spec_accept_length"] = 0
         meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+        # The draft tokens per speculative step (excluding the target-sampled token).
+        num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+
         if (
             recv_obj.spec_verify_ct[i] > 0
-            and self.server_args.speculative_num_steps is not None
+            and num_guess_tokens is not None
             and not isinstance(recv_obj, BatchEmbeddingOutput)
             and hasattr(recv_obj, "spec_accepted_tokens")
             # Checks that `spec_accepted_tokens[i]` will exist.
             and len(recv_obj.spec_accepted_tokens) > i
         ):
-            total_draft_tokens = (
-                recv_obj.spec_verify_ct[i] * self.server_args.speculative_num_steps
-            )
+            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
