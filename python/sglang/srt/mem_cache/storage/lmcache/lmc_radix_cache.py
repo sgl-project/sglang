@@ -206,7 +206,7 @@ class LMCRadixCache(RadixCache):
         return base_res
 
     def cache_finished_req(self, req: "Req", is_insert: bool = True) -> None:  # type: ignore[override]
-        """Cache finished request and write committed KV to LMCache."""
+        """On request completion, insert device KV into radix and store to LMCache."""
         if self.disable_finished_insert:
             is_insert = False
 
