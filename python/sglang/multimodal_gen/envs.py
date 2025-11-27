@@ -54,7 +54,7 @@ def _is_musa():
         return hasattr(torch, "musa") and torch.musa.is_available()
 
     try:
-        import torch_musa
+        import torch_musa  # noqa: F401
     except ImportError:
         setattr(_is_musa, "_patched", False)
         return False

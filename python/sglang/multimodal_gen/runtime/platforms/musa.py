@@ -5,7 +5,6 @@ adjusted to match the structure and interface of `cuda.py`.
 
 import torch
 
-import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -92,6 +91,7 @@ class MusaPlatform(Platform):
 
         if target_backend == AttentionBackendEnum.FA:
             try:
+                # XXX (MUSA): flash_attn -> mate once cu_seqlens_q is None gets supported
                 import flash_attn  # noqa: F401
 
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
