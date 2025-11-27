@@ -1021,7 +1021,11 @@ class ServerArgs:
             # common to all Deepseek MoE models
             if is_cuda() and is_sm100_supported():
                 # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
+                if (
+                    not self.enable_dp_attention
+                    and self.nnodes == 1
+                    and not self.enable_symm_mem
+                ):
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for DeepseekV3ForCausalLM"
@@ -1079,7 +1083,11 @@ class ServerArgs:
 
             if is_blackwell_supported():
                 # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
+                if (
+                    not self.enable_dp_attention
+                    and self.nnodes == 1
+                    and not self.enable_symm_mem
+                ):
                     self.enable_flashinfer_allreduce_fusion = True
                     logger.info(
                         "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
@@ -4047,6 +4055,11 @@ class ServerArgs:
 
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
+
+        if self.enable_flashinfer_allreduce_fusion:
+            assert (
+                not self.enable_symm_mem
+            ), "AllReduce Fusion is incompatible with symmetric memory."
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
