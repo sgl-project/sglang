@@ -476,6 +476,13 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
+        # prefill batch interval, only for null disaggregation mode
+        if self.server_args.disaggregation_mode == "null":
+            self.prefill_interval = envs.SGLANG_PREFILL_INTERVAL.get()
+            self.__prefill_batch_ct = 0
+            if self.prefill_interval > 0:
+                logger.info(f"Prefill interval: {self.prefill_interval}")
+
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
         self.init_new_token_ratio = min(
@@ -1637,7 +1644,14 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        new_batch = self.get_new_batch_prefill()
+        if (
+            self.prefill_interval > 0
+            and not self.running_batch.is_empty()
+            and self.__prefill_batch_ct < self.prefill_interval
+        ):
+            new_batch = None
+        else:
+            new_batch = self.get_new_batch_prefill()
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1649,11 +1663,18 @@ class Scheduler(
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
+            # Prefill batch scheduled: reset the decode iteration counter
+            if self.prefill_interval > 0:
+                self.__prefill_batch_ct = 0
             # Run prefill first if possible
             ret = new_batch
         else:
             # Run decode
             if not self.running_batch.is_empty():
+                # Increment decode iteration counter for prefill interval tracking
+                if self.prefill_interval > 0:
+                    self.__prefill_batch_ct = self.__prefill_batch_ct + 1
+
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -1737,7 +1758,6 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
             if self.enable_lora and not self.tp_worker.can_run_lora_batch(
                 lora_set
                 | set([req.lora_id for req in adder.can_run_list])

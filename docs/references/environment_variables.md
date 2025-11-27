@@ -16,6 +16,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_HEALTH_CHECK_TIMEOUT`             | Timeout for health check in seconds                                                                                              | `20`                         |
 | `SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL` | The interval of passes to collect the metric of selected count of physical experts on each layer and GPU rank. 0 means disabled. | `0`                          |
 | `SGLANG_FORWARD_UNKNOWN_TOOLS`            | Forward unknown tool calls to clients instead of dropping them                                                                   | `false` (drop unknown tools) |
+| `SGLANG_PREFILL_INTERVAL` | Controls the number of consecutive decode iterations before allowing a new prefill batch. When set to a positive integer N, the scheduler will skip prefill and run decode for N iterations before scheduling a new prefill batch. This helps reduce prefill-decode interference and can improve decode latency in high-throughput scenarios. | `-1` (disabled) |
 
 ## Performance Tuning
 
