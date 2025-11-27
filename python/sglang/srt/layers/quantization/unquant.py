@@ -423,6 +423,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )
 
         expert_tokens = expert_tokens.to(torch.int64)
+        w13_bias = layer.w13_weight_bias
+        w2_bias = layer.w2_weight_bias
         if layer.w13_weight.shape[-1] == layer.hidden_size:
             w13 = layer.w13_weight.transpose(1, 2)
             w2 = layer.w2_weight.transpose(1, 2)
@@ -431,6 +433,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[w13],
+            bias=[w13_bias],
             split_item=2,
             group_list_type=0,
             group_type=0,
@@ -439,9 +442,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         )[0]
 
         # act_fn:
-        if self.moe_runner_config.activation == "silu":
-            hidden_states = torch_npu.npu_swiglu(hidden_states)
-        else:
+        if self.moe_runner_config.custom_act_fn is not None:
+            hidden_states = self.moe_runner_config.custom_act_fn(layer, hidden_states)
+        elif self.moe_runner_config.activation == "silu":
             from sglang.srt.layers.activation import GeluAndMul
 
             hidden_states = GeluAndMul()(hidden_states)
@@ -450,6 +453,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         hidden_states = torch_npu.npu_grouped_matmul(
             x=[hidden_states],
             weight=[w2],
+            bias=[w2_bias],
             split_item=2,
             group_list_type=0,
             group_type=0,
