@@ -428,8 +428,6 @@ class Qwen3GatedDeltaNet(nn.Module):
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
         else:
 
-            
-
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
 
@@ -466,7 +464,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             mixed_qkv = torch.cat((query, key, value), dim=-1)
         # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
 
-        # 2. Convolution sequence transformation        
+        # 2. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
@@ -491,8 +489,6 @@ class Qwen3GatedDeltaNet(nn.Module):
             "num_v_heads": self.num_v_heads,
             "z": z,
         }
-
-
 
         core_attn_out = forward_batch.attn_backend.forward(
             q=None,
@@ -775,7 +771,7 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         q, k = self._apply_qk_norm(q, k)
 
         q, k = self.rotary_emb(positions, q, k)
-        
+
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
