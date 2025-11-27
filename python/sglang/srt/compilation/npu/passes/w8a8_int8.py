@@ -98,3 +98,27 @@ class NpuAddRmsNormQuantFuse:
         quantized_output = output[0]
         out2 = output[2]
         return quantized_output, out2
+
+
+class NpuAddRmsNormDynamicQuantFuse:
+    def pattern(rms_norm_input, residual, rms_norm_weight):
+        output = torch.ops.npu.npu_add_rms_norm(
+            rms_norm_input, residual, rms_norm_weight, 1e-6
+        )
+        out0 = output[0]
+        out2 = output[2]
+        quantized_output = torch.ops.npu.npu_dynamic_quant(out0)
+        return quantized_output, out2, dynamic_scale
+
+    def replacement(rms_norm_input, residual, rms_norm_weight):
+        output = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
+            x1=rms_norm_input,
+            x2=residual,
+            gamma=rms_norm_weight,
+            epsilon=1e-6,
+            output_mask=[True, True],
+        )
+        quantized_output = output[0]
+        out2 = output[2]
+        dynamic_scale = output[3]
+        return quantized_output, out2, dynamic_scale

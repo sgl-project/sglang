@@ -20,6 +20,7 @@ from sglang.srt.compilation.npu.pass_manager import PassManager
 from sglang.srt.compilation.npu.passes.w8a8_int8 import (
     DivFuse,
     EraseCopy,
+    NpuAddRmsNormDynamicQuantFuse,
     NpuAddRmsNormQuantFuse,
 )
 
@@ -36,6 +37,7 @@ class NpuGraphCompilerBackend:
     def apply_passes(graph_module: torch.fx.GraphModule):
         passManager = PassManager(graph_module)
         passManager.add(NpuAddRmsNormQuantFuse)
+        passManager.add(NpuAddRmsNormDynamicQuantFuse)
         passManager.add(DivFuse)
         passManager.add(EraseCopy)
         passManager.apply()
