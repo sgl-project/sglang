@@ -1016,7 +1016,16 @@ class Scheduler(
                 and self.last_batch.forward_mode.is_extend()
             )
 
-            if disable_overlap_for_batch:
+            # FIXME(lsyin): remove this grammar sync
+            need_grammar_sync = (
+                batch is not None
+                and batch.forward_mode.is_decode()
+                and batch.has_grammar
+                and batch.is_v2_eagle
+                and len(self.result_queue) > 0
+            )
+
+            if disable_overlap_for_batch or need_grammar_sync:
                 pop_and_process()
 
             batch_result = None
@@ -1025,7 +1034,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not need_grammar_sync:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
