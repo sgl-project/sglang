@@ -164,7 +164,10 @@ class ComponentLoader(ABC):
             target_device = self.target_device(should_offload)
             component = component.to(device=target_device)
             source = "native"
-            logger.warning("Native module %s is loaded, performance may be sub-optimal", module_name)
+            logger.warning(
+                "Native module %s is loaded, performance may be sub-optimal",
+                module_name,
+            )
 
         if component is None:
             logger.warning("Loaded %s returned None", module_name)
