@@ -546,6 +546,7 @@ class PiecewiseCudaGraphRunner:
             forward_mode=forward_batch.forward_mode,
             batch_size=bs,
             input_ids=input_ids,
+            input_embeds=input_embeds,
             req_pool_indices=forward_batch.req_pool_indices,
             seq_lens=forward_batch.seq_lens,
             next_token_logits_buffer=next_token_logits_buffer,
