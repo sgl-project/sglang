@@ -1,19 +1,3 @@
-########################################################
-# Multi-stage Dockerfile for SGLang
-#
-# Stages:
-# 1. base - System dependencies and Python setup
-# 2. framework - Framework development with full build tools
-# 3. runtime - Lightweight production runtime
-#
-# Optimizations:
-# - Multi-stage builds for smaller runtime images
-# - Better layer caching organization
-# - Separation of build vs runtime dependencies
-# - Fixed CUDA architecture compilation bugs
-# - Added retry logic for downloads
-########################################################
-
 ARG CUDA_VERSION=12.9.1
 
 ########################################################
@@ -445,20 +429,11 @@ WORKDIR /sgl-workspace/sglang
 ########################################################
 ########## Runtime Image ##############################
 ########################################################
-#
-# PURPOSE: Lightweight production runtime environment
-#
 # This stage creates a production-ready image containing:
 # - Pre-compiled SGLang and DeepEP components
 # - Essential runtime dependencies only (no build tools)
 # - Optimized for inference workloads and deployment
 # - Significantly smaller than the framework image
-#
-# Use this stage when you need:
-# - Production deployment of SGLang
-# - Minimal runtime footprint without build tools
-# - Ready-to-run inference server environment
-#
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04 AS runtime
 
 ARG CUDA_VERSION
