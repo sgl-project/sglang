@@ -401,10 +401,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         if not hasattr(self, "alt_stream"):
             self.alt_stream = None
 
-        # print('#$' * 100)
-        # # print(f'self.in_proj_qkvz:{self.in_proj_qkvz.weight.shape}')
-        # print(f'hidden_states:{hidden_states.shape}')
-
         # Use dual-stream only on CUDA and for short sequences
         if seq_len < DUAL_STREAM_TOKEN_THRESHOLD and torch.cuda.is_available():
             current_stream = torch.cuda.current_stream()
@@ -470,12 +466,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             mixed_qkv = torch.cat((query, key, value), dim=-1)
         # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
 
-        # 2. Convolution sequence transformation
-        
-        # print('#$' * 100)
-        # print(f'self.conv1d.weight{self.conv1d.weight.shape}')
-
-        
+        # 2. Convolution sequence transformation        
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         )
@@ -519,10 +510,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
-
-        # print('#$' * 100)
-        # print(f'core_attn_out:{core_attn_out.shape}')
-        # print(f'self.out_proj:{self.out_proj.weight.shape}')
 
         output, _ = self.out_proj(core_attn_out)
         return output
@@ -589,15 +576,6 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         **kwargs,
     ):
         forward_batch = kwargs.get("forward_batch", None)
-
-
-
-        # print('#$' * 1000)
-        # print(f'hidden_states:{hidden_states.dtype}')
-        # if residual is not None:
-        #     print(f'residual:{residual.dtype}')
-
-
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
@@ -780,11 +758,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
 
-        # print('#$' * 1000)
-        # print(f'qkv_hidden_states:{hidden_states.shape}')
-        # print(f'qkv_proj:{self.qkv_proj.weight.shape}')
-
-
         qkv, _ = self.qkv_proj(hidden_states)
 
         if self.attn_output_gate:
@@ -802,23 +775,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         q, k = self._apply_qk_norm(q, k)
 
         q, k = self.rotary_emb(positions, q, k)
-
-        
-        # print('#$' * 1000)
-        # print(f'q:{q.shape}')
-        # print(f'k:{k.shape}')
-        # print(f'v:{v.shape}')
-
         
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
-
-        # print('#$' * 1000)
-        # print(f'attn_output:{attn_output.shape}')
-        # print(f'o_proj:{self.o_proj.weight.shape}')
 
         output, _ = self.o_proj(attn_output)
         return output
