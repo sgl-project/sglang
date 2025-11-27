@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import List, Optional
 
 from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
@@ -14,9 +15,10 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     Supports both formats:
     1. Old format: "ib0, ib1, ib2"
     2. New format: {0: "ib0, ib1", 1: "ib2, ib3", 2: "ib4"}
+    3. JSON file: path to a JSON file containing the mapping
 
     Args:
-        ib_device_str: The original IB device string
+        ib_device_str: The original IB device string or path to JSON file
         gpu_id: The GPU ID to get devices for
 
     Returns:
@@ -27,8 +29,13 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
 
     ib_device_str = ib_device_str.strip()
 
-    # Check if it's JSON format (new format)
+    # Check if it's JSON format (new format or JSON file)
     try:
+        # Check if it's a JSON file first
+        if ib_device_str.endswith(".json") and os.path.isfile(ib_device_str):
+            with open(ib_device_str, "r") as f:
+                ib_device_str = f.read()
+
         parsed_json = json.loads(ib_device_str)
         if isinstance(parsed_json, dict):
             # Validate format - keys should be integers (or string rep), values should be strings
