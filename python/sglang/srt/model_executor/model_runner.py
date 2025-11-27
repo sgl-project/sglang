@@ -352,40 +352,6 @@ class ModelRunner:
         self._model_update_group = {}
         self._weights_send_group = {}
 
-        if (
-            self.server_args.enable_piecewise_cuda_graph
-            and self.can_run_piecewise_cuda_graph()
-        ):
-            self.attention_layers = []
-            for layer in self.model.model.layers:
-                if hasattr(layer, "self_attn"):
-                    if hasattr(layer.self_attn, "attn"):
-                        self.attention_layers.append(layer.self_attn.attn)
-                    elif hasattr(layer.self_attn, "attn_mqa"):
-                        # For DeepSeek model
-                        self.attention_layers.append(layer.self_attn.attn_mqa)
-                # For hybrid model
-                elif hasattr(layer, "attn"):
-                    self.attention_layers.append(layer.attn)
-                elif hasattr(layer, "linear_attn"):
-                    self.attention_layers.append(layer.linear_attn)
-                # For InternVL model
-                elif hasattr(layer, "attention"):
-                    if hasattr(layer.attention, "attn"):
-                        self.attention_layers.append(layer.attention.attn)
-
-            if len(self.attention_layers) < self.model_config.num_hidden_layers:
-                # TODO(yuwei): support Non-Standard GQA
-                log_info_on_rank0(
-                    logger,
-                    "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
-                )
-                self.piecewise_cuda_graph_runner = None
-            else:
-                self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
-        else:
-            self.piecewise_cuda_graph_runner = None
-
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
@@ -561,6 +527,40 @@ class ModelRunner:
                 eagle_aux_hidden_state_layer_ids = None
 
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+
+        if (
+            self.server_args.enable_piecewise_cuda_graph
+            and self.can_run_piecewise_cuda_graph()
+        ):
+            self.attention_layers = []
+            for layer in self.model.model.layers:
+                if hasattr(layer, "self_attn"):
+                    if hasattr(layer.self_attn, "attn"):
+                        self.attention_layers.append(layer.self_attn.attn)
+                    elif hasattr(layer.self_attn, "attn_mqa"):
+                        # For DeepSeek model
+                        self.attention_layers.append(layer.self_attn.attn_mqa)
+                # For hybrid model
+                elif hasattr(layer, "attn"):
+                    self.attention_layers.append(layer.attn)
+                elif hasattr(layer, "linear_attn"):
+                    self.attention_layers.append(layer.linear_attn)
+                # For InternVL model
+                elif hasattr(layer, "attention"):
+                    if hasattr(layer.attention, "attn"):
+                        self.attention_layers.append(layer.attention.attn)
+
+            if len(self.attention_layers) < self.model_config.num_hidden_layers:
+                # TODO(yuwei): support Non-Standard GQA
+                log_info_on_rank0(
+                    logger,
+                    "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
+                )
+                self.piecewise_cuda_graph_runner = None
+            else:
+                self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        else:
+            self.piecewise_cuda_graph_runner = None
 
     def model_specific_adjustment(self):
         server_args = self.server_args
