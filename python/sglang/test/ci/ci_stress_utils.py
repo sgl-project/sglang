@@ -1,5 +1,6 @@
 """Utilities for running stress tests with bench_serving."""
 
+import os
 import subprocess
 from typing import List, Optional
 
@@ -156,12 +157,20 @@ class StressTestRunner:
         print(f"Num prompts: {self.num_prompts}")
         print(f"{'='*60}\n")
 
+        # Get server launch timeout from env var or use default
+        server_timeout = int(
+            os.environ.get(
+                "SGLANG_SERVER_LAUNCH_TIMEOUT", DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            )
+        )
+        print(f"Server launch timeout: {server_timeout}s")
+
         # Launch server
         process = popen_launch_server(
             model=model_path,
             base_url=self.base_url,
             other_args=server_args or [],
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=server_timeout,
         )
 
         try:

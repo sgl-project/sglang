@@ -36,6 +36,7 @@ jobs:
         env:
           NUM_PROMPTS: ${{ inputs.num_prompts }}
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          SGLANG_SERVER_LAUNCH_TIMEOUT: '3600'
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite stress
