@@ -1202,7 +1202,7 @@ class ServerArgs:
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization == "fp8"
+                    self.quantization in ("fp8", "modelopt_fp4")
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -1229,7 +1229,7 @@ class ServerArgs:
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization == "fp8"
+                    (self.quantization == "fp8" or self.quantization == "modelopt_fp4")
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
