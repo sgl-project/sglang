@@ -29,7 +29,6 @@ from typing import (
 )
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tp_group
@@ -81,7 +80,7 @@ if _is_cuda:
         pass
 
 if _is_cuda or _is_hip:
-    from sgl_kernel import topk_softmax, topk_sigmoid
+    from sgl_kernel import topk_sigmoid, topk_softmax
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
