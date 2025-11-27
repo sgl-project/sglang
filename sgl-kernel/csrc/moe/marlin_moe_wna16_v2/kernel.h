@@ -3,9 +3,9 @@
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16_v2
 #endif
 
-#include "quantization/gptq_marlin/marlin.cuh"
-#include "quantization/gptq_marlin/marlin_dtypes.cuh"
-#include "core/scalar_type.hpp"
+#include "gemm/marlin/marlin.cuh"
+#include "gemm/marlin/marlin_dtypes.cuh"
+#include "scalar_type.hpp"
 
 #define MARLIN_KERNEL_PARAMS                                                  \
   const int4 *__restrict__ A, const int4 *__restrict__ B,                     \
