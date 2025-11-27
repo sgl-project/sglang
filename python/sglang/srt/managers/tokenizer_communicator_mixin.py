@@ -22,6 +22,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    CheckWeightsReqInput,
+    CheckWeightsReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -183,6 +185,9 @@ class TokenizerCommunicatorMixin:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.check_weights_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.slow_down_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -255,6 +260,10 @@ class TokenizerCommunicatorMixin:
                 (
                     ResumeMemoryOccupationReqOutput,
                     self.resume_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    CheckWeightsReqOutput,
+                    self.check_weights_communicator.handle_recv,
                 ),
                 (
                     SlowDownReqOutput,
@@ -669,6 +678,15 @@ class TokenizerCommunicatorMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def check_weights(
+        self: TokenizerManager,
+        obj: CheckWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> CheckWeightsReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.check_weights_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def slow_down(
         self: TokenizerManager,
