@@ -170,6 +170,7 @@ from sglang.srt.utils.offloader import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -297,6 +298,7 @@ class ModelRunner:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid = model_config.is_hybrid
+        self.is_hybrid_swa = self.is_hybrid
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
@@ -326,6 +328,8 @@ class ModelRunner:
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
+
+        self._weight_checker = WeightChecker(model_runner=self)
 
         if get_bool_env_var("SGLANG_DETECT_SLOW_RANK"):
             slow_rank_detector.execute()
@@ -1615,11 +1619,6 @@ class ModelRunner:
             )
 
     def can_run_piecewise_cuda_graph(self):
-        if self.server_args.disable_cuda_graph:
-            log_info_on_rank0(
-                logger, "Disable piecewise CUDA graph because disable_cuda_graph is set"
-            )
-            return False
         if self.server_args.enable_torch_compile:
             log_info_on_rank0(
                 logger,
@@ -2511,6 +2510,9 @@ class ModelRunner:
             f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
+
+    def check_weights(self, action: str):
+        self._weight_checker.handle(action=action)
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
