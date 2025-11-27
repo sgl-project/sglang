@@ -313,8 +313,10 @@ class SamplingParams:
         sampling_params = SamplingParams.from_pretrained(model_path)
 
         user_sampling_params = SamplingParams(*args, **kwargs)
+        # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
-
+        sampling_params.width_not_provided = user_sampling_params.width is None
+        sampling_params.height_not_provided = user_sampling_params.height is None
         sampling_params.adjust(server_args)
 
         return sampling_params
@@ -537,6 +539,8 @@ class SamplingParams:
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
 
+        self.height_not_provided = user_params.height_not_provided
+        self.width_not_provided = user_params.width_not_provided
         self.__post_init__()
 
     @property
