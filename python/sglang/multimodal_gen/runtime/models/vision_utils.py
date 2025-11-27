@@ -255,6 +255,8 @@ def get_default_height_width(
         else:
             width = image.shape[2]
 
+    print(f"{width=}")
+    print(f"{height=}")
     width, height = (
         x - x % vae_scale_factor for x in (width, height)
     )  # resize to integer multiple of vae_scale_factor
