@@ -2,6 +2,7 @@ import unittest
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.kits.json_constrained_kit import TestJSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import TestRegexConstrainedMixin
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
@@ -13,7 +14,9 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEagleServerBase(CustomTestCase, TestRegexConstrainedMixin):
+class TestEagleServerBase(
+    CustomTestCase, TestRegexConstrainedMixin, TestJSONConstrainedMixin
+):
     max_running_requests = 64
     attention_backend = "triton"
     spec_steps = 5
