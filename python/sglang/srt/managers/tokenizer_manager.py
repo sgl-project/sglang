@@ -55,6 +55,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     ConfigureLoggingReq,
+    ContinueGenerationReqInput,
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
@@ -62,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
+    PauseGenerationReqInput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -1247,21 +1249,25 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 self.metrics_collector.labels
             )
 
-    async def pause_generation(self):
+    async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
-            # we are using the model_update_lock to check if there is still on-going requests.
-            while True:
-                # TODO: maybe make it async instead of fire-and-forget
-                self.abort_request(abort_all=True)
-                is_locked = await self.model_update_lock.is_locked()
-                if not is_locked:
-                    break
-                await asyncio.sleep(1.0)
+            if obj.mode != "abort":
+                await self.send_to_scheduler.send_pyobj(obj)
+            else:
+                # we are using the model_update_lock to check if there is still on-going requests.
+                while True:
+                    # TODO: maybe make it async instead of fire-and-forget
+                    self.abort_request(abort_all=True)
+                    is_locked = await self.model_update_lock.is_locked()
+                    if not is_locked:
+                        break
+                    await asyncio.sleep(1.0)
 
-    async def continue_generation(self):
+    async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
+            await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1278,6 +1284,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
+
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
+                return await self._wait_for_model_update_from_disk(obj)
 
         if True:  # Keep this redundant check to simplify some internal code sync
             # Hold the lock if it is not async. This means that weight sync
@@ -1827,17 +1838,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         meta_info["spec_accept_length"] = 0
         meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+        # The draft tokens per speculative step (excluding the target-sampled token).
+        num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+
         if (
             recv_obj.spec_verify_ct[i] > 0
-            and self.server_args.speculative_num_steps is not None
+            and num_guess_tokens is not None
             and not isinstance(recv_obj, BatchEmbeddingOutput)
             and hasattr(recv_obj, "spec_accepted_tokens")
             # Checks that `spec_accepted_tokens[i]` will exist.
             and len(recv_obj.spec_accepted_tokens) > i
         ):
-            total_draft_tokens = (
-                recv_obj.spec_verify_ct[i] * self.server_args.speculative_num_steps
-            )
+            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
