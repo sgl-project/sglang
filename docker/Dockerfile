@@ -411,11 +411,20 @@ WORKDIR /sgl-workspace/sglang
 ########################################################
 ########## Runtime Image ##############################
 ########################################################
+#
+# PURPOSE: Lightweight production runtime environment
+#
 # This stage creates a production-ready image containing:
 # - Pre-compiled SGLang and DeepEP components
 # - Essential runtime dependencies only (no build tools)
 # - Optimized for inference workloads and deployment
 # - Significantly smaller than the framework image
+#
+# Use this stage when you need:
+# - Production deployment of SGLang
+# - Minimal runtime footprint without build tools
+# - Ready-to-run inference server environment
+#
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04 AS runtime
 
 ARG CUDA_VERSION
@@ -436,8 +445,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     # Python runtime
     software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && apt-get update && apt-get install -y --no-install-recommends \
     python3.12-full \
     python3.12-dev \
     wget \
@@ -447,7 +455,6 @@ RUN --mount=type=cache,target=/var/cache/apt \
     netcat-openbsd \
     curl \
     git \
-    locales \
     # Runtime libraries (no -dev packages)
     libopenmpi3 \
     libnuma1 \
@@ -473,7 +480,6 @@ RUN --mount=type=cache,target=/var/cache/apt \
     rdma-core \
     infiniband-diags \
     perftest \
-    && locale-gen en_US.UTF-8 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
@@ -482,6 +488,11 @@ RUN --mount=type=cache,target=/var/cache/apt \
     && rm get-pip.py \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
+
+# Set up locale
+RUN apt-get update && apt-get install -y --no-install-recommends locales \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
@@ -499,7 +510,9 @@ COPY --from=framework /usr/bin/gdrcopy_* /usr/bin/
 COPY --from=framework /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 
 # Copy essential binaries
-COPY --from=framework /usr/local/bin/sglang-router /usr/local/bin/sglang-router
+COPY --from=framework /usr/local/bin/diff-so-fancy /usr/local/bin/
+COPY --from=framework /usr/local/bin/yank /usr/local/bin/
+COPY --from=framework /usr/local/bin/just /usr/local/bin/
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
