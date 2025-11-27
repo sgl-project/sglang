@@ -28,9 +28,8 @@ ARG GRACE_BLACKWELL=0
 
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
-ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.17.post2
+ARG SGL_KERNEL_VERSION=0.3.18.post1
 ARG SGL_VERSION=0.5.5.post3
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -247,6 +246,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
         python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+        python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
         python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
         python3 -m pip uninstall -y torch torchaudio torchvision ; \
@@ -339,6 +339,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cd /sgl-workspace/sglang/sgl-router/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
+    && cd /sgl-workspace/sglang/sgl-router \
+    && cargo build --release --bin sglang-router --features vendored-openssl \
+    && cp target/release/sglang-router /usr/local/bin/sglang-router \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
@@ -541,9 +544,7 @@ COPY --from=framework /usr/bin/gdrcopy_* /usr/bin/
 COPY --from=framework /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 
 # Copy essential binaries
-COPY --from=framework /usr/local/bin/diff-so-fancy /usr/local/bin/
-COPY --from=framework /usr/local/bin/yank /usr/local/bin/
-COPY --from=framework /usr/local/bin/just /usr/local/bin/
+COPY --from=framework /usr/local/bin/sglang-router /usr/local/bin/sglang-router
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
