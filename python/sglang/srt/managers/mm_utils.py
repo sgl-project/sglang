@@ -987,6 +987,7 @@ def should_use_external_mm_preprocess(multimodal_model: nn.Module) -> bool:
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",
         "InternVLChatModel",
+        "HunYuanVLForConditionalGeneration",
     }
 
     return cls_name in external_mm_preprocess_classes
