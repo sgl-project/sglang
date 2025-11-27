@@ -5,6 +5,9 @@
 Synchronous pipeline executor implementation.
 """
 from typing import List
+import os
+import torch
+import torch.profiler
 
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -32,8 +35,48 @@ class SyncExecutor(PipelineExecutor):
         """
         logger.info("Running pipeline stages sequentially with SyncExecutor.")
 
-        for stage in stages:
-            with Timer(stage.__class__.__name__):
-                batch = stage(batch, server_args)
+        do_global_profile = bool(getattr(batch, "global_profile", False))
+        global_full = bool(getattr(batch, "global_profile_full", False))
+
+        def _run_all():
+            nonlocal batch
+            for stage in stages:
+                with Timer(stage.__class__.__name__):
+                    batch = stage(batch, server_args)
+            return batch
+
+        if do_global_profile:
+            try:
+                os.makedirs("./logs", exist_ok=True)
+            except Exception:
+                pass
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+            if global_full:
+                with torch.profiler.profile(
+                    activities=activities, record_shapes=True, with_stack=True
+                ) as prof:
+                    batch = _run_all()
+                prof.export_chrome_trace("./logs/pipeline.full.trace.json.gz")
+            else:
+                with torch.profiler.profile(
+                    activities=activities,
+                    schedule=torch.profiler.schedule(
+                        skip_first=0, wait=0, warmup=0, active=len(stages), repeat=1
+                    ),
+                    record_shapes=True,
+                    with_stack=True,
+                ) as prof:
+                    for stage in stages:
+                        with Timer(stage.__class__.__name__):
+                            batch = stage(batch, server_args)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        prof.step()
+                prof.export_chrome_trace("./logs/pipeline.stages.trace.json.gz")
+        else:
+            batch = _run_all()
 
         return batch

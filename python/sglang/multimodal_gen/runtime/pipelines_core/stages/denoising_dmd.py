@@ -30,7 +30,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler, CudaEventsTimer
 from sglang.multimodal_gen.utils import dict_to_3d_list
 
 logger = init_logger(__name__)
@@ -143,7 +143,9 @@ class DmdDenoisingStage(DenoisingStage):
 
         # Run denoising loop
         denoising_loop_start_time = time.time()
-        self.start_profile(batch=batch)
+        gpu_timings: dict[str, float] = {}
+        with CudaEventsTimer("denoising_total_gpu", gpu_timings):
+            self.start_profile(batch=batch)
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Skip if interrupted
@@ -278,6 +280,11 @@ class DmdDenoisingStage(DenoisingStage):
 
         self.stop_profile(batch)
         denoising_loop_end_time = time.time()
+        if getattr(batch, "timings", None) is not None and "denoising_total_gpu" in gpu_timings:
+            try:
+                batch.timings.record_stage("denoising_total_gpu", gpu_timings["denoising_total_gpu"])
+            except Exception:
+                pass
         if len(timesteps) > 0:
             self.log_info(
                 "average time per step: %.4f seconds",

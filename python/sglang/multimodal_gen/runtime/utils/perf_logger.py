@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from dateutil.tz import UTC
+import torch
 
 import sglang
 import sglang.multimodal_gen.envs as envs
@@ -261,3 +262,40 @@ class PerformanceLogger:
 
         except (OSError, PermissionError) as e:
             print(f"WARNING: Failed to log performance record: {e}", file=sys.stderr)
+
+
+class CudaEventsTimer:
+    """
+    Context manager for precise GPU timing using CUDA events.
+
+    Usage:
+        timings = {}
+        with CudaEventsTimer("section_name", timings):
+            ...  # GPU work
+        # timings["section_name"] -> seconds (float)
+    """
+
+    def __init__(self, name: str, sink: Optional[Dict[str, float]] = None):
+        self.name = name
+        self.sink = sink
+        self._start_event: Optional[torch.cuda.Event] = None
+        self._end_event: Optional[torch.cuda.Event] = None
+        self.seconds: float = 0.0
+
+    def __enter__(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            self._start_event = torch.cuda.Event(enable_timing=True)
+            self._end_event = torch.cuda.Event(enable_timing=True)
+            self._start_event.record()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if torch.cuda.is_available() and self._start_event is not None and self._end_event is not None:
+            self._end_event.record()
+            torch.cuda.synchronize()
+            ms = self._start_event.elapsed_time(self._end_event)
+            self.seconds = ms / 1000.0
+            if self.sink is not None:
+                self.sink[self.name] = self.seconds
+        return False

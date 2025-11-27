@@ -59,7 +59,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler, CudaEventsTimer
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 try:
@@ -604,28 +604,45 @@ class DenoisingStage(PipelineStage):
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-        self.profiler = torch.profiler.profile(
-            activities=activities,
-            schedule=torch.profiler.schedule(
-                skip_first=0,
-                wait=0,
-                warmup=1,
-                active=batch.num_profiled_timesteps,
-                repeat=5,
-            ),
-            on_trace_ready=lambda _: torch.profiler.tensorboard_trace_handler(
-                f"./logs"
-            ),
-            record_shapes=True,
-            with_stack=True,
-        )
+        # Enable a full-coverage mode (no schedule/step) when requested
+        self._profile_full = bool(getattr(batch, "profile_full", False))
+        # Ensure log directory exists for trace files/handlers
+        try:
+            os.makedirs("./logs", exist_ok=True)
+        except Exception:
+            pass
+        if self._profile_full:
+            self.profiler = torch.profiler.profile(
+                activities=activities,
+                on_trace_ready=lambda p: p.export_chrome_trace("./logs/full.trace.json.gz"),
+                record_shapes=True,
+                with_stack=True,
+            )
+        else:
+            self.profiler = torch.profiler.profile(
+                activities=activities,
+                schedule=torch.profiler.schedule(
+                    skip_first=0,
+                    wait=0,
+                    warmup=0,
+                    active=batch.num_profiled_timesteps,
+                    repeat=5,
+                ),
+                on_trace_ready=lambda _: torch.profiler.tensorboard_trace_handler(
+                    f"./logs"
+                ),
+                record_shapes=True,
+                with_stack=True,
+            )
         self.profiler.start()
 
     def step_profile(self):
         if self.profiler:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            self.profiler.step()
+            # Only step when using scheduled profiling
+            if not getattr(self, "_profile_full", False):
+                self.profiler.step()
 
     def stop_profile(self, batch: Req):
         try:
@@ -814,7 +831,9 @@ class DenoisingStage(PipelineStage):
         # Run denoising loop
         denoising_start_time = time.time()
 
-        self.start_profile(batch=batch)
+        gpu_timings: dict[str, float] = {}
+        with CudaEventsTimer("denoising_total_gpu", gpu_timings):
+            self.start_profile(batch=batch)
 
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = timesteps.cpu()
@@ -913,11 +932,17 @@ class DenoisingStage(PipelineStage):
                         ):
                             progress_bar.update()
 
-                        self.step_profile()
 
         self.stop_profile(batch)
 
         denoising_end_time = time.time()
+
+        # Record total GPU time as a stage metric (seconds -> record_stage expects seconds)
+        if getattr(batch, "timings", None) is not None and "denoising_total_gpu" in gpu_timings:
+            try:
+                batch.timings.record_stage("denoising_total_gpu", gpu_timings["denoising_total_gpu"])
+            except Exception:
+                pass
 
         if num_timesteps > 0:
             self.log_info(

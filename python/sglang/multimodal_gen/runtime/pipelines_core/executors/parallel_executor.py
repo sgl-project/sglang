@@ -1,8 +1,10 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 from typing import List
+import os
 
 import torch
+import torch.profiler
 
 from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -58,35 +60,92 @@ class ParallelExecutor(PipelineExecutor):
         cfg_rank = get_classifier_free_guidance_rank()
         cfg_group = get_cfg_group()
 
-        # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
-        for stage in stages:
-            with Timer(stage.__class__.__name__):
-                paradigm = stage.parallelism_type
+        do_global_profile = bool(getattr(batch, "global_profile", False))
+        global_full = bool(getattr(batch, "global_profile_full", False))
 
-                if paradigm == StageParallelismType.MAIN_RANK_ONLY:
-                    if rank == 0:
+        def _run_all_stages():
+            nonlocal batch
+            # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
+            for stage in stages:
+                with Timer(stage.__class__.__name__):
+                    paradigm = stage.parallelism_type
+
+                    if paradigm == StageParallelismType.MAIN_RANK_ONLY:
+                        if rank == 0:
+                            # Only main rank executes, others just wait
+                            batch = stage(batch, server_args)
+                        torch.distributed.barrier()
+
+                    elif paradigm == StageParallelismType.CFG_PARALLEL:
+                        obj_list = [batch] if rank == 0 else []
+                        broadcasted_list = broadcast_pyobj(
+                            obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
+                        )
+                        if rank != 0:
+                            batch = broadcasted_list[0]
                         batch = stage(batch, server_args)
-                    # obj_list = [batch] if rank == 0 else []
-                    #
-                    # broadcasted_list = broadcast_pyobj(
-                    #     obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
-                    # )
-                    # if rank != 0:
-                    #     batch = broadcasted_list[0]
-                    torch.distributed.barrier()
 
-                elif paradigm == StageParallelismType.CFG_PARALLEL:
-                    obj_list = [batch] if rank == 0 else []
-                    broadcasted_list = broadcast_pyobj(
-                        obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
-                    )
-                    if rank != 0:
-                        batch = broadcasted_list[0]
-                    batch = stage(batch, server_args)
+                        torch.distributed.barrier()
 
-                    torch.distributed.barrier()
+                    elif paradigm == StageParallelismType.REPLICATED:
+                        batch = stage(batch, server_args)
+            return batch
 
-                elif paradigm == StageParallelismType.REPLICATED:
-                    batch = stage(batch, server_args)
+        if do_global_profile:
+            try:
+                os.makedirs("./logs", exist_ok=True)
+            except Exception:
+                pass
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+            if global_full:
+                with torch.profiler.profile(
+                    activities=activities,
+                    record_shapes=True,
+                    with_stack=True,
+                ) as prof:
+                    batch = _run_all_stages()
+                if rank == 0:
+                    prof.export_chrome_trace("./logs/pipeline.full.trace.json.gz")
+            else:
+                with torch.profiler.profile(
+                    activities=activities,
+                    schedule=torch.profiler.schedule(
+                        skip_first=0, wait=0, warmup=0, active=len(stages), repeat=1
+                    ),
+                    record_shapes=True,
+                    with_stack=True,
+                ) as prof:
+                    # run with stepping per stage
+                    for stage in stages:
+                        with Timer(stage.__class__.__name__):
+                            paradigm = stage.parallelism_type
+                            if paradigm == StageParallelismType.MAIN_RANK_ONLY:
+                                if rank == 0:
+                                    batch = stage(batch, server_args)
+                                torch.distributed.barrier()
+                            elif paradigm == StageParallelismType.CFG_PARALLEL:
+                                obj_list = [batch] if rank == 0 else []
+                                broadcasted_list = broadcast_pyobj(
+                                    obj_list,
+                                    rank=rank,
+                                    dist_group=cfg_group.cpu_group,
+                                    src=0,
+                                )
+                                if rank != 0:
+                                    batch = broadcasted_list[0]
+                                batch = stage(batch, server_args)
+                                torch.distributed.barrier()
+                            elif paradigm == StageParallelismType.REPLICATED:
+                                batch = stage(batch, server_args)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        prof.step()
+                if rank == 0:
+                    prof.export_chrome_trace("./logs/pipeline.stages.trace.json.gz")
+        else:
+            batch = _run_all_stages()
 
         return batch
