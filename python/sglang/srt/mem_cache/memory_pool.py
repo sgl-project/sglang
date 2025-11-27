@@ -1517,7 +1517,7 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        from sgalng.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
+        from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 
         layer_id = layer.layer_id
 
@@ -1683,6 +1683,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
+
         layer_id = layer.layer_id
 
         if self.use_nsa and self.nsa_kv_cache_store_fp8:

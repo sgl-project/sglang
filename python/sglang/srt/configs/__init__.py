@@ -17,7 +17,9 @@ LongcatFlashConfig = LazyImport(
     "sglang.srt.configs.longcat_flash", "LongcatFlashConfig"
 )
 NemotronHConfig = LazyImport("sglang.srt.configs.nemotron_h", "NemotronHConfig")
-NemotronH_Nano_VL_V2_Config = LazyImport("sglang.srt.configs.nano_nemotron_vl", "NemotronH_Nano_VL_V2_Config")
+NemotronH_Nano_VL_V2_Config = LazyImport(
+    "sglang.srt.configs.nano_nemotron_vl", "NemotronH_Nano_VL_V2_Config"
+)
 Olmo3Config = LazyImport("sglang.srt.configs.olmo3", "Olmo3Config")
 Qwen3NextConfig = LazyImport("sglang.srt.configs.qwen3_next", "Qwen3NextConfig")
 Step3VLConfig = LazyImport("sglang.srt.configs.step3_vl", "Step3VLConfig")
@@ -47,5 +49,5 @@ __all__ = [
     "NemotronHConfig",
     "NemotronH_Nano_VL_V2_Config",
     "JetNemotronConfig",
-    "JetVLMConfig"
+    "JetVLMConfig",
 ]

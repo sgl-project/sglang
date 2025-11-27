@@ -1,9 +1,3 @@
-from __future__ import annotations
-
-import enum
-
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -104,9 +98,9 @@ _is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.dllm.config import DllmConfig
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
-    from sglang.srt.dllm.config import DllmConfig
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 

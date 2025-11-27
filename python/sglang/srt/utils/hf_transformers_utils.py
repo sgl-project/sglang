@@ -92,7 +92,7 @@ def _register_custom_configs():
         DeepseekVLV2Config,
         JetNemotronConfig,
         JetVLMConfig,
-]
+    ]
 
     _CONFIG_REGISTRY = {
         config_cls.model_type: config_cls for config_cls in _CONFIG_REGISTRY
