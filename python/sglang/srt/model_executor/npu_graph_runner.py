@@ -1,4 +1,4 @@
-# Copyright 2023-2025 SGLang Team
+# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 import sglang.srt.model_executor.cuda_graph_runner
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -43,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
 
 from sglang.srt.compilation.custom_ops import (
     _set_dp_buffer_len,
@@ -74,7 +73,6 @@ class NPUGraphRunner(CudaGraphRunner):
         )
 
         super().__init__(model_runner)
-        self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
@@ -148,24 +146,12 @@ class NPUGraphRunner(CudaGraphRunner):
         return self.attr_type[model_runner.model_config.attention_arch]
 
     def _update_inputs(self, seq_lens):
-        if self.enable_torch_compile and (
-            not self.compile_bs or self.bs in self.compile_bs
-        ):
-            if self.use_mla:
-                self.graphs[self.bs].update(
-                    cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
-                )
-            else:
-                self.graphs[self.bs].update(
-                    cpu_update_input=[{"context_lens": seq_lens}]
-                )
-        else:
-            if isinstance(self.update_attr_type, torch.Tensor):
-                seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+        if isinstance(self.update_attr_type, torch.Tensor):
+            seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
 
-            self.graphs[self.bs].update(
-                cpu_update_input=[{self.update_attr_name: seq_lens}]
-            )
+        self.graphs[self.bs].update(
+            cpu_update_input=[{self.update_attr_name: seq_lens}]
+        )
 
     def _cache_loc_dtype(self):
         return torch.int32
@@ -214,39 +200,20 @@ class NPUGraphRunner(CudaGraphRunner):
         self.update_attr_name = self._get_update_attr_name(self.model_runner)
         self.update_attr_type = self._get_update_attr_type(self.model_runner)
         # Replay
-        if self.enable_torch_compile and (
-            not self.compile_bs or self.bs in self.compile_bs
-        ):
-            seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                self.bs - self.raw_bs
-            )
-            if self.use_mla:
-                actual_seq_len_kv = seq_lens
+        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+            if forward_batch.forward_mode.is_target_verify():
+                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
-                actual_seq_len_kv = torch.from_numpy(
-                    np.array(seq_lens).astype(np.int32)
+                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                    self.bs - self.raw_bs
                 )
-            thread = threading.Thread(
-                target=self._update_inputs, args=(actual_seq_len_kv,)
-            )
+            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
             thread.start()
             self.graphs[self.bs].replay()
             thread.join()
         else:
-            if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
-                if forward_batch.forward_mode.is_target_verify():
-                    seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
-                    seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
-                else:
-                    seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                        self.bs - self.raw_bs
-                    )
-                thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
-                thread.start()
-                self.graphs[self.bs].replay()
-                thread.join()
-            else:
-                self.graphs[self.bs].replay()
+            self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):
