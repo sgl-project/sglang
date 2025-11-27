@@ -202,7 +202,7 @@ elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 ; \
-fi \
+fi
 
 # Install development tools and utilities
 RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
