@@ -138,7 +138,6 @@ class Qwen2_5_VLAttention(nn.Module):
             causal=True,
             supported_attention_backends=(
                 AttentionBackendEnum.FA,
-                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )

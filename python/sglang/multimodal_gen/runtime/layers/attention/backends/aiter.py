@@ -52,8 +52,6 @@ class AITerImpl(AttentionImpl):
         dropout_p: float = 0.0,
         **extra_impl_args,
     ) -> None:
-        if not isinstance(num_kv_heads, int):
-            raise ValueError("num_kv_heads must be an integer")
         if num_kv_heads is not None and num_kv_heads != num_heads:
             raise NotImplementedError(
                 "AITer backend does not support Grouped Query Attention yet."
@@ -82,17 +80,6 @@ class AITerImpl(AttentionImpl):
         """
         # aiter.flash_attn_func expects tensors in [B, H, S, D] layout,
         # which is what ring_attn provides.
-        allowed_dtypes = (torch.float16, torch.bfloat16)
-        orig_dtype = query.dtype
-        target_dtype = orig_dtype
-        if orig_dtype not in allowed_dtypes:
-            target_dtype = (
-                torch.bfloat16 if torch.bfloat16 in allowed_dtypes else torch.float16
-            )
-            query = query.to(target_dtype)
-            key = key.to(target_dtype)
-            value = value.to(target_dtype)
-
         output, _ = aiter.flash_attn_func(
             query,
             key,
@@ -102,6 +89,4 @@ class AITerImpl(AttentionImpl):
             return_attn_probs=False,
             return_lse=True,
         )
-        if output.dtype != orig_dtype:
-            output = output.to(orig_dtype)
         return output
