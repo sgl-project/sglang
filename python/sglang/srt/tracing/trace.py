@@ -68,7 +68,7 @@ def extract_trace_headers(headers: Mapping[str, str]) -> Optional[Dict]:
 
 
 @dataclass
-class SGLangTraceThreadInfo:
+class TraceThreadInfo:
     host_id: str
     pid: int
     thread_label: str
@@ -78,7 +78,7 @@ class SGLangTraceThreadInfo:
 
 
 @dataclass
-class SGLangTraceEvent:
+class TraceEvent:
     event_name: str
     ts: int
     attrs: Dict[str, Any]
@@ -97,15 +97,15 @@ class SGLangTraceSliceContext:
     lazy_flag: bool = False
     level: int = 1
     attrs: Optional[Dict[str, Any]] = None
-    events: Optional[List[SGLangTraceEvent]] = None
+    events: Optional[List[TraceEvent]] = None
     parent_slice: Optional[SGLangTraceSliceContext] = None
     child_slices: Optional[List[SGLangTraceSliceContext]] = None
     prev_span_context: Optional[trace.span.SpanContext] = None
 
 
 @dataclass
-class SGLangTraceThreadContext:
-    thread_info: SGLangTraceThreadInfo
+class TraceThreadContext:
+    thread_info: TraceThreadInfo
     cur_slice: Optional[SGLangTraceSliceContext] = None
     thread_span: Optional[trace.span.Span] = None
     # Record the most recently completed span as the previous span for the next span to be created.
@@ -113,7 +113,7 @@ class SGLangTraceThreadContext:
 
 
 @dataclass
-class SGLangTracePropagateContext:
+class TracePropagateContext:
     root_span_context: context.Context
     prev_span_context: Optional[trace.span.SpanContext]
 
@@ -173,7 +173,7 @@ class SGLangTraceCustomIdGenerator(id_generator.IdGenerator):
 
 
 # global variables
-threads_info: Dict[int, SGLangTraceThreadInfo] = {}
+threads_info: Dict[int, TraceThreadInfo] = {}
 
 get_cur_time_ns = lambda: int(time.time() * 1e9)
 if hasattr(time, "time_ns"):
@@ -273,7 +273,7 @@ def trace_set_thread_info(
     if pid in threads_info:
         return
 
-    threads_info[pid] = SGLangTraceThreadInfo(
+    threads_info[pid] = TraceThreadInfo(
         host_id=__get_host_id(),
         pid=pid,
         thread_label=thread_label,
@@ -299,7 +299,7 @@ class SGLangTraceReqContext:
             return
 
         self.start_time_ns: Optional[int] = None
-        self.thread_context: Optional[SGLangTraceThreadContext] = None
+        self.thread_context: Optional[TraceThreadContext] = None
         self.bootstrap_room: Optional[int] = bootstrap_room
         self.role: str = role
 
@@ -322,7 +322,7 @@ class SGLangTraceReqContext:
             trace_set_thread_info("unknown")
 
         thread_info = threads_info[self.pid]
-        thread_context = SGLangTraceThreadContext(
+        thread_context = TraceThreadContext(
             thread_info=thread_info,
         )
 
@@ -368,9 +368,7 @@ class SGLangTraceReqContext:
 
         root_span_context = self.root_span_context
 
-        trace_context = SGLangTracePropagateContext(
-            root_span_context, prev_span_context
-        )
+        trace_context = TracePropagateContext(root_span_context, prev_span_context)
         return trace_context.to_dict()
 
     def trace_set_proc_propagate_context(self, trace_context: Optional[Dict[str, Any]]):
@@ -380,7 +378,7 @@ class SGLangTraceReqContext:
         self.start_time_ns = get_cur_time_ns()
         self.is_copy = True
 
-        trace_context = SGLangTracePropagateContext.instance_from_dict(trace_context)
+        trace_context = TracePropagateContext.instance_from_dict(trace_context)
         if not trace_context:
             self.tracing_enable = False
         else:
@@ -654,7 +652,7 @@ class SGLangTraceReqContext:
         if cur_slice.span:
             cur_slice.span.add_event(name=name, timestamp=ts, attributes=attrs)
         else:
-            cur_slice.events.append(SGLangTraceEvent(name, ts, attrs))
+            cur_slice.events.append(TraceEvent(name, ts, attrs))
 
     # Add attrs to the current slice on the same thread with the same rid.
     def trace_slice_add_attr(self, attrs: Dict[str, Any]):

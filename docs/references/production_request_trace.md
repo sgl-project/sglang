@@ -116,18 +116,18 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
 
 The currently provided tracing package still has potential for further development. If you wish to build more advanced features upon it, you must first understand its existing design principles.
 
-The core of the tracing framework's implementation lies in the design of the span structure and the trace context. To aggregate scattered slices and enable concurrent tracking of multiple requests, we have designed a three-level trace context structure or span structure: `SGLangTraceReqContext`, `SGLangTraceThreadContext` and `SGLangTraceSliceContext`. Their relationship is as follows:
+The core of the tracing framework's implementation lies in the design of the span structure and the trace context. To aggregate scattered slices and enable concurrent tracking of multiple requests, we have designed a three-level trace context structure or span structure: `SGLangTraceReqContext`, `TraceThreadContext` and `SGLangTraceSliceContext`. Their relationship is as follows:
 ```
 SGLangTraceReqContext (req_id="req-123")
-├── SGLangTraceThreadContext(thread_label="scheduler", tp_rank=0)
+├── TraceThreadContext(thread_label="scheduler", tp_rank=0)
 |     └── SGLangTraceSliceContext(slice_name="prefill")
 |
-└── SGLangTraceThreadContext(thread_label="scheduler", tp_rank=1)
+└── TraceThreadContext(thread_label="scheduler", tp_rank=1)
       └── SGLangTraceSliceContext(slice_name="prefill")
 ```
 
-Each traced request maintains a global `SGLangTraceReqContext` and creates a corresponding request span. For every thread that processes the request, a `SGLangTraceThreadContext` is recorded and a thread span is created. The `SGLangTraceThreadContext` is nested within the `SGLangTraceReqContext`, and each currently traced code slice—potentially nested—is stored in its associated `SGLangTraceThreadContext`.
+Each traced request maintains a global `SGLangTraceReqContext` and creates a corresponding request span. For every thread that processes the request, a `TraceThreadContext` is recorded and a thread span is created. The `TraceThreadContext` is nested within the `SGLangTraceReqContext`, and each currently traced code slice—potentially nested—is stored in its associated `TraceThreadContext`.
 
 In addition to the above hierarchy, each slice also records its previous slice via Span.add_link(), which can be used to trace the execution flow.
 
-When the request execution flow transfers to a new thread, the trace context needs to be explicitly propagated. In the framework, this is represented by `SGLangTracePropagateContext`, which contains the context of the request span and the previous slice span.
+When the request execution flow transfers to a new thread, the trace context needs to be explicitly propagated. In the framework, this is represented by `TracePropagateContext`, which contains the context of the request span and the previous slice span.
