@@ -96,6 +96,7 @@ def fused_scale_shift_blc(x_t: cute.Tensor, scale_t: cute.Tensor, shift_t: cute.
     val_layout = cute.make_ordered_layout((16, coalesced_ldst_bytes), order=(1, 0))
     val_layout = cute.recast_layout(dtype.width, 8, val_layout)
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    print(f"tiler_mn: {tiler_mn}, tv_layout: {tv_layout}")
 
     # Tile tensors
     mX = cute.zipped_divide(x_t, tiler_mn)
