@@ -38,7 +38,8 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
-    get_diffusers_config,
+    get_diffusers_component_config,
+    get_hf_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -114,6 +115,14 @@ class ComponentLoader(ABC):
             logger.error("Failed to load %s from %s: %s", module_name, model_path, e)
             raise
 
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        """
+        Load the component using the native library (transformers/diffusers).
+        """
+        raise NotImplementedError(
+            f"load_native not implemented for {self.__class__.__name__}"
+        )
+
     @abstractmethod
     def _load_core(
         self, model_path: str, server_args: ServerArgs, module_name: str
@@ -185,6 +194,21 @@ class TextEncoderLoader(ComponentLoader):
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
+
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        from transformers import AutoModel
+
+        config = get_hf_config(
+            model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
+        return AutoModel.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
 
     def _prepare_weights(
         self,
@@ -286,7 +310,7 @@ class TextEncoderLoader(ComponentLoader):
         #     model_override_args=None,
         # )
         diffusers_pretrained_config = get_config(model_path, trust_remote_code=True)
-        model_config = get_diffusers_config(model=model_path)
+        model_config = get_diffusers_component_config(model_path=model_path)
         _clean_hf_config_inplace(model_config)
         logger.info("HF model config: %s", model_config)
 
@@ -392,7 +416,6 @@ class TextEncoderLoader(ComponentLoader):
 
 
 class ImageEncoderLoader(TextEncoderLoader):
-
     def load(self, model_path: str, server_args: ServerArgs, *args):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
@@ -425,6 +448,13 @@ class ImageEncoderLoader(TextEncoderLoader):
 class ImageProcessorLoader(ComponentLoader):
     """Loader for image processor."""
 
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        from transformers import AutoImageProcessor
+
+        return AutoImageProcessor.from_pretrained(
+            model_path, revision=server_args.revision
+        )
+
     def _load_core(
         self, model_path: str, server_args: ServerArgs, module_name: str
     ) -> Any:
@@ -434,6 +464,15 @@ class ImageProcessorLoader(ComponentLoader):
 class AutoProcessorLoader(ComponentLoader):
     """Loader for auto processor."""
 
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        from transformers import AutoProcessor
+
+        return AutoProcessor.from_pretrained(
+            model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
+
     def _load_core(
         self, model_path: str, server_args: ServerArgs, module_name: str
     ) -> Any:
@@ -442,6 +481,15 @@ class AutoProcessorLoader(ComponentLoader):
 
 class TokenizerLoader(ComponentLoader):
     """Loader for tokenizers."""
+
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
 
     def _load_core(
         self, model_path: str, server_args: ServerArgs, module_name: str
@@ -455,9 +503,27 @@ class TokenizerLoader(ComponentLoader):
 class VAELoader(ComponentLoader):
     """Loader for VAE."""
 
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        import diffusers
+
+        config = get_diffusers_component_config(model_path=model_path)
+        class_name = config.pop("_class_name", "AutoencoderKL")
+        # config.pop("_diffusers_version", None)
+
+        try:
+            cls = getattr(diffusers, class_name)
+        except AttributeError:
+            # Fallback for cases where class_name might not be directly exposed or is custom
+            logger.warning(
+                f"Could not find {class_name} in diffusers, falling back to AutoencoderKL"
+            )
+            cls = diffusers.AutoencoderKL
+
+        return cls.from_pretrained(model_path, revision=server_args.revision, **config)
+
     def load(self, model_path: str, server_args: ServerArgs, *args):
         """Load the VAE based on the model path, and inference args."""
-        config = get_diffusers_config(model=model_path)
+        config = get_diffusers_component_config(model_path=model_path)
         class_name = config.pop("_class_name")
         assert (
             class_name is not None
@@ -498,9 +564,26 @@ class VAELoader(ComponentLoader):
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        import diffusers
+
+        config = get_diffusers_component_config(model_path=model_path)
+        class_name = config.pop("_class_name", "Transformer2DModel")
+        # config.pop("_diffusers_version", None)
+
+        try:
+            cls = getattr(diffusers, class_name)
+        except AttributeError:
+            logger.warning(
+                f"Could not find {class_name} in diffusers, falling back to Transformer2DModel"
+            )
+            cls = diffusers.Transformer2DModel
+
+        return cls.from_pretrained(model_path, revision=server_args.revision, **config)
+
     def load(self, model_path: str, server_args: ServerArgs, *args):
         """Load the transformer based on the model path, and inference args."""
-        config = get_diffusers_config(model=model_path)
+        config = get_diffusers_component_config(model_path=model_path)
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
         if cls_name is None:
@@ -590,9 +673,19 @@ class TransformerLoader(ComponentLoader):
 class SchedulerLoader(ComponentLoader):
     """Loader for scheduler."""
 
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        import diffusers
+
+        config = get_diffusers_component_config(model_path=model_path)
+        class_name = config.pop("_class_name")
+        # config.pop("_diffusers_version", None)
+
+        cls = getattr(diffusers, class_name)
+        return cls.from_pretrained(model_path, revision=server_args.revision, **config)
+
     def load(self, model_path: str, server_args: ServerArgs, *args):
         """Load the scheduler based on the model path, and inference args."""
-        config = get_diffusers_config(model=model_path)
+        config = get_diffusers_component_config(model_path=model_path)
 
         class_name = config.pop("_class_name")
         assert (
@@ -616,6 +709,40 @@ class GenericComponentLoader(ComponentLoader):
         super().__init__()
         self.library = library
 
+    def load_native(self, model_path: str, server_args: ServerArgs, module_name: str):
+        if self.library == "transformers":
+            from transformers import AutoModel
+
+            config = get_hf_config(
+                model_path,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+            return AutoModel.from_pretrained(
+                model_path,
+                config=config,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+        elif self.library == "diffusers":
+            import diffusers
+
+            config = get_diffusers_component_config(model_path=model_path)
+            class_name = config.pop("_class_name", None)
+            # config.pop("_diffusers_version", None)
+
+            if class_name:
+                cls = getattr(diffusers, class_name)
+                return cls.from_pretrained(
+                    model_path, revision=server_args.revision, **config
+                )
+            else:
+                raise ValueError(
+                    "Cannot determine class name for generic diffusers loader"
+                )
+        else:
+            raise ValueError(f"Unsupported library: {self.library}")
+
     def _load_core(
         self, model_path: str, server_args: ServerArgs, module_name: str
     ) -> Any:
@@ -634,7 +761,7 @@ class GenericComponentLoader(ComponentLoader):
             logger.warning(
                 "Generic loading for diffusers components is not fully implemented"
             )
-            model_config = get_diffusers_config(model=model_path)
+            model_config = get_diffusers_component_config(model_path=model_path)
             logger.info("Diffusers Model config: %s", model_config)
             # Placeholder: not implemented
             return None

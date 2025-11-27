@@ -23,6 +23,7 @@ import hashlib
 import json
 import os
 import tempfile
+from functools import reduce
 from pathlib import Path
 from typing import Any, Optional, cast
 
@@ -125,30 +126,39 @@ def load_dict(file_path):
         ) from e
 
 
-def get_diffusers_config(
-    model: str,
+def get_diffusers_component_config(
+    model_path: str,
 ) -> dict[str, Any]:
-    """Gets a configuration for the given diffusers model.
+    """Gets a configuration of a submodule for the given diffusers model.
 
     Args:
-        model: The model name or path.
+        model_path: the path of the submodule
 
     Returns:
         The loaded configuration.
     """
 
-    config_name = "config.json"
-    if "scheduler" in model:
-        config_name = "scheduler_config.json"
     # Check if the model path exists
-    if os.path.exists(model):
-        config_file = os.path.join(model, config_name)
-        config_dict = load_dict(config_file)
-        generation_config_file = os.path.join(model, "generation_config.json")
-        generation_config_dict = load_dict(generation_config_file)
-        return config_dict | generation_config_dict
+    if os.path.exists(model_path):
+        # tokenizer
+        config_names = ["generation_config.json"]
+        # By default, we load config.json, but scheduler_config.json for scheduler
+        if "scheduler" in model_path:
+            config_names.append("scheduler_config.json")
+        else:
+            config_names.append("config.json")
+
+        config_file_paths = [
+            os.path.join(model_path, config_name) for config_name in config_names
+        ]
+
+        combined_config = reduce(
+            lambda acc, path: acc | load_dict(path), config_file_paths, {}
+        )
+
+        return combined_config
     else:
-        raise RuntimeError(f"Diffusers config file not found at {model}")
+        raise RuntimeError(f"Diffusers config file not found at {model_path}")
 
 
 # Models don't use the same configuration key for determining the maximum
