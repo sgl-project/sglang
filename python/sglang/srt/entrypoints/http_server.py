@@ -955,7 +955,7 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
-@app.post("/check_weights")
+@app.post("/weights_checker")
 async def check_weights(obj: CheckWeightsReqInput, request: Request):
     success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
     return ORJSONResponse(
