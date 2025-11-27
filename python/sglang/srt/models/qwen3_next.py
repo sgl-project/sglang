@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_cuda,
+    is_hip,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -793,7 +794,7 @@ class Qwen3NextModel(nn.Module):
         super().__init__()
         self.config = config
 
-        alt_stream = torch.cuda.Stream() if _is_cuda else None
+        alt_stream = torch.cuda.Stream() if (_is_cuda or is_hip()) else None
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,

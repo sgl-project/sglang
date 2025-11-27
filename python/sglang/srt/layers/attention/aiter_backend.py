@@ -82,7 +82,12 @@ class AiterAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        # For NSA models, use the first available full attention layer
+        if hasattr(model_runner.token_to_kv_pool, 'full_attention_layer_id_mapping'):
+            first_full_attn_layer = min(model_runner.token_to_kv_pool.full_attention_layer_id_mapping.keys())
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(first_full_attn_layer).shape[-1]
+        else:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -763,6 +768,33 @@ class AiterAttnBackend(AttentionBackend):
             )
 
             bs0 = forward_batch.batch_size + 1
+            
+            # WORKAROUND: aiter's batch_prefill only supports head_dim=128
+            # For other dimensions (like Qwen3-Next's 256), use triton fallback
+            if layer.head_dim != 128 or layer.v_head_dim != 128:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"Using triton fallback for head_dim={layer.head_dim}, v_head_dim={layer.v_head_dim} (aiter only supports 128)")
+                o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+                self.extend_attention_fwd(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k.contiguous() if k is not None else k_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v.contiguous() if v is not None else v_cache.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v_cache.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.kv_indices,
+                    None,
+                    True,  # causal
+                    None,
+                    self.forward_metadata.max_q_len,
+                    layer.scaling,
+                    0.0,  # logits_soft_cap
+                    -1,  # sliding_window_size
+                )
+                return o
 
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
