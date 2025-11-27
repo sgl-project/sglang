@@ -679,11 +679,13 @@ class MLATokenToKVPoolHost(HostKVCache):
                 (*base_dims, self.kv_lora_rank),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=self.pin_memory,
             )
             self.v_buffer = torch.empty(
                 (*base_dims, self.qk_rope_head_dim),
                 dtype=self.dtype,
                 device=self.device,
+                pin_memory=self.pin_memory,
             )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.

@@ -434,6 +434,7 @@ class ServerArgs:
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
+    enable_hierarchical_cache_direct: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
@@ -1869,12 +1870,23 @@ class ServerArgs:
             envs.SGLANG_TOOL_STRICT_LEVEL.set(ToolStrictLevel.PARAMETER)
 
     def _handle_cache_compatibility(self):
+        if self.enable_hierarchical_cache and self.enable_hierarchical_cache_direct:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache and enable-hierarchical-cache-direct are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_hierarchical_cache_direct and self.disable_radix_cache:
+            raise ValueError(
+                "The arguments enable-hierarchical-cache-direct and disable-radix-cache are mutually exclusive "
+                "and cannot be used at the same time. Please use only one of them."
+            )
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -3206,9 +3218,23 @@ class ServerArgs:
             help="The layout of host memory pool for hierarchical cache.",
         )
         parser.add_argument(
+            "--enable-hierarchical-cache-direct",
+            action="store_true",
+            help="Enable hierarchical cache direct",
+        )
+        parser.add_argument(
             "--hicache-storage-backend",
             type=str,
-            choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic", "eic"],
+            choices=[
+                "file",
+                "mooncake",
+                "hf3fs",
+                "nixl",
+                "aibrix",
+                "dynamic",
+                "eic",
+                "memcache",
+            ],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
             "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
