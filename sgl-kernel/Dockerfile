@@ -98,24 +98,23 @@ COPY . /sgl-kernel/
 ARG ENABLE_CMAKE_PROFILE
 ARG ENABLE_BUILD_PROFILE
 ARG ARCH=x86_64
-
-# ccache config (BuildKit cache mounts)
-ENV CCACHE_DIR=/ccache
-ENV CCACHE_BASEDIR=/sgl-kernel
-ENV CCACHE_MAXSIZE=10G
-ENV CCACHE_COMPILERCHECK=content
-ENV CCACHE_COMPRESS=true
-ENV CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime
-
-# Set up ccache as compiler launcher (don't use PATH to avoid -ccbin conflicts)
-ENV CMAKE_C_COMPILER_LAUNCHER=ccache
-ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
-ENV CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+ARG USE_CCACHE=1
 
 RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
-    ccache -sV; \
+    if [ "${USE_CCACHE}" = "1" ]; then \
+      export CCACHE_DIR=/ccache; \
+      export CCACHE_BASEDIR=/sgl-kernel; \
+      export CCACHE_MAXSIZE=10G; \
+      export CCACHE_COMPILERCHECK=content; \
+      export CCACHE_COMPRESS=true; \
+      export CCACHE_SLOPPINESS=file_macro,time_macros,include_file_mtime,include_file_ctime; \
+      export CMAKE_C_COMPILER_LAUNCHER=ccache; \
+      export CMAKE_CXX_COMPILER_LAUNCHER=ccache; \
+      export CMAKE_CUDA_COMPILER_LAUNCHER=ccache; \
+      ccache -sV; \
+    fi; \
     # Setting these flags to reduce OOM chance only on ARM
     if [ "${ARCH}" = "aarch64" ]; then \
       export CUDA_NVCC_FLAGS="-Xcudafe --threads=2"; \
@@ -159,8 +158,12 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     fi;
 
 RUN set -eux; \
-    echo "ccache Statistics"; \
-    ccache -s
+    if [ "${USE_CCACHE}" = "1" ]; then \
+      echo "ccache Statistics"; \
+      ccache -s; \
+    else \
+      echo "ccache disabled (USE_CCACHE=${USE_CCACHE})"; \
+    fi
 
 # Artifact stage (for --output to export wheel)
 FROM scratch AS artifact
