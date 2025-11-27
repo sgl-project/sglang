@@ -6,10 +6,13 @@ python3 -m unittest test_qwen3_next_deterministic.TestFlashInferDeterministic
 
 import unittest
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
+
+register_cuda_ci(est_time=200, suite="nightly-4-gpu", nightly=True)
 
 QWEN3_NEXT = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
