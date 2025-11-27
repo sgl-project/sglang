@@ -2,6 +2,7 @@
 
 import torch  # type: ignore
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
@@ -167,7 +168,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     image_latent[:, :, :1, :, :].to(target_dtype).permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
-                    device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    device_type=envs.get_device(),
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
                         image_first_btchw,
@@ -195,7 +198,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     .permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
-                    device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    device_type=envs.get_device(),
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
                         ref_btchw,
@@ -295,7 +300,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
                     with (
                         torch.autocast(
-                            device_type="cuda",
+                            device_type=envs.get_device(),
                             dtype=target_dtype,
                             enabled=autocast_enabled,
                         ),
@@ -371,7 +376,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 context_bcthw = current_latents.to(target_dtype)
                 with (
                     torch.autocast(
-                        device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                        device_type=envs.get_device(),
+                        dtype=target_dtype,
+                        enabled=autocast_enabled,
                     ),
                     set_forward_context(
                         current_timestep=0,

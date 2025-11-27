@@ -19,6 +19,7 @@ import torch.profiler
 from einops import rearrange
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
@@ -642,7 +643,7 @@ class DenoisingStage(PipelineStage):
         # Offload the unused model if it's on CUDA
         if (
             model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
+            and next(model_to_offload.parameters()).device.type == envs.get_device()
         ):
             model_to_offload.to("cpu")
 
@@ -799,7 +800,7 @@ class DenoisingStage(PipelineStage):
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(
-            device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+            device_type=envs.get_device(),
             dtype=target_dtype,
             enabled=autocast_enabled,
         ):
@@ -1342,7 +1343,9 @@ class DenoisingStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify denoising stage inputs."""
         result = VerificationResult()
-        result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.min_dims(1)])
+        # XXX (MUSA): 'isnan' is not implemented for 'Long'
+        if not envs._is_musa():
+            result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.min_dims(1)])
         # disable temporarily for image-generation models
         # result.add_check("latents", batch.latents, [V.is_tensor, V.with_dims(5)])
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)

@@ -691,7 +691,11 @@ class WanTransformer3DModel(CachableDiT):
         self.rotary_emb = NDRotaryEmbedding(
             rope_dim_list=self.rope_dim_list,
             rope_theta=10000,
-            dtype=torch.float32 if current_platform.is_mps() else torch.float64,
+            dtype=(
+                torch.float32
+                if (current_platform.is_mps() or current_platform.is_musa())
+                else torch.float64
+            ),
         )
 
     def forward(

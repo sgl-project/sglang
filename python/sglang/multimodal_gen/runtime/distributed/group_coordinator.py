@@ -43,11 +43,10 @@ def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    return (
-        torch.device(f"cuda:{envs.LOCAL_RANK}")
-        if current_platform.is_cuda_alike()
-        else torch.device("mps")
-    )
+    if current_platform.is_cuda_alike() or current_platform.is_musa():
+        return envs.get_device(envs.LOCAL_RANK)
+    else:
+        torch.device("mps")
 
 
 def _get_unique_name(name: str) -> str:
@@ -193,7 +192,7 @@ class GroupCoordinator:
         self.device_communicator: DeviceCommunicatorBase = None  # type: ignore
         if use_device_communicator and self.world_size > 1:
             # Platform-aware device communicator selection
-            if current_platform.is_cuda_alike():
+            if current_platform.is_cuda_alike() or current_platform.is_musa():
                 from sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator import (
                     CudaCommunicator,
                 )

@@ -13,6 +13,7 @@ from enum import Enum, auto
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
@@ -144,7 +145,7 @@ class PipelineStage(ABC):
     @property
     def device(self) -> torch.device:
         """Get the device for this stage."""
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(envs.get_device())
 
     def set_logging(self, enable: bool):
         """

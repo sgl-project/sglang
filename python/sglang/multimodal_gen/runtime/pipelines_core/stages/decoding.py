@@ -9,6 +9,7 @@ import weakref
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import VAELoader
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -110,7 +111,7 @@ class DecodingStage(PipelineStage):
 
         # Decode latents
         with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            device_type=envs.get_device(), dtype=vae_dtype, enabled=vae_autocast_enabled
         ):
             try:
                 # TODO: make it more specific

@@ -11,6 +11,7 @@ import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
@@ -291,7 +292,7 @@ class ImageVAEEncodingStage(PipelineStage):
 
         # Encode Image
         with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            device_type=envs.get_device(), dtype=vae_dtype, enabled=vae_autocast_enabled
         ):
             if server_args.pipeline_config.vae_tiling:
                 self.vae.enable_tiling()

@@ -6,7 +6,7 @@ import importlib.util
 import logging
 import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import diffusers
 import torch
@@ -50,11 +50,29 @@ def _is_cuda():
 
 
 def _is_musa():
+    if getattr(_is_musa, "_patched", False):
+        return hasattr(torch, "musa") and torch.musa.is_available()
+
     try:
-        if hasattr(torch, "musa") and torch.musa.is_available():
-            return True
-    except ModuleNotFoundError:
+        import torch_musa
+    except ImportError:
+        setattr(_is_musa, "_patched", False)
         return False
+
+    torch.cuda.device_count = torch.musa.device_count
+    torch.cuda.get_device_capability = torch.musa.get_device_capability
+    torch.cuda.get_device_name = torch.musa.get_device_name
+    torch.cuda.is_current_stream_capturing = torch.musa.is_current_stream_capturing
+    torch.cuda.synchronize = torch.musa.synchronize
+    torch.cuda.current_device = torch.musa.current_device
+    torch.cuda.CUDAGraph = torch.musa.MUSAGraph
+    torch.cuda.graph = torch.musa.graph
+    torch.cuda.set_device = torch.musa.set_device
+    torch.cuda.get_device_properties = torch.musa.get_device_properties
+    torch.cuda.manual_seed_all = torch.musa.manual_seed_all
+
+    setattr(_is_musa, "_patched", True)
+    return hasattr(torch, "musa") and torch.musa.is_available()
 
 
 def _is_mps():
@@ -317,10 +335,14 @@ def get_torch_distributed_backend() -> str:
         )
 
 
-def get_device(local_rank: int) -> torch.device:
+def get_device(local_rank: Optional[int] = None) -> torch.device:
     if torch.cuda.is_available():
+        if local_rank is None:
+            return "cuda"
         return torch.device("cuda", local_rank)
     elif _is_musa():
+        if local_rank is None:
+            return "musa"
         return torch.device("musa", local_rank)
     elif _is_mps():
         return torch.device("mps")
