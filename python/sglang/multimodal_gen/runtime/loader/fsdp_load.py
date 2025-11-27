@@ -262,7 +262,7 @@ def load_model_from_full_model_state_dict(
                 )
             else:
                 logger.warning(
-                    f"Parameter {target_param_name} not found in model state dict. Skipping."
+                    f"Parameter '{target_param_name}' from checkpoint not found in model; skipping. This is expected for optional parameters."
                 )
                 continue
         if not hasattr(meta_sharded_param, "device_mesh"):
