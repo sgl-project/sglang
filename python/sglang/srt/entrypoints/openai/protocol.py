@@ -931,13 +931,10 @@ class ResponseTool(BaseModel):
         description="Type of tool to enable"
     )
 
-    # Function tool fields (used when type == "function")
-    name: Optional[str] = Field(default=None, description="Function name")
-    description: Optional[str] = Field(default=None, description="Function description")
-    parameters: Optional[object] = Field(
-        default=None, description="Function parameters schema"
+    # Function tool field (used when type == "function")
+    function: Optional[Function] = Field(
+        default=None, description="Function definition when type is 'function'"
     )
-    strict: bool = Field(default=False, description="Whether to use strict mode")
 
 
 ResponseInputOutputItem: TypeAlias = Union[

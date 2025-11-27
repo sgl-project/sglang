@@ -380,19 +380,14 @@ class OpenAIServingResponses(OpenAIServingChat):
         for response_tool in response_tools:
             # Only convert function tools; skip built-in tools like web_search_preview and code_interpreter
             if response_tool.type == "function":
-                if not response_tool.name:
+                if not response_tool.function or not response_tool.function.name:
                     logger.warning(
-                        f"Skipping function tool without name: {response_tool}"
+                        f"Skipping function tool without function definition: {response_tool}"
                     )
                     continue
                 chat_tool = Tool(
                     type="function",
-                    function=Function(
-                        name=response_tool.name,
-                        description=response_tool.description,
-                        parameters=response_tool.parameters,
-                        strict=getattr(response_tool, "strict", False),
-                    ),
+                    function=response_tool.function,
                 )
                 chat_tools.append(chat_tool)
 
