@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestEagleServerBase(
+class TestEagleConstrainedDecoding(
     CustomTestCase, TestRegexConstrainedMixin, TestJSONConstrainedMixin
 ):
     max_running_requests = 64
@@ -27,6 +27,7 @@ class TestEagleServerBase(
     model = DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST
     draft_model = DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST
     grammar_backend = "xgrammar"
+    eagle_v2 = False
 
     @classmethod
     def setUpClass(cls):
@@ -55,7 +56,7 @@ class TestEagleServerBase(
             cls.grammar_backend,
         ]
         launch_args.extend(cls.other_launch_args)
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(cls.eagle_v2):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
@@ -66,6 +67,10 @@ class TestEagleServerBase(
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+
+
+class TestEagleConstrainedDecodingV2(TestEagleConstrainedDecoding):
+    eagle_v2 = True
 
 
 if __name__ == "__main__":
