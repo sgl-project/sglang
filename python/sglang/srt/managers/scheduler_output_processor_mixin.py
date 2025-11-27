@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
