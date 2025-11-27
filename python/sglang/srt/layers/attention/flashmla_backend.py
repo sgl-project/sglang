@@ -384,7 +384,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     (1,), dtype=torch.float32, device=reshape_q.device
                 )
 
-            # Quantize Q using scaled_fp8_quant (matching vLLM's approach)
             # Reshape to 2D for scaled_fp8_quant (which requires 2D input)
             q_shape = reshape_q.shape
             reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
