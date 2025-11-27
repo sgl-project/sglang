@@ -315,6 +315,7 @@ class TokenizerCommunicatorMixin:
         record_shapes: Optional[bool] = None,
         profile_by_stage: bool = False,
         merge_profiles: bool = False,
+        profile_prefix: Optional[str] = None,
     ):
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
@@ -334,6 +335,7 @@ class TokenizerCommunicatorMixin:
             profile_by_stage=profile_by_stage,
             profile_id=str(time.time()),
             merge_profiles=merge_profiles,
+            profile_prefix=profile_prefix,
         )
         return await self._execute_profile(req)
 
@@ -402,6 +404,14 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
+                result = (await self.update_weights_from_distributed_communicator(obj))[
+                    0
+                ]
+                return result.success, result.message
+
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
@@ -454,6 +464,12 @@ class TokenizerCommunicatorMixin:
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
+
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
+                result = (await self.update_weights_from_tensor_communicator(obj))[0]
+                return result.success, result.message
 
         # This means that weight sync
         # cannot run while requests are in progress.

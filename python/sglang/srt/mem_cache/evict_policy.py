@@ -36,3 +36,11 @@ class MRUStrategy(EvictionStrategy):
 class FILOStrategy(EvictionStrategy):
     def get_priority(self, node: "TreeNode") -> float:
         return -node.creation_time
+
+
+class PriorityStrategy(EvictionStrategy):
+    """Priority-aware eviction: lower priority values evicted first, then LRU within same priority."""
+
+    def get_priority(self, node: "TreeNode") -> Tuple[int, float]:
+        # Return (priority, last_access_time) so lower priority nodes are evicted first
+        return (node.priority, node.last_access_time)
