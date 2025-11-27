@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.nvtx_utils import nvtx_range
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -381,8 +382,10 @@ class TpModelWorker(BaseTpWorker):
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
-
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            with nvtx_range("tp_worker.batch_init_new"):
+                forward_batch = ForwardBatch.init_new(
+                    model_worker_batch, self.model_runner
+                )
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None

@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
+from sglang.srt.nvtx_utils import nvtx_range
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
@@ -839,14 +840,16 @@ class CudaGraphRunner:
         self.deepep_adapter.replay()
 
         if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
+            with nvtx_range("cuda_graph_runner.replay_prepare"):
+                self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
             self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
         # Replay
-        self.graphs[self.bs].replay()
+        with nvtx_range("cuda_graph_runner.replay"):
+            self.graphs[self.bs].replay()
 
         output = self.output_buffers[self.bs]
         if isinstance(output, LogitsProcessorOutput):

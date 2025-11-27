@@ -154,6 +154,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1023,6 +1024,7 @@ class Scheduler(
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
                 self._check_runtime_mem_leak()
 
+    @nvtx_annotated_method("scheduler.recv_requests")
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
@@ -1133,6 +1135,7 @@ class Scheduler(
 
         return recv_reqs
 
+    @nvtx_annotated_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
@@ -1649,6 +1652,7 @@ class Scheduler(
             swa_evictable_size,
         )
 
+    @nvtx_annotated_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -1963,6 +1967,7 @@ class Scheduler(
     ):
         pass
 
+    @nvtx_annotated_method("scheduler.run_batch")
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2088,6 +2093,7 @@ class Scheduler(
 
         return ret
 
+    @nvtx_annotated_method("scheduler.launch_batch_sample_if_needed")
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -2103,6 +2109,7 @@ class Scheduler(
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu()
 
+    @nvtx_annotated_method("scheduler.process_batch_result")
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -2130,6 +2137,7 @@ class Scheduler(
             self.return_health_check_ct -= 1
             self.send_to_tokenizer.send_output(HealthCheckOutput())
 
+    @nvtx_annotated_method("scheduler.prepare_mlp_sync_batch")
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return self.prepare_mlp_sync_batch_raw(
             local_batch,

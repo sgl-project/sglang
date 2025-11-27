@@ -58,6 +58,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     SWAKVPool,
 )
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.tracing.trace import (
     trace_event_batch,
     trace_slice_batch,
@@ -826,6 +827,7 @@ class DecodeTransferQueue:
 class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
+    @nvtx_annotated_method("scheduler.disagg_decode.event_loop_normal")
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
@@ -871,6 +873,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
 
     @torch.no_grad()
+    @nvtx_annotated_method("scheduler.disagg_decode.event_loop_overlap")
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
@@ -940,6 +943,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
             self.last_batch_in_queue = last_batch_in_queue
 
+    @nvtx_annotated_method("scheduler.disagg_decode.prepare_idle_batch")
     def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
         batch = self.prepare_mlp_sync_batch(batch)
         result = None
@@ -949,6 +953,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(batch, result)
         return batch, result
 
+    @nvtx_annotated_method("scheduler.disagg_decode.get_next_batch")
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[Tuple[ScheduleBatch, bool]]:
@@ -984,6 +989,7 @@ class SchedulerDisaggregationDecodeMixin:
             trace_event_batch("schedule", ret.reqs, attrs=attrs)
         return ret
 
+    @nvtx_annotated_method("scheduler.disagg_decode.get_new_prebuilt_batch")
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_queue:
@@ -1036,6 +1042,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
+    @nvtx_annotated_method("scheduler.disagg_decode.process_decode_queue")
     def process_decode_queue(self: Scheduler):
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()

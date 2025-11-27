@@ -26,6 +26,8 @@ RUN python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps 
     -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple
 RUN python3 -m pip install https://y.y.y/git-assert/local_attention_cuda-0.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall 
 
+RUN python3 -m pip install nvtx -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple
+
 COPY . .
 
 # Set workspace directory
