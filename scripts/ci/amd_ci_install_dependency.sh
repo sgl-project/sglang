@@ -12,7 +12,8 @@ else
 fi
 
 # Install the required dependencies in CI.
-docker exec ci_sglang chown -R root:root /sgl-data/pip-cache
+# Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
+docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
 docker exec ci_sglang pip uninstall sgl-kernel -y || true
 # Clear Python cache to ensure latest code is used
