@@ -9,7 +9,13 @@ This module contains implementations of image encoding stages for diffusion pipe
 
 import PIL
 import torch
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    Flux2PipelineConfig,
+    _prepare_image_ids,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
@@ -99,12 +105,14 @@ class ImageEncodingStage(PipelineStage):
             The batch with encoded prompt embeddings.
         """
 
+        if batch.condition_image is None:
+            return batch
         cuda_device = get_local_torch_device()
         self.move_to_device(cuda_device)
 
-        image = batch.pil_image
+        image = batch.condition_image
 
-        # preprocess the imag_processor
+        # preprocess via vae_image_processor
         prompt_image = server_args.pipeline_config.preprocess_image(
             image, self.vae_image_processor
         )
@@ -177,9 +185,9 @@ class ImageEncodingStage(PipelineStage):
         """Verify image encoding stage inputs."""
         result = VerificationResult()
         if batch.debug:
-            logger.debug(f"{batch.pil_image=}")
+            logger.debug(f"{batch.condition_image=}")
             logger.debug(f"{batch.image_embeds=}")
-        result.add_check("pil_image", batch.pil_image, V.not_none)
+        result.add_check("pil_image", batch.condition_image, V.not_none)
         result.add_check("image_embeds", batch.image_embeds, V.is_list)
         return result
 
@@ -217,10 +225,13 @@ class ImageVAEEncodingStage(PipelineStage):
         Returns:
             The batch with encoded outputs.
         """
-        assert batch.pil_image is not None
+
+        if batch.condition_image is None:
+            return batch
+
         if server_args.mode == ExecutionMode.INFERENCE:
-            assert batch.pil_image is not None and isinstance(
-                batch.pil_image, PIL.Image.Image
+            assert batch.condition_image is not None and isinstance(
+                batch.condition_image, PIL.Image.Image
             )
             assert batch.height is not None and isinstance(batch.height, int)
             assert batch.width is not None and isinstance(batch.width, int)
@@ -229,8 +240,8 @@ class ImageVAEEncodingStage(PipelineStage):
             width = batch.width
             num_frames = batch.num_frames
         elif server_args.mode == ExecutionMode.PREPROCESS:
-            assert batch.pil_image is not None and isinstance(
-                batch.pil_image, torch.Tensor
+            assert batch.condition_image is not None and isinstance(
+                batch.condition_image, torch.Tensor
             )
             assert batch.height is not None and isinstance(batch.height, list)
             assert batch.width is not None and isinstance(batch.width, list)
@@ -241,10 +252,7 @@ class ImageVAEEncodingStage(PipelineStage):
 
         self.vae = self.vae.to(get_local_torch_device())
 
-        latent_height = height // self.vae.spatial_compression_ratio
-        latent_width = width // self.vae.spatial_compression_ratio
-
-        image = batch.pil_image
+        image = batch.condition_image
         image = self.preprocess(
             image,
             vae_scale_factor=self.vae.spatial_compression_ratio,
@@ -255,19 +263,22 @@ class ImageVAEEncodingStage(PipelineStage):
         # (B, C, H, W) -> (B, C, 1, H, W)
         image = image.unsqueeze(2)
 
-        video_condition = torch.cat(
-            [
-                image,
-                image.new_zeros(
-                    image.shape[0],
-                    image.shape[1],
-                    num_frames - 1,
-                    image.shape[3],
-                    image.shape[4],
-                ),
-            ],
-            dim=2,
-        )
+        if num_frames == 1:
+            video_condition = image
+        else:
+            video_condition = torch.cat(
+                [
+                    image,
+                    image.new_zeros(
+                        image.shape[0],
+                        image.shape[1],
+                        num_frames - 1,
+                        image.shape[3],
+                        image.shape[4],
+                    ),
+                ],
+                dim=2,
+            )
         video_condition = video_condition.to(
             device=get_local_torch_device(), dtype=torch.float32
         )
@@ -288,7 +299,9 @@ class ImageVAEEncodingStage(PipelineStage):
             #     self.vae.enable_parallel()
             if not vae_autocast_enabled:
                 video_condition = video_condition.to(vae_dtype)
-            encoder_output = self.vae.encode(video_condition)
+            encoder_output: DiagonalGaussianDistribution = self.vae.encode(
+                video_condition
+            )
 
         if server_args.mode == ExecutionMode.PREPROCESS:
             latent_condition = encoder_output.mean
@@ -296,29 +309,45 @@ class ImageVAEEncodingStage(PipelineStage):
             generator = batch.generator
             if generator is None:
                 raise ValueError("Generator must be provided")
-            latent_condition = self.retrieve_latents(encoder_output, generator)
-
-        # Apply shifting if needed
-        if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
-            if isinstance(self.vae.shift_factor, torch.Tensor):
-                latent_condition -= self.vae.shift_factor.to(
-                    latent_condition.device, latent_condition.dtype
-                )
-            else:
-                latent_condition -= self.vae.shift_factor
-
-        if isinstance(self.vae.scaling_factor, torch.Tensor):
-            latent_condition = latent_condition * self.vae.scaling_factor.to(
-                latent_condition.device, latent_condition.dtype
+            # TODO: verify
+            sample_mode = (
+                "argmax"
+                if server_args.pipeline_config.task_type == ModelTaskType.I2I
+                else "sample"
             )
-        else:
-            latent_condition = latent_condition * self.vae.scaling_factor
+            latent_condition = self.retrieve_latents(
+                encoder_output, generator, sample_mode=sample_mode
+            )
+
+        latent_condition = self.server_args.pipeline_config.post_process_vae_encode(
+            latent_condition, self.vae
+        )
+
+        scaling_factor, shift_factor = (
+            self.server_args.pipeline_config.get_decode_scale_and_shift(
+                device=latent_condition.device,
+                dtype=latent_condition.dtype,
+                vae=self.vae,
+            )
+        )
+
+        # apply shift & scale if needed
+        if isinstance(shift_factor, torch.Tensor):
+            shift_factor = shift_factor.to(latent_condition.device)
+
+        if isinstance(scaling_factor, torch.Tensor):
+            scaling_factor = scaling_factor.to(latent_condition.device)
+
+        latent_condition -= shift_factor
+        latent_condition = latent_condition * scaling_factor
+
+        batch_size = batch.batch_size
 
         if server_args.mode == ExecutionMode.PREPROCESS:
             batch.image_latent = latent_condition
         else:
+            # TODO: abstract this
             if isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
-                batch_size = batch.batch_size
                 if (
                     batch_size > latent_condition.shape[0]
                     and batch_size % latent_condition.shape[0] == 0
@@ -351,7 +380,31 @@ class ImageVAEEncodingStage(PipelineStage):
                     image_latent_height,
                     image_latent_width,
                 )
+            elif isinstance(server_args.pipeline_config, Flux2PipelineConfig):
+                # Pack each latent and concatenate
+                image_latents = [latent_condition]
+                # get image_latent_ids right after scale & shift
+                image_latent_ids = _prepare_image_ids(image_latents)
+                image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
+                image_latent_ids = image_latent_ids.to(get_local_torch_device())
+                batch.condition_image_latent_ids = image_latent_ids
+
+                packed_latents = []
+                for latent in image_latents:
+                    # latent: (1, 128, 32, 32)
+                    packed = server_args.pipeline_config.maybe_pack_latents(
+                        latent, None, None
+                    )  # (1, 1024, 128)
+                    packed = packed.squeeze(0)  # (1024, 128) - remove batch dim
+                    packed_latents.append(packed)
+
+                # Concatenate all reference tokens along sequence dimension
+                image_latents = torch.cat(packed_latents, dim=0)  # (N*1024, 128)
+                image_latents = image_latents.unsqueeze(0)  # (1, N*1024, 128)
+                image_latents = image_latents.repeat(batch_size, 1, 1)
             else:
+                latent_height = height // self.vae.spatial_compression_ratio
+                latent_width = width // self.vae.spatial_compression_ratio
                 mask_lat_size = torch.ones(
                     1, 1, num_frames, latent_height, latent_width
                 )
@@ -388,7 +441,7 @@ class ImageVAEEncodingStage(PipelineStage):
 
     def retrieve_latents(
         self,
-        encoder_output: torch.Tensor,
+        encoder_output: DiagonalGaussianDistribution,
         generator: torch.Generator | None = None,
         sample_mode: str = "sample",
     ):
