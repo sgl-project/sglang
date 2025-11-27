@@ -2045,5 +2045,6 @@ class ModelWorkerBatch:
     dllm_config: Optional[DllmConfig] = None
 
     # For constrained decoding
+    # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
