@@ -4,6 +4,7 @@ import ctypes
 import dataclasses
 import logging
 import os
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -147,7 +148,29 @@ class KVArgsRegisterInfo:
         )
 
 
+class AuxDataCodec:
+    """Handles serialization and deserialization of auxiliary data buffers"""
+
+    @staticmethod
+    def serialize_data_from_buffer(src_addr, data_length):
+        """Serialize data from memory buffer to bytes"""
+        buffer = (ctypes.c_byte * data_length).from_address(src_addr)
+        return bytes(buffer)
+
+    @staticmethod
+    def deserialize_data_to_buffer(kv_args, buffer_index, aux_index, data):
+        """Deserialize bytes into target memory buffer"""
+        dst_aux_ptr = kv_args.aux_data_ptrs[buffer_index]
+        item_len = kv_args.aux_item_lens[buffer_index]
+        dst_addr = dst_aux_ptr + item_len * aux_index
+        buffer = (ctypes.c_byte * len(data)).from_address(dst_addr)
+        buffer[:] = data
+        return
+
+
 class MoriKVManager(CommonKVManager):
+    AUX_DATA_HEADER = b"AUX_DATA"
+
     def __init__(
         self,
         args: KVArgs,
@@ -339,6 +362,10 @@ class MoriKVManager(CommonKVManager):
             while True:
                 try:
                     msg = self.server_socket.recv_multipart()
+                    if msg and msg[0] == MoriKVManager.AUX_DATA_HEADER:
+                        self._handle_aux_data(msg)
+                        continue
+
                     if not msg or msg[0] != MORI_GUARD:
                         logger.warning(
                             "Received malformed status message on decode worker"
@@ -564,32 +591,79 @@ class MoriKVManager(CommonKVManager):
         peer_info: KVArgsRegisterInfo,
         prefill_aux_index: int,
         dst_aux_index: int,
+        room: int,
     ) -> List[TransferStatus]:
-        if not self.aux_mem_descs:
-            return []
+        return self.send_aux_tcp(peer_info, prefill_aux_index, dst_aux_index, room)
 
-        local_mems = self.aux_mem_descs
-        remote_mems = peer_info.dst_aux_mem_descs
-        local_offsets_list = [
-            [prefill_aux_index * length] for length in self.kv_args.aux_item_lens
-        ]
-        remote_offsets_list = [
-            [dst_aux_index * length] for length in self.kv_args.aux_item_lens
-        ]
-        sizes_list = [[length] for length in self.kv_args.aux_item_lens]
-        transfer_uids = [
-            self.engine.allocate_transfer_uid() for _ in self.aux_mem_descs
-        ]
+    def send_aux_tcp(
+        self,
+        peer_info: KVArgsRegisterInfo,
+        prefill_aux_index: int,
+        dst_aux_index: int,
+        room: int,
+    ) -> List[TransferStatus]:
+        prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+        prefill_aux_item_lens = self.kv_args.aux_item_lens
 
-        statuses = self.engine.batch_write(
-            local_mems,
-            local_offsets_list,
-            remote_mems,
-            remote_offsets_list,
-            sizes_list,
-            transfer_uids,
+        for i in range(len(prefill_aux_ptrs)):
+            length = prefill_aux_item_lens[i]
+            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+            data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
+
+            self.send_aux_data_to_endpoint(
+                remote=peer_info.endpoint,
+                dst_port=peer_info.dst_port,
+                room=room,
+                buffer_index=i,
+                aux_index=dst_aux_index,
+                data=data,
+            )
+
+        return []
+
+    def send_aux_data_to_endpoint(
+        self,
+        remote: str,
+        dst_port: int,
+        room: int,
+        buffer_index: int,
+        aux_index: int,
+        data: bytes,
+    ):
+        socket = self._connect(
+            format_tcp_address(remote, dst_port), is_ipv6=is_valid_ipv6_address(remote)
         )
-        return statuses
+
+        socket.send_multipart(
+            [
+                MoriKVManager.AUX_DATA_HEADER,
+                str(room).encode("ascii"),
+                str(buffer_index).encode("ascii"),
+                str(aux_index).encode("ascii"),
+                struct.pack(">I", len(data)),
+                data,
+            ]
+        )
+
+    def _handle_aux_data(self, msg: List[bytes]):
+        """Handle AUX_DATA messages received by the decode thread."""
+        room = int(msg[1].decode("ascii"))
+        buffer_index = int(msg[2].decode("ascii"))
+        aux_index = int(msg[3].decode("ascii"))
+        data_length = struct.unpack(">I", msg[4])[0]
+        data = msg[5]
+
+        if len(data) != data_length:
+            logger.error(f"AUX_DATA length mismatch for bootstrap_room {room}")
+            return
+
+        AuxDataCodec.deserialize_data_to_buffer(
+            self.kv_args, buffer_index, aux_index, data
+        )
+
+        logger.debug(
+            f"Received AUX_DATA for bootstrap_room {room} with length:{len(data)}"
+        )
 
     def add_transfer_request(
         self,
@@ -633,7 +707,9 @@ class MoriKVManager(CommonKVManager):
                     and self.pp_group.is_last_rank
                 ):
                     result_statuses.extend(
-                        self.send_aux(peer_info, aux_index, info.dst_aux_index)
+                        self.send_aux(
+                            peer_info, aux_index, info.dst_aux_index, bootstrap_room
+                        )
                     )
             if is_last:
                 self.update_status(bootstrap_room, KVPoll.Success)
@@ -713,7 +789,6 @@ class MoriKVSender(CommonKVSender):
             self._notify_decode(KVPoll.Success)
             self.conclude_state = KVPoll.Success
             return KVPoll.Success
-
         return KVPoll.Transferring if status == KVPoll.Success else status
 
     def _all_transfers_finished(self) -> bool:
