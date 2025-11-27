@@ -1788,7 +1788,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # If x_sf is None, x is not packed, so output_col = x.shape[1]
             output_col = x.shape[1]
             if x_sf is not None and layer.moe_runner_config.is_gated:
-              output_col *= 2
+                output_col *= 2
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
@@ -1797,7 +1797,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     output_col,
                     dtype=output_dtype,
                     device=x.device,
-                    x.shape[0], output_col, dtype=output_dtype, device=x.device
                 )
 
             output = flashinfer_cutlass_fused_moe(
