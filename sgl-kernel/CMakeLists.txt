@@ -13,6 +13,9 @@ set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
+# GitHub Artifactory
+set(GITHUB_ARTIFACTORY "x.x.x/artifactory/github" CACHE STRING "GitHub mirror URL")
+
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
@@ -46,81 +49,63 @@ clear_cuda_arches(CMAKE_FLAG)
 # cutlass
 FetchContent_Declare(
     repo-cutlass
-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz
 )
 FetchContent_Populate(repo-cutlass)
 
 # DeepGEMM
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        f4adba8a6695e635b0106ce3dae3202016ad0ee5
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/sgl-project/DeepGEMM/archive/f4adba8a6695e635b0106ce3dae3202016ad0ee5.tar.gz
 )
 FetchContent_Populate(repo-deepgemm)
 
 # fmt
 FetchContent_Declare(
     repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/fmtlib/fmt/archive/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28.tar.gz
 )
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        8f9f695ea8fde23a0c7c88e4ab256634ca27789f
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/8f9f695ea8fde23a0c7c88e4ab256634ca27789f.tar.gz
 )
 FetchContent_Populate(repo-triton)
 
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/archive/bc29697ba20b7e6bdb728ded98f04788e16ee021.tar.gz
 )
 FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        f20a52329482ddca4a627b2f028f88c2959ee299
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/f20a52329482ddca4a627b2f028f88c2959ee299.tar.gz
 )
 FetchContent_Populate(repo-flash-attention)
 
 # flash-attention origin
 FetchContent_Declare(
     repo-flash-attention-origin
-    GIT_REPOSITORY https://github.com/Dao-AILab/flash-attention.git
-    GIT_TAG        9dbed03d1a7a5862998c182c83d8265fea9dc21b
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/Dao-AILab/flash-attention/archive/9dbed03d1a7a5862998c182c83d8265fea9dc21b.tar.gz
 )
 FetchContent_Populate(repo-flash-attention-origin)
 
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp/archive/51eca89d20f0cfb3764ccd764338d7b22cd486a6.tar.gz
 )
 FetchContent_Populate(repo-mscclpp)
 
 # fast-hadamard-transform
 FetchContent_Declare(
     repo-fast-hadamard-transform
-    GIT_REPOSITORY https://github.com/sgl-project/fast-hadamard-transform.git
-    GIT_TAG 48f3c13764dc2ec662ade842a4696a90a137f1bc
-    GIT_SHALLOW OFF
+    URL https://${GITHUB_ARTIFACTORY}/sgl-project/fast-hadamard-transform/archive/48f3c13764dc2ec662ade842a4696a90a137f1bc.tar.gz
 )
 FetchContent_Populate(repo-fast-hadamard-transform)
 
