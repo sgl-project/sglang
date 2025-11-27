@@ -4098,12 +4098,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        if not _is_npu:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        else:
-            torch.npu.empty_cache()
-            torch.npu.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

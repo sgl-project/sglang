@@ -37,15 +37,8 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_npu, replace_submodule
+from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
-
-if is_npu():
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
-
-    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it to True
-    torch.cuda.is_available = lambda: False
-
 
 logger = logging.getLogger(__name__)
 
