@@ -90,27 +90,6 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
-    def __str__(self):
-        if self == ForwardMode.EXTEND:
-            return "EXTEND"
-        elif self == ForwardMode.DECODE:
-            return "DECODE"
-        elif self == ForwardMode.MIXED:
-            return "MIXED"
-        elif self == ForwardMode.IDLE:
-            return "IDLE"
-        elif self == ForwardMode.TARGET_VERIFY:
-            return "TARGET_VERIFY"
-        elif self == ForwardMode.DRAFT_EXTEND:
-            return "DRAFT_EXTEND"
-        elif self == ForwardMode.DRAFT_EXTEND_V2:
-            return "DRAFT_EXTEND_V2"
-        elif self == ForwardMode.PREBUILT:
-            return "PREBUILT"
-        elif self == ForwardMode.SPLIT_PREFILL:
-            return "SPLIT_PREFILL"
-        return "UNKNOWN"
-
     def is_prefill(self):
         return self.is_extend()
 
@@ -462,8 +441,17 @@ class ForwardBatch:
             )
             return ret
 
-        # Override the positions with spec_info
-        if (
+        # Override the positions with diffusion LLM or spec_info
+        if batch.dllm_config is not None:
+            block_size = batch.dllm_config.block_size
+            ret.positions = torch.tensor(
+                [
+                    [i for i in range(block_offset, block_offset + block_size)]
+                    for block_offset in batch.dllm_block_offsets
+                ],
+                dtype=torch.int32,
+            ).to(device, non_blocking=True)
+        elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):

@@ -8,9 +8,8 @@ ARG GRACE_BLACKWELL=0
 
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
-ARG TRITON_LANG_COMMIT=4caa0328bf8df64896dd5f6fb9df41b0eb2e750a
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.17.post2
+ARG SGL_KERNEL_VERSION=0.3.18.post1
 ARG SGL_VERSION=0.5.5.post4
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -134,10 +133,9 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
    fi \
  && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
       python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+      python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-      python3 -m pip uninstall -y torch torchaudio torchvision ; \
-      python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
     else \
       echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
     fi \
@@ -184,16 +182,6 @@ RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
 # In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
 # latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0" --extra-index-url https://pypi.org/simple/
-
-# For cuda 13, we install triton from source to fix some sm103 issues
-# This can be reverted after >3.4.5 is released
-# See the conversation in: https://github.com/triton-lang/triton/pull/8536
-RUN --mount=type=cache,target=/root/.cache/pip if [ "$CUDA_VERSION" = "13.0.1" ]; then \
-    wget -q https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/${TRITON_LANG_COMMIT}.zip && \
-    unzip -q ${TRITON_LANG_COMMIT}.zip && rm ${TRITON_LANG_COMMIT}.zip && mv triton-${TRITON_LANG_COMMIT} triton && \
-    cd triton && pip install --break-system-packages -r python/requirements.txt && \
-    MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
-fi
 
 # Python tools
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
