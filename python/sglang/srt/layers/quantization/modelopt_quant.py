@@ -50,6 +50,7 @@ from sglang.srt.utils.common import (
     is_sm120_supported,
     next_power_of_2,
 )
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -128,7 +129,7 @@ def _sglang_fp4_gemm_fake(
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 
-    @torch.library.register_fake("sgl_kernel::scaled_fp4_quant")
+    @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
     def _sgl_kernel_scaled_fp4_quant_fake(
         output, input, output_scale, input_global_scale
     ):
@@ -1753,14 +1754,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = torch.bfloat16
 
+            # If x_sf is not None, x is FP4 packed (half size), so we need * 2
+            # If x_sf is None, x is not packed, so output_col = x.shape[1]
+            output_col = x.shape[1]
+            if x_sf is not None and layer.moe_runner_config.is_gated:
+              output_col *= 2
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
                     x.shape[0],
-                    x.shape[1] * (2 if layer.moe_runner_config.is_gated else 1),
+                    output_col,
                     dtype=output_dtype,
                     device=x.device,
+                    x.shape[0], output_col, dtype=output_dtype, device=x.device
                 )
 
             output = flashinfer_cutlass_fused_moe(
