@@ -8,7 +8,6 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
-import logging
 import multiprocessing as mp
 import os
 import time
@@ -21,23 +20,25 @@ import torch
 import torchvision
 from einops import rearrange
 
-from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-
-# Suppress verbose logging from imageio, which is triggered when saving images.
-logging.getLogger("imageio").setLevel(logging.WARNING)
-logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
-# Suppress Pillow plugin import logs when app log level is DEBUG
-logging.getLogger("PIL").setLevel(logging.WARNING)
-logging.getLogger("PIL.Image").setLevel(logging.WARNING)
-
 from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    MergeLoraWeightsReq,
+    SetLoraReq,
+    UnmergeLoraWeightsReq,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.launch_server import launch_server
-from sglang.multimodal_gen.runtime.managers.schedulerbase import SchedulerBase
+from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    suppress_loggers,
+    suppress_other_loggers,
+)
+
+suppress_loggers(["imageio", "imageio_ffmpeg", "PIL", "PIL_Image"])
 
 logger = init_logger(__name__)
 
@@ -77,6 +78,9 @@ class DiffGenerator:
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None
         self.owns_scheduler_client: bool = False
+        self._current_lora_path: str | None = None
+        self._current_lora_nickname: str | None = None
+        self._is_lora_merged: bool = False
 
     @classmethod
     def from_pretrained(
@@ -117,7 +121,6 @@ class DiffGenerator:
         Returns:
             The created DiffGenerator
         """
-        executor_class = SchedulerBase.get_class(server_args)
         instance = cls(
             server_args=server_args,
         )
@@ -185,15 +188,16 @@ class DiffGenerator:
         if save_output:
             if save_file_path:
                 os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-                if data_type == DataType.VIDEO:
-                    imageio.mimsave(
-                        save_file_path,
-                        frames,
-                        fps=fps,
-                        format=data_type.get_default_extension(),
-                    )
-                else:
-                    imageio.imwrite(save_file_path, frames[0])
+                with suppress_other_loggers():
+                    if data_type == DataType.VIDEO:
+                        imageio.mimsave(
+                            save_file_path,
+                            frames,
+                            fps=fps,
+                            format=data_type.get_default_extension(),
+                        )
+                    else:
+                        imageio.imwrite(save_file_path, frames[0])
                 logger.info("Saved output to %s", save_file_path)
             else:
                 logger.warning("No output path provided, output not saved")
@@ -284,7 +288,7 @@ class DiffGenerator:
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
             logger.info(
-                "Processing prompt %d/%d: %s...",
+                "Processing prompt: %d/%d: %s",
                 request_idx + 1,
                 len(requests),
                 req.prompt[:100],
@@ -366,32 +370,98 @@ class DiffGenerator:
         """
         return sync_scheduler_client.forward(batch)
 
-    def set_lora_adapter(
-        self, lora_nickname: str, lora_path: str | None = None
-    ) -> None:
-        # self.scheduler.set_lora_adapter(lora_nickname, lora_path)
-        pass  # Removed as per edit hint
+    # LoRA
+    def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
+        response = sync_scheduler_client.forward(req)
+        if isinstance(response, dict) and response.get("status") == "ok":
+            logger.info(success_msg)
+        else:
+            error_msg = (
+                response.get("message", "Unknown error")
+                if isinstance(response, dict)
+                else "Unknown response format"
+            )
+            raise RuntimeError(f"{failure_msg}: {error_msg}")
+
+    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
+        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
+        self._send_lora_request(
+            req,
+            f"Successfully set LoRA adapter: {lora_nickname}",
+            "Failed to set LoRA adapter",
+        )
 
     def unmerge_lora_weights(self) -> None:
-        """
-        Use unmerged weights for inference to produce outputs that align with
-        validation outputs generated during training.
-        """
-        # self.scheduler.unmerge_lora_weights()
-        pass  # Removed as per edit hint
+        req = UnmergeLoraWeightsReq()
+        self._send_lora_request(
+            req,
+            "Successfully unmerged LoRA weights",
+            "Failed to unmerge LoRA weights",
+        )
+        self._is_lora_merged = False
 
     def merge_lora_weights(self) -> None:
-        # self.scheduler.merge_lora_weights()
-        pass  # Removed as per edit hint
+        req = MergeLoraWeightsReq()
+        self._send_lora_request(
+            req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
+        )
+        self._is_lora_merged = True
+
+    def _ensure_lora_state(
+        self,
+        lora_path: str | None,
+        lora_nickname: str | None = None,
+        merge_lora: bool = True,
+    ) -> None:
+        if lora_path is None:
+            if self._is_lora_merged:
+                self.unmerge_lora_weights()
+            self._current_lora_path = None
+            self._current_lora_nickname = None
+            self._is_lora_merged = False
+            return
+
+        lora_nickname = lora_nickname or self.server_args.lora_nickname
+
+        if self._current_lora_path != lora_path:
+            if self._is_lora_merged:
+                self.unmerge_lora_weights()
+                self._is_lora_merged = False
+            self.set_lora(lora_nickname, lora_path)
+            self._current_lora_path = lora_path
+            self._current_lora_nickname = lora_nickname
+            self._is_lora_merged = False
+
+        if merge_lora and not self._is_lora_merged:
+            self.merge_lora_weights()
+        elif not merge_lora:
+            self._is_lora_merged = False
+
+    def generate_with_lora(
+        self,
+        prompt: str | list[str] | None = None,
+        sampling_params: SamplingParams | None = None,
+        *,
+        lora_path: str | None = None,
+        lora_nickname: str | None = None,
+        merge_lora: bool = True,
+        **kwargs,
+    ):
+        self._ensure_lora_state(
+            lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
+        )
+        return self.generate(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            **kwargs,
+        )
 
     def shutdown(self):
         """
         Shutdown the generator.
         If in local mode, it also shuts down the scheduler server.
         """
-        # This sends the shutdown command to the server
-        # self.scheduler.shutdown()
-
+        # sends the shutdown command to the server
         if self.local_scheduler_process:
             logger.info("Waiting for local worker processes to terminate...")
             for process in self.local_scheduler_process:

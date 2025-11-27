@@ -166,6 +166,7 @@ class Envs:
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+    SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
@@ -277,11 +278,17 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
+    # RoPE cache configuration
+    SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
+    SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
+
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # VLM
+    SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
 

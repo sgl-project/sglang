@@ -34,6 +34,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
 )
@@ -88,6 +89,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -121,7 +123,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.hook_manager import register_hooks
+from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -155,6 +157,7 @@ from sglang.srt.utils import (
     is_npu,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
+    reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
     xpu_has_xmx_support,
@@ -362,6 +365,15 @@ class ModelRunner:
                     elif hasattr(layer.self_attn, "attn_mqa"):
                         # For DeepSeek model
                         self.attention_layers.append(layer.self_attn.attn_mqa)
+                # For hybrid model
+                elif hasattr(layer, "attn"):
+                    self.attention_layers.append(layer.attn)
+                elif hasattr(layer, "linear_attn"):
+                    self.attention_layers.append(layer.linear_attn)
+                # For InternVL model
+                elif hasattr(layer, "attention"):
+                    if hasattr(layer.attention, "attn"):
+                        self.attention_layers.append(layer.attention.attn)
 
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
                 # TODO(yuwei): support Non-Standard GQA
@@ -524,8 +536,8 @@ class ModelRunner:
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
-        if server_args.hooks:
-            register_hooks(self.model, server_args.hooks)
+        if server_args.forward_hooks:
+            register_forward_hooks(self.model, server_args.forward_hooks)
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -533,6 +545,7 @@ class ModelRunner:
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
+                model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
 
@@ -592,9 +605,12 @@ class ModelRunner:
                 )
             moe_tp_size = self.tp_size // self.moe_ep_size
 
-            moe_intermediate_size = (
-                self.model_config.hf_text_config.moe_intermediate_size
+            moe_intermediate_size = getattr(
+                self.model_config.hf_text_config, "moe_intermediate_size", None
             )
+            if moe_intermediate_size is None:
+                return
+
             if moe_intermediate_size % moe_tp_size != 0:
                 raise ValueError(
                     f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
@@ -861,6 +877,14 @@ class ModelRunner:
                 self.tp_rank,
                 self.pp_rank,
             )
+
+        # Pre-expand RoPE cache before CUDA Graph capture
+        reserve_rope_cache_for_long_sequences(
+            self.model,
+            self.server_args,
+            self.model_config,
+            logger,
+        )
 
         if self.server_args.elastic_ep_backend == "mooncake":
             # Mooncake does not support `monitored_barrier`
@@ -1129,7 +1153,14 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -1145,6 +1176,10 @@ class ModelRunner:
             "Please call `init_weights_update_group` first."
         )
 
+        if load_format == "flattened_bucket":
+            return self._update_bucketed_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
         try:
             weights = []
             handles = []
@@ -1168,6 +1203,37 @@ class ModelRunner:
             self.model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def _update_bucketed_weights_from_distributed(
+        self, names, dtypes, shapes, group_name
+    ):
+        try:
+            named_tensors = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                named_tensors.append(
+                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
+                )
+            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            flattened_tensor = bucket.get_flattened_tensor()
+            torch.distributed.broadcast(
+                flattened_tensor,
+                src=0,
+                group=self._model_update_group[group_name],
+            )
+            reconstructed_tensors = bucket.reconstruct_tensors()
+            self.model.load_weights(reconstructed_tensors)
+            return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -1451,6 +1517,8 @@ class ModelRunner:
         config = self.model_config.hf_config
         if isinstance(config, FalconH1Config | NemotronHConfig):
             return config
+        if isinstance(config, NemotronH_Nano_VL_V2_Config):
+            return config.llm_config
         return None
 
     @property
@@ -2179,7 +2247,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
 
         if self.is_multimodal and should_use_external_mm_preprocess(self.model):
             data_embedding_funcs = resolve_external_mm_data_embedding_funcs(self.model)

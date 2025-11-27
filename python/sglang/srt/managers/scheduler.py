@@ -60,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -73,6 +74,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
@@ -83,7 +85,6 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
-    GetLoadReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -93,6 +94,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
+    PauseGenerationReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -148,12 +150,9 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
-from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -288,6 +287,9 @@ class Scheduler(
         # Init model config
         self.model_config = ModelConfig.from_server_args(server_args)
 
+        # Init diffusion LLM config
+        self.dllm_config = DllmConfig.from_server_args(server_args)
+
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
 
@@ -419,8 +421,8 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
-        # Init memory pool and cache
-        self.init_memory_pool_and_cache()
+        # Init cache using the existing memory pool
+        self.init_cache_with_memory_pool()
 
         # Init running status
         self.waiting_queue: List[Req] = []
@@ -446,9 +448,14 @@ class Scheduler(
         if self.device == "cpu":
             self.default_stream.synchronize = lambda: None  # No-op for CPU
         self.forward_sleep_time = None
+        self._engine_paused = False
 
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
+        if self.dllm_config is not None:
+            # We currently leverage chunked prefill to implement block diffusion
+            # for diffusion LLM.
+            self.chunked_prefill_size = self.dllm_config.block_size
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_req = None
@@ -571,6 +578,8 @@ class Scheduler(
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (GetLoadReqInput, self.get_load),
+                (PauseGenerationReqInput, self.pause_generation),
+                (ContinueGenerationReqInput, self.continue_generation),
             ]
         )
 
@@ -693,117 +702,81 @@ class Scheduler(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
 
-    def init_memory_pool_and_cache(self):
+    def init_cache_with_memory_pool(self):
         server_args = self.server_args
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
 
+        params = CacheInitParams(
+            disable=server_args.disable_radix_cache,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            page_size=self.page_size,
+            is_eagle=self.spec_algorithm.is_eagle(),
+            tp_cache_group=(
+                self.attn_tp_cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_cpu_group
+            ),
+            eviction_policy=server_args.radix_eviction_policy,
+            enable_metrics=self.enable_metrics,
+            enable_kv_cache_events=self.enable_kv_cache_events,
+        )
+
         if (
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            if self.is_hybrid:
-                ChunkCacheClass = SWAChunkCache
+            if not self.is_hybrid:
+                from sglang.srt.mem_cache.chunk_cache import ChunkCache
+
+                self.tree_cache = ChunkCache(params)
             else:
-                ChunkCacheClass = ChunkCache
-            self.tree_cache = ChunkCacheClass(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                page_size=self.page_size,
-            )
+
+                from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+
+                self.tree_cache = SWAChunkCache(params)
         else:
+
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
                 logger.info("Using experimental C++ radix tree implementation.")
-                self.tree_cache = RadixCacheCpp(
-                    disable=False,
-                    use_hicache=self.enable_hierarchical_cache,
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=self.tp_cpu_group,
-                    page_size=self.page_size,
-                    hicache_ratio=server_args.hicache_ratio,
-                    hicache_size=server_args.hicache_size,
-                    hicache_write_policy=server_args.hicache_write_policy,
-                    enable_metrics=self.enable_metrics,
-                    enable_kv_cache_events=self.enable_kv_cache_events,
-                )
+                self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
-                self.tree_cache = HiRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    tp_cache_group=(
-                        self.attn_tp_cpu_group
-                        if self.server_args.enable_dp_attention
-                        else self.tp_cpu_group
-                    ),
-                    page_size=self.page_size,
-                    eviction_policy=server_args.radix_eviction_policy,
-                    hicache_ratio=server_args.hicache_ratio,
-                    hicache_size=server_args.hicache_size,
-                    hicache_write_policy=server_args.hicache_write_policy,
-                    hicache_io_backend=server_args.hicache_io_backend,
-                    hicache_mem_layout=server_args.hicache_mem_layout,
-                    enable_metrics=self.enable_metrics,
-                    hicache_storage_backend=server_args.hicache_storage_backend,
-                    hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
-                    model_name=server_args.served_model_name,
-                    storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
-                    is_eagle=self.spec_algorithm.is_eagle(),
-                )
+                from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
+
+                self.tree_cache = HiRadixCache(params=params, server_args=server_args)
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
             elif self.is_hybrid:
+                from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+
                 self.tree_cache = SWARadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    sliding_window_size=self.sliding_window_size,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    is_eagle=self.spec_algorithm.is_eagle(),
-                    enable_metrics=self.enable_metrics,
+                    params=params, sliding_window_size=self.sliding_window_size
                 )
             elif self.is_hybrid_gdn:
-                self.tree_cache = MambaRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    enable_metrics=self.enable_metrics,
-                )
+                from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+
+                self.tree_cache = MambaRadixCache(params)
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,
                 )
 
                 self.tree_cache = LMCRadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    enable_metrics=self.enable_metrics,
+                    params=params,
                     model_config=self.model_config,
                     tp_size=self.tp_size,
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
-                    eviction_policy=server_args.radix_eviction_policy,
                 )
             else:
-                self.tree_cache = RadixCache(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    page_size=self.page_size,
-                    disable=server_args.disable_radix_cache,
-                    enable_metrics=self.enable_metrics,
-                    enable_kv_cache_events=self.enable_kv_cache_events,
-                    eviction_policy=server_args.radix_eviction_policy,
-                    is_eagle=self.spec_algorithm.is_eagle(),
-                )
+                self.tree_cache = RadixCache(params)
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -812,11 +785,7 @@ class Scheduler(
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=(
-                    self.attn_tp_cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_cpu_group
-                ),
+                tp_group=params.tp_cache_group,
                 tree_cache=self.tree_cache,
                 server_args=self.server_args,
             )
@@ -835,7 +804,7 @@ class Scheduler(
             )
         )
 
-        embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
+        embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_disaggregation(self):
@@ -967,7 +936,11 @@ class Scheduler(
         ).stream(self.copy_stream)
 
         self.future_map = FutureMap(
-            self.max_running_requests, self.device, self.spec_algorithm
+            self.max_running_requests,
+            self.chunked_prefill_size,
+            self.model_config.context_len,
+            self.device,
+            self.spec_algorithm,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -991,6 +964,9 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1023,6 +999,9 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
 
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1312,6 +1291,7 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
+                dllm_config=self.dllm_config,
             )
             req.tokenizer = self.tokenizer
 
@@ -1627,67 +1607,11 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
-    def _get_token_info(self):
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
-        return num_used, token_usage, available_size, evictable_size
-
-    def _get_mamba_token_info(self):
-        is_radix_tree = isinstance(self.tree_cache, MambaRadixCache)
-        full_available_size = self.token_to_kv_pool_allocator.available_size()
-        full_evictable_size = (
-            self.tree_cache.full_evictable_size() if is_radix_tree else 0
-        )
-        mamba_available_size = self.req_to_token_pool.mamba_pool.available_size()
-        mamba_evictable_size = (
-            self.tree_cache.mamba_evictable_size() if is_radix_tree else 0
-        )
-        full_num_used = self.token_to_kv_pool_allocator.size - (
-            full_available_size + full_evictable_size
-        )
-        mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
-            mamba_available_size + mamba_evictable_size
-        )
-        full_token_usage = full_num_used / self.token_to_kv_pool_allocator.size
-        mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
-        return (
-            full_num_used,
-            mamba_num_used,
-            full_token_usage,
-            mamba_usage,
-            full_available_size,
-            full_evictable_size,
-            mamba_available_size,
-            mamba_evictable_size,
-        )
-
-    def _get_swa_token_info(self):
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-        full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-        swa_evictable_size = self.tree_cache.swa_evictable_size()
-        full_num_used = self.full_tokens_per_layer - (
-            full_available_size + full_evictable_size
-        )
-        swa_num_used = self.swa_tokens_per_layer - (
-            swa_available_size + swa_evictable_size
-        )
-        full_token_usage = full_num_used / self.full_tokens_per_layer
-        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
-        return (
-            full_num_used,
-            swa_num_used,
-            full_token_usage,
-            swa_token_usage,
-            full_available_size,
-            full_evictable_size,
-            swa_available_size,
-            swa_evictable_size,
-        )
-
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if self.dllm_config is not None:
+            if self.chunked_req is not None and self.chunked_req.finished():
+                self.chunked_req = None
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -1920,6 +1844,7 @@ class Scheduler(
             self.enable_overlap,
             self.spec_algorithm,
             chunked_req=self.chunked_req,
+            dllm_config=self.dllm_config,
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
@@ -2152,7 +2077,10 @@ class Scheduler(
             self.process_batch_result_decode(batch, result)
             trace_slice_batch(RequestStage.DECODE_LOOP, batch.reqs)
         elif batch.forward_mode.is_extend():
-            self.process_batch_result_prefill(batch, result)
+            if batch.is_dllm():
+                self.process_batch_result_dllm(batch, result)
+            else:
+                self.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
@@ -2253,8 +2181,7 @@ class Scheduler(
 
     def _is_no_request(self):
         no_request = (
-            len(self.waiting_queue) == 0
-            and self.running_batch.is_empty()
+            self.running_batch.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
@@ -2303,57 +2230,6 @@ class Scheduler(
             )
             if_success = False
         return if_success
-
-    def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
-        # TODO(lsyin): use dynamically maintained num_waiting_tokens
-
-        if self.is_hybrid:
-            num_tokens_full = (
-                self.full_tokens_per_layer
-                - self.token_to_kv_pool_allocator.full_available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-            num_tokens_swa = (
-                self.swa_tokens_per_layer
-                - self.token_to_kv_pool_allocator.swa_available_size()
-                - self.tree_cache.swa_evictable_size()
-            )
-            num_tokens = max(num_tokens_full, num_tokens_swa)
-        elif self.is_hybrid_gdn:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-        else:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.evictable_size()
-            )
-
-        # Tokens in waiting queue, bootstrap queue, prealloc queue
-        num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
-        num_waiting_reqs = len(self.waiting_queue)
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            num_tokens += sum(
-                len(req.origin_input_ids)
-                for req in self.disagg_prefill_bootstrap_queue.queue
-            )
-            num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            num_tokens += sum(
-                len(req.req.origin_input_ids)
-                for req in self.disagg_decode_prealloc_queue.queue
-            )
-            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
-
-        return GetLoadReqOutput(
-            dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
-            num_waiting_reqs=num_waiting_reqs,
-            num_tokens=num_tokens,
-        )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = vars(get_global_server_args())
@@ -2526,6 +2402,29 @@ class Scheduler(
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
+
+    def pause_generation(self, recv_req: PauseGenerationReqInput):
+        self._engine_paused = True
+
+        if self.enable_overlap and self.last_batch:
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+            self.last_batch = None
+            self.cur_batch = None
+
+        if recv_req.mode == "retract":
+            self.running_batch.filter_batch()
+            if len(self.running_batch.reqs) != 0:
+                retracted_reqs = self.running_batch.retract_all(self.server_args)
+                for req in retracted_reqs:
+                    self._add_request_to_queue(req)
+
+            self.running_batch.batch_is_full = False
+            self.chunked_req = None
+
+    def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        self._engine_paused = False
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
