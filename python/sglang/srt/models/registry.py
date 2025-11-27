@@ -84,7 +84,6 @@ class _ModelRegistry:
             if model_cls is not None:
                 return (model_cls, arch)
 
-        return None
         return self._raise_for_unsupported(architectures)
 
 
