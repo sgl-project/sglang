@@ -691,7 +691,8 @@ class Req:
         self.dllm_config = dllm_config
 
     @property
-    def seqlen(self):
+    def seqlen(self) -> int:
+        """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
@@ -1923,6 +1924,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            reqs=self.reqs,
+            has_grammar=self.has_grammar,
         )
 
     def copy(self):
@@ -2040,3 +2043,8 @@ class ModelWorkerBatch:
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
+
+    # For constrained decoding
+    # FIXME(lsyin): remove this after fully overlap grammar
+    reqs: Optional[List[Req]] = None
+    has_grammar: bool = False

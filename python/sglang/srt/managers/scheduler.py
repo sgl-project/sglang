@@ -71,6 +71,7 @@ from sglang.srt.managers.io_struct import (
     BaseReq,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    CheckWeightsReqInput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -85,7 +86,6 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
-    GetLoadReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -427,7 +427,6 @@ class Scheduler(
 
         # Init running status
         self.waiting_queue: List[Req] = []
-        self.num_waiting_tokens = 0
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -570,6 +569,7 @@ class Scheduler(
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
+                (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
                 (ProfileReq, self.profile),
                 (FreezeGCReq, self.handle_freeze_gc),
@@ -1016,7 +1016,16 @@ class Scheduler(
                 and self.last_batch.forward_mode.is_extend()
             )
 
-            if disable_overlap_for_batch:
+            # FIXME(lsyin): remove this grammar sync
+            need_grammar_sync = (
+                batch is not None
+                and batch.forward_mode.is_decode()
+                and batch.has_grammar
+                and batch.is_v2_eagle
+                and len(self.result_queue) > 0
+            )
+
+            if disable_overlap_for_batch or need_grammar_sync:
                 pop_and_process()
 
             batch_result = None
@@ -1025,7 +1034,7 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not disable_overlap_for_batch and not need_grammar_sync:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -1465,7 +1474,6 @@ class Scheduler(
                 return
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
-            self.num_waiting_tokens += len(req.origin_input_ids)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
             trace_slice_end(RequestStage.REQUEST_PROCESS, req.rid, auto_next_anon=True)
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1533,8 +1541,6 @@ class Scheduler(
             if abort_existing_req:
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
-                # update counter for preempted existing request
-                self.num_waiting_tokens -= len(req_to_abort.origin_input_ids)
                 message = "The request is aborted by a higher priority request."
 
         self.send_to_tokenizer.send_output(
@@ -1812,15 +1818,9 @@ class Scheduler(
             for req in can_run_list:
                 req.add_latency(RequestStage.PREFILL_WAITING)
 
-        can_run_set = set(can_run_list)
-        waiting_queue = []
-        for x in self.waiting_queue:
-            if x in can_run_set:
-                self.num_waiting_tokens -= len(x.origin_input_ids)
-            else:
-                waiting_queue.append(x)
-
-        self.waiting_queue = waiting_queue
+        self.waiting_queue = [
+            x for x in self.waiting_queue if x not in set(can_run_list)
+        ]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -2242,49 +2242,6 @@ class Scheduler(
             if_success = False
         return if_success
 
-    def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
-        if self.is_hybrid:
-            num_tokens_full = (
-                self.full_tokens_per_layer
-                - self.token_to_kv_pool_allocator.full_available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-            num_tokens_swa = (
-                self.swa_tokens_per_layer
-                - self.token_to_kv_pool_allocator.swa_available_size()
-                - self.tree_cache.swa_evictable_size()
-            )
-            num_tokens = max(num_tokens_full, num_tokens_swa)
-        elif self.is_hybrid_gdn:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-        else:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.evictable_size()
-            )
-
-        # Tokens in waiting queue, bootstrap queue, prealloc/retract queue
-        num_tokens += self.num_waiting_tokens
-        num_waiting_reqs = len(self.waiting_queue)
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
-            num_waiting_reqs += len(self.disagg_decode_transfer_queue.queue)
-            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.retracted_queue)
-
-        return GetLoadReqOutput(
-            dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
-            num_waiting_reqs=num_waiting_reqs,
-            num_tokens=num_tokens,
-        )
-
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = vars(get_global_server_args())
         ret["last_gen_throughput"] = self.last_gen_throughput
@@ -2392,9 +2349,6 @@ class Scheduler(
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 release_kv_cache(req, self.tree_cache)
-            else:
-                # update counter for abort request in prealloc and waiting queue
-                self.num_waiting_tokens -= len(req.origin_input_ids)
 
             # For mamba radix cache
             if req.mamba_pool_idx is not None:
