@@ -55,6 +55,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
+    ALPHA_MOE = "alpha_moe"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -82,6 +83,9 @@ class MoeRunnerBackend(Enum):
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS
+
+    def is_alpha_moe(self):
+        return self == MoeRunnerBackend.ALPHA_MOE
 
 
 class DeepEPMode(Enum):
