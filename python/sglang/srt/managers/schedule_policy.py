@@ -553,7 +553,7 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
-            if self.rem_chunk_tokens == 0:
+            if self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
             # Chunked prefill
