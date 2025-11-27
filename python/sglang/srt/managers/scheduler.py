@@ -1192,7 +1192,7 @@ class Scheduler(
             self.server_args.language_only
             and self.server_args.mm_transfer_backend == "zmq_to_scheduler"
         ):
-            self.mm_receiver.process_waiting_requests(recv_reqs)
+            recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
 
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.

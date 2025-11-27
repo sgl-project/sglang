@@ -1872,6 +1872,12 @@ class ServerArgs:
             raise ValueError(
                 "Cannot set --mm-only and --disaggregation-mode prefill/decode together"
             )
+        if (
+            self.language_only
+            and self.mm_transfer_backend == "zmq_to_scheduler"
+            and self.pp_size > 1
+        ):
+            raise ValueError("zmq_to_scheduler not support pp_size > 1")
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":

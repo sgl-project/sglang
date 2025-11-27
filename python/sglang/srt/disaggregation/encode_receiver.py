@@ -167,13 +167,13 @@ class WaitingImageRequest:
 
     def _try_recv_mm_data(self):
         if self.ready:
-            return True
+            return
         while self.recv_embedding_data is None or not self.recv_embedding_data.ready:
             try:
                 parts = self.recv_socket.recv_multipart(flags=zmq.NOBLOCK, copy=False)
             except zmq.Again:
                 # No data available yet, wait a bit and retry
-                return False
+                return
 
             recv_obj: EmbeddingData = pickle.loads(parts[0])
             buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
@@ -195,7 +195,6 @@ class WaitingImageRequest:
         self.recv_req.mm_inputs = mm_inputs
         self.recv_req.input_ids = mm_inputs["input_ids"]
         self.ready = True
-        return True
 
 
 def _determine_tensor_transport_mode(server_args):
@@ -238,6 +237,7 @@ class MMReceiver:
             self.nnodes = server_args.nnodes
             self.hostname = get_local_ip_auto()
             self.world_size = server_args.pp_size * server_args.tp_size
+            self.waiting_list: List[WaitingImageRequest] = []
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
                 import_processors("sglang.srt.multimodal.processors")
@@ -271,7 +271,7 @@ class MMReceiver:
 
     # For zmq_to_scheduler
     def process_waiting_requests(self, recv_reqs):
-        waiting_list: List[WaitingImageRequest] = []
+        new_recv_reqs = []
         for recv_req in recv_reqs:
             # E Disaggregation
             if (
@@ -294,15 +294,31 @@ class MMReceiver:
                 )
                 if recv_req.embedding_ports is None:
                     waiting_req.send_encode_request()
-                waiting_list.append(waiting_req)
+                self.waiting_list.append(waiting_req)
+            else:
+                new_recv_reqs.append(recv_req)
 
-        # waiting for recv embedding result
-        ready = False
-        while not ready:
-            ready = True
-            for waiting_req in waiting_list:
-                if not waiting_req._try_recv_mm_data():
-                    ready = False
+        if len(self.waiting_list) == 0:
+            return new_recv_reqs
+
+        local_status = []
+        for waiting_req in self.waiting_list:
+            waiting_req._try_recv_mm_data()
+            local_status.append(waiting_req.ready)
+
+        local_status = torch.tensor(local_status, device="cuda", dtype=torch.int32)
+
+        torch.distributed.all_reduce(local_status, op=torch.distributed.ReduceOp.MIN)
+
+        new_waiting = []
+        for i, waiting_req in enumerate(self.waiting_list):
+            if local_status[i].item():
+                new_recv_reqs.append(waiting_req.recv_req)
+            else:
+                new_waiting.append(waiting_req)
+
+        self.waiting_list = new_waiting
+        return new_recv_reqs
 
     # For zmq_to_scheduler
     def _run_encode_in_thread(
