@@ -533,7 +533,9 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     :return: (scale_mn, scale_k), float32
     """
     if len(sf_packed.shape) == 3:
-        return torch.stack([_inverse_transform_scale_ue8m0_impl(x) for x in sf_packed], dim=0)
+        return torch.stack(
+            [_inverse_transform_scale_ue8m0_impl(x) for x in sf_packed], dim=0
+        )
 
     block_size = 128
     assert len(sf_packed.shape) == 2, f"{sf_packed.shape=}"
