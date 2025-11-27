@@ -4,7 +4,7 @@ import json
 import torch
 import torch.nn as nn
 
-from sglang.srt.model_executor.hook_manager import register_hooks
+from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,7 +46,7 @@ class TinyModel(nn.Module):
 
 
 class TestAttachHooks(CustomTestCase):
-    """Tests for ModelRunner.register_hooks / resolve_callable integration."""
+    """Tests for register_forward_hooks / resolve_callable integration."""
 
     def setUp(self):
         HOOK_CALLS.clear()
@@ -67,7 +67,7 @@ class TestAttachHooks(CustomTestCase):
         ]
 
         model = TinyModel()
-        register_hooks(model, hook_specs)
+        register_forward_hooks(model, hook_specs)
 
         x = torch.randn(3, 4)
         _ = model(x)
@@ -92,7 +92,7 @@ class TestAttachHooks(CustomTestCase):
             }
         ]
 
-        register_hooks(model, hook_specs)
+        register_forward_hooks(model, hook_specs)
 
         x = torch.randn(3, 4)
         _ = model(x)
@@ -103,7 +103,7 @@ class TestAttachHooks(CustomTestCase):
     def test_cli_hooks_reach_model(self):
         """
         Ensure that when hooks are provided via CLI, they are parsed into
-        ServerArgs, passed to ModelRunner.register_hooks, and actually
+        ServerArgs, passed to register_forward_hooks, and actually
         run during a forward pass.
         """
         parser = argparse.ArgumentParser()
@@ -121,17 +121,17 @@ class TestAttachHooks(CustomTestCase):
         cli_args = [
             "--model-path",
             "Qwen/Qwen2-7B-Instruct",  # Dummy value; not used in this test
-            "--hooks",
+            "--forward-hooks",
             json.dumps(hooks_spec),
         ]
 
         args = parser.parse_args(cli_args)
         server_args = ServerArgs.from_cli_args(args)
 
-        self.assertEqual(server_args.hooks, hooks_spec)
+        self.assertEqual(server_args.forward_hooks, hooks_spec)
 
         model = TinyModel()
-        register_hooks(model, server_args.hooks)
+        register_forward_hooks(model, server_args.forward_hooks)
 
         x = torch.randn(3, 4)
         _ = model(x)
