@@ -493,6 +493,7 @@ class ServerArgs:
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     disable_overlap_schedule: bool = False
+    enable_embedding_schedule_overlap: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
@@ -3406,6 +3407,11 @@ class ServerArgs:
             "--disable-overlap-schedule",
             action="store_true",
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+        )
+        parser.add_argument(
+            "--enable-embedding-schedule-overlap",
+            action="store_true",
+            help="Enable overlap scheduling for non-generation models to improve throughput. By default, overlap scheduling is only enabled for generation models.",
         )
         parser.add_argument(
             "--enable-mixed-chunk",

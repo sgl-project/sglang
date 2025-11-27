@@ -203,6 +203,16 @@ GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 @dataclass
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
+    copy_done: Optional[torch.cuda.Event] = None
+
+    def copy_to_cpu(self):
+        """Copy embeddings tensor to CPU in overlap scheduling."""
+        if isinstance(self.embeddings, torch.Tensor):
+            self.embeddings = self.embeddings.to("cpu", non_blocking=True)
+            if self.copy_done is not None:
+                self.copy_done.record()
+        # For sparse embeddings or lists, we keep them on GPU for now
+        # as the .indices() and .values() calls will handle the transfer
 
 
 class Scheduler(
@@ -300,8 +310,10 @@ class Scheduler(
 
         # Check whether overlap can be enabled
         if not self.is_generation:
-            self.enable_overlap = False
-            logger.info("Overlap scheduler is disabled for embedding models.")
+            self.enable_overlap = self.server_args.enable_embedding_schedule_overlap
+            logger.info(
+                f"Overlap scheduler is {'disabled' if not self.enable_overlap else 'enabled'} for embedding models."
+            )
 
         # Launch a tensor parallel worker
         from sglang.srt.managers.tp_worker import TpModelWorker
@@ -971,7 +983,9 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
+        self.result_queue: Deque[
+            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+        ] = deque()
         disable_consecutive_prefill_overlap = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
         )
@@ -1011,7 +1025,8 @@ class Scheduler(
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-            self.launch_batch_sample_if_needed(batch_result)
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -2018,8 +2033,25 @@ class Scheduler(
             ret = batch_result
         else:  # embedding or reward model
             model_worker_batch = batch.get_model_worker_batch()
-            embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-            ret = EmbeddingBatchResult(embeddings=embeddings)
+
+            if self.enable_overlap:
+                self.record_batch_in_overlap(model_worker_batch)
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.default_stream)
+                    embeddings = self.tp_worker.forward_batch_embedding(
+                        model_worker_batch
+                    )
+                    ret = EmbeddingBatchResult(embeddings=embeddings)
+                    ret.copy_done = (
+                        torch.get_device_module(embeddings.device).Event()
+                        if isinstance(embeddings, torch.Tensor)
+                        else None
+                    )
+                    if ret.copy_done is not None:
+                        ret.copy_to_cpu()
+            else:
+                embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
+                ret = EmbeddingBatchResult(embeddings=embeddings)
 
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
@@ -2031,7 +2063,7 @@ class Scheduler(
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
-    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+    ) -> Union[GenerationBatchResult]:
         # TODO(lsyin): make the delayed sample a default behavior after
         # unifying the forward_batch_generation interface (related to spec V2).
         if batch_result is None or batch_result.delay_sample_func is None:
