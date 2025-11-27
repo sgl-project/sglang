@@ -401,7 +401,7 @@ class SchedulerOutputProcessorMixin:
                     if batch.spec_algorithm.is_none():
                         # Normal decode: single token
                         req.grammar.accept_token(next_token_id)
-                    else:
+                    elif batch.is_v2_eagle:
                         # Speculative decode: next_token_id is a list of accepted tokens
                         for token_id in next_token_id:
                             req.grammar.accept_token(token_id)
