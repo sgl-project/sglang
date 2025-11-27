@@ -158,14 +158,14 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
 
         img_shapes = [
-                         [
-                             (
-                                 1,
-                                 height // vae_scale_factor // 2,
-                                 width // vae_scale_factor // 2,
-                             )
-                         ]
-                     ] * batch_size
+            [
+                (
+                    1,
+                    height // vae_scale_factor // 2,
+                    width // vae_scale_factor // 2,
+                )
+            ]
+        ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
 
         (img_cos, img_sin), (txt_cos, txt_sin) = self.get_freqs_cis(
@@ -223,19 +223,19 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         vae_scale_factor = self.get_vae_scale_factor()
 
         img_shapes = [
-                         [
-                             (
-                                 1,
-                                 height // vae_scale_factor // 2,
-                                 width // vae_scale_factor // 2,
-                             ),
-                             (
-                                 1,
-                                 edit_height // vae_scale_factor // 2,
-                                 edit_width // vae_scale_factor // 2,
-                             ),
-                         ],
-                     ] * batch_size
+            [
+                (
+                    1,
+                    height // vae_scale_factor // 2,
+                    width // vae_scale_factor // 2,
+                ),
+                (
+                    1,
+                    edit_height // vae_scale_factor // 2,
+                    edit_width // vae_scale_factor // 2,
+                ),
+            ],
+        ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
         (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype

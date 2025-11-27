@@ -71,11 +71,11 @@ def _normalize_module_type(module_type: str) -> str:
 def _clean_hf_config_inplace(model_config: dict) -> None:
     """Remove common extraneous HF fields if present."""
     for key in (
-            "_name_or_path",
-            "transformers_version",
-            "model_type",
-            "tokenizer_class",
-            "torch_dtype",
+        "_name_or_path",
+        "transformers_version",
+        "model_type",
+        "tokenizer_class",
+        "torch_dtype",
     ):
         model_config.pop(key, None)
 
@@ -102,6 +102,7 @@ def load_native(library, component_module_path: str, server_args: ServerArgs):
         )
     elif library == "diffusers":
         import diffusers
+
         config = get_diffusers_component_config(model_path=component_module_path)
         class_name = config.pop("_class_name", None)
         if class_name:
@@ -110,9 +111,7 @@ def load_native(library, component_module_path: str, server_args: ServerArgs):
                 component_module_path, revision=server_args.revision, **config
             )
         else:
-            raise ValueError(
-                "Cannot determine class name for generic diffusers loader"
-            )
+            raise ValueError("Cannot determine class name for generic diffusers loader")
     else:
         raise ValueError(f"Unsupported library: {library}")
 
@@ -128,23 +127,36 @@ class ComponentLoader(ABC):
 
     def target_device(self, should_offload):
         if should_offload:
-            return torch.device("mps") if current_platform.is_mps() else torch.device("cpu")
+            return (
+                torch.device("mps")
+                if current_platform.is_mps()
+                else torch.device("cpu")
+            )
         else:
             return get_local_torch_device()
 
-    def load(self, component_model_path: str, server_args: ServerArgs, module_name: str,
-             transformers_or_diffusers: str):
+    def load(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        module_name: str,
+        transformers_or_diffusers: str,
+    ):
         """
         Template method that standardizes logging around the core load implementation.
         Subclasses should implement load_customized.
         """
         logger.info("Loading %s from %s", module_name, component_model_path)
         try:
-            component = self.load_customized(component_model_path, server_args, module_name)
+            component = self.load_customized(
+                component_model_path, server_args, module_name
+            )
             source = "customized"
         # except NotImplementedError:
         except Exception as e:
-            component = self.load_native(component_model_path, server_args, transformers_or_diffusers)
+            component = self.load_native(
+                component_model_path, server_args, transformers_or_diffusers
+            )
             should_offload = self.should_offload(server_args)
             target_device = self.target_device(should_offload)
             component = component.to(device=target_device)
@@ -156,16 +168,27 @@ class ComponentLoader(ABC):
         if component is None:
             logger.warning("Loaded %s returned None", module_name)
         else:
-            logger.info(f"Loaded %s: %s from: {source}", module_name, component.__class__.__name__)
+            logger.info(
+                f"Loaded %s: %s from: {source}",
+                module_name,
+                component.__class__.__name__,
+            )
         return component
 
-    def load_native(self, component_model_path: str, server_args: ServerArgs, transformers_or_diffusers: str):
+    def load_native(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        transformers_or_diffusers: str,
+    ):
         """
         Load the component using the native library (transformers/diffusers).
         """
         return load_native(transformers_or_diffusers, component_model_path, server_args)
 
-    def load_customized(self, component_model_path: str, server_args: ServerArgs, module_name: str):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
         """
         Load the customized version component, implemented and optimized in SGL-diffusion
         """
@@ -342,7 +365,9 @@ class TextEncoderLoader(ComponentLoader):
         for source in secondary_weights:
             yield from self._get_weights_iterator(source, to_cpu)
 
-    def load_customized(self, component_model_path: str, server_args: ServerArgs, module_name: str):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
@@ -350,7 +375,9 @@ class TextEncoderLoader(ComponentLoader):
         #     revision=server_args.revision,
         #     model_override_args=None,
         # )
-        diffusers_pretrained_config = get_config(component_model_path, trust_remote_code=True)
+        diffusers_pretrained_config = get_config(
+            component_model_path, trust_remote_code=True
+        )
         model_config = get_diffusers_component_config(model_path=component_model_path)
         _clean_hf_config_inplace(model_config)
         logger.info("HF model config: %s", model_config)
@@ -376,7 +403,6 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config,
             server_args,
             encoder_dtype,
-
         )
 
     def load_model(
@@ -429,7 +455,7 @@ class TextEncoderLoader(ComponentLoader):
                         reshard_after_forward=True,
                         mesh=mesh["offload"],
                         fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
-                                              or getattr(model, "_fsdp_shard_conditions", None),
+                        or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
             # We only enable strict check for non-quantized models
@@ -452,7 +478,9 @@ class ImageEncoderLoader(TextEncoderLoader):
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
-    def load_customized(self, component_model_path: str, server_args: ServerArgs, *args):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
         """Load the text encoders based on the model path, and inference args."""
         # model_config: PretrainedConfig = get_hf_config(
         #     model=model_path,
@@ -516,7 +544,9 @@ class VAELoader(ComponentLoader):
     def should_offload(self, server_args, cpu_offload_flag, model_config):
         return True
 
-    def load_customized(self, component_model_path: str, server_args: ServerArgs, *args):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
         class_name = config.pop("_class_name")
@@ -559,7 +589,9 @@ class VAELoader(ComponentLoader):
 class TransformerLoader(ComponentLoader):
     """Loader for transformer."""
 
-    def load_customized(self, component_model_path: str, server_args: ServerArgs, *args):
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
         """Load the transformer based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
         hf_config = deepcopy(config)
@@ -650,7 +682,10 @@ class TransformerLoader(ComponentLoader):
 
 class SchedulerLoader(ComponentLoader):
     """Loader for scheduler."""
-    def load_customized(self, component_model_path: str, server_args: ServerArgs, *args):
+
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, *args
+    ):
         """Load the scheduler based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
 
@@ -713,7 +748,12 @@ class PipelineComponentLoader:
 
         try:
             # Load the module
-            return loader.load(component_model_path, server_args, module_name, transformers_or_diffusers)
+            return loader.load(
+                component_model_path,
+                server_args,
+                module_name,
+                transformers_or_diffusers,
+            )
         except Exception as e:
             logger.error(
                 f"Error while loading component: {module_name}, {component_model_path=}"

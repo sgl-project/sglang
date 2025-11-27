@@ -72,7 +72,10 @@ def get_hf_config(
         raise NotImplementedError("GGUF models are not supported.")
 
     config = AutoConfig.from_pretrained(
-        component_model_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        component_model_path,
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
     )
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
