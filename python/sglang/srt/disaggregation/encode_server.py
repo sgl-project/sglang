@@ -290,7 +290,7 @@ class MMEncoder:
             self.embedding_to_send[mm_data.req_id] = mm_data
         return mm_embedding.nbytes, mm_embedding.shape[0], mm_embedding.shape[1]
 
-    # For zmq_t zmq_s and mooncake
+    # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
         self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
     ):
@@ -304,7 +304,7 @@ class MMEncoder:
             embedding_port=embedding_port,
         )
 
-    # For zmq_s
+    # For zmq_to_scheduler
     async def send_with_url(
         self,
         req_id,
@@ -462,7 +462,7 @@ async def handle_encode_request(request: dict):
             }
         )
         return ORJSONResponse(content=request)
-    elif encoder.server_args.mm_transfer_backend == "zmq_s":
+    elif encoder.server_args.mm_transfer_backend == "zmq_to_scheduler":
         logger.info(f"{request['embedding_port'] = }")
         if request["embedding_port"] is None:
             await encoder.send_with_url(
@@ -482,7 +482,7 @@ async def handle_encode_request(request: dict):
             await asyncio.gather(*tasks)
             encoder.embedding_to_send.pop(request["req_id"], None)
         return ORJSONResponse(content=None)
-    elif encoder.server_args.mm_transfer_backend == "zmq_t":
+    elif encoder.server_args.mm_transfer_backend == "zmq_to_tokenizer":
         await encoder.send(
             req_id=request["req_id"],
             prefill_host=request["prefill_host"],

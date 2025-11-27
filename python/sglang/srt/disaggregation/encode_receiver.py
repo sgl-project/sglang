@@ -80,7 +80,7 @@ class EmbeddingData:
         return new_data
 
 
-# For zmq_s
+# For zmq_to_scheduler
 class WaitingImageRequest:
     def __init__(
         self,
@@ -214,7 +214,6 @@ class MMReceiver:
         self,
         server_args: ServerArgs,
         dtype=None,
-        hostname=None,
         hf_config=None,
         pp_rank=None,
         tp_rank=None,
@@ -232,12 +231,12 @@ class MMReceiver:
                 ib_device=server_args.disaggregation_ib_device,
             )
             self.embeddings_buffer = dict()
-        elif self.mm_transfer_backend == "zmq_s":
+        elif self.mm_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
             self.tp_rank = tp_rank
             self.tp_size = server_args.tp_size
             self.nnodes = server_args.nnodes
-            self.hostname = hostname
+            self.hostname = get_local_ip_auto()
             self.world_size = server_args.pp_size * server_args.tp_size
             if hf_config is not None:
                 transport_mode = _determine_tensor_transport_mode(server_args)
@@ -270,7 +269,7 @@ class MMReceiver:
                     hf_config, server_args, _processor, transport_mode
                 )
 
-    # For zmq_s
+    # For zmq_to_scheduler
     def process_waiting_requests(self, recv_reqs):
         waiting_list: List[WaitingImageRequest] = []
         for recv_req in recv_reqs:
@@ -305,7 +304,7 @@ class MMReceiver:
                 if not waiting_req._try_recv_mm_data():
                     ready = False
 
-    # For zmq_s
+    # For zmq_to_scheduler
     def _run_encode_in_thread(
         self, req_id, img_data, endpoint_encode, num_items_assigned, embedding_port
     ):
@@ -436,7 +435,7 @@ class MMReceiver:
         self.embeddings_buffer[req_id] = embeddings
         return embeddings.data_ptr()
 
-    # For zmq_s
+    # For zmq_to_scheduler
     def send_encode_requset(self, obj):
         if type(obj.image_data) != list:
             image_urls = [obj.image_data.url]
@@ -469,7 +468,7 @@ class MMReceiver:
             )
             encode_thread.start()
 
-    # For zmq_t and mooncake
+    # For zmq_to_tokenizer and mooncake
     async def recv_mm_data(self, img_data, mm_processor, prompt):
         try:
             if len(self.encode_urls) == 0:
@@ -493,7 +492,7 @@ class MMReceiver:
                 del self.embeddings_buffer[req_id]
             return None
 
-    # For zmq_t and mooncake
+    # For zmq_to_tokenizer and mooncake
     async def _recv_mm_data(self, req_id, embedding_port, mm_processor, prompt):
         # Bypass MMReceiver
         if req_id is None:
@@ -514,7 +513,7 @@ class MMReceiver:
 
             recv_obj: EmbeddingData = pickle.loads(parts[0])
             logger.info(f"{recv_obj = }")
-            if self.mm_transfer_backend == "zmq_t":
+            if self.mm_transfer_backend == "zmq_to_tokenizer":
                 buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
                 recv_obj.embedding = torch.frombuffer(
                     buffer, dtype=recv_obj.dtype
@@ -529,7 +528,7 @@ class MMReceiver:
             recv_embedding = self.embeddings_buffer[req_id]
             del self.embeddings_buffer[req_id]
             self.embeddings_engine.deregister(recv_embedding.data_ptr())
-        elif self.mm_transfer_backend == "zmq_t":
+        elif self.mm_transfer_backend == "zmq_to_tokenizer":
             recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
 
         img_grid_thw = recv_embedding_data.get_img_grid()
