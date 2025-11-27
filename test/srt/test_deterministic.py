@@ -9,12 +9,16 @@ test into unit tests so that's easily reproducible in CI.
 
 import unittest
 
+from sglang.srt.utils import is_hip
 from sglang.test.test_deterministic_utils import (
     COMMON_SERVER_ARGS,
     TestDeterministicBase,
 )
 
+_is_hip = is_hip()
 
+
+@unittest.skipIf(_is_hip, "Falshinfer is not supported on HIP")
 class TestFlashinferDeterministic(TestDeterministicBase):
     # Test with flashinfer attention backend
     @classmethod
@@ -29,6 +33,7 @@ class TestFlashinferDeterministic(TestDeterministicBase):
         return args
 
 
+@unittest.skipIf(_is_hip, "Falshinfer is not supported on HIP")
 class TestFa3Deterministic(TestDeterministicBase):
     # Test with fa3 attention backend
     @classmethod
