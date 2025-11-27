@@ -477,9 +477,11 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         # prefill batch interval, only for null disaggregation mode
+        self.prefill_interval = -1
+        self.__consecutive_decode_steps = 0
         if self.server_args.disaggregation_mode == "null":
             self.prefill_interval = envs.SGLANG_PREFILL_INTERVAL.get()
-            self.__prefill_batch_ct = 0
+            self.__consecutive_decode_steps = 0
             if self.prefill_interval > 0:
                 logger.info(f"Prefill interval: {self.prefill_interval}")
 
@@ -1647,7 +1649,7 @@ class Scheduler(
         if (
             self.prefill_interval > 0
             and not self.running_batch.is_empty()
-            and self.__prefill_batch_ct < self.prefill_interval
+            and self.__consecutive_decode_steps < self.prefill_interval
         ):
             new_batch = None
         else:
@@ -1665,7 +1667,7 @@ class Scheduler(
         if new_batch is not None:
             # Prefill batch scheduled: reset the decode iteration counter
             if self.prefill_interval > 0:
-                self.__prefill_batch_ct = 0
+                self.__consecutive_decode_steps = 0
             # Run prefill first if possible
             ret = new_batch
         else:
@@ -1673,7 +1675,7 @@ class Scheduler(
             if not self.running_batch.is_empty():
                 # Increment decode iteration counter for prefill interval tracking
                 if self.prefill_interval > 0:
-                    self.__prefill_batch_ct = self.__prefill_batch_ct + 1
+                    self.__consecutive_decode_steps += 1
 
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
