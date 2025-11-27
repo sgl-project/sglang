@@ -32,14 +32,14 @@ jobs:
           bash scripts/ci/ci_install_dependency.sh
 
       - name: Run stress tests
-        timeout-minutes: 210
+        timeout-minutes: 480
         env:
           NUM_PROMPTS: ${{ inputs.num_prompts }}
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
           SGLANG_SERVER_LAUNCH_TIMEOUT: '3600'
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stress
+          python3 run_suite.py --hw cuda --suite stress --timeout-per-file 6300
 
       - name: Upload results
         if: always()
