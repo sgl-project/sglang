@@ -192,9 +192,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
         self.crash_dump_folder = server_args.crash_dump_folder
         self.enable_trace = server_args.enable_trace
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
 
         # Read model args
         self.model_path = server_args.model_path
