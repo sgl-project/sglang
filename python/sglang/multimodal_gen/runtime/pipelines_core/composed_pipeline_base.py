@@ -110,26 +110,7 @@ class ComposedPipelineBase(ABC):
         self.post_init_called = True
 
         self.initialize_pipeline(self.server_args)
-        if self.server_args.enable_torch_compile:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except Exception:
-                pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-            )
-            transformer = self.modules.get("transformer")
-            if transformer is not None and hasattr(transformer, "forward"):
-                compiled_forward = torch.compile(
-                    getattr(transformer, "forward"), mode=mode
-                )
-                setattr(transformer, "forward", compiled_forward)
-                self.modules["transformer"] = transformer
-                logger.info(
-                    "Torch Compile enabled for DiT (mode=%s, forward-wrapped)", mode
-                )
+        # NOTE: torch.compile is managed in the denoising stage to cover lazy-load paths.
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
