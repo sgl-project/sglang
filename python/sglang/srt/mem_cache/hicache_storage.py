@@ -141,7 +141,7 @@ class HiCacheStorage(ABC):
     ) -> List[bool]:
         """
         Retrieve values for multiple keys.
-        Returns a list of tensors or None for each key.
+        Returns a list of booleans indicating success for each key.
         """
         pass
 
@@ -152,8 +152,8 @@ class HiCacheStorage(ABC):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         """
-        Retrieve values for multiple keys.
-        Returns a list of tensors or None for each key.
+        Store multiple key-value pairs.
+        Returns a list of booleans indicating success for each key.
         """
         pass
 
