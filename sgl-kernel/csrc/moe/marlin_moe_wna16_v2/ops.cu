@@ -995,6 +995,4 @@ torch::Tensor moe_wna16_marlin_gemm_v2(
 
 #endif
 
-// Registration will be done separately for v2 version {
-  // moe_wna16_marlin_gemm_v2 will be registered separately
-}
+// Registration is done in common_extension.cc for v2 version
