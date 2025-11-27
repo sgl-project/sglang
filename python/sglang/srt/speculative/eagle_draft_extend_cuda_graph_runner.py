@@ -225,7 +225,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             else torch.cuda.graph
         )
 
-        with graph_fn(graph, pool=pool, stream=stream):
+        with graph_fn(cuda_graph=graph, pool=pool, stream=stream):
             out = run_once_fn()
         return out
 
