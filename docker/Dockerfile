@@ -18,6 +18,7 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.5.3
+ARG NVSHMEM_VERSION=3.4.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -136,9 +137,9 @@ RUN --mount=type=cache,target=/root/.cache/pip  python3 -m pip install --upgrade
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 RUN set -eux; \
     if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-      pip install nvidia-nvshmem-cu12==3.4.5 ; \
+      pip install nvidia-nvshmem-cu12==${NVSHMEM_VERSION} ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      pip install nvidia-nvshmem-cu13==3.4.5 ; \
+      pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} ; \
     else \
       echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ; \
     fi && \
@@ -198,12 +199,12 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
-    python3 -m pip install nvidia-nvshmem-cu12==3.4.5 --force-reinstall --no-deps; \
+    python3 -m pip install nvidia-nvshmem-cu12==${NVSHMEM_VERSION} --force-reinstall --no-deps; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 ; \
-    python3 -m pip install nvidia-nvshmem-cu13==3.4.5 --force-reinstall --no-deps; \
+    python3 -m pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} --force-reinstall --no-deps; \
 fi
 
 # Install development tools and utilities
