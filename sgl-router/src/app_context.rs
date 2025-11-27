@@ -426,6 +426,12 @@ impl AppContextBuilder {
     /// Create policy registry
     fn with_policy_registry(mut self, config: &RouterConfig) -> Self {
         self.policy_registry = Some(Arc::new(PolicyRegistry::new(config.policy.clone())));
+        if config.dp_minimum_tokens_scheduler {
+            self.policy_registry
+                .as_ref()
+                .unwrap()
+                .enable_dp_minimum_tokens_scheduler();
+        }
         self
     }
 
@@ -457,7 +463,7 @@ impl AppContextBuilder {
                 .expect("policy_registry must be set")
                 .clone(),
             client.clone(),
-            config.worker_startup_check_interval_secs,
+            config.worker_load_check_interval_secs,
         )));
         self
     }

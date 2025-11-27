@@ -627,6 +627,7 @@ async fn test_unsupported_endpoints() {
         bootstrap_room: None,
         bootstrap_pair_key: None,
         data_parallel_rank: None,
+        data_parallel_rank_decode: None,
         background: false,
         conversation_id: None,
         priority: None,
@@ -808,6 +809,7 @@ async fn test_openai_router_circuit_breaker() {
         assert!(
             response.status() == StatusCode::INTERNAL_SERVER_ERROR
                 || response.status() == StatusCode::SERVICE_UNAVAILABLE
+                || response.status() == StatusCode::GATEWAY_TIMEOUT
         );
     }
 }

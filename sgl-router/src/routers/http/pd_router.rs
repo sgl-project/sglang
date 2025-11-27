@@ -292,6 +292,24 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
+                        if self
+                            .policy_registry
+                            .is_dp_minimum_tokens_scheduler_enabled()
+                        {
+                            // data_parallel_rank
+                            json_request = match self
+                                .select_data_parallel_rank(
+                                    json_request,
+                                    prefill.as_ref(),
+                                    decode.as_ref(),
+                                    context.request_text.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => return Self::handle_serialization_error(e),
+                            };
+                        }
                         let response = self
                             .execute_dual_dispatch_internal(
                                 headers,
@@ -546,6 +564,59 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+    }
+
+    async fn select_data_parallel_rank(
+        &self,
+        mut original: Value,
+        prefill_worker: &dyn Worker,
+        decode_worker: &dyn Worker,
+        request_text: Option<&str>,
+    ) -> Result<Value, String> {
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        let length = match request_text {
+            Some(s) => s.len(),
+            None => 0,
+        };
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let lowest_prefill_dp_rank = prefill_policy.get_lowest_dp_load(prefill_worker);
+        let decode_policy = self.policy_registry.get_decode_policy();
+        let lowest_decode_dp_rank = decode_policy.get_lowest_dp_load(decode_worker);
+        obj.insert(
+            "data_parallel_rank".to_string(),
+            match lowest_prefill_dp_rank {
+                Some(v) => Value::from(v),
+                None => Value::Null,
+            },
+        );
+        // During the prefill and decode stages, requests may be scheduled to different dp_rank
+        // data_parallel_rank_decode specifies which dp_rank the request should be scheduled to for decode
+        // data_parallel_rank specifies which dp_rank the request is in for preill
+        obj.insert(
+            "data_parallel_rank_decode".to_string(),
+            match lowest_decode_dp_rank {
+                Some(v) => Value::from(v),
+                None => Value::Null,
+            },
+        );
+        let prompt_len = length
+            .try_into()
+            .map_err(|e| format!("Failed to convert length tp isize:{}", e))?;
+        debug!(
+            "select_data_parallel_rank obj:{:?}, prompt_len:{}",
+            obj, prompt_len
+        );
+        if let Some(dp_rank) = lowest_prefill_dp_rank {
+            prefill_policy.load_increment(prefill_worker, dp_rank, prompt_len);
+        }
+        if let Some(dp_rank) = lowest_decode_dp_rank {
+            decode_policy.load_increment(decode_worker, dp_rank, prompt_len);
+        }
+
+        Ok(original)
     }
 
     async fn select_pd_pair(
