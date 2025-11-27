@@ -47,17 +47,18 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
-    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
-    Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.entrypoints.openai.utils import (
+    convert_response_tools_to_chat_tools,
+    parse_tool_calls_from_content,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -369,30 +370,6 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
 
-    def _convert_response_tools_to_chat_tools(
-        self, response_tools: list[Any]
-    ) -> Optional[list[Tool]]:
-        """Convert ResponseTool objects to Tool objects for ChatCompletionRequest."""
-        if not response_tools:
-            return None
-
-        chat_tools = []
-        for response_tool in response_tools:
-            # Only convert function tools; skip built-in tools like web_search_preview and code_interpreter
-            if response_tool.type == "function":
-                if not response_tool.function or not response_tool.function.name:
-                    logger.warning(
-                        f"Skipping function tool without function definition: {response_tool}"
-                    )
-                    continue
-                chat_tool = Tool(
-                    type="function",
-                    function=response_tool.function,
-                )
-                chat_tools.append(chat_tool)
-
-        return chat_tools if chat_tools else None
-
     async def _make_request(
         self,
         request: ResponsesRequest,
@@ -403,7 +380,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         # Convert ResponseTool to Tool format for ChatCompletionRequest
-        tools = self._convert_response_tools_to_chat_tools(request.tools)
+        tools = convert_response_tools_to_chat_tools(request.tools)
 
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
@@ -593,37 +570,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             and content
         ):
             # Convert ResponseTool to Tool format for parsing
-            tools = self._convert_response_tools_to_chat_tools(request.tools)
+            tools = convert_response_tools_to_chat_tools(request.tools)
             if tools:
-                finish_reason = {"type": "stop", "matched": None}
-                history_tool_calls_cnt = (
-                    0  # TODO: track history tool calls count for responses API
+                remaining_text, tool_calls = parse_tool_calls_from_content(
+                    content=content,
+                    tools=tools,
+                    tool_call_parser=self.tool_call_parser,
+                    generate_tool_call_id=self._process_tool_call_id,
                 )
-
-                # Use the same tool call processing as chat API
-                parser = FunctionCallParser(tools, self.tool_call_parser)
-                if parser.has_tool_call(content):
-                    try:
-                        text, call_info_list = parser.parse_non_stream(content)
-                        for call_info in call_info_list:
-                            tool_id = self._process_tool_call_id(
-                                call_info, history_tool_calls_cnt
-                            )
-                            # Create ResponseFunctionToolCall for each tool call
-                            function_tool_call = ResponseFunctionToolCall(
-                                id=f"ft_{random_uuid()}",
-                                type="function_call",
-                                call_id=tool_id,
-                                name=call_info.name,
-                                arguments=call_info.parameters,
-                            )
-                            output_items.append(function_tool_call)
-                            history_tool_calls_cnt += 1
-                        remaining_text = text
-                    except Exception as e:
-                        logger.error(f"Tool call parsing error: {e}")
-                        # Fall back to returning text if parsing fails
-                        remaining_text = content
+                output_items.extend(tool_calls)
 
         # Only add message if there's remaining text after tool call parsing
         if remaining_text:
