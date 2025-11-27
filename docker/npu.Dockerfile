@@ -81,10 +81,6 @@ RUN git clone ${SGLANG_REPO} --branch ${VER_SGLANG} sglang && \
     rm -f pyproject.toml && \
     mv pyproject_npu.toml pyproject.toml && \
     ${PIP_INSTALL} -v ".[srt_npu]" && \
-    cd ../sgl-router && \
-    python -m build && \
-    ${PIP_INSTALL} --force-reinstall dist/*.whl && \
-    cd ../.. && \
     rm -rf sglang
 
 # Install Deep-ep
