@@ -41,7 +41,7 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
             other_args=cls.other_args,
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):
