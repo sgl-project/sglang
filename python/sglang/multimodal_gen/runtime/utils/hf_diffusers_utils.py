@@ -61,24 +61,24 @@ def download_from_hf(model_path: str):
 
 
 def get_hf_config(
-    model: str,
+    component_model_path: str,
     trust_remote_code: bool,
     revision: str | None = None,
     model_override_args: dict | None = None,
     **kwargs,
-):
-    is_gguf = check_gguf_file(model)
+) -> PretrainedConfig:
+    is_gguf = check_gguf_file(component_model_path)
     if is_gguf:
         raise NotImplementedError("GGUF models are not supported.")
 
     config = AutoConfig.from_pretrained(
-        model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        component_model_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
     )
     if config.model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[config.model_type]
-        config = config_class.from_pretrained(model, revision=revision)
+        config = config_class.from_pretrained(component_model_path, revision=revision)
         # NOTE(HandH1998): Qwen2VL requires `_name_or_path` attribute in `config`.
-        config._name_or_path = model
+        config._name_or_path = component_model_path
     if model_override_args:
         config.update(model_override_args)
 

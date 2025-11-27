@@ -28,8 +28,8 @@ COMPONENT_DIRS = [
     d
     for d in os.listdir(MODELS_PATH)
     if os.path.isdir(os.path.join(MODELS_PATH, d))
-    and not d.startswith("__")
-    and not d.startswith(".")
+       and not d.startswith("__")
+       and not d.startswith(".")
 ]
 
 _IMAGE_ENCODER_MODELS: dict[str, tuple] = {
@@ -316,9 +316,10 @@ class _ModelRegistry:
         normalized_arch = []
         for arch in architectures:
             if arch not in self.registered_models:
-                raise Exception(
-                    f"Unsupported model architecture: {arch}. Registered architectures: {self.registered_models=}"
-                )
+                # raise Exception(
+                #     f"Unsupported model architecture: {arch}. Registered architectures: {self.registered_models=}"
+                # )
+                pass
             normalized_arch.append(arch)
         return normalized_arch
 
@@ -357,9 +358,9 @@ ModelRegistry = _ModelRegistry(
             class_name=cls_name,
         )
         for model_arch, (
-            component_name,
-            mod_relname,
-            cls_name,
-        ) in _SGLANG_DIFFUSION_MODELS.items()
+        component_name,
+        mod_relname,
+        cls_name,
+    ) in _SGLANG_DIFFUSION_MODELS.items()
     }
 )

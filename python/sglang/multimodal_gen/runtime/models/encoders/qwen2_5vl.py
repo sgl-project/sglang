@@ -1177,4 +1177,4 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
 
-EntryClass = Qwen2_5_VLForConditionalGeneration
+# EntryClass = Qwen2_5_VLForConditionalGeneration
