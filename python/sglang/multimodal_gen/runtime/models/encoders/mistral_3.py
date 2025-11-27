@@ -31,6 +31,10 @@ from transformers.models.mistral.modeling_mistral import (
     MistralRotaryEmbedding,
     apply_rotary_pos_emb,
 )
+from transformers.models.mistral3.modeling_mistral3 import (
+    Mistral3CausalLMOutputWithPast,
+    Mistral3ModelOutputWithPast,
+)
 
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
@@ -73,7 +77,7 @@ class MistralAttention(nn.Module):
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.q_proj = nn.Linear(
