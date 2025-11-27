@@ -16,7 +16,6 @@ from sglang.srt.layers.moe.moe_runner.triton import (
     TritonRunnerInput,
     TritonRunnerOutput,
 )
-from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import is_cuda
 
@@ -165,6 +164,7 @@ def fused_experts_none_to_alpha_moe(
     quant_info: TritonMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
     output = alpha_moe_fused_moe(
         hidden_states=dispatch_output.hidden_states,
