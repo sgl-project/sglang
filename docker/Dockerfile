@@ -479,7 +479,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     # Python runtime
     software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends \
     python3.12-full \
     python3.12-dev \
     wget \
@@ -489,6 +489,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     netcat-openbsd \
     curl \
     git \
+    locales \
     # Runtime libraries (no -dev packages)
     libopenmpi3 \
     libnuma1 \
@@ -514,6 +515,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     rdma-core \
     infiniband-diags \
     perftest \
+    && locale-gen en_US.UTF-8 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
@@ -522,11 +524,6 @@ RUN --mount=type=cache,target=/var/cache/apt \
     && rm get-pip.py \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
-
-# Set up locale
-RUN apt-get update && apt-get install -y --no-install-recommends locales \
-    && locale-gen en_US.UTF-8 \
-    && rm -rf /var/lib/apt/lists/*
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
