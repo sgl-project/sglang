@@ -34,6 +34,7 @@ from sglang.srt.configs import (
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
+    NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Qwen3NextConfig,
 )
@@ -88,6 +89,7 @@ from sglang.srt.layers.dp_attention import (
     initialize_dp_attention,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -121,7 +123,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.hook_manager import register_hooks
+from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -534,8 +536,8 @@ class ModelRunner:
             self.graph_mem_usage = 0
             self.init_attention_backend()
 
-        if server_args.hooks:
-            register_hooks(self.model, server_args.hooks)
+        if server_args.forward_hooks:
+            register_forward_hooks(self.model, server_args.forward_hooks)
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -1151,7 +1153,14 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
-    def update_weights_from_distributed(self, names, dtypes, shapes, group_name):
+    def update_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
@@ -1167,6 +1176,10 @@ class ModelRunner:
             "Please call `init_weights_update_group` first."
         )
 
+        if load_format == "flattened_bucket":
+            return self._update_bucketed_weights_from_distributed(
+                names, dtypes, shapes, group_name
+            )
         try:
             weights = []
             handles = []
@@ -1190,6 +1203,37 @@ class ModelRunner:
             self.model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
+        except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def _update_bucketed_weights_from_distributed(
+        self, names, dtypes, shapes, group_name
+    ):
+        try:
+            named_tensors = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                named_tensors.append(
+                    (name, torch.empty(shape, dtype=target_dtype, device=self.device))
+                )
+            bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+            flattened_tensor = bucket.get_flattened_tensor()
+            torch.distributed.broadcast(
+                flattened_tensor,
+                src=0,
+                group=self._model_update_group[group_name],
+            )
+            reconstructed_tensors = bucket.reconstruct_tensors()
+            self.model.load_weights(reconstructed_tensors)
+            return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -1473,6 +1517,8 @@ class ModelRunner:
         config = self.model_config.hf_config
         if isinstance(config, FalconH1Config | NemotronHConfig):
             return config
+        if isinstance(config, NemotronH_Nano_VL_V2_Config):
+            return config.llm_config
         return None
 
     @property
@@ -2201,7 +2247,7 @@ class ModelRunner:
         forward_batch: ForwardBatch,
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
-    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
 
         if self.is_multimodal and should_use_external_mm_preprocess(self.model):
             data_embedding_funcs = resolve_external_mm_data_embedding_funcs(self.model)

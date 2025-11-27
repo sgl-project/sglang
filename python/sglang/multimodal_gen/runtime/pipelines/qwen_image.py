@@ -154,10 +154,6 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             stage_name="image_encoding_stage_primary",
             stage=ImageVAEEncodingStage(
-                vae_image_processor=VaeImageProcessor(
-                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-                    * 2
-                ),
                 vae=self.get_module("vae"),
             ),
         )
