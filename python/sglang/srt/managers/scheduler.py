@@ -1014,15 +1014,12 @@ class Scheduler(
                 and self.last_batch.forward_mode.is_extend()
             )
 
-            # Grammar sync: ensure grammar state is updated before the current decode step.
-            # This is needed because grammar state must be updated with the generated/accepted
-            # tokens before we can generate the vocab mask for the next step.
-            # For speculative decoding, each decode step may accept multiple tokens,
-            # and all accepted tokens need to be processed by grammar.accept_token().
+            # FIXME(lsyin): remove this grammar sync
             need_grammar_sync = (
                 batch is not None
                 and batch.forward_mode.is_decode()
                 and batch.has_grammar
+                and batch.is_v2_eagle
                 and len(self.result_queue) > 0
             )
 
