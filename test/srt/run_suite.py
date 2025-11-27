@@ -7,6 +7,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
+        TestFile("test_eagle_constrained_decoding.py", 100),
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("hicache/test_hicache_variants.py", 393),
