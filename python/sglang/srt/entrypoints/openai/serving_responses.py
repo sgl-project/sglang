@@ -57,6 +57,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -587,9 +588,52 @@ class OpenAIServingResponses(OpenAIServingChat):
                 status=None,
             )
             output_items.append(reasoning_item)
-        if content:
+
+        # Parse tool calls if tools are provided
+        remaining_text = content
+        if (
+            request.tool_choice != "none"
+            and request.tools
+            and self.tool_call_parser
+            and content
+        ):
+            # Convert ResponseTool to Tool format for parsing
+            tools = self._convert_response_tools_to_chat_tools(request.tools)
+            if tools:
+                finish_reason = {"type": "stop", "matched": None}
+                history_tool_calls_cnt = (
+                    0  # TODO: track history tool calls count for responses API
+                )
+
+                # Use the same tool call processing as chat API
+                parser = FunctionCallParser(tools, self.tool_call_parser)
+                if parser.has_tool_call(content):
+                    try:
+                        text, call_info_list = parser.parse_non_stream(content)
+                        for call_info in call_info_list:
+                            tool_id = self._process_tool_call_id(
+                                call_info, history_tool_calls_cnt
+                            )
+                            # Create ResponseFunctionToolCall for each tool call
+                            function_tool_call = ResponseFunctionToolCall(
+                                id=f"ft_{random_uuid()}",
+                                type="function_call",
+                                call_id=tool_id,
+                                name=call_info.name,
+                                arguments=call_info.parameters,
+                            )
+                            output_items.append(function_tool_call)
+                            history_tool_calls_cnt += 1
+                        remaining_text = text
+                    except Exception as e:
+                        logger.error(f"Tool call parsing error: {e}")
+                        # Fall back to returning text if parsing fails
+                        remaining_text = content
+
+        # Only add message if there's remaining text after tool call parsing
+        if remaining_text:
             output_text = ResponseOutputText(
-                text=content,
+                text=remaining_text,
                 annotations=[],  # TODO
                 type="output_text",
                 logprobs=None,  # TODO
