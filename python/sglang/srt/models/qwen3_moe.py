@@ -267,7 +267,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def op_output(self, state):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
-
 class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
@@ -364,6 +363,7 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+        self.enable_save_kv_poc = True
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -413,6 +413,10 @@ class Qwen3MoeAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         if _use_aiter and self.rope_scaling is not None and "aiter_rope_fused_qknorm" in self.rope_scaling:
             assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
+            if forward_batch.forward_mode.is_decode():
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.attn, forward_batch.out_cache_loc, k, v
+                )
             q, k, v = self.rotary_emb(
                 qkv,
                 self.q_norm.weight,
@@ -422,6 +426,25 @@ class Qwen3MoeAttention(nn.Module):
                 self.num_kv_heads,
                 self.k_norm.variance_epsilon,
             )
+            # enabled fused set kv buffer
+            # poc code
+            k = k.view(-1, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, self.num_kv_heads, self.head_dim)
+            if forward_batch.forward_mode.is_extend():
+                cache_loc = (
+                    forward_batch.out_cache_loc
+                    if not self.attn.is_cross_attention
+                    else forward_batch.encoder_out_cache_loc
+                )
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.attn, cache_loc, k, v, self.attn.k_scale, self.attn.v_scale
+                )
+                self.enable_save_kv_poc = False
+            elif forward_batch.forward_mode.is_decode():
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.attn, forward_batch.out_cache_loc, k, v
+                )
+                self.enable_save_kv_poc = False
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._apply_qk_norm(q, k)
@@ -441,6 +464,8 @@ class Qwen3MoeAttention(nn.Module):
                 ),
             )
         inner_state = q, k, v, forward_batch
+        
+
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
@@ -452,7 +477,7 @@ class Qwen3MoeAttention(nn.Module):
             save_kv_cache=not (
                 enable_fused_set_kv_buffer(forward_batch)
                 and self.compatible_with_fused_kv_buffer
-            ),
+            ) and self.enable_save_kv_poc,
         )
         output, _ = self.o_proj(attn_output)
         return output
