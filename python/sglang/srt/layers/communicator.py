@@ -603,7 +603,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 _use_aiter
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and get_global_server_args().enable_aiter_allreduce_fusion
-                and hidden_states.shape[0] > 128
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual

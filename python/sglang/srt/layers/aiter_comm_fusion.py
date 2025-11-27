@@ -4,6 +4,20 @@ from typing import Tuple
 import aiter
 import torch
 import torch.distributed as dist
+from aiter.dist.communication_op import (
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_fused_allreduce_rmsnorm,
+)
+
+from aiter.dist.parallel_state import (
+    ensure_model_parallel_initialized,
+    init_distributed_environment,
+    set_custom_all_reduce,
+    get_tp_group,
+    graph_capture,
+    destroy_model_parallel,
+    destroy_distributed_environment,
+)
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.utils import direct_register_custom_op
@@ -34,6 +48,15 @@ class AiterCommManager:
         self.rank = rank
         self.dtype = dtype
         self.dist_env = aiter.TRTLLMDistEnv(rank, world_size, dtype=self.dtype)
+
+        set_custom_all_reduce(True)
+        init_distributed_environment(
+            world_size=self.world_size,
+            rank=rank,
+            distributed_init_method=None,
+        )
+        ensure_model_parallel_initialized(self.world_size, 1)
+
         self.initialized = True
 
     def cleanup(self):
@@ -86,13 +109,18 @@ def aiter_allreduce_residual_rmsnorm(
     if not ensure_workspace_initialized(allreduce_in.dtype):
         logger.debug("Aiter workspace is not initialized")
         return None, None, None
-    return _aiter_comm_manager.dist_env.allreduce_add_rms_fused(
-        allreduce_in,
-        residual_in,
-        rms_weight,
-        eps,
-        fp8_out,
-    )
+    num_tokens = allreduce_in.shape[0]
+    if num_tokens <= 1024:
+        residual_out, norm_out = tensor_model_parallel_fused_allreduce_rmsnorm(allreduce_in, residual_in, rms_weight, eps)
+    else:
+        return _aiter_comm_manager.dist_env.allreduce_add_rms_fused(
+            allreduce_in,
+            residual_in,
+            rms_weight,
+            eps,
+            fp8_out,
+        )
+    return residual_out, norm_out, None
 
 
 def fake_aiter_allreduce_residual_rmsnorm(
