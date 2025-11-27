@@ -36,6 +36,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
+    generate_token_bitmask,
     load_token_map,
 )
 from sglang.srt.utils.common import (
@@ -667,7 +668,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Run target verify batch in the main compute stream
+        # Prepare grammar data on CPU if needed
+        if batch.has_grammar:
+            retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
+            draft_tokens_cpu = verify_input.draft_token.view(
+                verify_input.retrive_next_token.shape
+            ).cpu()
+
+        # Run target verify batch in the main compute stream (GPU compute)
         forward_batch_output = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
             forward_batch=verify_forward_batch,
@@ -676,6 +685,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
+        # Generate vocab mask for constrained decoding
+        vocab_mask = None
+        if batch.has_grammar:
+            # Generate the logit mask for structured output.
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                verify_input,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(
+                    verify_input.retrive_next_token.device
+                )
+                # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
+                # and will be applied to produce wrong results
+                batch.sampling_info.vocab_mask = None
+
         # Sample
         if self.enable_nan_detection:
             detect_nan(logits_output)
@@ -683,7 +714,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             predict,
             accept_length,
             accept_index,
-        ) = verify_input.sample(batch, logits_output)
+        ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
