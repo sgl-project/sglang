@@ -315,7 +315,12 @@ class CudaGraphRunner:
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
-        self.buffers: GraphInputBuffers = GraphInputBuffers.create(
+
+        # In overlap mode, we use double-buffering: staging_buffers are populated
+        # on the default stream while compute_buffers are used by the graph.
+        # In non-overlap mode, they point to the same object - no copy needed.
+        self.enable_overlap = not model_runner.server_args.disable_overlap_schedule
+        self.compute_buffers = GraphInputBuffers.create(
             device=self.device,
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
@@ -331,8 +336,34 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
         )
+        if self.enable_overlap:
+            self.staging_buffers = GraphInputBuffers.create(
+                device=self.device,
+                max_bs=self.max_bs,
+                max_num_token=self.max_num_token,
+                hidden_size=self.model_runner.model_config.hidden_size,
+                vocab_size=self.model_runner.model_config.vocab_size,
+                dtype=self.model_runner.model_config.dtype,
+                dp_size=self.dp_size,
+                pp_size=self.pp_size,
+                is_encoder_decoder=self.is_encoder_decoder,
+                require_mlp_tp_gather=self.require_mlp_tp_gather,
+                seq_len_fill_value=self.seq_len_fill_value,
+                encoder_len_fill_value=self.encoder_len_fill_value,
+                num_tokens_per_bs=self.num_tokens_per_bs,
+                cache_loc_dtype=self._cache_loc_dtype(),
+            )
+            # Event to signal staging buffer copy is done (for overlap synchronization)
+            self.staging_copy_done_event = self.device_module.Event()
+        else:
+            # Non-overlap: staging and compute are the same buffer
+            self.staging_buffers = self.compute_buffers
+            self.staging_copy_done_event = None
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
+
+        # Flag to track if staging buffers are already populated by scheduler
+        self.staging_populated = False
 
         # Speculative_inference
         if model_runner.spec_algorithm.is_eagle3():
@@ -532,7 +563,7 @@ class CudaGraphRunner:
     def capture_one_batch_size(
         self, bs: int, forward: Callable, stream_idx: Optional[int] = None
     ):
-        buffers = self.buffers
+        buffers = self.compute_buffers
         graph = self._create_device_graph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -734,14 +765,11 @@ class CudaGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
-    def replay_prepare(
+    def populate_staging_buffers(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
-        buffers = self.buffers
-        self.recapture_if_needed(forward_batch)
-
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
@@ -758,7 +786,12 @@ class CudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
         bs = self.capture_bs[index]
 
-        seq_lens_cpu = buffers.populate_from_forward_batch(
+        # Store these for replay_prepare to use on the compute stream.
+        self.raw_bs = raw_bs
+        self.raw_num_token = raw_num_token
+        self.bs = bs
+
+        self.staging_buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
             raw_bs=raw_bs,
             raw_num_token=raw_num_token,
@@ -773,6 +806,45 @@ class CudaGraphRunner:
                 self.model_runner.server_args
             ),
             pp_proxy_tensors=pp_proxy_tensors,
+        )
+        self.staging_populated = True
+
+    def wait_staging_copy_done(self, stream: torch.cuda.Stream):
+        """Wait for the previous staging buffer copy to complete before populating again.
+
+        Call this on the stream that will run populate_staging_buffers (typically default stream).
+        """
+        if self.staging_copy_done_event is not None:
+            stream.wait_event(self.staging_copy_done_event)
+
+    def replay_prepare(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        buffers = self.compute_buffers
+        self.recapture_if_needed(forward_batch)
+
+        # Skip populate if scheduler already called it (for overlap mode)
+        if not self.staging_populated:
+            self.populate_staging_buffers(forward_batch, pp_proxy_tensors)
+        self.staging_populated = False
+
+        # Use the values computed by populate_staging_buffers (on default stream).
+        raw_bs = self.raw_bs
+        raw_num_token = self.raw_num_token
+        bs = self.bs
+
+        # In overlap mode, copy from staging into compute buffers.
+        if self.enable_overlap:
+            buffers.copy_from(self.staging_buffers)
+            buffers.input_ids[:raw_num_token].copy_(
+                forward_batch.input_ids, non_blocking=True
+            )
+            self.staging_copy_done_event.record()
+        seq_lens_cpu = buffers.get_seq_lens_cpu(
+            forward_batch,
+            bs,
         )
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
@@ -800,11 +872,6 @@ class CudaGraphRunner:
             seq_lens_cpu=seq_lens_cpu,
         )
 
-        # Store fields
-        self.raw_bs = raw_bs
-        self.raw_num_token = raw_num_token
-        self.bs = bs
-
     def replay(
         self,
         forward_batch: ForwardBatch,
@@ -817,8 +884,12 @@ class CudaGraphRunner:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            self.compute_buffers.input_ids[: self.raw_num_token].copy_(
+                forward_batch.input_ids
+            )
+            self.compute_buffers.positions[: self.raw_num_token].copy_(
+                forward_batch.positions
+            )
 
         # Replay
         if self.enable_pdmux:
@@ -853,7 +924,7 @@ class CudaGraphRunner:
             else:
                 spec_info = EagleVerifyInput(
                     draft_token=None,
-                    custom_mask=self.buffers.custom_mask,
+                    custom_mask=self.compute_buffers.custom_mask,
                     positions=None,
                     retrive_index=None,
                     retrive_next_token=None,
@@ -872,7 +943,7 @@ class CudaGraphRunner:
 
             spec_info = NgramVerifyInput(
                 draft_token=None,
-                tree_mask=self.buffers.custom_mask,
+                tree_mask=self.compute_buffers.custom_mask,
                 positions=None,
                 retrive_index=None,
                 retrive_next_token=None,

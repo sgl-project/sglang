@@ -346,7 +346,10 @@ class EAGLEWorker(TpModelWorker):
         # We need the full hidden states to prefill the KV cache of the draft model.
         model_worker_batch = batch.get_model_worker_batch()
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.target_worker.model_runner
+        )
+        batch_result = self.target_worker.forward_batch_generation(forward_batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -684,8 +687,11 @@ class EAGLEWorker(TpModelWorker):
             ).cpu()
 
         # Forward
+        forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.target_worker.model_runner
+        )
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+            forward_batch, is_verify=True
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,

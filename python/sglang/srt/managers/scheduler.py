@@ -153,7 +153,7 @@ from sglang.srt.managers.utils import GenerationBatchResult, validate_input_leng
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
@@ -1956,11 +1956,21 @@ class Scheduler(
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
+            self.model_worker.set_hicache_consumer(batch.hicache_consumer_index)
+
+            # Only create ForwardBatch when needed (overlap or no spec)
+            # For spec without overlap, the conversion is handled internally
+            if self.enable_overlap or self.spec_algorithm.is_none():
+                forward_batch = ForwardBatch.init_new(
+                    batch_or_worker_batch, self.model_worker.model_runner
+                )
+
             if self.enable_overlap:
                 # FIXME: remove this assert
                 assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
                 model_worker_batch = batch_or_worker_batch
                 self.record_batch_in_overlap(model_worker_batch)
+                forward_batch.record_stream(self.forward_stream)
 
                 # Sampling info will be modified during forward
                 model_worker_batch.sampling_info = (
@@ -1970,11 +1980,25 @@ class Scheduler(
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
+                use_staging = self.model_worker.use_scheduler_staging_copy()
+
+                # Prepare staging buffers on default stream (decoupled from forward stream)
+                # input_ids will be copied after resolve_future on forward stream
+                if use_staging and self.model_worker.can_run_graph(forward_batch):
+                    graph_runner = self.model_worker.model_runner.graph_runner
+                    # Wait for previous copy_from to finish reading staging buffers
+                    graph_runner.wait_staging_copy_done(self.default_stream)
+                    graph_runner.populate_staging_buffers(forward_batch)
+
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
-                    self.future_map.resolve_future(model_worker_batch)
+                    self.future_map.resolve_future(
+                        forward_batch if use_staging else model_worker_batch
+                    )
+                    # forward_batch_generation will copy resolved input_ids from forward_batch to compute buffers in replay_prepare
+                    # Spec workers (use_staging=False) receive model_worker_batch instead
                     batch_result = self.model_worker.forward_batch_generation(
-                        model_worker_batch
+                        forward_batch if use_staging else model_worker_batch,
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = torch.get_device_module(
@@ -2002,15 +2026,23 @@ class Scheduler(
                     # )
 
                     # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    # # new_seq_lens was allocated on forward_stream, protect it from
+                    # # being freed while default_stream uses it
+                    # new_seq_lens = batch_result.next_draft_input.new_seq_lens
+                    # if new_seq_lens is not None:
+                    #     new_seq_lens.record_stream(self.default_stream)
+                    #     batch.seq_lens = new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
-                )
+                # For spec without overlap, pass ScheduleBatch; otherwise pass ForwardBatch
+                if self.spec_algorithm.is_none():
+                    batch_result = self.model_worker.forward_batch_generation(
+                        forward_batch
+                    )
+                else:
+                    batch_result = self.model_worker.forward_batch_generation(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 

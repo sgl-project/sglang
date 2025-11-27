@@ -333,6 +333,19 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
+    def can_run_graph(self, forward_batch: ForwardBatch):
+        mode_check = (
+            forward_batch.forward_mode.is_cpu_graph
+            if self.device == "cpu"
+            else forward_batch.forward_mode.is_cuda_graph
+        )
+        if graph_runner := self.model_runner.graph_runner:
+            return mode_check() and graph_runner.can_run(forward_batch)
+        return False
+
+    def use_scheduler_staging_copy(self):
+        return True
+
     def get_worker_info(self):
         return (
             self.max_total_num_tokens,
@@ -353,23 +366,12 @@ class TpModelWorker(BaseTpWorker):
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
-        forward_batch: Optional[ForwardBatch] = None,
+        forward_batch: ForwardBatch,
         is_verify: bool = False,
         skip_attn_backend_init=False,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
-
-        if model_worker_batch is not None:
-            # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
-
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        else:
-            # FIXME(lsyin): unify the interface of forward_batch
-            assert forward_batch is not None
-
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
@@ -406,7 +408,7 @@ class TpModelWorker(BaseTpWorker):
             if (
                 self.enable_overlap
                 and not self.enable_spec
-                and model_worker_batch.sampling_info.grammars is not None
+                and forward_batch.sampling_info.grammars is not None
             ):
 
                 def sample_batch_func():
@@ -418,21 +420,21 @@ class TpModelWorker(BaseTpWorker):
                 batch_result.delay_sample_func = sample_batch_func
                 return batch_result
 
-            if model_worker_batch.is_prefill_only:
+            if forward_batch.is_prefill_only:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
                 batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
+                    len(forward_batch.seq_lens),
                     dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
+                    device=forward_batch.input_ids.device,
                 )
                 if (
-                    model_worker_batch.return_logprob
+                    forward_batch.return_logprob
                     and logits_output.next_token_logits is not None
                 ):
                     # NOTE: Compute logprobs without full sampling
                     self.model_runner.compute_logprobs_only(
-                        logits_output, model_worker_batch
+                        logits_output, forward_batch
                     )
             else:
                 batch_result.next_token_ids = self.model_runner.sample(
