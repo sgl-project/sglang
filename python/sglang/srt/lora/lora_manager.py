@@ -21,24 +21,31 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
-    LoRABatchInfo,
     LoRAType,
-    get_layer_id,
     get_normalized_target_modules,
     get_target_module_name,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import replace_submodule
+from sglang.srt.utils import is_npu, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+if is_npu():
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it to True
+    torch.cuda.is_available = lambda: False
+
 
 logger = logging.getLogger(__name__)
 
@@ -87,25 +94,13 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+    def init_cuda_graph_batch_info(
+        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+    ):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        with torch.device("cuda"):
-            self.cuda_graph_batch_info = LoRABatchInfo(
-                bs=max_bs_in_cuda_graph,
-                use_cuda_graph=True,
-                num_segments=None,
-                seg_lens=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
-                max_len=1,
-                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
-                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
-            )
-
         self.lora_backend.init_cuda_graph_batch_info(
-            cuda_graph_batch_info=self.cuda_graph_batch_info,
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+            num_tokens_per_bs=num_tokens_per_bs,
         )
 
     def create_lora_update_result(
@@ -134,16 +129,6 @@ class LoRAManager:
             lora_ref.lora_id not in self.loras
         ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
-        if lora_ref.pinned and self.num_pinned_loras >= self.max_loras_per_batch - 1:
-            return self.create_lora_update_result(
-                success=False,
-                error_message=(
-                    f"Already have {self.num_pinned_loras} pinned adapters, "
-                    f"max allowed is {self.max_loras_per_batch - 1} (reserving 1 slot for dynamic use). "
-                    f"Please unpin some adapters or increase max_loras_per_batch."
-                ),
-            )
-
         try:
             # load configs
             new_adapter = LoRAConfig(lora_ref.lora_path)
@@ -170,13 +155,17 @@ class LoRAManager:
         """
 
         # Check if this LoRA adapter is already loaded
-        if any(
-            lora_ref.lora_name == existing_lora_ref.lora_name
-            for existing_lora_ref in self.lora_refs.values()
-        ):
-            raise ValueError(
-                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
-            )
+        for existing_lora_ref in self.lora_refs.values():
+            if lora_ref.lora_name == existing_lora_ref.lora_name:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                )
+
+            if lora_ref.lora_path == existing_lora_ref.lora_path:
+                logger.warning(
+                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
@@ -289,7 +278,7 @@ class LoRAManager:
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,
             scalings=scalings,
-            batch_info=self.cuda_graph_batch_info if use_cuda_graph else None,
+            use_cuda_graph=use_cuda_graph,
         )
 
     def update_lora_info(self):
