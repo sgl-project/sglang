@@ -80,6 +80,12 @@ class AlphaMoeRunnerCore(MoeRunnerCore):
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
 
+        assert block_shape[0] == 128
+        assert block_shape[1] == 128
+        assert use_fp8_w8a8
+        assert hidden_states[1].shape % 128 == 0
+        assert activation == "silu"
+
         out_hidden_states = alpha_moe_fused_moe(
             hidden_states,
             w13,
@@ -165,6 +171,12 @@ def fused_experts_none_to_alpha_moe(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    assert quant_info.block_shape[0] == 128
+    assert quant_info.block_shape[1] == 128
+    assert quant_info.use_fp8_w8a8
+    assert dispatch_output.hidden_states.shape[1] % 128 == 0
+    assert runner_config.activation == "silu"
 
     output = alpha_moe_fused_moe(
         hidden_states=dispatch_output.hidden_states,
