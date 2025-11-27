@@ -240,10 +240,6 @@ class ServerArgs:
     revision: Optional[str] = None
     model_impl: str = "auto"
 
-    # Diffusion LLM
-    dllm_algorithm: Optional[str] = None
-    dllm_block_size: Optional[int] = None
-
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
@@ -398,7 +394,7 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
 
-    # For ngram only
+    # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
     speculative_ngram_min_bfs_breadth: int = 1
@@ -457,6 +453,10 @@ class ServerArgs:
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
+
+    # Diffusion LLM
+    dllm_algorithm: Optional[str] = None
+    dllm_block_size: Optional[int] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -1203,7 +1203,7 @@ class ServerArgs:
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization == "fp8"
+                    self.quantization in ("fp8", "modelopt_fp4")
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -1230,7 +1230,7 @@ class ServerArgs:
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization == "fp8"
+                    (self.quantization == "fp8" or self.quantization == "modelopt_fp4")
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -2125,20 +2125,6 @@ class ServerArgs:
             "implementation.\n",
         )
 
-        # Diffusion LLM
-        parser.add_argument(
-            "--dllm-algorithm",
-            type=str,
-            default=ServerArgs.dllm_algorithm,
-            help="The diffusion LLM algorithm.",
-        )
-        parser.add_argument(
-            "--dllm-block-size",
-            type=int,
-            default=ServerArgs.dllm_block_size,
-            help="The number of tokens processed in each iteration of the block diffusion LLM.",
-        )
-
         # HTTP server
         parser.add_argument(
             "--host",
@@ -2980,7 +2966,8 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
         )
-        # Ngram speculative decoding
+
+        # Speculative decoding (ngram)
         parser.add_argument(
             "--speculative-ngram-min-match-window-size",
             type=int,
@@ -3289,6 +3276,21 @@ class ServerArgs:
             default=ServerArgs.kt_max_deferred_experts_per_token,
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
+
+        # Diffusion LLM
+        parser.add_argument(
+            "--dllm-algorithm",
+            type=str,
+            default=ServerArgs.dllm_algorithm,
+            help="The diffusion LLM algorithm.",
+        )
+        parser.add_argument(
+            "--dllm-block-size",
+            type=int,
+            default=ServerArgs.dllm_block_size,
+            help="The number of tokens processed in each iteration of the block diffusion LLM.",
+        )
+
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
