@@ -23,6 +23,7 @@ from diffusers.models.transformers.transformer_flux2 import Flux2PosEmbed
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
@@ -144,20 +145,16 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.to_v = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
 
         # QK Norm
-        self.norm_q = torch.nn.RMSNorm(
-            dim_head, eps=eps, elementwise_affine=elementwise_affine
-        )
-        self.norm_k = torch.nn.RMSNorm(
-            dim_head, eps=eps, elementwise_affine=elementwise_affine
-        )
+        self.norm_q = RMSNorm(dim_head, eps=eps)
+        self.norm_k = RMSNorm(dim_head, eps=eps)
 
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
         self.to_out.append(torch.nn.Dropout(dropout))
 
         if added_kv_proj_dim is not None:
-            self.norm_added_q = torch.nn.RMSNorm(dim_head, eps=eps)
-            self.norm_added_k = torch.nn.RMSNorm(dim_head, eps=eps)
+            self.norm_added_q = RMSNorm(dim_head, eps=eps)
+            self.norm_added_k = RMSNorm(dim_head, eps=eps)
             self.add_q_proj = torch.nn.Linear(
                 added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
             )
@@ -294,12 +291,8 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.mlp_act_fn = Flux2SwiGLU()
 
         # QK Norm
-        self.norm_q = torch.nn.RMSNorm(
-            dim_head, eps=eps, elementwise_affine=elementwise_affine
-        )
-        self.norm_k = torch.nn.RMSNorm(
-            dim_head, eps=eps, elementwise_affine=elementwise_affine
-        )
+        self.norm_q = RMSNorm(dim_head, eps=eps)
+        self.norm_k = RMSNorm(dim_head, eps=eps)
 
         # Fused attention output projection + MLP output projection
         self.to_out = torch.nn.Linear(
