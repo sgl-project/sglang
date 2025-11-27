@@ -25,6 +25,36 @@ where
     serializer.serialize_str(&hex_string)
 }
 
+/// Deserialize hex string to [u8; 32]
+fn deserialize_sha256_hash<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let hex_string = String::deserialize(deserializer)?;
+
+    // Parse hex string to bytes
+    if hex_string.len() != 64 {
+        return Err(serde::de::Error::custom(format!(
+            "Invalid SHA256 hash length: expected 64 hex characters, got {}",
+            hex_string.len()
+        )));
+    }
+
+    let mut hash = [0u8; 32];
+    for (i, chunk) in hex_string.as_bytes().chunks(2).enumerate() {
+        if chunk.len() != 2 {
+            return Err(serde::de::Error::custom("Invalid hex string format"));
+        }
+        let byte_str = std::str::from_utf8(chunk)
+            .map_err(|e| serde::de::Error::custom(format!("Invalid UTF-8: {}", e)))?;
+        hash[i] = u8::from_str_radix(byte_str, 16)
+            .map_err(|e| serde::de::Error::custom(format!("Invalid hex digit: {}", e)))?;
+    }
+
+    Ok(hash)
+}
+
 /// Serialize u64 timestamp (nanoseconds since epoch) as ISO 8601 string
 fn serialize_timestamp<S>(timestamp: &u64, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -45,6 +75,34 @@ where
             // Fallback: format manually if timestamp is out of range
             let s = format!("{}", timestamp);
             serializer.serialize_str(&s)
+        }
+    }
+}
+
+/// Deserialize ISO 8601 string to u64 timestamp (nanoseconds since epoch)
+fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use chrono::{DateTime, Utc};
+    use serde::Deserialize;
+
+    let timestamp_str = String::deserialize(deserializer)?;
+
+    // Try to parse as ISO 8601 datetime (RFC 3339)
+    match DateTime::parse_from_rfc3339(&timestamp_str) {
+        Ok(dt) => {
+            // Convert to UTC and then to nanoseconds since epoch
+            let dt_utc = dt.with_timezone(&Utc);
+            let secs = dt_utc.timestamp();
+            let nanos = dt_utc.timestamp_subsec_nanos();
+            Ok((secs as u64) * 1_000_000_000 + (nanos as u64))
+        }
+        Err(_) => {
+            // Fallback: try to parse as u64 directly
+            timestamp_str
+                .parse::<u64>()
+                .map_err(|e| serde::de::Error::custom(format!("Invalid timestamp format: {}", e)))
         }
     }
 }
@@ -78,15 +136,24 @@ pub struct WasmModuleMeta {
     // path to the module file
     pub file_path: String,
     // sha256 hash of the module file
-    #[serde(serialize_with = "serialize_sha256_hash")]
+    #[serde(
+        serialize_with = "serialize_sha256_hash",
+        deserialize_with = "deserialize_sha256_hash"
+    )]
     pub sha256_hash: [u8; 32],
     // size of the module file in bytes
     pub size_bytes: u64,
     // timestamp of when the module was created (nanoseconds since epoch)
-    #[serde(serialize_with = "serialize_timestamp")]
+    #[serde(
+        serialize_with = "serialize_timestamp",
+        deserialize_with = "deserialize_timestamp"
+    )]
     pub created_at: u64,
     // timestamp of when the module was last accessed (nanoseconds since epoch)
-    #[serde(serialize_with = "serialize_timestamp")]
+    #[serde(
+        serialize_with = "serialize_timestamp",
+        deserialize_with = "deserialize_timestamp"
+    )]
     pub last_accessed_at: u64,
     // number of times the module was accessed
     pub access_count: u64,

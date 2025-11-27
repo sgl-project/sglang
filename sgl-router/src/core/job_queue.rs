@@ -377,7 +377,9 @@ impl JobQueue {
                     .ok_or_else(|| "Workflow engine not initialized".to_string())?;
 
                 let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-                workflow_context.set("wasm_module_config", config.clone());
+                // Convert Box to Arc for context storage
+                let config_arc: Arc<WasmModuleConfigRequest> = Arc::new(*config.clone());
+                workflow_context.set_arc("wasm_module_config", config_arc);
                 workflow_context.set_arc("app_context", Arc::clone(context));
 
                 let instance_id = engine
@@ -412,7 +414,9 @@ impl JobQueue {
                     .ok_or_else(|| "Workflow engine not initialized".to_string())?;
 
                 let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
-                workflow_context.set("wasm_module_removal_request", request.clone());
+                // Convert Box to Arc for context storage
+                let request_arc: Arc<WasmModuleRemovalRequest> = Arc::new(*request.clone());
+                workflow_context.set_arc("wasm_module_removal_request", request_arc);
                 workflow_context.set_arc("app_context", Arc::clone(context));
 
                 let instance_id = engine
