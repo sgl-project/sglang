@@ -1069,9 +1069,13 @@ class Scheduler(
                     recv_rpc = self.recv_from_rpc.recv_pyobj()
                     self.recv_queue.put(recv_rpc)
 
+            except zmq.ZMQError as e:
+                if self.recv_thread_running:
+                    logger.error(f"ZMQError in recv thread: {e}", exc_info=True)
+                break
             except Exception as e:
                 if self.recv_thread_running:  # Only log if not intentionally stopped
-                    logger.error(f"Error in recv thread: {e}")
+                    logger.error(f"Unhandled error in recv thread: {e}", exc_info=True)
                 break
 
     def recv_requests(
