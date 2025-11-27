@@ -70,7 +70,7 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
-        x = x.view(-1, shape[-1])
+        x = x.reshape(-1, shape[-1])
         if residual is not None:
             residual_shape = residual.shape
             residual = residual.view(-1, shape[-1])
