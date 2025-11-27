@@ -113,7 +113,7 @@ class ImageEncodingStage(PipelineStage):
         image = batch.condition_image
 
         # preprocess via vae_image_processor
-        prompt_image = server_args.pipeline_config.preprocess_image(
+        image = server_args.pipeline_config.preprocess_image(
             image, self.vae_image_processor
         )
 
@@ -128,7 +128,7 @@ class ImageEncodingStage(PipelineStage):
             image_processor_kwargs = {}
 
         image_inputs = self.image_processor(
-            images=prompt_image, return_tensors="pt", **image_processor_kwargs
+            images=image, return_tensors="pt", **image_processor_kwargs
         ).to(cuda_device)
         if self.image_encoder:
             # if an image encoder is provided
@@ -151,7 +151,7 @@ class ImageEncodingStage(PipelineStage):
                 neg_image_processor_kwargs = {}
 
             neg_image_inputs = self.image_processor(
-                images=prompt_image, return_tensors="pt", **neg_image_processor_kwargs
+                images=image, return_tensors="pt", **neg_image_processor_kwargs
             ).to(get_local_torch_device())
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -203,7 +203,7 @@ class ImageVAEEncodingStage(PipelineStage):
     Stage for encoding pixel representations into latent space.
 
     This stage handles the encoding of pixel representations into the final
-    input format (e.g., latents).
+    input format (e.g., image_latents).
     """
 
     def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:
@@ -462,14 +462,18 @@ class ImageVAEEncodingStage(PipelineStage):
     ) -> torch.Tensor:
 
         if isinstance(image, PIL.Image.Image):
-            width, height = (
-                self.server_args.pipeline_config.vae_config.calculate_dimensions(
-                    image, vae_scale_factor, width, height
-                )
-            )
+            # image already resized in InputValidateStage
+            # width, height = (
+            #     self.server_args.pipeline_config.calculate_condition_image_size(
+            #         image, width, height
+            #     )
+            # )
+            print(f"{image.size=}")
+
             image = resize(image, height, width, resize_mode=resize_mode)
             image = pil_to_numpy(image)  # to np
             image = numpy_to_pt(image)  # to pt
+            print(f"{image=}")
 
         do_normalize = True
         if image.min() < 0:
