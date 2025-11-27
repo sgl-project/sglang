@@ -85,7 +85,6 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadReqInput,
-    GetLoadReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -2231,57 +2230,6 @@ class Scheduler(
             )
             if_success = False
         return if_success
-
-    def get_load(self, recv_req: GetLoadReqInput = None) -> GetLoadReqOutput:
-        # TODO(lsyin): use dynamically maintained num_waiting_tokens
-
-        if self.is_hybrid:
-            num_tokens_full = (
-                self.full_tokens_per_layer
-                - self.token_to_kv_pool_allocator.full_available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-            num_tokens_swa = (
-                self.swa_tokens_per_layer
-                - self.token_to_kv_pool_allocator.swa_available_size()
-                - self.tree_cache.swa_evictable_size()
-            )
-            num_tokens = max(num_tokens_full, num_tokens_swa)
-        elif self.is_hybrid_gdn:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.full_evictable_size()
-            )
-        else:
-            num_tokens = (
-                self.max_total_num_tokens
-                - self.token_to_kv_pool_allocator.available_size()
-                - self.tree_cache.evictable_size()
-            )
-
-        # Tokens in waiting queue, bootstrap queue, prealloc queue
-        num_tokens += sum(len(req.origin_input_ids) for req in self.waiting_queue)
-        num_waiting_reqs = len(self.waiting_queue)
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            num_tokens += sum(
-                len(req.origin_input_ids)
-                for req in self.disagg_prefill_bootstrap_queue.queue
-            )
-            num_waiting_reqs += len(self.disagg_prefill_bootstrap_queue.queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            num_tokens += sum(
-                len(req.req.origin_input_ids)
-                for req in self.disagg_decode_prealloc_queue.queue
-            )
-            num_waiting_reqs += len(self.disagg_decode_prealloc_queue.queue)
-
-        return GetLoadReqOutput(
-            dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
-            num_waiting_reqs=num_waiting_reqs,
-            num_tokens=num_tokens,
-        )
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = vars(get_global_server_args())
