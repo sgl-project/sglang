@@ -1284,13 +1284,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        if True:  # Keep this redundant check to simplify some internal code sync
-            # Hold the lock if it is not async. This means that weight sync
-            # cannot run while requests are in progress.
-            async with self.model_update_lock.writer_lock:
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
                 success, message, num_paused_requests = (
                     await self._wait_for_model_update_from_disk(obj)
                 )
+            elif True:  # Keep this redundant check to simplify some internal code sync
+                # Hold the lock if it is not async. This means that weight sync
+                # cannot run while requests are in progress.
+                async with self.model_update_lock.writer_lock:
+                    success, message, num_paused_requests = (
+                        await self._wait_for_model_update_from_disk(obj)
+                    )
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
