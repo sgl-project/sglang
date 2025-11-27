@@ -238,6 +238,14 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mix_mask_cache,
         )
 
+        self.enable_torch_air_compile = (
+            model_runner.server_args.disable_cuda_graph
+            and model_runner.server_args.enable_torch_compile
+        )
+        if self.enable_torch_air_compile:
+            max_total_tokens = model_runner.max_total_num_tokens
+            self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers for verify attention kernels that needs to be filled after draft.
@@ -250,14 +258,6 @@ class AscendAttnBackend(AttentionBackend):
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
         pass
-
-        self.enable_torch_air_compile = (
-            model_runner.server_args.disable_cuda_graph
-            and model_runner.server_args.enable_torch_compile
-        )
-        if self.enable_torch_air_compile:
-            max_total_tokens = model_runner.max_total_num_tokens
-            self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
