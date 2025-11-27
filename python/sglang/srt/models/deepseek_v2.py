@@ -114,7 +114,6 @@ from sglang.srt.layers.quantization.fp8_utils import (
     inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
-    requant_weight_ue8m0_inplace,
     transform_scale_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
@@ -3738,42 +3737,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        # Requant the weights and scales of MoE layers
-        if get_moe_runner_backend().is_deep_gemm():
-            self._maybe_moe_weight_requant_ue8m0(is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._transform_scale_nextn_moe_ue8m0()
-
-    def _maybe_moe_weight_requant_ue8m0(self, is_nextn=False):
-        # Dense fp8 layers will be processed in Fp8LinearMethod.process_weights_after_loading
-        # So we only need to process sparse MoE layers here
-        weight_block_size = self.quant_config.weight_block_size
-
-        moe_layers = list(
-            range(
-                self.config.first_k_dense_replace,
-                self.config.num_hidden_layers,
-                self.config.moe_layer_freq,
-            )
-        )
-
-        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
-
-        for layer_id in range(num_hidden_layers):
-            if is_nextn:
-                layer = self.model.decoder
-            else:
-                layer = self.model.layers[layer_id]
-
-            if layer_id in moe_layers or is_nextn:
-                experts = layer.mlp.experts
-                # TODO: move this logic to Fp8MoEMethod.process_weights_after_loading
-                if isinstance(experts, DeepEPMoE):
-                    for w in [
-                        (experts.w13_weight, experts.w13_weight_scale_inv),
-                        (experts.w2_weight, experts.w2_weight_scale_inv),
-                    ]:
-                        requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
 
     # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
     def _transform_scale_nextn_moe_ue8m0(self):
