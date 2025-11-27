@@ -2254,7 +2254,7 @@ class Scheduler(
                 while True:
                     try:
                         self.recv_queue.get_nowait()
-                    except:  # queue.Empty
+                    except queue.Empty:  # queue.Empty
                         break
 
             self.num_generated_tokens = 0
