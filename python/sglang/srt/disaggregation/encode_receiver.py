@@ -51,8 +51,11 @@ class EmbeddingData:
         )
         self.embedding_list[embedding_data.part_idx] = embedding_data.embedding
 
-    def get_embedding(self):
-        return torch.concatenate(self.embedding_list)
+    def get_embedding(self, is_concat=False):
+        if is_concat:
+            return torch.concat([embedding.cuda() for embedding in self.embedding_list])
+        else:
+            return self.embedding_list
 
     def get_img_grid(self):
         return torch.concatenate(self.image_grid_dim_list)
@@ -183,7 +186,7 @@ class WaitingImageRequest:
             else:
                 self.recv_embedding_data.add(recv_obj)
 
-        recv_embedding = self.recv_embedding_data.get_embedding()
+        recv_embedding = self.recv_embedding_data.get_embedding(is_concat=True)
         img_grid_thw = self.recv_embedding_data.get_img_grid()
 
         mm_inputs = self.mm_processor.get_mm_data(
@@ -527,7 +530,7 @@ class MMReceiver:
             del self.embeddings_buffer[req_id]
             self.embeddings_engine.deregister(recv_embedding.data_ptr())
         elif self.mm_transfer_backend == "zmq_t":
-            recv_embedding = recv_embedding_data.get_embedding()
+            recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
 
         img_grid_thw = recv_embedding_data.get_img_grid()
 

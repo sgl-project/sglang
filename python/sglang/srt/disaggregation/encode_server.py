@@ -218,23 +218,20 @@ class MMEncoder:
 
         if mm_embedding is None:
             with torch.inference_mode():
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
                 mm_embedding: torch.Tensor = self.model.get_image_feature([mm_item])
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                mm_embedding = mm_embedding.cpu()
             if len(mm_embedding.shape) != 2:
                 mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
 
         if self.server_args.enable_prefix_mm_cache:
             async with self.mm_cache_lock:
-                self.mm_cache.set(mm_hash, mm_embedding.cpu())
+                self.mm_cache.set(mm_hash, mm_embedding)
         end_time = time.perf_counter()
         logger.info(
             f"Vit time : {(end_time - start_time)*1000:.2f} ms {mm_embedding.shape = }"
         )
 
-        return _get_image_grid_dim(images_input), mm_embedding.cpu()
+        return _get_image_grid_dim(images_input), mm_embedding
 
     async def _send(
         self,
