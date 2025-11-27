@@ -1098,7 +1098,7 @@ class Scheduler(
                     try:
                         recv_req = self.recv_queue.get_nowait()
                         recv_reqs.append(recv_req)
-                    except:  # queue.Empty
+                    except queue.Empty:  # queue.Empty
                         break
             else:
                 recv_reqs = None
