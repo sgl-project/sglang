@@ -476,8 +476,8 @@ class Qwen3MoeAttention(nn.Module):
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
         self.compatible_with_fused_qk_norm_rope = (
-            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        )
+            not isinstance(self.rotary_emb, MRotaryEmbedding)
+        ) and self.head_dim in (64, 128, 256)
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
@@ -574,7 +574,8 @@ class Qwen3MoeAttention(nn.Module):
         return None, forward_batch, inner_state
 
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
-        if self.use_fused_qk_norm_rope:
+        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        if use_fused:
             theta = getattr(self.config, "rope_theta", 10000.0)
             positions = (
                 positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
