@@ -21,15 +21,15 @@ from transformers import Cache, DynamicCache, LlavaConfig, Mistral3Config, Mistr
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.mistral3.modeling_mistral3 import (
+    Mistral3CausalLMOutputWithPast,
+    Mistral3ModelOutputWithPast,
+)
 from transformers.models.mistral.modeling_mistral import (
     MistralMLP,
     MistralRMSNorm,
     MistralRotaryEmbedding,
     apply_rotary_pos_emb,
-)
-from transformers.models.mistral3.modeling_mistral3 import (
-    Mistral3CausalLMOutputWithPast,
-    Mistral3ModelOutputWithPast,
 )
 
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -73,7 +73,7 @@ class MistralAttention(nn.Module):
         self.num_key_value_groups = (
             config.num_attention_heads // config.num_key_value_heads
         )
-        self.scaling = self.head_dim ** -0.5
+        self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.q_proj = nn.Linear(

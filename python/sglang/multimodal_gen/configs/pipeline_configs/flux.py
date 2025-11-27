@@ -14,9 +14,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
-from sglang.multimodal_gen.configs.models.encoders.mistral import (
-    Mistral3Config,
-    _is_embeddings,
+from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
     _is_transformer_layer,
 )
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
@@ -346,7 +344,7 @@ class Flux2MistralTextArchConfig(TextEncoderArchConfig):
         ]
     )
     _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer, _is_embeddings]
+        default_factory=lambda: [_is_transformer_layer]
     )
 
     def __post_init__(self):
@@ -405,9 +403,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.I2I
 
-    text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (Mistral3Config(),)
-    )
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
