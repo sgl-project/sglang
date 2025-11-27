@@ -691,7 +691,8 @@ class Req:
         self.dllm_config = dllm_config
 
     @property
-    def seqlen(self):
+    def seqlen(self) -> int:
+        """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property

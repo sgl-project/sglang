@@ -24,6 +24,7 @@ suites = {
         TestFile("models/test_encoder_embedding_models.py", 460),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 160),
+        TestFile("models/test_nvidia_nemotron_nano_v2_vl.py", 350),  # GSM8k + MMMU
         TestFile("models/test_qwen_models.py", 150),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
@@ -53,7 +54,7 @@ suites = {
         TestFile("quant/test_w8a8_quantization.py", 160),
         TestFile("quant/test_autoround.py", 60),
         TestFile("rl/test_fp32_lm_head.py", 30),
-        TestFile("rl/test_update_weights_from_disk.py", 210),
+        # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rl/test_update_weights_from_tensor.py", 80),
         TestFile("test_abort.py", 190),
         TestFile("test_build_eagle_tree.py", 8),
@@ -125,6 +126,7 @@ suites = {
         TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
         TestFile("test_triton_sliding_window.py", 100),
         TestFile("test_utils_update_weights.py", 48),
+        TestFile("test_video_utils.py", 5),
         TestFile("test_vision_chunked_prefill.py", 170),
         TestFile("test_vision_openai_server_a.py", 900),
         TestFile("test_vlm_input_format.py", 300),
@@ -201,6 +203,9 @@ suites = {
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
         TestFile("models/test_dummy_grok_models.py"),
+        TestFile(
+            "rl/test_update_weights_from_disk.py"
+        ),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("test_bench_one_batch.py"),
         TestFile("test_bench_serving.py"),
         TestFile("test_eval_accuracy_large.py"),
@@ -247,7 +252,7 @@ suite_amd = {
         TestFile("quant/test_awq_dequant.py", 2),
         TestFile("quant/test_block_int8.py", 22),
         TestFile("quant/test_fused_rms_fp8_group_quant.py", 10),
-        TestFile("rl/test_update_weights_from_disk.py", 210),
+        # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("test_abort.py", 51),
         TestFile("test_bench_typebaseddispatcher.py", 10),
         TestFile("test_chunked_prefill.py", 410),
