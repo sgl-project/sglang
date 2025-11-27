@@ -316,10 +316,9 @@ class _ModelRegistry:
         normalized_arch = []
         for arch in architectures:
             if arch not in self.registered_models:
-                # raise Exception(
-                #     f"Unsupported model architecture: {arch}. Registered architectures: {self.registered_models=}"
-                # )
-                pass
+                raise Exception(
+                    f"Unsupported model architecture: {arch}. Registered architectures: {self.registered_models=}"
+                )
             normalized_arch.append(arch)
         return normalized_arch
 
