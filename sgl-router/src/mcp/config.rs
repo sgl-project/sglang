@@ -2,8 +2,7 @@
 //!
 //! Defines configuration structures for MCP servers, transports, proxies, and inventory.
 
-use std::collections::HashMap;
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 pub use rmcp::model::{Prompt, RawResource, Tool};
 use serde::{Deserialize, Serialize};
