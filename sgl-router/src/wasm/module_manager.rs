@@ -2,22 +2,18 @@
 
 use std::{
     collections::HashMap,
-    fs::File,
-    io::Read,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
     },
 };
 
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use wasmtime::{component::Component, Config, Engine};
 
 use crate::wasm::{
     config::WasmRuntimeConfig,
-    errors::{Result, WasmError, WasmManagerError, WasmModuleError, WasmRuntimeError},
-    module::{WasmModule, WasmModuleAttachPoint, WasmModuleDescriptor, WasmModuleMeta},
+    errors::{Result, WasmError, WasmManagerError, WasmModuleError},
+    module::{WasmModule, WasmModuleAttachPoint},
     runtime::WasmRuntime,
     types::{WasmComponentInput, WasmComponentOutput},
 };
@@ -51,7 +47,30 @@ impl WasmModuleManager {
         Self::new(WasmRuntimeConfig::default())
     }
 
-    fn check_duplicate_sha256_hash(&self, sha256_hash: &[u8; 32]) -> Result<()> {
+    /// Register a module (for workflow steps)
+    pub(crate) fn register_module_internal(&self, module: WasmModule) -> Result<()> {
+        let mut modules = self
+            .modules
+            .write()
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        modules.insert(module.module_uuid, module);
+        Ok(())
+    }
+
+    /// Remove a module (for workflow steps)
+    pub(crate) fn remove_module_internal(&self, module_uuid: Uuid) -> Result<()> {
+        let mut modules = self
+            .modules
+            .write()
+            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
+        if !modules.contains_key(&module_uuid) {
+            return Err(WasmManagerError::ModuleNotFound(module_uuid).into());
+        }
+        modules.remove(&module_uuid);
+        Ok(())
+    }
+
+    pub(crate) fn check_duplicate_sha256_hash(&self, sha256_hash: &[u8; 32]) -> Result<()> {
         let modules = self
             .modules
             .read()
@@ -62,141 +81,6 @@ impl WasmModuleManager {
         {
             return Err(WasmModuleError::DuplicateSha256((*sha256_hash).into()).into());
         }
-        Ok(())
-    }
-
-    fn calculate_size_bytes(&self, file_path: &str) -> Result<u64> {
-        let file = File::open(file_path).map_err(|e| WasmError::from(e))?;
-        let metadata = file.metadata().map_err(|e| WasmError::from(e))?;
-        Ok(metadata.len())
-    }
-
-    fn calculate_sha256_hash(&self, file_path: &str) -> Result<[u8; 32]> {
-        let mut file = File::open(file_path).map_err(|e| WasmError::from(e))?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0; 1024];
-        loop {
-            let bytes_read = file.read(&mut buffer).map_err(|e| WasmError::from(e))?;
-            if bytes_read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..bytes_read]);
-        }
-        Ok(hasher.finalize().into())
-    }
-
-    fn validate_module_descriptor(&self, descriptor: &WasmModuleDescriptor) -> Result<()> {
-        if descriptor.name.is_empty() {
-            return Err(WasmModuleError::InvalidDescriptor(
-                "Module name cannot be empty".to_string(),
-            )
-            .into());
-        }
-        if descriptor.file_path.is_empty() {
-            return Err(WasmModuleError::InvalidDescriptor(
-                "Module file path cannot be empty".to_string(),
-            )
-            .into());
-        }
-        if self.calculate_size_bytes(&descriptor.file_path)? == 0 {
-            return Err(WasmModuleError::ValidationFailed(
-                "Module file size cannot be 0".to_string(),
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    pub fn add_module(&self, descriptor: WasmModuleDescriptor) -> Result<Uuid> {
-        // validate the module descriptor
-        self.validate_module_descriptor(&descriptor)?;
-
-        // calculate the sha256 hash of the module file
-        let sha256_hash = self.calculate_sha256_hash(&descriptor.file_path)?;
-        self.check_duplicate_sha256_hash(&sha256_hash)?;
-
-        // calculate size before moving descriptor
-        let size_bytes = self.calculate_size_bytes(&descriptor.file_path)?;
-
-        // Pre-load WASM bytes into memory for faster execution
-        let wasm_bytes = std::fs::read(&descriptor.file_path).map_err(|e| {
-            WasmError::from(WasmModuleError::FileRead(format!(
-                "Failed to read WASM file: {}",
-                e
-            )))
-        })?;
-
-        // Validate that the WASM file is a valid component by attempting to compile it
-        // This catches errors early during module addition rather than during execution
-        self.validate_wasm_component(&wasm_bytes)?;
-
-        // now safe, insert the module into the manager
-        // SystemTime::duration_since only fails if the system time is before UNIX_EPOCH,
-        // which should never happen in normal operation. If it does, use current time as fallback.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_else(|_| {
-                // Fallback to a reasonable timestamp if system time is invalid
-                // This should never occur in practice, but provides a safe fallback
-                std::time::Duration::from_nanos(0)
-            })
-            .as_nanos() as u64;
-        let module_uuid = Uuid::new_v4();
-        let module = WasmModule {
-            module_uuid,
-            module_meta: WasmModuleMeta {
-                name: descriptor.name,
-                file_path: descriptor.file_path,
-                sha256_hash,
-                size_bytes,
-                created_at: now,
-                last_accessed_at: now,
-                access_count: 0,
-                attach_points: descriptor.attach_points.clone(),
-                wasm_bytes,
-            },
-        };
-
-        let mut modules = self
-            .modules
-            .write()
-            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
-        modules.insert(module_uuid, module);
-        Ok(module_uuid)
-    }
-
-    /// Validate that WASM bytes represent a valid component
-    fn validate_wasm_component(&self, wasm_bytes: &[u8]) -> Result<()> {
-        // Create a temporary engine to validate the component
-        let mut config = Config::new();
-        config.async_support(true);
-        config.wasm_component_model(true);
-        let engine = Engine::new(&config)
-            .map_err(|e| WasmError::from(WasmRuntimeError::EngineCreateFailed(e.to_string())))?;
-
-        // Attempt to compile the component to validate it
-        Component::new(&engine, wasm_bytes)
-            .map_err(|e| WasmError::from(WasmRuntimeError::CompileFailed(format!(
-                "Invalid WASM component: {}. \
-                 Hint: The WASM file must be in component format. \
-                 If you're using wit-bindgen, use 'wasm-tools component new' to wrap the WASM module into a component.",
-                e
-            ))))?;
-
-        Ok(())
-    }
-
-    pub fn remove_module(&self, module_uuid: Uuid) -> Result<()> {
-        let mut modules = self
-            .modules
-            .write()
-            .map_err(|e| WasmManagerError::LockFailed(e.to_string()))?;
-        if !modules.contains_key(&module_uuid) {
-            return Err(WasmManagerError::ModuleNotFound(module_uuid).into());
-        }
-        // Remove the module - the wasm_bytes Vec will be dropped automatically,
-        // releasing the memory
-        modules.remove(&module_uuid);
         Ok(())
     }
 

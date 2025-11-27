@@ -24,7 +24,8 @@ use crate::{
     core::{
         worker_to_info,
         workflow::{
-            create_mcp_registration_workflow, create_worker_registration_workflow,
+            create_mcp_registration_workflow, create_wasm_module_registration_workflow,
+            create_wasm_module_removal_workflow, create_worker_registration_workflow,
             create_worker_removal_workflow, LoggingSubscriber, WorkflowEngine,
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
@@ -762,6 +763,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     engine.register_workflow(create_worker_registration_workflow(&config.router_config));
     engine.register_workflow(create_worker_removal_workflow());
     engine.register_workflow(create_mcp_registration_workflow());
+    engine.register_workflow(create_wasm_module_registration_workflow());
+    engine.register_workflow(create_wasm_module_removal_workflow());
     app_context
         .workflow_engine
         .set(engine)
