@@ -427,10 +427,8 @@ class Qwen3GatedDeltaNet(nn.Module):
                 # no alt stream available -> do sequentially
                 projected_states_ba, _ = self.in_proj_ba(hidden_states)
         else:
-
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
-
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -755,7 +753,6 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
 
         qkv, _ = self.qkv_proj(hidden_states)
-
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
                 [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
