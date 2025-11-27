@@ -71,11 +71,11 @@ def _normalize_module_type(module_type: str) -> str:
 def _clean_hf_config_inplace(model_config: dict) -> None:
     """Remove common extraneous HF fields if present."""
     for key in (
-        "_name_or_path",
-        "transformers_version",
-        "model_type",
-        "tokenizer_class",
-        "torch_dtype",
+            "_name_or_path",
+            "transformers_version",
+            "model_type",
+            "tokenizer_class",
+            "torch_dtype",
     ):
         model_config.pop(key, None)
 
@@ -165,8 +165,9 @@ class ComponentLoader(ABC):
             component = component.to(device=target_device)
             source = "native"
             logger.warning(
-                "Native module %s is loaded, performance may be sub-optimal",
+                "Native module %s: %s is loaded, performance may be sub-optimal",
                 module_name,
+                component.__class__.__name__
             )
 
         if component is None:
@@ -459,7 +460,7 @@ class TextEncoderLoader(ComponentLoader):
                         reshard_after_forward=True,
                         mesh=mesh["offload"],
                         fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
-                        or getattr(model, "_fsdp_shard_conditions", None),
+                                              or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
             # We only enable strict check for non-quantized models
