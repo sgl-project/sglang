@@ -13,9 +13,19 @@
 # ==============================================================================
 
 import multiprocessing as mp
+import sys
 import unittest
+from pathlib import Path
 
-from utils import LoRAAdaptor, LoRAModelCase, run_lora_multiple_batch_on_model_cases
+# Add test directory to path for lora_utils import
+# TODO: can be removed after migration
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lora_utils import (
+    LoRAAdaptor,
+    LoRAModelCase,
+    run_lora_multiple_batch_on_model_cases,
+)
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
