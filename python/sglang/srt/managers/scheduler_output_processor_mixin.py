@@ -314,6 +314,7 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
+
     def _add_eagle_v2_logprobs(
         self: Scheduler,
         batch: ScheduleBatch,
