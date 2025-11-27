@@ -915,6 +915,9 @@ def load_image(
     elif image_file.startswith("data:"):
         image_file = image_file.split(",")[1]
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+    elif image_file.startswith("video:"):
+        image_file = image_file.split(":")[1]
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     elif isinstance(image_file, str):
         image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
     else:
