@@ -1,8 +1,7 @@
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 
 import torch
 
-from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -97,8 +96,8 @@ class BaseLoRABackend:
 
     def init_cuda_graph_batch_info(
         self,
-        cuda_graph_batch_info: LoRABatchInfo,
         max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
     ):
         """Initialize the batch info for CUDA Graph mode.
 
@@ -108,6 +107,7 @@ class BaseLoRABackend:
         Args:
             cuda_graph_batch_info: the LoRABatchInfo object created in LoraManager
             max_bs_in_cuda_graph: maximum batch size for CUDA Graph mode
+            num_tokens_per_bs: number of tokens per sequence (1 for decoding, >1 for target_verify)
         """
         pass
 
@@ -117,7 +117,7 @@ class BaseLoRABackend:
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        batch_info: Optional[LoRABatchInfo] = None,
+        use_cuda_graph: bool,
     ):
         """Prepare the lora weights and batch info for current forward batch.
 
@@ -129,27 +129,6 @@ class BaseLoRABackend:
             weight_indices: list of indices of lora weights to be applied for current batch
             lora_ranks: list of lora ranks corresponding to weight_indices
             scalings: list of scaling factors corresponding to weight_indices
-            batch_info: optional LoRABatchInfo object, if not provided, the backend should use its own
-                        internal batch info (e.g., self.cuda_graph_batch_info for CUDA Graph mode)
+            use_cuda_graph: whether to use CUDA Graph for this batch
         """
         pass
-
-
-def get_backend_from_name(name: str) -> BaseLoRABackend:
-    """
-    Get corresponding backend class from backend's name
-    """
-    if name == "triton":
-        from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
-
-        return TritonLoRABackend
-    elif name == "csgmv":
-        from sglang.srt.lora.backend.chunked_backend import ChunkedSgmvLoRABackend
-
-        return ChunkedSgmvLoRABackend
-    elif name == "flashinfer":
-        raise ValueError(
-            "FlashInfer LoRA backend has been deprecated, please use `triton` instead."
-        )
-    else:
-        raise ValueError(f"Invalid backend: {name}")

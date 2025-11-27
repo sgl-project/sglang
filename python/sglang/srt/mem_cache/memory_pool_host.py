@@ -7,9 +7,17 @@ from typing import Optional
 import psutil
 import torch
 
+from sglang.jit_kernel.hicache import can_use_hicache_jit_kernel
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
+)
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
+)
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool, MLATokenToKVPool
-from sglang.srt.utils import is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_npu, is_xpu
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 if not (_is_npu or _is_xpu):
@@ -17,6 +25,7 @@ if not (_is_npu or _is_xpu):
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_lf_pf,
+        transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
         transfer_kv_all_layer_mla_lf_pf,
         transfer_kv_direct,
@@ -25,6 +34,7 @@ if not (_is_npu or _is_xpu):
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
+        transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
@@ -32,8 +42,6 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 SUPPORT_PIN_MEMORY = not _is_npu
-if SUPPORT_PIN_MEMORY:
-    logger.warning("Current platform not support pin_memory")
 
 
 def synchronized(func):
@@ -203,6 +211,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
         )
+        self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
+        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
+            element_size=self.element_dim * self.dtype.itemsize
+        )
+
         self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
         self.k_data_ptrs = torch.tensor(
@@ -240,6 +253,15 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.head_num,
                 self.head_dim,
             )
+        elif self.layout == "page_head":
+            dims = (
+                2,
+                self.page_num,
+                self.head_num,
+                self.page_size,
+                self.layer_num,
+                self.head_dim,
+            )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
@@ -273,15 +295,26 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_kv_per_layer(
-                    src_k=self.k_buffer[layer_id],
-                    dst_k=device_pool.k_buffer[layer_id],
-                    src_v=self.v_buffer[layer_id],
-                    dst_v=device_pool.v_buffer[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    item_size=self.token_stride_size,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_one_layer(
+                        k_cache_dst=device_pool.k_buffer[layer_id],
+                        v_cache_dst=device_pool.v_buffer[layer_id],
+                        k_cache_src=self.k_buffer[layer_id],
+                        v_cache_src=self.v_buffer[layer_id],
+                        indices_dst=device_indices,
+                        indices_src=host_indices,
+                        element_dim=self.element_dim,
+                    )
+                else:
+                    transfer_kv_per_layer(
+                        src_k=self.k_buffer[layer_id],
+                        dst_k=device_pool.k_buffer[layer_id],
+                        src_v=self.v_buffer[layer_id],
+                        dst_v=device_pool.v_buffer[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        item_size=self.token_stride_size,
+                    )
             elif self.layout == "page_first":
                 transfer_kv_per_layer_pf_lf(
                     src_k=self.k_buffer,
@@ -293,6 +326,20 @@ class MHATokenToKVPoolHost(HostKVCache):
                     layer_id=layer_id,
                     item_size=self.token_stride_size,
                     src_layout_dim=self.layout_dim,
+                )
+            elif self.layout == "page_head":
+                transfer_kv_per_layer_ph_lf(
+                    src_k=self.k_buffer,
+                    dst_k=device_pool.k_buffer[layer_id],
+                    src_v=self.v_buffer,
+                    dst_v=device_pool.v_buffer[layer_id],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    layer_id=layer_id,
+                    item_size=self.token_stride_size,
+                    src_layout_dim=self.layout_dim,
+                    page_size=self.page_size,
+                    head_num=self.head_num,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -346,16 +393,29 @@ class MHATokenToKVPoolHost(HostKVCache):
     ):
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                transfer_kv_all_layer(
-                    src_k_layers=device_pool.k_data_ptrs,
-                    dst_k_layers=self.k_data_ptrs,
-                    src_v_layers=device_pool.v_data_ptrs,
-                    dst_v_layers=self.v_data_ptrs,
-                    src_indices=device_indices,
-                    dst_indices=host_indices,
-                    item_size=self.token_stride_size,
-                    num_layers=self.layer_num,
-                )
+                if self.can_use_jit:
+                    jit_transfer_hicache_all_layer(
+                        k_ptr_dst=self.k_data_ptrs,
+                        v_ptr_dst=self.v_data_ptrs,
+                        indices_dst=host_indices,
+                        k_ptr_src=device_pool.k_data_ptrs,
+                        v_ptr_src=device_pool.v_data_ptrs,
+                        indices_src=device_indices,
+                        kv_cache_dst_stride_bytes=self.token_stride_size,
+                        kv_cache_src_stride_bytes=self.token_stride_size,
+                        element_size=self.element_dim * self.dtype.itemsize,
+                    )
+                else:
+                    transfer_kv_all_layer(
+                        src_k_layers=device_pool.k_data_ptrs,
+                        dst_k_layers=self.k_data_ptrs,
+                        src_v_layers=device_pool.v_data_ptrs,
+                        dst_v_layers=self.v_data_ptrs,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        item_size=self.token_stride_size,
+                        num_layers=self.layer_num,
+                    )
             elif self.layout == "page_first":
                 transfer_kv_all_layer_lf_pf(
                     src_k_layers=device_pool.k_data_ptrs,
@@ -367,6 +427,20 @@ class MHATokenToKVPoolHost(HostKVCache):
                     item_size=self.token_stride_size,
                     dst_layout_dim=self.layout_dim,
                     num_layers=self.layer_num,
+                )
+            elif self.layout == "page_head":
+                transfer_kv_all_layer_lf_ph(
+                    src_k_layers=device_pool.k_data_ptrs,
+                    dst_k=self.k_buffer,
+                    src_v_layers=device_pool.v_data_ptrs,
+                    dst_v=self.v_buffer,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    item_size=self.token_stride_size,
+                    dst_layout_dim=self.layout_dim,
+                    num_layers=self.layer_num,
+                    page_size=self.page_size,
+                    head_num=self.head_num,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -411,7 +485,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
-        elif self.layout == "page_first_direct":
+        elif self.layout in ["page_first_direct", "page_head"]:
             real_index = index // self.page_size
             data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
         else:
@@ -450,6 +524,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
                 data_page.reshape(
                     2, 1, self.layer_num, self.page_size, self.head_num, self.head_dim
+                )
+            )
+        elif self.layout == "page_head":
+            real_index = index // self.page_size
+            self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
+                data_page.reshape(
+                    2, 1, self.head_num, self.page_size, self.layer_num, self.head_dim
                 )
             )
         else:
@@ -492,7 +573,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                 self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
             )
             element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_head"]:
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     kv_buffer_data_ptr
