@@ -65,7 +65,7 @@ FetchContent_Populate(repo-deepgemm)
 FetchContent_Declare(
     repo-fmt
     GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        f259a0eaf0294de4f710541807023480ddcfc206
+    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-fmt)
