@@ -9,10 +9,10 @@ import pytest
 
 
 @pytest.mark.parametrize("setup_backend", ["grpc", "grpc_harmony"], indirect=True)
-class TestStreamingEventsTest:
+class TestStreamingEvents:
     """Tests for streaming event validation."""
 
-    def test_output_index_zero_based(self, setup_backend):
+    def test_output_item_event_emitted(self, setup_backend):
         """
         Test that output_index is zero-based in streaming responses.
         Verifies that the first output item has output_index: 0.
@@ -49,57 +49,17 @@ class TestStreamingEventsTest:
                 event.output_index == i
             ), f"Output item {i} should have output_index: {i}"
 
-    def test_output_item_done_event_emitted(self, setup_backend):
-        """
-        Test that response.output_item.done event is emitted in streaming.
-        Verifies that output_item.done events are emitted for each output item.
-        """
-        _, model, client = setup_backend
-
-        resp = client.responses.create(
-            model=model,
-            input="Say hello",
-            stream=True,
-            max_output_tokens=50,
-        )
-
-        events = [event for event in resp]
-        assert len(events) > 0
-
-        event_types = [e.type for e in events]
-
         # Verify output_item.done event exists
-        assert (
-            "response.output_item.done" in event_types
-        ), "Should emit response.output_item.done event"
-
-        # Verify output_item.done event structure
         output_item_done_events = [
             event for event in events if event.type == "response.output_item.done"
         ]
         assert len(output_item_done_events) > 0
 
+        # Verify output_item.done event structure
         for event in output_item_done_events:
             assert event.item is not None
             assert event.output_index is not None
             assert event.item.type is not None
-
-    def test_output_array_in_completed_event(self, setup_backend):
-        """
-        Test that output array is properly constructed in response.completed event.
-        Verifies that the completed event contains all output items in the output array.
-        """
-        _, model, client = setup_backend
-
-        resp = client.responses.create(
-            model=model,
-            input="What is 2+2?",
-            stream=True,
-            max_output_tokens=50,
-        )
-
-        events = [event for event in resp]
-        assert len(events) > 0
 
         # Find response.completed event
         completed_events = [
@@ -128,18 +88,15 @@ class TestStreamingEventsTest:
             output_array
         ), "Number of output_item.added events should match output array length"
 
-
-@pytest.mark.parametrize("setup_backend", ["grpc_harmony"], indirect=True)
-class TestHarmonyStreamingEvents:
-    """Tests for Harmony-specific streaming events (reasoning content)."""
-
-    def test_reasoning_content_output_index(self, setup_backend):
+    def test_reasoning_content(self, setup_backend):
         """
         Test that reasoning content has correct zero-based output_index.
         Specifically tests that reasoning item has output_index: 0
         and message item has output_index: 1.
         """
-        _, model, client = setup_backend
+        backend, model, client = setup_backend
+        if backend in ["grpc"]:
+            pytest.skip("skip test_reasoning_content for grpc")
 
         resp = client.responses.create(
             model=model,
@@ -177,24 +134,6 @@ class TestHarmonyStreamingEvents:
             assert (
                 message_item.output_index == 1
             ), "Message item after reasoning should have output_index: 1"
-
-    def test_reasoning_content_in_output_array(self, setup_backend):
-        """
-        Test that reasoning content is properly included in final output array.
-        Verifies that reasoning items are stored and included in the
-        response.completed event's output array.
-        """
-        _, model, client = setup_backend
-
-        resp = client.responses.create(
-            model=model,
-            input="Explain why 2+2=4. Show your reasoning.",
-            stream=True,
-            max_output_tokens=200,
-        )
-
-        events = [event for event in resp]
-        assert len(events) > 0
 
         # Find response.completed event
         completed_events = [
