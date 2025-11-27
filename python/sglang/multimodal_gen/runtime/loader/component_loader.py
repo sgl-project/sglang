@@ -144,7 +144,11 @@ class ComponentLoader(ABC):
     ):
         """
         Template method that standardizes logging around the core load implementation.
-        Subclasses should implement load_customized.
+        The priority of loading method is:
+            1. load customized module
+            2. load native diffusers/transformers module
+        If all of the above methods failed, an error will be thrown
+
         """
         logger.info("Loading %s from %s", module_name, component_model_path)
         try:
@@ -152,7 +156,6 @@ class ComponentLoader(ABC):
                 component_model_path, server_args, module_name
             )
             source = "customized"
-        # except NotImplementedError:
         except Exception as e:
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers
@@ -161,10 +164,8 @@ class ComponentLoader(ABC):
             target_device = self.target_device(should_offload)
             component = component.to(device=target_device)
             source = "native"
+            logger.warning("Native module %s is loaded, performance may be sub-optimal", module_name)
 
-        # except Exception as e:
-        #     logger.error("Failed to load %s from %s: %s", module_name, component_model_path, e)
-        #     raise
         if component is None:
             logger.warning("Loaded %s returned None", module_name)
         else:
