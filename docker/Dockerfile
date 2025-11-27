@@ -149,24 +149,6 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
-########################################################
-########## Framework Development Image ################
-########################################################
-#
-# PURPOSE: Framework development and SGLang compilation
-#
-# This stage builds and compiles framework dependencies including:
-# - SGLang inference engine with CUDA support
-# - DeepEP for distributed inference
-# - All necessary build tools and compilation dependencies
-# - Framework-level Python packages and extensions
-#
-# Use this stage when you need to:
-# - Build SGLang from source with custom modifications
-# - Develop or debug framework-level components
-# - Create custom builds with specific optimization flags
-#
-
 # Copy local source if building from local
 FROM scratch AS local_src
 COPY . /src
