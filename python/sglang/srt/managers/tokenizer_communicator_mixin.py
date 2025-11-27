@@ -407,17 +407,14 @@ class TokenizerCommunicatorMixin:
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             if self.is_pause:
-                result = (await self.update_weights_from_distributed_communicator(obj))[
-                    0
-                ]
-                return result.success, result.message
+                results = await self.update_weights_from_distributed_communicator(obj)
+            else:
+                # This means that weight sync
+                # cannot run while requests are in progress.
+                async with self.model_update_lock.writer_lock:
+                    results = await self.update_weights_from_distributed_communicator(obj)
 
-        # This means that weight sync
-        # cannot run while requests are in progress.
-        async with self.model_update_lock.writer_lock:
-            results = await self.update_weights_from_distributed_communicator(obj)
-            success, message = _Communicator.merge_results(results)
-
+        success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -468,15 +465,14 @@ class TokenizerCommunicatorMixin:
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
             if self.is_pause:
-                result = (await self.update_weights_from_tensor_communicator(obj))[0]
-                return result.success, result.message
+                results = await self.update_weights_from_tensor_communicator(obj)
+            else:
+                # This means that weight sync
+                # cannot run while requests are in progress.
+                async with self.model_update_lock.writer_lock:
+                    results = await self.update_weights_from_tensor_communicator(obj)
 
-        # This means that weight sync
-        # cannot run while requests are in progress.
-        async with self.model_update_lock.writer_lock:
-            result = (await self.update_weights_from_tensor_communicator(obj))[0]
-            success, message = result.success, result.message
-
+        success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
