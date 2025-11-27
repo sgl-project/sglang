@@ -348,26 +348,11 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
 
         input_ids = input_ids.flatten()
 
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.mm_tokens.image_token_id,
-            video_token_id=self.mm_tokens.video_token_id,
-            vision_start_token_id=self.vision_start_token_id,
-            model_type=self.model_type,
-            tokens_per_second=getattr(
-                self.hf_config.vision_config, "tokens_per_second", None
-            ),
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_ernie45(
             input_ids=input_ids.unsqueeze(0),
+            hf_config=self.hf_config,
             image_grid_thw=getattr(ret, "image_grid_thw", None),
             video_grid_thw=getattr(ret, "video_grid_thw", None),
-            second_per_grid_ts=second_per_grid_ts,
-            use_audio_in_video=False,
-            audio_seqlens=audio_feature_lengths,
-            audio_token_id=getattr(self.hf_config, "audio_token_id", None),
-            audio_start_token_id=self.audio_start_token_id,
-            position_id_per_seconds=getattr(
-                self.hf_config, "position_id_per_seconds", None
-            ),
         )
         mrope_positions = mrope_positions.squeeze(1)
         get_rope_index_time = time.perf_counter()
@@ -380,14 +365,27 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
         )
 
-        return {
+        mm_inputs = {
             "input_ids": input_ids.tolist(),
             "mm_items": mm_items,
             "im_start_id": self.IM_START_TOKEN_ID,
             "im_end_id": self.IM_END_TOKEN_ID,
             "im_token_id": self.mm_tokens.image_token_id,
             "video_token_id": self.mm_tokens.video_token_id,
-            "audio_token_id": self.mm_tokens.audio_token_id,
             "mrope_positions": mrope_positions,
             "mrope_position_delta": mrope_position_delta,
         }
+
+        return mm_inputs
+
+        # return {
+        #     "input_ids": input_ids.tolist(),
+        #     "mm_items": mm_items,
+        #     "im_start_id": self.IM_START_TOKEN_ID,
+        #     "im_end_id": self.IM_END_TOKEN_ID,
+        #     "im_token_id": self.mm_tokens.image_token_id,
+        #     "video_token_id": self.mm_tokens.video_token_id,
+        #     "audio_token_id": self.mm_tokens.audio_token_id,
+        #     "mrope_positions": mrope_positions,
+        #     "mrope_position_delta": mrope_position_delta,
+        # }

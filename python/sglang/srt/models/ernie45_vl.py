@@ -29,8 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
-from transformers import Ernie4_5_VLConfig
-from transformers.models.qwen2_vl.configuration_qwen2_vl import Ernie4_5_VLVisionConfig
+from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -481,7 +480,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
 
     def __init__(
         self,
-        vision_config: Ernie4_5_VLVisionConfig,
+        vision_config: PretrainedConfig,
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -627,7 +626,7 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: Ernie4_5_VLConfig,
+        config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -757,7 +756,7 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
-
+        # TODO 计算 视觉mask
         if self._visual_token_ids_tensor_cache is None:
             visual_token_mask = None
         else:
@@ -769,7 +768,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                 -1, 1
             )
 
-        # TODO 计算 视觉mask
         if visual_token_mask is not None:
             if visual_token_mask.shape[0] != input_ids.shape[0]:
                 padding_len = input_ids.shape[0] - visual_token_mask.shape[0]
