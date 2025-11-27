@@ -47,10 +47,12 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
+    Tool,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -366,6 +368,35 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return self.create_error_response(str(e))
         return self.create_error_response("Unknown error")
 
+    def _convert_response_tools_to_chat_tools(
+        self, response_tools: list[Any]
+    ) -> Optional[list[Tool]]:
+        """Convert ResponseTool objects to Tool objects for ChatCompletionRequest."""
+        if not response_tools:
+            return None
+
+        chat_tools = []
+        for response_tool in response_tools:
+            # Only convert function tools; skip built-in tools like web_search_preview and code_interpreter
+            if response_tool.type == "function":
+                if not response_tool.name:
+                    logger.warning(
+                        f"Skipping function tool without name: {response_tool}"
+                    )
+                    continue
+                chat_tool = Tool(
+                    type="function",
+                    function=Function(
+                        name=response_tool.name,
+                        description=response_tool.description,
+                        parameters=response_tool.parameters,
+                        strict=getattr(response_tool, "strict", False),
+                    ),
+                )
+                chat_tools.append(chat_tool)
+
+        return chat_tools if chat_tools else None
+
     async def _make_request(
         self,
         request: ResponsesRequest,
@@ -375,6 +406,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         # Construct the input messages
         messages = self._construct_input_messages(request, prev_response)
 
+        # Convert ResponseTool to Tool format for ChatCompletionRequest
+        tools = self._convert_response_tools_to_chat_tools(request.tools)
+
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
             # Convert ResponsesRequest to ChatCompletionRequest for processing
@@ -382,6 +416,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                tools=tools,
+                tool_choice=request.tool_choice,
             )
 
             # Follow SGLang's _process_messages pattern

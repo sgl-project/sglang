@@ -927,9 +927,17 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
+    type: Literal["web_search_preview", "code_interpreter", "function", "mcp"] = Field(
         description="Type of tool to enable"
     )
+
+    # Function tool fields (used when type == "function")
+    name: Optional[str] = Field(default=None, description="Function name")
+    description: Optional[str] = Field(default=None, description="Function description")
+    parameters: Optional[object] = Field(
+        default=None, description="Function parameters schema"
+    )
+    strict: bool = Field(default=False, description="Whether to use strict mode")
 
 
 ResponseInputOutputItem: TypeAlias = Union[
