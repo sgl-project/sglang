@@ -7,7 +7,7 @@ from sglang.srt.utils.common import is_cuda, is_npu
 if is_cuda():
     from sgl_kernel import weak_ref_tensor
 elif is_npu():
-    from sgl_kernel_npu.memory import weak_ref_tensor
+    from torch_npu._C import _weak_ref_tensor as weak_ref_tensor
 else:
     raise NotImplementedError("weak_ref_tensor is implemented only for CUDA and NPU.")
 
