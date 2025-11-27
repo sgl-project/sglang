@@ -27,6 +27,7 @@ import ipaddress
 import itertools
 import json
 import logging
+import math
 import os
 import pickle
 import platform
@@ -96,6 +97,9 @@ from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 if TYPE_CHECKING:
+    # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
+    from decord import VideoReader
+
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -633,38 +637,48 @@ def get_cmo_stream():
     AIV or communication kernels, aiming to overlap the memory access time.
     """
     global cmo_stream
-    if cmo_stream is None:
-        cmo_stream = torch.get_device_module().Stream()
     return cmo_stream
 
 
-def prepare_weight_cache(handle, cache):
+def set_cmo_stream(stream):
+    global cmo_stream
+    cmo_stream = stream
+
+
+def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
+    """
+    PREFETCH_MAX_SIZE: maximum size (bytes) for each prefetch operation.
+    This affects the time spent in prefetch:
+        time ≈ PREFETCH_MAX_SIZE / system_bandwidth
+    """
     import torch_npu
 
-    NPU_PREFETCH_MAX_SIZE_BYTES = (
-        1000000000  # 1GB, a large value to prefetch entire weight
-    )
     stream = get_cmo_stream()
-    stream.wait_stream(torch.npu.current_stream())
-    with torch.npu.stream(stream):
+    if stream is None:
+        stream = torch.get_device_module().Stream()
+        set_cmo_stream(stream)
+    stream.wait_stream(torch.get_device_module().current_stream())
+    with torch.get_device_module().stream(stream):
         if isinstance(cache, list):
             for weight in cache:
                 torch_npu.npu_prefetch(
                     weight,
                     handle,
-                    NPU_PREFETCH_MAX_SIZE_BYTES,
+                    PREFETCH_MAX_SIZE,
                 )
         else:
             torch_npu.npu_prefetch(
                 cache,
                 handle,
-                NPU_PREFETCH_MAX_SIZE_BYTES,
+                PREFETCH_MAX_SIZE,
             )
 
 
 def wait_cmo_stream():
-    cur_stream = torch.get_device_module().current_stream()
-    cur_stream.wait_stream(get_cmo_stream())
+    stream = get_cmo_stream()
+    if stream is not None:
+        cur_stream = torch.get_device_module().current_stream()
+        cur_stream.wait_stream(stream)
 
 
 @lru_cache(maxsize=1)
@@ -982,6 +996,24 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
     finally:
         if tmp_file and os.path.exists(tmp_file.name):
             os.unlink(tmp_file.name)
+
+
+def sample_video_frames(
+    video: "VideoReader", *, desired_fps: int, max_frames: int
+) -> list[int]:
+    total_frames = len(video)
+    assert total_frames > 0, "Video must have at least one frame"
+
+    duration = total_frames / video.get_avg_fps()
+    fps = min(desired_fps, video.get_avg_fps())
+
+    num_frames = math.floor(duration * fps)
+    num_frames = min(max_frames, num_frames, total_frames)
+    num_frames = max(1, num_frames)  # At least one frame
+    if num_frames == total_frames:
+        return list(range(total_frames))
+    else:
+        return np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
 
 
 def encode_video(video_path, frame_count_limit=None):
@@ -2743,6 +2775,21 @@ def load_json_config(data: str):
 
 
 def dispose_tensor(x: torch.Tensor):
+    """
+    Dispose a tensor by freeing its memory.
+    During piecewise CUDA graph capture/replay, we skip disposal to avoid
+    interfering with torch.compile's memory tracking and graph recording.
+    """
+
+    # Skip disposal during piecewise CUDA graph to avoid torch.compile issues
+    # we do local import to avoid circular import
+    from sglang.srt.compilation.piecewise_context_manager import (
+        is_in_piecewise_cuda_graph,
+    )
+
+    if is_in_piecewise_cuda_graph():
+        return
+
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
 
 
@@ -3653,11 +3700,6 @@ def reserve_rope_cache_for_long_sequences(
     """Pre-expand RoPE cache for long sequences and speculative decoding."""
     from sglang.srt.environ import envs
 
-    if logger is None:
-        import logging
-
-        logger = logging.getLogger(__name__)
-
     SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.value
     MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.value
     ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.value
@@ -3679,23 +3721,13 @@ def reserve_rope_cache_for_long_sequences(
     # 3) Align to reduce reallocation frequency
     reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
 
-    logger.info(
-        f"RoPE cache reserve={reserve} (cap={base_ctx}, steps={steps}, draft={draft}, k={SAFETY_FACTOR}, margin={MARGIN})"
-    )
-
     # Recursively expand all RoPE layers
     def reserve_rope_cache_recursive(module):
         for child in module.children():
             if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
                 child, "cos_sin_cache"
             ):
-                old_len = child.cos_sin_cache.shape[0]
                 child._ensure_cos_sin_cache_length(reserve - 1)
-                new_len = child.cos_sin_cache.shape[0]
-                if new_len > old_len:
-                    logger.info(
-                        f"Expanded RoPE cache from {old_len} to {new_len} positions"
-                    )
             else:
                 reserve_rope_cache_recursive(child)
 
