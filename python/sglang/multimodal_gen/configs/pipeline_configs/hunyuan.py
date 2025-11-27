@@ -15,7 +15,10 @@ from sglang.multimodal_gen.configs.models.encoders import (
     LlamaConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
+    PipelineConfig,
+)
 
 PROMPT_TEMPLATE_ENCODE_VIDEO = (
     "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: "
@@ -65,6 +68,8 @@ def clip_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.ten
 @dataclass
 class HunyuanConfig(PipelineConfig):
     """Base configuration for HunYuan pipeline architecture."""
+
+    task_type: ModelTaskType = ModelTaskType.T2V
 
     # HunyuanConfig-specific parameters with defaults
     # DiT

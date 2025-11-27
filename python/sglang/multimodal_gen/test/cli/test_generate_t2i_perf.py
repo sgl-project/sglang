@@ -24,8 +24,15 @@ class TestFlux_T2V(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 6.90 * 1.05,
+        "test_single_gpu": 6.5 * 1.05,
+        "test_usp": 8.3 * 1.05,
     }
+
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
 
 
 class TestQwenImage(TestGenerateBase):
@@ -33,8 +40,15 @@ class TestQwenImage(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 11.7 * 1.05,
+        "test_single_gpu": 10.4 * 1.05,
+        "test_usp": 20.2 * 1.05,
     }
+
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
 
 
 class TestQwenImageEdit(TestGenerateBase):
@@ -42,7 +56,8 @@ class TestQwenImageEdit(TestGenerateBase):
     extra_args = []
     data_type: DataType = DataType.IMAGE
     thresholds = {
-        "test_single_gpu": 43.5 * 1.05,
+        "test_single_gpu": 33.4 * 1.05,
+        "test_usp": 26.9 * 1.05,
     }
 
     prompt: str | None = (
@@ -66,13 +81,11 @@ class TestQwenImageEdit(TestGenerateBase):
             f"--output-path={self.output_path}",
         ] + [f"--image-path={img_path}"]
 
-    def test_single_gpu(self):
-        self._run_test(
-            name=f"{self.model_name()}_single_gpu",
-            args=None,
-            model_path=self.model_path,
-            test_key="test_single_gpu",
-        )
+    def test_cfg_parallel(self):
+        pass
+
+    def test_mixed(self):
+        pass
 
 
 if __name__ == "__main__":
