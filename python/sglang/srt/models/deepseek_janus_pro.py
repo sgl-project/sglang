@@ -606,10 +606,12 @@ class PatchDropout(nn.Module):
 
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
-                seed_tensor = torch.randint(0, 2**32, (1,), dtype=torch.int64, device=x.device)
+                seed_tensor = torch.randint(
+                    0, 2**32, (1,), dtype=torch.int64, device=x.device
+                )
             else:
                 seed_tensor = torch.empty((1,), dtype=torch.int64, device=x.device)
-            
+
             torch.distributed.broadcast(seed_tensor, src=0)
             generator = torch.Generator(device=x.device).manual_seed(seed_tensor.item())
             noise = torch.randn(B, L, device=x.device, generator=generator)
