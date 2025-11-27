@@ -412,7 +412,9 @@ class TokenizerCommunicatorMixin:
                 # This means that weight sync
                 # cannot run while requests are in progress.
                 async with self.model_update_lock.writer_lock:
-                    results = await self.update_weights_from_distributed_communicator(obj)
+                    results = await self.update_weights_from_distributed_communicator(
+                        obj
+                    )
 
         success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
