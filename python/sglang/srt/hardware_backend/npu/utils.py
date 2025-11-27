@@ -2,6 +2,10 @@ import functools
 import logging
 from typing import TYPE_CHECKING, Callable
 
+import torch
+
+from sglang.srt.utils import is_npu
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
@@ -44,3 +48,22 @@ def set_default_server_args(args: "ServerArgs"):
             args.hicache_mem_layout = "page_first_kv_split"
         else:
             args.hicache_mem_layout = "page_first_direct"
+
+
+@_call_once
+def init_npu_backend():
+    """
+    Initialize NPU backend. This function should be called only once.
+    """
+
+    assert is_npu(), "NPU backend initialization called on non-NPU device."
+
+    import sgl_kernel_npu  # noqa: F401
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
+    torch.cuda.is_available = lambda: False
+
+    torch_npu.npu.config.allow_internal_format = True
+    torch_npu.npu.set_compile_mode(jit_compile=False)
