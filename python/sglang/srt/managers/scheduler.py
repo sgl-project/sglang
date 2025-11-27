@@ -150,6 +150,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.ascend_radix_cache import AscendHiRadixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -723,6 +724,7 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            gpu_id=self.gpu_id,
         )
 
         if (
@@ -746,6 +748,16 @@ class Scheduler(
 
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
+            elif (
+                self.enable_hierarchical_cache
+                and self.server_args.hicache_storage_backend == "memcache"
+            ):
+                self.tree_cache = AscendHiRadixCache(
+                    params=params, server_args=server_args
+                )
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
             elif self.enable_hierarchical_cache:
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
@@ -1435,7 +1447,7 @@ class Scheduler(
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache)
-            if req.last_node.backuped:
+            if req.last_node != self.tree_cache.root_node and req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
                 last_hash = req.last_host_node.get_last_hash_value()
@@ -1784,6 +1796,7 @@ class Scheduler(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
+                enable_hierarchical_cache=self.enable_hierarchical_cache,
             )
 
             if res != AddReqResult.CONTINUE:
