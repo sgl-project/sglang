@@ -107,7 +107,7 @@ class NpuAddRmsNormDynamicQuantFuse:
         )
         out0 = output[0]
         out2 = output[2]
-        quantized_output = torch.ops.npu.npu_dynamic_quant(out0)
+        quantized_output, dynamic_scale = torch.ops.npu.npu_dynamic_quant(out0)
         return quantized_output, out2, dynamic_scale
 
     def replacement(rms_norm_input, residual, rms_norm_weight):
