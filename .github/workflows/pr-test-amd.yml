@@ -5,7 +5,6 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
@@ -14,7 +13,6 @@ on:
     branches: [ main ]
     paths:
       - "python/**"
-      - "!python/sglang/multimodal_gen/**"
       - "scripts/ci/**"
       - "test/**"
       - "sgl-kernel/**"
@@ -41,6 +39,7 @@ jobs:
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -56,6 +55,11 @@ jobs:
               - ".github/workflows/pr-test-amd.yml"
             sgl_kernel:
               - "sgl-kernel/**"
+            multimodal_gen:
+              - "python/sglang/multimodal_gen/**"
+              - "python/sglang/cli/**"
+              - "python/*.toml"
+              - ".github/workflows/pr-test-amd.yml"
 
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
@@ -139,6 +143,44 @@ jobs:
         timeout-minutes: 10
         run: |
           docker exec -w /sglang-checkout/test ci_sglang python3 run_suite.py --hw amd --suite stage-a-test-1
+
+  multimodal-gen-test-amd:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi300-gpu-1]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd_ci_install_dependency.sh diffusion
+
+      - name: Run diffusion server tests
+        timeout-minutes: 60
+        run: |
+          true
+          docker exec -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server/test_server_performance.py -s -v --log-cli-level=INFO
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -399,7 +441,7 @@ jobs:
       - name: Benchmark dummy grok (TP=2)
         timeout-minutes: 30
         run: |
-          bash scripts/ci/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
+          docker exec -w /sglang-checkout/test/manual/models ci_sglang python3 test_dummy_grok_models.py
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 25
@@ -504,6 +546,7 @@ jobs:
         check-changes,
 
         sgl-kernel-unit-test-amd,
+        multimodal-gen-test-amd,
 
         stage-a-test-1-amd,
         unit-test-backend-1-gpu-amd,
