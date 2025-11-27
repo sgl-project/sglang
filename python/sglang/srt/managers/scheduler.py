@@ -178,7 +178,6 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
-    get_local_ip_by_remote,
     get_zmq_socket,
     kill_itself_when_parent_died,
     numa_bind_to_node,
@@ -236,7 +235,6 @@ class Scheduler(
     ):
         # Parse args
         self.server_args = server_args
-        self.host_name = get_local_ip_by_remote()
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
@@ -546,11 +544,10 @@ class Scheduler(
 
         if (
             self.server_args.language_only
-            and self.server_args.mm_transfer_backend == "zmq_s"
+            and self.server_args.mm_transfer_backend == "zmq_to_scheduler"
         ):
             self.mm_receiver = MMReceiver(
                 server_args,
-                hostname=self.host_name,
                 hf_config=self.model_config.hf_config,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
@@ -1193,7 +1190,7 @@ class Scheduler(
         # Process MM requests under E disaggregation
         if (
             self.server_args.language_only
-            and self.server_args.mm_transfer_backend == "zmq_s"
+            and self.server_args.mm_transfer_backend == "zmq_to_scheduler"
         ):
             self.mm_receiver.process_waiting_requests(recv_reqs)
 

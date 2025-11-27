@@ -448,7 +448,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if (
             self.server_args.language_only
             and isinstance(obj, GenerateReqInput)
-            and self.server_args.mm_transfer_backend == "zmq_s"
+            and self.server_args.mm_transfer_backend == "zmq_to_scheduler"
         ):
             self.mm_receiver.send_encode_requset(obj)
 
@@ -731,7 +731,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if (
                 not self.server_args.language_only
-                or self.server_args.mm_transfer_backend != "zmq_s"
+                or self.server_args.mm_transfer_backend != "zmq_to_scheduler"
             ):
                 if self.server_args.language_only:
                     mm_inputs = await self.mm_receiver.recv_mm_data(
