@@ -454,6 +454,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     # Python runtime
     software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
     python3.12-full \
     python3.12-dev \
