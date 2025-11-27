@@ -18,24 +18,24 @@ class TestCreateKvIndices(CustomTestCase):
 
     def _run_test(self, batch, max_batch, max_context_len):
         req_to_token = torch.arange(
-            max_batch * max_context_len, dtype=torch.int32, device="cuda"
+            max_batch * max_context_len, dtype=torch.int32, device=env_type
         ).reshape((max_batch, max_context_len))
         req_pool_indices = torch.tensor(
             torch.from_numpy(
                 np.random.choice(range(max_batch), size=batch, replace=False)
             ),
             dtype=torch.int32,
-            device="cuda",
+            device=env_type,
         )
         paged_kernel_lens = torch.tensor(
             torch.from_numpy(
                 np.random.choice(range(max_context_len), size=batch, replace=False)
             ),
             dtype=torch.int32,
-            device="cuda",
+            device=env_type,
         )
 
-        kv_indptr = torch.zeros((batch + 1,), dtype=torch.int32, device="cuda")
+        kv_indptr = torch.zeros((batch + 1,), dtype=torch.int32, device=env_type)
         kv_indptr[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
         # ref
@@ -50,7 +50,7 @@ class TestCreateKvIndices(CustomTestCase):
         ).contiguous()
 
         # triton
-        kv_indices_triton = torch.empty(kv_indptr[-1], dtype=torch.int32, device="cuda")
+        kv_indices_triton = torch.empty(kv_indptr[-1], dtype=torch.int32, device=env_type)
         create_flashinfer_kv_indices_triton[(batch,)](
             req_to_token,
             req_pool_indices,
