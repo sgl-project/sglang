@@ -212,7 +212,18 @@ class LMCRadixCache(RadixCache):
         if not is_insert:
             return
 
-        kv_committed_len = req.kv_committed_len
+        from sglang.srt.server_args import get_global_server_args
+
+        global_server_args = get_global_server_args()
+        topk = global_server_args.speculative_eagle_topk
+        enable_kv_committed_len = topk is None or topk == 1
+        if enable_kv_committed_len:
+            kv_committed_len = req.kv_committed_len
+        else:
+            kv_committed_len = len(req.origin_input_ids) + max(
+                len(req.output_ids) - 1, 0
+            )
+
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
