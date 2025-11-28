@@ -213,9 +213,20 @@ class DiffusersPipeline(ComposedPipelineBase):
         logger.info("Loading diffusers pipeline with dtype=%s", dtype)
         try:
             pipe = DiffusionPipeline.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=server_args.trust_remote_code, revision=server_args.revision)
+        except AttributeError as e:
+            if "has no attribute" in str(e) and not server_args.trust_remote_code:
+                raise RuntimeError(
+                    f"This model uses a custom pipeline class not in diffusers. "
+                    f"Please add --trust-remote-code flag to load it. Original error: {e}"
+                ) from e
+            raise
         except Exception as e:
-            logger.warning("Failed with dtype=%s, falling back to float32: %s", dtype, e)
-            pipe = DiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.float32, trust_remote_code=server_args.trust_remote_code, revision=server_args.revision)
+            # Only retry with float32 for dtype-related errors
+            if "dtype" in str(e).lower() or "float" in str(e).lower():
+                logger.warning("Failed with dtype=%s, falling back to float32: %s", dtype, e)
+                pipe = DiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.float32, trust_remote_code=server_args.trust_remote_code, revision=server_args.revision)
+            else:
+                raise
         if torch.cuda.is_available():
             pipe = pipe.to("cuda")
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
