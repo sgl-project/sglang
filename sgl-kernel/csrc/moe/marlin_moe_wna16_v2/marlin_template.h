@@ -1325,15 +1325,17 @@ __global__ void Marlin(
       }
     }
 
-    if constexpr (w_type == sglang::kFE2M1f) {
-      int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
-      int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
-
-      dequant_fp8_scales<scalar_t2, s_type_id>(
-          s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
-      dequant_fp8_scales<scalar_t2, s_type_id>(
-          s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
-    }
+    // Commented out FP4/FP8 scale dequantization since we don't generate
+    // kFE2M1f kernels to reduce compilation time
+    // if constexpr (w_type == sglang::kFE2M1f) {
+    //   int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
+    //   int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
+    //
+    //   dequant_fp8_scales<scalar_t2, s_type_id>(
+    //       s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
+    //   dequant_fp8_scales<scalar_t2, s_type_id>(
+    //       s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
+    // }
 
   // We have the m dimension as the inner loop in order to encourage overlapping
   // dequantization and matmul operations.
