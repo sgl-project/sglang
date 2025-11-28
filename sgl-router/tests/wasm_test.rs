@@ -522,7 +522,7 @@ async fn test_wasm_api_remove_module() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(&format!("/wasm/{}", module_uuid))
+                .uri(format!("/wasm/{}", module_uuid))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -564,7 +564,7 @@ async fn test_wasm_api_remove_module_not_found() {
         .oneshot(
             Request::builder()
                 .method("DELETE")
-                .uri(&format!("/wasm/{}", fake_uuid))
+                .uri(format!("/wasm/{}", fake_uuid))
                 .body(Body::empty())
                 .unwrap(),
         )
