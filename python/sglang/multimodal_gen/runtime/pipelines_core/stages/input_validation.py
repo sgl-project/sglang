@@ -11,7 +11,11 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
+from sglang.multimodal_gen.runtime.models.vision_utils import (
+    load_image,
+    load_video,
+    resize,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -20,7 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import best_output_size
+from sglang.multimodal_gen.utils import best_output_size, calculate_dimensions
 
 logger = init_logger(__name__)
 
@@ -128,6 +132,15 @@ class InputValidationStage(PipelineStage):
                 )
                 batch.width = condition_image_width
                 batch.height = condition_image_height
+                image_size = batch.condition_image.size
+                calculated_width, calculated_height, _ = calculate_dimensions(
+                    1024 * 1024, image_size[0] / image_size[1]
+                )
+                print(f"{calculated_height=} {calculated_width=}")
+                condition_image = resize(
+                    image, calculated_height, calculated_width, resize_mode="default"
+                )
+                batch.condition_image = condition_image
                 # resized_image, resized_width, resized_height = (
                 #     server_args.pipeline_config.maybe_resize_condition_image(
                 #         condition_image_width,

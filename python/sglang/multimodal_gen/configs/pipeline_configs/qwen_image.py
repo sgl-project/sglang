@@ -276,7 +276,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         calculated_width, calculated_height, _ = calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
         )
-        image = image_processor.resize(image, calculated_height, calculated_width)
+        # image = image_processor.resize(image, calculated_height, calculated_width)
         return image
 
     def maybe_resize_condition_image(self, width, height, image):

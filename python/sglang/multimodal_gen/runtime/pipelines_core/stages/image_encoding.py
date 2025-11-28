@@ -29,7 +29,6 @@ from sglang.multimodal_gen.runtime.models.vision_utils import (
     normalize,
     numpy_to_pt,
     pil_to_numpy,
-    resize,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -462,12 +461,12 @@ class ImageVAEEncodingStage(PipelineStage):
     ) -> torch.Tensor:
 
         if isinstance(image, PIL.Image.Image):
-            width, height = (
-                self.server_args.pipeline_config.vae_config.calculate_dimensions(
-                    image, vae_scale_factor, width, height
-                )
-            )
-            image = resize(image, height, width, resize_mode=resize_mode)
+            # width, height = (
+            #     self.server_args.pipeline_config.vae_config.calculate_dimensions(
+            #         image, vae_scale_factor, width, height
+            #     )
+            # )
+            # image = resize(image, height, width, resize_mode=resize_mode)
             image = pil_to_numpy(image)  # to np
             image = numpy_to_pt(image)  # to pt
 
