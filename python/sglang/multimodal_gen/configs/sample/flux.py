@@ -16,3 +16,10 @@ class FluxSamplingParams(SamplingParams):
     guidance_scale: float = 1.0
     negative_prompt: str = None
     num_inference_steps: int = 50
+
+    def __post_init__(self):
+        default_sample_size = 128
+        vae_scale_factor = 8
+        # FIXME
+        # self.height = default_sample_size * vae_scale_factor
+        # self.width = default_sample_size * vae_scale_factor

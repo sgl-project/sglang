@@ -74,7 +74,7 @@ FetchContent_Populate(repo-fmt)
 FetchContent_Declare(
     repo-triton
     GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        8f9f695ea8fde23a0c7c88e4ab256634ca27789f
+    GIT_TAG        v3.5.1
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-triton)
@@ -269,7 +269,6 @@ set(SOURCES
     "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
-    "csrc/attention/lightning_attention_decode_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
@@ -323,6 +322,7 @@ set(SOURCES
     "csrc/moe/moe_sum.cu"
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
+    "csrc/moe/moe_topk_sigmoid_kernels.cu"
     "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
