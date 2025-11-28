@@ -503,7 +503,8 @@ pub async fn concurrency_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Check mesh global rate limit first if enabled
+    // Check mesh global rate limit first if mesh is enabled
+    // If mesh is not enabled, this check is skipped and local rate limiting is used
     if let Some(sync_manager) = &app_state.mesh_sync_manager {
         let (is_exceeded, current_count, limit) = sync_manager.check_global_rate_limit();
         if is_exceeded {

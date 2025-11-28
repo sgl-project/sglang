@@ -1,4 +1,4 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use dashmap::DashMap;
 use serde_json;
@@ -32,7 +32,9 @@ pub struct PolicyRegistry {
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 
     /// Optional mesh sync manager for state synchronization
-    mesh_sync: OptionalMeshSyncManager,
+    /// When None, the registry works independently without mesh synchronization
+    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
+    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl PolicyRegistry {
@@ -46,13 +48,13 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
-            mesh_sync: None,
+            mesh_sync: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// Set mesh sync manager
-    pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
-        self.mesh_sync = mesh_sync;
+    /// Set mesh sync manager (thread-safe, can be called after initialization)
+    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
+        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Called when a worker is added
@@ -94,8 +96,8 @@ impl PolicyRegistry {
         self.model_policies
             .insert(model_id.to_string(), Arc::clone(&policy));
 
-        // Sync to mesh if enabled
-        if let Some(ref mesh_sync) = self.mesh_sync {
+        // Sync to mesh if enabled (no-op if mesh is not enabled)
+        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
             // Serialize policy config (simplified - just store policy name for now)
             let config = serde_json::to_vec(&policy.name()).unwrap_or_default();
             mesh_sync.sync_policy_state(model_id.to_string(), policy.name().to_string(), config);
@@ -139,8 +141,8 @@ impl PolicyRegistry {
                 );
             }
 
-            // Sync removal to mesh if enabled
-            if let Some(ref mesh_sync) = self.mesh_sync {
+            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
                 mesh_sync.remove_policy_state(model_id);
             }
         }
@@ -181,9 +183,10 @@ impl PolicyRegistry {
 
     /// Create a policy from a type string (delegates to PolicyFactory)
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
-        if policy_type == "cache_aware" && self.mesh_sync.is_some() {
+        if policy_type == "cache_aware" {
             let mut cache_aware = CacheAwarePolicy::new();
-            cache_aware.set_mesh_sync(self.mesh_sync.clone());
+            let ref mesh_sync = *self.mesh_sync.read().unwrap();
+            cache_aware.set_mesh_sync(mesh_sync.clone());
             Arc::new(cache_aware)
         } else {
             PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {

@@ -941,6 +941,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
+    // Set mesh sync manager to worker registry and policy registry if mesh is enabled
+    // This allows these components to sync state across mesh nodes when mesh is enabled,
+    // but they work independently without mesh when mesh is disabled.
+    // Using thread-safe set_mesh_sync method that works with Arc-wrapped registries
+    if let Some(ref sync_manager) = mesh_sync_manager {
+        app_context
+            .worker_registry
+            .set_mesh_sync(Some(sync_manager.clone()));
+        info!("Mesh sync manager set on worker registry");
+
+        app_context
+            .policy_registry
+            .set_mesh_sync(Some(sync_manager.clone()));
+        info!("Mesh sync manager set on policy registry");
+    }
+
     // Get mesh cluster state and port before moving mesh_handler into app_state
     let mesh_cluster_state = mesh_handler.as_ref().map(|h| h.state.clone());
     let mesh_port = config

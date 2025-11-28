@@ -284,7 +284,9 @@ pub async fn start_service_discovery(
         let config_arc = Arc::new(config.clone());
         let port = config.port;
 
-        // Spawn router discovery task if enabled
+        // Spawn router discovery task if enabled and mesh is available
+        // Router discovery requires mesh to be enabled to update cluster state
+        // If mesh is not enabled, router discovery is skipped and service discovery works independently
         if !config_arc.router_selector.is_empty() {
             if let (Some(cluster_state), Some(mesh_port)) = (mesh_cluster_state.clone(), mesh_port)
             {
@@ -294,8 +296,12 @@ pub async fn start_service_discovery(
                     start_router_discovery(router_config, router_pods, cluster_state, mesh_port)
                         .await;
                 });
+                info!("Router discovery enabled (requires mesh to be enabled)");
             } else {
-                warn!("Router selector configured but mesh cluster state or mesh port not provided, skipping router discovery");
+                warn!(
+                    "Router selector configured but mesh is not enabled (mesh cluster state or mesh port not provided). \
+                    Router discovery requires mesh to be enabled. Skipping router discovery."
+                );
             }
         }
 

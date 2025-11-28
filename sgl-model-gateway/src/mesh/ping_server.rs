@@ -556,7 +556,7 @@ impl Gossip for GossipService {
                                     }
 
                                     let store_type = LocalStoreType::from_proto(update.store);
-                                    log::info!("Received incremental update from {}: store={:?}, {} updates", 
+                                    log::info!("Received incremental update from {}: store={:?}, {} updates",
                                         peer_id, store_type, update.updates.len());
 
                                     // Apply incremental updates to state stores
@@ -668,7 +668,7 @@ impl Gossip for GossipService {
                                 {
                                     let store_type = LocalStoreType::from_proto(req.store);
                                     let store_name = store_type.as_str();
-                                    log::info!("Received snapshot request from {}: store={:?}, from_version={}", 
+                                    log::info!("Received snapshot request from {}: store={:?}, from_version={}",
                                         peer_id, store_type, req.from_version);
 
                                     record_snapshot_trigger(store_name, "request");
@@ -809,7 +809,7 @@ impl Gossip for GossipService {
                                     if let Some(received_chunks) = snapshot_state.get(&chunk_key) {
                                         if received_chunks.len() as u64 == chunk.total_chunks {
                                             // All chunks received, apply snapshot
-                                            log::info!("All {} chunks received for store {:?}, applying snapshot", 
+                                            log::info!("All {} chunks received for store {:?}, applying snapshot",
                                                 chunk.total_chunks, store_type);
 
                                             if let Some(ref stores) = stores {
