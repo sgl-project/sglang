@@ -45,7 +45,10 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     import aiter
-    from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
+
+    # from aiter import gemm_a8w8_blockscale, gemm_a8w8_bpreshuffle, get_hip_quant
+    from aiter import gemm_a8w8_bpreshuffle, get_hip_quant
+    from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
 
@@ -439,7 +442,7 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     assert isinstance(weight, torch.nn.Parameter)
     assert isinstance(weight_scale_inv, torch.nn.Parameter)
 
-    new_weight, new_weight_scale_inv = _requant_weight_ue8m0(
+    new_weight, new_weight_scale_inv = requant_weight_ue8m0(
         weight.to(weight_scale_inv.device), weight_scale_inv, weight_block_size
     )
 
@@ -447,7 +450,7 @@ def requant_weight_ue8m0_inplace(weight, weight_scale_inv, weight_block_size):
     weight_scale_inv.data = new_weight_scale_inv
 
 
-def _requant_weight_ue8m0(
+def requant_weight_ue8m0(
     weight: torch.Tensor,
     weight_scale_inv: torch.Tensor,
     weight_block_size: List[int],
@@ -529,8 +532,13 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     :param sf_packed: (scale_mn, scale_k/4) int32
     :return: (scale_mn, scale_k), float32
     """
+    if len(sf_packed.shape) == 3:
+        return torch.stack(
+            [_inverse_transform_scale_ue8m0_impl(x) for x in sf_packed], dim=0
+        )
+
     block_size = 128
-    assert len(sf_packed.shape) == 2
+    assert len(sf_packed.shape) == 2, f"{sf_packed.shape=}"
     assert sf_packed.dtype == torch.int32
 
     mn_repeat_128, k_div_4 = sf_packed.shape
@@ -544,7 +552,12 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     # remove repeat
     sf_reshaped = sf_fp32.view(mn, block_size, k)
     sf_unrepeated = sf_reshaped[:, 0:1, :]
-    assert torch.all(sf_unrepeated == sf_reshaped)
+    if not torch.all(sf_unrepeated == sf_reshaped):
+        from sglang.srt.debug_utils.dumper import get_tensor_info
+
+        raise AssertionError(
+            f"sf_unrepeated != sf_reshaped ({get_tensor_info(sf_unrepeated)=} {get_tensor_info(sf_reshaped)=})"
+        )
     sf_unrepeated = sf_unrepeated.squeeze(1).contiguous()
 
     assert sf_unrepeated.shape == (mn, k)

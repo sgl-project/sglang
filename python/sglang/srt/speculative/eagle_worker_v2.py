@@ -36,6 +36,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
+    generate_token_bitmask,
     load_token_map,
 )
 from sglang.srt.utils.common import (
@@ -447,7 +448,6 @@ class EagleDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            allocate_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 num token per batch
             num_tokens_per_batch=1,
             num_tokens_for_logprob_per_batch=1,
@@ -620,19 +620,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
+            batch_output = self.verify(model_worker_batch)
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
-    def verify(
-        self,
-        batch: ModelWorkerBatch,
-        cur_allocate_lens: torch.Tensor,
-    ):
+    def verify(self, batch: ModelWorkerBatch):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
         # while forward_stream is still running.
@@ -673,7 +668,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Run target verify batch in the main compute stream
+        # Prepare grammar data on CPU if needed
+        if batch.has_grammar:
+            retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
+            draft_tokens_cpu = verify_input.draft_token.view(
+                verify_input.retrive_next_token.shape
+            ).cpu()
+
+        # Run target verify batch in the main compute stream (GPU compute)
         forward_batch_output = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
             forward_batch=verify_forward_batch,
@@ -682,6 +685,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
+        # Generate vocab mask for constrained decoding
+        vocab_mask = None
+        if batch.has_grammar:
+            # Generate the logit mask for structured output.
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                verify_input,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
+                # and will be applied to produce wrong results
+                batch.sampling_info.vocab_mask = None
+
         # Sample
         if self.enable_nan_detection:
             detect_nan(logits_output)
@@ -689,7 +712,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             predict,
             accept_length,
             accept_index,
-        ) = verify_input.sample(batch, logits_output)
+        ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
@@ -710,7 +733,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            allocate_lens=cur_allocate_lens,
             verify_done=verify_done,
         )
 
@@ -720,7 +742,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
-            allocate_lens=cur_allocate_lens,
         )
 
     def move_accepted_tokens_to_target_kvcache(
