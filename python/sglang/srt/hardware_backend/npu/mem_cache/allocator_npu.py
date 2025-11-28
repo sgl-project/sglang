@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 import torch
@@ -11,7 +9,7 @@ from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_num_new_pages
 
 
-def alloc_extend_kernel_ascend(
+def _alloc_extend_naive(
     prefix_lens,
     seq_lens,
     last_loc,
@@ -65,7 +63,7 @@ def alloc_extend_kernel_ascend(
             ).view(-1)
 
 
-class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     def __init__(
         self,
         size: int,
@@ -104,8 +102,6 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return None
 
         if num_new_pages_item < 200:
-            import sgl_kernel_npu  # noqa: F401
-
             out_indices = torch.empty(
                 (extend_num_tokens,),
                 dtype=torch.int64,
@@ -127,7 +123,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 dtype=torch.int32,
                 device=self.device,
             )
-            alloc_extend_kernel_ascend(
+            _alloc_extend_naive(
                 prefix_lens,
                 seq_lens,
                 last_loc,

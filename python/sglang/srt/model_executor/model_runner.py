@@ -103,10 +103,7 @@ from sglang.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.allocator_ascend import AscendPagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
-    AscendMLAPagedTokenToKVPool,
-    AscendTokenToKVPool,
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -1781,7 +1778,11 @@ class ModelRunner:
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
-                self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
+                from sglang.srt.hardware_backend.npu.mem_cache.memory_pool_npu import (
+                    NPUMLATokenToKVPool,
+                )
+
+                self.token_to_kv_pool = NPUMLATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -1795,7 +1796,11 @@ class ModelRunner:
                     end_layer=self.end_layer,
                 )
             else:
-                self.token_to_kv_pool = AscendTokenToKVPool(
+                from sglang.srt.hardware_backend.npu.mem_cache.memory_pool_npu import (
+                    NPUMHATokenToKVPool,
+                )
+
+                self.token_to_kv_pool = NPUMHATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -1953,7 +1958,11 @@ class ModelRunner:
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
             ):
-                self.token_to_kv_pool_allocator = AscendPagedTokenToKVPoolAllocator(
+                from sglang.srt.hardware_backend.npu.mem_cache.allocator_npu import (
+                    NPUPagedTokenToKVPoolAllocator,
+                )
+
+                self.token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
