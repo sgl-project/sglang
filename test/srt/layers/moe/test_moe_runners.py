@@ -54,6 +54,8 @@ class TestMoERunner(CustomTestCase):
             "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
             "other_args": [
                 "--trust-remote-code",
+                "--quantization",
+                "fp8",
                 "--moe-runner-backend",
                 "flashinfer_trtllm",
             ],
