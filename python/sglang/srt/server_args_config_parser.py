@@ -66,7 +66,7 @@ class ConfigArgumentMerger:
 
         # Split arguments around config file
         before_config = cli_args[:config_index]
-        after_config = cli_args[config_index + 2:]  # Skip --config and file path
+        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
 
         # Simple merge: config args + CLI args
         return config_args + before_config + after_config

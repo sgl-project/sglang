@@ -2041,8 +2041,8 @@ class ServerArgs:
             default=ServerArgs.tokenizer_mode,
             choices=["auto", "slow"],
             help="Tokenizer mode. 'auto' will use the fast "
-                 "tokenizer if available, and 'slow' will "
-                 "always use the slow tokenizer.",
+            "tokenizer if available, and 'slow' will "
+            "always use the slow tokenizer.",
         )
         parser.add_argument(
             "--tokenizer-worker-num",
@@ -2061,27 +2061,27 @@ class ServerArgs:
             default=ServerArgs.load_format,
             choices=LOAD_FORMAT_CHOICES,
             help="The format of the model weights to load. "
-                 '"auto" will try to load the weights in the safetensors format '
-                 "and fall back to the pytorch bin format if safetensors format "
-                 "is not available. "
-                 '"pt" will load the weights in the pytorch bin format. '
-                 '"safetensors" will load the weights in the safetensors format. '
-                 '"npcache" will load the weights in pytorch format and store '
-                 "a numpy cache to speed up the loading. "
-                 '"dummy" will initialize the weights with random values, '
-                 "which is mainly for profiling."
-                 '"gguf" will load the weights in the gguf format. '
-                 '"bitsandbytes" will load the weights using bitsandbytes '
-                 "quantization."
-                 '"layered" loads weights layer by layer so that one can quantize a '
-                 "layer before loading another to make the peak memory envelope "
-                 "smaller.",
+            '"auto" will try to load the weights in the safetensors format '
+            "and fall back to the pytorch bin format if safetensors format "
+            "is not available. "
+            '"pt" will load the weights in the pytorch bin format. '
+            '"safetensors" will load the weights in the safetensors format. '
+            '"npcache" will load the weights in pytorch format and store '
+            "a numpy cache to speed up the loading. "
+            '"dummy" will initialize the weights with random values, '
+            "which is mainly for profiling."
+            '"gguf" will load the weights in the gguf format. '
+            '"bitsandbytes" will load the weights using bitsandbytes '
+            "quantization."
+            '"layered" loads weights layer by layer so that one can quantize a '
+            "layer before loading another to make the peak memory envelope "
+            "smaller.",
         )
         parser.add_argument(
             "--model-loader-extra-config",
             type=str,
             help="Extra config for model loader. "
-                 "This will be passed to the model loader corresponding to the chosen load_format.",
+            "This will be passed to the model loader corresponding to the chosen load_format.",
             default=ServerArgs.model_loader_extra_config,
         )
         parser.add_argument(
@@ -2111,21 +2111,21 @@ class ServerArgs:
             type=str,
             default=None,
             help="The specific model version to use. It can be a branch "
-                 "name, a tag name, or a commit id. If unspecified, will use "
-                 "the default version.",
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
         )
         parser.add_argument(
             "--model-impl",
             type=str,
             default=ServerArgs.model_impl,
             help="Which implementation of the model to use.\n\n"
-                 '* "auto" will try to use the SGLang implementation if it exists '
-                 "and fall back to the Transformers implementation if no SGLang "
-                 "implementation is available.\n"
-                 '* "sglang" will use the SGLang model implementation.\n'
-                 '* "transformers" will use the Transformers model '
-                 '* "mindspore" will use the MindSpore model '
-                 "implementation.\n",
+            '* "auto" will try to use the SGLang implementation if it exists '
+            "and fall back to the Transformers implementation if no SGLang "
+            "implementation is available.\n"
+            '* "sglang" will use the SGLang model implementation.\n'
+            '* "transformers" will use the Transformers model '
+            '* "mindspore" will use the MindSpore model '
+            "implementation.\n",
         )
 
         # HTTP server
@@ -2162,7 +2162,7 @@ class ServerArgs:
             type=str,
             required=False,
             help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
-                 "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+            "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
         )
         parser.add_argument(
             "--nccl-port",
@@ -2174,7 +2174,7 @@ class ServerArgs:
             "--checkpoint-engine-wait-weights-before-ready",
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
-                 "before serving inference requests.",
+            "before serving inference requests.",
         )
 
         # Quantization and data type
@@ -2184,13 +2184,13 @@ class ServerArgs:
             default=ServerArgs.dtype,
             choices=["auto", "half", "float16", "bfloat16", "float", "float32"],
             help="Data type for model weights and activations.\n\n"
-                 '* "auto" will use FP16 precision for FP32 and FP16 models, and '
-                 "BF16 precision for BF16 models.\n"
-                 '* "half" for FP16. Recommended for AWQ quantization.\n'
-                 '* "float16" is the same as "half".\n'
-                 '* "bfloat16" for a balance between precision and range.\n'
-                 '* "float" is shorthand for FP32 precision.\n'
-                 '* "float32" for FP32 precision.',
+            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+            "BF16 precision for BF16 models.\n"
+            '* "half" for FP16. Recommended for AWQ quantization.\n'
+            '* "float16" is the same as "half".\n'
+            '* "bfloat16" for a balance between precision and range.\n'
+            '* "float" is shorthand for FP32 precision.\n'
+            '* "float32" for FP32 precision.',
         )
         parser.add_argument(
             "--quantization",
@@ -2204,9 +2204,9 @@ class ServerArgs:
             type=nullable_str,
             default=None,
             help="Path to the JSON file containing the KV cache "
-                 "scaling factors. This should generally be supplied, when "
-                 "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
-                 "default to 1.0, which may cause accuracy issues. ",
+            "scaling factors. This should generally be supplied, when "
+            "KV cache dtype is FP8. Otherwise, KV cache scaling factors "
+            "default to 1.0, which may cause accuracy issues. ",
         )
         parser.add_argument(
             "--kv-cache-dtype",
@@ -2225,39 +2225,39 @@ class ServerArgs:
             type=str,
             default=ServerArgs.modelopt_quant,
             help="The ModelOpt quantization configuration. "
-                 "Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. "
-                 "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
+            "Supported values: 'fp8', 'int4_awq', 'w4a8_awq', 'nvfp4', 'nvfp4_awq'. "
+            "This requires the NVIDIA Model Optimizer library to be installed: pip install nvidia-modelopt",
         )
         parser.add_argument(
             "--modelopt-checkpoint-restore-path",
             type=str,
             default=ServerArgs.modelopt_checkpoint_restore_path,
             help="Path to restore a previously saved ModelOpt quantized checkpoint. "
-                 "If provided, the quantization process will be skipped and the model "
-                 "will be loaded from this checkpoint.",
+            "If provided, the quantization process will be skipped and the model "
+            "will be loaded from this checkpoint.",
         )
         parser.add_argument(
             "--modelopt-checkpoint-save-path",
             type=str,
             default=ServerArgs.modelopt_checkpoint_save_path,
             help="Path to save the ModelOpt quantized checkpoint after quantization. "
-                 "This allows reusing the quantized model in future runs.",
+            "This allows reusing the quantized model in future runs.",
         )
         parser.add_argument(
             "--modelopt-export-path",
             type=str,
             default=ServerArgs.modelopt_export_path,
             help="Path to export the quantized model in HuggingFace format after ModelOpt quantization. "
-                 "The exported model can then be used directly with SGLang for inference. "
-                 "If not provided, the model will not be exported.",
+            "The exported model can then be used directly with SGLang for inference. "
+            "If not provided, the model will not be exported.",
         )
         parser.add_argument(
             "--quantize-and-serve",
             action="store_true",
             default=ServerArgs.quantize_and_serve,
             help="Quantize the model with ModelOpt and immediately serve it without exporting. "
-                 "This is useful for development and prototyping. For production, it's recommended "
-                 "to use separate quantization and deployment steps.",
+            "This is useful for development and prototyping. For production, it's recommended "
+            "to use separate quantization and deployment steps.",
         )
 
         # Memory and scheduling
@@ -2284,7 +2284,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_total_tokens,
             help="The maximum number of tokens in the memory pool. If not specified, it will be automatically calculated based on the memory usage fraction. "
-                 "This option is typically used for development and debugging purposes.",
+            "This option is typically used for development and debugging purposes.",
         )
         parser.add_argument(
             "--chunked-prefill-size",
@@ -2358,7 +2358,7 @@ class ServerArgs:
             type=float,
             default=ServerArgs.swa_full_tokens_ratio,
             help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
-                 "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+            "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
         )
         parser.add_argument(
             "--disable-hybrid-swa-memory",
@@ -2515,8 +2515,8 @@ class ServerArgs:
             "--enable-metrics-for-all-schedulers",
             action="store_true",
             help="Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) "
-                 "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
-                 "otherwise all metrics appear to come from TP 0.",
+            "to record request metrics separately. This is especially useful when dp_attention is enabled, as "
+            "otherwise all metrics appear to come from TP 0.",
         )
         parser.add_argument(
             "--tokenizer-metrics-custom-labels-header",
@@ -2530,8 +2530,8 @@ class ServerArgs:
             nargs="+",
             default=ServerArgs.tokenizer_metrics_allowed_custom_labels,
             help="The custom labels allowed for tokenizer metrics. The labels are specified via a dict in "
-                 "'--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': "
-                 "'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set.",
+            "'--tokenizer-metrics-custom-labels-header' field in HTTP requests, e.g., {'label1': 'value1', 'label2': "
+            "'value2'} is allowed if '--tokenizer-metrics-allowed-custom-labels label1 label2' is set.",
         )
         parser.add_argument(
             "--bucket-time-to-first-token",
@@ -2698,9 +2698,9 @@ class ServerArgs:
             choices=["openai", "model"],
             default=ServerArgs.sampling_defaults,
             help="Where to get default sampling parameters. "
-                 "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
-                 "'model' uses the model's generation_config.json to get the recommended "
-                 "sampling parameters if available. Default is 'model'.",
+            "'openai' uses SGLang/OpenAI defaults (temperature=1.0, top_p=1.0, etc.). "
+            "'model' uses the model's generation_config.json to get the recommended "
+            "sampling parameters if available. Default is 'model'.",
         )
 
         # Data parallelism
@@ -2782,8 +2782,8 @@ class ServerArgs:
             nargs="*",
             default=None,
             help="The union set of all target modules where LoRA should be applied. If not specified, "
-                 "it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, "
-                 "all supported modules will be targeted.",
+            "it will be automatically inferred from the adapters provided in --lora-paths. If 'all' is specified, "
+            "all supported modules will be targeted.",
         )
         parser.add_argument(
             "--lora-paths",
@@ -2901,8 +2901,8 @@ class ServerArgs:
             type=str,
             default=None,
             help="The specific draft model version to use. It can be a branch "
-                 "name, a tag name, or a commit id. If unspecified, will use "
-                 "the default version.",
+            "name, a tag name, or a commit id. If unspecified, will use "
+            "the default version.",
         )
         parser.add_argument(
             "--speculative-draft-load-format",
@@ -2910,8 +2910,8 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_load_format,
             choices=LOAD_FORMAT_CHOICES,
             help="The format of the draft model weights to load. "
-                 "If not specified, will use the same format as --load-format. "
-                 "Use 'dummy' to initialize draft model weights with random values for profiling.",
+            "If not specified, will use the same format as --load-format. "
+            "Use 'dummy' to initialize draft model weights with random values for profiling.",
         )
         parser.add_argument(
             "--speculative-num-steps",
@@ -3139,8 +3139,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.mooncake_ib_device,
             help="The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices "
-                 "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
-                 "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
+            "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
 
         # Mamba Cache
@@ -3215,9 +3215,9 @@ class ServerArgs:
             choices=["file", "mooncake", "hf3fs", "nixl", "aibrix", "dynamic", "eic"],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "
-                 "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
-                 "For dynamic backend, use --hicache-storage-backend-extra-config to specify: "
-                 "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
+            "Built-in backends: file, mooncake, hf3fs, nixl, aibrix. "
+            "For dynamic backend, use --hicache-storage-backend-extra-config to specify: "
+            "backend_name (custom name), module_path (Python module path), class_name (backend class name).",
         )
         parser.add_argument(
             "--hicache-storage-prefetch-policy",
@@ -3549,7 +3549,7 @@ class ServerArgs:
             "--triton-attention-reduce-in-fp32",
             action="store_true",
             help="Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-                 "This only affects Triton attention kernels.",
+            "This only affects Triton attention kernels.",
         )
         parser.add_argument(
             "--triton-attention-num-kv-splits",
@@ -3568,8 +3568,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.num_continuous_decode_steps,
             help="Run multiple continuous decoding steps to reduce scheduling overhead. "
-                 "This can potentially increase throughput but may also increase time-to-first-token latency. "
-                 "The default value is 1, meaning only run one decoding step at a time.",
+            "This can potentially increase throughput but may also increase time-to-first-token latency. "
+            "The default value is 1, meaning only run one decoding step at a time.",
         )
         parser.add_argument(
             "--delete-ckpt-after-loading",
@@ -3755,8 +3755,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_ib_device,
             help="The InfiniBand devices for disaggregation transfer, accepts single device (e.g., --disaggregation-ib-device mlx5_0) "
-                 "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
-                 "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
+            "or multiple comma-separated devices (e.g., --disaggregation-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
@@ -3940,8 +3940,8 @@ class ServerArgs:
     def check_server_args(self):
         # Check parallel size constraints
         assert (
-                   self.tp_size * self.pp_size
-               ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+            self.tp_size * self.pp_size
+        ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
         if self.pp_size > 1:
             assert (
@@ -4217,8 +4217,8 @@ class ServerArgs:
         baseline_vit_hidden_size = 1024
 
         # weight params count
-        current_complexity_score = vit_num_layers * (vit_hidden_size ** 2)
-        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size ** 2)
+        current_complexity_score = vit_num_layers * (vit_hidden_size**2)
+        baseline_complexity_score = baseline_vit_layers * (baseline_vit_hidden_size**2)
         complexity_ratio = (
             current_complexity_score / baseline_complexity_score
             if baseline_complexity_score > 0
@@ -4278,11 +4278,13 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         ServerArgs.add_cli_args(parser)
 
         # Merge config file arguments with CLI arguments
-        config_merger = ConfigArgumentMerger(boolean_actions=[
-            action.dest
-            for action in parser._actions
-            if isinstance(action, argparse._StoreTrueAction)
-        ])
+        config_merger = ConfigArgumentMerger(
+            boolean_actions=[
+                action.dest
+                for action in parser._actions
+                if isinstance(action, argparse._StoreTrueAction)
+            ]
+        )
         argv = config_merger.merge_config_with_args(argv)
 
     parser = argparse.ArgumentParser()
