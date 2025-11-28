@@ -111,11 +111,6 @@ class ImageEncodingStage(PipelineStage):
 
         image = batch.condition_image
 
-        # preprocess via vae_image_processor
-        image = server_args.pipeline_config.preprocess_image(
-            image, self.vae_image_processor
-        )
-
         if batch.prompt and (
             isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig)
             or isinstance(server_args.pipeline_config, QwenImagePipelineConfig)
@@ -285,8 +280,8 @@ class ImageVAEEncodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                                   vae_dtype != torch.float32
+                               ) and not server_args.disable_autocast
 
         # Encode Image
         with torch.autocast(

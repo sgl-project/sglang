@@ -175,6 +175,9 @@ class PipelineConfig:
     # Compilation
     # enable_torch_compile: bool = False
 
+    # calculate the adjust size for condition image
+    # width: original condition image width
+    # height: original condition image height
     def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
         vae_scale_factor = self.vae_config.arch_config.spatial_compression_ratio
         height, width = get_default_height_width(image, vae_scale_factor, height, width)
@@ -183,12 +186,6 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
-    def maybe_resize_condition_image(self, width, height, image):
-        """
-        image: input image
-        """
-        return image, width, height
-
     def adjust_num_frames(self, num_frames):
         return num_frames
 
@@ -196,9 +193,6 @@ class PipelineConfig:
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
 
-    # called in ImageEncodingStage, preprocess the image
-    def preprocess_image(self, image, image_processor: VaeImageProcessor):
-        return image
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio

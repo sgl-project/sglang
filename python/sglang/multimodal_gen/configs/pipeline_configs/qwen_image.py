@@ -158,14 +158,14 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
 
         img_shapes = [
-            [
-                (
-                    1,
-                    height // vae_scale_factor // 2,
-                    width // vae_scale_factor // 2,
-                )
-            ]
-        ] * batch_size
+                         [
+                             (
+                                 1,
+                                 height // vae_scale_factor // 2,
+                                 width // vae_scale_factor // 2,
+                             )
+                         ]
+                     ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
 
         (img_cos, img_sin), (txt_cos, txt_sin) = self.get_freqs_cis(
@@ -222,19 +222,19 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         vae_scale_factor = self.get_vae_scale_factor()
 
         img_shapes = [
-            [
-                (
-                    1,
-                    height // vae_scale_factor // 2,
-                    width // vae_scale_factor // 2,
-                ),
-                (
-                    1,
-                    edit_height // vae_scale_factor // 2,
-                    edit_width // vae_scale_factor // 2,
-                ),
-            ],
-        ] * batch_size
+                         [
+                             (
+                                 1,
+                                 height // vae_scale_factor // 2,
+                                 width // vae_scale_factor // 2,
+                             ),
+                             (
+                                 1,
+                                 edit_height // vae_scale_factor // 2,
+                                 edit_width // vae_scale_factor // 2,
+                             ),
+                         ],
+                     ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
         (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
@@ -271,26 +271,11 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
         )
 
-    def preprocess_image(self, image, image_processor):
-        image_size = image[0].size if isinstance(image, list) else image.size
+    def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
         calculated_width, calculated_height, _ = calculate_dimensions(
-            1024 * 1024, image_size[0] / image_size[1]
+            1024 * 1024, width / height
         )
-        # image = image_processor.resize(image, calculated_height, calculated_width)
-        return image
-
-    def maybe_resize_condition_image(self, width, height, image):
-        image_size = image[0].size if isinstance(image, list) else image.size
-        calculated_width, calculated_height, _ = calculate_dimensions(
-            1024 * 1024, image_size[0] / image_size[1]
-        )
-        height = height or calculated_height
-        width = width or calculated_width
-
-        multiple_of = self.get_vae_scale_factor() * 2
-        width = width // multiple_of * multiple_of
-        height = height // multiple_of * multiple_of
-        return image, width, height
+        return calculated_width, calculated_height
 
     def slice_noise_pred(self, noise, latents):
         # remove noise over input image

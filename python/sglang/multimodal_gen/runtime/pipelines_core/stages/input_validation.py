@@ -24,7 +24,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import best_output_size, calculate_dimensions
+from sglang.multimodal_gen.utils import best_output_size
 
 logger = init_logger(__name__)
 
@@ -126,17 +126,16 @@ class InputValidationStage(PipelineStage):
         # NOTE: resizing needs to be bring in advance
         if server_args.pipeline_config.task_type == ModelTaskType.I2I:
             if batch.condition_image is not None:
-                batch.original_condition_image_size = (
-                    condition_image_width,
-                    condition_image_height,
-                )
-                batch.width = condition_image_width
-                batch.height = condition_image_height
-                image_size = batch.condition_image.size
-                calculated_width, calculated_height, _ = calculate_dimensions(
-                    1024 * 1024, image_size[0] / image_size[1]
-                )
-                print(f"{calculated_height=} {calculated_width=}")
+                # batch.width = condition_image_width
+                # batch.height = condition_image_height
+                # image_size = batch.condition_image.size
+                # calculated_width, calculated_height, _ = calculate_dimensions(
+                #     1024 * 1024, image_size[0] / image_size[1]
+                # )
+                # print(f"{calculated_height=} {calculated_width=}")
+
+                calculated_width, calculated_height = server_args.pipeline_config.calculate_condition_image_size(
+                    batch.condition_image, condition_image_width, condition_image_height)
                 condition_image = resize(
                     image, calculated_height, calculated_width, resize_mode="default"
                 )
@@ -149,10 +148,18 @@ class InputValidationStage(PipelineStage):
                 #     )
                 # )
                 # batch.condition_image = resized_image
-                # batch.width = resized_width if batch.width_not_provided else batch.width
-                # batch.height = (
-                #     resized_height if batch.height_not_provided else batch.height
-                # )
+                print(f"{batch.width_not_provided=} {batch.height_not_provided=}")
+                print(f"{calculated_width=} {calculated_height=}")
+                print(f"{batch.width=} {batch.height=}")
+                width = calculated_width if batch.width_not_provided else batch.width
+                height = (
+                    calculated_height if batch.height_not_provided else batch.height
+                )
+                multiple_of = server_args.pipeline_config.get_vae_scale_factor() * 2
+                width = width // multiple_of * multiple_of
+                height = height // multiple_of * multiple_of
+                batch.width = width
+                batch.height = height
         elif (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
         ) and batch.condition_image is not None:
@@ -215,7 +222,7 @@ class InputValidationStage(PipelineStage):
             "prompt_or_embeds",
             None,
             lambda _: V.string_or_list_strings(batch.prompt)
-            or V.list_not_empty(batch.prompt_embeds),
+                      or V.list_not_empty(batch.prompt_embeds),
         )
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)
