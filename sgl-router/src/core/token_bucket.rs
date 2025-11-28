@@ -33,9 +33,9 @@ impl TokenBucket {
     /// * `refill_rate` - Tokens added per second
     pub fn new(capacity: usize, refill_rate: usize) -> Self {
         let capacity = capacity as f64;
+        // Allow refill_rate=0 for pure concurrency limiting (semaphore behavior)
+        // When refill_rate=0, tokens are only returned via return_tokens()
         let refill_rate = refill_rate as f64;
-
-        let refill_rate = if refill_rate > 0.0 { refill_rate } else { 1.0 };
 
         Self {
             inner: Arc::new(Mutex::new(TokenBucketInner {
@@ -81,6 +81,25 @@ impl TokenBucket {
     pub async fn acquire(&self, tokens: f64) -> Result<(), tokio::time::error::Elapsed> {
         if self.try_acquire(tokens).await.is_ok() {
             return Ok(());
+        }
+
+        // When refill_rate=0 (pure concurrency limiting), tokens only come back
+        // via return_tokens(), so we wait indefinitely on notify signal.
+        // The caller should use acquire_timeout() to set an appropriate timeout.
+        if self.refill_rate == 0.0 {
+            debug!(
+                "Token bucket: waiting indefinitely for {} tokens (refill_rate=0)",
+                tokens
+            );
+
+            loop {
+                if self.try_acquire(tokens).await.is_ok() {
+                    return Ok(());
+                }
+
+                // Wait for notify signal from return_tokens()
+                self.notify.notified().await;
+            }
         }
 
         let wait_time = {
@@ -175,5 +194,50 @@ mod tests {
 
         let available = bucket.available_tokens().await;
         assert!((4.0..=6.0).contains(&available));
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_zero_refill_rate() {
+        // With refill_rate=0, tokens should only come back via return_tokens()
+        let bucket = TokenBucket::new(2, 0);
+
+        // Acquire both tokens
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+
+        // No more tokens available
+        assert!(bucket.try_acquire(1.0).await.is_err());
+
+        // Wait - should NOT refill automatically
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(bucket.try_acquire(1.0).await.is_err());
+
+        // Return a token - now we should be able to acquire
+        bucket.return_tokens(1.0).await;
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+
+        // No more tokens again
+        assert!(bucket.try_acquire(1.0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_zero_refill_with_notify() {
+        // Test that acquire wakes up when tokens are returned
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+
+        // Acquire the only token
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+
+        let bucket_clone = bucket.clone();
+
+        // Spawn a task that will return the token after a delay
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            bucket_clone.return_tokens(1.0).await;
+        });
+
+        // This should wait and then succeed when token is returned
+        let result = bucket.acquire_timeout(1.0, Duration::from_secs(1)).await;
+        assert!(result.is_ok());
     }
 }
