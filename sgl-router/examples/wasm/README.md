@@ -100,4 +100,3 @@ curl -X POST http://localhost:3000/wasm \
 ```
 
 Modules execute in the order they are deployed. If a module returns `Reject`, subsequent modules won't execute.
-

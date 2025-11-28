@@ -12,9 +12,11 @@ wit_bindgen::generate!({
     world: "sgl-router",
 });
 
-use exports::sgl::router::middleware_on_request::Guest as OnRequestGuest;
-use exports::sgl::router::middleware_on_response::Guest as OnResponseGuest;
-use sgl::router::middleware_types::{Request, Response, Action, Header, ModifyAction};
+use exports::sgl::router::{
+    middleware_on_request::Guest as OnRequestGuest,
+    middleware_on_response::Guest as OnResponseGuest,
+};
+use sgl::router::middleware_types::{Action, Header, ModifyAction, Request, Response};
 
 /// Main middleware implementation
 struct Middleware;
@@ -40,14 +42,12 @@ impl OnRequestGuest for Middleware {
 
         // Request Logging and Tracing
         // Add tracing headers with request ID
-        modify_action.headers_add.push(create_header(
-            "x-request-id",
-            &req.request_id,
-        ));
-        modify_action.headers_add.push(create_header(
-            "x-wasm-processed",
-            "true",
-        ));
+        modify_action
+            .headers_add
+            .push(create_header("x-request-id", &req.request_id));
+        modify_action
+            .headers_add
+            .push(create_header("x-wasm-processed", "true"));
         modify_action.headers_add.push(create_header(
             "x-processed-at",
             &req.now_epoch_ms.to_string(),
@@ -55,10 +55,9 @@ impl OnRequestGuest for Middleware {
 
         // Add custom header for API requests
         if req.path.starts_with("/api") || req.path.starts_with("/v1") {
-            modify_action.headers_add.push(create_header(
-                "x-api-route",
-                "true",
-            ));
+            modify_action
+                .headers_add
+                .push(create_header("x-api-route", "true"));
         }
 
         Action::Modify(modify_action)
@@ -87,4 +86,3 @@ impl OnResponseGuest for Middleware {
 
 // Export the component
 export!(Middleware);
-

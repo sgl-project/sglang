@@ -11,9 +11,11 @@ wit_bindgen::generate!({
     world: "sgl-router",
 });
 
-use exports::sgl::router::middleware_on_request::Guest as OnRequestGuest;
-use exports::sgl::router::middleware_on_response::Guest as OnResponseGuest;
-use sgl::router::middleware_types::{Request, Response, Action};
+use exports::sgl::router::{
+    middleware_on_request::Guest as OnRequestGuest,
+    middleware_on_response::Guest as OnResponseGuest,
+};
+use sgl::router::middleware_types::{Action, Request, Response};
 
 /// Expected API Key (in production, this should be passed as configuration)
 const EXPECTED_API_KEY: &str = "secret-api-key-12345";
@@ -22,7 +24,10 @@ const EXPECTED_API_KEY: &str = "secret-api-key-12345";
 struct Middleware;
 
 // Helper function to find header value
-fn find_header_value(headers: &[sgl::router::middleware_types::Header], name: &str) -> Option<String> {
+fn find_header_value(
+    headers: &[sgl::router::middleware_types::Header],
+    name: &str,
+) -> Option<String> {
     headers
         .iter()
         .find(|h| h.name.eq_ignore_ascii_case(name))
@@ -63,4 +68,3 @@ impl OnResponseGuest for Middleware {
 
 // Export the component
 export!(Middleware);
-
