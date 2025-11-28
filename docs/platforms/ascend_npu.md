@@ -167,4 +167,3 @@ sudo sysctl -w vm.swappiness=10
 # Check
 cat /proc/sys/vm/swappiness # shows 10
 ```
-
