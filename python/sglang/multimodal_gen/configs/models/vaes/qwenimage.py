@@ -28,9 +28,6 @@ class QwenImageVAEArchConfig(VAEArchConfig):
     scale_factor_spatial: int = 8
     clip_output: bool = True
 
-    def __post_init__(self):
-        self.vae_scale_factor = 2 ** len(self.temperal_downsample)
-
 
 @dataclass
 class QwenImageVAEConfig(VAEConfig):

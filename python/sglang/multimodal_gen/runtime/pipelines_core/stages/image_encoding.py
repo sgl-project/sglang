@@ -203,7 +203,7 @@ class ImageVAEEncodingStage(PipelineStage):
     Stage for encoding pixel representations into latent space.
 
     This stage handles the encoding of pixel representations into the final
-    input format (e.g., latents).
+    input format (e.g., image_latents).
     """
 
     def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:

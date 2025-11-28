@@ -1,6 +1,4 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
-# SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
@@ -23,6 +21,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.conditioning import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+# SPDX-License-Identifier: Apache-2.0
+
 
 # TODO(will): move PRECISION_TO_TYPE to better place
 
