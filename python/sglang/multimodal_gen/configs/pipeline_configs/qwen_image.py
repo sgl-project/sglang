@@ -361,7 +361,6 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
         )
 
-
     def preprocess_image(self, image, image_processor):
         if not isinstance(image, list):
             image = [image]

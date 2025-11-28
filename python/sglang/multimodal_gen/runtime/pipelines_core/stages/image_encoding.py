@@ -12,15 +12,14 @@ import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
     PipelineConfig,
-    ModelTaskType
 )
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
     _prepare_image_ids,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    VAE_IMAGE_SIZE,
     QwenImageEditPipelineConfig,
     QwenImageEditPlusPipelineConfig,
     QwenImagePipelineConfig,
@@ -45,7 +44,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, calculate_dimensions
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -414,11 +413,7 @@ class ImageVAEEncodingStage(PipelineStage):
             self.vae.enable_tiling()
 
         if isinstance(server_args.pipeline_config, QwenImageEditPlusPipelineConfig):
-            images = (
-                image
-                if isinstance(image, list)
-                else [image]
-            )
+            images = image if isinstance(image, list) else [image]
             all_latent_conditions = []
 
             for img in images:
@@ -612,9 +607,7 @@ class ImageVAEEncodingStage(PipelineStage):
             raise ValueError("Generator must be provided")
         # TODO: verify
         sample_mode = (
-            "argmax"
-            if pipeline_config.task_type == ModelTaskType.I2I
-            else "sample"
+            "argmax" if pipeline_config.task_type == ModelTaskType.I2I else "sample"
         )
         latent_condition = self.retrieve_latents(
             encoder_output, generator, sample_mode=sample_mode
