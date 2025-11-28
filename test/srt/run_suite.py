@@ -479,7 +479,7 @@ def main():
     arg_parser.add_argument(
         "--timeout-per-file",
         type=int,
-        default=1200,
+        default=1800,
         help="The time limit for running one file in seconds.",
     )
     arg_parser.add_argument(
