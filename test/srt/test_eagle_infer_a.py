@@ -1,3 +1,4 @@
+import os
 import unittest
 
 import requests
@@ -34,6 +35,7 @@ class TestEAGLEEngine(CustomTestCase):
         "speculative_num_draft_tokens": 8,
         "mem_fraction_static": 0.7,
         "cuda_graph_max_bs": 5,
+        "trust_remote_code": True,
     }
     NUM_CONFIGS = 2
 
@@ -189,21 +191,32 @@ class TestEAGLERadixCache(CustomTestCase):
         "speculative_draft_model_path": DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3,
         "speculative_algorithm": "EAGLE3",
         "speculative_num_steps": 2,
-        "speculative_eagle_topk": 1,
-        "speculative_num_draft_tokens": 3,
+        "speculative_eagle_topk": 2,
+        "speculative_num_draft_tokens": 5,
         "mem_fraction_static": 0.7,
-        "cuda_graph_max_bs": 5,
         "dtype": "float16",
+        "trust_remote_code": True,
+        "attention_backend": "fa3",
+        "skip_server_warmup": True,
+        "cuda_graph_max_bs": 5,
     }
 
     def test_correctness(self):
+        os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"] = "1"
         configs = [
             # Basic config
             self.BASE_CONFIG,
-            # Chunked prefill
-            {**self.BASE_CONFIG, "chunked_prefill_size": 64},
             # Chunked prefill & Page Size > 1
             {**self.BASE_CONFIG, "chunked_prefill_size": 64, "page_size": 4},
+            {**self.BASE_CONFIG, "page_size": 4},
+            # Preferred by some kernels
+            {**self.BASE_CONFIG, "page_size": 64},
+            # Disable CUDA Graph
+            {
+                **self.BASE_CONFIG,
+                "disable_cuda_graph": True,
+                "page_size": 4,
+            },
         ]
 
         for i, config in enumerate(configs):
@@ -212,9 +225,11 @@ class TestEAGLERadixCache(CustomTestCase):
                 engine = sgl.Engine(**config, log_level="info", decode_log_interval=10)
                 try:
                     self._test_acc_length(engine)
+                    self._test_batch_generation(engine)
                 finally:
                     engine.shutdown()
                 print("=" * 100)
+        del os.environ["SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN"]
 
     def _test_acc_length(self, engine):
         warmup_prompt = [
@@ -243,6 +258,29 @@ class TestEAGLERadixCache(CustomTestCase):
         print(f"{acc_length=:.4f}, {speed=}")
 
         self.assertGreater(acc_length, 2.5)
+
+    def _test_batch_generation(self, engine):
+        prompts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        params = {"temperature": 0, "max_new_tokens": 50}
+
+        outputs = engine.generate(prompts, params)
+        for prompt, output in zip(prompts, outputs):
+            print(f"Prompt: {prompt}")
+            print(f"Generated: {output['text']}")
+            print("-" * 40)
+
+        print(f"{engine.get_server_info()=}")
+
+        avg_spec_accept_length = engine.get_server_info()["internal_states"][0][
+            "avg_spec_accept_length"
+        ]
+        print(f"{avg_spec_accept_length=}")
+        self.assertGreater(avg_spec_accept_length, 2.0)
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")

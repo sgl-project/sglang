@@ -3,7 +3,10 @@ import unittest
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.attention.flashattention_backend import (
+    FlashAttentionBackend,
+    update_draft_decode_set_expand_metadata_with_page_size,
+)
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -344,6 +347,72 @@ class TestFlashAttentionBackend(CustomTestCase):
     def test_forward_decode_with_page_size_greater_than_1(self):
         """Test decode operation with page size greater than 1."""
         self._run_attention_test(ForwardMode.DECODE, q_len=1, page_size=64)
+
+
+class TestUpdateDraftDecodeSetExpandMetadata(CustomTestCase):
+    def test_update_draft_decode_set_expand_metadata_with_page_size(self):
+        bs, topk, decode_length, page_size = 1, 2, 1, 4
+
+        cases = [
+            (
+                torch.tensor(
+                    [
+                        [23, 24],
+                        [31, 32],
+                    ],
+                    dtype=torch.int32,
+                ),
+                torch.tensor(
+                    [
+                        [5],
+                        [7],
+                    ],
+                    dtype=torch.int32,
+                ),
+            ),
+            (
+                torch.tensor(
+                    [
+                        [27, 28],
+                        [35, 36],
+                    ],
+                    dtype=torch.int32,
+                ),
+                torch.tensor(
+                    [
+                        [6],
+                        [8],
+                    ],
+                    dtype=torch.int32,
+                ),
+            ),
+        ]
+
+        last_page_lens = torch.tensor([3], dtype=torch.int32)
+        strided_indices_expand = torch.arange(
+            0, decode_length, page_size, dtype=torch.long
+        )
+
+        for cache_loc, expected_page_table in cases:
+            cache_seqlens_int32 = torch.zeros(bs * topk, dtype=torch.int32)
+            page_table = torch.zeros(bs * topk, decode_length, dtype=torch.int32)
+
+            update_draft_decode_set_expand_metadata_with_page_size(
+                cache_seqlens_int32=cache_seqlens_int32,
+                page_table=page_table,
+                cache_loc=cache_loc,
+                last_page_lens=last_page_lens,
+                strided_indices_expand=strided_indices_expand,
+                decode_length=decode_length,
+                bs=bs,
+                topk=topk,
+                page_size=page_size,
+            )
+
+            expected_cache_seqlens = torch.tensor([4, 4], dtype=torch.int32)
+
+            self.assertTrue(torch.equal(cache_seqlens_int32, expected_cache_seqlens))
+            self.assertTrue(torch.equal(page_table, expected_page_table))
 
 
 if __name__ == "__main__":

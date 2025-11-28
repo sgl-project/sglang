@@ -12,16 +12,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-
-  # ==================== PR Gate ==================== #
-  pr-gate:
-    uses: ./.github/workflows/pr-gate.yml
-    secrets: inherit
-  # ================================================= #
-
   # ==================== Check Changes ==================== #
   check-changes:
-    needs: [pr-gate]
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package }}
@@ -40,10 +32,16 @@ jobs:
               - "scripts/ci/npu_ci_install_dependency.sh"
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
-  # ======================================================= #
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.main_package == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
 
   per-commit-1-npu-a2:
-    needs: [check-changes]
+    needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-1
     container:
@@ -82,7 +80,7 @@ jobs:
           python3 run_suite.py --suite per-commit-1-npu-a2
 
   per-commit-2-npu-a2:
-    needs: [check-changes]
+    needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-2
     strategy:
@@ -125,7 +123,7 @@ jobs:
           python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   per-commit-4-npu-a2:
-    needs: [check-changes]
+    needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-4
     container:
@@ -164,7 +162,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-npu-a2 --timeout-per-file 3600
 
   per-commit-16-npu-a3:
-    needs: [check-changes]
+    needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
     strategy:

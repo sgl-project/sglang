@@ -337,7 +337,8 @@ class TextEncoderLoader(ComponentLoader):
                         cpu_offload=True,
                         reshard_after_forward=True,
                         mesh=mesh["offload"],
-                        fsdp_shard_conditions=model._fsdp_shard_conditions,
+                        fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
+                        or getattr(model, "_fsdp_shard_conditions", None),
                         pin_cpu_memory=server_args.pin_cpu_memory,
                     )
             # We only enable strict check for non-quantized models
@@ -346,7 +347,7 @@ class TextEncoderLoader(ComponentLoader):
             weights_not_loaded = weights_to_load - loaded_weights
             if weights_not_loaded:
                 raise ValueError(
-                    "Following weights were not initialized from "
+                    "Following model weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
 

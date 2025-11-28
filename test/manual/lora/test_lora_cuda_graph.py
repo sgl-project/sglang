@@ -17,7 +17,7 @@ import os
 import unittest
 from typing import List
 
-from utils import (
+from lora_utils import (
     ALL_OTHER_LORA_MODELS,
     CI_LORA_MODELS,
     DEFAULT_PROMPTS,
