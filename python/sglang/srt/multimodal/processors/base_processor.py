@@ -453,7 +453,6 @@ class BaseMultimodalProcessor(ABC):
 
     @staticmethod
     def validate_mm_data(
-        self,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
         audio_data: Optional[list] = None,
@@ -639,26 +638,28 @@ class BaseMultimodalProcessor(ABC):
                 continue
 
             # Get modality for this attribute
-            modality = modality or self.ATTR_NAME_TO_MODALITY.get(attr_name)
+            current_modality = modality or self.ATTR_NAME_TO_MODALITY.get(attr_name)
 
             if attr_name == "precomputed_embeddings":
                 modality_str = data_dict.get("modality")
-                modality = Modality.IMAGE
+                current_modality = Modality.IMAGE
                 if modality_str:
                     try:
-                        modality = Modality.from_str(modality_str)
+                        current_modality = Modality.from_str(modality_str)
                     except ValueError:
                         pass
 
-            if modality:
+            if current_modality:
                 # Create item if needed
-                if modality not in items:
-                    items[modality] = MultimodalDataItem(modality=modality)
+                if current_modality not in items:
+                    items[current_modality] = MultimodalDataItem(
+                        modality=current_modality
+                    )
 
                 if attr_name in self.FEATURE_NAMES:
                     attr_name = "feature"
 
-                items[modality].set(attr_name, value)
+                items[current_modality].set(attr_name, value)
 
         return list(items.values())
 
