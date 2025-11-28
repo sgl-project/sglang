@@ -7,6 +7,10 @@ on:
         description: 'Model list to benchmark on MI355 (JSON array format, default: ["Qwen3-VL-235B","Qwen3-next"])'
         required: false
         default: '["Qwen3-VL-235B","Qwen3-next"]'
+      image:
+        description: 'Image to use for the benchmark (default: "rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125")'
+        required: true
+        default: "rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125"
   
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
