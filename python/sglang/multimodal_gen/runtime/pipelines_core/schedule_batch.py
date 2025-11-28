@@ -218,14 +218,6 @@ class Req:
 
     def adjust_size(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
-            _image, width, height = (
-                server_args.pipeline_config.maybe_resize_condition_image(
-                    self.width, self.height, self.condition_image
-                )
-            )
-            self.width = width
-            self.height = height
-        if self.height is None or self.width is None:
             self.width = 1280
             self.height = 720
 
