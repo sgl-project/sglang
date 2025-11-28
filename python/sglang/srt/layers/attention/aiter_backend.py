@@ -82,9 +82,14 @@ class AiterAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        first_full_attn_id = list(
-            model_runner.token_to_kv_pool.full_attention_layer_id_mapping.keys()
-        )[0]
+        mapping = getattr(
+            model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
+        )
+
+        if isinstance(mapping, dict) and mapping:
+            first_full_attn_id = next(iter(mapping.keys()))
+        else:
+            first_full_attn_id = 0
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(
             first_full_attn_id
         ).shape[-1]
