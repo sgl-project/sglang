@@ -555,9 +555,7 @@ class TestRadixCache(unittest.TestCase):
 
     def test_hash_value_storage(self):
         """Test that hash_value is stored correctly after insert operations."""
-        cache = RadixCache(
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=None,
+        cache = RadixCache.create_simulated(
             page_size=4,
             enable_kv_cache_events=True,
         )
@@ -583,9 +581,7 @@ class TestRadixCache(unittest.TestCase):
 
     def test_hash_value_repeating_tokens(self):
         """Test that repeating token patterns get different hash values."""
-        cache = RadixCache(
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=None,
+        cache = RadixCache.create_simulated(
             page_size=4,
             enable_kv_cache_events=True,
         )
@@ -619,9 +615,7 @@ class TestRadixCache(unittest.TestCase):
 
     def test_hash_value_split(self):
         """Test that hash_value is split correctly when nodes are split."""
-        cache = RadixCache(
-            req_to_token_pool=None,
-            token_to_kv_pool_allocator=None,
+        cache = RadixCache.create_simulated(
             page_size=2,
             enable_kv_cache_events=True,
         )
