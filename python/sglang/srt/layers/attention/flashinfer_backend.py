@@ -1053,7 +1053,6 @@ class FlashInferIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
         else:
-            seq_lens_cpu = None
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 

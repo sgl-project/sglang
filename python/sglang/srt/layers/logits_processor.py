@@ -151,7 +151,6 @@ class LogitsMetadata:
             and forward_batch.return_logprob
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_simple_draft()
-            and not forward_batch.forward_mode.is_simple_verify()
         ):
             extend_return_top_logprob = any(
                 x > 0 for x in forward_batch.top_logprobs_nums

@@ -20,13 +20,6 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.nn.functional as F
-
-from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
-    get_attention_tp_rank,
-    get_attention_tp_size,
-    set_dp_buffer_len,
-)
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
     CudaGraphRunner,
@@ -41,8 +34,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
-    PPProxyTensors,
-    enable_num_token_non_padded,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -54,7 +45,6 @@ if TYPE_CHECKING:
 
 if is_cuda():
     from sgl_kernel import top_k_renorm_prob, top_p_renorm_prob
-
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -87,14 +77,9 @@ class SimpleEAGLECudaGraphRunner:
         self.speculative_algorithm = self.model_runner.server_args.speculative_algorithm
         self.tp_size = self.model_runner.server_args.tp_size
         self.dp_size = self.model_runner.server_args.dp_size
-        
-        self.attn_tp_size = get_attention_tp_size()
-        self.attn_tp_rank = get_attention_tp_rank()
-        
         self.enable_profile_cuda_graph = (
             self.model_runner.server_args.enable_profile_cuda_graph
         )
-        self.page_size = eagle_worker.page_size
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(self.model_runner)
         self.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -117,6 +102,8 @@ class SimpleEAGLECudaGraphRunner:
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
+
+        self.enable_pdmux = False
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -145,24 +132,6 @@ class SimpleEAGLECudaGraphRunner:
             self.one_tensor = torch.tensor([1])
             self.spec_info_topk_p = torch.zeros((self.max_bs, 1), dtype=torch.float32)
             self.spec_info_topk_index = torch.zeros((self.max_bs, 1), dtype=torch.int64)
-            
-            if self.require_gathered_buffer:
-                if self.require_mlp_tp_gather:
-                    self.global_num_tokens_gpu = torch.zeros(
-                        (self.dp_size,), dtype=torch.int32
-                    )
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (self.dp_size,), dtype=torch.int32
-                    )
-                else:
-                    assert self.require_attn_tp_gather
-                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
-                        (1,), dtype=torch.int32
-                    )
-            else:
-                self.global_num_tokens_gpu = None
-                self.global_num_tokens_for_logprob_gpu = None
         # Capture
         try:
             with model_capture_mode():
@@ -186,7 +155,7 @@ class SimpleEAGLECudaGraphRunner:
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(self, bs: int, forward: Callable):
+    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
         graph = torch.cuda.CUDAGraph()
         stream = self.stream
         num_tokens = bs * self.num_tokens_per_bs
@@ -201,47 +170,6 @@ class SimpleEAGLECudaGraphRunner:
 
         spec_info_topk_p = self.spec_info_topk_p[:bs]
         spec_info_topk_index = self.spec_info_topk_index[:bs]
-        
-        # pipeline parallelism
-        # if self.pp_size > 1:
-        #     pp_proxy_tensors = PPProxyTensors(
-        #         {k: v[:num_tokens] for k, v in self.pp_proxy_tensors.items()}
-        #     )
-
-        if self.require_mlp_tp_gather:
-            self.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            self.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens] * self.dp_size,
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens * self.dp_size
-        elif self.require_attn_tp_gather:
-            self.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            self.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=input_ids.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens
-        else:
-            global_dp_buffer_len = None
 
         verify_spec_info, draft_spec_info = self.get_spec_info()
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
@@ -272,7 +200,6 @@ class SimpleEAGLECudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            seq_lens_cpu = seq_lens.cpu(),
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
@@ -281,16 +208,12 @@ class SimpleEAGLECudaGraphRunner:
             encoder_lens=None,
             return_logprob=False,
             positions=positions,
-            global_num_tokens_gpu=self.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=verify_spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             sampling_info=sampling_info,
             simple_eagle_skip_attn_backend_init=True,
-            global_dp_buffer_len=global_dp_buffer_len,
         )
         draft_token_num = 2
         kv_indptr = torch.zeros(
@@ -430,12 +353,6 @@ class SimpleEAGLECudaGraphRunner:
         for _ in range(2):
             torch.cuda.synchronize()
             self.model_runner.tp_group.barrier()
-
-            # add
-              # Clean intermediate result cache for DP attention
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(global_dp_buffer_len, num_tokens) 
-
             forward_batch.forward_mode = self.capture_forward_mode
             verify_spec_info_backup = forward_batch.spec_info
             seq_lens_back_up = forward_batch.seq_lens
@@ -497,21 +414,6 @@ class SimpleEAGLECudaGraphRunner:
             self.encoder_lens[:raw_bs].copy_(forward_batch.encoder_lens)
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_bs].copy_(forward_batch.mrope_positions)
-        if self.require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
-        if enable_num_token_non_padded(self.model_runner.server_args):
-            num_token_non_padded = forward_batch.num_token_non_padded
-            if self.require_gathered_buffer:
-                tokens_per_rank = bs // self.attn_tp_size * self.num_tokens_per_bs
-                num_local_token_non_padded = torch.clamp(
-                    num_token_non_padded - tokens_per_rank * self.attn_tp_rank,
-                    min=0,
-                    max=tokens_per_rank,
-                )
-                self.num_token_non_padded.copy_(num_local_token_non_padded)
-            else:
-                self.num_token_non_padded.copy_(num_token_non_padded)
 
         if hasattr(forward_batch.spec_info, "hidden_states"):
             self.hidden_states[:raw_num_token] = forward_batch.spec_info.hidden_states
@@ -623,7 +525,7 @@ class SimpleEAGLECudaGraphRunner:
         return (
             logits_output,
             next_token_ids,
-            accept_index.clone(),
+            accept_index,
             draft_logits_output,
             draft_input,
         )
