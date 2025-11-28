@@ -16,6 +16,7 @@ import numpy as np
 import requests
 import torch
 import torchvision.transforms as T
+from diffusers import DiffusionPipeline
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
