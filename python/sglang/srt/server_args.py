@@ -393,7 +393,7 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
 
-    # For ngram only
+    # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
     speculative_ngram_max_match_window_size: int = 12
     speculative_ngram_min_bfs_breadth: int = 1
@@ -452,6 +452,10 @@ class ServerArgs:
     kt_threadpool_count: Optional[int] = None
     kt_num_gpu_experts: Optional[int] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
+
+    # Diffusion LLM
+    dllm_algorithm: Optional[str] = None
+    dllm_block_size: Optional[int] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -584,7 +588,7 @@ class ServerArgs:
     mm_enable_dp_encoder: bool = False
 
     # For forward hooks
-    hooks: Optional[List[dict[str, Any]]] = None
+    forward_hooks: Optional[List[dict[str, Any]]] = None
 
     def __post_init__(self):
         """
@@ -662,6 +666,9 @@ class ServerArgs:
 
         # Handle exporting request-level metrics.
         self._handle_request_metrics_exporters()
+
+        # Handle diffusion LLM inference.
+        self._handle_dllm_inference()
 
         # Handle any other necessary validations.
         self._handle_other_validations()
@@ -1110,6 +1117,21 @@ class ServerArgs:
             self.disable_hybrid_swa_memory = True
 
         elif "Llama4" in model_arch and self.device != "cpu":
+            # Auto-select attention backend for Llama4 if not specified
+            if self.attention_backend is None:
+                if is_sm100_supported():
+                    self.attention_backend, platform = "trtllm_mha", "sm100"
+                elif is_sm90_supported():
+                    self.attention_backend, platform = "fa3", "sm90"
+                elif is_hip():
+                    self.attention_backend, platform = "aiter", "hip"
+                elif self.device == "xpu":
+                    self.attention_backend, platform = "intel_xpu", "xpu"
+                else:
+                    self.attention_backend, platform = "triton", "other platforms"
+                logger.warning(
+                    f"Use {self.attention_backend} as attention backend on {platform} for Llama4 model"
+                )
             assert self.attention_backend in {
                 "fa3",
                 "aiter",
@@ -1117,11 +1139,6 @@ class ServerArgs:
                 "trtllm_mha",
                 "intel_xpu",
             }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
-            if is_sm100_supported() and self.attention_backend is None:
-                self.attention_backend = "trtllm_mha"
-                logger.warning(
-                    "Use trtllm_mha as attention backend on sm100 for Llama4 model"
-                )
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1185,7 +1202,7 @@ class ServerArgs:
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization == "fp8"
+                    self.quantization in ("fp8", "modelopt_fp4")
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -1212,7 +1229,7 @@ class ServerArgs:
                 if self.quantization is None and quant_method is not None:
                     self.quantization = quant_method
                 if (
-                    self.quantization == "fp8"
+                    (self.quantization == "fp8" or self.quantization == "modelopt_fp4")
                     and self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
                 ):
@@ -1500,6 +1517,11 @@ class ServerArgs:
                 self.ep_size == 1
             ), "FP8 Cutlass MoE is only supported with ep_size == 1"
 
+        if self.moe_runner_backend == "deep_gemm":
+            assert (
+                self.ep_size > 1 and self.moe_a2a_backend == "deepep"
+            ), "DeepGemm MoE runner is only supported when ep is enabled and moe_a2a_backend is deepep"
+
     def _handle_a2a_moe(self):
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
@@ -1710,7 +1732,7 @@ class ServerArgs:
             if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
-                and self.attention_backend != "flashinfer"
+                and self.attention_backend not in ["flashinfer", "fa3"]
             ):
                 raise ValueError(
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
@@ -1963,6 +1985,30 @@ class ServerArgs:
             raise ValueError(
                 "--export-metrics-to-file-dir is required when --export-metrics-to-file is enabled"
             )
+
+    def _handle_dllm_inference(self):
+        if self.dllm_algorithm is None:
+            return
+        if not self.disable_cuda_graph:
+            logger.warning(
+                "Cuda graph is disabled because of using diffusion LLM inference"
+            )
+            self.disable_cuda_graph = True
+        if not self.disable_overlap_schedule:
+            logger.warning(
+                "Overlap schedule is disabled because of using diffusion LLM inference"
+            )
+            self.disable_overlap_schedule = True
+        if not self.disable_radix_cache:
+            logger.warning(
+                "Radix cache is disabled because of using diffusion LLM inference"
+            )
+            self.disable_radix_cache = True
+        if not self.pp_size > 1:
+            logger.warning(
+                "Pipeline parallelism is disabled because of using diffusion LLM inference"
+            )
+            self.pp_size = 1
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
@@ -2918,7 +2964,8 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
         )
-        # Ngram speculative decoding
+
+        # Speculative decoding (ngram)
         parser.add_argument(
             "--speculative-ngram-min-match-window-size",
             type=int,
@@ -3227,6 +3274,21 @@ class ServerArgs:
             default=ServerArgs.kt_max_deferred_experts_per_token,
             help="[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
         )
+
+        # Diffusion LLM
+        parser.add_argument(
+            "--dllm-algorithm",
+            type=str,
+            default=ServerArgs.dllm_algorithm,
+            help="The diffusion LLM algorithm.",
+        )
+        parser.add_argument(
+            "--dllm-block-size",
+            type=int,
+            default=ServerArgs.dllm_block_size,
+            help="The number of tokens processed in each iteration of the block diffusion LLM.",
+        )
+
         # Double Sparsity
         parser.add_argument(
             "--enable-double-sparsity",
@@ -3815,10 +3877,10 @@ class ServerArgs:
 
         # For registering hooks
         parser.add_argument(
-            "--hooks",
+            "--forward-hooks",
             type=json_list_type,
-            default=None,
-            help="The hooks to be attached.",
+            default=ServerArgs.forward_hooks,
+            help="JSON-formatted forward hook specifications to attach to the model.",
         )
 
     @classmethod
