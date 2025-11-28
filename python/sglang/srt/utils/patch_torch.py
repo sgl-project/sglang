@@ -33,9 +33,6 @@ def monkey_patch_torch_reductions():
     if hasattr(reductions, "_reduce_tensor_original"):
         return
 
-    # from remote_pdb import set_trace
-    # set_trace()
-
     UntypedStorage._new_shared_cuda_original = UntypedStorage._new_shared_cuda
 
     reductions._reduce_tensor_original = reductions.reduce_tensor
@@ -44,8 +41,6 @@ def monkey_patch_torch_reductions():
     UntypedStorage._new_shared_cuda = _new_shared_cuda_safe
 
     reductions.reduce_tensor = _reduce_tensor_modified
-    # reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
-
     reductions._rebuild_cuda_tensor = _rebuild_cuda_tensor_safe
 
     reductions.init_reductions()
@@ -81,9 +76,6 @@ def _new_shared_cuda_safe(*args, **kwargs):
     try:
         return UntypedStorage._new_shared_cuda_original(*args, **kwargs)
     except:
-        # from remote_pdb import set_trace
-        # set_trace()
-
         # original impl of https://github.com/pytorch/pytorch/blob/f47dd0ddef1359e5b43e4b962412f67b30ecde56/torch/csrc/StorageSharing.cpp#L423
         size_bytes = args[2]
         if size_bytes is None or not isinstance(size_bytes, int):
@@ -96,11 +88,7 @@ def _new_shared_cuda_safe(*args, **kwargs):
 def _rebuild_cuda_tensor_safe(*args):
     try:
         return _rebuild_cuda_tensor_modified(*args)
-    except RuntimeError as e:
-        from remote_pdb import set_trace
-
-        set_trace()
-
+    except RuntimeError:
         args = _modify_tuple(
             args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid
         )

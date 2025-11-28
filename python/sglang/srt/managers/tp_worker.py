@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -59,14 +60,14 @@ logger = logging.getLogger(__name__)
 def safe_load():
     import torch.multiprocessing as mp
 
-    # 1) 用 filesystem 共享策略，避免依赖 pidfd/fd 传递
+    # 1) setting process sharing policy
     try:
         mp.set_sharing_strategy("file_system")
-        # 有时需要在每个子进程里也执行一次（见下面注释）
+        mp.set_start_method("fork", force=True)
     except Exception:
         pass
 
-    # 2) 改用 fork 启动（如果你的程序早已初始化线程/CUDA，这可能不安全）
+    # 2) using forks method
     try:
         mp.set_start_method("fork", force=True)
     except RuntimeError:
@@ -85,7 +86,8 @@ def safe_load():
     pass
 
 
-safe_load()
+if os.environ.get("SAFE_LOAD", "0") == "1":
+    safe_load()
 
 
 class BaseTpWorker(ABC):
