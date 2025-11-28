@@ -17,7 +17,10 @@ use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::workflow::{
-        steps::{McpServerConfigRequest, WorkerRemovalRequest},
+        steps::{
+            McpServerConfigRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
+            WorkerRemovalRequest,
+        },
         WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus,
     },
     mcp::McpConfig,
@@ -28,11 +31,27 @@ use crate::{
 /// Job types for control plane operations
 #[derive(Debug, Clone)]
 pub enum Job {
-    AddWorker { config: Box<WorkerConfigRequest> },
-    RemoveWorker { url: String },
-    InitializeWorkersFromConfig { router_config: Box<RouterConfig> },
-    InitializeMcpServers { mcp_config: Box<McpConfig> },
-    RegisterMcpServer { config: Box<McpServerConfigRequest> },
+    AddWorker {
+        config: Box<WorkerConfigRequest>,
+    },
+    RemoveWorker {
+        url: String,
+    },
+    InitializeWorkersFromConfig {
+        router_config: Box<RouterConfig>,
+    },
+    InitializeMcpServers {
+        mcp_config: Box<McpConfig>,
+    },
+    RegisterMcpServer {
+        config: Box<McpServerConfigRequest>,
+    },
+    AddWasmModule {
+        config: Box<WasmModuleConfigRequest>,
+    },
+    RemoveWasmModule {
+        request: Box<WasmModuleRemovalRequest>,
+    },
 }
 
 impl Job {
@@ -44,10 +63,12 @@ impl Job {
             Job::InitializeWorkersFromConfig { .. } => "InitializeWorkersFromConfig",
             Job::InitializeMcpServers { .. } => "InitializeMcpServers",
             Job::RegisterMcpServer { .. } => "RegisterMcpServer",
+            Job::AddWasmModule { .. } => "AddWasmModule",
+            Job::RemoveWasmModule { .. } => "RemoveWasmModule",
         }
     }
 
-    /// Get worker URL or MCP server name for logging
+    /// Get worker URL, MCP server name, or WASM module identifier for logging and status tracking
     pub fn worker_url(&self) -> &str {
         match self {
             Job::AddWorker { config } => &config.url,
@@ -55,6 +76,8 @@ impl Job {
             Job::InitializeWorkersFromConfig { .. } => "startup",
             Job::InitializeMcpServers { .. } => "startup",
             Job::RegisterMcpServer { config } => &config.name,
+            Job::AddWasmModule { config } => &config.descriptor.name,
+            Job::RemoveWasmModule { request } => &request.uuid_string,
         }
     }
 }
@@ -346,6 +369,77 @@ impl JobQueue {
                 }
 
                 result
+            }
+            Job::AddWasmModule { config } => {
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+                // Convert Box to Arc for context storage
+                let config_arc: Arc<WasmModuleConfigRequest> = Arc::new(*config.clone());
+                workflow_context.set_arc("wasm_module_config", config_arc);
+                workflow_context.set_arc("app_context", Arc::clone(context));
+
+                let instance_id = engine
+                    .start_workflow(
+                        WorkflowId::new("wasm_module_registration"),
+                        workflow_context,
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!("Failed to start WASM module registration workflow: {:?}", e)
+                    })?;
+
+                debug!(
+                    "Started WASM module registration workflow for {} (instance: {})",
+                    config.descriptor.name, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(300); // 5 minutes
+
+                Self::wait_for_workflow_completion(
+                    engine,
+                    instance_id,
+                    &config.descriptor.name,
+                    timeout_duration,
+                )
+                .await
+            }
+            Job::RemoveWasmModule { request } => {
+                let engine = context
+                    .workflow_engine
+                    .get()
+                    .ok_or_else(|| "Workflow engine not initialized".to_string())?;
+
+                let mut workflow_context = WorkflowContext::new(WorkflowInstanceId::new());
+                // Convert Box to Arc for context storage
+                let request_arc: Arc<WasmModuleRemovalRequest> = Arc::new(*request.clone());
+                workflow_context.set_arc("wasm_module_removal_request", request_arc);
+                workflow_context.set_arc("app_context", Arc::clone(context));
+
+                let instance_id = engine
+                    .start_workflow(WorkflowId::new("wasm_module_removal"), workflow_context)
+                    .await
+                    .map_err(|e| {
+                        format!("Failed to start WASM module removal workflow: {:?}", e)
+                    })?;
+
+                debug!(
+                    "Started WASM module removal workflow for {} (instance: {})",
+                    request.module_uuid, instance_id
+                );
+
+                let timeout_duration = Duration::from_secs(60); // 1 minute
+
+                Self::wait_for_workflow_completion(
+                    engine,
+                    instance_id,
+                    &request.module_uuid.to_string(),
+                    timeout_duration,
+                )
+                .await
             }
             Job::InitializeWorkersFromConfig { router_config } => {
                 let api_key = router_config.api_key.clone();
