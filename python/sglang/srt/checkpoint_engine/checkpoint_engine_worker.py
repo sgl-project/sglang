@@ -25,7 +25,6 @@ from sglang.srt.utils import is_npu
 
 try:
     from checkpoint_engine.worker import update_weights_from_ipc
-    from checkpoint_engine.device_utils import npu_generate_uuid
 except ImportError:
     raise ImportError(
         "checkpoint-engine is not installed. "
@@ -111,6 +110,7 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
         # Get device UUID for current device
         try:
             if is_npu:
+                from checkpoint_engine.device_utils import npu_generate_uuid
                 return f"NPU-{npu_generate_uuid()}"
             else:
                 device_id = torch.cuda.current_device()
@@ -144,11 +144,11 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
                         # Move parameters to device if needed for quantization processing
                         if is_npu:
                             target_device = torch.device(
-                                "cuda", torch.cuda.current_device()
+                                "npu", torch_npu.npu.current_device()
                             )
                         else:
                             target_device = torch.device(
-                                "npu", torch_npu.npu.current_device()
+                                "cuda", torch.cuda.current_device()
                             )
                         with device_loading_context(module, target_device):
                             quant_method.process_weights_after_loading(module)
