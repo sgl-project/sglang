@@ -135,28 +135,52 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
             b = len(self.reqs)
             topk = server_args.speculative_eagle_topk
-            topk_p = torch.stack(
-                [
-                    torch.as_tensor(
-                        req.output_topk_p[:topk],
-                        device=self.device,
-                        dtype=torch.float32,
-                    )
-                    for req in self.reqs
-                ],
-                dim=0,
-            )
-            topk_index = torch.stack(
-                [
-                    torch.as_tensor(
-                        req.output_topk_index[:topk],
-                        device=self.device,
-                        dtype=torch.int64,
-                    )
-                    for req in self.reqs
-                ],
-                dim=0,
-            )
+            if server_args.enable_mtp:
+                topk_p = torch.stack(
+                    [
+                        torch.as_tensor(
+                            req.output_topk_p[:topk * server_args.speculative_num_steps],
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        for req in self.reqs
+                    ],
+                    dim=0,
+                )
+                topk_index = torch.stack(
+                    [
+                        torch.as_tensor(
+                            req.output_topk_index[:topk * server_args.speculative_num_steps],
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                        for req in self.reqs
+                    ],
+                    dim=0,
+                )
+            else:
+                topk_p = torch.stack(
+                    [
+                        torch.as_tensor(
+                            req.output_topk_p[:topk],
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                        for req in self.reqs
+                    ],
+                    dim=0,
+                )
+                topk_index = torch.stack(
+                    [
+                        torch.as_tensor(
+                            req.output_topk_index[:topk],
+                            device=self.device,
+                            dtype=torch.int64,
+                        )
+                        for req in self.reqs
+                    ],
+                    dim=0,
+                )
 
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)

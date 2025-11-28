@@ -75,7 +75,6 @@ class MiMoV2MTPLayer(nn.Module):
         is_previous_layer_sparse = True
 
         if enable_moe_dense_fully_dp():
-            print("enable_moe_dense_fully_dp")
             mlp_tp_rank, mlp_tp_size = 0, 1
         else:
             mlp_tp_rank, mlp_tp_size = None, None
