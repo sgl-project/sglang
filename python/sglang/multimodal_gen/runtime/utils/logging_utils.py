@@ -381,6 +381,17 @@ def configure_logger(server_args, prefix: str = ""):
     set_uvicorn_logging_configs()
 
 
+def suppress_loggers(loggers_to_suppress: list[str]):
+    original_levels = {}
+
+    for logger_name in loggers_to_suppress:
+        logger = logging.getLogger(logger_name)
+        original_levels[logger_name] = logger.level
+        logger.setLevel(logging.WARNING)
+
+    return original_levels
+
+
 @contextmanager
 def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
     """
@@ -400,21 +411,8 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
         if get_is_main_process() == 0:
             should_suppress = False
 
-    loggers_to_suppress = ["urllib3"]
-    original_levels = {}
-
-    if should_suppress:
-        for logger_name in loggers_to_suppress:
-            logger = logging.getLogger(logger_name)
-            original_levels[logger_name] = logger.level
-            logger.setLevel(logging.WARNING)
-
-    # Suppress verbose logging from imageio, which is triggered when saving images.
-    logging.getLogger("imageio").setLevel(logging.WARNING)
-    logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
-    # Suppress Pillow plugin import logs when app log level is DEBUG
-    logging.getLogger("PIL").setLevel(logging.WARNING)
-    logging.getLogger("PIL.Image").setLevel(logging.WARNING)
+    loggers_to_suppress = ["urllib3", "imageio", "imageio_ffmpeg", "PIL", "PIL_Image"]
+    original_levels = suppress_loggers(loggers_to_suppress)
 
     try:
         yield
