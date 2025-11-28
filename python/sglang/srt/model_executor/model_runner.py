@@ -1401,6 +1401,50 @@ class ModelRunner:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
+
+        per_layer_bytes = cell_size // max(num_layers, 1)
+        bytes_per_token = cell_size
+        layout_label = "MLA" if self.use_mla_backend else "MHA"
+        dtype_size = torch._utils._element_size(self.kv_cache_dtype)
+        if self.use_mla_backend:
+            layout_detail = (
+                f"kv_lora_rank={self.model_config.kv_lora_rank}, "
+                f"rope_head_dim={self.model_config.qk_rope_head_dim}"
+            )
+        else:
+            kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
+            layout_detail = (
+                f"kv_heads={kv_heads}, head_dim={self.model_config.head_dim}"
+            )
+
+        dp_divisor = (
+            self.server_args.dp_size if self.server_args.enable_dp_attention else 1
+        )
+        tokens_per_dp_rank = max_num_token // max(dp_divisor, 1)
+
+        logger.info(
+            (
+                "Profiling KV tokens: layout=%s (%s), layers=%s, dtype=%s (elem=%s B), "
+                "per_token_bytes=%.2f KB, per_layer_bytes=%.2f KB, "
+                "available_mem=%.2f GB, total_mem=%.2f GB, mem_fraction_static=%.2f, "
+                "rest_mem=%.2f GB -> max_tokens=%s dp_attention=%s dp_size=%s tokens_per_dp_rank=%s"
+            ),
+            layout_label,
+            layout_detail,
+            num_layers,
+            self.kv_cache_dtype,
+            dtype_size,
+            bytes_per_token / 1024,
+            per_layer_bytes / 1024,
+            available_gpu_memory,
+            total_gpu_memory,
+            self.mem_fraction_static,
+            rest_memory,
+            max_num_token,
+            self.server_args.enable_dp_attention,
+            self.server_args.dp_size,
+            tokens_per_dp_rank,
+        )
         return max_num_token
 
     def handle_max_mamba_cache(self, total_rest_memory):

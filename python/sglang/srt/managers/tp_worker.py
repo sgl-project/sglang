@@ -75,10 +75,17 @@ class BaseTpWorker(ABC):
         return self.model_runner.is_hybrid is not None
 
     def get_tokens_per_layer_info(self):
-        return (
-            self.model_runner.full_max_total_num_tokens,
-            self.model_runner.swa_max_total_num_tokens,
+        full_tokens = getattr(
+            self.model_runner,
+            "full_max_total_num_tokens",
+            self.model_runner.max_total_num_tokens,
         )
+        swa_tokens = getattr(
+            self.model_runner,
+            "swa_max_total_num_tokens",
+            full_tokens,
+        )
+        return full_tokens, swa_tokens
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
@@ -278,28 +285,164 @@ class TpModelWorker(BaseTpWorker):
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.max_running_requests = min(
+        token_pool = self.model_runner.req_to_token_pool
+        token_pool_size = token_pool.size
+        token_pool_ctx_cap = token_pool.max_context_len
+        kv_pool_size = self.model_runner.token_to_kv_pool.size
+        sliding_window = self.model_runner.sliding_window_size
+        dp_divisor = server_args.dp_size if server_args.enable_dp_attention else 1
+
+        full_tokens, swa_tokens = self.get_tokens_per_layer_info()
+        logger.info(
             (
-                self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
+                "TP worker raw token stats tp_rank=%s/%s device=%s full_total=%s "
+                "swa_total=%s sliding_window=%s token_pool_size=%s token_pool_ctx=%s kv_pool_size=%s"
             ),
-            self.model_runner.req_to_token_pool.size,
+            self.tp_rank,
+            self.tp_size,
+            self.device,
+            full_tokens,
+            swa_tokens,
+            sliding_window,
+            token_pool_size,
+            token_pool_ctx_cap,
+            kv_pool_size,
         )
+
+        prefill_limit_source = (
+            "arg" if self.max_prefill_tokens is not None else "total_tokens"
+        )
+        effective_prefill_tokens = (
+            self.max_prefill_tokens
+            if self.max_prefill_tokens is not None
+            else self.max_total_num_tokens
+        )
+        logger.info(
+            "TP worker prefill cap raw=%s source=%s effective=%s",
+            self.max_prefill_tokens,
+            prefill_limit_source,
+            effective_prefill_tokens,
+        )
+
+        if server_args.max_running_requests is None:
+            configured_running_requests_source = "half_total_tokens"
+            configured_running_requests_raw = self.max_total_num_tokens // 2
+            configured_running_requests = configured_running_requests_raw
+        else:
+            configured_running_requests_raw = server_args.max_running_requests
+            configured_running_requests = configured_running_requests_raw // dp_divisor
+            configured_running_requests_source = (
+                f"arg//dp({dp_divisor})" if dp_divisor != 1 else "arg"
+            )
+
+        logger.info(
+            (
+                "TP worker running_requests calc raw=%s source=%s dp_divisor=%s "
+                "normalized=%s token_pool_size=%s"
+            ),
+            configured_running_requests_raw,
+            configured_running_requests_source,
+            dp_divisor,
+            configured_running_requests,
+            token_pool_size,
+        )
+
+        self.max_running_requests = min(
+            configured_running_requests,
+            token_pool_size,
+        )
+        running_requests_limit_reason = (
+            "token_pool_size"
+            if self.max_running_requests < configured_running_requests
+            else configured_running_requests_source
+        )
+        logger.info(
+            "TP worker running_requests final=%s limit_reason=%s",
+            self.max_running_requests,
+            running_requests_limit_reason,
+        )
+
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
         assert (
             self.max_queued_requests is None or self.max_queued_requests >= 1
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
+
+        context_cap = self.model_config.context_len - 1
+        memory_cap = self.max_total_num_tokens - 1
+        self.max_req_len = min(context_cap, memory_cap)
+        req_len_reason = "context_len" if context_cap <= memory_cap else "memory"
+        logger.info(
+            (
+                "TP worker req_len calc context_len=%s->cap=%s total_tokens=%s->cap=%s "
+                "chosen=%s reason=%s"
+            ),
+            self.model_config.context_len,
+            context_cap,
+            self.max_total_num_tokens,
+            memory_cap,
+            self.max_req_len,
+            req_len_reason,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert (
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
+
+        logger.info(
+            (
+                "TP worker capacity tp_rank=%s/%s pp_rank=%s/%s device=%s "
+                "total_tokens=%s prefill_tokens=%s(source=%s raw=%s) "
+                "req_len=%s(reason=%s) req_input_len=%s "
+                "running_requests=%s(limit_reason=%s) queued_requests=%s"
+            ),
+            self.tp_rank,
+            self.tp_size,
+            self.pp_rank,
+            server_args.pp_size,
+            self.device,
+            self.max_total_num_tokens,
+            effective_prefill_tokens,
+            prefill_limit_source,
+            self.max_prefill_tokens,
+            self.max_req_len,
+            req_len_reason,
+            self.max_req_input_len,
+            self.max_running_requests,
+            running_requests_limit_reason,
+            self.max_queued_requests,
+        )
+        logger.info(
+            (
+                "TP worker token budget detail tp_rank=%s/%s "
+                "configured_running_requests=%s(source=%s raw=%s dp_divisor=%s) "
+                "token_pool_size=%s token_pool_max_ctx=%s kv_pool_size=%s"
+            ),
+            self.tp_rank,
+            self.tp_size,
+            configured_running_requests,
+            configured_running_requests_source,
+            configured_running_requests_raw,
+            dp_divisor,
+            token_pool_size,
+            self.model_runner.req_to_token_pool.max_context_len,
+            self.model_runner.token_to_kv_pool.size,
+        )
+
+        if server_args.enable_dp_attention:
+            dp_rank_display = dp_rank if dp_rank is not None else 0
+            logger.info(
+                (
+                    "DP attention capacity tp_rank=%s/%s dp_rank=%s/%s "
+                    "tokens_per_rank=%s running_requests_per_rank=%s"
+                ),
+                self.tp_rank,
+                self.tp_size,
+                dp_rank_display,
+                server_args.dp_size,
+                self.max_total_num_tokens,
+                self.max_running_requests,
+            )
 
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(

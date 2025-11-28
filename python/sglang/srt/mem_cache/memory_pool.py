@@ -462,23 +462,28 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+    def describe_layout(self) -> Optional[str]:
+        return None
+
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
         Supports both tuple (K, V) size returns and single KV size returns.
         """
         kv_size_bytes = self.get_kv_size_bytes()
+        layout_info = self.describe_layout()
+        layout_suffix = f", layout={layout_info}" if layout_info else ""
         if isinstance(kv_size_bytes, tuple):
             k_size, v_size = kv_size_bytes
             k_size_GB = k_size / GB
             v_size_GB = v_size / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB{layout_suffix}"
             )
             self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB"
+                f"KV Cache is allocated. #tokens: {num_tokens}, KV size: {kv_size_GB:.2f} GB{layout_suffix}"
             )
             self.mem_usage = kv_size_GB
 
@@ -560,6 +565,19 @@ class MHATokenToKVPool(KVCache):
             self._kv_copy_config = None
 
         self._finalize_allocation_log(size)
+
+    def describe_layout(self) -> Optional[str]:
+        total_slots = self.size + self.page_size
+        dtype_info = (
+            f"store_dtype={self.store_dtype}, logical_dtype={self.dtype}"
+            if self.store_dtype != self.dtype
+            else f"dtype={self.dtype}"
+        )
+        return (
+            "NHD token-major "
+            f"(per-layer tensor shape=({total_slots}, {self.head_num}, {self.head_dim}), "
+            f"page_size={self.page_size}, heads={self.head_num}, head_dim={self.head_dim}, {dtype_info})"
+        )
 
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
@@ -1424,6 +1442,20 @@ class MLATokenToKVPool(KVCache):
         if not use_nsa:
             # NSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
+
+    def describe_layout(self) -> Optional[str]:
+        total_slots = self.size + self.page_size
+        dtype_info = (
+            f"store_dtype={self.store_dtype}, logical_dtype={self.dtype}"
+            if self.store_dtype != self.dtype
+            else f"dtype={self.dtype}"
+        )
+        return (
+            "N1D token-major "
+            f"(per-layer tensor shape=({total_slots}, 1, {self.kv_cache_dim}), "
+            f"page_size={self.page_size}, kv_lora_rank={self.kv_lora_rank}, "
+            f"rope_head_dim={self.qk_rope_head_dim}, {dtype_info})"
+        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
