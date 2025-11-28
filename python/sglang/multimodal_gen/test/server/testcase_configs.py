@@ -255,6 +255,19 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             output_size="1024x1024",
         ),
     ),
+    DiffusionTestCase(
+        "zimage_image_t2i",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+        ),
+        DiffusionSamplingParams(
+            prompt="Doraemon is eating dorayaki.",
+            output_size="1024x1024",
+        ),
+    ),
     # === Text and Image to Image (TI2I) ===
     # TODO: Timeout with Torch2.9. Add back when it can pass CI
     # DiffusionTestCase(
