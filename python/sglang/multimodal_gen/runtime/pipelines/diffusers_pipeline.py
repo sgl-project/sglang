@@ -267,8 +267,11 @@ class DiffusersExecutionStage(PipelineStage):
 
     def _load_input_image(self, batch: Req) -> Image.Image | None:
         """Load input image from batch."""
-        if batch.pil_image is not None:
-            return batch.pil_image
+        # Check for PIL image in condition_image or pixel_values
+        if batch.condition_image is not None and isinstance(batch.condition_image, Image.Image):
+            return batch.condition_image
+        if batch.pixel_values is not None and isinstance(batch.pixel_values, Image.Image):
+            return batch.pixel_values
 
         if not batch.image_path:
             return None
