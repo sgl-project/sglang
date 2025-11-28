@@ -16,6 +16,8 @@ from sglang.srt.sparsity2.backend.backend_adaptor import (
 )
 from sglang.srt.sparsity2.core.sparse_coordinator import SparseConfig, SparseCoordinator
 
+from sglang.srt.sparsity2.core.sparse_kvcache_manager import SparseKVCacheManager
+
 logger = logging.getLogger(__name__)
 
 _global_sparse_coordinator: Optional[SparseCoordinator] = None
@@ -84,9 +86,11 @@ def create_sparse_coordinator(
     page_size: int,
     req_to_token_pool,
     token_to_kv_pool,
-    decode_offload_manager,
     start_layer: int,
     end_layer: int,
+    token_to_kv_pool_allocator,
+    tp_group,
+    server_args,
     **kwargs,
 ) -> SparseCoordinator:
     config = SparseConfig(page_size=page_size, algorithm="deepseek_nsa")
@@ -98,8 +102,15 @@ def create_sparse_coordinator(
     if sparse_mode == SparseMode.TOKEN_WISE:
         assert page_size == 1, "TOKEN_WISE sparse requires page_size=1"
 
+    sparse_kv_cache_manager = SparseKVCacheManager(
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        tp_group=tp_group,
+        server_args=server_args,
+    )
+
     backend_adaptor = _create_backend_adaptor(
-        config.backend, device, algorithm, req_to_token_pool, decode_offload_manager
+        config.backend, device, algorithm, req_to_token_pool, sparse_kv_cache_manager
     )
     total_num_pages = _calculate_total_pages(
         token_to_kv_pool, start_layer, config.page_size
@@ -111,12 +122,13 @@ def create_sparse_coordinator(
         backend_adaptor=backend_adaptor,
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool=token_to_kv_pool,
-        decode_offload_manager=decode_offload_manager,
+        sparse_kv_cache_manager=sparse_kv_cache_manager,
         start_layer=start_layer,
         end_layer=end_layer,
         device=device,
         total_num_pages=total_num_pages,
     )
+    sparse_kv_cache_manager.req_states = coordinator.states
 
     register_sparse_coordinator(coordinator)
     logger.info(

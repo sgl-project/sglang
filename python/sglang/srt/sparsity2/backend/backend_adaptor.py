@@ -240,7 +240,7 @@ class NSABackendAdaptor(BackendAdaptor):
         hierarchical_indices = sparse_mask.nonzero(as_tuple=False).squeeze(1)
         if hierarchical_indices.numel() > 0:
             hierarchical_device_indices = (
-                self.decode_offload_manager.transform_sparse_top_k_cache(
+                self.decode_offload_manager.transfer_sparse_top_k_cache(
                     req_pool_indices=req_pool_indices[hierarchical_indices],
                     top_k_result=selected_indices[hierarchical_indices],
                     out_cache_loc=forward_batch.out_cache_loc[hierarchical_indices],

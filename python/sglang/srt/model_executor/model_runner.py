@@ -1955,22 +1955,16 @@ class ModelRunner:
             else:
                 tp_group_cpu = get_tp_group().cpu_group
 
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=tp_group_cpu,
-                tree_cache=None,
-                server_args=self.server_args,
-            )
-
             self.sparse_coordinator = create_sparse_coordinator(
                 device=self.device,
                 page_size=self.server_args.page_size,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
-                decode_offload_manager=self.decode_offload_manager,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=tp_group_cpu,
+                server_args=self.server_args,
             )
 
         except Exception as e:

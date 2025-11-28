@@ -5,10 +5,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
-import nvtx
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -19,7 +16,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    HostKVCache,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
@@ -29,197 +25,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
-
-
-@triton.jit
-def sparse_diff_triton_kernel(
-    prev_top_k_result_ptr,
-    curr_top_k_result_ptr,
-    prev_device_indices_ptr,
-    curr_device_indices_ptr,
-    bitmap_ptr,
-    curr_host_indices_ptr,
-    full_host_indices_ptr,
-    host_start_indices_ptr,
-    seq_lens_ptr,
-    prev_top_k_result_stride: tl.constexpr,
-    curr_top_k_result_stride: tl.constexpr,
-    prev_device_indices_stride: tl.constexpr,
-    curr_device_indices_stride: tl.constexpr,
-    bitmap_stride: tl.constexpr,
-    curr_host_indices_stride: tl.constexpr,
-    TOPK: tl.constexpr,
-):
-    bid = tl.program_id(0)
-    offset = tl.arange(0, TOPK)
-    prev_top_k_result = tl.load(
-        prev_top_k_result_ptr + prev_top_k_result_stride * bid + offset
-    )
-    max_val = tl.max(prev_top_k_result)
-    seq_len = tl.load(seq_lens_ptr + bid)
-    if max_val == -1:
-        # After prefilling the first round, the entire cache needs to be loaded.
-        no_exist_top_k_result = tl.load(
-            curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
-        )
-        mask = no_exist_top_k_result < seq_len
-        start_index = tl.load(host_start_indices_ptr + bid)
-        no_exist_host_indices = tl.load(
-            full_host_indices_ptr + start_index + no_exist_top_k_result, mask=mask
-        )
-        tl.store(
-            curr_host_indices_ptr + curr_host_indices_stride * bid + offset,
-            no_exist_host_indices,
-            mask=mask,
-        )
-        return
-    tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset)
-
-    prev_max_val_index = tl.load(bitmap_ptr + bitmap_stride * bid + seq_len - 1)
-    if prev_max_val_index != -1:
-        tl.store(bitmap_ptr + bitmap_stride * bid + seq_len - 1, -1)
-        tl.store(
-            prev_device_indices_ptr
-            + prev_device_indices_stride * bid
-            + prev_max_val_index,
-            -1,
-        )
-
-    curr_top_k_result = tl.load(
-        curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
-    )
-    exist_indices = tl.load(bitmap_ptr + bitmap_stride * bid + curr_top_k_result)
-
-    mask = exist_indices >= 0
-    exist_prev_device_indices = tl.load(
-        prev_device_indices_ptr + prev_device_indices_stride * bid + exist_indices,
-        mask=mask,
-    )
-    tl.store(
-        curr_device_indices_ptr + curr_device_indices_stride * bid + offset,
-        exist_prev_device_indices,
-        mask=mask,
-    )
-
-    tl.store(
-        prev_device_indices_ptr + prev_device_indices_stride * bid + exist_indices,
-        -1,
-        mask=mask,
-    )
-    tl.store(
-        curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset, -1, mask=mask
-    )
-    tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, -1)
-
-    no_exist_top_k_result = tl.load(
-        curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
-    )
-    start_index = tl.load(host_start_indices_ptr + bid)
-    mask1 = no_exist_top_k_result < seq_len
-    host_mask = ~mask & mask1
-    no_exist_host_indices = tl.load(
-        full_host_indices_ptr + start_index + no_exist_top_k_result, mask=host_mask
-    )
-    tl.store(
-        curr_host_indices_ptr + curr_host_indices_stride * bid + offset,
-        no_exist_host_indices,
-        mask=host_mask,
-    )
-
-
-class SparseTopKIndicesHelper:
-    """Sparse top_k indices helper handles the differences between the top_k indices and extracts the indices that need to be transformed."""
-
-    def __init__(
-        self, server_args: ServerArgs, host_mem_pool: HostKVCache, max_pool_size: int
-    ):
-        self.device = server_args.device
-        self.max_model_len = server_args.model_config.context_len
-        self.max_pool_size = max_pool_size
-        self.host_mem_pool = host_mem_pool
-
-        # init bitmap
-        self.bitmap = torch.full(
-            (self.max_pool_size, self.max_model_len),
-            -1,
-            dtype=torch.int16,
-            device=self.device,
-        )
-
-    @nvtx.annotate("SparseTopKIndicesHelper.load_top_k_cache", color="red")
-    def load_top_k_cache(
-        self,
-        prev_top_k_result: torch.Tensor,
-        curr_top_k_result: torch.Tensor,
-        prev_device_indices: torch.Tensor,
-        full_host_indices: torch.Tensor,
-        host_start_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        layer_id: int,
-    ):
-        bs = prev_top_k_result.shape[0]
-        top_k = prev_top_k_result.shape[1]
-        curr_device_indices = torch.full(
-            (bs, top_k + 1), -1, dtype=torch.int64, device=self.device
-        )
-        curr_host_indices = torch.full(
-            (bs, top_k), -1, dtype=torch.int64, device=self.device
-        )
-
-        grid = (bs,)
-        sparse_diff_triton_kernel[grid](
-            prev_top_k_result,
-            curr_top_k_result,
-            prev_device_indices,
-            curr_device_indices,
-            self.bitmap,
-            curr_host_indices,
-            full_host_indices,
-            host_start_indices,
-            seq_lens,
-            prev_top_k_result.stride(0),
-            curr_top_k_result.stride(0),
-            prev_device_indices.stride(0),
-            curr_device_indices.stride(0),
-            self.bitmap.stride(0),
-            curr_host_indices.stride(0),
-            top_k,
-        )
-
-        # TODO(huangtingwei9988)：Further optimization is needed.
-        should_load_device_indices = [
-            prev_device_indices[i][prev_device_indices[i] != -1] for i in range(bs)
-        ]
-        should_load_host_indices = [
-            curr_host_indices[i][curr_host_indices[i] != -1] for i in range(bs)
-        ]
-        for i in range(bs):
-            curr_device_indices[i][:-1][curr_top_k_result[i] == seq_lens[i]] = (
-                out_cache_loc[i].to(dtype=torch.int64)
-            )
-            mask = (curr_device_indices[i] == -1) & (
-                curr_device_indices[i] != out_cache_loc[i]
-            )
-            curr_device_indices[i][mask] = should_load_device_indices[i]
-            should_load_device_indices[i] = should_load_device_indices[i][
-                : len(should_load_host_indices[i])
-            ]
-        should_load_device_indices = torch.cat(should_load_device_indices)
-        should_load_host_indices = torch.cat(should_load_host_indices)
-
-        assert len(should_load_device_indices) == len(should_load_host_indices)
-        if len(should_load_device_indices) > 0:
-            # load cache from cpu
-            self.host_mem_pool.load_to_device_per_layer(
-                self.host_mem_pool.device_pool,
-                should_load_host_indices,
-                should_load_device_indices,
-                layer_id,
-                "kernel",
-            )
-
-        return curr_device_indices
 
 
 class DecodeKVCacheOffloadManager:
@@ -245,7 +50,7 @@ class DecodeKVCacheOffloadManager:
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                1,
+                self.page_size,
                 server_args.hicache_mem_layout,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
@@ -253,7 +58,7 @@ class DecodeKVCacheOffloadManager:
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
-                1,
+                self.page_size,
                 server_args.hicache_mem_layout,
             )
         else:
@@ -276,174 +81,7 @@ class DecodeKVCacheOffloadManager:
 
         self.ongoing_offload = {}
         self.ongoing_backup = {}
-        if server_args.enable_sparse_attn:
-            self.sparse_decode_ongoing_offload = {}
-            self.sparse_prefill_ongoing_offload = {}
-            max_pool_size = self.req_to_token_pool.req_to_token.shape[0]
-            self.sparse_indices_helper = SparseTopKIndicesHelper(
-                server_args, self.decode_host_mem_pool, max_pool_size
-            )
-            self.req_states = None
         logger.info("Enable offload kv cache for decode side")
-
-    @nvtx.annotate(
-        "DecodeKVCacheOffloadManager.transform_sparse_top_k_cache", color="red"
-    )
-    def transform_sparse_top_k_cache(
-        self,
-        req_pool_indices,
-        top_k_result,
-        out_cache_loc,
-        seq_lens,
-        layer_id,
-    ):
-
-        # get prev data from req_states
-        prev_top_k_result = (
-            self.req_states.prev_top_k_result[req_pool_indices, layer_id]
-            .detach()
-            .clone()
-        )
-
-        prev_device_indices = (
-            self.req_states.prev_device_indices[req_pool_indices, layer_id]
-            .detach()
-            .clone()
-        )
-
-        self.req_states.prev_top_k_result[req_pool_indices, layer_id] = (
-            top_k_result.detach().clone().long()
-        )
-
-        full_host_indices = torch.cat(
-            [self.req_states.full_host_indices[idx] for idx in req_pool_indices], dim=0
-        )
-
-        host_indices_lens = [0] + [
-            len(self.req_states.full_host_indices[idx]) for idx in req_pool_indices
-        ][:-1]
-        host_indices_lens = torch.tensor(
-            host_indices_lens,
-            dtype=torch.int64,
-            device=full_host_indices.device,
-        )
-        host_start_indices = torch.cumsum(host_indices_lens, dim=-1)
-
-        curr_device_indices = self.sparse_indices_helper.load_top_k_cache(
-            prev_top_k_result=prev_top_k_result,
-            curr_top_k_result=top_k_result,
-            prev_device_indices=prev_device_indices,
-            full_host_indices=full_host_indices,
-            host_start_indices=host_start_indices,
-            seq_lens=seq_lens - 1,  # TODO:  FIXME,
-            out_cache_loc=out_cache_loc,
-            layer_id=layer_id,
-        )
-
-        # update indices
-        self.req_states.prev_device_indices[req_pool_indices, layer_id] = (
-            curr_device_indices
-        )
-
-        return curr_device_indices[:, :-1]
-
-    def offload_sparse_decode_req_tokens(self, req_pool_indices, out_alloc_len):
-        """Offload incremental token KV cache for sparse attention."""
-
-        self.request_counter += 1
-        ack_id = self.request_counter
-        host_indices = self.cache_controller.write(
-            device_indices=out_alloc_len.long(),
-            node_id=ack_id,
-        )
-        assert host_indices is not None, "Host out of memory"
-        self.sparse_decode_ongoing_offload[ack_id] = (host_indices, req_pool_indices)
-        return ack_id
-
-    def check_sparse_offload_progress(self):
-        """Check the progress of offload from device to host for sparse schedule every step"""
-        if len(self.sparse_decode_ongoing_offload) == 0:
-            return
-
-        cc = self.cache_controller
-        qsizes = torch.tensor(
-            [
-                len(cc.ack_write_queue),
-            ],
-            dtype=torch.int,
-        )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
-        finish_count = qsizes.tolist()[0]
-        assert finish_count == 1
-
-        _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-        finish_event.synchronize()
-
-        # update full_host_indices
-        host_indices, req_pool_indices = self.sparse_decode_ongoing_offload.pop(
-            ack_list[0]
-        )
-        for i in range(len(req_pool_indices)):
-            full_host_indices = self.req_states.full_host_indices[req_pool_indices[i]]
-            if len(host_indices) > 0:
-                host_idx_i = host_indices[i].to(self.req_states.device).reshape(-1)
-                self.req_states.full_host_indices[req_pool_indices[i]] = torch.cat(
-                    [full_host_indices, host_idx_i]
-                )
-            else:
-                logger.warning(
-                    f"Host indices is empty for request {req_pool_indices[i]}"
-                )
-
-    def offload_prefill_full_kv_cache(self, req):
-        offloaded_len = len(req.origin_input_ids)
-        token_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :offloaded_len
-        ].long()
-
-        self.request_counter += 1
-        ack_id = self.request_counter
-        host_indices = self.cache_controller.write(
-            device_indices=token_indices,
-            node_id=ack_id,
-        )
-        assert host_indices is not None, "Host out of memory"
-        self.sparse_prefill_ongoing_offload[ack_id] = (host_indices, req)
-        logger.info(
-            f"Offloaded prefill full KV cache for request {req.rid}, offloaded len:{offloaded_len}, host len:{len(host_indices)}"
-        )
-        return ack_id
-
-    def check_prefill_offload_progress(self):
-        if len(self.sparse_prefill_ongoing_offload) == 0:
-            return
-
-        cc = self.cache_controller
-        while True:
-            qsizes = torch.tensor(
-                [
-                    len(cc.ack_write_queue),
-                ],
-                dtype=torch.int,
-            )
-            if self.tp_world_size > 1:
-                torch.distributed.all_reduce(
-                    qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-                )
-            finish_count = qsizes.tolist()[0]
-            if finish_count > 0:
-                break
-
-        _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-        finish_event.synchronize()
-
-        (host_indices, req) = self.sparse_prefill_ongoing_offload.pop(ack_list[0])
-        self.req_states.full_host_indices[req.req_pool_idx] = host_indices.to(
-            self.req_states.device
-        )
 
     def offload_kv_cache(self, req) -> bool:
         """Offload incremental KV cache for decode side."""
