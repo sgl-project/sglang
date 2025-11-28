@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.models import (
     EncoderConfig,
     VAEConfig,
 )
-from sglang.multimodal_gen.configs.pipelines.base import ModelTaskType, PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs import ModelTaskType, PipelineConfig
 
 
 @dataclass
