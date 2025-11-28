@@ -103,9 +103,12 @@ def _should_enable_trtllm_fp8_fuse(forward_batch: ForwardBatch) -> bool:
     # Check if backend is TRTLLM MHA
     backend = forward_batch.attn_backend
     backend_class_name = backend.__class__.__name__
-    is_trtllm_mha = backend_class_name in (
-        "TRTLLMHAAttnBackend",
-        "TRTLLMHAAttnMultiStepDraftBackend",
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnBackend,
+        TRTLLMHAAttnMultiStepDraftBackend,
+    )
+    is_trtllm_mha = isinstance(
+        backend, (TRTLLMHAAttnBackend, TRTLLMHAAttnMultiStepDraftBackend)
     )
 
     if not is_trtllm_mha:
