@@ -2,13 +2,9 @@
 // clang-format off
 #pragma once
 
-#include "kernel_bf16_kfe2m1f.cuh"
-#include "kernel_bf16_kfe4m3fn.cuh"
 #include "kernel_bf16_ku4.cuh"
 #include "kernel_bf16_ku4b8.cuh"
 #include "kernel_bf16_ku8b128.cuh"
-#include "kernel_fp16_kfe2m1f.cuh"
-#include "kernel_fp16_kfe4m3fn.cuh"
 #include "kernel_fp16_ku4.cuh"
 #include "kernel_fp16_ku4b8.cuh"
 #include "kernel_fp16_ku8b128.cuh"
