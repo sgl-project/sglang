@@ -938,6 +938,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
+    // Get HA cluster state and port before moving ha_handler into app_state
+    let ha_cluster_state = ha_handler.as_ref().map(|h| h.state.clone());
+    let ha_port = config.ha_server_config.as_ref().map(|c| c.self_addr.port());
+
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
@@ -949,7 +953,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
             let app_context_arc = Arc::clone(&app_state.context);
-            match start_service_discovery(service_discovery_config, app_context_arc).await {
+
+            match start_service_discovery(
+                service_discovery_config,
+                app_context_arc,
+                ha_cluster_state,
+                ha_port,
+            )
+            .await
+            {
                 Ok(handle) => {
                     info!("Service discovery started");
                     spawn(async move {

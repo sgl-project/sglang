@@ -50,7 +50,17 @@ impl HAController {
 
         loop {
             log::info!("Round {} Status:{:?}", cnt, read_state.read());
-            let peer = if cnt == 0 {
+
+            // Get available peers from cluster state
+            let mut map = init_state.read().clone();
+            map.retain(|k, v| {
+                k.ne(&self.self_name.to_string())
+                    && v.status != NodeStatus::Down as i32
+                    && v.status != NodeStatus::Leaving as i32
+            });
+
+            let peer = if cnt == 0 && map.is_empty() {
+                // Only use init_peer if cluster state is empty (no service discovery)
                 self.init_peer.map(|init_peer| NodeState {
                     name: "init_peer".to_string(),
                     address: init_peer.to_string(),
@@ -59,12 +69,7 @@ impl HAController {
                     metadata: HashMap::new(),
                 })
             } else {
-                let mut map = init_state.read().clone();
-                map.retain(|k, v| {
-                    k.ne(&self.self_name.to_string())
-                        && v.status != NodeStatus::Down as i32
-                        && v.status != NodeStatus::Leaving as i32
-                });
+                // Use nodes from cluster state (from service discovery or gossip)
                 let random_nodes = get_random_values_refs(&map, 1);
                 random_nodes.first().map(|&node| node.clone())
             };

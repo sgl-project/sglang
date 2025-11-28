@@ -839,6 +839,8 @@ impl CliArgs {
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                router_selector: HashMap::new(), // Can be set via config file
+                router_ha_port_annotation: "sglang.ai/ha-port".to_string(),
             })
         } else {
             None
@@ -965,6 +967,18 @@ impl CliArgs {
 
     fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
         let service_discovery_config = if self.service_discovery {
+            // Get router discovery config from router_config.discovery if available
+            let (router_selector, router_ha_port_annotation) = router_config
+                .discovery
+                .as_ref()
+                .map(|d| {
+                    (
+                        d.router_selector.clone(),
+                        d.router_ha_port_annotation.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (HashMap::new(), "sglang.ai/ha-port".to_string()));
+
             Some(ServiceDiscoveryConfig {
                 enabled: true,
                 selector: Self::parse_selector(&self.selector),
@@ -975,6 +989,8 @@ impl CliArgs {
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+                router_selector,
+                router_ha_port_annotation,
             })
         } else {
             None

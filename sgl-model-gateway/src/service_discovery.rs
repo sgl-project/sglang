@@ -21,6 +21,10 @@ use tracing::{debug, error, info, warn};
 use crate::{
     app_context::AppContext,
     core::Job,
+    ha::service::{
+        gossip::{NodeState, NodeStatus},
+        ClusterState,
+    },
     observability::metrics::{metrics_labels, Metrics},
     protocols::worker_spec::WorkerConfigRequest,
 };
@@ -38,6 +42,9 @@ pub struct ServiceDiscoveryConfig {
     pub decode_selector: HashMap<String, String>,
     // Bootstrap port annotation specific to mooncake implementation
     pub bootstrap_port_annotation: String,
+    // Router node discovery for HA
+    pub router_selector: HashMap<String, String>,
+    pub router_ha_port_annotation: String,
 }
 
 impl Default for ServiceDiscoveryConfig {
@@ -52,6 +59,8 @@ impl Default for ServiceDiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_ha_port_annotation: "sglang.ai/ha-port".to_string(),
         }
     }
 }
@@ -71,6 +80,8 @@ pub struct PodInfo {
     pub is_ready: bool,
     pub pod_type: Option<PodType>,
     pub bootstrap_port: Option<u16>,
+    pub is_router: bool,
+    pub ha_port: Option<u16>,
 }
 
 impl PodInfo {
@@ -147,6 +158,29 @@ impl PodInfo {
             None
         };
 
+        // Check if this is a router pod
+        let is_router = if let Some(config) = config {
+            !config.router_selector.is_empty()
+                && Self::matches_selector(pod, &config.router_selector)
+        } else {
+            false
+        };
+
+        // Extract HA port from annotation if this is a router pod
+        let ha_port = if is_router {
+            if let Some(config) = config {
+                pod.metadata
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get(&config.router_ha_port_annotation))
+                    .and_then(|port_str| port_str.parse::<u16>().ok())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Some(PodInfo {
             name,
             ip: pod_ip,
@@ -154,6 +188,8 @@ impl PodInfo {
             is_ready,
             pod_type,
             bootstrap_port,
+            is_router,
+            ha_port,
         })
     }
 
@@ -170,6 +206,8 @@ impl PodInfo {
 pub async fn start_service_discovery(
     config: ServiceDiscoveryConfig,
     app_context: Arc<AppContext>,
+    ha_cluster_state: Option<ClusterState>,
+    ha_port: Option<u16>,
 ) -> Result<task::JoinHandle<()>, kube::Error> {
     if !config.enabled {
         return Err(kube::Error::Api(kube::error::ErrorResponse {
@@ -218,6 +256,20 @@ pub async fn start_service_discovery(
         );
     }
 
+    // Log router discovery if enabled
+    if !config.router_selector.is_empty() {
+        let router_selector = config
+            .router_selector
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join(",");
+        info!(
+            "Router node discovery enabled | selector: '{}' | HA port annotation: '{}'",
+            router_selector, config.router_ha_port_annotation
+        );
+    }
+
     let handle = task::spawn(async move {
         let tracked_pods = Arc::new(Mutex::new(HashSet::new()));
 
@@ -231,6 +283,20 @@ pub async fn start_service_discovery(
 
         let config_arc = Arc::new(config.clone());
         let port = config.port;
+
+        // Spawn router discovery task if enabled
+        if !config_arc.router_selector.is_empty() {
+            if let (Some(cluster_state), Some(ha_port)) = (ha_cluster_state.clone(), ha_port) {
+                let router_config = config_arc.clone();
+                let router_pods = pods.clone();
+                tokio::spawn(async move {
+                    start_router_discovery(router_config, router_pods, cluster_state, ha_port)
+                        .await;
+                });
+            } else {
+                warn!("Router selector configured but HA cluster state or HA port not provided, skipping router discovery");
+            }
+        }
 
         let mut retry_delay = Duration::from_secs(1);
         const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
@@ -522,6 +588,139 @@ async fn handle_pod_deletion(
     }
 }
 
+/// Start router node discovery for HA cluster
+async fn start_router_discovery(
+    config: Arc<ServiceDiscoveryConfig>,
+    pods: Api<Pod>,
+    cluster_state: ClusterState,
+    default_ha_port: u16,
+) {
+    use std::collections::HashMap;
+
+    let mut retry_delay = Duration::from_secs(1);
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
+
+    loop {
+        let watcher_config = Config::default();
+        let watcher_stream = watcher(pods.clone(), watcher_config).applied_objects();
+
+        let config_clone = Arc::clone(&config);
+
+        let filtered_stream = watcher_stream.filter_map(move |obj_res| {
+            let config_inner = Arc::clone(&config_clone);
+
+            async move {
+                match obj_res {
+                    Ok(pod) => {
+                        // Check if this pod matches router selector
+                        if PodInfo::matches_selector(&pod, &config_inner.router_selector) {
+                            Some(Ok(pod))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => Some(Err(e)),
+                }
+            }
+        });
+
+        let config_clone2 = Arc::clone(&config);
+        let cluster_state_clone2 = cluster_state.clone();
+
+        match filtered_stream
+            .try_for_each(move |pod| {
+                let config_inner = Arc::clone(&config_clone2);
+                let cluster_state_inner = cluster_state_clone2.clone();
+
+                async move {
+                    let pod_info = PodInfo::from_pod(&pod, Some(&config_inner));
+
+                    if let Some(pod_info) = pod_info {
+                        if pod_info.is_router {
+                            let ha_port = pod_info.ha_port.unwrap_or(default_ha_port);
+                            let node_address = format!("{}:{}", pod_info.ip, ha_port);
+
+                            if pod.metadata.deletion_timestamp.is_some() {
+                                // Pod is being deleted, mark node as Down
+                                let mut state = cluster_state_inner.write();
+                                if let Some(node) = state.get_mut(&pod_info.name) {
+                                    node.status = NodeStatus::Down as i32;
+                                    node.version += 1;
+                                    info!(
+                                        "Router node {} marked as Down (pod deleted)",
+                                        pod_info.name
+                                    );
+                                } else {
+                                    debug!(
+                                        "Router node {} not found in cluster state (already removed)",
+                                        pod_info.name
+                                    );
+                                }
+                            } else if pod_info.is_healthy() {
+                                // Pod is healthy, add or update node in cluster state
+                                let mut state = cluster_state_inner.write();
+                                let existing_version = state
+                                    .get(&pod_info.name)
+                                    .map(|n| n.version)
+                                    .unwrap_or(0);
+
+                                let node_state = NodeState {
+                                    name: pod_info.name.clone(),
+                                    address: node_address,
+                                    status: NodeStatus::Alive as i32,
+                                    version: existing_version + 1,
+                                    metadata: HashMap::new(),
+                                };
+
+                                state.insert(pod_info.name.clone(), node_state.clone());
+                                info!(
+                                    "Router node {} added/updated in HA cluster (address: {})",
+                                    pod_info.name, node_state.address
+                                );
+                            } else {
+                                // Pod is not healthy, mark as Suspected
+                                let mut state = cluster_state_inner.write();
+                                if let Some(node) = state.get_mut(&pod_info.name) {
+                                    if node.status != NodeStatus::Down as i32 {
+                                        node.status = NodeStatus::Suspected as i32;
+                                        node.version += 1;
+                                        debug!(
+                                            "Router node {} marked as Suspected (pod not healthy)",
+                                            pod_info.name
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            })
+            .await
+        {
+            Ok(_) => {
+                retry_delay = Duration::from_secs(1);
+            }
+            Err(err) => {
+                error!("Error in router discovery watcher: {}", err);
+                warn!(
+                    "Retrying router discovery in {} seconds with exponential backoff",
+                    retry_delay.as_secs()
+                );
+                time::sleep(retry_delay).await;
+
+                retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+            }
+        }
+
+        warn!(
+            "Router discovery watcher exited, restarting in {} seconds",
+            config.check_interval.as_secs()
+        );
+        time::sleep(config.check_interval).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use k8s_openapi::{
@@ -671,6 +870,8 @@ mod tests {
             prefill_selector,
             decode_selector,
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_ha_port_annotation: "sglang.ai/ha-port".to_string(),
         }
     }
 
@@ -872,6 +1073,8 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
         assert!(healthy_pod.is_healthy());
 
@@ -882,6 +1085,8 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
         assert!(!not_ready_pod.is_healthy());
 
@@ -892,6 +1097,8 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
         assert!(!not_running_pod.is_healthy());
     }
@@ -905,6 +1112,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            ha_port: None,
         };
 
         let pod2 = PodInfo {
@@ -914,6 +1123,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            ha_port: None,
         };
 
         let pod3 = PodInfo {
@@ -923,6 +1134,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
 
         assert_eq!(pod1, pod2);
@@ -940,6 +1153,8 @@ mod tests {
             is_ready: false,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
         let port = 8080u16;
 
@@ -966,6 +1181,8 @@ mod tests {
             is_ready: true,
             pod_type: None,
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
         let port = 8080u16;
 
@@ -991,6 +1208,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            ha_port: None,
         };
         let port = 8080u16;
 
@@ -1022,6 +1241,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
         let port = 8080u16;
 
@@ -1053,6 +1274,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            ha_port: None,
         };
 
         // Add pod to tracked set first
@@ -1086,6 +1309,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
         let port = 8080u16;
 
@@ -1114,6 +1339,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Regular),
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
         let port = 8080u16;
 
@@ -1146,6 +1373,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Prefill),
             bootstrap_port: Some(8081),
+            is_router: false,
+            ha_port: None,
         };
         let port = 8080u16;
 
@@ -1177,6 +1406,8 @@ mod tests {
             is_ready: true,
             pod_type: Some(PodType::Decode),
             bootstrap_port: None,
+            is_router: false,
+            ha_port: None,
         };
 
         // Add pod to tracked set first

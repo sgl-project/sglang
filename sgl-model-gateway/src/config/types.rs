@@ -406,6 +406,16 @@ pub struct DiscoveryConfig {
     /// PD mode decode
     pub decode_selector: HashMap<String, String>,
     pub bootstrap_port_annotation: String,
+    /// Router node discovery for HA (Kubernetes label selector)
+    #[serde(default)]
+    pub router_selector: HashMap<String, String>,
+    /// Annotation key to read HA port from Router Pods
+    #[serde(default = "default_router_ha_port_annotation")]
+    pub router_ha_port_annotation: String,
+}
+
+fn default_router_ha_port_annotation() -> String {
+    "sglang.ai/ha-port".to_string()
 }
 
 impl Default for DiscoveryConfig {
@@ -419,6 +429,8 @@ impl Default for DiscoveryConfig {
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
+            router_selector: HashMap::new(),
+            router_ha_port_annotation: default_router_ha_port_annotation(),
         }
     }
 }
@@ -924,6 +936,8 @@ mod tests {
             prefill_selector: selector.clone(),
             decode_selector: selector.clone(),
             bootstrap_port_annotation: "custom.io/port".to_string(),
+            router_selector: HashMap::new(),
+            router_ha_port_annotation: "sglang.ai/ha-port".to_string(),
         };
 
         assert!(config.enabled);
@@ -1200,6 +1214,8 @@ mod tests {
                 prefill_selector: selectors.clone(),
                 decode_selector: selectors,
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
+                router_selector: HashMap::new(),
+                router_ha_port_annotation: "sglang.ai/ha-port".to_string(),
             })
             .enable_metrics("::", 9999) // IPv6 any
             .enable_trace("localhost:4317")
