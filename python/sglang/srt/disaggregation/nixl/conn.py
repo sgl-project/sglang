@@ -724,9 +724,15 @@ class NixlKVSender(CommonKVSender):
         if not self.has_sent:
             return self.kv_mgr.check_status(self.bootstrap_room)
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
-        if all([x == "DONE" for x in states]):
+        if all(x == "DONE" for x in states):
+            for handle in self.xfer_handles:
+                self.kv_mgr.agent.release_xfer_handle(handle)
+            self.xfer_handles.clear()
             return KVPoll.Success  # type: ignore
-        if any([x == "ERR" for x in states]):
+        if any(x == "ERR" for x in states):
+            for handle in self.xfer_handles:
+                self.kv_mgr.agent.release_xfer_handle(handle)
+            self.xfer_handles.clear()
             raise Exception("KVSender transfer encountered an error.")
         return KVPoll.WaitingForInput  # type: ignore
 
