@@ -117,8 +117,7 @@ class InputValidationStage(PipelineStage):
                 image = load_image(batch.image_path)
             batch.condition_image = image
             condition_image_width, condition_image_height = image.width, image.height
-        else:
-            condition_image_width, condition_image_height = None, None
+            batch.original_condition_image_size = image.size
 
         # NOTE: resizing needs to be bring in advance
         if server_args.pipeline_config.task_type == ModelTaskType.I2I:

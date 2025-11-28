@@ -215,8 +215,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image = batch.condition_image
-        image_size = image[0].size if isinstance(image, list) else image.size
+        image_size = batch.original_condition_image_size
         edit_width, edit_height, _ = calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
         )
@@ -291,7 +290,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         multiple_of = self.get_vae_scale_factor() * 2
         width = width // multiple_of * multiple_of
         height = height // multiple_of * multiple_of
-        return width, height
+        return image, width, height
 
     def slice_noise_pred(self, noise, latents):
         # remove noise over input image
