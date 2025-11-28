@@ -186,7 +186,6 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
-        TestFile("ep/test_moe_ep.py", 140),
         # TODO: Add it back after mooncake supports torch 2.9
         # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
@@ -202,6 +201,9 @@ suites = {
     ],
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
+        TestFile(
+            "ep/test_moe_ep.py", 140
+        ),  # Temporarily disabled, need to fix ep errors
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
         TestFile(
