@@ -150,10 +150,11 @@ def fused_marlin_moe(
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     )
 
-    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache1 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm_v2.default(
         hidden_states,
         intermediate_cache1,
         w1,
+        None,  # b_bias_or_none
         w1_scale,
         w1_zeros,
         g_idx1,
@@ -182,10 +183,11 @@ def fused_marlin_moe(
     if expert_map is not None:
         intermediate_cache3.zero_()
 
-    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm.default(
+    intermediate_cache3 = torch.ops.sgl_kernel.moe_wna16_marlin_gemm_v2.default(
         intermediate_cache2,
         intermediate_cache3,
         w2,
+        None,  # b_bias_or_none
         w2_scale,
         w2_zeros,
         g_idx2,
