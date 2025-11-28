@@ -308,7 +308,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "moe_wna16_marlin_gemm_v2(Tensor! a, Tensor? c_or_none,"
       "Tensor! b_q_weight, Tensor? b_bias_or_none, Tensor! b_scales,"
-      "Tensor? b_zeros_or_none,"
+      "Tensor? global_scale_or_none, Tensor? b_zeros_or_none,"
       "Tensor? g_idx_or_none, Tensor? perm_or_none, Tensor! workspace,"
       "Tensor sorted_token_ids,"
       "Tensor! expert_ids, Tensor! num_tokens_past_padded,"

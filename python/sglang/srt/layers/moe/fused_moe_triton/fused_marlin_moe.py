@@ -156,6 +156,7 @@ def fused_marlin_moe(
         w1,
         None,  # b_bias_or_none
         w1_scale,
+        None,  # global_scale_or_none
         w1_zeros,
         g_idx1,
         sort_indices1,
@@ -189,6 +190,7 @@ def fused_marlin_moe(
         w2,
         None,  # b_bias_or_none
         w2_scale,
+        None,  # global_scale_or_none
         w2_zeros,
         g_idx2,
         sort_indices2,
