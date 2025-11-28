@@ -614,20 +614,17 @@ class HiCacheController:
             return
 
         inc = 0
-        failed_keys = []
         for i in range(len(hash_values)):
             if not results[i]:
-                failed_keys.append(hash_values[i])
-                if len(failed_keys) == 1:  # Only log first failure
-                    logger.warning(
-                        f"Prefetch {operation.request_id}: batch_get_v1 failed for {hash_values[i]}"
-                    )
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                )
                 break
             inc += self.page_size
 
         if inc == 0:
             logger.error(
-                f"Prefetch {operation.request_id}: no tokens incremented, "
+                f"Prefetch operation {operation.request_id}: no tokens incremented, "
                 f"all {len(hash_values)} pages failed"
             )
         operation.increment(inc)
@@ -811,8 +808,7 @@ class HiCacheController:
             self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
-        ret = self.storage_backend.batch_set(hash_values, data)
-        return ret
+        return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
         results = self.storage_backend.batch_set_v1(
