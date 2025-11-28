@@ -71,14 +71,13 @@ def safe_load():
     try:
         mp.set_start_method("fork", force=True)
     except RuntimeError:
-        # 如果已经设置过 start method，会抛错，忽略即可
         pass
 
     import ctypes
 
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        PR_SET_PTRACER = 0x59616D61  # 如果 headers 新旧不一致也可以尝试直接调用
+        PR_SET_PTRACER = 0x59616D61
         PR_SET_PTRACER_ANY = -1
         libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
     except Exception:
