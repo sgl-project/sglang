@@ -115,7 +115,6 @@ class GPUWorker:
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
                     trajectory_latents=getattr(result, "trajectory_latents", None),
                     trajectory_decoded=getattr(result, "trajectory_decoded", None),
-                    logging_info=getattr(result, "logging_info", None),
                 )
             else:
                 output_batch = result
