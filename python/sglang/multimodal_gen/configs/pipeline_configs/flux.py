@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-import PIL.Image
+import PIL
 import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
@@ -448,18 +448,21 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds[0]
 
-    def maybe_resize_condition_image(self, width, height, image):
+    def calculate_condition_image_size(
+        self, image, width, height
+    ) -> Optional[tuple[int, int]]:
         target_area: int = 1024 * 1024
-
         if width is not None and height is not None:
             if width * height > target_area:
                 scale = math.sqrt(target_area / (width * height))
                 width = int(width * scale)
                 height = int(height * scale)
-                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
-                width, height = image.size
+                return width, height
 
-        return image, width, height
+        return None
+
+    def resize_condition_image(self, image, target_width, target_height):
+        return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
 
