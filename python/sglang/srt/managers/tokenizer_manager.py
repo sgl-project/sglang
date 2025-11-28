@@ -1050,9 +1050,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
-        has_feature_tensors, feature_wrappers, feature_infos = (
-            TokenizerManager.extract_feature_tensors(tokenized_obj)
-        )
+        has_feature_tensors = False
+        if not self.server_args.skip_tokenizer_init:
+            has_feature_tensors, feature_wrappers, feature_infos = (
+                TokenizerManager.extract_feature_tensors(tokenized_obj)
+            )
         # Send the request
         if has_feature_tensors:
             parts = [
