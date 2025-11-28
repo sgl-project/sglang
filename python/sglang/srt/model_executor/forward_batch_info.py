@@ -506,7 +506,7 @@ class ForwardBatch:
                 ret._compute_spec_mrope_positions(model_runner, batch)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
-        
+
         if model_runner.model_is_xdrope:
             ret._compute_xdrope_positions(model_runner, batch)
 
@@ -696,7 +696,6 @@ class ForwardBatch:
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device)
 
-
     def _compute_xdrope_positions(
         self,
         model_runner: ModelRunner,
@@ -718,9 +717,7 @@ class ForwardBatch:
                     )
                 else:
                     xdrope_positions = (
-                        (self.seq_lens[batch_idx] - 1)
-                        .unsqueeze(0)
-                        .repeat(4, 1)
+                        (self.seq_lens[batch_idx] - 1).unsqueeze(0).repeat(4, 1)
                     )
                     xdrope_positions_list[batch_idx] = xdrope_positions
             elif self.forward_mode.is_extend():

@@ -2444,7 +2444,7 @@ class ModelRunner:
             return False
         is_mrope_enabled = "mrope_section" in rope_scaling
         return is_mrope_enabled
-    
+
     @property
     def model_is_xdrope(self) -> bool:
         """Detect if the model has "xdrope" rope_scaling type."""

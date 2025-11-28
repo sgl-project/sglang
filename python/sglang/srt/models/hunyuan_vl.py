@@ -1,15 +1,6 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 # coding=utf-8
-# Copyright 2024 The HunYuan team.
-# Copyright 2023 The vLLM team.
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
-#
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+# Adapted from https://github.com/ManaEstras/transformers/blob/v4.57.1.hyvl/src/transformers/models/hunyuan_vl/modeling_hunyuan_vl.py
+# Copyright (C) 2025 THL A29 Limited, a Tencent company and the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,36 +16,22 @@
 """Inference-only HunYuan-VL model compatible with HuggingFace weights."""
 
 import logging
-import re
-from functools import lru_cache, partial
-from typing import Callable, Iterable, List, Optional, Tuple, Union
+from functools import partial
+from typing import Callable, Iterable, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
-from einops import rearrange
 from transformers.activations import ACT2FN
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-)
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.distributed.parallel_state import get_pp_group
 
-from sglang.srt.configs.hunyuan_vl import HunYuanVLVisionConfig, HunYuanVLConfig, HunYuanVLTextConfig
+from sglang.srt.configs.hunyuan_vl import HunYuanVLConfig, HunYuanVLVisionConfig
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    general_mm_embed_routine,
-)
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -63,11 +40,9 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.hunyuan import HunYuanModel
-from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +55,7 @@ class HunYuan_VisionMLP(nn.Module):
         in_features: int,
         hidden_features: int,
         bias: bool = True,
-        hidden_act = "gelu",
+        hidden_act="gelu",
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -105,6 +80,7 @@ class HunYuan_VisionMLP(nn.Module):
         x_up, _ = self.dense_h_to_4h(x)
         x_down, _ = self.dense_4h_to_h(self.act_fn(x_up))
         return x_down
+
 
 class HunYuan_VisionPatchEmbed(nn.Module):
     def __init__(self, config):
@@ -167,7 +143,10 @@ class HunYuan_VisionPatchEmbed(nn.Module):
             h0, w0 = h0 + 0.1, w0 + 0.1
             patch_pos_embed = nn.functional.interpolate(
                 self.patch_pos_embed,
-                scale_factor=((h0 / self.position_edge).item(), (w0 / self.position_edge).item()),
+                scale_factor=(
+                    (h0 / self.position_edge).item(),
+                    (w0 / self.position_edge).item(),
+                ),
                 mode=self.interpolate_mode,
                 align_corners=False,
             )
@@ -236,6 +215,7 @@ class HunYuan_VisionBlock(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states += residual
         return hidden_states
+
 
 class HunYuanVLRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -316,6 +296,7 @@ class HunYuanVLRMSNorm(nn.Module):
 
 #         return x
 
+
 class HunYuanVisionPatchMerger(nn.Module):
     def __init__(
         self,
@@ -330,7 +311,12 @@ class HunYuanVisionPatchMerger(nn.Module):
         embed_std = out_channels**-0.5
         self.spatial_merge_size = spatial_merge_size
         self.proj = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels * 2, kernel_size=spatial_merge_size, stride=spatial_merge_size),
+            nn.Conv2d(
+                in_channels,
+                in_channels * 2,
+                kernel_size=spatial_merge_size,
+                stride=spatial_merge_size,
+            ),
             nn.GELU(),
             nn.Conv2d(in_channels * 2, in_channels * 4, kernel_size=1),
         )
@@ -351,16 +337,31 @@ class HunYuanVisionPatchMerger(nn.Module):
         x = self.proj(x)  # b,c,h,w
         b, c, h, w = x.shape
         x = torch.cat(
-            [x, self.image_newline.reshape(1, c, 1, 1).expand(b, c, h, 1).to(dtype, non_blocking=True)], dim=-1
+            [
+                x,
+                self.image_newline.reshape(1, c, 1, 1)
+                .expand(b, c, h, 1)
+                .to(dtype, non_blocking=True),
+            ],
+            dim=-1,
         )
         x = x.reshape(b, c, -1).permute(0, 2, 1)
         x = self.mlp(x)
 
-        begin = self.image_begin.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype, non_blocking=True)
-        end = self.image_end.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype, non_blocking=True)
+        begin = (
+            self.image_begin.reshape(1, 1, -1)
+            .expand(b, 1, x.shape[-1])
+            .to(dtype, non_blocking=True)
+        )
+        end = (
+            self.image_end.reshape(1, 1, -1)
+            .expand(b, 1, x.shape[-1])
+            .to(dtype, non_blocking=True)
+        )
         x = torch.cat([begin, x, end], dim=1)
 
         return self.after_rms(x)
+
 
 class HunYuanVisionTransformer(nn.Module):
     def __init__(
@@ -376,7 +377,6 @@ class HunYuanVisionTransformer(nn.Module):
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_attention_heads
         self.spatial_merge_size = vision_config.spatial_merge_size
-
 
         self.embeddings = HunYuan_VisionPatchEmbed(vision_config)
 
@@ -439,7 +439,7 @@ class HunYuanVisionTransformer(nn.Module):
             image_embeds_list.append(
                 self.perceive(split_item.contiguous(), size=grid[1:])
             )
-        
+
         image_embeds = torch.cat(image_embeds_list, dim=1)
 
         return image_embeds
@@ -472,26 +472,15 @@ class HunYuanVisionTransformer(nn.Module):
         return loaded_params
 
 
-class HunYuanVLForConditionalGeneration(nn.Module,):
-    multimodal_cpu_fields = {"image_grid_thw"}
-
-    # To ensure correct weight loading and mapping.
-    # hf_to_vllm_mapper = WeightsMapper(
-    #     orig_to_new_prefix={
-    #         # mapping for new names in checkpoint saved after transformers v4.52
-    #         "vit.vit.": "visual.",
-    #         "vit.": "visual.",
-    #         "model.": "language_model.model.",
-    #     }
-    # )
-
-    # supports_encoder_tp_data = True
+class HunYuanVLForConditionalGeneration(
+    nn.Module,
+):
 
     def __init__(
-            self, 
-            config: HunYuanVLConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            prefix: str = "",
+        self,
+        config: HunYuanVLConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -521,7 +510,7 @@ class HunYuanVLForConditionalGeneration(nn.Module,):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
-        
+
         self.xdrope_enabled = "xdrope_section" in self.config.rope_scaling
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -545,7 +534,6 @@ class HunYuanVLForConditionalGeneration(nn.Module,):
             )
         else:
             img_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-            torch.save(img_embeds, "/data1/nfs15/nfs/zhanglei335/open-git/zl-sgl/sglang/sgl_img_embeds.pt")
             return img_embeds
 
     def post_process(
@@ -579,12 +567,11 @@ class HunYuanVLForConditionalGeneration(nn.Module,):
         input_embeds=None,
         get_embedding: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) :
+    ):
         if self.xdrope_enabled:
             positions = forward_batch.xdrope_positions
-            
+
         input_embeds = forward_batch.input_embeds
-        torch.save(input_embeds, "/data1/nfs15/nfs/zhanglei335/open-git/zl-sgl/sglang/sgl_input_embeds.pt")
         hidden_states = self.model(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -604,12 +591,7 @@ class HunYuanVLForConditionalGeneration(nn.Module,):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
-        
-    # def compute_logits(
-    #     self,
-    #     hidden_states: torch.Tensor,
-    # ) -> torch.Tensor | None:
-    #     return self.language_model.compute_logits(hidden_states)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -619,7 +601,6 @@ class HunYuanVLForConditionalGeneration(nn.Module,):
             ("gate_up_proj", "up_proj", 1),
             ("gate_up_proj", "gate_proj", 0),
         ]
-        # weight_name_list = [name for name, _ in weights]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
@@ -632,12 +613,9 @@ class HunYuanVLForConditionalGeneration(nn.Module,):
             if "vit." in name:
                 name = name.replace(r"vit.", r"visual.")
 
-
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                # if "visual" in name:
-                #     continue
                 name = name.replace(weight_name, param_name)
 
                 # Skip loading extra bias for GPTQ models.
@@ -664,14 +642,5 @@ class HunYuanVLForConditionalGeneration(nn.Module,):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-    # def get_mm_mapping(self) -> MultiModelKeys:
-    #     """
-    #     Get the module prefix in multimodal models
-    #     """
-    #     return MultiModelKeys.from_string_field(
-    #         language_model="language_model.model",
-    #         connector="visual.perceive",
-    #         tower_model="visual",
-    #     )
 
 EntryClass = HunYuanVLForConditionalGeneration

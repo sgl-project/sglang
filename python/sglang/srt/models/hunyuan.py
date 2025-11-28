@@ -516,7 +516,7 @@ class HunYuanModel(nn.Module):
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.get_input_embeddings()(input_ids)
-    
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 

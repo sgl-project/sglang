@@ -2519,80 +2519,6 @@ class XDRotaryEmbedding(DynamicNTKAlphaRotaryEmbedding):
             dtype,
         )
 
-    # @staticmethod
-    # def get_xdrope_input_positions(
-    #     spatial_merge_size: int,
-    #     xd_num: int,
-    #     image_token_id: int,
-    #     input_ids: Optional[torch.LongTensor] = None,
-    #     image_grid_thw: Optional[torch.LongTensor] = None,
-    # ) -> torch.Tensor:
-    #     # kwargs = MultiModalFeatureSpec.gather_kwargs(
-    #     #     mm_features,
-    #     #     {"image_grid_thw"},
-    #     # )
-    #     # image_grid_thw = [item.tolist() for item in kwargs.get("image_grid_thw", [])]
-        
-    #     # hf_config = self.config
-    #     # image_start_token_id = hf_config.image_start_token_id
-    #     # spatial_merge_size = hf_config.vision_config.spatial_merge_size
-    #     # xd_num = len(hf_config.rope_scaling["xdrope_section"])
-
-
-    #     # input_tokens_tensor = torch.tensor(input_tokens)
-
-    #     position_ids = torch.arange(len(input_ids))
-    #     position_ids_w = torch.arange(len(input_ids))
-    #     position_ids_h = torch.arange(len(input_ids))
-    #     position_ids_t = torch.arange(len(input_ids))
-        
-    #     # image_start_indices = torch.argwhere(input_ids == image_token_id).squeeze(1)
-    #     image_token_pos_indices = torch.where(input_ids[0] == image_token_id)[0]
-    #     for i in range(len(image_grid_thw)):
-    #         grid_h, grid_w = image_grid_thw[i][-2:]
-    #         patch_h = grid_h // spatial_merge_size
-    #         patch_w = grid_w // spatial_merge_size
-    #         num_image_tokens = patch_h * (patch_w + 1)
-    #         start_pos = image_token_pos_indices[image_tokens_cumsum[i]].item() + 1
-    #         replace_num = (patch_w + 1) * patch_h
-    #         position_ids_w[start_pos: start_pos + replace_num] = torch.tensor(list(range(patch_w + 1)) * patch_h, dtype=torch.int64)
-    #         patch_h_list = []
-    #         for h in range(patch_h):
-    #             patch_h_list += [h] * (patch_w+1)
-    #         position_ids_h[start_pos: start_pos + replace_num] = torch.tensor(patch_h_list, dtype=torch.int64)
-    #         position_ids_t[start_pos: start_pos + replace_num] = 0
-    #     # for image_index in range(len(image_start_indices)):
-    #     #     # +1 : first image_token, +2: for xdrope positions
-    #     #     pos = image_start_indices[image_index] + 2
-    #     #     t, h, w = image_grid_thw[image_index]
-    #     #     _, llm_grid_h, llm_grid_w = (
-    #     #         t,
-    #     #         h // spatial_merge_size,
-    #     #         w // spatial_merge_size,
-    #     #     )
-
-    #     #     token_num = (llm_grid_w + 1) * llm_grid_h
-    #     #     w_index[pos : pos + token_num].copy_(
-    #     #         torch.arange(0, llm_grid_w + 1)
-    #     #         .reshape(1, -1)
-    #     #         .expand(llm_grid_h, -1)
-    #     #         .reshape(-1)
-    #     #     )
-    #     #     h_index[pos : pos + token_num].copy_(
-    #     #         torch.arange(0, llm_grid_h)
-    #     #         .reshape(-1, 1)
-    #     #         .expand(-1, llm_grid_w + 1)
-    #     #         .reshape(-1)
-    #     #     )
-    #     #     h_index[pos : pos + token_num] = 0
-
-    #     # if xd_num == 4:
-    #     #     llm_positions = torch.stack([p_index, w_index, h_index, t_index])
-    #     # elif xd_num == 3:
-    #     #     llm_positions = torch.stack([w_index, h_index, t_index])
-
-    #     return llm_positions
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -2608,6 +2534,7 @@ class XDRotaryEmbedding(DynamicNTKAlphaRotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
+        # TODO support other backends
         return self._forward_native(positions, query, key)
 
     def _forward_native(
@@ -2652,29 +2579,7 @@ class XDRotaryEmbedding(DynamicNTKAlphaRotaryEmbedding):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
-
-    # @staticmethod
-    # def get_next_input_positions(
-    #     context_len: int,
-    #     seq_len: int,
-    #     xd_sections: int = 4,
-    # ) -> list[list[int]]:
-    #     return [list(range(context_len, seq_len)) for _ in range(xd_sections)]
-
-    # @staticmethod
-    # def get_next_input_positions_tensor(
-    #     out: np.ndarray,
-    #     out_offset: int,
-    #     context_len: int,
-    #     num_new_tokens: int,
-    # ):
-    #     values = np.arange(
-    #         context_len,
-    #         context_len + num_new_tokens,
-    #         dtype=out.dtype,
-    #     )
-    #     out[:, out_offset : out_offset + num_new_tokens] = values
-
+    
 _ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
 
 

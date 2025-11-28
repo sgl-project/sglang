@@ -156,6 +156,11 @@ class GraphInputBuffers:
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
 
+        if forward_batch.xdrope_positions is not None:
+            self.xdrope_positions[:, :raw_num_token].copy_(
+                forward_batch.xdrope_positions
+            )
+
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
