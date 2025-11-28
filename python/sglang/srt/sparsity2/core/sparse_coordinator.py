@@ -16,6 +16,8 @@ from sglang.srt.sparsity2.algorithms.base_algorithm import (
 from sglang.srt.sparsity2.backend.backend_adaptor import BackendAdaptor
 from sglang.srt.sparsity2.core.representation_pool import RepresentationPool
 
+from sglang.srt.sparsity2.core.sparse_kvcache_manager import SparseKVCacheManager
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.managers.schedule_batch import Req
@@ -113,7 +115,7 @@ class SparseCoordinator:
         backend_adaptor: Optional[BackendAdaptor],
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: KVCache,
-        decode_offload_manager: DecodeKVCacheOffloadManager,
+        sparse_kv_cache_manager: SparseKVCacheManager,
         start_layer: int,
         end_layer: int,
         device: torch.device,
@@ -124,7 +126,7 @@ class SparseCoordinator:
         self.backend_adaptor = backend_adaptor
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
-        self.decode_offload_manager = decode_offload_manager
+        self.sparse_kv_cache_manager = sparse_kv_cache_manager
         self.start_layer = start_layer
         self.end_layer = end_layer
         self.device = device
@@ -137,8 +139,8 @@ class SparseCoordinator:
             end_layer - start_layer + 1,
             self.config.min_sparse_prompt_len,
         )
-        if self.decode_offload_manager is not None:
-            self.decode_offload_manager.req_states = self.states
+        if self.sparse_kv_cache_manager is not None:
+            self.sparse_kv_cache_manager.req_states = self.states
 
         self.repr_pool = RepresentationPool(
             total_num_pages, start_layer, end_layer, device
@@ -168,14 +170,14 @@ class SparseCoordinator:
         """Handle prefill end."""
         if (
             req.req_pool_idx is None
-            or self.decode_offload_manager is None
+            or self.sparse_kv_cache_manager is None
             or len(req.origin_input_ids) < self.config.min_sparse_prompt_len
         ):
             return
 
         # Offload full KV cache for prefill
-        self.decode_offload_manager.offload_prefill_full_kv_cache(req)
-        self.decode_offload_manager.check_prefill_offload_progress()
+        self.sparse_kv_cache_manager.offload_prefill_full_kv_cache(req)
+        self.sparse_kv_cache_manager.check_prefill_offload_progress()
 
         # Store previous device indices
         indices_len = self.config.min_sparse_prompt_len
@@ -185,15 +187,15 @@ class SparseCoordinator:
 
     def on_request_end(self, req: "Req") -> None:
         """Handle request end."""
-        if req.req_pool_idx is None or self.decode_offload_manager is None:
+        if req.req_pool_idx is None or self.sparse_kv_cache_manager is None:
             return
 
-        self.decode_offload_manager.check_sparse_offload_progress()
+        self.sparse_kv_cache_manager.check_sparse_offload_progress()
         host_indices = self.states.clear(req.req_pool_idx)
 
         if host_indices.numel() > 0:
             # Free host indices
-            self.decode_offload_manager.decode_host_mem_pool.free(host_indices.cpu())
+            self.sparse_kv_cache_manager.decode_host_mem_pool.free(host_indices.cpu())
             req_seqlen = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
             assert (
                 len(host_indices) == req_seqlen
@@ -206,7 +208,7 @@ class SparseCoordinator:
     def forward_begin(self, forward_batch: "ForwardBatch") -> None:
         """Handle forward begin."""
         if self._should_check_offload(forward_batch):
-            self.decode_offload_manager.check_sparse_offload_progress()
+            self.sparse_kv_cache_manager.check_sparse_offload_progress()
 
     @nvtx.annotate("SparseCoordinator.forward_end", color="yellow")
     def forward_end(self, forward_batch: "ForwardBatch") -> None:
@@ -219,7 +221,7 @@ class SparseCoordinator:
             >= self.config.min_sparse_prompt_len
         )
         if offload_mask.any():
-            self.decode_offload_manager.offload_sparse_decode_req_tokens(
+            self.sparse_kv_cache_manager.offload_sparse_decode_req_tokens(
                 forward_batch.req_pool_indices[offload_mask],
                 forward_batch.out_cache_loc[offload_mask],
             )
@@ -228,7 +230,7 @@ class SparseCoordinator:
         return (
             forward_batch.req_pool_indices.numel() > 0
             and forward_batch.forward_mode.is_decode_or_idle()
-            and self.decode_offload_manager is not None
+            and self.sparse_kv_cache_manager is not None
         )
 
     @nvtx.annotate("SparseCoordinator.attention_begin", color="green")
