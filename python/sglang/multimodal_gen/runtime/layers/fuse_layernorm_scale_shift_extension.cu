@@ -156,23 +156,15 @@ torch::Tensor fuse_layernorm_scale_shift_infer(
     c10::optional<torch::Tensor> gamma,
     c10::optional<torch::Tensor> beta) {
   TORCH_CHECK(x.is_cuda(), "x must be CUDA");
-  // Fallback for bf16: compute in fp32 then cast back to bf16
-  if (x.dtype() == torch::kBFloat16) {
-    auto x_f = x.to(torch::kFloat32);
-    c10::optional<torch::Tensor> gamma_f =
-        gamma.has_value() && gamma->defined() ? c10::optional<torch::Tensor>(gamma->to(torch::kFloat32)) : c10::nullopt;
-    c10::optional<torch::Tensor> beta_f =
-        beta.has_value() && beta->defined() ? c10::optional<torch::Tensor>(beta->to(torch::kFloat32)) : c10::nullopt;
-    auto y_f = layernorm_cutlass<float>(x_f, gamma_f, beta_f);
-    return y_f.to(torch::kBFloat16);
-  }
   if (x.dtype() == torch::kFloat32) {
     return layernorm_cutlass<float>(x, gamma, beta);
   } else if (x.dtype() == torch::kFloat16) {
     // at::Half storage maps to __half on device; cast pointer in templated path
     return layernorm_cutlass<half>(x, gamma, beta);
+  } else if (x.dtype() == torch::kBFloat16) {
+    return layernorm_cutlass<cutlass::bfloat16_t>(x, gamma, beta);
   } else {
-    TORCH_CHECK(false, "Unsupported dtype. Use float32 or float16.");
+    TORCH_CHECK(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
   }
 }
 
@@ -183,20 +175,12 @@ torch::Tensor fuse_layernorm_scale_shift_fused_infer(
     torch::Tensor scale,
     torch::Tensor shift) {
   TORCH_CHECK(x.is_cuda(), "x must be CUDA");
-  // Fallback for bf16: compute in fp32 then cast back
-  if (x.dtype() == torch::kBFloat16) {
-    auto x_f = x.to(torch::kFloat32);
-    auto g_f = gamma.to(torch::kFloat32);
-    auto b_f = beta.to(torch::kFloat32);
-    auto s_f = scale.to(torch::kFloat32);
-    auto sh_f = shift.to(torch::kFloat32);
-    auto y_f = launch_fuse_layernorm_scale_shift_fused_impl<float>(x_f, g_f, b_f, s_f, sh_f);
-    return y_f.to(torch::kBFloat16);
-  }
   if (x.dtype() == torch::kFloat32) {
     return launch_fuse_layernorm_scale_shift_fused_impl<float>(x, gamma, beta, scale, shift);
   } else if (x.dtype() == torch::kFloat16) {
     return launch_fuse_layernorm_scale_shift_fused_impl<half>(x, gamma, beta, scale, shift);
+  } else if (x.dtype() == torch::kBFloat16) {
+    return launch_fuse_layernorm_scale_shift_fused_impl<cutlass::bfloat16_t>(x, gamma, beta, scale, shift);
   } else {
     TORCH_CHECK(false, "Unsupported dtype. Use float32, float16, or bfloat16.");
   }

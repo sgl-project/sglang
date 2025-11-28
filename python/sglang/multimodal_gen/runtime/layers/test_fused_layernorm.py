@@ -21,7 +21,6 @@ def build_cutlass_ext(verbose: bool = False):
         extra_cuda_cflags=[
             "-O3",
             "-std=c++17",
-            # Allow __half conversions/operators used by the vendor kernel
             "-U__CUDA_NO_HALF_CONVERSIONS__",
             "-U__CUDA_NO_HALF_OPERATORS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -123,21 +122,12 @@ def run_case_fused(
     triton_ms = time_op(run_triton_fused)
     device_ms = time_op(run_device_fused)
 
-    if dtype == torch.bfloat16:
-        # Align full fused path to fp32 like device fused kernel, then cast
-        y_triton_fp32 = triton_ops.norm_infer(x.float(), weight.float(), bias.float(), eps=eps, is_rms_norm=False)
-        y_triton_fused_3d = triton_ops.fuse_scale_shift_kernel(
-            y_triton_fp32.view(1, M, N),
-            scale.view(1, M, N).float(),
-            shift.view(1, M, N).float(),
-        ).to(dtype)
-    else:
-        y_triton = triton_ops.norm_infer(x, weight, bias, eps=eps, is_rms_norm=False)
-        y_triton_fused_3d = triton_ops.fuse_scale_shift_kernel(
-            y_triton.view(1, M, N),
-            scale.view(1, M, N),
-            shift.view(1, M, N),
-        )
+    y_triton = triton_ops.norm_infer(x, weight, bias, eps=eps, is_rms_norm=False)
+    y_triton_fused_3d = triton_ops.fuse_scale_shift_kernel(
+        y_triton.view(1, M, N),
+        scale.view(1, M, N),
+        shift.view(1, M, N),
+    )
     y_triton_fused = y_triton_fused_3d.view(M, N)
     y_dev_fused = ext.fuse_layernorm_scale_shift(x, weight, bias, scale, shift)
 
@@ -164,6 +154,8 @@ def main():
     cases = [
         (129, 1024),
         (257, 2048),
+        (20, 3072),
+        (2000, 3072),
         (65, 4096),
     ]
     dtypes = (torch.float32, torch.bfloat16)

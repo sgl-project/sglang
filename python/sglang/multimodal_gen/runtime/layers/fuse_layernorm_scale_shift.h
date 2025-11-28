@@ -44,6 +44,7 @@
 #include "device_utils.h"
 #include <cfloat>
 #include <cassert>
+#include <type_traits>
  
 namespace cutlass {
  
@@ -256,6 +257,11 @@ __global__ void layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift(
   }
 }
 
+// Vector-of-4 type for bfloat16
+struct alignas(8) bf16_4 {
+  cutlass::bfloat16_t x, y, z, w;
+};
+
 template <typename T>
 void layernorm(cutlass::MatrixCoord tensor_size,
                TensorRef<T, layout::RowMajor> ref_output,
@@ -285,6 +291,14 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const float4*)beta,
        m,
        n);
+   } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+     layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 1><<<grid, block, 0, stream>>>(
+       (bf16_4*)output,
+       (const bf16_4*)input,
+       (const bf16_4*)gamma,
+       (const bf16_4*)beta,
+       m,
+       n);
    } else {
      layernorm_twoPassAlgo_stored_locally_e4<half4, half, 1><<<grid, block, 0, stream>>>(
        (half4*)output,
@@ -303,6 +317,14 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const float4*)input,
        (const float4*)gamma,
        (const float4*)beta,
+       m,
+       n);
+   } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+     layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, stream>>>(
+       (bf16_4*)output,
+       (const bf16_4*)input,
+       (const bf16_4*)gamma,
+       (const bf16_4*)beta,
        m,
        n);
    } else {
@@ -325,6 +347,14 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const float4*)beta,
        m,
        n);
+   } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+     layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 4><<<grid, block, 0, stream>>>(
+       (bf16_4*)output,
+       (const bf16_4*)input,
+       (const bf16_4*)gamma,
+       (const bf16_4*)beta,
+       m,
+       n);
    } else {
      layernorm_twoPassAlgo_stored_locally_e4<half4, half, 4><<<grid, block, 0, stream>>>(
        (half4*)output,
@@ -345,6 +375,14 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const float4*)beta,
        m,
        n);
+   } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+     layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, stream>>>(
+       (bf16_4*)output,
+       (const bf16_4*)input,
+       (const bf16_4*)gamma,
+       (const bf16_4*)beta,
+       m,
+       n);
    } else {
      layernorm_twoPassAlgo_stored_locally_e4<half4, half, 8><<<grid, block, 0, stream>>>(
        (half4*)output,
@@ -363,6 +401,14 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const float4*)input,
        (const float4*)gamma,
        (const float4*)beta,
+       m,
+       n);
+   } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+     layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 16><<<grid, block, 0, stream>>>(
+       (bf16_4*)output,
+       (const bf16_4*)input,
+       (const bf16_4*)gamma,
+       (const bf16_4*)beta,
        m,
        n);
    } else {
@@ -412,6 +458,16 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const float4*)shift,
         m,
         n);
+    } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+      layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 1><<<grid, block, 0, stream>>>(
+        (bf16_4*)output,
+        (const bf16_4*)input,
+        (const bf16_4*)gamma,
+        (const bf16_4*)beta,
+        (const bf16_4*)scale,
+        (const bf16_4*)shift,
+        m,
+        n);
     } else {
       layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 1><<<grid, block, 0, stream>>>(
         (half4*)output,
@@ -434,6 +490,16 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const float4*)beta,
         (const float4*)scale,
         (const float4*)shift,
+        m,
+        n);
+    } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+      layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, stream>>>(
+        (bf16_4*)output,
+        (const bf16_4*)input,
+        (const bf16_4*)gamma,
+        (const bf16_4*)beta,
+        (const bf16_4*)scale,
+        (const bf16_4*)shift,
         m,
         n);
     } else {
@@ -460,6 +526,16 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const float4*)shift,
         m,
         n);
+    } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+      layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 4><<<grid, block, 0, stream>>>(
+        (bf16_4*)output,
+        (const bf16_4*)input,
+        (const bf16_4*)gamma,
+        (const bf16_4*)beta,
+        (const bf16_4*)scale,
+        (const bf16_4*)shift,
+        m,
+        n);
     } else {
       layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 4><<<grid, block, 0, stream>>>(
         (half4*)output,
@@ -484,6 +560,16 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const float4*)shift,
         m,
         n);
+    } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+      layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, stream>>>(
+        (bf16_4*)output,
+        (const bf16_4*)input,
+        (const bf16_4*)gamma,
+        (const bf16_4*)beta,
+        (const bf16_4*)scale,
+        (const bf16_4*)shift,
+        m,
+        n);
     } else {
       layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 8><<<grid, block, 0, stream>>>(
         (half4*)output,
@@ -506,6 +592,16 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const float4*)beta,
         (const float4*)scale,
         (const float4*)shift,
+        m,
+        n);
+    } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+      layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 16><<<grid, block, 0, stream>>>(
+        (bf16_4*)output,
+        (const bf16_4*)input,
+        (const bf16_4*)gamma,
+        (const bf16_4*)beta,
+        (const bf16_4*)scale,
+        (const bf16_4*)shift,
         m,
         n);
     } else {
