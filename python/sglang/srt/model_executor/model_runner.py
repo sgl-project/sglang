@@ -1422,13 +1422,12 @@ class ModelRunner:
         )
         tokens_per_dp_rank = max_num_token // max(dp_divisor, 1)
 
-        logger.info(
-            (
-                "Profiling KV tokens: layout=%s (%s), layers=%s, dtype=%s (elem=%s B), "
-                "per_token_bytes=%.2f KB, per_layer_bytes=%.2f KB, "
-                "available_mem=%.2f GB, total_mem=%.2f GB, mem_fraction_static=%.2f, "
-                "rest_mem=%.2f GB -> max_tokens=%s dp_attention=%s dp_size=%s tokens_per_dp_rank=%s"
-            ),
+        message = (
+            "KV profiling: layout=%s (%s) layers=%s dtype=%s elem=%sB "
+            "per_token=%.2fKB per_layer=%.2fKB avail=%.2fGB total=%.2fGB "
+            "mem_static=%.2f rest=%.2fGB max_tokens=%s"
+        )
+        log_args = [
             layout_label,
             layout_detail,
             num_layers,
@@ -1441,10 +1440,12 @@ class ModelRunner:
             self.mem_fraction_static,
             rest_memory,
             max_num_token,
-            self.server_args.enable_dp_attention,
-            self.server_args.dp_size,
-            tokens_per_dp_rank,
-        )
+        ]
+        if self.server_args.enable_dp_attention:
+            message += " dp_size=%s tokens_per_dp=%s"
+            log_args.extend([self.server_args.dp_size, tokens_per_dp_rank])
+
+        logger.info(message, *log_args)
         return max_num_token
 
     def handle_max_mamba_cache(self, total_rest_memory):
