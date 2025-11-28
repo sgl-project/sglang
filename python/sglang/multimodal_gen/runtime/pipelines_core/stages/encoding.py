@@ -7,6 +7,7 @@ Encoding stage for diffusion pipelines.
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -83,7 +84,7 @@ class EncodingStage(PipelineStage):
 
         # Encode image to latents
         with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            device_type=envs.get_device(), dtype=vae_dtype, enabled=vae_autocast_enabled
         ):
             if server_args.pipeline_config.vae_tiling:
                 self.vae.enable_tiling()

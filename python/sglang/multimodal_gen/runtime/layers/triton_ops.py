@@ -8,6 +8,8 @@ import triton  # type: ignore
 import triton.language as tl  # type: ignore
 from torch import Tensor
 
+from sglang.multimodal_gen import envs
+
 
 @triton.autotune(
     configs=[
@@ -136,7 +138,10 @@ def fuse_scale_shift_kernel(
     block_l: int = 128,
     block_c: int = 128,
 ):
-    assert x.is_cuda and scale.is_cuda
+    if not envs._is_musa:
+        assert x.is_cuda and scale.is_cuda
+    else:
+        assert x.is_musa and scale.is_musa
     assert x.is_contiguous()
 
     B, L, C = x.shape

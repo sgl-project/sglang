@@ -73,7 +73,7 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
 
 def _split_tensor_dict(
-    tensor_dict: dict[str, torch.Tensor | Any]
+    tensor_dict: dict[str, torch.Tensor | Any],
 ) -> tuple[list[tuple[str, Any]], list[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
@@ -225,7 +225,9 @@ def init_distributed_environment(
     # Determine the appropriate backend based on the platform
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if backend == "nccl" and not current_platform.is_cuda_alike():
+    if (backend == "nccl" and not current_platform.is_cuda_alike()) or (
+        backend == "mccl" and not current_platform.is_musa()
+    ):
         # Use gloo backend for non-CUDA platforms (MPS, CPU)
         backend = "gloo"
         logger.info("Using gloo backend for %s platform", current_platform.device_name)
@@ -245,7 +247,12 @@ def init_distributed_environment(
         )
 
         # For MPS, don't pass device_id as it doesn't support device indices
-        extra_args = {} if current_platform.is_mps() else dict(device_id=device_id)
+        # XXX (MUSA): Not supported for device indices either
+        extra_args = (
+            {}
+            if (current_platform.is_mps() or current_platform.is_musa())
+            else dict(device_id=device_id)
+        )
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -585,6 +592,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         rank=rank,
         local_rank=local_rank,
         distributed_init_method=distributed_init_method,
+        backend=envs.get_torch_distributed_backend(),
         device_id=device,
     )
     initialize_model_parallel(
@@ -596,9 +604,9 @@ def maybe_init_distributed_environment_and_model_parallel(
         sequence_parallel_degree=sp_size,
     )
 
-    # Only set CUDA device if we're on a CUDA platform
-    if current_platform.is_cuda_alike():
-        device = torch.device(f"cuda:{local_rank}")
+    # Only set CUDA device if we're on a CUDA/MUSA platform
+    if current_platform.is_cuda_alike() or current_platform.is_musa():
+        device = envs.get_device(local_rank)
         torch.cuda.set_device(device)
 
 

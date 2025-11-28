@@ -6,15 +6,19 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
 
 try:
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+    if not envs._is_musa():
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-    # flash_attn 3 no longer have a different API, see following commit:
-    # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
-    flash_attn_func = flash_attn_varlen_func
+        # flash_attn 3 no longer have a different API, see following commit:
+        # https://github.com/Dao-AILab/flash-attention/commit/ed209409acedbb2379f870bbd03abce31a7a51b7
+        flash_attn_func = flash_attn_varlen_func
+    else:
+        from mate import flash_attn_varlen_func as flash_attn_func
 except ImportError as e:
     raise e
 
@@ -124,6 +128,13 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             max_seqlen_q = query.shape[1]
             max_seqlen_k = key.shape[1]
+
+        kwargs = {}
+        if not envs._is_musa:
+            kwargs["return_softmax_lse"] = return_softmax_lse
+            kwargs["ver"] = fa_ver
+        else:
+            kwargs["return_attn_probs"] = return_softmax_lse
         output = flash_attn_func(
             q=query,  # type: ignore[no-untyped-call]
             k=key,
@@ -134,7 +145,6 @@ class FlashAttentionImpl(AttentionImpl):
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
-            return_softmax_lse=return_softmax_lse,
-            ver=fa_ver,
+            **kwargs,
         )
         return output

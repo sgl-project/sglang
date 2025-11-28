@@ -12,6 +12,7 @@ from typing import Any, Callable, Tuple
 
 import numpy as np
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
@@ -161,5 +162,9 @@ class TimestepPreparationStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify timestep preparation stage outputs."""
         result = VerificationResult()
-        result.add_check("timesteps", batch.timesteps, [V.is_tensor, V.with_dims(1)])
+        # XXX (MUSA): 'isnan' is not implemented for 'Long'
+        if not envs._is_musa():
+            result.add_check(
+                "timesteps", batch.timesteps, [V.is_tensor, V.with_dims(1)]
+            )
         return result

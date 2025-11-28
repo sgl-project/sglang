@@ -5,6 +5,7 @@ import time
 import torch
 from einops import rearrange
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_sp_parallel_rank,
@@ -185,7 +186,7 @@ class DmdDenoisingStage(DenoisingStage):
 
                     # Predict noise residual
                     with torch.autocast(
-                        device_type="cuda",
+                        device_type=envs.get_device(),
                         dtype=target_dtype,
                         enabled=autocast_enabled,
                     ):
