@@ -830,6 +830,13 @@ class Scheduler(
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
+            self.decode_polling_count = 0
+            self.decode_polling_interval = (
+                self.server_args.disaggregation_decode_polling_interval
+            )
+            if self.decode_polling_interval < 1:
+                self.decode_polling_interval = 1
+                logger.warning("Decode polling interval is less than 1, setting to 1")
             buffer_size = (self.req_to_token_pool.size) * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
