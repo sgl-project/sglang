@@ -2,11 +2,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
-
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
 from sglang.srt.utils import get_num_new_pages
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import KVCache
 
 
 def _alloc_extend_naive(
@@ -70,7 +70,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: str,
-        kvcache: KVCache,
+        kvcache: "KVCache",
         need_sort: bool,
     ):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)

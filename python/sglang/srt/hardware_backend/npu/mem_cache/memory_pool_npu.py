@@ -1,15 +1,17 @@
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
 
 
 class NPUMHATokenToKVPool(MHATokenToKVPool):
@@ -64,7 +66,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
+        layer: "RadixAttention",
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
@@ -245,7 +247,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
+        layer: "RadixAttention",
         loc: torch.Tensor,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
