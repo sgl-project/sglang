@@ -614,7 +614,6 @@ class DenoisingStage(PipelineStage):
         if self._profile_full:
             self.profiler = torch.profiler.profile(
                 activities=activities,
-                on_trace_ready=lambda p: p.export_chrome_trace("./logs/full.trace.json.gz"),
                 record_shapes=True,
                 with_stack=True,
             )

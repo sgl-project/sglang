@@ -59,7 +59,17 @@ class SyncExecutor(PipelineExecutor):
                     activities=activities, record_shapes=True, with_stack=True
                 ) as prof:
                     batch = _run_all()
-                prof.export_chrome_trace("./logs/pipeline.full.trace.json.gz")
+                request_id = getattr(batch, "request_id", "global_profile")
+                rank = 0
+                try:
+                    os.makedirs("./logs", exist_ok=True)
+                except Exception:
+                    pass
+                trace_path = os.path.abspath(
+                    f"./logs/{request_id}-global-rank{rank}.trace.json.gz"
+                )
+                logger.info("Saving global profiler trace to: %s", trace_path)
+                prof.export_chrome_trace(trace_path)
             else:
                 with torch.profiler.profile(
                     activities=activities,
@@ -75,7 +85,17 @@ class SyncExecutor(PipelineExecutor):
                         if torch.cuda.is_available():
                             torch.cuda.synchronize()
                         prof.step()
-                prof.export_chrome_trace("./logs/pipeline.stages.trace.json.gz")
+                request_id = getattr(batch, "request_id", "global_profile")
+                rank = 0
+                try:
+                    os.makedirs("./logs", exist_ok=True)
+                except Exception:
+                    pass
+                trace_path = os.path.abspath(
+                    f"./logs/{request_id}-global.stages-rank{rank}.trace.json.gz"
+                )
+                logger.info("Saving global (stages) profiler trace to: %s", trace_path)
+                prof.export_chrome_trace(trace_path)
         else:
             batch = _run_all()
 

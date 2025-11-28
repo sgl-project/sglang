@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
@@ -22,6 +23,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class ParallelExecutor(PipelineExecutor):
@@ -108,7 +112,17 @@ class ParallelExecutor(PipelineExecutor):
                 ) as prof:
                     batch = _run_all_stages()
                 if rank == 0:
-                    prof.export_chrome_trace("./logs/pipeline.full.trace.json.gz")
+                    try:
+                        os.makedirs("./logs", exist_ok=True)
+                    except Exception:
+                        pass
+                    request_id = getattr(batch, "request_id", "global_profile")
+                    world_rank = get_world_rank()
+                    trace_path = os.path.abspath(
+                        f"./logs/{request_id}-global-rank{world_rank}.trace.json.gz"
+                    )
+                    logger.info("Saving global profiler trace to: %s", trace_path)
+                    prof.export_chrome_trace(trace_path)
             else:
                 with torch.profiler.profile(
                     activities=activities,
@@ -144,7 +158,17 @@ class ParallelExecutor(PipelineExecutor):
                             torch.cuda.synchronize()
                         prof.step()
                 if rank == 0:
-                    prof.export_chrome_trace("./logs/pipeline.stages.trace.json.gz")
+                    try:
+                        os.makedirs("./logs", exist_ok=True)
+                    except Exception:
+                        pass
+                    request_id = getattr(batch, "request_id", "global_profile")
+                    world_rank = get_world_rank()
+                    trace_path = os.path.abspath(
+                        f"./logs/{request_id}-global.stages-rank{world_rank}.trace.json.gz"
+                    )
+                    logger.info("Saving global (stages) profiler trace to: %s", trace_path)
+                    prof.export_chrome_trace(trace_path)
         else:
             batch = _run_all_stages()
 
