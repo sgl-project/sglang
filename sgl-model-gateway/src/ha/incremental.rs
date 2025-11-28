@@ -23,6 +23,7 @@ struct LastSentVersions {
     policy: HashMap<String, u64>,
     app: HashMap<String, u64>,
     membership: HashMap<String, u64>,
+    rate_limit: HashMap<String, u64>, // Track last sent timestamp for rate limit counters
 }
 
 /// Incremental update collector
@@ -198,6 +199,49 @@ impl IncrementalUpdateCollector {
                     }
                 }
             }
+            StoreType::RateLimit => {
+                // Collect rate limit counters from owners
+                let rate_limit_keys = self.stores.rate_limit.keys();
+                let mut last_sent = self.last_sent.write();
+
+                for key in rate_limit_keys {
+                    // Only collect if this node is an owner
+                    if self.stores.rate_limit.is_owner(&key) {
+                        if let Some(counter) = self.stores.rate_limit.get_counter(&key) {
+                            // Use timestamp as version for rate limit counters
+                            let current_timestamp = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos()
+                                as u64;
+
+                            let last_sent_timestamp =
+                                last_sent.rate_limit.get(&key).copied().unwrap_or(0);
+
+                            // Only send if enough time has passed (to avoid too frequent updates)
+                            // Or if this is the first time
+                            // Check if at least 1 second has passed since last send
+                            if current_timestamp > last_sent_timestamp + 1_000_000_000 {
+                                // Serialize the counter snapshot
+                                if let Ok(serialized) = serde_json::to_vec(&counter.snapshot()) {
+                                    let key_str = key.clone();
+                                    updates.push(StateUpdate {
+                                        key: key_str.clone(),
+                                        value: serialized,
+                                        version: current_timestamp,
+                                        actor: self.self_name.clone(),
+                                        timestamp: current_timestamp,
+                                    });
+
+                                    // Update last sent timestamp
+                                    last_sent.rate_limit.insert(key_str, current_timestamp);
+                                    trace!("Collected rate limit counter update: {}", key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         debug!(
@@ -217,6 +261,7 @@ impl IncrementalUpdateCollector {
             StoreType::Policy,
             StoreType::App,
             StoreType::Membership,
+            StoreType::RateLimit,
         ] {
             let updates = self.collect_updates_for_store(store_type);
             if !updates.is_empty() {
@@ -250,6 +295,13 @@ impl IncrementalUpdateCollector {
                 for update in updates {
                     last_sent
                         .membership
+                        .insert(update.key.clone(), update.version);
+                }
+            }
+            StoreType::RateLimit => {
+                for update in updates {
+                    last_sent
+                        .rate_limit
                         .insert(update.key.clone(), update.version);
                 }
             }

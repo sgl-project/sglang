@@ -33,9 +33,11 @@ use crate::{
     },
     ha::{
         endpoints::{
-            get_app_config, get_cluster_status, get_ha_health, get_policy_state, get_policy_states,
-            get_worker_state, get_worker_states, trigger_graceful_shutdown, update_app_config,
+            get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
+            get_ha_health, get_policy_state, get_policy_states, get_worker_state,
+            get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
         },
+        rate_limit_window::RateLimitWindow,
         service::{HAServerConfig, HAServerHandler},
         sync::HASyncManager,
     },
@@ -665,6 +667,9 @@ pub fn build_app(
         .route("/ha/policies/{model_id}", get(get_policy_state))
         .route("/ha/config/{key}", get(get_app_config))
         .route("/ha/config", post(update_app_config))
+        .route("/ha/rate-limit", post(set_global_rate_limit))
+        .route("/ha/rate-limit", get(get_global_rate_limit))
+        .route("/ha/rate-limit/stats", get(get_global_rate_limit_stats))
         .route("/ha/shutdown", post(trigger_graceful_shutdown))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
@@ -745,6 +750,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
         // Initialize rate-limit hash ring with current membership
         sync_manager.update_rate_limit_membership();
+
+        // Start rate limit window reset task
+        let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
+        spawn(async move {
+            window_manager.start_reset_task().await;
+        });
 
         // Create HA server builder and build with stores
         use crate::ha::service::HAServerBuilder;

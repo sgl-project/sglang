@@ -14,10 +14,12 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
 use bytes::Bytes;
 use http_body::Frame;
 use rand::Rng;
+use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
@@ -501,6 +503,26 @@ pub async fn concurrency_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Check HA global rate limit first if enabled
+    if let Some(sync_manager) = &app_state.ha_sync_manager {
+        let (is_exceeded, current_count, limit) = sync_manager.check_global_rate_limit();
+        if is_exceeded {
+            debug!(
+                "Global rate limit exceeded: {}/{} req/s",
+                current_count, limit
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "Rate limit exceeded",
+                    "current_count": current_count,
+                    "limit": limit
+                })),
+            )
+                .into_response();
+        }
+    }
+
     let token_bucket = match &app_state.context.rate_limiter {
         Some(bucket) => bucket.clone(),
         None => {

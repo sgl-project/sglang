@@ -9,6 +9,7 @@ pub mod mtls;
 pub mod node_state_machine;
 pub mod partition;
 mod ping_server;
+pub mod rate_limit_window;
 pub mod service;
 pub mod stores;
 pub mod sync;

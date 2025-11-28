@@ -65,6 +65,7 @@ impl GossipService {
             LocalStoreType::App => gossip::StoreType::App as i32,
             LocalStoreType::Worker => gossip::StoreType::Worker as i32,
             LocalStoreType::Policy => gossip::StoreType::Policy as i32,
+            LocalStoreType::RateLimit => gossip::StoreType::RateLimit as i32,
         };
 
         // Get all entries from the store
@@ -117,6 +118,31 @@ impl GossipService {
                     (k, serialized)
                 })
                 .collect(),
+            LocalStoreType::RateLimit => {
+                // For rate limit, serialize all counters from owners
+                stores
+                    .rate_limit
+                    .keys()
+                    .into_iter()
+                    .filter_map(|key| {
+                        if stores.rate_limit.is_owner(&key) {
+                            stores.rate_limit.get_counter(&key).map(|counter| {
+                                let serialized = serde_json::to_vec(&counter.snapshot())
+                                    .unwrap_or_else(|e| {
+                                        log::error!(
+                                            "Failed to serialize rate limit counter: {}",
+                                            e
+                                        );
+                                        vec![]
+                                    });
+                                (SKey::new(key.clone()), serialized)
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
         };
 
         if entries.is_empty() {
@@ -146,6 +172,13 @@ impl GossipService {
                         }
                         LocalStoreType::Policy => {
                             stores.policy.get_metadata(key).map(|(v, _)| v).unwrap_or(1)
+                        }
+                        LocalStoreType::RateLimit => {
+                            // For rate limit, use timestamp as version
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_nanos() as u64
                         }
                     };
 
@@ -334,7 +367,8 @@ impl Gossip for GossipService {
             let self_name_incremental = self_name.clone();
             let size_validator_clone = size_validator.clone();
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(5)); // Send every 5 seconds
+                // Use 1 second interval for rate limit counter sync (faster than other stores)
+                let mut interval = tokio::time::interval(Duration::from_secs(1)); // Send every 1 second
                 let mut sequence_counter: u64 = 0;
 
                 loop {
@@ -350,6 +384,7 @@ impl Gossip for GossipService {
                                 LocalStoreType::App => gossip::StoreType::App as i32,
                                 LocalStoreType::Worker => gossip::StoreType::Worker as i32,
                                 LocalStoreType::Policy => gossip::StoreType::Policy as i32,
+                                LocalStoreType::RateLimit => gossip::StoreType::RateLimit as i32,
                             };
 
                             sequence_counter += 1;
@@ -435,12 +470,14 @@ impl Gossip for GossipService {
                     LocalStoreType::App,
                     LocalStoreType::Worker,
                     LocalStoreType::Policy,
+                    LocalStoreType::RateLimit,
                 ] {
                     let store_len = match store_type {
                         LocalStoreType::Membership => stores.membership.len(),
                         LocalStoreType::App => stores.app.len(),
                         LocalStoreType::Worker => stores.worker.len(),
                         LocalStoreType::Policy => stores.policy.len(),
+                        LocalStoreType::RateLimit => stores.rate_limit.keys().len(),
                     };
 
                     // If store is empty or very small, request snapshot
@@ -455,6 +492,7 @@ impl Gossip for GossipService {
                             LocalStoreType::App => gossip::StoreType::App as i32,
                             LocalStoreType::Worker => gossip::StoreType::Worker as i32,
                             LocalStoreType::Policy => gossip::StoreType::Policy as i32,
+                            LocalStoreType::RateLimit => gossip::StoreType::RateLimit as i32,
                         };
 
                         let snapshot_request = StreamMessage {
@@ -557,6 +595,24 @@ impl Gossip for GossipService {
                                                             policy_state,
                                                             actor,
                                                         );
+                                                    }
+                                                }
+                                                LocalStoreType::RateLimit => {
+                                                    // Deserialize and apply rate limit counter
+                                                    if let Ok(counter) = serde_json::from_slice::<
+                                                        super::crdt::CRDTPNCounter,
+                                                    >(
+                                                        &state_update.value
+                                                    ) {
+                                                        // Convert CRDTPNCounter to SyncPNCounter for merging
+                                                        let sync_counter =
+                                                            super::crdt::SyncPNCounter::new();
+                                                        sync_counter.merge(&counter);
+                                                        sync_manager
+                                                            .apply_remote_rate_limit_counter(
+                                                                state_update.key.clone(),
+                                                                &sync_counter,
+                                                            );
                                                     }
                                                 }
                                                 _ => {
@@ -768,6 +824,16 @@ impl Gossip for GossipService {
                                                                     // Also update sync manager if available
                                                                     if let Some(ref sync_manager) = sync_manager {
                                                                         sync_manager.apply_remote_policy_state(policy_state, Some(entry.actor.clone()));
+                                                                    }
+                                                                }
+                                                            }
+                                                            LocalStoreType::RateLimit => {
+                                                                // For rate limit counters, deserialize and merge
+                                                                if let Ok(counter) = serde_json::from_slice::<super::crdt::CRDTPNCounter>(&entry.value) {
+                                                                    if let Some(ref sync_manager) = sync_manager {
+                                                                        let sync_counter = super::crdt::SyncPNCounter::new();
+                                                                        sync_counter.merge(&counter);
+                                                                        sync_manager.apply_remote_rate_limit_counter(entry.key.clone(), &sync_counter);
                                                                     }
                                                                 }
                                                             }

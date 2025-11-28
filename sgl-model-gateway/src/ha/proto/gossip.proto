@@ -118,4 +118,5 @@ enum StoreType {
   APP = 1;
   WORKER = 2;
   POLICY = 3;
+  RATE_LIMIT = 4;
 }

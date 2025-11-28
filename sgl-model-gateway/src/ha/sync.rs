@@ -9,7 +9,10 @@ use tracing::debug;
 use super::{
     crdt::SKey,
     gossip::NodeStatus,
-    stores::{PolicyState, StateStores, WorkerState},
+    stores::{
+        PolicyState, RateLimitConfig, StateStores, WorkerState, GLOBAL_RATE_LIMIT_COUNTER_KEY,
+        GLOBAL_RATE_LIMIT_KEY,
+    },
 };
 
 /// HA sync manager for coordinating state synchronization
@@ -268,6 +271,55 @@ impl HASyncManager {
     /// Get rate-limit value (aggregate from all owners)
     pub fn get_rate_limit_value(&self, key: &str) -> Option<i64> {
         self.stores.rate_limit.value(key)
+    }
+
+    /// Get global rate limit configuration from AppStore
+    pub fn get_global_rate_limit_config(&self) -> Option<RateLimitConfig> {
+        let key = SKey::new(GLOBAL_RATE_LIMIT_KEY.to_string());
+        self.stores
+            .app
+            .get(&key)
+            .and_then(|app_state| serde_json::from_slice::<RateLimitConfig>(&app_state.value).ok())
+    }
+
+    /// Check if global rate limit is exceeded
+    /// Returns (is_exceeded, current_count, limit)
+    pub fn check_global_rate_limit(&self) -> (bool, i64, u64) {
+        let config = self.get_global_rate_limit_config().unwrap_or_default();
+
+        if config.limit_per_second == 0 {
+            // Rate limit disabled
+            return (false, 0, 0);
+        }
+
+        // Increment counter if this node is an owner
+        self.sync_rate_limit_inc(GLOBAL_RATE_LIMIT_COUNTER_KEY.to_string(), 1);
+
+        // Get aggregated counter value from all owners
+        let current_count = self
+            .get_rate_limit_value(GLOBAL_RATE_LIMIT_COUNTER_KEY)
+            .unwrap_or(0);
+
+        let is_exceeded = current_count > config.limit_per_second as i64;
+        (is_exceeded, current_count, config.limit_per_second)
+    }
+
+    /// Reset global rate limit counter (called periodically for time window reset)
+    pub fn reset_global_rate_limit_counter(&self) {
+        // Reset by decrementing the current value
+        // Since we use PNCounter, we can't directly reset, but we can track the window
+        // For simplicity, we'll use a time-based approach where counters are reset periodically
+        // The actual reset logic will be handled by the window manager
+        let current_count = self
+            .get_rate_limit_value(GLOBAL_RATE_LIMIT_COUNTER_KEY)
+            .unwrap_or(0);
+
+        if current_count > 0 {
+            // Decrement by current count to effectively reset
+            // Note: This is a workaround since PNCounter doesn't support direct reset
+            // In production, you might want to use a different approach like timestamped counters
+            self.sync_rate_limit_inc(GLOBAL_RATE_LIMIT_COUNTER_KEY.to_string(), -current_count);
+        }
     }
 }
 

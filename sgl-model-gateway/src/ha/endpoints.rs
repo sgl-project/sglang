@@ -277,6 +277,139 @@ pub async fn get_app_config(
     }
 }
 
+/// Set global rate limit configuration
+#[derive(Debug, Deserialize)]
+pub struct SetRateLimitRequest {
+    pub limit_per_second: u64,
+}
+
+pub async fn set_global_rate_limit(
+    State(app_state): State<Arc<AppState>>,
+    Json(request): Json<SetRateLimitRequest>,
+) -> Response {
+    // Store configuration in AppStore
+    let config = RateLimitConfig {
+        limit_per_second: request.limit_per_second,
+    };
+
+    if let Ok(config_bytes) = serde_json::to_vec(&config) {
+        let handler = match &app_state.ha_handler {
+            Some(h) => h,
+            None => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"error": "HA not enabled"})),
+                )
+                    .into_response();
+            }
+        };
+
+        handler.write_data(GLOBAL_RATE_LIMIT_KEY.to_string(), config_bytes);
+        info!("Set global rate limit: {} req/s", request.limit_per_second);
+
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "updated",
+                "limit_per_second": request.limit_per_second
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Failed to serialize rate limit config"})),
+        )
+            .into_response()
+    }
+}
+
+/// Get global rate limit configuration
+pub async fn get_global_rate_limit(State(app_state): State<Arc<AppState>>) -> Response {
+    let handler = match &app_state.ha_handler {
+        Some(h) => h,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "HA not enabled"})),
+            )
+                .into_response();
+        }
+    };
+
+    match handler.read_data(GLOBAL_RATE_LIMIT_KEY.to_string()) {
+        Some(value) => match serde_json::from_slice::<RateLimitConfig>(&value) {
+            Ok(config) => (
+                StatusCode::OK,
+                Json(json!({
+                    "limit_per_second": config.limit_per_second
+                })),
+            )
+                .into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to deserialize rate limit config"})),
+            )
+                .into_response(),
+        },
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Global rate limit not configured"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Get global rate limit statistics
+pub async fn get_global_rate_limit_stats(State(app_state): State<Arc<AppState>>) -> Response {
+    let sync_manager = match &app_state.ha_sync_manager {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "HA sync manager not available"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Get configuration
+    let handler = match &app_state.ha_handler {
+        Some(h) => h,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "HA not enabled"})),
+            )
+                .into_response();
+        }
+    };
+
+    let config = handler
+        .read_data(GLOBAL_RATE_LIMIT_KEY.to_string())
+        .and_then(|v| serde_json::from_slice::<RateLimitConfig>(&v).ok())
+        .unwrap_or_default();
+
+    // Get current counter value
+    let current_count = sync_manager
+        .get_rate_limit_value(crate::ha::stores::GLOBAL_RATE_LIMIT_COUNTER_KEY)
+        .unwrap_or(0);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "limit_per_second": config.limit_per_second,
+            "current_count": current_count,
+            "remaining": if config.limit_per_second > 0 {
+                (config.limit_per_second as i64).saturating_sub(current_count).max(0)
+            } else {
+                -1 // Unlimited
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// Trigger graceful shutdown
 pub async fn trigger_graceful_shutdown(State(app_state): State<Arc<AppState>>) -> Response {
     let handler = match &app_state.ha_handler {
@@ -304,4 +437,7 @@ pub async fn trigger_graceful_shutdown(State(app_state): State<Arc<AppState>>) -
 
 use std::sync::Arc;
 
-use crate::server::AppState;
+use crate::{
+    ha::stores::{RateLimitConfig, GLOBAL_RATE_LIMIT_KEY},
+    server::AppState,
+};

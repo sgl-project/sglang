@@ -24,6 +24,7 @@ pub enum StoreType {
     App,
     Worker,
     Policy,
+    RateLimit,
 }
 
 impl StoreType {
@@ -33,6 +34,7 @@ impl StoreType {
             StoreType::App => "app",
             StoreType::Worker => "worker",
             StoreType::Policy => "policy",
+            StoreType::RateLimit => "rate_limit",
         }
     }
 
@@ -43,6 +45,7 @@ impl StoreType {
             1 => StoreType::App,
             2 => StoreType::Worker,
             3 => StoreType::Policy,
+            4 => StoreType::RateLimit,
             _ => StoreType::Membership, // Default fallback
         }
     }
@@ -65,6 +68,25 @@ pub struct AppState {
     pub value: Vec<u8>, // Serialized config
     pub version: u64,
 }
+
+/// Global rate limit configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RateLimitConfig {
+    pub limit_per_second: u64,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            limit_per_second: 0, // 0 means disabled
+        }
+    }
+}
+
+/// Key for global rate limit configuration in AppStore
+pub const GLOBAL_RATE_LIMIT_KEY: &str = "global_rate_limit";
+/// Key for global rate limit counter in RateLimitStore
+pub const GLOBAL_RATE_LIMIT_COUNTER_KEY: &str = "global";
 
 /// Worker state entry
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
