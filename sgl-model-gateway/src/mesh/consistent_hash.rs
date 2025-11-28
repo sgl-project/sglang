@@ -66,28 +66,18 @@ impl ConsistentHashRing {
         let key_hash = Self::hash(key);
         let mut owners = Vec::new();
         let mut seen_nodes = HashSet::new();
-        let total_nodes = self.node_hashes.len();
-
-        // If we have fewer nodes than NUM_OWNERS, we can only return what we have
-        let max_owners = NUM_OWNERS.min(total_nodes);
+        let total_unique_nodes = self.node_hashes.len();
 
         // Find the first node >= key_hash (clockwise)
         let mut iter = self.ring.range(key_hash..);
-        let mut wrapped = false;
-
-        while owners.len() < max_owners {
+        while owners.len() < NUM_OWNERS && seen_nodes.len() < total_unique_nodes {
             if let Some((_, node)) = iter.next() {
                 if !seen_nodes.contains(node) {
                     owners.push(node.clone());
                     seen_nodes.insert(node.clone());
                 }
             } else {
-                // Wrap around to the beginning, but only once
-                if wrapped {
-                    // Already wrapped, no more nodes to check
-                    break;
-                }
-                wrapped = true;
+                // Wrap around to the beginning
                 iter = self.ring.range(..);
             }
         }
@@ -194,5 +184,32 @@ mod tests {
         assert!(!ring.has_node("node1"));
         assert!(ring.has_node("node2"));
         assert!(ring.has_node("node3"));
+    }
+
+    #[test]
+    fn test_get_owners_with_fewer_nodes_than_owners() {
+        // Test that the loop terminates correctly when there are fewer nodes than NUM_OWNERS
+        let mut ring = ConsistentHashRing::new();
+        ring.add_node("node1");
+        ring.add_node("node2");
+        // Only 2 nodes, but NUM_OWNERS is 3
+
+        let owners = ring.get_owners("test_key");
+        // Should return all available nodes (2) without infinite loop
+        assert_eq!(owners.len(), 2);
+        assert!(owners.contains(&"node1".to_string()));
+        assert!(owners.contains(&"node2".to_string()));
+    }
+
+    #[test]
+    fn test_get_owners_with_single_node() {
+        // Test with only one node
+        let mut ring = ConsistentHashRing::new();
+        ring.add_node("node1");
+
+        let owners = ring.get_owners("test_key");
+        // Should return the single node without infinite loop
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0], "node1");
     }
 }
