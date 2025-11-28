@@ -8,9 +8,9 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
-def register_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
+def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -> None:
     """
-    hook_specs is a list of dicts from server_args.hooks.
+    hook_specs is a list of dicts from server_args.forward_hooks.
     Attaches forward hooks to the matching modules.
     """
     name_to_module = dict(model.named_modules())

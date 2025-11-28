@@ -156,9 +156,6 @@ class ExecutionMode(str, Enum):
     """
 
     INFERENCE = "inference"
-    PREPROCESS = "preprocess"
-    FINETUNING = "finetuning"
-    DISTILLATION = "distillation"
 
     @classmethod
     def from_string(cls, value: str) -> "ExecutionMode":
@@ -620,6 +617,19 @@ class ServerArgs:
             type=str,
             default=ServerArgs.override_transformer_cls_name,
             help="Override transformer cls name",
+        )
+        # LoRA
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=ServerArgs.lora_path,
+            help="The path to the LoRA adapter weights (can be local file path or HF hub id) to launch with",
+        )
+        parser.add_argument(
+            "--lora-nickname",
+            type=str,
+            default=ServerArgs.lora_nickname,
+            help="The nickname for the LoRA adapter to launch with",
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)

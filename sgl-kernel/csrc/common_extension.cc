@@ -264,8 +264,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
   m.impl("shuffle_rows", torch::kCUDA, &shuffle_rows);
+
   m.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
   m.impl("apply_shuffle_mul_sum", torch::kCUDA, &apply_shuffle_mul_sum);
+
+  m.def(
+      "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
+      "int num_heads_k, int num_heads_v, int head_dim, float eps, "
+      "Tensor q_weight, Tensor k_weight, float base, "
+      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor) -> ()");
+  m.impl("fused_qk_norm_rope", torch::kCUDA, &fused_qk_norm_rope);
 
   /*
    * From csrc/moe/cutlass_moe/w4a8

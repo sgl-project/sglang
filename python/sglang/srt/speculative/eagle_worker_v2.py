@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -36,6 +37,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
     draft_tp_context,
+    generate_token_bitmask,
     load_token_map,
 )
 from sglang.srt.utils.common import (
@@ -43,10 +45,12 @@ from sglang.srt.utils.common import (
     fast_topk,
     get_available_gpu_memory,
     is_npu,
+    is_cuda,
     next_power_of_2,
 )
 
 _is_npu = is_npu()
+_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -242,8 +246,8 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # FIXME cuda not support draft_extend capture
-        if self.draft_extend_attn_backend and _is_npu:
+        # FIXME cuda graph for draft_extend capture only support triton now
+        if self.draft_extend_attn_backend and (_is_npu or (_is_cuda and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend))):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -497,6 +501,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.plan_stream
             )
 
+        if forward_batch.spec_info.accept_length is None:
+            forward_batch.spec_info.accept_length = batch_result.accept_lens
+
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
@@ -667,7 +674,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Run target verify batch in the main compute stream
+        # Prepare grammar data on CPU if needed
+        if batch.has_grammar:
+            retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
+            draft_tokens_cpu = verify_input.draft_token.view(
+                verify_input.retrive_next_token.shape
+            ).cpu()
+
+        # Run target verify batch in the main compute stream (GPU compute)
         forward_batch_output = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
             forward_batch=verify_forward_batch,
@@ -676,6 +691,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
+        # Generate vocab mask for constrained decoding
+        vocab_mask = None
+        if batch.has_grammar:
+            # Generate the logit mask for structured output.
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                verify_input,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
+                # and will be applied to produce wrong results
+                batch.sampling_info.vocab_mask = None
+
         # Sample
         if self.enable_nan_detection:
             detect_nan(logits_output)
@@ -683,7 +718,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             predict,
             accept_length,
             accept_index,
-        ) = verify_input.sample(batch, logits_output)
+        ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()

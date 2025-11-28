@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -12,6 +13,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+
+register_cuda_ci(est_time=600, suite="nightly-8-gpu-h200", nightly=True)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 
