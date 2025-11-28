@@ -72,6 +72,39 @@ def draft_tp_context(tp_group: GroupCoordinator):
     with disable_dp_size(), patch_tensor_parallel_group(tp_group):
         yield
 
+@triton.jit
+def align_evict_mask_to_page_size_simple_eagle(
+    out_cache_loc,
+    evict_mask,
+    page_size: tl.constexpr,
+    num_draft_tokens: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    bid = tl.program_id(axis=0)
+    t_range = tl.arange(0, BLOCK_SIZE)
+    io_mask = t_range < num_draft_tokens
+
+    loc_ptr = out_cache_loc + bid * num_draft_tokens
+    mask_ptr = evict_mask + bid * num_draft_tokens
+
+    slot_locs = tl.load(loc_ptr + t_range, mask=io_mask, other=0)
+    page_ids = slot_locs // page_size
+
+    is_on_protected_page = tl.zeros((BLOCK_SIZE,), dtype=tl.int1)
+    for i in range(0, BLOCK_SIZE):
+        if i < num_draft_tokens:
+            is_accepted_scalar = tl.load(mask_ptr + i) == 0
+            page_id_scalar = tl.load(loc_ptr + i) // page_size
+            protected_page_candidate = tl.where(is_accepted_scalar, page_id_scalar, -1)
+            is_on_protected_page = is_on_protected_page | (
+                page_ids == protected_page_candidate
+            )
+
+    initial_evict_mask = tl.load(mask_ptr + t_range, mask=io_mask, other=True)
+    final_evict_mask = initial_evict_mask & (~is_on_protected_page)
+
+    tl.store(mask_ptr + t_range, final_evict_mask, mask=io_mask)
+
 class SimpleEagleWorker(TpModelWorker):
 
     def __init__(
@@ -304,17 +337,35 @@ class SimpleEagleWorker(TpModelWorker):
                 backup_state=False,
             )
             end_offset = batch.seq_lens + 2  # assign 2 tokens
-            assign_req_to_token_pool[(num_seqs,)](
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                end_offset,
-                batch.out_cache_loc,
-                batch.req_to_token_pool.req_to_token.shape[1],
-                next_power_of_2(num_seqs),
-            )
         else:
-            raise NotImplementedError("TODO: Page size > 1 not supported yet")
+            prefix_lens = batch.seq_lens
+            prefix_lens_cpu = batch.seq_lens_cpu
+            end_offset = prefix_lens + 2
+            end_offset_cpu = prefix_lens_cpu + 2
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                batch.req_pool_indices,
+                prefix_lens,
+            )
+
+            batch.out_cache_loc = alloc_paged_token_slots_extend(
+                batch.tree_cache,
+                prefix_lens,
+                prefix_lens_cpu,
+                end_offset,
+                end_offset_cpu,
+                last_loc,
+                num_seqs * 2,
+            )
+        assign_req_to_token_pool[(num_seqs,)](
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+            next_power_of_2(num_seqs),
+        )
 
         batch.input_ids = torch.column_stack(
             (batch.output_ids, draft_input_spec_info.topk_index.squeeze(1))
@@ -492,7 +543,13 @@ class SimpleEagleWorker(TpModelWorker):
         evict_mask[accept_index[accept_index != -1]] = False
         if self.page_size != 1:
             # TODO: align_evict_mask_to_page_size, see eagle_utils.py/align_evict_mask_to_page_size
-            pass
+            align_evict_mask_to_page_size_simple_eagle[num_seqs,](
+                batch.out_cache_loc,
+                evict_mask,
+                self.page_size,
+                2,
+                next_power_of_2(2),
+            )
 
         self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
 
