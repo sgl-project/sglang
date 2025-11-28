@@ -66,7 +66,7 @@ class ConfigArgumentMerger:
 
         # Split arguments around config file
         before_config = cli_args[:config_index]
-        after_config = cli_args[config_index + 2 :]  # Skip --config and file path
+        after_config = cli_args[config_index + 2:]  # Skip --config and file path
 
         # Simple merge: config args + CLI args
         return config_args + before_config + after_config
@@ -126,14 +126,20 @@ class ConfigArgumentMerger:
         return args
 
     def _add_boolean_arg(self, args: List[str], key: str, value: bool) -> None:
-        """Add boolean argument to the list."""
+        """
+        Add boolean argument to the list.
+
+        Only store_true flags:
+            - value True → add flag
+            - value False → skip
+        Regular booleans:
+            - always add --key true/false
+        """
         if key in self.boolean_actions:
-            # For boolean actions, always add the flag and value
-            args.extend([f"--{key}", str(value).lower()])
-        else:
-            # For regular booleans, only add flag if True
             if value:
                 args.append(f"--{key}")
+        else:
+            args.extend([f"--{key}", str(value).lower()])
 
     def _add_list_arg(self, args: List[str], key: str, value: List[Any]) -> None:
         """Add list argument to the list."""
