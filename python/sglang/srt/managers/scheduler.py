@@ -150,7 +150,6 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
-from sglang.srt.mem_cache.ascend_radix_cache import AscendHiRadixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -752,6 +751,8 @@ class Scheduler(
                 self.enable_hierarchical_cache
                 and self.server_args.hicache_storage_backend == "memcache"
             ):
+                from sglang.srt.mem_cache.ascend_radix_cache import AscendHiRadixCache
+
                 self.tree_cache = AscendHiRadixCache(
                     params=params, server_args=server_args
                 )

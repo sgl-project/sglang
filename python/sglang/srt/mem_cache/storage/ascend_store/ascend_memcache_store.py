@@ -224,7 +224,7 @@ class AscendMemCacheStore(HiCacheStorage):
                 f"non exist keys is {len(new_keys)}, "
                 f"copy_total_pages={total_pages}, "
                 f"copy_total_size={total_size}, "
-                f"duration {(end - start) * 1000:.3f}ms "
+                f"duration {(end - start) * 1000:.3f}ms, "
                 f"speed {float(total_size) / 1024 / 1024 / 1024 / (end - start):.3f}GB/s"
             )
 

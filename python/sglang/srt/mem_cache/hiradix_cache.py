@@ -409,7 +409,7 @@ class HiRadixCache(RadixCache):
         # todo: more loading policies
 
         start_time = time.perf_counter()
-        last_hit_node = node  # last_host_node
+        last_hit_node = node
         nodes_to_load = []
         while node.evicted:
             assert (

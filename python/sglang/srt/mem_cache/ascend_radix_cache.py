@@ -82,7 +82,8 @@ class AscendHiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
 
-            num_evicted += self._evict_regular(x)
+            if not x.backuped:
+                num_evicted += self._evict_regular(x)
 
             for child in x.parent.children.values():
                 if not child.evicted:
@@ -105,7 +106,7 @@ class AscendHiRadixCache(RadixCache):
         node: TreeNode,
         new_input_tokens: List[int],
         extra_key: Optional[str] = None,
-        mem_quota: Optional[int] = None,
+        priority: int = 0,
     ) -> tuple[Tensor | None, TreeNode]:
         start_time = time.perf_counter()
 
@@ -130,6 +131,12 @@ class AscendHiRadixCache(RadixCache):
             device_indices=device_indices,
             last_hash=node.get_last_hash_value(),
         )
+
+        if free_device_indices is not None and cached_device_indices is not None:
+            assert (len(cached_device_indices) + len(free_device_indices)) == len(
+                device_indices
+            )
+
         if free_device_indices is not None:
             self.mem_pool_device_allocator.free(free_device_indices)
 
@@ -142,7 +149,13 @@ class AscendHiRadixCache(RadixCache):
             RadixKey(new_input_tokens[:cached_token_len], extra_key),
             cached_device_indices,
             last_hit_node,
+            priority=priority,
         )
+
+        if new_node is None:
+            logger.error(f"====> failed to _insert: {len(cached_device_indices)=}")
+            self.mem_pool_device_allocator.free(cached_device_indices)
+            return None, last_hit_node
 
         self.ongoing_load_back[new_node.id] = new_node
         self.inc_lock_ref(new_node)
@@ -160,7 +173,6 @@ class AscendHiRadixCache(RadixCache):
         req: Req,
         mem_quota: Optional[int] = None,
     ):
-        req.ongoing_loading_l3 = False
         matched_len = len(req.prefix_indices)
         new_input_tokens = req.fill_ids[matched_len:]
         new_input_len = len(new_input_tokens)
@@ -176,11 +188,11 @@ class AscendHiRadixCache(RadixCache):
 
         last_node = req.last_node
         if not last_node.evicted:
+            priority = getattr(req, "priority", 0) or 0
             loading_values, last_node = self.load_back(
-                req.rid, last_node, new_input_tokens, req.extra_key, mem_quota
+                req.rid, last_node, new_input_tokens, req.extra_key, priority
             )
             if loading_values is not None:
-                req.ongoing_loading_l3 = True
                 req.last_node = last_node
 
                 logger.debug(
@@ -188,11 +200,8 @@ class AscendHiRadixCache(RadixCache):
                     f"{len(loading_values)} tokens for node {last_node.id}"
                 )
                 return loading_values
-            else:
-                logger.info(f"init_load_back {req.req_id=} loading_values is None")
-
         else:
-            logger.error(f"should not enter here")
+            logger.error(f"should not enter branch")
             # should not enter this branch
             while last_node.evicted:
                 last_node = last_node.parent
@@ -236,14 +245,11 @@ class AscendHiRadixCache(RadixCache):
         value: Tensor,
         parent,
         chunked=False,
-        priority: int | None = None,
-    ) -> TreeNode:
-        key, value = self.maybe_bigram_convert(key, value)
+        priority: int = 0,
+    ) -> TreeNode | None:
+        # key, value = self.maybe_bigram_convert(key, value)
         if len(key) == 0:
-            return parent
-
-        if priority is None:
-            priority = 0
+            return None
 
         child_key = self.get_child_key_fn(key)
 
@@ -271,14 +277,11 @@ class AscendHiRadixCache(RadixCache):
         key: RadixKey,
         value=None,
         chunked=False,
-        priority: int | None = None,
+        priority: int = 0,
     ) -> int:
         key, value = self.maybe_bigram_convert(key, value)
         if len(key) == 0:
             return 0
-
-        if priority is None:
-            priority = 0
 
         if self.is_eagle and value is not None:
             # Make sure the value len equal to the EAGLE bigram key len

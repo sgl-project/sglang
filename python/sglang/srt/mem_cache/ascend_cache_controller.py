@@ -185,11 +185,11 @@ class AscendHiCacheController:
         # producer_event.start_event.record()
 
         try:
-            hit_hash_keys, hit_hash_len, hit_token_len = self._storage_hit_query(op)
+            hit_hash_len = self._storage_hit_query(op)
             if self.tp_world_size > 1:
                 hit_hash_len = self._allreduce_results(hit_hash_len)
-                hit_token_len = hit_hash_len * self.page_size
 
+            hit_token_len = hit_hash_len * self.page_size
             if hit_token_len < self.load_tokens_threshold:
                 # not to load storage if not enough benefits
                 logger.debug(
@@ -197,7 +197,7 @@ class AscendHiCacheController:
                 )
                 return None, op.device_indices
             else:
-                hit_hash_keys = hit_hash_keys[:hit_hash_len]
+                hit_hash_keys = op.hash_keys[:hit_hash_len]
                 device_indices = op.device_indices[:hit_token_len]
                 load_results = self._memcpy_between_device_and_storage(
                     hit_hash_keys, device_indices, "load"
@@ -206,21 +206,21 @@ class AscendHiCacheController:
                     load_results = self._allreduce_results(load_results)
 
                 # fresh hash keys and its len get successfully
-                hash_keys, hash_len, token_len = (
-                    self._parse_success_hashes_from_l3_results(
-                        hit_hash_keys, load_results
-                    )
+                hash_len = self._parse_success_hashes_from_l3_results(
+                    hit_hash_keys, load_results
                 )
+
+                token_len = hash_len * self.page_size
                 hit_device_indices = op.device_indices[:token_len]
                 free_device_indices = op.device_indices[token_len:]
 
                 logger.debug(
-                    f"success load {hash_len} pages for request {op.request_id}"
+                    f"success load {token_len} tokens for request {op.request_id}"
                 )
                 return hit_device_indices, free_device_indices
         except Empty:
             logger.error(
-                f"Load storage {len(op.hash_keys)} pages for request {op.request_id}"
+                f"Failed load storage {len(op.hash_keys)} pages for request {op.request_id}"
             )
             return None, op.device_indices
 
@@ -239,12 +239,10 @@ class AscendHiCacheController:
         else:
             return result_tensor.tolist()
 
-    def _storage_hit_query(
-        self, operation: LoadStorageOperation
-    ) -> tuple[list[str], int, int]:
+    def _storage_hit_query(self, operation: LoadStorageOperation) -> int:
         flatten_hash_keys = operation.hash_keys
         if not operation.hash_keys:
-            return [], 0, 0
+            return 0
 
         exist_results = []
         total_len = len(flatten_hash_keys)
@@ -296,18 +294,16 @@ class AscendHiCacheController:
         self,
         hash_keys: List[str],
         results: List[int],
-    ) -> tuple[List[str], int, int]:
+    ) -> int:
         # for each key
-        hit_hashes: List[str] = []
         hit_hash_len = 0
         for h, r in zip(hash_keys, results):
             if r == 1:
-                hit_hashes.append(h)
                 hit_hash_len += 1
             else:
                 break
 
-        return hit_hashes, hit_hash_len, hit_hash_len * self.page_size
+        return hit_hash_len
 
     def _get_page_buffer_meta(
         self, device_indices: torch.Tensor
