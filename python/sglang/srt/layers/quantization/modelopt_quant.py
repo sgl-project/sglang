@@ -1654,11 +1654,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = torch.bfloat16
 
+            # If x_sf is not None, x is FP4 packed (half size), so we need * 2
+            # If x_sf is None, x is not packed, so output_col = x.shape[1]
+            output_col = x.shape[1] * 2 if x_sf is not None else x.shape[1]
+
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
-                    x.shape[0], x.shape[1] * 2, dtype=output_dtype, device=x.device
+                    x.shape[0], output_col, dtype=output_dtype, device=x.device
                 )
 
             output = flashinfer_cutlass_fused_moe(

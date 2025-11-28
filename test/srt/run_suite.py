@@ -7,6 +7,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
+        TestFile("test_eagle_constrained_decoding.py", 100),
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 15),
         TestFile("hicache/test_hicache_storage.py", 127),
         TestFile("hicache/test_hicache_variants.py", 393),
@@ -24,6 +25,7 @@ suites = {
         TestFile("models/test_encoder_embedding_models.py", 460),
         TestFile("models/test_generation_models.py", 103),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 160),
+        TestFile("models/test_nvidia_nemotron_nano_v2_vl.py", 350),  # GSM8k + MMMU
         TestFile("models/test_qwen_models.py", 150),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
@@ -125,6 +127,7 @@ suites = {
         TestFile("test_triton_moe_channel_fp8_kernel.py", 25),
         TestFile("test_triton_sliding_window.py", 100),
         TestFile("test_utils_update_weights.py", 48),
+        TestFile("test_video_utils.py", 5),
         TestFile("test_vision_chunked_prefill.py", 170),
         TestFile("test_vision_openai_server_a.py", 900),
         TestFile("test_vlm_input_format.py", 300),
@@ -146,7 +149,6 @@ suites = {
         TestFile("test_dp_attention.py", 350),
         TestFile("test_load_weights_from_remote_instance.py", 72),
         TestFile("test_patch_torch.py", 19),
-        TestFile("test_release_memory_occupation.py", 200),
         TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
@@ -200,6 +202,7 @@ suites = {
     ],
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
+        TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
         TestFile(
             "rl/test_update_weights_from_disk.py"

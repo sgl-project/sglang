@@ -5,6 +5,9 @@ import unittest
 import torch
 
 from sglang.srt.batch_invariant_ops import batch_invariant_ops
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="nightly-1-gpu", nightly=True)
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode
 from sglang.test.test_utils import CustomTestCase
 
