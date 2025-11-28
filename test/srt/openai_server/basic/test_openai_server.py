@@ -893,24 +893,36 @@ class TestOpenAIServerv1ResponsesFunctionCalling(CustomTestCase):
         self.assertIn("status", body)
 
     def test_responses_api_function_tool_call_parsing(self):
-        """Test that function tool calls are parsed from model output."""
+        """Test that function tool calls are correctly parsed with expected name and arguments.
+
+        This is a strict test that verifies:
+        1. The model outputs a function_call (not just a message)
+        2. The function call has the correct name (get_weather)
+        3. The function call arguments contain the expected city
+
+        Uses tool_choice="required" to force function calling via JSON schema constraint,
+        making the test deterministic.
+        """
+        import json
+
         url = f"{self.base_url}/responses"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
 
-        # Use a prompt that should trigger tool usage
+        # Use tool_choice="required" to force the model to call a function
+        # This activates JSON schema constraint for deterministic output
         payload = {
             "model": self.model,
             "input": [
                 {"role": "system", "content": self.SYSTEM_MESSAGE},
-                {"role": "user", "content": "Compute (3+5) using the add function"},
+                {"role": "user", "content": "What is the weather in Tokyo?"},
             ],
             "tools": self.get_function_tools(),
-            "tool_choice": "auto",
-            "temperature": 0.8,
-            "max_output_tokens": 512,
+            "tool_choice": "required",
+            "temperature": 0,
+            "max_output_tokens": 256,
         }
 
         r = requests.post(url, headers=headers, json=payload)
@@ -923,12 +935,49 @@ class TestOpenAIServerv1ResponsesFunctionCalling(CustomTestCase):
         output = body.get("output", [])
         self.assertIsInstance(output, list)
 
-        # The response should contain either a function_call or a message
-        # depending on whether the model decided to use tools
-        output_types = [item.get("type") for item in output]
-        self.assertTrue(
-            any(t in ["function_call", "message"] for t in output_types),
-            f"Expected 'function_call' or 'message' in output, got: {output_types}",
+        # Find function_call items
+        function_calls = [item for item in output if item.get("type") == "function_call"]
+
+        # With tool_choice="required", we MUST have at least one function call
+        self.assertGreaterEqual(
+            len(function_calls),
+            1,
+            f"Expected at least one function_call with tool_choice='required', "
+            f"got output: {json.dumps(output, indent=2)}",
+        )
+
+        # Verify the function call structure
+        fc = function_calls[0]
+
+        # Must have required fields
+        self.assertIn("name", fc, f"Function call missing 'name': {fc}")
+        self.assertIn("call_id", fc, f"Function call missing 'call_id': {fc}")
+        self.assertIn("arguments", fc, f"Function call missing 'arguments': {fc}")
+
+        # Function name should be get_weather (since we asked about weather)
+        self.assertEqual(
+            fc["name"],
+            "get_weather",
+            f"Expected function 'get_weather' for weather query, got: {fc['name']}",
+        )
+
+        # Parse and verify arguments
+        args = fc["arguments"]
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                self.fail(f"Could not parse arguments as JSON: {args}")
+
+        # Must have 'city' argument
+        self.assertIn("city", args, f"Expected 'city' in get_weather arguments, got: {args}")
+
+        # City should contain Tokyo (case-insensitive)
+        city_value = args["city"].lower()
+        self.assertIn(
+            "tokyo",
+            city_value,
+            f"Expected 'tokyo' in city argument, got: {args['city']}",
         )
 
     def test_responses_api_tool_choice_none(self):
