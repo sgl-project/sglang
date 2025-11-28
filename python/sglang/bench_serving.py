@@ -829,6 +829,7 @@ ASYNC_REQUEST_FUNCS = {
     "trt": async_request_trt_llm,
     "gserver": async_request_gserver,
     "truss": async_request_truss,
+    "mindIE": async_request_openai_chat_completions,
 }
 
 
@@ -2252,6 +2253,7 @@ def run_benchmark(args_: argparse.Namespace):
             "lmdeploy": 23333,
             "vllm": 8000,
             "trt": 8000,
+            "mindIE": 1025,
             "gserver": 9988,
             "truss": 8080,
         }.get(args.backend, 30000)
@@ -2273,6 +2275,12 @@ def run_benchmark(args_: argparse.Namespace):
             f"{args.base_url}/v1/completions"
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/completions"
+        )
+    elif args.backend in ["mindIE"]:
+        api_url = (
+            f"{args.base_url}/v1/chat/completions"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/v1/chat/completions"
         )
     elif args.backend in ["sglang-oai-chat", "vllm-chat", "lmdeploy-chat"]:
         api_url = (
@@ -2312,7 +2320,11 @@ def run_benchmark(args_: argparse.Namespace):
         try:
             response = requests.get(model_url, headers=get_auth_headers())
             model_list = response.json().get("data", [])
-            args.model = model_list[0]["id"] if model_list else None
+            if args.backend in ["mindIE"]:
+                args.model = model_list[0]["root"] if model_list else None
+                args.served_model_name = args.served_model_name or (model_list[0]["id"] if model_list else None)
+            else:
+                args.model = model_list[0]["id"] if model_list else None
         except Exception as e:
             print(f"Failed to fetch model from {model_url}. Error: {e}")
             print(
