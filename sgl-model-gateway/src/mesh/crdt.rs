@@ -403,7 +403,7 @@ mod tests {
         assert!(key1 < key2);
     }
 
-    // LWWRegister tests
+    // LWWRegister tests with i32
     #[test]
     fn test_lww_register_new() {
         let reg = LWWRegister::new(42, "actor1".to_string());
@@ -433,6 +433,37 @@ mod tests {
         assert_eq!(reg1.actor, "actor2");
     }
 
+    // LWWRegister tests with String
+    #[test]
+    fn test_lww_register_create_and_read() {
+        let reg = LWWRegister::new("value1".to_string(), "actor1".to_string());
+        assert_eq!(reg.read(), "value1");
+        assert_eq!(reg.version, 1);
+        assert_eq!(reg.actor, "actor1");
+    }
+
+    #[test]
+    fn test_lww_register_version_increment() {
+        let mut reg = LWWRegister::new("value1".to_string(), "actor1".to_string());
+        let initial_version = reg.version;
+        reg.write("value2".to_string(), "actor2".to_string());
+        assert_eq!(reg.version, initial_version + 1);
+        assert_eq!(reg.read(), "value2");
+        assert_eq!(reg.actor, "actor2");
+    }
+
+    #[test]
+    fn test_lww_register_merge_timestamp_priority() {
+        let mut reg1 = LWWRegister::new("value1".to_string(), "actor1".to_string());
+        thread::sleep(Duration::from_millis(10)); // Ensure different timestamp
+        let reg2 = LWWRegister::new("value2".to_string(), "actor2".to_string());
+
+        // reg2 has newer timestamp, should win
+        reg1.merge(&reg2);
+        assert_eq!(reg1.read(), "value2");
+        assert_eq!(reg1.actor, "actor2");
+    }
+
     #[test]
     fn test_lww_register_merge_older_loses() {
         let reg1 = LWWRegister::new(42, "actor1".to_string());
@@ -445,7 +476,46 @@ mod tests {
         assert_eq!(reg2_clone.actor, "actor2");
     }
 
-    // CRDTMap tests
+    #[test]
+    fn test_lww_register_merge_version_priority() {
+        let mut reg1 = LWWRegister::new("value1".to_string(), "actor1".to_string());
+        let mut reg2 = LWWRegister::new("value2".to_string(), "actor2".to_string());
+
+        // Set same timestamp but different versions
+        reg2.timestamp = reg1.timestamp;
+        reg2.version = reg1.version + 1;
+
+        reg1.merge(&reg2);
+        assert_eq!(reg1.read(), "value2");
+        assert_eq!(reg1.version, reg2.version);
+    }
+
+    #[test]
+    fn test_lww_register_concurrent_merge() {
+        let mut reg1 = LWWRegister::new("value1".to_string(), "actor1".to_string());
+        thread::sleep(Duration::from_millis(10));
+        let reg2 = LWWRegister::new("value2".to_string(), "actor2".to_string());
+        thread::sleep(Duration::from_millis(10));
+        let reg3 = LWWRegister::new("value3".to_string(), "actor3".to_string());
+
+        // Merge in different orders should give same result (latest wins)
+        reg1.merge(&reg2);
+        reg1.merge(&reg3);
+        assert_eq!(reg1.read(), "value3");
+
+        let mut reg4 = LWWRegister::new("value1".to_string(), "actor1".to_string());
+        thread::sleep(Duration::from_millis(10));
+        let reg5 = LWWRegister::new("value2".to_string(), "actor2".to_string());
+        thread::sleep(Duration::from_millis(10));
+        let reg6 = LWWRegister::new("value3".to_string(), "actor3".to_string());
+
+        reg4.merge(&reg6);
+        reg4.merge(&reg5);
+        // reg6 should win (latest timestamp)
+        assert_eq!(reg4.read(), "value3");
+    }
+
+    // CRDTMap tests with i32
     #[test]
     fn test_crdt_map_new() {
         let map: CRDTMap<i32> = CRDTMap::new();
@@ -499,6 +569,37 @@ mod tests {
         assert_eq!(values, vec![1, 2, 3]);
     }
 
+    // CRDTMap tests with String
+    #[test]
+    fn test_crdt_map_insert_get_remove_string() {
+        let mut map = CRDTMap::new();
+        let key = SKey::new("key1".to_string());
+
+        map.insert(key.clone(), "value1".to_string(), "actor1".to_string());
+        assert_eq!(map.get(&key), Some(&"value1".to_string()));
+        assert_eq!(map.len(), 1);
+
+        map.remove(&key);
+        assert_eq!(map.get(&key), None);
+        assert_eq!(map.len(), 0);
+    }
+
+    #[test]
+    fn test_crdt_map_version_management() {
+        let mut map = CRDTMap::new();
+        let key = SKey::new("key1".to_string());
+
+        map.insert(key.clone(), "value1".to_string(), "actor1".to_string());
+        let (version1, actor1) = map.get_metadata(&key).unwrap();
+        assert_eq!(version1, 1);
+        assert_eq!(actor1, "actor1");
+
+        map.insert(key.clone(), "value2".to_string(), "actor2".to_string());
+        let (version2, actor2) = map.get_metadata(&key).unwrap();
+        assert_eq!(version2, 2);
+        assert_eq!(actor2, "actor2");
+    }
+
     #[test]
     fn test_crdt_map_merge() {
         let mut map1 = CRDTMap::new();
@@ -517,6 +618,39 @@ mod tests {
         assert_eq!(map1.get(&SKey::new("key2".to_string())), Some(&20)); // Newer value wins
         assert_eq!(map1.get(&SKey::new("key3".to_string())), Some(&3));
         assert_eq!(map1.len(), 3);
+    }
+
+    #[test]
+    fn test_crdt_map_merge_string() {
+        let mut map1 = CRDTMap::new();
+        let mut map2 = CRDTMap::new();
+
+        let key1 = SKey::new("key1".to_string());
+        let key2 = SKey::new("key2".to_string());
+
+        map1.insert(key1.clone(), "value1".to_string(), "actor1".to_string());
+        map2.insert(key2.clone(), "value2".to_string(), "actor2".to_string());
+
+        map1.merge(&map2);
+        assert_eq!(map1.get(&key1), Some(&"value1".to_string()));
+        assert_eq!(map1.get(&key2), Some(&"value2".to_string()));
+        assert_eq!(map1.len(), 2);
+    }
+
+    #[test]
+    fn test_crdt_map_merge_conflict_resolution() {
+        let mut map1 = CRDTMap::new();
+        let mut map2 = CRDTMap::new();
+
+        let key = SKey::new("key1".to_string());
+
+        map1.insert(key.clone(), "value1".to_string(), "actor1".to_string());
+        thread::sleep(Duration::from_millis(10));
+        map2.insert(key.clone(), "value2".to_string(), "actor2".to_string());
+
+        // map2 has newer timestamp, should win
+        map1.merge(&map2);
+        assert_eq!(map1.get(&key), Some(&"value2".to_string()));
     }
 
     #[test]
@@ -564,6 +698,21 @@ mod tests {
     }
 
     #[test]
+    fn test_pn_counter_inc_dec() {
+        let mut counter = CRDTPNCounter::new();
+        assert_eq!(counter.value(), 0);
+
+        counter.inc("actor1".to_string(), 5);
+        assert_eq!(counter.value(), 5);
+
+        counter.inc("actor2".to_string(), 3);
+        assert_eq!(counter.value(), 8);
+
+        counter.inc("actor1".to_string(), -2);
+        assert_eq!(counter.value(), 6);
+    }
+
+    #[test]
     fn test_pn_counter_merge() {
         let mut counter1 = CRDTPNCounter::new();
         counter1.inc("actor1".to_string(), 5);
@@ -578,6 +727,31 @@ mod tests {
         // For now, just verify merge() doesn't panic
         // TODO: Fix value() method to properly read PNCounter value
         assert!(val >= 0); // At minimum, should not panic
+    }
+
+    #[test]
+    fn test_pn_counter_merge_exact() {
+        let mut counter1 = CRDTPNCounter::new();
+        let mut counter2 = CRDTPNCounter::new();
+
+        counter1.inc("actor1".to_string(), 10);
+        counter2.inc("actor2".to_string(), 5);
+
+        counter1.merge(&counter2);
+        assert_eq!(counter1.value(), 15);
+    }
+
+    #[test]
+    fn test_pn_counter_merge_idempotent() {
+        let mut counter1 = CRDTPNCounter::new();
+        let mut counter2 = CRDTPNCounter::new();
+
+        counter1.inc("actor1".to_string(), 10);
+        counter2.inc("actor1".to_string(), 10);
+
+        counter1.merge(&counter2);
+        // Merging same operations should not double count
+        assert_eq!(counter1.value(), 10);
     }
 
     #[test]
@@ -610,6 +784,19 @@ mod tests {
 
         assert_eq!(map.get(&key), Some(42));
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_sync_crdt_map() {
+        let map = SyncCRDTMap::new();
+        let key = SKey::new("key1".to_string());
+
+        map.insert(key.clone(), "value1".to_string(), "actor1".to_string());
+        assert_eq!(map.get(&key), Some("value1".to_string()));
+
+        let (version, actor) = map.get_metadata(&key).unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(actor, "actor1");
     }
 
     #[test]
@@ -679,6 +866,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_pn_counter() {
+        let counter = SyncPNCounter::new();
+        assert_eq!(counter.value(), 0);
+
+        counter.inc("actor1".to_string(), 10);
+        assert_eq!(counter.value(), 10);
+
+        let snapshot = counter.snapshot();
+        let counter2 = SyncPNCounter::new();
+        counter2.merge(&snapshot);
+        assert_eq!(counter2.value(), 10);
+    }
+
+    #[test]
     fn test_sync_pn_counter_concurrent_access() {
         let counter = Arc::new(SyncPNCounter::new());
         let mut handles = vec![];
@@ -700,6 +901,27 @@ mod tests {
         // For now, just verify concurrent access doesn't panic
         // TODO: Fix value() method to properly read PNCounter value
         assert!(val >= 0); // At minimum, should not panic
+    }
+
+    #[test]
+    fn test_sync_pn_counter_concurrent() {
+        let counter = Arc::new(SyncPNCounter::new());
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let counter_clone = counter.clone();
+            let handle = thread::spawn(move || {
+                counter_clone.inc(format!("actor{}", i), 1);
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let val = counter.value();
+        assert!(val >= 0);
     }
 
     #[test]
@@ -729,5 +951,12 @@ mod tests {
         // For now, just verify snapshot() doesn't panic
         // TODO: Fix value() method to properly read PNCounter value
         assert!(val >= 0); // At minimum, should not panic
+    }
+
+    #[test]
+    fn test_sync_pn_counter_value() {
+        let counter = SyncPNCounter::new();
+        counter.inc("actor1".to_string(), 10);
+        assert_eq!(counter.value(), 10);
     }
 }

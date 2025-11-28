@@ -19,7 +19,7 @@ use super::{
 /// Mesh sync manager for coordinating state synchronization
 #[derive(Clone, Debug)]
 pub struct MeshSyncManager {
-    stores: Arc<StateStores>,
+    pub(crate) stores: Arc<StateStores>,
     self_name: String,
 }
 
@@ -437,12 +437,22 @@ pub type OptionalMeshSyncManager = Option<Arc<MeshSyncManager>>;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::mesh::stores::StateStores;
+    use crate::mesh::stores::{
+        AppState, MembershipState, RateLimitConfig, StateStores, GLOBAL_RATE_LIMIT_COUNTER_KEY,
+        GLOBAL_RATE_LIMIT_KEY,
+    };
 
     fn create_test_sync_manager() -> MeshSyncManager {
         let stores = Arc::new(StateStores::new());
         MeshSyncManager::new(stores, "test_node".to_string())
+    }
+
+    fn create_test_manager(self_name: String) -> MeshSyncManager {
+        let stores = Arc::new(StateStores::with_self_name(self_name.clone()));
+        MeshSyncManager::new(stores, self_name)
     }
 
     #[test]
@@ -455,24 +465,23 @@ mod tests {
 
     #[test]
     fn test_sync_worker_state() {
-        let manager = create_test_sync_manager();
+        let manager = create_test_manager("node1".to_string());
 
         manager.sync_worker_state(
             "worker1".to_string(),
             "model1".to_string(),
-            "http://worker1:8000".to_string(),
+            "http://localhost:8000".to_string(),
             true,
             0.5,
         );
 
-        let state = manager.get_worker_state("worker1");
-        assert!(state.is_some());
-        let state = state.unwrap();
+        let state = manager.get_worker_state("worker1").unwrap();
         assert_eq!(state.worker_id, "worker1");
         assert_eq!(state.model_id, "model1");
-        assert_eq!(state.url, "http://worker1:8000");
+        assert_eq!(state.url, "http://localhost:8000");
         assert!(state.health);
         assert_eq!(state.load, 0.5);
+        assert_eq!(state.version, 1);
     }
 
     #[test]
@@ -482,7 +491,7 @@ mod tests {
         manager.sync_worker_state(
             "worker1".to_string(),
             "model1".to_string(),
-            "http://worker1:8000".to_string(),
+            "http://localhost:8000".to_string(),
             true,
             0.5,
         );
@@ -490,7 +499,7 @@ mod tests {
         manager.sync_worker_state(
             "worker2".to_string(),
             "model1".to_string(),
-            "http://worker2:8000".to_string(),
+            "http://localhost:8001".to_string(),
             false,
             0.8,
         );
@@ -498,7 +507,7 @@ mod tests {
         manager.sync_worker_state(
             "worker3".to_string(),
             "model2".to_string(),
-            "http://worker3:8000".to_string(),
+            "http://localhost:8002".to_string(),
             true,
             0.3,
         );
@@ -520,13 +529,42 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_worker_state() {
-        let manager = create_test_sync_manager();
+    fn test_sync_worker_state_version_increment() {
+        let manager = create_test_manager("node1".to_string());
 
         manager.sync_worker_state(
             "worker1".to_string(),
             "model1".to_string(),
-            "http://worker1:8000".to_string(),
+            "http://localhost:8000".to_string(),
+            true,
+            0.5,
+        );
+
+        let state1 = manager.get_worker_state("worker1").unwrap();
+        assert_eq!(state1.version, 1);
+
+        manager.sync_worker_state(
+            "worker1".to_string(),
+            "model1".to_string(),
+            "http://localhost:8000".to_string(),
+            false,
+            0.8,
+        );
+
+        let state2 = manager.get_worker_state("worker1").unwrap();
+        assert_eq!(state2.version, 2);
+        assert!(!state2.health);
+        assert_eq!(state2.load, 0.8);
+    }
+
+    #[test]
+    fn test_remove_worker_state() {
+        let manager = create_test_manager("node1".to_string());
+
+        manager.sync_worker_state(
+            "worker1".to_string(),
+            "model1".to_string(),
+            "http://localhost:8000".to_string(),
             true,
             0.5,
         );
@@ -550,21 +588,19 @@ mod tests {
 
     #[test]
     fn test_sync_policy_state() {
-        let manager = create_test_sync_manager();
+        let manager = create_test_manager("node1".to_string());
 
-        let config = b"policy_config_data".to_vec();
         manager.sync_policy_state(
             "model1".to_string(),
-            "round_robin".to_string(),
-            config.clone(),
+            "cache_aware".to_string(),
+            b"config_data".to_vec(),
         );
 
-        let state = manager.get_policy_state("model1");
-        assert!(state.is_some());
-        let state = state.unwrap();
+        let state = manager.get_policy_state("model1").unwrap();
         assert_eq!(state.model_id, "model1");
-        assert_eq!(state.policy_type, "round_robin");
-        assert_eq!(state.config, config);
+        assert_eq!(state.policy_type, "cache_aware");
+        assert_eq!(state.config, b"config_data");
+        assert_eq!(state.version, 1);
     }
 
     #[test]
@@ -630,12 +666,32 @@ mod tests {
 
     #[test]
     fn test_apply_remote_worker_state() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Apply remote state with higher version
+        let remote_state = WorkerState {
+            worker_id: "worker1".to_string(),
+            model_id: "model1".to_string(),
+            url: "http://localhost:8000".to_string(),
+            health: true,
+            load: 0.5,
+            version: 5,
+        };
+
+        manager.apply_remote_worker_state(remote_state.clone(), Some("node2".to_string()));
+
+        let state = manager.get_worker_state("worker1").unwrap();
+        assert_eq!(state.version, 5);
+    }
+
+    #[test]
+    fn test_apply_remote_worker_state_basic() {
         let manager = create_test_sync_manager();
 
         let remote_state = WorkerState {
             worker_id: "remote_worker1".to_string(),
             model_id: "model1".to_string(),
-            url: "http://remote:8000".to_string(),
+            url: "http://localhost:8000".to_string(),
             health: true,
             load: 0.6,
             version: 1,
@@ -648,9 +704,40 @@ mod tests {
         let state = state.unwrap();
         assert_eq!(state.worker_id, "remote_worker1");
         assert_eq!(state.model_id, "model1");
-        assert_eq!(state.url, "http://remote:8000");
+        assert_eq!(state.url, "http://localhost:8000");
         assert!(state.health);
         assert_eq!(state.load, 0.6);
+    }
+
+    #[test]
+    fn test_apply_remote_worker_state_version_check() {
+        let manager = create_test_manager("node1".to_string());
+
+        // First insert local state
+        manager.sync_worker_state(
+            "worker1".to_string(),
+            "model1".to_string(),
+            "http://localhost:8000".to_string(),
+            true,
+            0.5,
+        );
+
+        // Try to apply older version - should be skipped
+        let old_state = WorkerState {
+            worker_id: "worker1".to_string(),
+            model_id: "model1".to_string(),
+            url: "http://localhost:8000".to_string(),
+            health: false,
+            load: 0.8,
+            version: 0, // Older version
+        };
+
+        manager.apply_remote_worker_state(old_state, Some("node2".to_string()));
+
+        // Should still have version 1
+        let state = manager.get_worker_state("worker1").unwrap();
+        assert_eq!(state.version, 1);
+        assert!(state.health); // Not updated
     }
 
     #[test]
@@ -682,7 +769,7 @@ mod tests {
         manager.sync_worker_state(
             "local_worker".to_string(),
             "model1".to_string(),
-            "http://local:8000".to_string(),
+            "http://localhost:8000".to_string(),
             true,
             0.5,
         );
@@ -691,7 +778,7 @@ mod tests {
         let remote_state = WorkerState {
             worker_id: "remote_worker".to_string(),
             model_id: "model1".to_string(),
-            url: "http://remote:8000".to_string(),
+            url: "http://localhost:8001".to_string(),
             health: true,
             load: 0.7,
             version: 1,
@@ -713,7 +800,7 @@ mod tests {
         manager.sync_worker_state(
             "worker1".to_string(),
             "model1".to_string(),
-            "http://worker1:8000".to_string(),
+            "http://localhost:8000".to_string(),
             true,
             0.5,
         );
@@ -722,7 +809,7 @@ mod tests {
         manager.sync_worker_state(
             "worker1".to_string(),
             "model1".to_string(),
-            "http://worker1:8000".to_string(),
+            "http://localhost:8000".to_string(),
             false,
             0.9,
         );
@@ -769,5 +856,322 @@ mod tests {
         let manager = create_test_sync_manager();
         let states = manager.get_all_policy_states();
         assert!(states.is_empty());
+    }
+
+    #[test]
+    fn test_update_rate_limit_membership() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Add membership nodes
+        let key1 = SKey::new("node1".to_string());
+        manager.stores.membership.insert(
+            key1,
+            MembershipState {
+                name: "node1".to_string(),
+                address: "127.0.0.1:8000".to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 1,
+                metadata: BTreeMap::new(),
+            },
+            "node1".to_string(),
+        );
+
+        let key2 = SKey::new("node2".to_string());
+        manager.stores.membership.insert(
+            key2,
+            MembershipState {
+                name: "node2".to_string(),
+                address: "127.0.0.1:8001".to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 1,
+                metadata: BTreeMap::new(),
+            },
+            "node1".to_string(),
+        );
+
+        manager.update_rate_limit_membership();
+
+        // Check that hash ring was updated
+        let owners = manager.stores.rate_limit.get_owners("test_key");
+        assert!(!owners.is_empty());
+    }
+
+    #[test]
+    fn test_handle_node_failure() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Setup membership
+        let key1 = SKey::new("node1".to_string());
+        manager.stores.membership.insert(
+            key1,
+            MembershipState {
+                name: "node1".to_string(),
+                address: "127.0.0.1:8000".to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 1,
+                metadata: BTreeMap::new(),
+            },
+            "node1".to_string(),
+        );
+
+        let key2 = SKey::new("node2".to_string());
+        manager.stores.membership.insert(
+            key2,
+            MembershipState {
+                name: "node2".to_string(),
+                address: "127.0.0.1:8001".to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 1,
+                metadata: BTreeMap::new(),
+            },
+            "node1".to_string(),
+        );
+
+        manager.update_rate_limit_membership();
+
+        // Handle node failure
+        manager.handle_node_failure(&["node2".to_string()]);
+
+        // Membership should be updated
+        manager.update_rate_limit_membership();
+    }
+
+    #[test]
+    fn test_sync_rate_limit_inc() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Setup membership to make node1 an owner
+        manager
+            .stores
+            .rate_limit
+            .update_membership(&["node1".to_string()]);
+
+        let test_key = "test_key".to_string();
+        if manager.stores.rate_limit.is_owner(&test_key) {
+            manager.sync_rate_limit_inc(test_key.clone(), 5);
+
+            let value = manager.get_rate_limit_value(&test_key);
+            assert_eq!(value, Some(5));
+        }
+    }
+
+    #[test]
+    fn test_sync_rate_limit_inc_non_owner() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Setup membership without node1
+        manager
+            .stores
+            .rate_limit
+            .update_membership(&["node2".to_string(), "node3".to_string()]);
+
+        let test_key = "test_key".to_string();
+        if !manager.stores.rate_limit.is_owner(&test_key) {
+            manager.sync_rate_limit_inc(test_key.clone(), 5);
+
+            // Should not increment if not owner
+            let value = manager.get_rate_limit_value(&test_key);
+            assert_eq!(value, None);
+        }
+    }
+
+    #[test]
+    fn test_get_global_rate_limit_config() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Initially should be None
+        assert!(manager.get_global_rate_limit_config().is_none());
+
+        // Set config
+        let key = SKey::new(GLOBAL_RATE_LIMIT_KEY.to_string());
+        let config = RateLimitConfig {
+            limit_per_second: 100,
+        };
+        let serialized = serde_json::to_vec(&config).unwrap();
+        manager.stores.app.insert(
+            key,
+            AppState {
+                key: GLOBAL_RATE_LIMIT_KEY.to_string(),
+                value: serialized,
+                version: 1,
+            },
+            "node1".to_string(),
+        );
+
+        let retrieved = manager.get_global_rate_limit_config().unwrap();
+        assert_eq!(retrieved.limit_per_second, 100);
+    }
+
+    #[test]
+    fn test_check_global_rate_limit() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Setup config
+        let key = SKey::new(GLOBAL_RATE_LIMIT_KEY.to_string());
+        let config = RateLimitConfig {
+            limit_per_second: 10,
+        };
+        let serialized = serde_json::to_vec(&config).unwrap();
+        manager.stores.app.insert(
+            key,
+            AppState {
+                key: GLOBAL_RATE_LIMIT_KEY.to_string(),
+                value: serialized,
+                version: 1,
+            },
+            "node1".to_string(),
+        );
+
+        // Setup membership
+        manager
+            .stores
+            .rate_limit
+            .update_membership(&["node1".to_string()]);
+
+        // Check rate limit
+        let (is_exceeded, _current_count, limit) = manager.check_global_rate_limit();
+        assert!(!is_exceeded); // First check should not exceed
+        assert_eq!(limit, 10);
+
+        // Increment multiple times
+        for _ in 0..15 {
+            manager.check_global_rate_limit();
+        }
+
+        let (is_exceeded2, current_count2, _) = manager.check_global_rate_limit();
+        // Should exceed after many increments
+        assert!(is_exceeded2 || current_count2 > 10);
+    }
+
+    #[test]
+    fn test_reset_global_rate_limit_counter() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Setup membership
+        manager
+            .stores
+            .rate_limit
+            .update_membership(&["node1".to_string()]);
+
+        // Increment counter
+        if manager
+            .stores
+            .rate_limit
+            .is_owner(GLOBAL_RATE_LIMIT_COUNTER_KEY)
+        {
+            manager.sync_rate_limit_inc(GLOBAL_RATE_LIMIT_COUNTER_KEY.to_string(), 10);
+            let value = manager.get_rate_limit_value(GLOBAL_RATE_LIMIT_COUNTER_KEY);
+            assert!(value.is_some() && value.unwrap() > 0);
+
+            // Reset
+            manager.reset_global_rate_limit_counter();
+            let value_after = manager.get_rate_limit_value(GLOBAL_RATE_LIMIT_COUNTER_KEY);
+            // Should be reset (0 or negative)
+            assert!(value_after.is_none() || value_after.unwrap() <= 0);
+        }
+    }
+
+    #[test]
+    fn test_sync_tree_operation() {
+        let manager = create_test_manager("node1".to_string());
+
+        use crate::mesh::tree_ops::{TreeInsertOp, TreeOperation};
+
+        let op = TreeOperation::Insert(TreeInsertOp {
+            text: "test_text".to_string(),
+            tenant: "http://localhost:8000".to_string(),
+        });
+
+        let result = manager.sync_tree_operation("model1".to_string(), op);
+        assert!(result.is_ok());
+
+        // Verify tree state was stored
+        let tree_state = manager.get_tree_state("model1");
+        assert!(tree_state.is_some());
+        let tree = tree_state.unwrap();
+        assert_eq!(tree.model_id, "model1");
+        assert_eq!(tree.operations.len(), 1);
+    }
+
+    #[test]
+    fn test_get_tree_state() {
+        let manager = create_test_manager("node1".to_string());
+
+        // Initially should be None
+        assert!(manager.get_tree_state("model1").is_none());
+
+        // Sync an operation
+        use crate::mesh::tree_ops::{TreeInsertOp, TreeOperation};
+        let op = TreeOperation::Insert(TreeInsertOp {
+            text: "test_text".to_string(),
+            tenant: "http://localhost:8000".to_string(),
+        });
+        manager
+            .sync_tree_operation("model1".to_string(), op)
+            .unwrap();
+
+        let tree_state = manager.get_tree_state("model1");
+        assert!(tree_state.is_some());
+    }
+
+    #[test]
+    fn test_apply_remote_tree_operation() {
+        let manager = create_test_manager("node1".to_string());
+
+        use crate::mesh::tree_ops::{TreeInsertOp, TreeOperation, TreeState};
+
+        let mut tree_state = TreeState::new("model1".to_string());
+        tree_state.version = 5;
+        tree_state.add_operation(TreeOperation::Insert(TreeInsertOp {
+            text: "remote_text".to_string(),
+            tenant: "http://localhost:8001".to_string(),
+        }));
+        // add_operation increments version, so version is now 6
+
+        manager.apply_remote_tree_operation(
+            "model1".to_string(),
+            tree_state,
+            Some("node2".to_string()),
+        );
+
+        let retrieved = manager.get_tree_state("model1").unwrap();
+        assert_eq!(retrieved.version, 6); // add_operation increments version from 5 to 6
+        assert_eq!(retrieved.operations.len(), 1);
+    }
+
+    #[test]
+    fn test_get_all_worker_states() {
+        let manager = create_test_manager("node1".to_string());
+
+        manager.sync_worker_state(
+            "worker1".to_string(),
+            "model1".to_string(),
+            "http://localhost:8000".to_string(),
+            true,
+            0.5,
+        );
+
+        manager.sync_worker_state(
+            "worker2".to_string(),
+            "model2".to_string(),
+            "http://localhost:8001".to_string(),
+            false,
+            0.8,
+        );
+
+        let all_states = manager.get_all_worker_states();
+        assert_eq!(all_states.len(), 2);
+    }
+
+    #[test]
+    fn test_get_all_policy_states() {
+        let manager = create_test_manager("node1".to_string());
+
+        manager.sync_policy_state("model1".to_string(), "cache_aware".to_string(), vec![]);
+
+        manager.sync_policy_state("model2".to_string(), "round_robin".to_string(), vec![]);
+
+        let all_states = manager.get_all_policy_states();
+        assert_eq!(all_states.len(), 2);
     }
 }

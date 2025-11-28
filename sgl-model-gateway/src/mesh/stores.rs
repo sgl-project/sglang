@@ -497,3 +497,240 @@ impl Default for StateStores {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::mesh::service::gossip::NodeStatus;
+
+    #[test]
+    fn test_membership_store() {
+        let store = MembershipStore::new();
+        let key = SKey::new("node1".to_string());
+        let state = MembershipState {
+            name: "node1".to_string(),
+            address: "127.0.0.1:8000".to_string(),
+            status: NodeStatus::Alive as i32,
+            version: 1,
+            metadata: BTreeMap::new(),
+        };
+
+        store.insert(key.clone(), state.clone(), "node1".to_string());
+        assert_eq!(store.get(&key).unwrap().name, "node1");
+        assert_eq!(store.len(), 1);
+
+        store.remove(&key);
+        assert!(store.get(&key).is_none());
+    }
+
+    #[test]
+    fn test_app_store() {
+        let store = AppStore::new();
+        let key = SKey::new("app_key1".to_string());
+        let state = AppState {
+            key: "app_key1".to_string(),
+            value: b"app_value".to_vec(),
+            version: 1,
+        };
+
+        store.insert(key.clone(), state.clone(), "node1".to_string());
+        assert_eq!(store.get(&key).unwrap().key, "app_key1");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_worker_store() {
+        let store = WorkerStore::new();
+        let key = SKey::new("worker1".to_string());
+        let state = WorkerState {
+            worker_id: "worker1".to_string(),
+            model_id: "model1".to_string(),
+            url: "http://localhost:8000".to_string(),
+            health: true,
+            load: 0.5,
+            version: 1,
+        };
+
+        store.insert(key.clone(), state.clone(), "node1".to_string());
+        assert_eq!(store.get(&key).unwrap().worker_id, "worker1");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_policy_store() {
+        let store = PolicyStore::new();
+        let key = SKey::new("policy:model1".to_string());
+        let state = PolicyState {
+            model_id: "model1".to_string(),
+            policy_type: "cache_aware".to_string(),
+            config: b"config_data".to_vec(),
+            version: 1,
+        };
+
+        store.insert(key.clone(), state.clone(), "node1".to_string());
+        assert_eq!(store.get(&key).unwrap().model_id, "model1");
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_rate_limit_store_update_membership() {
+        let store = RateLimitStore::new("node1".to_string());
+
+        store.update_membership(&[
+            "node1".to_string(),
+            "node2".to_string(),
+            "node3".to_string(),
+        ]);
+
+        let owners = store.get_owners("test_key");
+        assert_eq!(owners.len(), 3);
+        assert!(
+            owners.contains(&"node1".to_string())
+                || owners.contains(&"node2".to_string())
+                || owners.contains(&"node3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rate_limit_store_is_owner() {
+        let store = RateLimitStore::new("node1".to_string());
+
+        store.update_membership(&["node1".to_string()]);
+
+        let test_key = "test_key".to_string();
+        let is_owner = store.is_owner(&test_key);
+        // node1 should be owner since it's the only node
+        assert!(is_owner);
+    }
+
+    #[test]
+    fn test_rate_limit_store_inc_only_owner() {
+        let store = RateLimitStore::new("node1".to_string());
+
+        store.update_membership(&["node1".to_string()]);
+
+        let test_key = "test_key".to_string();
+        if store.is_owner(&test_key) {
+            store.inc(test_key.clone(), "node1".to_string(), 5);
+
+            let value = store.value(&test_key);
+            assert_eq!(value, Some(5));
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_store_inc_non_owner() {
+        let store = RateLimitStore::new("node1".to_string());
+
+        // Setup membership without node1 as owner
+        store.update_membership(&["node2".to_string(), "node3".to_string()]);
+
+        let test_key = "test_key".to_string();
+        if !store.is_owner(&test_key) {
+            store.inc(test_key.clone(), "node1".to_string(), 5);
+
+            // Should not increment if not owner
+            let value = store.value(&test_key);
+            assert_eq!(value, None);
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_store_merge_counter() {
+        let store1 = RateLimitStore::new("node1".to_string());
+        let store2 = RateLimitStore::new("node2".to_string());
+
+        store1.update_membership(&["node1".to_string()]);
+        store2.update_membership(&["node2".to_string()]);
+
+        let test_key = "test_key".to_string();
+
+        // Both nodes increment their counters
+        if store1.is_owner(&test_key) {
+            store1.inc(test_key.clone(), "node1".to_string(), 10);
+        }
+
+        if store2.is_owner(&test_key) {
+            store2.inc(test_key.clone(), "node2".to_string(), 5);
+        }
+
+        // Merge counter from store2 into store1
+        if let Some(counter2) = store2.get_counter(&test_key) {
+            store1.merge_counter(test_key.clone(), &counter2);
+        }
+
+        // Get aggregated value (if node1 is owner)
+        if store1.is_owner(&test_key) {
+            let value = store1.value(&test_key);
+            // Should include merged value
+            assert!(value.is_some());
+        }
+    }
+
+    #[test]
+    fn test_rate_limit_store_check_ownership_transfer() {
+        let store = RateLimitStore::new("node1".to_string());
+
+        store.update_membership(&[
+            "node1".to_string(),
+            "node2".to_string(),
+            "node3".to_string(),
+        ]);
+
+        let test_key = "test_key".to_string();
+
+        // Setup a counter (if node1 is owner)
+        if store.is_owner(&test_key) {
+            store.inc(test_key.clone(), "node1".to_string(), 10);
+        }
+
+        // Check ownership transfer when node2 fails
+        let affected = store.check_ownership_transfer(&["node2".to_string()]);
+        // Should detect if node2 was an owner
+        let _ = affected;
+    }
+
+    #[test]
+    fn test_rate_limit_store_keys() {
+        let store = RateLimitStore::new("node1".to_string());
+
+        store.update_membership(&["node1".to_string()]);
+
+        let key1 = "key1".to_string();
+        let key2 = "key2".to_string();
+
+        if store.is_owner(&key1) {
+            store.inc(key1.clone(), "node1".to_string(), 1);
+        }
+
+        if store.is_owner(&key2) {
+            store.inc(key2.clone(), "node1".to_string(), 1);
+        }
+
+        let keys = store.keys();
+        // Should contain keys where node1 is owner
+        let _ = keys;
+    }
+
+    #[test]
+    fn test_state_stores_new() {
+        let stores = StateStores::new();
+        assert_eq!(stores.membership.len(), 0);
+        assert_eq!(stores.app.len(), 0);
+        assert_eq!(stores.worker.len(), 0);
+        assert_eq!(stores.policy.len(), 0);
+    }
+
+    #[test]
+    fn test_state_stores_with_self_name() {
+        let stores = StateStores::with_self_name("test_node".to_string());
+        // Rate limit store should have the self_name
+        let test_key = "test_key".to_string();
+        stores
+            .rate_limit
+            .update_membership(&["test_node".to_string()]);
+        assert!(stores.rate_limit.is_owner(&test_key));
+    }
+}

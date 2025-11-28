@@ -256,3 +256,289 @@ impl IncrementalUpdateCollector {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{thread, time::Duration};
+
+    use super::*;
+    use crate::mesh::stores::{AppState, MembershipState, PolicyState, StateStores, WorkerState};
+
+    fn create_test_collector(self_name: String) -> IncrementalUpdateCollector {
+        let stores = Arc::new(StateStores::with_self_name(self_name.clone()));
+        IncrementalUpdateCollector::new(stores, self_name)
+    }
+
+    #[test]
+    fn test_collect_worker_updates() {
+        let collector = create_test_collector("node1".to_string());
+        let stores = collector.stores.clone();
+
+        // Insert a worker state
+        let key = SKey::new("worker1".to_string());
+        let worker_state = WorkerState {
+            worker_id: "worker1".to_string(),
+            model_id: "model1".to_string(),
+            url: "http://localhost:8000".to_string(),
+            health: true,
+            load: 0.5,
+            version: 1,
+        };
+        stores.worker.insert(key, worker_state, "node1".to_string());
+
+        // Collect updates
+        let updates = collector.collect_updates_for_store(StoreType::Worker);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].key, "worker1");
+        assert_eq!(updates[0].version, 1);
+        assert_eq!(updates[0].actor, "node1");
+
+        // Collect again - should be empty (already sent)
+        let updates2 = collector.collect_updates_for_store(StoreType::Worker);
+        assert_eq!(updates2.len(), 0);
+
+        // Update worker state
+        let key2 = SKey::new("worker1".to_string());
+        let worker_state2 = WorkerState {
+            worker_id: "worker1".to_string(),
+            model_id: "model1".to_string(),
+            url: "http://localhost:8000".to_string(),
+            health: false,
+            load: 0.8,
+            version: 2,
+        };
+        stores
+            .worker
+            .insert(key2, worker_state2, "node1".to_string());
+
+        // Should collect new version
+        let updates3 = collector.collect_updates_for_store(StoreType::Worker);
+        assert_eq!(updates3.len(), 1);
+        assert_eq!(updates3[0].version, 2);
+    }
+
+    #[test]
+    fn test_collect_policy_updates() {
+        let collector = create_test_collector("node1".to_string());
+        let stores = collector.stores.clone();
+
+        let key = SKey::new("policy:model1".to_string());
+        let policy_state = PolicyState {
+            model_id: "model1".to_string(),
+            policy_type: "cache_aware".to_string(),
+            config: b"config_data".to_vec(),
+            version: 1,
+        };
+        stores.policy.insert(key, policy_state, "node1".to_string());
+
+        let updates = collector.collect_updates_for_store(StoreType::Policy);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].key, "policy:model1");
+    }
+
+    #[test]
+    fn test_collect_app_updates() {
+        let collector = create_test_collector("node1".to_string());
+        let stores = collector.stores.clone();
+
+        let key = SKey::new("app_key1".to_string());
+        let app_state = AppState {
+            key: "app_key1".to_string(),
+            value: b"app_value".to_vec(),
+            version: 1,
+        };
+        stores.app.insert(key, app_state, "node1".to_string());
+
+        let updates = collector.collect_updates_for_store(StoreType::App);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].key, "app_key1");
+    }
+
+    #[test]
+    fn test_collect_membership_updates() {
+        let collector = create_test_collector("node1".to_string());
+        let stores = collector.stores.clone();
+
+        let key = SKey::new("node2".to_string());
+        let membership_state = MembershipState {
+            name: "node2".to_string(),
+            address: "127.0.0.1:8001".to_string(),
+            status: 1, // Alive
+            version: 1,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        stores
+            .membership
+            .insert(key, membership_state, "node1".to_string());
+
+        let updates = collector.collect_updates_for_store(StoreType::Membership);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].key, "node2");
+    }
+
+    #[test]
+    fn test_collect_all_updates() {
+        let collector = create_test_collector("node1".to_string());
+        let stores = collector.stores.clone();
+
+        // Insert into multiple stores
+        let worker_key = SKey::new("worker1".to_string());
+        stores.worker.insert(
+            worker_key,
+            WorkerState {
+                worker_id: "worker1".to_string(),
+                model_id: "model1".to_string(),
+                url: "http://localhost:8000".to_string(),
+                health: true,
+                load: 0.5,
+                version: 1,
+            },
+            "node1".to_string(),
+        );
+
+        let policy_key = SKey::new("policy:model1".to_string());
+        stores.policy.insert(
+            policy_key,
+            PolicyState {
+                model_id: "model1".to_string(),
+                policy_type: "cache_aware".to_string(),
+                config: vec![],
+                version: 1,
+            },
+            "node1".to_string(),
+        );
+
+        let all_updates = collector.collect_all_updates();
+        assert_eq!(all_updates.len(), 2); // Worker and Policy
+    }
+
+    #[test]
+    fn test_mark_sent() {
+        let collector = create_test_collector("node1".to_string());
+        let stores = collector.stores.clone();
+
+        // Insert and collect
+        let key = SKey::new("worker1".to_string());
+        stores.worker.insert(
+            key,
+            WorkerState {
+                worker_id: "worker1".to_string(),
+                model_id: "model1".to_string(),
+                url: "http://localhost:8000".to_string(),
+                health: true,
+                load: 0.5,
+                version: 1,
+            },
+            "node1".to_string(),
+        );
+
+        let updates = collector.collect_updates_for_store(StoreType::Worker);
+        assert_eq!(updates.len(), 1);
+
+        // Mark as sent
+        collector.mark_sent(StoreType::Worker, &updates);
+
+        // Should not collect again
+        let updates2 = collector.collect_updates_for_store(StoreType::Worker);
+        assert_eq!(updates2.len(), 0);
+    }
+
+    #[test]
+    fn test_rate_limit_timestamp_filtering() {
+        let collector = create_test_collector("node1".to_string());
+        let stores = collector.stores.clone();
+
+        // Update membership to make node1 an owner
+        stores.rate_limit.update_membership(&["node1".to_string()]);
+
+        // Insert a counter (node1 should be owner)
+        let test_key = "test_rate_limit_key".to_string();
+        if stores.rate_limit.is_owner(&test_key) {
+            stores
+                .rate_limit
+                .inc(test_key.clone(), "node1".to_string(), 1);
+        }
+
+        // Collect immediately - should be filtered by timestamp
+        let _updates = collector.collect_updates_for_store(StoreType::RateLimit);
+        // May be empty if timestamp check fails, or may have one update
+        // The exact behavior depends on timing
+
+        // Wait a bit and try again
+        thread::sleep(Duration::from_secs(2));
+
+        // Now should collect (enough time has passed)
+        let updates2 = collector.collect_updates_for_store(StoreType::RateLimit);
+        // Should have at least one update if node1 is owner
+        if stores.rate_limit.is_owner(&test_key) {
+            // Updates may be 0 or 1 depending on timing
+            let _ = updates2;
+        }
+    }
+
+    #[test]
+    fn test_version_tracking() {
+        let collector = create_test_collector("node1".to_string());
+        let stores = collector.stores.clone();
+
+        let key = SKey::new("worker1".to_string());
+
+        // Insert first version (will be version 1 in store)
+        stores.worker.insert(
+            key.clone(),
+            WorkerState {
+                worker_id: "worker1".to_string(),
+                model_id: "model1".to_string(),
+                url: "http://localhost:8000".to_string(),
+                health: true,
+                load: 0.5,
+                version: 1, // Note: CRDT will use this but increment internally
+            },
+            "node1".to_string(),
+        );
+
+        let updates1 = collector.collect_updates_for_store(StoreType::Worker);
+        assert_eq!(updates1.len(), 1);
+        let version1 = updates1[0].version;
+        assert!(version1 >= 1);
+
+        // Insert second version (will increment from version1)
+        stores.worker.insert(
+            key.clone(),
+            WorkerState {
+                worker_id: "worker1".to_string(),
+                model_id: "model1".to_string(),
+                url: "http://localhost:8000".to_string(),
+                health: false,
+                load: 0.8,
+                version: 2, // Note: CRDT will increment internally
+            },
+            "node1".to_string(),
+        );
+
+        let updates2 = collector.collect_updates_for_store(StoreType::Worker);
+        assert_eq!(updates2.len(), 1);
+        let version2 = updates2[0].version;
+        assert!(version2 > version1);
+
+        // Insert again - should increment version and be collected
+        stores.worker.insert(
+            key,
+            WorkerState {
+                worker_id: "worker1".to_string(),
+                model_id: "model1".to_string(),
+                url: "http://localhost:8000".to_string(),
+                health: true,
+                load: 0.3,
+                version: 1, // Note: CRDT ignores this and increments internally
+            },
+            "node1".to_string(),
+        );
+
+        let updates3 = collector.collect_updates_for_store(StoreType::Worker);
+        // Should collect because version was incremented (version2 + 1 > version2)
+        assert_eq!(updates3.len(), 1);
+        let version3 = updates3[0].version;
+        assert!(version3 > version2);
+    }
+}

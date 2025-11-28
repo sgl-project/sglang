@@ -16,6 +16,9 @@ pub mod sync;
 pub mod topology;
 pub mod tree_ops;
 
+#[cfg(test)]
+mod test_utils;
+
 pub use crdt::{CRDTMap, CRDTPNCounter, SKey, SyncCRDTMap, SyncPNCounter};
 pub use endpoints::{
     get_app_config, get_cluster_status, get_mesh_health, get_policy_state, get_policy_states,
