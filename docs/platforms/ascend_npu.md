@@ -3,37 +3,6 @@
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
-## System Settings
-
-### CPU performance power scheme
-
-The default power scheme on Ascend hardware is `ondemand` which could affect performance, changing it to `performance` is recommended.
-
-```shell
-echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# Make sure changes are applied successfully
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
-```
-
-### Disable NUMA balancing
-
-```shell
-sudo sysctl -w kernel.numa_balancing=0
-
-# Check
-cat /proc/sys/kernel/numa_balancing # shows 0
-```
-
-### Prevent swapping out system memory
-
-```shell
-sudo sysctl -w vm.swappiness=10
-
-# Check
-cat /proc/sys/vm/swappiness # shows 10
-```
-
 ## Installing SGLang
 
 ### Method 1: Installing from source with prerequisites
@@ -53,22 +22,16 @@ Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kern
 
 #### MemFabric Adaptor
 
-_TODO: MemFabric is still a working project yet open sourced. We will release it as prebuilt wheel package for now._
-
 If you want to use PD disaggregation mode, you need to install MemFabric Adaptor. MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
-PLATFORM can be "aarch64" or "x86_64"
 
 ```shell
-PLATFORM="aarch64"
-MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_${PLATFORM}.whl"
-MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
-wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
+pip install mf-adapter==1.0.0
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
 At the moment NPUGraph optimizations are supported only in `torch_npu==2.6.0.post3` that requires 'torch==2.6.0'.
-_TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0
+_TODO: NPUGraph optimizations will be supported in future releases of 'torch_npu' 2.7.1, 2.8.0 and 2.9.0_
 
 ```shell
 PYTORCH_VERSION=2.6.0
@@ -77,11 +40,23 @@ TORCH_NPU_VERSION=2.6.0.post3
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 pip install torch_npu==$TORCH_NPU_VERSION
 ```
-If you are using later versions of 'torch' install 'torch_npu' from sources, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
 
-#### vLLM
+While there is no resleased versions of 'torch_npu' for 'torch==2.7.1' and 'torch==2.8.0' we provide custom builds of 'torch_npu'. PLATFORM can be 'aarch64' or 'x86_64'
 
-vLLM is still a prerequisite for SGLang. Due to limitations on 'torch' version it is recommended to use vLLM v0.8.5. If you are using later version of 'torch' you can use latest vLLM version.
+```shell
+PLATFORM="aarch64"
+PYTORCH_VERSION=2.8.0
+TORCHVISION_VERSION=0.23.0
+pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
+wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux_2_28_${PLATFORM}.whl
+pip install torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux_2_28_${PLATFORM}.whl
+```
+
+If you are using other versions of 'torch' install 'torch_npu' from sources, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
+
+#### vLLM (optional)
+
+vLLM is an optional prerequisite for some SGLang supported models. Due to limitations on 'torch==2.6.0' version it is recommended to use vLLM v0.8.5. If you are using later version of 'torch' you can use later vLLM version.
 
 ```shell
 VLLM_TAG=v0.8.5
@@ -110,7 +85,7 @@ We prowide our own set of SGL kernels, check [installation guide](https://github
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
 
 #### CustomOps
-_TODO: to be removed once merged into sgl-kernel-npu
+_TODO: to be removed once merged into sgl-kernel-npu._
 Additional package with custom operations. DEVICE_TYPE can be "a3" for Atlas A3 server or "910b" for Atlas A2 server.
 
 ```shell
@@ -161,3 +136,35 @@ drun --env "HF_TOKEN=<secret>" \
     <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend --host 0.0.0.0 --port 30000
 ```
+
+## System Settings
+
+### CPU performance power scheme
+
+The default power scheme on Ascend hardware is `ondemand` which could affect performance, changing it to `performance` is recommended.
+
+```shell
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# Make sure changes are applied successfully
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor # shows performance
+```
+
+### Disable NUMA balancing
+
+```shell
+sudo sysctl -w kernel.numa_balancing=0
+
+# Check
+cat /proc/sys/kernel/numa_balancing # shows 0
+```
+
+### Prevent swapping out system memory
+
+```shell
+sudo sysctl -w vm.swappiness=10
+
+# Check
+cat /proc/sys/vm/swappiness # shows 10
+```
+
