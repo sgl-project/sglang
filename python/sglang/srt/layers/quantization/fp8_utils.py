@@ -1,5 +1,7 @@
 from typing import Callable, List, Optional, Tuple
 
+import os
+
 import torch
 
 from sglang.srt.environ import envs
