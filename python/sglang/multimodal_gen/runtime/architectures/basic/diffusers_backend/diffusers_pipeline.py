@@ -207,6 +207,7 @@ class DiffusersPipeline(ComposedPipelineBase):
 
     def _load_diffusers_pipeline(self, model_path: str, server_args: ServerArgs) -> Any:
         from diffusers import DiffusionPipeline
+        original_model_path = model_path  # Keep original for custom_pipeline
         model_path = maybe_download_model(model_path)
         self.model_path = model_path
         dtype = self._get_dtype(server_args)
@@ -219,7 +220,7 @@ class DiffusersPipeline(ComposedPipelineBase):
                 logger.info("Pipeline class not found in diffusers, trying custom_pipeline from repo...")
                 try:
                     pipe = DiffusionPipeline.from_pretrained(
-                        model_path, torch_dtype=dtype, custom_pipeline=model_path,
+                        model_path, torch_dtype=dtype, custom_pipeline=original_model_path,
                         trust_remote_code=True, revision=server_args.revision
                     )
                 except Exception as e2:

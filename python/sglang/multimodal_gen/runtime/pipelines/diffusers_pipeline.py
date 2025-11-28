@@ -319,6 +319,7 @@ class DiffusersPipeline(ComposedPipelineBase):
     ) -> Any:
         """Load the diffusers pipeline."""
 
+        original_model_path = model_path  # Keep original for custom_pipeline
         model_path = maybe_download_model(model_path)
         self.model_path = model_path
 
@@ -340,7 +341,7 @@ class DiffusersPipeline(ComposedPipelineBase):
                     pipe = DiffusionPipeline.from_pretrained(
                         model_path,
                         torch_dtype=dtype,
-                        custom_pipeline=model_path,
+                        custom_pipeline=original_model_path,
                         trust_remote_code=True,
                         revision=server_args.revision,
                     )
