@@ -249,9 +249,6 @@ class ImageVAEEncodingStage(PipelineStage):
         image = batch.condition_image
         image = self.preprocess(
             image,
-            vae_scale_factor=self.vae.spatial_compression_ratio,
-            height=height,
-            width=width,
         ).to(get_local_torch_device(), dtype=torch.float32)
 
         # (B, C, H, W) -> (B, C, 1, H, W)
@@ -280,8 +277,8 @@ class ImageVAEEncodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+                                   vae_dtype != torch.float32
+                               ) and not server_args.disable_autocast
 
         # Encode Image
         with torch.autocast(
@@ -449,19 +446,9 @@ class ImageVAEEncodingStage(PipelineStage):
     def preprocess(
         self,
         image: torch.Tensor | PIL.Image.Image,
-        vae_scale_factor: int,
-        height: int | None = None,
-        width: int | None = None,
-        resize_mode: str = "default",  # "default", "fill", "crop"
     ) -> torch.Tensor:
 
         if isinstance(image, PIL.Image.Image):
-            # width, height = (
-            #     self.server_args.pipeline_config.vae_config.calculate_dimensions(
-            #         image, vae_scale_factor, width, height
-            #     )
-            # )
-            # image = resize(image, height, width, resize_mode=resize_mode)
             image = pil_to_numpy(image)  # to np
             image = numpy_to_pt(image)  # to pt
 

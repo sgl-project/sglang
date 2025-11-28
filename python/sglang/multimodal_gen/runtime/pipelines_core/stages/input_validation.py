@@ -119,7 +119,7 @@ class InputValidationStage(PipelineStage):
             condition_image_width, condition_image_height = image.width, image.height
             batch.original_condition_image_size = image.size
 
-        # NOTE: resizing needs to be bring in advance
+        # NOTE: condition image resizing is only allowed to do in InputValidationStage
         if server_args.pipeline_config.task_type == ModelTaskType.I2I:
             if batch.condition_image is not None:
                 # calculate new condition image size
