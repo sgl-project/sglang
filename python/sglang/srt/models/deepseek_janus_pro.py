@@ -247,17 +247,18 @@ def resample_patch_embed(
     Returns:
         Resized patch embedding kernel.
     """
-    if any(x <= 0 for x in new_size):
-        raise ValueError(f"new_size elements must be positive integers, got {new_size}")
-    if any(isinstance(x, float) for x in new_size):
-        new_size = [int(x) for x in new_size]
-
     import numpy as np
 
     try:
-        from torch import vmap
-    except ImportError:
-        from torch.func import vmap
+        new_size_int = [int(x) for x in new_size]
+
+        if not all(x > 0 for x in new_size_int):
+            raise ValueError
+
+        new_size = new_size_int
+
+    except (TypeError, ValueError):
+        raise ValueError(f"new_size elements must be positive integers, got {new_size}")
 
     assert len(patch_embed.shape) == 4, "Four dimensions expected"
     assert len(new_size) == 2, "New shape should only be hw"
