@@ -23,5 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:info=Protobuf compilation completed successfully");
 
+    // Only regenerate if proto files change
+    println!("cargo:rerun-if-changed=src/mesh/proto/gossip.proto");
+
+    tonic_prost_build::configure()
+        // Generate both client and server code
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(&["src/mesh/proto/gossip.proto"], &["src/mesh/proto"])?;
+
+    println!("cargo:info=Protobuf compilation completed successfully");
+
     Ok(())
 }
