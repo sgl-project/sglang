@@ -120,6 +120,7 @@ http-body-util = "0.1"
 portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
+wasm-encoder = "0.242"
 
 [[bench]]
 name = "request_processing"

@@ -148,36 +148,33 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
 }
 
 /// Create a test WASM component file
-/// Uses the pre-built component from examples if available, otherwise creates a minimal valid component
+/// Dynamically generates a valid WASM component programmatically without external tools
+/// This ensures tests work in new environments without requiring pre-built files or external tools
 async fn create_test_wasm_component(temp_dir: &TempDir) -> String {
-    // Try to use pre-built component from examples
-    let example_component_path =
-        "examples/wasm/wasm-guest-auth/target/wasm32-wasip2/release/wasm_guest_auth.component.wasm";
+    use wasm_encoder::{Component, Module};
 
-    if std::path::Path::new(example_component_path).exists() {
-        // Copy the pre-built component to temp directory
-        let dest_path = temp_dir.path().join("test_module.component.wasm");
-        fs::copy(example_component_path, &dest_path)
-            .await
-            .expect("Failed to copy example WASM component");
-        return dest_path.to_str().unwrap().to_string();
-    }
+    // Create a minimal valid WASM module first
+    // A minimal module needs at least a type section
+    let mut module = Module::new();
 
-    // Fallback: Create a minimal valid WASM component
-    // This is a minimal WASM component that implements the middleware interface
-    // Note: This is a placeholder - in practice, you'd need a properly built component
-    // For now, we'll create a file that will fail validation, which is fine for error testing
-    let wasm_bytes = vec![
-        0x00, 0x61, 0x73, 0x6d, // WASM magic number
-        0x01, 0x00, 0x00, 0x00, // WASM version
-    ];
-
-    let file_path = temp_dir.path().join("test_module.component.wasm");
-    fs::write(&file_path, wasm_bytes)
+    // Add an empty type section (0 types) - this is valid
+    let type_section = wasm_encoder::TypeSection::new();
+    module.section(&type_section);
+    let mut component = Component::new();
+    component.section(&wasm_encoder::ModuleSection(&module));
+    let component_bytes = component.as_slice().to_vec();
+    let component_path = temp_dir.path().join("test_module.component.wasm");
+    fs::write(&component_path, component_bytes)
         .await
-        .expect("Failed to write test WASM file");
+        .expect("Failed to write WASM component file");
 
-    file_path.to_str().unwrap().to_string()
+    // Return absolute path
+    component_path
+        .canonicalize()
+        .expect("Failed to canonicalize path")
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 /// Create a test app with WASM support
