@@ -6,6 +6,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
+
 # Compatible with HunYuan VL
 class HunYuanImageProcessor(SGLangBaseProcessor):
     models = [HunYuanVLForConditionalGeneration]

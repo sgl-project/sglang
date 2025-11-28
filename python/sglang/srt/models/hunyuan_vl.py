@@ -26,6 +26,7 @@ from transformers.activations import ACT2FN
 from sglang.srt.configs.hunyuan_vl import HunYuanVLConfig, HunYuanVLVisionConfig
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -217,99 +218,20 @@ class HunYuan_VisionBlock(nn.Module):
         return hidden_states
 
 
-class HunYuanVLRMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        """
-        HunYuanVLRMSNorm is equivalent to T5LayerNorm
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
-
-# class HunYuanVisionPatchMerger(nn.Module):
-#     def __init__(
-#         self,
-#         in_channels,
-#         out_channels,
-#         spatial_merge_size=2,
-#         rms_norm_eps=1e-5,
-#         quant_config: Optional[QuantizationConfig] = None,
-#         prefix="",
-#     ):
-#         super().__init__()
-#         self.spatial_merge_size = spatial_merge_size
-#         embed_std = out_channels**-0.5
-
-#         self.proj = nn.Sequential(
-#             nn.Conv2d(
-#                 in_channels,
-#                 in_channels * 2,
-#                 kernel_size=spatial_merge_size,
-#                 stride=spatial_merge_size,
-#             ),
-#             nn.GELU(),
-#             nn.Conv2d(in_channels * 2, in_channels * 4, kernel_size=1),
-#         )
-#         self.mlp = nn.Linear(in_channels * 4, out_channels)
-
-#         self.image_newline = nn.Parameter(torch.randn(in_channels * 4) * embed_std)
-#         self.image_begin = nn.Parameter(torch.randn(out_channels) * embed_std)
-#         self.image_end = nn.Parameter(torch.randn(out_channels) * embed_std)
-#         self.image_sep = nn.Parameter(torch.randn(out_channels) * embed_std)
-
-#         self.before_rms = RMSNorm(in_channels, eps=rms_norm_eps)
-#         self.after_rms = RMSNorm(out_channels, eps=rms_norm_eps)
-
-#     def forward(self, x, size=(16, 16)):
-#         B, S, D = x.shape
-#         x2d = x.reshape(-1, D)
-#         x2d = self.before_rms(x2d) # RMSNorm expects 2D
-#         x = x2d.reshape(B, S, D)
-#         h, w = size
-#         dtype = x.dtype
-#         x = x.permute(0, 2, 1).reshape(x.shape[0], -1, h.item(), w.item())
-
-#         x = self.proj(x)  # b,c,h,w
-#         b, c, h, w = x.shape
-#         x = torch.cat(
-#             [x, self.image_newline.reshape(1, c, 1, 1).expand(b, c, h, 1).to(dtype,non_blocking=True)],
-#             dim=-1,
-#         )
-#         x = x.reshape(b, c, -1).permute(0, 2, 1)
-#         x = self.mlp(x)
-
-#         begin = self.image_begin.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype)
-#         end = self.image_end.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype)
-#         x = torch.cat([begin, x, end], dim=1)
-#         B, S, D = x.shape
-#         x = x.reshape(-1, D)
-#         x = self.after_rms(x)
-#         x = x.reshape(B, S, D)
-
-#         return x
-
-
 class HunYuanVisionPatchMerger(nn.Module):
     def __init__(
         self,
         in_channels,
         out_channels,
-        spatial_merge_size,
-        rms_norm_eps,
-        **kwargs,
+        spatial_merge_size=2,
+        rms_norm_eps=1e-5,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix="",
     ):
         super().__init__()
-
-        embed_std = out_channels**-0.5
         self.spatial_merge_size = spatial_merge_size
+        embed_std = out_channels**-0.5
+
         self.proj = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -321,19 +243,25 @@ class HunYuanVisionPatchMerger(nn.Module):
             nn.Conv2d(in_channels * 2, in_channels * 4, kernel_size=1),
         )
         self.mlp = nn.Linear(in_channels * 4, out_channels)
+
         self.image_newline = nn.Parameter(torch.randn(in_channels * 4) * embed_std)
         self.image_begin = nn.Parameter(torch.randn(out_channels) * embed_std)
         self.image_end = nn.Parameter(torch.randn(out_channels) * embed_std)
         self.image_sep = nn.Parameter(torch.randn(out_channels) * embed_std)
 
-        self.before_rms = HunYuanVLRMSNorm(in_channels, eps=rms_norm_eps)
-        self.after_rms = HunYuanVLRMSNorm(out_channels, eps=rms_norm_eps)
+        self.before_rms = RMSNorm(in_channels, eps=rms_norm_eps)
+        self.after_rms = RMSNorm(out_channels, eps=rms_norm_eps)
 
     def forward(self, x, size=(16, 16)):
-        x = self.before_rms(x)
+        # B, S, D = x.shape
+        # x2d = x.reshape(-1, D)
+        # Note: when use forward_cuda, model inference result differs significantly from the HuggingFace Transformers implementation.
+        x = self.before_rms.forward_native(x)  # RMSNorm expects 2D
+        # x = x2d.reshape(B, S, D)
         h, w = size
         dtype = x.dtype
-        x = x.permute(0, 2, 1).reshape(x.shape[0], -1, int(h.item()), int(w.item()))
+        x = x.permute(0, 2, 1).reshape(x.shape[0], -1, h.item(), w.item())
+
         x = self.proj(x)  # b,c,h,w
         b, c, h, w = x.shape
         x = torch.cat(
@@ -348,19 +276,15 @@ class HunYuanVisionPatchMerger(nn.Module):
         x = x.reshape(b, c, -1).permute(0, 2, 1)
         x = self.mlp(x)
 
-        begin = (
-            self.image_begin.reshape(1, 1, -1)
-            .expand(b, 1, x.shape[-1])
-            .to(dtype, non_blocking=True)
-        )
-        end = (
-            self.image_end.reshape(1, 1, -1)
-            .expand(b, 1, x.shape[-1])
-            .to(dtype, non_blocking=True)
-        )
+        begin = self.image_begin.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype)
+        end = self.image_end.reshape(1, 1, -1).expand(b, 1, x.shape[-1]).to(dtype)
         x = torch.cat([begin, x, end], dim=1)
+        # B, S, D = x.shape
+        # x = x.reshape(-1, D)
+        x = self.after_rms.forward_native(x)
+        # x = x.reshape(B, S, D)
 
-        return self.after_rms(x)
+        return x
 
 
 class HunYuanVisionTransformer(nn.Module):
