@@ -24,8 +24,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionResponseChoice,
     ChatMessage,
     CompletionRequest,
+    Function,
     ModelCard,
     ModelList,
+    ResponseTool,
     UsageInfo,
 )
 
@@ -344,6 +346,86 @@ class TestValidationEdgeCases(unittest.TestCase):
         self.assertEqual(restored_request.temperature, original_request.temperature)
         self.assertEqual(restored_request.max_tokens, original_request.max_tokens)
         self.assertEqual(len(restored_request.messages), len(original_request.messages))
+
+
+class TestResponseTool(unittest.TestCase):
+    """Test ResponseTool protocol model for Responses API"""
+
+    def test_response_tool_with_function(self):
+        """Test ResponseTool with function definition"""
+        function = Function(
+            name="get_weather",
+            description="Get the current weather",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"},
+                },
+                "required": ["location"],
+            },
+            strict=True,
+        )
+        tool = ResponseTool(type="function", function=function)
+
+        self.assertEqual(tool.type, "function")
+        self.assertIsNotNone(tool.function)
+        self.assertEqual(tool.function.name, "get_weather")
+        self.assertEqual(tool.function.description, "Get the current weather")
+        self.assertTrue(tool.function.strict)
+
+    def test_response_tool_builtin_web_search(self):
+        """Test ResponseTool with built-in web_search_preview type"""
+        tool = ResponseTool(type="web_search_preview")
+
+        self.assertEqual(tool.type, "web_search_preview")
+        self.assertIsNone(tool.function)
+
+    def test_response_tool_builtin_code_interpreter(self):
+        """Test ResponseTool with built-in code_interpreter type"""
+        tool = ResponseTool(type="code_interpreter")
+
+        self.assertEqual(tool.type, "code_interpreter")
+        self.assertIsNone(tool.function)
+
+    def test_response_tool_mcp_type(self):
+        """Test ResponseTool with mcp type"""
+        tool = ResponseTool(type="mcp")
+
+        self.assertEqual(tool.type, "mcp")
+        self.assertIsNone(tool.function)
+
+    def test_response_tool_function_without_definition(self):
+        """Test ResponseTool with function type but no function definition"""
+        tool = ResponseTool(type="function")
+
+        self.assertEqual(tool.type, "function")
+        self.assertIsNone(tool.function)
+
+    def test_response_tool_serialization(self):
+        """Test ResponseTool JSON serialization"""
+        function = Function(
+            name="add",
+            description="Add two numbers",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "a": {"type": "integer"},
+                    "b": {"type": "integer"},
+                },
+                "required": ["a", "b"],
+            },
+        )
+        tool = ResponseTool(type="function", function=function)
+
+        data = tool.model_dump()
+        self.assertEqual(data["type"], "function")
+        self.assertIsNotNone(data["function"])
+        self.assertEqual(data["function"]["name"], "add")
+
+    def test_response_tool_invalid_type(self):
+        """Test ResponseTool with invalid type raises validation error"""
+        with self.assertRaises(ValidationError):
+            ResponseTool(type="invalid_type")
 
 
 if __name__ == "__main__":
