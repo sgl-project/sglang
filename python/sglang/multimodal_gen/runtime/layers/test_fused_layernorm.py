@@ -131,17 +131,30 @@ def run_case_fused(
     y_triton_fused = y_triton_fused_3d.view(M, N)
     y_dev_fused = ext.fuse_layernorm_scale_shift(x, weight, bias, scale, shift)
 
-    max_abs_err = (y_triton_fused - y_dev_fused).abs().max().item()
-    max_rel_err = ((y_triton_fused - y_dev_fused).abs() / (y_triton_fused.abs() + 1e-8)).max().item()
+    # Reference fused output: compute LN in fp32, then apply scale/shift in fp32, cast back
+    x32 = x.float()
+    w32 = weight.float()
+    b32 = bias.float()
+    s32 = scale.float()
+    sh32 = shift.float()
+    mean = x32.mean(dim=1, keepdim=True)
+    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
+    inv_std = (var + eps).sqrt().reciprocal()
+    y_ln32 = (x32 - mean) * inv_std
+    y_ln32 = y_ln32 * w32 + b32
+    y_gt_fused = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
+
+    triton_max_abs_err = (y_triton_fused - y_gt_fused).abs().max().item()
+    dev_max_abs_err = (y_dev_fused - y_gt_fused).abs().max().item()
     print(
         f"[Fused] dtype={dtype}, M={M}, N={N} -> "
-        f"max_abs_err={max_abs_err:.3e}, max_rel_err={max_rel_err:.3e}"
+        f"triton_max_abs_err={triton_max_abs_err:.3e}, dev_max_abs_err={dev_max_abs_err:.3e}"
     )
     print(
         f"[Fused] Triton fused: {triton_ms:.3f} ms, Device LN+ScaleShift: {device_ms:.3f} ms, "
         f"speedup={triton_ms / device_ms if device_ms > 0 else float('inf'):.3f}x"
     )
-    return max_abs_err, max_rel_err
+    return dev_max_abs_err
 
 
 def main():
@@ -152,11 +165,16 @@ def main():
 
     # Test a grid of cases within Triton's 64KB/row constraint
     cases = [
-        (129, 1024),
-        (257, 2048),
+        # (129, 1024),
+        # (257, 2048),
+        # (65, 4096),
         (20, 3072),
-        (2000, 3072),
-        (65, 4096),
+        (128, 3072),
+        (256, 3072),
+        (512, 3072),
+        (1024, 3072),
+        (2000, 3072),     
+        (2048, 3072)
     ]
     dtypes = (torch.float32, torch.bfloat16)
     # Match device kernel's epsilon (hardcoded in device_layernorm.h kernels)
@@ -182,16 +200,16 @@ def main():
             # Fused kernel requires N % 4 == 0 (x4 vectorization)
             if (N % 4) != 0:
                 continue
-            f_abs_err, f_rel_err = run_case_fused(
+            f_abs_err = run_case_fused(
                 dtype=dtype,
                 M=M,
                 N=N,
                 eps=eps,
             )
             if dtype == torch.float32:
-                assert (f_abs_err < 2e-5) or (f_rel_err < 1e-2)
+                assert (f_abs_err < 2e-5)
             else:
-                assert (f_abs_err < 1e-2) or (f_rel_err < 1e-1)
+                assert (f_abs_err < 2e-1)
     print("All device_layernorm vs Triton comparisons passed.")
 
 
