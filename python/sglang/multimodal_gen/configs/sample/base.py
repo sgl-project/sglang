@@ -125,7 +125,12 @@ class SamplingParams:
 
     # Profiling
     profile: bool = False
+    profile_full: bool = False
     num_profiled_timesteps: int = 2
+
+    # Global pipeline profiling (covers the whole pipeline execution)
+    global_profile: bool = False
+    global_profile_full: bool = False
 
     # Debugging
     debug: bool = False
@@ -348,6 +353,24 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.profile,
             help="Enable torch profiler for denoising stage",
+        )
+        parser.add_argument(
+            "--profile-full",
+            action="store_true",
+            default=SamplingParams.profile_full,
+            help="Profile the entire denoising stage without schedule/step (exports ./logs/full.trace.json.gz)",
+        )
+        parser.add_argument(
+            "--global-profile",
+            action="store_true",
+            default=SamplingParams.global_profile,
+            help="Enable global profiler for the entire pipeline execution",
+        )
+        parser.add_argument(
+            "--global-profile-full",
+            action="store_true",
+            default=SamplingParams.global_profile_full,
+            help="Profile the entire pipeline without schedule/step (exports ./logs/pipeline.full.trace.json.gz)",
         )
         parser.add_argument(
             "--debug",
