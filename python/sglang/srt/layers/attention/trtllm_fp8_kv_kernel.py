@@ -70,9 +70,6 @@ def _fused_fp8_set_kv_buffer_kernel(
 
     Grid: (num_tokens,)
     """
-    # Constants
-    FP8_E4M3_MAX = 448.0
-
     # Get token ID for this program
     token_id = tl.program_id(0)
 
@@ -451,15 +448,12 @@ def _naive_fp8_set_kv_buffer(
     # Write to cache using advanced indexing (same as original)
     if k_cache.ndim == 3:
         # 3D cache: [total_slots, H, D]
-        # Original code: k_buffer[layer_id][loc] = cache_k
         k_cache[cache_loc] = k
         v_cache[cache_loc] = v
     else:
         # 4D cache: [num_pages, page_size, H, D]
-        # Need to decompose loc into page_id and page_offset
-        for token_idx in range(num_tokens):
-            loc = cache_loc[token_idx].item()
-            page_id = loc // page_size
-            page_offset = loc % page_size
-            k_cache[page_id, page_offset, :, :] = k[token_idx]
-            v_cache[page_id, page_offset, :, :] = v[token_idx]
+        # Decompose loc into page_id and page_offset (vectorized)
+        page_ids = cache_loc // page_size
+        page_offsets = cache_loc % page_size
+        k_cache[page_ids, page_offsets] = k
+        v_cache[page_ids, page_offsets] = v

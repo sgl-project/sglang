@@ -415,6 +415,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
+    def _should_use_fused_fp8_path(
+        self, save_kv_cache: bool, k: torch.Tensor, **kwargs
+    ) -> bool:
+        """Check if we should use the fused FP8 KV cache write path."""
+        enable_trtllm_fp8_fuse = kwargs.get("enable_trtllm_fp8_fuse", False)
+        return (
+            save_kv_cache
+            and k is not None
+            and self.data_type == torch.float8_e4m3fn
+            and enable_trtllm_fp8_fuse
+        )
+
     def _fused_fp8_set_kv_buffer(
         self,
         q: torch.Tensor,
@@ -555,14 +567,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Run forward for decode using TRTLLM MHA kernel."""
         cache_loc = forward_batch.out_cache_loc
 
-        # Check if we should use the fused FP8 KV cache write path
-        enable_trtllm_fp8_fuse = kwargs.get("enable_trtllm_fp8_fuse", False)
-        use_fused_fp8_path = (
-            save_kv_cache
-            and k is not None
-            and self.data_type == torch.float8_e4m3fn
-            and enable_trtllm_fp8_fuse
-        )
+        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k, **kwargs)
 
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
@@ -646,14 +651,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ):
         cache_loc = forward_batch.out_cache_loc
 
-        # Check if we should use the fused FP8 KV cache write path
-        enable_trtllm_fp8_fuse = kwargs.get("enable_trtllm_fp8_fuse", False)
-        use_fused_fp8_path = (
-            save_kv_cache
-            and k is not None
-            and self.data_type == torch.float8_e4m3fn
-            and enable_trtllm_fp8_fuse
-        )
+        use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k, **kwargs)
 
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
