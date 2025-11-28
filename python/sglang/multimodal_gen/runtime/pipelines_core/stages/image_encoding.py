@@ -373,8 +373,8 @@ class ImageVAEEncodingStage(PipelineStage):
             image_latents = image_latents.unsqueeze(0)  # (1, N*1024, 128)
             image_latents = image_latents.repeat(batch_size, 1, 1)
         else:
-            latent_height = height // self.vae.spatial_compression_ratio
-            latent_width = width // self.vae.spatial_compression_ratio
+            latent_height = batch.height // self.vae.spatial_compression_ratio
+            latent_width = batch.width // self.vae.spatial_compression_ratio
             mask_lat_size = torch.ones(1, 1, num_frames, latent_height, latent_width)
             mask_lat_size[:, :, list(range(1, num_frames))] = 0
             first_frame_mask = mask_lat_size[:, :, 0:1]
@@ -397,11 +397,9 @@ class ImageVAEEncodingStage(PipelineStage):
             mask_lat_size = mask_lat_size.to(latent_condition.device)
             image_latents = torch.concat([mask_lat_size, latent_condition], dim=1)
 
-            batch.image_latent = image_latents
+        batch.image_latent = image_latents
 
-        # Offload models if needed
-        if hasattr(self, "maybe_free_model_hooks"):
-            self.maybe_free_model_hooks()
+        self.maybe_free_model_hooks()
 
         self.vae.to("cpu")
 
