@@ -24,7 +24,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     sequence_model_parallel_all_gather,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
@@ -174,11 +173,6 @@ class PipelineConfig:
 
     # Compilation
     # enable_torch_compile: bool = False
-
-    def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-        vae_scale_factor = self.vae_config.arch_config.spatial_compression_ratio
-        height, width = get_default_height_width(image, vae_scale_factor, height, width)
-        return width, height
 
     def slice_noise_pred(self, noise, latents):
         return noise

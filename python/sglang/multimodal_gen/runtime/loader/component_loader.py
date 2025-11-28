@@ -156,7 +156,8 @@ class ComponentLoader(ABC):
                 component_model_path, server_args, module_name
             )
             source = "customized"
-        except Exception as e:
+        except Exception as _e:
+            # fallback to native version
             component = self.load_native(
                 component_model_path, server_args, transformers_or_diffusers
             )
