@@ -66,8 +66,7 @@ jobs:
         with:
           context: docker
           file: docker/npu.Dockerfile
-          # TODO: need add x86 platforms support when memfabric is ready
-          platforms: linux/arm64
+          platforms: linux/arm64,linux/amd64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
