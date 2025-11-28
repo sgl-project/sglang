@@ -14,7 +14,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     shard_rotary_emb_for_sp,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import PIL_INTERPOLATION
 from sglang.multimodal_gen.utils import calculate_dimensions
 
 
@@ -216,7 +215,8 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image_size = batch.original_condition_image_size
+        image = batch.condition_image
+        image_size = image[0].size if isinstance(image, list) else image.size
         edit_width, edit_height, _ = calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
         )
@@ -273,11 +273,11 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         )
 
     def preprocess_image(self, image, image_processor):
-        # image_size = image[0].size if isinstance(image, list) else image.size
-        # calculated_width, calculated_height, _ = calculate_dimensions(
-        #     1024 * 1024, image_size[0] / image_size[1]
-        # )
-        # image = image_processor.resize(image, calculated_height, calculated_width)
+        image_size = image[0].size if isinstance(image, list) else image.size
+        calculated_width, calculated_height, _ = calculate_dimensions(
+            1024 * 1024, image_size[0] / image_size[1]
+        )
+        image = image_processor.resize(image, calculated_height, calculated_width)
         return image
 
     def maybe_resize_condition_image(self, width, height, image):
@@ -291,13 +291,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         multiple_of = self.get_vae_scale_factor() * 2
         width = width // multiple_of * multiple_of
         height = height // multiple_of * multiple_of
-
-        image = image.resize(
-            (width, height),
-            resample=PIL_INTERPOLATION["lanczos",],
-            reducing_gap=None,
-        )
-        return image, width, height
+        return width, height
 
     def slice_noise_pred(self, noise, latents):
         # remove noise over input image
