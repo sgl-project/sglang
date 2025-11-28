@@ -67,6 +67,13 @@ class LoRAManager:
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
         server_args: Optional[ServerArgs] = None,
+        ##############################
+        ##########emb lora############
+        ##############################
+        lora_extra_vocab_size: int = 0,
+        ##############################
+        ##############################
+        ##############################
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -76,6 +83,13 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+        ##############################
+        ##########emb lora############
+        ##############################
+        self.lora_extra_vocab_size: int = lora_extra_vocab_size
+        ##############################
+        ##############################
+        ##############################
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -249,6 +263,14 @@ class LoRAManager:
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
             lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
+            ##############################
+            ##########emb lora############
+            ##############################
+            lora_embed_tokens_module=self.embed_tokens_module, #merge into embedding or lora module
+            lora_lm_head_module=self.lm_head_module, #merge into embedding or lora module
+            ##############################
+            ##############################
+            ##############################
         )
 
         # set up batch info shared by all lora modules
@@ -304,15 +326,16 @@ class LoRAManager:
         ##############################
         ##########emb lora############
         ##############################
-        # Update embedding layer if present
-        if self.embed_tokens_module is not None and hasattr(self.memory_pool, 'embedding_A_buffer') and self.memory_pool.embedding_A_buffer is not None:
+        # Update embedding layer if present - gotta merge (refer to PR codebase)
+        if self.embed_tokens_module is not None:
             self.embed_tokens_module.set_lora_info(
+                self.memory_pool.get_embedding_tensor("added_tokens", LoRAType.LORA_A), #choose name: "added_tokens"
                 self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_A),
                 self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_B),
             )
         
         # Update lm_head layer if present
-        if self.lm_head_module is not None and hasattr(self.memory_pool, 'lm_head_A_buffer') and self.memory_pool.lm_head_A_buffer is not None:
+        if self.lm_head_module is not None:
             self.lm_head_module.set_lora_info(
                 self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_A),
                 self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_B),
@@ -441,6 +464,13 @@ class LoRAManager:
             target_modules=self.target_modules,
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
+            ##############################
+            ##########emb lora############
+            ##############################
+            lora_extra_vocab_size=self.lora_extra_vocab_size, # check whether read from the config
+            ##############################
+            ##############################
+            ##############################
         )
 
     def set_lora_module(self, module_name, module):

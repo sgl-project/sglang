@@ -74,8 +74,12 @@ class LoRAAdapter(nn.Module):
         ##############################
         ##########emb lora############
         ############################## 
-        self.embedding_layer = LoRALayer(config, base_hf_config)
-        self.lm_head_layer = LoRALayer(config, base_hf_config)
+        # self.embedding_layer = LoRALayer(config, base_hf_config)
+        # self.lm_head_layer = LoRALayer(config, base_hf_config)
+        # self.weights: Dict[str, torch.Tensor] = {}
+        # self.extra_embeddings: Dict[str, torch.Tensor] = {}
+        self.embedding_layers: Dict[str, torch.Tensor] = {}
+        self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
         ############################## 
         ############################## 
         ############################## 
@@ -96,10 +100,16 @@ class LoRAAdapter(nn.Module):
             ##############################
             ##########emb lora############
             ############################## 
-            elif "embed_tokens" in name:
-                self.embedding_layer.weights[name] = loaded_weight.cpu()
-            elif "lm_head" in name:
-                self.lm_head_layer.weights[name] = loaded_weight.cpu()
+            elif "embed_tokens" in name or "lm_head" in name:
+                # self.embedding_layers.weights[name] = loaded_weight.cpu()
+                self.embedding_layers[name] = loaded_weight.cpu()
+            elif "input_embeddings" in name or "output_embeddings" in name:
+                #added token emb
+                self.added_tokens_embeddings[name] = loaded_weight.cpu()
+                assert loaded_weight.shape[0] == self.config.extra_vocab_size, (
+                    f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
+                    f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+                )
             ##############################
             ##############################
             ##############################

@@ -30,6 +30,17 @@ class LoRAConfig:
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
 
+        ##############################
+        ##########emb lora############
+        ##############################
+        self.added_tokens = self.get_added_tokens()
+        self.extra_vocab_size = (
+            len(self.added_tokens) if self.added_tokens is not None else 0
+        )
+        ##############################
+        ##############################
+        ##############################
+
     def get_lora_config(self, dummy=False):
         if dummy:
             raise NotImplementedError()
@@ -41,3 +52,35 @@ class LoRAConfig:
             config_name = "adapter_config.json"
             with open(os.path.join(weights_dir, config_name), "r") as f:
                 return json.load(f)
+
+    ##############################
+    ##########emb lora############
+    ##############################
+    def get_added_tokens(self):
+        """Load added tokens from the LoRA adapter if the file exists."""
+        # Determine the weights directory
+        if not os.path.isdir(self.path):
+            weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
+        else:
+            weights_dir = self.path
+        
+        # Construct the path to added_tokens.json
+        added_tokens_path = os.path.join(weights_dir, "added_tokens.json")
+        
+        # Return None if the file doesn't exist (optional for standard LoRA adapters)
+        if not os.path.exists(added_tokens_path):
+            return None
+        
+        # Load and return the added tokens
+        try:
+            with open(added_tokens_path, "r") as f:
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            # Log warning but don't crash if JSON is malformed
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Failed to parse added_tokens.json: {e}")
+            return None
+    ##############################
+    ##############################
+    ##############################
