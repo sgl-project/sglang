@@ -102,7 +102,7 @@ pub async fn add_wasm_module(
             Ok(_) => {
                 // Wait for job completion (timeout: 5 minutes)
                 let timeout = Duration::from_secs(300);
-                match wait_for_job_completion(&job_queue, &worker_url, timeout).await {
+                match wait_for_job_completion(job_queue, &worker_url, timeout).await {
                     Ok(_) => {
                         // Job completed successfully, but we need to get the UUID
                         // Since job queue removes status on success, we need to query
@@ -187,7 +187,7 @@ pub async fn remove_wasm_module(
         Ok(_) => {
             // Wait for job completion (timeout: 1 minute)
             let timeout = Duration::from_secs(60);
-            match wait_for_job_completion(&job_queue, &worker_url, timeout).await {
+            match wait_for_job_completion(job_queue, &worker_url, timeout).await {
                 Ok(_) => (StatusCode::OK, "Module removed successfully").into_response(),
                 Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
             }
@@ -223,6 +223,6 @@ pub async fn list_wasm_modules(State(state): State<Arc<AppState>>) -> Response {
         let response = WasmModuleListResponse { modules, metrics };
         (StatusCode::OK, Json(response)).into_response()
     } else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
     }
 }
