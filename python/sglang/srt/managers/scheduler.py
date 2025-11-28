@@ -1048,9 +1048,9 @@ class Scheduler(
                 self.self_check_during_busy()
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        if self.max_recv_per_poll < 0 or num_recv_reqs < self.max_recv_per_poll:
+        if self.max_recv_per_poll < 0:
             return False
-        return True
+        return num_recv_reqs >= self.max_recv_per_poll
 
     def recv_requests(
         self,
