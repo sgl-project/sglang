@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import nvtx
 import torch
@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.sparsity2.core.sparse_coordinator import RequestTrackers
 from sglang.srt.sparsity2.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
 
 if TYPE_CHECKING:
@@ -39,7 +38,6 @@ class SparseKVCacheManager:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
-        req_states: RequestTrackers,
         server_args: ServerArgs,
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
@@ -49,7 +47,7 @@ class SparseKVCacheManager:
         self.request_counter = 0
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
         if isinstance(kv_cache, MHATokenToKVPool):
-            self.decode_host_mem_pool = MHATokenToKVPoolHost(
+            self.host_mem_pool = MHATokenToKVPoolHost(
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
@@ -57,7 +55,7 @@ class SparseKVCacheManager:
                 server_args.hicache_mem_layout,
             )
         elif isinstance(kv_cache, MLATokenToKVPool):
-            self.decode_host_mem_pool = MLATokenToKVPoolHost(
+            self.host_mem_pool = MLATokenToKVPoolHost(
                 kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
@@ -72,7 +70,7 @@ class SparseKVCacheManager:
 
         self.cache_controller = HiCacheController(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            mem_pool_host=self.decode_host_mem_pool,
+            mem_pool_host=self.host_mem_pool,
             page_size=self.page_size,
             tp_group=tp_group,
             io_backend=server_args.hicache_io_backend,
@@ -92,7 +90,7 @@ class SparseKVCacheManager:
             dtype=torch.int16,
             device=server_args.device,
         )
-        self.req_states = req_states
+        self.req_states = None
 
 
     @nvtx.annotate(
@@ -101,29 +99,29 @@ class SparseKVCacheManager:
     def transfer_sparse_top_k_cache(
         self,
         req_pool_indices,
-        curr_top_k_result,
+        top_k_result,
         out_cache_loc,
         seq_lens,
         layer_id,
     ):
-        bs = curr_top_k_result.shape[0]
-        top_k = curr_top_k_result.shape[1]
+        bs = top_k_result.shape[0]
+        top_k = top_k_result.shape[1]
 
         # need to register buffer for cuda graph
         curr_device_indices = torch.full(
-            (bs, top_k + 1), -1, dtype=torch.int64, device=self.device
+            (bs, top_k + 1), -1, dtype=torch.int64, device=top_k_result.device
         )
         should_load_device_indices = torch.full(
-            (bs, top_k), -1, dtype=torch.int64, device=self.device
+            (bs, top_k), -1, dtype=torch.int64, device=top_k_result.device
         )
         should_load_host_indices = torch.full(
-            (bs, top_k), -1, dtype=torch.int64, device=self.device
+            (bs, top_k), -1, dtype=torch.int64, device=top_k_result.device
         )
 
         full_host_indices = [self.req_states.full_host_indices[idx] for idx in req_pool_indices]
         invoke_nsa_sparse_diff_kernel(
             self.req_states.prev_top_k_result,
-            curr_top_k_result,
+            top_k_result,
             self.req_states.prev_device_indices,
             curr_device_indices,
             self.bitmap,
@@ -131,7 +129,7 @@ class SparseKVCacheManager:
             should_load_device_indices,
             should_load_host_indices,
             out_cache_loc,
-            seq_lens,
+            seq_lens - 1,
             req_pool_indices,
             layer_id,
         )

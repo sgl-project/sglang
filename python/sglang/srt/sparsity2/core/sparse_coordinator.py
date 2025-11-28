@@ -195,7 +195,7 @@ class SparseCoordinator:
 
         if host_indices.numel() > 0:
             # Free host indices
-            self.sparse_kv_cache_manager.decode_host_mem_pool.free(host_indices.cpu())
+            self.sparse_kv_cache_manager.host_mem_pool.free(host_indices.cpu())
             req_seqlen = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
             assert (
                 len(host_indices) == req_seqlen

@@ -106,7 +106,6 @@ def create_sparse_coordinator(
         req_to_token_pool=req_to_token_pool,
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         tp_group=tp_group,
-        tree_cache=None,
         server_args=server_args,
     )
 
@@ -129,6 +128,7 @@ def create_sparse_coordinator(
         device=device,
         total_num_pages=total_num_pages,
     )
+    sparse_kv_cache_manager.req_states = coordinator.states
 
     register_sparse_coordinator(coordinator)
     logger.info(
