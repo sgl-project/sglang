@@ -14,6 +14,7 @@ suites = {
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),
         TestFile("layers/attention/mamba/test_mamba_ssm.py", 50),
         TestFile("layers/attention/mamba/test_mamba_ssm_ssd.py", 20),
+        TestFile("layers/moe/test_moe_runners.py", 300),
         TestFile("lora/test_lora.py", 150),
         TestFile("lora/test_lora_eviction.py", 240),
         TestFile("lora/test_lora_update.py", 600),
@@ -140,6 +141,7 @@ suites = {
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
         TestFile("layers/attention/mamba/test_mamba2_mixer.py", 50),
+        TestFile("layers/moe/test_moe_runners_2gpu.py", 180),
         TestFile("lora/test_lora_tp.py", 116),
         TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
@@ -173,6 +175,7 @@ suites = {
         TestFile("test_disaggregation_dp_attention.py", 155),
     ],
     "per-commit-4-gpu-b200": [
+        TestFile("layers/moe/test_moe_runners_blackwell.py", 300),
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),

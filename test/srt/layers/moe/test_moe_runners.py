@@ -5,8 +5,6 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
-    DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
-    DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -16,6 +14,8 @@ from sglang.test.test_utils import (
 
 
 class TestMoERunner(CustomTestCase):
+    """Tests for MoE runner backends that work on H100 (SM90) GPUs."""
+
     BASE_URL = DEFAULT_URL_FOR_TEST
     TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
     DEFAULT_EVAL_KWARGS = {
@@ -25,18 +25,6 @@ class TestMoERunner(CustomTestCase):
     }
 
     CONFIGS = {
-        "moe_runner_auto": {
-            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
-            "other_args": [
-                "--trust-remote-code",
-                "--moe-runner-backend",
-                "triton",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
-            ],
-        },
         "moe_runner_triton": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
@@ -61,74 +49,13 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
-        "moe_runner_flashinfer_cutlass": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,  # requires model with modelopt_fp4 quantization
-            "other_args": [
-                "--trust-remote-code",
-                "--moe-runner-backend",
-                "flashinfer_cutlass",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
-            ],
-        },
-        "moe_runner_deep_gemm": {
-            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
-            "other_args": [
-                "--trust-remote-code",
-                "--moe-runner-backend",
-                "deep_gemm",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
-            ],
-        },
         "moe_runner_flashinfer_trtllm": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,  # modelopt_fp4 or fp8 quantization is required for Flashinfer trtllm MOE
+            # modelopt_fp4 or fp8 quantization is required for Flashinfer trtllm MOE
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
             "other_args": [
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "flashinfer_trtllm",
-            ],
-        },
-        "moe_runner_flashinfer_mxfp4": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE,
-            "other_args": [
-                "--trust-remote-code",
-                "--moe-runner-backend",
-                "flashinfer_mxfp4",
-                "--quantization",
-                "mxfp4",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
-            ],
-        },
-        "moe_runner_flashinfer_cutedsl": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
-            "other_args": [
-                "--trust-remote-code",
-                "--moe-runner-backend",
-                "flashinfer_cutedsl",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
-            ],
-        },
-        "moe_runner_cutlass": {
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,
-            "other_args": [
-                "--trust-remote-code",
-                "--moe-runner-backend",
-                "cutlass",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
             ],
         },
         "moe_runner_speculative": {
