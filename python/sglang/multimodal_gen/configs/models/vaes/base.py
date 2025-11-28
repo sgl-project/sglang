@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
+from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.utils import StoreBoolean
 
 
@@ -51,6 +52,11 @@ class VAEConfig(ModelConfig):
         pass
 
     # returns width, height
+    def calculate_dimensions(
+        self, image, vae_scale_factor, width, height
+    ) -> tuple[int, int]:
+        height, width = get_default_height_width(image, vae_scale_factor, height, width)
+        return width, height
 
     @staticmethod
     def add_cli_args(parser: Any, prefix: str = "vae-config") -> Any:

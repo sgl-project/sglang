@@ -203,7 +203,7 @@ class ImageVAEEncodingStage(PipelineStage):
     Stage for encoding pixel representations into latent space.
 
     This stage handles the encoding of pixel representations into the final
-    input format (e.g., image_latents).
+    input format (e.g., latents).
     """
 
     def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:
@@ -462,18 +462,14 @@ class ImageVAEEncodingStage(PipelineStage):
     ) -> torch.Tensor:
 
         if isinstance(image, PIL.Image.Image):
-            # image already resized in InputValidateStage
-            # width, height = (
-            #     self.server_args.pipeline_config.calculate_condition_image_size(
-            #         image, width, height
-            #     )
-            # )
-            print(f"{image.size=}")
-
+            width, height = (
+                self.server_args.pipeline_config.vae_config.calculate_dimensions(
+                    image, vae_scale_factor, width, height
+                )
+            )
             image = resize(image, height, width, resize_mode=resize_mode)
             image = pil_to_numpy(image)  # to np
             image = numpy_to_pt(image)  # to pt
-            print(f"{image=}")
 
         do_normalize = True
         if image.min() < 0:

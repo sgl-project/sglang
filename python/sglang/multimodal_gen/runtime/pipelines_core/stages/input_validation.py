@@ -7,7 +7,6 @@ Input validation stage for diffusion pipelines.
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
-from diffusers.image_processor import VaeImageProcessor
 from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
@@ -41,13 +40,6 @@ class InputValidationStage(PipelineStage):
 
     In this stage, input image and output image may be resized
     """
-
-    def __init__(self):
-        super().__init__()
-        self.vae_image_processor = VaeImageProcessor(
-            vae_scale_factor=self.server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-            * 2
-        )
 
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
         """Generate seeds for the inference"""
@@ -131,41 +123,18 @@ class InputValidationStage(PipelineStage):
         # NOTE: resizing needs to be bring in advance
         if server_args.pipeline_config.task_type == ModelTaskType.I2I:
             if batch.condition_image is not None:
-                batch.original_condition_image_size = (
-                    condition_image_width,
-                    condition_image_height,
+                resized_image, resized_width, resized_height = (
+                    server_args.pipeline_config.maybe_resize_condition_image(
+                        condition_image_width,
+                        condition_image_height,
+                        batch.condition_image,
+                    )
                 )
-                batch.width = condition_image_width
-                batch.height = condition_image_height
-
-                # resized_width, resized_height = (
-                #     server_args.pipeline_config.calculate_condition_image_size(
-                #         batch.condition_image,
-                #         condition_image_width,
-                #         condition_image_height,
-                #     )
-                # )
-                #
-                # resized_image = self.vae_image_processor.resize(
-                #     image, resized_height, resized_width
-                # )
-                #
-                # resized_image, resized_width, resized_height = (
-                #     server_args.pipeline_config.maybe_resize_condition_image(
-                #         condition_image_width,
-                #         condition_image_height,
-                #         batch.condition_image,
-                #     )
-                # )
-                # print(f"{condition_image_width=}")
-                # print(f"{condition_image_height=}")
-                # print(f"{resized_width=}")
-                # print(f"{resized_height=}")
-                # batch.condition_image = resized_image
-                # batch.width = resized_width if batch.width_not_provided else batch.width
-                # batch.height = (
-                #     resized_height if batch.height_not_provided else batch.height
-                # )
+                batch.condition_image = resized_image
+                batch.width = resized_width if batch.width_not_provided else batch.width
+                batch.height = (
+                    resized_height if batch.height_not_provided else batch.height
+                )
         elif (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
         ) and batch.condition_image is not None:
