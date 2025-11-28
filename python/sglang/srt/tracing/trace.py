@@ -142,7 +142,7 @@ class TracePropagateContext:
         carrier = d["root_span"]
         root_span_context = propagate.extract(carrier)
 
-        if d["prev_span"] == "None":
+        if d["prev_span"] == "None" or d["prev_span"] is None:
             prev_span_context = None
         else:
             prev_span_context = trace.span.SpanContext(
