@@ -227,7 +227,7 @@ def _get_diffusers_model_info(model_path: str) -> ModelInfo:
     from sglang.multimodal_gen.configs.sample.diffusers_generic import (
         DiffusersGenericSamplingParams,
     )
-    from sglang.multimodal_gen.runtime.architectures.basic.diffusers_backend import (
+    from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import (
         DiffusersPipeline,
     )
 

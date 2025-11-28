@@ -7,6 +7,7 @@ through sglang's infrastructure using vanilla diffusers pipelines.
 """
 
 import argparse
+import re
 import warnings
 from io import BytesIO
 from typing import Any
@@ -346,9 +347,12 @@ class DiffusersPipeline(ComposedPipelineBase):
                         revision=server_args.revision,
                     )
                 except Exception as e2:
+                    match = re.search(r"has no attribute (\w+)", str(e))
+                    class_name = match.group(1) if match else "unknown"
                     raise RuntimeError(
-                        f"Failed to load custom pipeline. Make sure the model repo contains the pipeline code. "
-                        f"Original error: {e}, Retry error: {e2}"
+                        f"Pipeline class '{class_name}' not found in diffusers and no custom pipeline.py in repo. "
+                        f"Try: pip install --upgrade diffusers (some pipelines require latest version). "
+                        f"Original error: {e}"
                     ) from e2
             else:
                 raise
