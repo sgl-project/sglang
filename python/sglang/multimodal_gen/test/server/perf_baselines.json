@@ -361,6 +361,31 @@
             "expected_avg_denoise_ms": 167.89,
             "expected_median_denoise_ms": 169.67
         },
+        "zimage_image_t2i": {
+            "stages_ms": {
+                "InputValidationStage": 0.03,
+                "TextEncodingStage": 104.21,
+                "ConditioningStage": 0.01,
+                "TimestepPreparationStage": 1.33,
+                "LatentPreparationStage": 1.13,
+                "DenoisingStage": 850.85,
+                "DecodingStage": 289.32
+            },
+            "denoise_step_ms": {
+                "0": 101.56,
+                "1": 28.26,
+                "2": 101.74,
+                "3": 101.68,
+                "4": 102.19,
+                "5": 102.05,
+                "6": 102.03,
+                "7": 102.28,
+                "8": 105.54
+            },
+            "expected_e2e_ms": 1248.41,
+            "expected_avg_denoise_ms": 94.15,
+            "expected_median_denoise_ms": 102.03
+        },
         "qwen_image_edit_ti2i": {
             "notes": "single uploaded reference image, Qwen/Qwen-Image-Edit",
             "expected_e2e_ms": 138500.0,
