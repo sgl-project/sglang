@@ -46,7 +46,7 @@ from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     is_deepseek_nsa,
 )
-from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_xpu_tp
+from sglang.srt.configs.update_config import maybe_adjust_config_with_unaligned_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
@@ -780,7 +780,7 @@ class ModelRunner:
             modelopt_config=modelopt_config,
         )
         if self.device in ["cpu", "xpu"]:
-            self.model_config = adjust_config_with_unaligned_cpu_xpu_tp(
+            self.model_config = maybe_adjust_config_with_unaligned_tp(
                 self.model_config, self.load_config, self.tp_size
             )
 
