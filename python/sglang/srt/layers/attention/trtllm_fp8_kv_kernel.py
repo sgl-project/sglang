@@ -23,6 +23,66 @@ logger = logging.getLogger(__name__)
 
 
 @triton.jit
+def _process_kv_tensor(
+    token_id,
+    page_id,
+    page_offset,
+    input_ptr,
+    cache_ptr,
+    inv_scale,
+    use_provided_scale: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    input_stride_token: tl.constexpr,
+    input_stride_head: tl.constexpr,
+    input_stride_dim: tl.constexpr,
+    cache_stride_page: tl.constexpr,
+    cache_stride_offset: tl.constexpr,
+    cache_stride_head: tl.constexpr,
+    cache_stride_dim: tl.constexpr,
+    BLOCK_HEAD: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+):
+    """Process a single K or V tensor: load, quantize to FP8, and write to cache."""
+    for head_idx in range(0, num_kv_heads, BLOCK_HEAD):
+        num_heads_in_block = min(BLOCK_HEAD, num_kv_heads - head_idx)
+        for dim_idx in range(0, head_dim, BLOCK_DIM):
+            num_dims_in_block = min(BLOCK_DIM, head_dim - dim_idx)
+
+            head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
+            dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
+
+            head_mask = head_offsets < (head_idx + num_heads_in_block)
+            dim_mask = dim_offsets < (dim_idx + num_dims_in_block)
+
+            # Load from input using 3D strides
+            input_offsets = (
+                token_id * input_stride_token
+                + head_offsets[:, None] * input_stride_head
+                + dim_offsets[None, :] * input_stride_dim
+            )
+            mask = head_mask[:, None] & dim_mask[None, :]
+
+            block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+
+            # Quantize to FP8
+            if use_provided_scale:
+                block_fp8 = (block * inv_scale).to(tl.float8e4nv)
+            else:
+                block_fp8 = block.to(tl.float8e4nv)
+
+            # Write to cache at [page_id, page_offset, head, dim]
+            cache_offsets = (
+                page_id * cache_stride_page
+                + page_offset * cache_stride_offset
+                + head_offsets[:, None] * cache_stride_head
+                + dim_offsets[None, :] * cache_stride_dim
+            )
+
+            tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+
+
+@triton.jit
 def _fused_fp8_set_kv_buffer_kernel(
     # Input tensors (post-RoPE K and V in FP16/BF16)
     k_ptr,  # [num_tokens, num_kv_heads, head_dim]
@@ -80,117 +140,53 @@ def _fused_fp8_set_kv_buffer_kernel(
     page_id = cache_loc // page_size
     page_offset = cache_loc % page_size
 
-    # ========== Process K tensor ==========
+    # Compute inverse scales
+    k_inv_scale = 1.0 / k_scale if use_provided_scale else 1.0
+    v_inv_scale = 1.0 / v_scale if use_provided_scale else 1.0
 
-    # Compute inverse scale (for performance, do division once)
-    if use_provided_scale:
-        k_inv_scale = 1.0 / k_scale
-    else:
-        # No scale provided: just do dtype conversion (matching original set_kv_buffer)
-        k_inv_scale = 1.0  # Will not actually scale
+    # Process K tensor
+    _process_kv_tensor(
+        token_id,
+        page_id,
+        page_offset,
+        k_ptr,
+        k_cache_ptr,
+        k_inv_scale,
+        use_provided_scale,
+        num_kv_heads,
+        head_dim,
+        k_stride_token,
+        k_stride_head,
+        k_stride_dim,
+        k_cache_stride_page,
+        k_cache_stride_offset,
+        k_cache_stride_head,
+        k_cache_stride_dim,
+        BLOCK_HEAD,
+        BLOCK_DIM,
+    )
 
-    # Quantize and write to cache
-    for head_idx in range(0, num_kv_heads, BLOCK_HEAD):
-        num_heads_in_block = min(BLOCK_HEAD, num_kv_heads - head_idx)
-        for dim_idx in range(0, head_dim, BLOCK_DIM):
-            num_dims_in_block = min(BLOCK_DIM, head_dim - dim_idx)
-
-            # Load K block
-            head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
-            dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
-
-            head_mask = head_offsets < (head_idx + num_heads_in_block)
-            dim_mask = dim_offsets < (dim_idx + num_dims_in_block)
-
-            # Load from input using 3D strides
-            k_offsets = (
-                token_id * k_stride_token +
-                head_offsets[:, None] * k_stride_head +
-                dim_offsets[None, :] * k_stride_dim
-            )
-            mask = head_mask[:, None] & dim_mask[None, :]
-
-            k_block = tl.load(
-                k_ptr + k_offsets,
-                mask=mask,
-                other=0.0
-            )
-
-            # Quantize to FP8
-            if use_provided_scale:
-                k_block_fp8 = (k_block * k_inv_scale).to(tl.float8e4nv)
-            else:
-                # No scale: just convert dtype (matching PyTorch .to(fp8) behavior)
-                k_block_fp8 = k_block.to(tl.float8e4nv)
-
-            # Write to cache at [page_id, page_offset, head, dim]
-            cache_offsets = (
-                page_id * k_cache_stride_page +
-                page_offset * k_cache_stride_offset +
-                head_offsets[:, None] * k_cache_stride_head +
-                dim_offsets[None, :] * k_cache_stride_dim
-            )
-
-            tl.store(
-                k_cache_ptr + cache_offsets,
-                k_block_fp8,
-                mask=mask
-            )
-
-    # ========== Process V tensor (same logic) ==========
-
-    # Compute inverse scale (for performance, do division once)
-    if use_provided_scale:
-        v_inv_scale = 1.0 / v_scale
-    else:
-        # No scale provided: just do dtype conversion (matching original set_kv_buffer)
-        v_inv_scale = 1.0  # Will not actually scale
-
-    # Quantize and write to cache
-    for head_idx in range(0, num_kv_heads, BLOCK_HEAD):
-        num_heads_in_block = min(BLOCK_HEAD, num_kv_heads - head_idx)
-        for dim_idx in range(0, head_dim, BLOCK_DIM):
-            num_dims_in_block = min(BLOCK_DIM, head_dim - dim_idx)
-
-            head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
-            dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
-
-            head_mask = head_offsets < (head_idx + num_heads_in_block)
-            dim_mask = dim_offsets < (dim_idx + num_dims_in_block)
-
-            # Load from input using 3D strides
-            v_offsets = (
-                token_id * v_stride_token +
-                head_offsets[:, None] * v_stride_head +
-                dim_offsets[None, :] * v_stride_dim
-            )
-            mask = head_mask[:, None] & dim_mask[None, :]
-
-            v_block = tl.load(
-                v_ptr + v_offsets,
-                mask=mask,
-                other=0.0
-            )
-
-            # Quantize to FP8
-            if use_provided_scale:
-                v_block_fp8 = (v_block * v_inv_scale).to(tl.float8e4nv)
-            else:
-                # No scale: just convert dtype (matching PyTorch .to(fp8) behavior)
-                v_block_fp8 = v_block.to(tl.float8e4nv)
-
-            cache_offsets = (
-                page_id * v_cache_stride_page +
-                page_offset * v_cache_stride_offset +
-                head_offsets[:, None] * v_cache_stride_head +
-                dim_offsets[None, :] * v_cache_stride_dim
-            )
-
-            tl.store(
-                v_cache_ptr + cache_offsets,
-                v_block_fp8,
-                mask=mask
-            )
+    # Process V tensor
+    _process_kv_tensor(
+        token_id,
+        page_id,
+        page_offset,
+        v_ptr,
+        v_cache_ptr,
+        v_inv_scale,
+        use_provided_scale,
+        num_kv_heads,
+        head_dim,
+        v_stride_token,
+        v_stride_head,
+        v_stride_dim,
+        v_cache_stride_page,
+        v_cache_stride_offset,
+        v_cache_stride_head,
+        v_cache_stride_dim,
+        BLOCK_HEAD,
+        BLOCK_DIM,
+    )
 
 
 def fused_fp8_set_kv_buffer(
