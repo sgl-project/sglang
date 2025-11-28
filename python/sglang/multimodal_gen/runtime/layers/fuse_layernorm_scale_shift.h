@@ -299,7 +299,7 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const bf16_4*)beta,
        m,
        n);
-   } else {
+  } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
      layernorm_twoPassAlgo_stored_locally_e4<half4, half, 1><<<grid, block, 0, stream>>>(
        (half4*)output,
        (const half4*)input,
@@ -307,6 +307,8 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const half4*)beta,
        m,
        n);
+  } else {
+    assert(false && "Unsupported data type for layernorm");
    }
  } else if (n <= 8192) {
    block.x = ((n + 7)/8 + 31)/32*32;
@@ -327,7 +329,7 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const bf16_4*)beta,
        m,
        n);
-   } else {
+  } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
      layernorm_twoPassAlgo_stored_locally_e4<half4, half, 8><<<grid, block, 0, stream>>>(
        (half4*)output,
        (const half4*)input,
@@ -335,6 +337,8 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const half4*)beta,
        m,
        n);
+  } else {
+    assert(false && "Unsupported data type for layernorm");
    }
  } else if (n <= 16384) {
    block.x = ((n + 15)/16 + 31)/32*32;
@@ -355,7 +359,7 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const bf16_4*)beta,
        m,
        n);
-   } else {
+  } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
      layernorm_twoPassAlgo_stored_locally_e4<half4, half, 4><<<grid, block, 0, stream>>>(
        (half4*)output,
        (const half4*)input,
@@ -363,6 +367,8 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const half4*)beta,
        m,
        n);
+  } else {
+    assert(false && "Unsupported data type for layernorm");
    }
  } else if (n <= 32768) {
    block.x = ((n + 31)/32 + 31)/32*32;
@@ -383,7 +389,7 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const bf16_4*)beta,
        m,
        n);
-   } else {
+  } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
      layernorm_twoPassAlgo_stored_locally_e4<half4, half, 8><<<grid, block, 0, stream>>>(
        (half4*)output,
        (const half4*)input,
@@ -391,6 +397,8 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const half4*)beta,
        m,
        n);
+  } else {
+    assert(false && "Unsupported data type for layernorm");
    }
  } else {
    block.x = ((n + 63)/64 + 31)/32*32;
@@ -411,7 +419,7 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const bf16_4*)beta,
        m,
        n);
-   } else {
+  } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
      layernorm_twoPassAlgo_stored_locally_e4<half4, half, 16><<<grid, block, 0, stream>>>(
        (half4*)output,
        (const half4*)input,
@@ -419,6 +427,8 @@ void layernorm(cutlass::MatrixCoord tensor_size,
        (const half4*)beta,
        m,
        n);
+  } else {
+    assert(false && "Unsupported data type for layernorm");
    }
  }
 }
@@ -468,7 +478,7 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const bf16_4*)shift,
         m,
         n);
-    } else {
+    } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
       layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 1><<<grid, block, 0, stream>>>(
         (half4*)output,
         (const half4*)input,
@@ -478,6 +488,8 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const half4*)shift,
         m,
         n);
+    } else {
+      assert(false && "Unsupported data type for layernorm_fused_scale_shift");
     }
   } else if (n <= 8192) {
     block.x = ((n + 7)/8 + 31)/32*32;
@@ -502,7 +514,7 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const bf16_4*)shift,
         m,
         n);
-    } else {
+    } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
       layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 8><<<grid, block, 0, stream>>>(
         (half4*)output,
         (const half4*)input,
@@ -512,6 +524,8 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const half4*)shift,
         m,
         n);
+    } else {
+      assert(false && "Unsupported data type for layernorm_fused_scale_shift");
     }
   } else if (n <= 16384) {
     block.x = ((n + 15)/16 + 31)/32*32;
@@ -536,7 +550,7 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const bf16_4*)shift,
         m,
         n);
-    } else {
+    } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
       layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 4><<<grid, block, 0, stream>>>(
         (half4*)output,
         (const half4*)input,
@@ -546,6 +560,8 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const half4*)shift,
         m,
         n);
+    } else {
+      assert(false && "Unsupported data type for layernorm_fused_scale_shift");
     }
   } else if (n <= 32768) {
     block.x = ((n + 31)/32 + 31)/32*32;
@@ -570,7 +586,7 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const bf16_4*)shift,
         m,
         n);
-    } else {
+    } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
       layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 8><<<grid, block, 0, stream>>>(
         (half4*)output,
         (const half4*)input,
@@ -580,6 +596,8 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const half4*)shift,
         m,
         n);
+    } else {
+      assert(false && "Unsupported data type for layernorm_fused_scale_shift");
     }
   } else {
     block.x = ((n + 63)/64 + 31)/32*32;
@@ -604,7 +622,7 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const bf16_4*)shift,
         m,
         n);
-    } else {
+    } else if (std::is_same<T, cutlass::half_t>::value || std::is_same<T, half>::value) {
       layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 16><<<grid, block, 0, stream>>>(
         (half4*)output,
         (const half4*)input,
@@ -614,6 +632,8 @@ void layernorm_fused_scale_shift(cutlass::MatrixCoord tensor_size,
         (const half4*)shift,
         m,
         n);
+    } else {
+      assert(false && "Unsupported data type for layernorm_fused_scale_shift");
     }
   }
 }
