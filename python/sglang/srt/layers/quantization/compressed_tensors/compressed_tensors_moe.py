@@ -26,7 +26,13 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, set_weight_attrs
+from sglang.srt.utils import (
+    ceil_align,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
