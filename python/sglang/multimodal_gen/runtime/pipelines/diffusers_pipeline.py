@@ -1,504 +1,456 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 # SPDX-License-Identifier: Apache-2.0
 """
-DiffGenerator module for sglang-diffusion.
+Diffusers backend pipeline wrapper.
 
-This module provides a consolidated interface for generating videos using
-diffusion models.
+This module provides a wrapper that allows running any diffusers-supported model
+through sglang's infrastructure using vanilla diffusers pipelines.
 """
 
-import multiprocessing as mp
-import os
-import time
-from copy import deepcopy
+import argparse
+from io import BytesIO
 from typing import Any
+import warnings
 
-import imageio
+from diffusers import DiffusionPipeline
+
 import numpy as np
+import requests
 import torch
-import torchvision
-from einops import rearrange
+import torchvision.transforms as T
+from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    MergeLoraWeightsReq,
-    SetLoraReq,
-    UnmergeLoraWeightsReq,
+from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
+from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+    ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.launch_server import launch_server
-from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
-from sglang.multimodal_gen.runtime.sync_scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    init_logger,
-    suppress_loggers,
-    suppress_other_loggers,
+from sglang.multimodal_gen.runtime.pipelines.executors.pipeline_executor import (
+    PipelineExecutor,
 )
-
-suppress_loggers(["imageio", "imageio_ffmpeg", "PIL", "PIL_Image"])
+from sglang.multimodal_gen.runtime.pipelines.executors.sync_executor import (
+    SyncExecutor,
+)
+from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines.stages import PipelineStage
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# TODO: move to somewhere appropriate
-try:
-    # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
-    # This must be done at the top level of the module, before any CUDA context
-    # or other processes are initialized.
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    # The start method can only be set once per program execution.
-    pass
+
+class DiffusersExecutionStage(PipelineStage):
+    """Pipeline stage that wraps diffusers pipeline execution."""
+
+    def __init__(self, diffusers_pipe: Any):
+        super().__init__()
+        self.diffusers_pipe = diffusers_pipe
+
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        """Execute the diffusers pipeline."""
+
+        kwargs = self._build_pipeline_kwargs(batch, server_args)
+
+        # Request tensor output for cleaner handling
+        if "output_type" not in kwargs:
+            kwargs["output_type"] = "pt"
+
+        with torch.no_grad(), warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            try:
+                output = self.diffusers_pipe(**kwargs)
+            except TypeError as e:
+                # Some pipelines don't support output_type="pt"
+                if "output_type" in str(e):
+                    kwargs.pop("output_type", None)
+                    output = self.diffusers_pipe(**kwargs)
+                else:
+                    raise
+
+        batch.output = self._extract_output(output)
+        if batch.output is not None:
+            batch.output = self._postprocess_output(batch.output)
+
+        return batch
+
+    def _extract_output(self, output: Any) -> torch.Tensor | None:
+        """Extract tensor output from pipeline result."""
+        for attr in ["images", "frames", "video", "sample", "pred_original_sample"]:
+            if not hasattr(output, attr):
+                continue
+
+            data = getattr(output, attr)
+            if data is None:
+                continue
+
+            result = self._convert_to_tensor(data)
+            if result is not None:
+                logger.info(
+                    "Extracted output from '%s': shape=%s, dtype=%s",
+                    attr,
+                    result.shape,
+                    result.dtype,
+                )
+                return result
+
+        logger.warning("Could not extract output from pipeline result")
+        return None
+
+    def _convert_to_tensor(self, data: Any) -> torch.Tensor | None:
+        """Convert various data formats to a tensor."""
+        if isinstance(data, torch.Tensor):
+            return data
+
+        if isinstance(data, np.ndarray):
+            tensor = torch.from_numpy(data).float()
+            if tensor.max() > 1.0:
+                tensor = tensor / 255.0
+            # (B, H, W, C) -> (B, C, H, W) or (B, T, H, W, C) -> (B, C, T, H, W)
+            if tensor.ndim == 4:
+                tensor = tensor.permute(0, 3, 1, 2)
+            elif tensor.ndim == 5:
+                tensor = tensor.permute(0, 4, 1, 2, 3)
+            return tensor
+
+        if hasattr(data, "mode"):  # PIL Image
+            return T.ToTensor()(data)
+
+        if isinstance(data, list) and len(data) > 0:
+            return self._convert_list_to_tensor(data)
+
+        return None
+
+    def _convert_list_to_tensor(self, data: list) -> torch.Tensor | None:
+        """Convert a list of items to a tensor."""
+        first = data[0]
+
+        # Nested list (e.g., [[frame1, frame2, ...]] for video batches)
+        if isinstance(first, list) and len(first) > 0:
+            data = first
+            first = data[0]
+
+        if hasattr(first, "mode"):  # PIL images
+            tensors = [T.ToTensor()(img) for img in data]
+            stacked = torch.stack(tensors)
+            if len(tensors) > 1:
+                return stacked.permute(1, 0, 2, 3)  # (T, C, H, W) -> (C, T, H, W)
+            return stacked[0]
+
+        if isinstance(first, torch.Tensor):
+            stacked = torch.stack(data)
+            if len(data) > 1:
+                return stacked.permute(1, 0, 2, 3)
+            return stacked[0]
+
+        if isinstance(first, np.ndarray):
+            tensors = [torch.from_numpy(arr).float() for arr in data]
+            if tensors[0].max() > 1.0:
+                tensors = [t / 255.0 for t in tensors]
+            if tensors[0].ndim == 3:
+                tensors = [t.permute(2, 0, 1) for t in tensors]
+            stacked = torch.stack(tensors)
+            if len(data) > 1:
+                return stacked.permute(1, 0, 2, 3)
+            return stacked[0]
+
+        return None
+
+    def _postprocess_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Post-process output tensor to ensure valid values and correct shape."""
+        output = output.cpu().float()
+
+        # Handle NaN or Inf values
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            logger.warning("Output contains invalid values, fixing...")
+            output = torch.nan_to_num(output, nan=0.5, posinf=1.0, neginf=0.0)
+
+        # Normalize to [0, 1] range if needed
+        min_val, max_val = output.min().item(), output.max().item()
+        if min_val < -0.5 or max_val > 1.5:
+            output = (output + 1) / 2
+
+        output = output.clamp(0, 1)
+
+        # Ensure correct shape for downstream processing
+        output = self._fix_output_shape(output)
+
+        logger.info("Final output tensor shape: %s", output.shape)
+        return output
+
+    def _fix_output_shape(self, output: torch.Tensor) -> torch.Tensor:
+        """Fix tensor shape for downstream processing.
+
+        Expected: (B, C, H, W) for images or (B, C, T, H, W) for videos.
+        """
+        if output.dim() == 5:
+            # Video: (B, T, C, H, W) -> (B, C, T, H, W)
+            return output.permute(0, 2, 1, 3, 4)
+
+        if output.dim() == 4:
+            if output.shape[0] == 1 or output.shape[1] in [1, 3, 4]:
+                return output  # Already (B, C, H, W)
+            # (T, C, H, W) -> (1, C, T, H, W)
+            return output.unsqueeze(0).permute(0, 2, 1, 3, 4)
+
+        if output.dim() == 3:
+            c, h, w = output.shape
+            if c > 4 and w <= 4:
+                output = output.permute(2, 0, 1)
+            if output.shape[0] == 1:
+                output = output.repeat(3, 1, 1)
+            return output.unsqueeze(0)
+
+        if output.dim() == 2:
+            return output.unsqueeze(0).repeat(3, 1, 1).unsqueeze(0)
+
+        return output
+
+    def _build_pipeline_kwargs(self, batch: Req, server_args: ServerArgs) -> dict:
+        """Build kwargs dict for diffusers pipeline call."""
+        kwargs = {}
+
+        if batch.prompt is not None:
+            kwargs["prompt"] = batch.prompt
+
+        if batch.negative_prompt:
+            kwargs["negative_prompt"] = batch.negative_prompt
+
+        if batch.num_inference_steps is not None:
+            kwargs["num_inference_steps"] = batch.num_inference_steps
+
+        if batch.guidance_scale is not None:
+            kwargs["guidance_scale"] = batch.guidance_scale
+
+        if batch.height is not None:
+            kwargs["height"] = batch.height
+
+        if batch.width is not None:
+            kwargs["width"] = batch.width
+
+        if batch.num_frames is not None and batch.num_frames > 1:
+            kwargs["num_frames"] = batch.num_frames
+
+        # Generator for reproducibility
+        if batch.generator is not None:
+            kwargs["generator"] = batch.generator
+        elif batch.seed is not None:
+            device = self._get_pipeline_device()
+            kwargs["generator"] = torch.Generator(device=device).manual_seed(batch.seed)
+
+        # Image input for img2img or inpainting
+        image = self._load_input_image(batch)
+        if image is not None:
+            kwargs["image"] = image
+
+        if batch.num_outputs_per_prompt > 1:
+            kwargs["num_images_per_prompt"] = batch.num_outputs_per_prompt
+
+        # Extra diffusers-specific kwargs
+        if batch.extra:
+            diffusers_kwargs = batch.extra.get("diffusers_kwargs", {})
+            if diffusers_kwargs:
+                kwargs.update(diffusers_kwargs)
+
+        return kwargs
+
+    def _get_pipeline_device(self) -> str:
+        """Get the device the pipeline is running on."""
+        for attr in ["unet", "transformer", "vae"]:
+            component = getattr(self.diffusers_pipe, attr, None)
+            if component is not None:
+                try:
+                    return next(component.parameters()).device
+                except StopIteration:
+                    pass
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    def _load_input_image(self, batch: Req) -> Image.Image | None:
+        """Load input image from batch."""
+        if batch.pil_image is not None:
+            return batch.pil_image
+
+        if not batch.image_path:
+            return None
+
+        try:
+            if batch.image_path.startswith(("http://", "https://")):
+                response = requests.get(batch.image_path, timeout=30)
+                response.raise_for_status()
+                return Image.open(BytesIO(response.content)).convert("RGB")
+            return Image.open(batch.image_path).convert("RGB")
+        except Exception as e:
+            logger.error("Failed to load image from %s: %s", batch.image_path, e)
+            return None
 
 
-# TODO: rename
-class DiffGenerator:
+class DiffusersPipeline(ComposedPipelineBase):
     """
-    A unified class for generating images/videos using diffusion models.
+    Pipeline wrapper that uses vanilla diffusers pipelines.
 
-    This class provides a simple interface for image/video generation with rich
-    customization options, similar to popular frameworks like HF Diffusers.
+    This allows running any diffusers-supported model through sglang's infrastructure
+    without requiring native sglang implementation.
     """
+
+    pipeline_name = "DiffusersPipeline"
+    is_video_pipeline = False
+    _required_config_modules: list[str] = []
 
     def __init__(
         self,
+        model_path: str,
         server_args: ServerArgs,
+        required_config_modules: list[str] | None = None,
+        loaded_modules: dict[str, torch.nn.Module] | None = None,
+        executor: PipelineExecutor | None = None,
     ):
-        """
-        Initialize the generator.
-
-        Args:
-            server_args: The inference arguments
-        """
         self.server_args = server_args
-        self.port_args = PortArgs.from_server_args(server_args)
+        self.model_path = model_path
+        self._stages: list[PipelineStage] = []
+        self._stage_name_mapping: dict[str, PipelineStage] = {}
+        self.modules: dict[str, Any] = {}
+        self.post_init_called = False
+        self.executor = executor or SyncExecutor(server_args=server_args)
 
-        # The executor is now a client to the Scheduler service
-        self.local_scheduler_process: list[mp.Process] | None = None
-        self.owns_scheduler_client: bool = False
-        self._current_lora_path: str | None = None
-        self._current_lora_nickname: str | None = None
-        self._is_lora_merged: bool = False
+        logger.info("Loading diffusers pipeline from %s", model_path)
+        self.diffusers_pipe = self._load_diffusers_pipeline(model_path, server_args)
+        self._detect_pipeline_type()
+
+    def _load_diffusers_pipeline(
+        self, model_path: str, server_args: ServerArgs
+    ) -> Any:
+        """Load the diffusers pipeline."""
+
+        model_path = maybe_download_model(model_path)
+        self.model_path = model_path
+
+        dtype = self._get_dtype(server_args)
+        logger.info("Loading diffusers pipeline with dtype=%s", dtype)
+
+        try:
+            pipe = DiffusionPipeline.from_pretrained(
+                model_path,
+                torch_dtype=dtype,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+        except Exception as e:
+            logger.warning("Failed with dtype=%s, falling back to float32: %s", dtype, e)
+            pipe = DiffusionPipeline.from_pretrained(
+                model_path,
+                torch_dtype=torch.float32,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+            )
+
+        if torch.cuda.is_available():
+            pipe = pipe.to("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            pipe = pipe.to("mps")
+
+        logger.info("Loaded diffusers pipeline: %s", pipe.__class__.__name__)
+        return pipe
+
+    def _get_dtype(self, server_args: ServerArgs) -> torch.dtype:
+        """Determine the dtype to use for model loading."""
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        if hasattr(server_args, "pipeline_config") and server_args.pipeline_config:
+            dit_precision = getattr(server_args.pipeline_config, "dit_precision", None)
+            if dit_precision == "fp16":
+                dtype = torch.float16
+            elif dit_precision == "bf16":
+                dtype = torch.bfloat16
+            elif dit_precision == "fp32":
+                dtype = torch.float32
+
+        return dtype
+
+    def _detect_pipeline_type(self):
+        """Detect if this is an image or video pipeline."""
+        pipe_class_name = self.diffusers_pipe.__class__.__name__.lower()
+        video_indicators = ["video", "animat", "cogvideo", "wan", "hunyuan"]
+        self.is_video_pipeline = any(ind in pipe_class_name for ind in video_indicators)
+        logger.info(
+            "Detected pipeline type: %s",
+            "video" if self.is_video_pipeline else "image",
+        )
+
+    def load_modules(
+        self,
+        server_args: ServerArgs,
+        loaded_modules: dict[str, torch.nn.Module] | None = None,
+    ) -> dict[str, Any]:
+        """Skip sglang's module loading - diffusers handles it."""
+        return {"diffusers_pipeline": self.diffusers_pipe}
+
+    def create_pipeline_stages(self, server_args: ServerArgs):
+        """Create the execution stage wrapping the diffusers pipeline."""
+        self.add_stage(
+            stage_name="diffusers_execution",
+            stage=DiffusersExecutionStage(self.diffusers_pipe),
+        )
+
+    def initialize_pipeline(self, server_args: ServerArgs):
+        """Initialize the pipeline."""
+        pass
+
+    def post_init(self) -> None:
+        """Post initialization hook."""
+        if self.post_init_called:
+            return
+        self.post_init_called = True
+        self.initialize_pipeline(self.server_args)
+        self.create_pipeline_stages(self.server_args)
+
+    def add_stage(self, stage_name: str, stage: PipelineStage):
+        """Add a stage to the pipeline."""
+        self._stages.append(stage)
+        self._stage_name_mapping[stage_name] = stage
+        setattr(self, stage_name, stage)
+
+    @property
+    def stages(self) -> list[PipelineStage]:
+        """List of stages in the pipeline."""
+        return self._stages
+
+    @torch.no_grad()
+    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        """Execute the pipeline on the given batch."""
+        if not self.post_init_called:
+            self.post_init()
+        return self.executor.execute(self.stages, batch, server_args)
 
     @classmethod
     def from_pretrained(
         cls,
+        model_path: str,
+        device: str | None = None,
+        torch_dtype: torch.dtype | None = None,
+        pipeline_config: str | PipelineConfig | None = None,
+        args: argparse.Namespace | None = None,
+        required_config_modules: list[str] | None = None,
+        loaded_modules: dict[str, torch.nn.Module] | None = None,
         **kwargs,
-    ) -> "DiffGenerator":
-        """
-        Create a DiffGenerator from a pretrained model.
+    ) -> "DiffusersPipeline":
+        """Load a pipeline from a pretrained model using diffusers backend."""
+        kwargs["model_path"] = model_path
+        server_args = ServerArgs.from_kwargs(**kwargs)
 
-        Args:
-            **kwargs: Additional arguments to customize model loading, set any ServerArgs or PipelineConfig attributes here.
-
-        Returns:
-            The created DiffGenerator
-
-        Priority level: Default pipeline config < User's pipeline config < User's kwargs
-        """
-        # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
-
-        if (server_args := kwargs.get("server_args", None)) is not None:
-            if isinstance(server_args, ServerArgs):
-                pass
-            elif isinstance(server_args, dict):
-                server_args = ServerArgs.from_kwargs(**server_args)
-        else:
-            server_args = ServerArgs.from_kwargs(**kwargs)
-
-        return cls.from_server_args(server_args)
-
-    @classmethod
-    def from_server_args(cls, server_args: ServerArgs) -> "DiffGenerator":
-        """
-        Create a DiffGenerator with the specified arguments.
-
-        Args:
-            server_args: The inference arguments
-
-        Returns:
-            The created DiffGenerator
-        """
-        instance = cls(
-            server_args=server_args,
+        pipe = cls(
+            model_path,
+            server_args,
+            required_config_modules=required_config_modules,
+            loaded_modules=loaded_modules,
         )
-        is_local_mode = server_args.is_local_mode
-        logger.info(f"Local mode: {is_local_mode}")
-        if is_local_mode:
-            instance.local_scheduler_process = instance._start_local_server_if_needed()
-        else:
-            # In remote mode, we just need to connect and check.
-            sync_scheduler_client.initialize(server_args)
-            instance._check_remote_scheduler()
+        pipe.post_init()
+        return pipe
 
-        # In both modes, this DiffGenerator instance is responsible for the client's lifecycle.
-        instance.owns_scheduler_client = True
-        return instance
+    def get_module(self, module_name: str, default_value: Any = None) -> Any:
+        """Get a module by name."""
+        if module_name == "diffusers_pipeline":
+            return self.diffusers_pipe
+        return self.modules.get(module_name, default_value)
 
-    def _start_local_server_if_needed(
-        self,
-    ) -> list[mp.Process]:
-        """Check if a local server is running; if not, start it and return the process handles."""
-        # First, we need a client to test the server. Initialize it temporarily.
-        sync_scheduler_client.initialize(self.server_args)
 
-        processes = launch_server(self.server_args, launch_http_server=False)
-
-        return processes
-
-    def _check_remote_scheduler(self):
-        """Check if the remote scheduler is accessible."""
-        if not sync_scheduler_client.ping():
-            raise ConnectionError(
-                f"Could not connect to remote scheduler at "
-                f"{self.server_args.scheduler_endpoint()} with `local mode` as False. "
-                "Please ensure the server is running."
-            )
-        logger.info(
-            f"Successfully connected to remote scheduler at "
-            f"{self.server_args.scheduler_endpoint()}."
-        )
-
-    def post_process_sample(
-        self,
-        sample: torch.Tensor,
-        data_type: DataType,
-        fps: int,
-        save_output: bool = True,
-        save_file_path: str = None,
-    ):
-        """
-        Process a single sample output and save output if necessary
-        """
-        # Process outputs
-        if sample.dim() == 3:
-            # for images, dim t is missing
-            sample = sample.unsqueeze(1)
-        sample = rearrange(sample, "c t h w -> t c h w")
-        frames = []
-        # TODO: this can be batched
-        for x in sample:
-            x = torchvision.utils.make_grid(x, nrow=6)
-            x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
-            frames.append((x * 255).numpy().astype(np.uint8))
-
-        # Save outputs if requested
-        if save_output:
-            if save_file_path:
-                os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-                with suppress_other_loggers():
-                    if data_type == DataType.VIDEO:
-                        imageio.mimsave(
-                            save_file_path,
-                            frames,
-                            fps=fps,
-                            format=data_type.get_default_extension(),
-                        )
-                    else:
-                        imageio.imwrite(save_file_path, frames[0])
-                logger.info("Saved output to %s", save_file_path)
-            else:
-                logger.warning("No output path provided, output not saved")
-
-        return frames
-
-    def generate(
-        self,
-        prompt: str | list[str] | None = None,
-        sampling_params: SamplingParams | None = None,
-        **kwargs,
-    ) -> dict[str, Any] | list[np.ndarray] | list[dict[str, Any]] | None:
-        """
-        Generate a image/video based on the given prompt.
-
-        Args:
-            prompt: The prompt to use for generation (optional if prompt_txt is provided)
-            output_file_name: Name of the file to save. Default is the first 100 characters of the prompt.
-            save_output: Whether to save the output to disk
-            return_frames: Whether to return the raw frames
-            num_inference_steps: Number of denoising steps (overrides server_args)
-            guidance_scale: Classifier-free guidance scale (overrides server_args)
-            num_frames: Number of frames to generate (overrides server_args)
-            height: Height of generated file (overrides server_args)
-            width: Width of generated file (overrides server_args)
-            fps: Frames per second for saved file (overrides server_args)
-            seed: Random seed for generation (overrides server_args)
-            callback: Callback function called after each step
-            callback_steps: Number of steps between each callback
-
-        Returns:
-            Either the output dictionary, list of frames, or list of results for batch processing
-        """
-        # 1. prepare requests
-        prompts: list[str] = []
-        # Handle batch processing from text file
-        if self.server_args.prompt_file_path is not None:
-            prompt_txt_path = self.server_args.prompt_file_path
-            if not os.path.exists(prompt_txt_path):
-                raise FileNotFoundError(
-                    f"Prompt text file not found: {prompt_txt_path}"
-                )
-            # Read prompts from file
-            with open(prompt_txt_path, encoding="utf-8") as f:
-                prompts.extend(line.strip() for line in f if line.strip())
-
-            if not prompts:
-                raise ValueError(f"No prompts found in file: {prompt_txt_path}")
-
-            logger.info("Found %d prompts in %s", len(prompts), prompt_txt_path)
-        elif prompt is not None:
-            if isinstance(prompt, str):
-                prompts.append(prompt)
-            elif isinstance(prompt, list):
-                prompts.extend(prompt)
-        else:
-            raise ValueError("Either prompt or prompt_txt must be provided")
-
-        pretrained_sampling_params = SamplingParams.from_pretrained(
-            self.server_args.model_path, **kwargs
-        )
-        pretrained_sampling_params._merge_with_user_params(sampling_params)
-        # TODO: simplify
-        data_type = (
-            DataType.IMAGE
-            if self.server_args.pipeline_config.task_type.is_image_gen()
-            or pretrained_sampling_params.num_frames == 1
-            else DataType.VIDEO
-        )
-        pretrained_sampling_params.data_type = data_type
-        pretrained_sampling_params._set_output_file_name()
-        pretrained_sampling_params.adjust(self.server_args)
-
-        # Extract diffusers_kwargs if passed
-        diffusers_kwargs = kwargs.pop("diffusers_kwargs", None)
-
-        requests: list[Req] = []
-        for output_idx, p in enumerate(prompts):
-            current_sampling_params = deepcopy(pretrained_sampling_params)
-            current_sampling_params.prompt = p
-            req = prepare_request(
-                p,
-                server_args=self.server_args,
-                sampling_params=current_sampling_params,
-            )
-            # Add diffusers_kwargs to request's extra dict
-            if diffusers_kwargs:
-                req.extra["diffusers_kwargs"] = diffusers_kwargs
-            requests.append(req)
-
-        results = []
-        total_start_time = time.perf_counter()
-        # 2. send requests to scheduler, one at a time
-        # TODO: send batch when supported
-        for request_idx, req in enumerate(requests):
-            logger.info(
-                "Processing prompt %d/%d: %s",
-                request_idx + 1,
-                len(requests),
-                req.prompt[:100],
-            )
-            try:
-                start_time = time.perf_counter()
-                output_batch = self._send_to_scheduler_and_wait_for_response([req])
-                gen_time = time.perf_counter() - start_time
-                if output_batch.error:
-                    raise Exception(f"{output_batch.error}")
-
-                # FIXME: in generate mode, an internal assertion error won't raise an error
-                logger.info(
-                    "Pixel data generated successfully in %.2f seconds",
-                    gen_time,
-                )
-
-                if output_batch.output is None:
-                    logger.error(
-                        "Received empty output from scheduler for prompt %d",
-                        request_idx + 1,
-                    )
-                    continue
-                for output_idx, sample in enumerate(output_batch.output):
-                    num_outputs = len(output_batch.output)
-                    frames = self.post_process_sample(
-                        sample,
-                        fps=req.fps,
-                        save_output=req.save_output,
-                        save_file_path=req.output_file_path(num_outputs, output_idx),
-                        data_type=req.data_type,
-                    )
-
-                    result_item: dict[str, Any] = {
-                        "samples": sample,
-                        "frames": frames,
-                        "prompts": req.prompt,
-                        "size": (req.height, req.width, req.num_frames),
-                        "generation_time": gen_time,
-                        "timings": (
-                            output_batch.timings.to_dict()
-                            if output_batch.timings
-                            else {}
-                        ),
-                        "trajectory": output_batch.trajectory_latents,
-                        "trajectory_timesteps": output_batch.trajectory_timesteps,
-                        "trajectory_decoded": output_batch.trajectory_decoded,
-                        "prompt_index": output_idx,
-                    }
-                    results.append(result_item)
-            except Exception as e:
-                logger.error(
-                    "Failed to generate output for prompt %d: %s",
-                    request_idx + 1,
-                    e,
-                    exc_info=True,
-                )
-                continue
-
-        total_gen_time = time.perf_counter() - total_start_time
-        logger.info(
-            "Completed batch processing. Generated %d outputs in %.2f seconds.",
-            len(results),
-            total_gen_time,
-        )
-
-        if len(results) == 0:
-            return None
-        else:
-            if requests[0].return_frames:
-                results = [r["frames"] for r in results]
-            if len(results) == 1:
-                return results[0]
-            return results
-
-    def _send_to_scheduler_and_wait_for_response(self, batch: list[Req]) -> OutputBatch:
-        """
-        Sends a request to the scheduler and waits for a response.
-        """
-        return sync_scheduler_client.forward(batch)
-
-    # LoRA
-    def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
-        response = sync_scheduler_client.forward(req)
-        if isinstance(response, dict) and response.get("status") == "ok":
-            logger.info(success_msg)
-        else:
-            error_msg = (
-                response.get("message", "Unknown error")
-                if isinstance(response, dict)
-                else "Unknown response format"
-            )
-            raise RuntimeError(f"{failure_msg}: {error_msg}")
-
-    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
-        req = SetLoraReq(lora_nickname=lora_nickname, lora_path=lora_path)
-        self._send_lora_request(
-            req,
-            f"Successfully set LoRA adapter: {lora_nickname}",
-            "Failed to set LoRA adapter",
-        )
-
-    def unmerge_lora_weights(self) -> None:
-        req = UnmergeLoraWeightsReq()
-        self._send_lora_request(
-            req,
-            "Successfully unmerged LoRA weights",
-            "Failed to unmerge LoRA weights",
-        )
-        self._is_lora_merged = False
-
-    def merge_lora_weights(self) -> None:
-        req = MergeLoraWeightsReq()
-        self._send_lora_request(
-            req, "Successfully merged LoRA weights", "Failed to merge LoRA weights"
-        )
-        self._is_lora_merged = True
-
-    def _ensure_lora_state(
-        self,
-        lora_path: str | None,
-        lora_nickname: str | None = None,
-        merge_lora: bool = True,
-    ) -> None:
-        if lora_path is None:
-            if self._is_lora_merged:
-                self.unmerge_lora_weights()
-            self._current_lora_path = None
-            self._current_lora_nickname = None
-            self._is_lora_merged = False
-            return
-
-        lora_nickname = lora_nickname or self.server_args.lora_nickname
-
-        if self._current_lora_path != lora_path:
-            if self._is_lora_merged:
-                self.unmerge_lora_weights()
-                self._is_lora_merged = False
-            self.set_lora(lora_nickname, lora_path)
-            self._current_lora_path = lora_path
-            self._current_lora_nickname = lora_nickname
-            self._is_lora_merged = False
-
-        if merge_lora and not self._is_lora_merged:
-            self.merge_lora_weights()
-        elif not merge_lora:
-            self._is_lora_merged = False
-
-    def generate_with_lora(
-        self,
-        prompt: str | list[str] | None = None,
-        sampling_params: SamplingParams | None = None,
-        *,
-        lora_path: str | None = None,
-        lora_nickname: str | None = None,
-        merge_lora: bool = True,
-        **kwargs,
-    ):
-        self._ensure_lora_state(
-            lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
-        )
-        return self.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            **kwargs,
-        )
-
-    def shutdown(self):
-        """
-        Shutdown the generator.
-        If in local mode, it also shuts down the scheduler server.
-        """
-        # sends the shutdown command to the server
-        if self.local_scheduler_process:
-            logger.info("Waiting for local worker processes to terminate...")
-            for process in self.local_scheduler_process:
-                process.join(timeout=10)
-                if process.is_alive():
-                    logger.warning(
-                        f"Local worker {process.name} did not terminate gracefully, forcing."
-                    )
-                    process.terminate()
-            self.local_scheduler_process = None
-
-        if self.owns_scheduler_client:
-            sync_scheduler_client.close()
-            self.owns_scheduler_client = False
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.shutdown()
-
-    def __del__(self):
-        if self.owns_scheduler_client:
-            logger.warning(
-                "Generator was garbage collected without being shut down. "
-                "Attempting to shut down the local server and client."
-            )
-            self.shutdown()
-        elif self.local_scheduler_process:
-            logger.warning(
-                "Generator was garbage collected without being shut down. "
-                "Attempting to shut down the local server."
-            )
-            self.shutdown()
+EntryClass = DiffusersPipeline

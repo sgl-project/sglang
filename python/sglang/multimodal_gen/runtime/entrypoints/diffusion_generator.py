@@ -271,16 +271,22 @@ class DiffGenerator:
         pretrained_sampling_params._set_output_file_name()
         pretrained_sampling_params.adjust(self.server_args)
 
+        # Extract diffusers_kwargs if passed
+        diffusers_kwargs = kwargs.pop("diffusers_kwargs", None)
+
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
             current_sampling_params = deepcopy(pretrained_sampling_params)
             current_sampling_params.prompt = p
-            requests.append(
-                prepare_request(
-                    server_args=self.server_args,
-                    sampling_params=current_sampling_params,
-                )
+            req = prepare_request(
+                p,
+                server_args=self.server_args,
+                sampling_params=current_sampling_params,
             )
+            # Add diffusers_kwargs to request's extra dict
+            if diffusers_kwargs:
+                req.extra["diffusers_kwargs"] = diffusers_kwargs
+            requests.append(req)
 
         results = []
         total_start_time = time.perf_counter()
