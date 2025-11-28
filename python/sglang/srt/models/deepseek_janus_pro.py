@@ -247,6 +247,11 @@ def resample_patch_embed(
     Returns:
         Resized patch embedding kernel.
     """
+    if any(x <= 0 for x in new_size):
+        raise ValueError(f"new_size elements must be positive integers, got {new_size}")
+    if any(isinstance(x, float) for x in new_size):
+        new_size = [int(x) for x in new_size]
+
     import numpy as np
 
     try:
