@@ -1008,6 +1008,7 @@ class Glm4MoeForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        self.num_fused_shared_experts = 0
         self.determine_num_fused_shared_experts()
         self.model = Glm4MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -1028,7 +1029,6 @@ class Glm4MoeForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
@@ -1056,6 +1056,7 @@ class Glm4MoeForCausalLM(nn.Module):
         assert (
             self.num_fused_shared_experts == 1
         ), "Only 1 fused shared expert is supported for Glm4MoeForCausalLM"
+        log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     @torch.no_grad()
     def forward(
@@ -1111,15 +1112,11 @@ class Glm4MoeForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        num_fused_shared_experts = getattr(self, "num_fused_shared_experts", 0)
-        if num_fused_shared_experts > 0:
-            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
-
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts + num_fused_shared_experts,
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
         if is_nextn:
@@ -1136,7 +1133,9 @@ class Glm4MoeForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             weight_names.append(name)
 
-            if num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+            if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
+                # Map shared expert weights to the last expert slot
+                # Shared expert becomes expert ID = n_routed_experts
                 name = name.replace(
                     "mlp.shared_experts",
                     f"mlp.experts.{self.config.n_routed_experts}",
