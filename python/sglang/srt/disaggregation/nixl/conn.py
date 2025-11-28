@@ -697,6 +697,20 @@ class NixlKVSender(CommonKVSender):
         self.has_sent = False
         self.chunk_id = 0
 
+    def _release_xfer_handles(self):
+        """Release all outstanding transfer handles."""
+
+        if not self.xfer_handles:
+            return
+
+        for handle in self.xfer_handles:
+            try:
+                self.kv_mgr.agent.release_xfer_handle(handle)
+            except Exception:
+                logger.warning("Failed to release transfer handle", exc_info=True)
+
+        self.xfer_handles.clear()
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -733,11 +747,13 @@ class NixlKVSender(CommonKVSender):
                     raise Exception("KVSender transfer encountered an error.")
                 return KVPoll.Success  # type: ignore
             finally:
-                for handle in self.xfer_handles:
-                    self.kv_mgr.agent.release_xfer_handle(handle)
-                self.xfer_handles.clear()
+                self._release_xfer_handles()
 
         return KVPoll.WaitingForInput  # type: ignore
+
+    def __del__(self):
+        # Ensure handles are returned even if poll() is not called again
+        self._release_xfer_handles()
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
