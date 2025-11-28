@@ -85,7 +85,6 @@ def _build_sampling_params_from_request(
     return sampling_params
 
 
-
 def _build_req_from_sampling(s: SamplingParams) -> Req:
     return Req(
         request_id=s.request_id,

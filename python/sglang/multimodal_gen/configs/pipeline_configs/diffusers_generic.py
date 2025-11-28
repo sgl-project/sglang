@@ -8,11 +8,7 @@ Since diffusers handles its own model loading and configuration, this config is 
 
 from dataclasses import dataclass, field
 
-from sglang.multimodal_gen.configs.models import (
-    DiTConfig,
-    EncoderConfig,
-    VAEConfig,
-)
+from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,

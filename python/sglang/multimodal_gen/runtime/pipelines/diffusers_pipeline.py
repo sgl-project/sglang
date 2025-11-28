@@ -32,9 +32,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-    maybe_download_model,
-)
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -268,9 +266,13 @@ class DiffusersExecutionStage(PipelineStage):
     def _load_input_image(self, batch: Req) -> Image.Image | None:
         """Load input image from batch."""
         # Check for PIL image in condition_image or pixel_values
-        if batch.condition_image is not None and isinstance(batch.condition_image, Image.Image):
+        if batch.condition_image is not None and isinstance(
+            batch.condition_image, Image.Image
+        ):
             return batch.condition_image
-        if batch.pixel_values is not None and isinstance(batch.pixel_values, Image.Image):
+        if batch.pixel_values is not None and isinstance(
+            batch.pixel_values, Image.Image
+        ):
             return batch.pixel_values
 
         if not batch.image_path:
@@ -319,9 +321,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         self.diffusers_pipe = self._load_diffusers_pipeline(model_path, server_args)
         self._detect_pipeline_type()
 
-    def _load_diffusers_pipeline(
-        self, model_path: str, server_args: ServerArgs
-    ) -> Any:
+    def _load_diffusers_pipeline(self, model_path: str, server_args: ServerArgs) -> Any:
         """Load the diffusers pipeline."""
 
         original_model_path = model_path  # Keep original for custom_pipeline
@@ -341,7 +341,9 @@ class DiffusersPipeline(ComposedPipelineBase):
         except AttributeError as e:
             if "has no attribute" in str(e):
                 # Custom pipeline class not in diffusers - try loading with custom_pipeline
-                logger.info("Pipeline class not found in diffusers, trying custom_pipeline from repo...")
+                logger.info(
+                    "Pipeline class not found in diffusers, trying custom_pipeline from repo..."
+                )
                 try:
                     pipe = DiffusionPipeline.from_pretrained(
                         model_path,
@@ -363,7 +365,9 @@ class DiffusersPipeline(ComposedPipelineBase):
         except Exception as e:
             # Only retry with float32 for dtype-related errors
             if "dtype" in str(e).lower() or "float" in str(e).lower():
-                logger.warning("Failed with dtype=%s, falling back to float32: %s", dtype, e)
+                logger.warning(
+                    "Failed with dtype=%s, falling back to float32: %s", dtype, e
+                )
                 pipe = DiffusionPipeline.from_pretrained(
                     model_path,
                     torch_dtype=torch.float32,

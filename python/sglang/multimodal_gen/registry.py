@@ -13,7 +13,17 @@ import os
 import pkgutil
 import re
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
@@ -215,6 +225,7 @@ class ModelInfo:
     sampling_param_cls: Any
     pipeline_config_cls: Type[PipelineConfig]
 
+
 def _get_diffusers_model_info(model_path: str) -> ModelInfo:
     """
     Get model info for diffusers backend.
@@ -236,6 +247,7 @@ def _get_diffusers_model_info(model_path: str) -> ModelInfo:
         sampling_param_cls=DiffusersGenericSamplingParams,
         pipeline_config_cls=DiffusersGenericPipelineConfig,
     )
+
 
 @lru_cache(maxsize=1)
 def get_model_info(

@@ -126,7 +126,9 @@ def generate_cmd(args: argparse.Namespace):
         extra_kwargs["diffusers_kwargs"] = diffusers_kwargs
 
     results = generator.generate(
-        prompt=sampling_params.prompt, sampling_params=sampling_params, **extra_kwargs,
+        prompt=sampling_params.prompt,
+        sampling_params=sampling_params,
+        **extra_kwargs,
     )
 
     maybe_dump_performance(args, server_args, sampling_params, results)

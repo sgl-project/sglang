@@ -81,7 +81,6 @@ def _build_sampling_params_from_request(
     return sampling_params
 
 
-
 # extract metadata which http_server needs to know
 def _video_job_from_sampling(
     request_id: str, req: VideoGenerationsRequest, sampling: SamplingParams

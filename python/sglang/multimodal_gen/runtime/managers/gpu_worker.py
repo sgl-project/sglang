@@ -135,7 +135,6 @@ class GPUWorker:
         finally:
             return output_batch
 
-
     def merge_lora_weights(self) -> None:
         """
         Merge LoRA weights.

@@ -200,6 +200,7 @@ class WorkloadType(str, Enum):
         """Get all available choices as strings for argparse."""
         return [workload.value for workload in cls]
 
+
 class Backend(str, Enum):
     """
     Enumeration for different model backends.
@@ -226,7 +227,8 @@ class Backend(str, Enum):
     def choices(cls) -> list[str]:
         """Get all available choices as strings for argparse."""
         return [backend.value for backend in cls]
-    
+
+
 # args for sgl_diffusion framework
 @dataclasses.dataclass
 class ServerArgs:
