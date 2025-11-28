@@ -21,13 +21,21 @@ from typing import Callable, Dict, Optional
 import torch
 import zmq
 
+from sglang.srt.utils import is_npu
+
 try:
     from checkpoint_engine.worker import update_weights_from_ipc
+    from checkpoint_engine.device_utils import npu_generate_uuid
 except ImportError:
     raise ImportError(
         "checkpoint-engine is not installed. "
         "Please install it with: pip install sglang[checkpoint-engine]"
     )
+
+is_npu = is_npu()
+
+if is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -101,15 +109,21 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
     def get_device_uuid(self) -> str:
         """Get the UUID of current device."""
         # Get device UUID for current device
-        device_id = torch.cuda.current_device()
         try:
-            return f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
+            if is_npu:
+                return f"NPU-{npu_generate_uuid()}"
+            else:
+                device_id = torch.cuda.current_device()
+                return f"GPU-{torch.cuda.get_device_properties(device_id).uuid!s}"
         except AssertionError as e:
             raise ValueError(f"Failed to get GPU UUID for device {device_id}") from e
 
     def get_device_id(self) -> int:
         """Get the device ID."""
-        return torch.cuda.current_device()
+        if is_npu:
+            return torch_npu.npu.current_device()
+        else:
+            return torch.cuda.current_device()
 
     def get_model_loader(self) -> Callable:
         """Get the model weight loader function."""
@@ -128,9 +142,14 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         # Move parameters to device if needed for quantization processing
-                        target_device = torch.device(
-                            "cuda", torch.cuda.current_device()
-                        )
+                        if is_npu:
+                            target_device = torch.device(
+                                "cuda", torch.cuda.current_device()
+                            )
+                        else:
+                            target_device = torch.device(
+                                "npu", torch_npu.npu.current_device()
+                            )
                         with device_loading_context(module, target_device):
                             quant_method.process_weights_after_loading(module)
                 # Call model-specific post-loading hook if available
