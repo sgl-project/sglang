@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,18 @@ from sglang.srt.utils import (
     is_hip,
     set_weight_attrs,
 )
+
+
+def _pad_moe_weight(weight: torch.Tensor, dim: int, alignment: int) -> torch.Tensor:
+    """Helper to pad MoE weight tensor along specified dimension."""
+    current_size = weight.shape[dim]
+    aligned_size = ceil_align(current_size, alignment)
+    if aligned_size == current_size:
+        return weight
+    
+    pad_sizes = [0] * (len(weight.shape) * 2)
+    pad_sizes[-(dim * 2 + 1)] = aligned_size - current_size
+    return torch.nn.functional.pad(weight, pad_sizes)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -332,69 +345,22 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     topk_weights, dtype=torch.float32
                 )  # topk_weights must be FP32 (float32)
             
-            w13_weight = layer.w13_weight
-            w2_weight = layer.w2_weight
-            w1_scale = layer.w13_weight_scale
-            w2_scale = layer.w2_weight_scale
-            
-            # Pad MoE inter_dim to 128 alignment for certain AITer MoE kernels
-            if get_bool_env_var("SGLANG_AITER_PAD_K"):
-                inter_dim = layer.w2_weight.shape[2]
-                inter_dim_aligned = ceil_align(inter_dim, 128)
-                
-                if inter_dim_aligned != inter_dim:
-                    E, model_dim, _ = layer.w2_weight.shape
-                    
-                    # Pad w2_weight: [E, model_dim, inter_dim] -> [E, model_dim, inter_dim_aligned]
-                    w2_weight = torch.zeros(
-                        (E, model_dim, inter_dim_aligned),
-                        dtype=layer.w2_weight.dtype,
-                        device=layer.w2_weight.device
-                    )
-                    w2_weight[:, :, :inter_dim] = layer.w2_weight
-                    
-                    # Pad w13_weight
-                    if layer.w13_weight.shape[1] == inter_dim * 2:
-                        w13_weight = torch.zeros(
-                            (E, inter_dim_aligned * 2, model_dim),
-                            dtype=layer.w13_weight.dtype,
-                            device=layer.w13_weight.device
-                        )
-                        w13_weight[:, :inter_dim * 2, :] = layer.w13_weight
-                    else:
-                        w13_weight = torch.zeros(
-                            (E, inter_dim_aligned, model_dim),
-                            dtype=layer.w13_weight.dtype,
-                            device=layer.w13_weight.device
-                        )
-                        w13_weight[:, :inter_dim, :] = layer.w13_weight
-                    
-                    # Pad scales
-                    if layer.w13_weight_scale is not None and len(layer.w13_weight_scale.shape) == 3:
-                        scale_dim = layer.w13_weight_scale.shape[1]
-                        if scale_dim == inter_dim * 2:
-                            w1_scale = torch.zeros(
-                                (E, inter_dim_aligned * 2, 1),
-                                dtype=layer.w13_weight_scale.dtype,
-                                device=layer.w13_weight_scale.device
-                            )
-                            w1_scale[:, :inter_dim * 2, :] = layer.w13_weight_scale
-                        elif scale_dim == inter_dim:
-                            w1_scale = torch.zeros(
-                                (E, inter_dim_aligned, 1),
-                                dtype=layer.w13_weight_scale.dtype,
-                                device=layer.w13_weight_scale.device
-                            )
-                            w1_scale[:, :inter_dim, :] = layer.w13_weight_scale
-                    
-                    if layer.w2_weight_scale is not None and len(layer.w2_weight_scale.shape) == 3:
-                        if layer.w2_weight_scale.shape[1] == inter_dim:
-                            w2_scale = torch.zeros(
-                                (E, inter_dim_aligned, 1),
-                                dtype=layer.w2_weight_scale.dtype,
-                                device=layer.w2_weight_scale.device
-                            )
-                            w2_scale[:, :inter_dim, :] = layer.w2_weight_scale
+            # Pad MoE inter_dim for certain AITer MoE kernels if alignment is specified
+            # SGLANG_AITER_PAD_K can be set to alignment value (e.g., 128, 256)
+            pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+            if pad_k_align and pad_k_align.isdigit():
+                k_align = int(pad_k_align)
+                # w2_weight: [E, model_dim, inter_dim], pad dim=2
+                # w13_weight: [E, inter_dim or inter_dim*2, model_dim], pad dim=1
+                w13_weight = _pad_moe_weight(layer.w13_weight, dim=1, alignment=k_align)
+                w2_weight = _pad_moe_weight(layer.w2_weight, dim=2, alignment=k_align)
+                w1_scale = _pad_moe_weight(layer.w13_weight_scale, dim=1, alignment=k_align) if layer.w13_weight_scale is not None else None
+                w2_scale = _pad_moe_weight(layer.w2_weight_scale, dim=1, alignment=k_align) if layer.w2_weight_scale is not None else None
+            else:
+                w13_weight = layer.w13_weight
+                w2_weight = layer.w2_weight
+                w1_scale = layer.w13_weight_scale
+                w2_scale = layer.w2_weight_scale
             
             output = fused_moe(
                 x,

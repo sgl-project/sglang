@@ -758,26 +758,19 @@ def apply_fp8_linear(
             # w_scale -> weight scale tensor, shape = (n ,1)
             # dtype -> output dtype
             
-            # Pad K dimension to 128 alignment for certain AITer kernels
-            if get_bool_env_var("SGLANG_AITER_PAD_K"):
+            # Pad K dimension for certain AITer kernels if alignment is specified
+            # SGLANG_AITER_PAD_K can be set to alignment value (e.g., 128, 256)
+            pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+            if pad_k_align and pad_k_align.isdigit():
+                k_align = int(pad_k_align)
                 k = weight.shape[0]
-                k_aligned = ceil_align(k, 128)
+                k_aligned = ceil_align(k, k_align)
                 
                 if k_aligned != k:
                     # Pad input: (m, k) -> (m, k_aligned)
-                    qinput_padded = torch.zeros(
-                        (qinput.shape[0], k_aligned), dtype=qinput.dtype, device=qinput.device
-                    )
-                    qinput_padded[:, :k] = qinput
-                    
+                    qinput = torch.nn.functional.pad(qinput, (0, k_aligned - k))
                     # Pad weight: (k, n) -> (k_aligned, n)
-                    weight_padded = torch.zeros(
-                        (k_aligned, weight.shape[1]), dtype=weight.dtype, device=weight.device
-                    )
-                    weight_padded[:k, :] = weight
-                    
-                    qinput = qinput_padded
-                    weight = weight_padded
+                    weight = torch.nn.functional.pad(weight, (0, 0, 0, k_aligned - k))
             
             output = gemm_a8w8_bpreshuffle(
                 XQ=qinput,
