@@ -519,12 +519,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         latents = _unpatchify_latents(latents)
         return latents
 
-    def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
-        calculated_width, calculated_height, _ = calculate_dimensions(
-            1024 * 1024, width / height
-        )
-        return calculated_width, calculated_height
-
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
         latents_bn_mean = (
