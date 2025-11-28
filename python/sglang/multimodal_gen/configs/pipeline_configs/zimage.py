@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    shard_rotary_emb_for_sp,
 )
 
 
@@ -72,3 +73,22 @@ class ZImagePipelineConfig(ImagePipelineConfig):
     def post_denoising_loop(self, latents, batch):
         bs, channels, num_frames, height, width = latents.shape
         return latents.view(bs, channels, height, width)
+
+    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+        txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device)
+        img_ids = self._prepare_latent_image_ids(
+            original_height=height,
+            original_width=width,
+            device=device,
+        )
+
+        # NOTE(mick): prepare it here, to avoid unnecessary computations
+        img_cos, img_sin = rotary_emb.forward(img_ids)
+        img_cos = shard_rotary_emb_for_sp(img_cos)
+        img_sin = shard_rotary_emb_for_sp(img_sin)
+
+        txt_cos, txt_sin = rotary_emb.forward(txt_ids)
+
+        cos = torch.cat([txt_cos, img_cos], dim=0).to(device=device)
+        sin = torch.cat([txt_sin, img_sin], dim=0).to(device=device)
+        return cos, sin

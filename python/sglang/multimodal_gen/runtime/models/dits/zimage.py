@@ -433,7 +433,7 @@ class ZImageTransformer2DModel(CachableDiT):
         self.axes_dims = arch_config.axes_dims
         self.axes_lens = arch_config.axes_lens
 
-        self.rope_embedder = RopeEmbedder(
+        self.rotary_emb = RopeEmbedder(
             theta=self.rope_theta, axes_dims=self.axes_dims, axes_lens=self.axes_lens
         )
 
@@ -561,13 +561,14 @@ class ZImageTransformer2DModel(CachableDiT):
     def forward(
         self,
         hidden_states: List[torch.Tensor],
-        timestep,
         encoder_hidden_states: List[torch.Tensor],
+        timestep,
         guidance=0,
         patch_size=2,
         f_patch_size=1,
         **kwargs,
     ):
+        print(f"{kwargs=}", flush=True)
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
@@ -590,7 +591,7 @@ class ZImageTransformer2DModel(CachableDiT):
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
         x_pos_ids = torch.cat(x_pos_ids, dim=0)
-        x_freqs_cis = self.rope_embedder(x_pos_ids)
+        x_freqs_cis = self.rotary_emb(x_pos_ids)
 
         x = x.unsqueeze(0)
         x_freqs_cis = x_freqs_cis.unsqueeze(0)
@@ -602,7 +603,7 @@ class ZImageTransformer2DModel(CachableDiT):
         cap_feats, _ = self.cap_embedder(cap_feats)
 
         cap_pos_ids = torch.cat(cap_pos_ids, dim=0)
-        cap_freqs_cis = self.rope_embedder(cap_pos_ids)
+        cap_freqs_cis = self.rotary_emb(cap_pos_ids)
 
         cap_feats = cap_feats.unsqueeze(0)
         cap_freqs_cis = cap_freqs_cis.unsqueeze(0)
