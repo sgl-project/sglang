@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -31,10 +30,6 @@ class TestMoERunner(CustomTestCase):
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "triton",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
             ],
         },
         "moe_runner_triton_kernel": {
@@ -43,15 +38,11 @@ class TestMoERunner(CustomTestCase):
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "triton_kernel",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
             ],
         },
         "moe_runner_flashinfer_trtllm": {
-            # modelopt_fp4 or fp8 quantization is required for Flashinfer trtllm MOE
-            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            # fp8 quantization is required for Flashinfer trtllm MOE
+            "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [
                 "--trust-remote-code",
                 "--quantization",
@@ -76,10 +67,8 @@ class TestMoERunner(CustomTestCase):
                 "2",
                 "--speculative-num-draft-tokens",
                 "4",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
+                "--speculative-eagle-topk",
+                "1",
             ],
         },
     }

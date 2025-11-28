@@ -37,10 +37,6 @@ class TestMoERunner2GPU(CustomTestCase):
                 "deep_gemm",
                 "--moe-a2a-backend",
                 "deepep",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
             ],
         },
     }

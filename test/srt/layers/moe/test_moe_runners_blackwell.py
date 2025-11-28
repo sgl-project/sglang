@@ -36,10 +36,6 @@ class TestMoERunnerBlackwell(CustomTestCase):
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "flashinfer_cutlass",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
             ],
         },
         "moe_runner_flashinfer_cutedsl": {
@@ -48,10 +44,6 @@ class TestMoERunnerBlackwell(CustomTestCase):
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
             ],
         },
         "moe_runner_cutlass": {
@@ -60,10 +52,6 @@ class TestMoERunnerBlackwell(CustomTestCase):
                 "--trust-remote-code",
                 "--moe-runner-backend",
                 "cutlass",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
             ],
         },
         # MXFP4 models require Blackwell for native FP4 support
@@ -75,10 +63,6 @@ class TestMoERunnerBlackwell(CustomTestCase):
                 "flashinfer_mxfp4",
                 "--quantization",
                 "mxfp4",
-                "--attention-backend",
-                "torch_native",
-                "--sampling-backend",
-                "pytorch",
             ],
         },
     }
