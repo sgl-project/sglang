@@ -9,6 +9,7 @@ on:
       - 'sgl-router/**'
   pull_request:
     branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
@@ -26,7 +27,11 @@ permissions:
 
 jobs:
   test-disaggregation:
-    if: github.event_name != 'pull_request' || (contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark'))
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci' && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'router-benchmark' && contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: [8-gpu-h200-oracle]
     timeout-minutes: 45
 
