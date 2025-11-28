@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
 from typing import Any
 
+import PIL
 import torch
-from diffusers.image_processor import VaeImageProcessor
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models import (
@@ -183,6 +183,9 @@ class PipelineConfig:
         height, width = get_default_height_width(image, vae_scale_factor, height, width)
         return width, height
 
+    def resize_condition_image(self, image, target_width, target_height):
+        return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+
     def slice_noise_pred(self, noise, latents):
         return noise
 
@@ -192,7 +195,6 @@ class PipelineConfig:
     # tokenize the prompt
     def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
         return tokenizer(prompt, **tok_kwargs)
-
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio

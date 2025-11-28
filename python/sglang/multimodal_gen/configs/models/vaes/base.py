@@ -140,6 +140,9 @@ class VAEConfig(ModelConfig):
 
         return parser
 
+    def get_vae_scale_factor(self):
+        return 2 ** (len(self.arch_config.block_out_channels) - 1)
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace) -> "VAEConfig":
         kwargs = {}
