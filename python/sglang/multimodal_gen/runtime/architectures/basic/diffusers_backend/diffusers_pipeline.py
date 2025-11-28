@@ -214,12 +214,21 @@ class DiffusersPipeline(ComposedPipelineBase):
         try:
             pipe = DiffusionPipeline.from_pretrained(model_path, torch_dtype=dtype, trust_remote_code=server_args.trust_remote_code, revision=server_args.revision)
         except AttributeError as e:
-            if "has no attribute" in str(e) and not server_args.trust_remote_code:
-                raise RuntimeError(
-                    f"This model uses a custom pipeline class not in diffusers. "
-                    f"Please add --trust-remote-code flag to load it. Original error: {e}"
-                ) from e
-            raise
+            if "has no attribute" in str(e):
+                # Custom pipeline class not in diffusers - try loading with custom_pipeline
+                logger.info("Pipeline class not found in diffusers, trying custom_pipeline from repo...")
+                try:
+                    pipe = DiffusionPipeline.from_pretrained(
+                        model_path, torch_dtype=dtype, custom_pipeline=model_path,
+                        trust_remote_code=True, revision=server_args.revision
+                    )
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Failed to load custom pipeline. Make sure the model repo contains the pipeline code. "
+                        f"Original error: {e}, Retry error: {e2}"
+                    ) from e2
+            else:
+                raise
         except Exception as e:
             # Only retry with float32 for dtype-related errors
             if "dtype" in str(e).lower() or "float" in str(e).lower():
