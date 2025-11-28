@@ -200,12 +200,41 @@ class WorkloadType(str, Enum):
         """Get all available choices as strings for argparse."""
         return [workload.value for workload in cls]
 
+class Backend(str, Enum):
+    """
+    Enumeration for different model backends.
+    - AUTO: Automatically select backend (prefer sglang native, fallback to diffusers)
+    - SGLANG: Use sglang's native optimized implementation
+    - DIFFUSERS: Use vanilla diffusers pipeline (supports all diffusers models)
+    """
 
+    AUTO = "auto"
+    SGLANG = "sglang"
+    DIFFUSERS = "diffusers"
+
+    @classmethod
+    def from_string(cls, value: str) -> "Backend":
+        """Convert string to Backend enum."""
+        try:
+            return cls(value.lower())
+        except ValueError:
+            raise ValueError(
+                f"Invalid backend: {value}. Must be one of: {', '.join([m.value for m in cls])}"
+            ) from None
+
+    @classmethod
+    def choices(cls) -> list[str]:
+        """Get all available choices as strings for argparse."""
+        return [backend.value for backend in cls]
+    
 # args for sgl_diffusion framework
 @dataclasses.dataclass
 class ServerArgs:
     # Model and path configuration (for convenience)
     model_path: str
+
+    # Model backend (sglang native or diffusers)
+    backend: Backend = Backend.AUTO
 
     # Attention
     attention_backend: str = None
@@ -641,6 +670,14 @@ class ServerArgs:
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
         )
+        parser.add_argument(
+            "--backend",
+            type=str,
+            choices=Backend.choices(),
+            default=ServerArgs.backend.value,
+            help="The model backend to use. 'auto' prefers sglang native and falls back to diffusers. "
+            "'sglang' uses native optimized implementation. 'diffusers' uses vanilla diffusers pipeline.",
+        )
         return parser
 
     def url(self):
@@ -768,10 +805,12 @@ class ServerArgs:
         # Convert mode string to enum if necessary
         if "mode" in kwargs and isinstance(kwargs["mode"], str):
             kwargs["mode"] = ExecutionMode.from_string(kwargs["mode"])
-
         # Convert workload_type string to enum if necessary
         if "workload_type" in kwargs and isinstance(kwargs["workload_type"], str):
             kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
+        # Convert backend string to enum if necessary
+        if "backend" in kwargs and isinstance(kwargs["backend"], str):
+            kwargs["backend"] = Backend.from_string(kwargs["backend"])
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)

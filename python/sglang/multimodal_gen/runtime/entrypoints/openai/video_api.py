@@ -49,14 +49,13 @@ def _build_sampling_params_from_request(
 ) -> SamplingParams:
     width, height = _parse_size(request.size or "720x1280")
     seconds = request.seconds if request.seconds is not None else 4
-    # Prefer user-provided fps/num_frames from request; fallback to defaults
     fps_default = 24
     fps = request.fps if request.fps is not None else fps_default
-    # If user provides num_frames, use it directly; otherwise derive from seconds * fps
     derived_num_frames = fps * seconds
     num_frames = (
         request.num_frames if request.num_frames is not None else derived_num_frames
     )
+
     server_args = get_global_server_args()
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
@@ -72,7 +71,15 @@ def _build_sampling_params_from_request(
         output_file_name=request_id,
     )
 
+    if request.num_inference_steps is not None:
+        sampling_params.num_inference_steps = request.num_inference_steps
+    if request.guidance_scale is not None:
+        sampling_params.guidance_scale = request.guidance_scale
+    if request.seed is not None:
+        sampling_params.seed = request.seed
+
     return sampling_params
+
 
 
 # extract metadata which http_server needs to know
@@ -192,6 +199,9 @@ async def create_video(
         server_args=get_global_server_args(),
         sampling_params=sampling_params,
     )
+    # Add diffusers_kwargs if provided
+    if req.diffusers_kwargs:
+        batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(_dispatch_job_async(request_id, batch))
     return VideoResponse(**job)

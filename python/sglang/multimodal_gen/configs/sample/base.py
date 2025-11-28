@@ -493,6 +493,13 @@ class SamplingParams:
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
         )
+        parser.add_argument(
+            "--diffusers-kwargs",
+            type=str,
+            default=None,
+            help='JSON string of extra kwargs to pass to diffusers pipeline. '
+                 'Example: \'{"output_type": "latent", "clip_skip": 2}\'',
+        )
         return parser
 
     @classmethod

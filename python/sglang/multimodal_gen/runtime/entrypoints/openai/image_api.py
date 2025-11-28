@@ -53,17 +53,20 @@ def _build_sampling_params_from_request(
     output_format: Optional[str],
     background: Optional[str],
     image_path: Optional[str] = None,
+    num_inference_steps: Optional[int] = None,
+    guidance_scale: Optional[float] = None,
+    seed: Optional[int] = None,
 ) -> SamplingParams:
     width, height = _parse_size(size)
     ext = _choose_ext(output_format, background)
+
     server_args = get_global_server_args()
-    # Build user params
     sampling_params = SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
         request_id=request_id,
         prompt=prompt,
         image_path=image_path,
-        num_frames=1,  # image
+        num_frames=1,
         width=width,
         height=height,
         num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
@@ -71,7 +74,16 @@ def _build_sampling_params_from_request(
         server_args=server_args,
         output_file_name=f"{request_id}.{ext}",
     )
+
+    if num_inference_steps is not None:
+        sampling_params.num_inference_steps = num_inference_steps
+    if guidance_scale is not None:
+        sampling_params.guidance_scale = guidance_scale
+    if seed is not None:
+        sampling_params.seed = seed
+
     return sampling_params
+
 
 
 def _build_req_from_sampling(s: SamplingParams) -> Req:
@@ -96,6 +108,7 @@ def _build_req_from_sampling(s: SamplingParams) -> Req:
 async def generations(
     request: ImageGenerationsRequest,
 ):
+
     request_id = generate_request_id()
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
@@ -104,11 +117,17 @@ async def generations(
         size=request.size,
         output_format=request.output_format,
         background=request.background,
+        num_inference_steps=request.num_inference_steps,
+        guidance_scale=request.guidance_scale,
+        seed=request.seed,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
+    # Add diffusers_kwargs if provided
+    if request.diffusers_kwargs:
+        batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
     # Run synchronously for images and save to disk
     save_file_path = await process_generation_batch(scheduler_client, batch)
 

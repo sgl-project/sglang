@@ -5,6 +5,7 @@
 
 import argparse
 import dataclasses
+import json
 import os
 from typing import cast
 
@@ -102,12 +103,30 @@ def generate_cmd(args: argparse.Namespace):
     server_args = ServerArgs.from_cli_args(args)
     sampling_params = SamplingParams.from_cli_args(args)
     sampling_params.request_id = generate_request_id()
+
+    # Handle diffusers-specific kwargs passed via CLI
+    diffusers_kwargs = None
+    if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:
+        try:
+            diffusers_kwargs = json.loads(args.diffusers_kwargs)
+            logger.info("Parsed diffusers_kwargs: %s", diffusers_kwargs)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse --diffusers-kwargs as JSON: %s", e)
+            raise ValueError(
+                f"--diffusers-kwargs must be valid JSON. Got: {args.diffusers_kwargs}"
+            ) from e
+
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args
     )
 
+    # Pass diffusers_kwargs in the extra parameter
+    extra_kwargs = {}
+    if diffusers_kwargs:
+        extra_kwargs["diffusers_kwargs"] = diffusers_kwargs
+
     results = generator.generate(
-        prompt=sampling_params.prompt, sampling_params=sampling_params
+        prompt=sampling_params.prompt, sampling_params=sampling_params, **extra_kwargs,
     )
 
     maybe_dump_performance(args, server_args, sampling_params, results)

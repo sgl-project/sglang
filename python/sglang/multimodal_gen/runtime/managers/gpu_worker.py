@@ -96,7 +96,6 @@ class GPUWorker:
         Execute a forward pass.
         """
         assert self.pipeline is not None
-        # TODO: dealing with first req for now
         req = batch[0]
         output_batch = None
         try:
@@ -104,7 +103,23 @@ class GPUWorker:
             timings = RequestTimings(request_id=req.request_id)
             req.timings = timings
 
-            output_batch = self.pipeline.forward(req, self.server_args)
+            result = self.pipeline.forward(req, self.server_args)
+
+            if isinstance(result, Req):
+                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+                    OutputBatch,
+                )
+
+                output_batch = OutputBatch(
+                    output=result.output,
+                    trajectory_timesteps=result.trajectory_timesteps,
+                    trajectory_latents=result.trajectory_latents,
+                    trajectory_decoded=getattr(result, "trajectory_decoded", None),
+                    logging_info=result.logging_info,
+                )
+            else:
+                output_batch = result
+
             duration_ms = (time.monotonic() - start_time) * 1000
 
             if output_batch.timings:
@@ -121,12 +136,6 @@ class GPUWorker:
         finally:
             return output_batch
 
-    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
-        """
-        Set the LoRA adapter for the pipeline.
-        """
-        assert self.pipeline is not None
-        self.pipeline.set_lora(lora_nickname, lora_path)
 
     def merge_lora_weights(self) -> None:
         """
