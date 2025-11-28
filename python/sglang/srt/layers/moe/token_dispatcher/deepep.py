@@ -684,7 +684,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 )
             else:
                 overlap_args_dict = dict(
-                    overlap=True,
+                    overlap=overlap_args.overlap,
                     packed_recv_count=self.packed_recv_count,
                     comp_signal=overlap_args.signal,
                     block_m=meta_overlap_args["block_m"],
