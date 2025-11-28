@@ -35,9 +35,10 @@ from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm, LayerNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
+    ReplicatedLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -232,17 +233,14 @@ class Glm4vPatchMerger(nn.Module):
         self.hidden_size = d_model
         tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
         tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
-        self.proj = ColumnParallelLinear(
+        self.proj = ReplicatedLinear(
             self.hidden_size,
             self.hidden_size,
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
-            gather_output=True,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
         )
-        self.post_projection_norm = nn.LayerNorm(self.hidden_size)
+        self.post_projection_norm = LayerNorm(self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=self.hidden_size,
             output_sizes=[context_dim] * 2,
@@ -684,12 +682,18 @@ class Glm4vForConditionalGeneration(nn.Module):
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
-        if not get_embedding:
-            return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
-            )
+        if self.pp_group.is_last_rank:
+            if not get_embedding:
+                return self.logits_processor(
+                    input_ids,
+                    hidden_states,
+                    self.lm_head,
+                    forward_batch,
+                )
+            else:
+                return self.pooler(hidden_states, forward_batch)
         else:
-            return self.pooler(hidden_states, forward_batch)
+            return hidden_states
 
     def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
         """pad attn qkv weights for dummy heads"""
