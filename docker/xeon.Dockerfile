@@ -1,8 +1,8 @@
 FROM ubuntu:24.04
 SHELL ["/bin/bash", "-c"]
 
-ARG SGLANG_REPO=https://github.com/ZailiWang/sglang.git
-ARG VER_SGLANG=apply-uv
+ARG SGLANG_REPO=https://github.com/sgl-project/sglang.git
+ARG VER_SGLANG=main
 
 ARG VER_TORCH=2.9.0
 ARG VER_TORCHVISION=0.24.0
