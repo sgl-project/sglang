@@ -482,9 +482,7 @@ class ZImageTransformer2DModel(CachableDiT):
         all_image_out = []
         all_image_size = []
         all_image_pos_ids = []
-        all_image_pad_mask = []
         all_cap_pos_ids = []
-        all_cap_pad_mask = []
         all_cap_feats_out = []
 
         for i, (image, cap_feat) in enumerate(zip(all_image, all_cap_feats)):
@@ -498,16 +496,6 @@ class ZImageTransformer2DModel(CachableDiT):
                 device=device,
             ).flatten(0, 2)
             all_cap_pos_ids.append(cap_padded_pos_ids)
-            # pad mask
-            all_cap_pad_mask.append(
-                torch.cat(
-                    [
-                        torch.zeros((cap_ori_len,), dtype=torch.bool, device=device),
-                        torch.ones((cap_padding_len,), dtype=torch.bool, device=device),
-                    ],
-                    dim=0,
-                )
-            )
             # padded feature
             cap_padded_feat = torch.cat(
                 [cap_feat, cap_feat[-1:].repeat(cap_padding_len, 1)],
@@ -547,18 +535,6 @@ class ZImageTransformer2DModel(CachableDiT):
                 [image_ori_pos_ids, image_padding_pos_ids], dim=0
             )
             all_image_pos_ids.append(image_padded_pos_ids)
-            # pad mask
-            all_image_pad_mask.append(
-                torch.cat(
-                    [
-                        torch.zeros((image_ori_len,), dtype=torch.bool, device=device),
-                        torch.ones(
-                            (image_padding_len,), dtype=torch.bool, device=device
-                        ),
-                    ],
-                    dim=0,
-                )
-            )
             # padded feature
             image_padded_feat = torch.cat(
                 [image, image[-1:].repeat(image_padding_len, 1)], dim=0
@@ -571,8 +547,6 @@ class ZImageTransformer2DModel(CachableDiT):
             all_image_size,
             all_image_pos_ids,
             all_cap_pos_ids,
-            all_image_pad_mask,
-            all_cap_pad_mask,
         )
 
     def forward(
@@ -602,8 +576,6 @@ class ZImageTransformer2DModel(CachableDiT):
             x_size,
             x_pos_ids,
             cap_pos_ids,
-            x_inner_pad_mask,
-            cap_inner_pad_mask,
         ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
 
         x = torch.cat(x, dim=0)
