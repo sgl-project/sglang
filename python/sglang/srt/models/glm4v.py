@@ -48,6 +48,8 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -528,6 +530,7 @@ class Glm4vForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.visual = Glm4vVisionModel(
             config.vision_config,
             quant_config=quant_config,
@@ -565,45 +568,36 @@ class Glm4vForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat(
-            [item.feature.squeeze(0) for item in items], dim=0
-        ).type(self.visual.dtype)
+        # in GLM-V, last dim is the same
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        # For multi-image, pixel_values is [num_of_images, L, C] shape
-        # assert pixel_values.dim() == 2, pixel_values.dim()
+        assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        split_sizes = (
-            image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
-        ).tolist()
-        image_embeds = torch.split(image_embeds, split_sizes)
-        return torch.cat(image_embeds)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+            )
+        else:
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values_videos = torch.cat(
-            [item.feature.squeeze(0) for item in items], dim=0
-        ).type(self.visual.dtype)
-        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
-        # For multi-video, pixel_values_videos is [num_of_videos, L, C] shape
-        # assert pixel_values_videos.dim() == 2, pixel_values_videos.dim()
-        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-
-        # reshape video_grid_thw -> [b, 3] -> [1, h, w] * frames
-        temp_frames_hw = []
-        for t, h, w in video_grid_thw:
-            repeated_row = (
-                torch.tensor([1, h.item(), w.item()]).unsqueeze(0).repeat(t, 1)
-            )
-            temp_frames_hw.append(repeated_row)
-        flattened_video_grid_thw = torch.cat(temp_frames_hw, dim=0)
-        video_embeds = self.visual(
-            pixel_values_videos, grid_thw=flattened_video_grid_thw
+        # in GLM-V, last dim is the same
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
         )
-        split_sizes = (
-            video_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
-        ).tolist()
-        video_embeds = torch.split(video_embeds, split_sizes)
-        return torch.cat(video_embeds)
+        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+        assert pixel_values.dim() == 2, pixel_values.dim()
+        assert video_grid_thw.dim() == 2, video_grid_thw.dim()
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+            )
+        else:
+            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        return video_embeds
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
