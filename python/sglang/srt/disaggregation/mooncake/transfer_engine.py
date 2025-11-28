@@ -12,7 +12,7 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     """
     Parse IB device string and get IB devices for a specific GPU ID.
 
-    Supports both formats:
+    Supports all the following formats:
     1. Old format: "ib0, ib1, ib2"
     2. New format: {0: "ib0, ib1", 1: "ib2, ib3", 2: "ib4"}
     3. JSON file: path to a JSON file containing the mapping
