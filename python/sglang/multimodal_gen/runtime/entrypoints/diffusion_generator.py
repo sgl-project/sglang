@@ -279,7 +279,6 @@ class DiffGenerator:
             current_sampling_params = deepcopy(pretrained_sampling_params)
             current_sampling_params.prompt = p
             req = prepare_request(
-                p,
                 server_args=self.server_args,
                 sampling_params=current_sampling_params,
             )
