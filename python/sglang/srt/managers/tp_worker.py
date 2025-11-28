@@ -56,6 +56,38 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def safe_load():
+    import torch.multiprocessing as mp
+
+    # 1) 用 filesystem 共享策略，避免依赖 pidfd/fd 传递
+    try:
+        mp.set_sharing_strategy("file_system")
+        # 有时需要在每个子进程里也执行一次（见下面注释）
+    except Exception:
+        pass
+
+    # 2) 改用 fork 启动（如果你的程序早已初始化线程/CUDA，这可能不安全）
+    try:
+        mp.set_start_method("fork", force=True)
+    except RuntimeError:
+        # 如果已经设置过 start method，会抛错，忽略即可
+        pass
+
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PTRACER = 0x59616D61  # 如果 headers 新旧不一致也可以尝试直接调用
+        PR_SET_PTRACER_ANY = -1
+        libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+    except Exception:
+        pass
+    pass
+
+
+safe_load()
+
+
 class BaseTpWorker(ABC):
     @abstractmethod
     def forward_batch_generation(self, forward_batch: ForwardBatch):

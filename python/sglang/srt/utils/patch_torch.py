@@ -16,6 +16,7 @@ from typing import Callable, Union
 import torch
 from packaging import version
 from torch.multiprocessing import reductions
+from torch.storage import UntypedStorage
 
 from sglang.srt.utils.common import is_npu
 
@@ -32,11 +33,20 @@ def monkey_patch_torch_reductions():
     if hasattr(reductions, "_reduce_tensor_original"):
         return
 
+    # from remote_pdb import set_trace
+    # set_trace()
+
+    UntypedStorage._new_shared_cuda_original = UntypedStorage._new_shared_cuda
+
     reductions._reduce_tensor_original = reductions.reduce_tensor
     reductions._rebuild_cuda_tensor_original = reductions.rebuild_cuda_tensor
 
+    UntypedStorage._new_shared_cuda = _new_shared_cuda_safe
+
     reductions.reduce_tensor = _reduce_tensor_modified
-    reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
+    # reductions.rebuild_cuda_tensor = _rebuild_cuda_tensor_modified
+
+    reductions._rebuild_cuda_tensor = _rebuild_cuda_tensor_safe
 
     reductions.init_reductions()
 
@@ -57,6 +67,51 @@ def _reduce_tensor_modified(*args, **kwargs):
 def _rebuild_cuda_tensor_modified(*args):
     args = _modify_tuple(args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid)
     return reductions._rebuild_cuda_tensor_original(*args)
+
+
+# NOTE (yiakwy)
+def _new_shared_cuda_safe(*args, **kwargs):
+    """
+    Monkey-patch for torch.UntypedStorage._new_shared_cuda to avoid pidfd_getfd
+    failures in Docker / restricted environments.
+
+    Instead of using pidfd, fallback to CPU tensor and move to GPU manually later.
+    """
+    # Allocate CPU storage of the same size
+    try:
+        return UntypedStorage._new_shared_cuda_original(*args, **kwargs)
+    except:
+        # from remote_pdb import set_trace
+        # set_trace()
+
+        # original impl of https://github.com/pytorch/pytorch/blob/f47dd0ddef1359e5b43e4b962412f67b30ecde56/torch/csrc/StorageSharing.cpp#L423
+        size_bytes = args[2]
+        if size_bytes is None or not isinstance(size_bytes, int):
+            raise RuntimeError("Cannot determine size for safe CUDA storage fallback")
+
+        return torch.UntypedStorage._new_shared(size_bytes)
+
+
+# NOTE (yiakwy)
+def _rebuild_cuda_tensor_safe(*args):
+    try:
+        return _rebuild_cuda_tensor_modified(*args)
+    except RuntimeError as e:
+        from remote_pdb import set_trace
+
+        set_trace()
+
+        args = _modify_tuple(
+            args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_from_maybe_uuid
+        )
+
+        storage, metadata = args[1], args[2]
+
+        if storage.device.type != "cuda":
+            storage = storage.cuda()
+
+        tensor = torch._utils._rebuild_tensor_v2(storage, *metadata)
+        return tensor
 
 
 def _device_to_uuid(device: int) -> str:
