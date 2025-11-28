@@ -29,13 +29,22 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
 
     ib_device_str = ib_device_str.strip()
 
-    # Check if it's JSON format (new format or JSON file)
-    try:
-        # Check if it's a JSON file first
-        if ib_device_str.endswith(".json") and os.path.isfile(ib_device_str):
-            with open(ib_device_str, "r") as f:
-                ib_device_str = f.read()
+    # Check if it's a JSON file first and load its content
+    is_json_file = ib_device_str.endswith(".json")
+    if is_json_file:
+        try:
+            if os.path.isfile(ib_device_str):
+                with open(ib_device_str, "r") as f:
+                    ib_device_str = f.read()
+            else:
+                # File doesn't exist, treat as old format
+                return ib_device_str
+        except (IOError, OSError) as e:
+            # File reading failed, raise exception
+            raise RuntimeError(f"Failed to read JSON file {ib_device_str}: {e}") from e
 
+    # Check if it's JSON format (new format)
+    try:
         parsed_json = json.loads(ib_device_str)
         if isinstance(parsed_json, dict):
             # Validate format - keys should be integers (or string rep), values should be strings
@@ -66,6 +75,11 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
                 )
 
     except json.JSONDecodeError:
+        if is_json_file:
+            # It was supposed to be a JSON file but failed to parse
+            raise RuntimeError(
+                f"Failed to parse JSON content from file {ib_device_str}"
+            )
         # Not JSON format, treat as old format - return same devices for all GPUs
         return ib_device_str
 
