@@ -26,7 +26,7 @@ class RouterArgs:
     policy: str = "cache_aware"
     prefill_policy: Optional[str] = None  # Specific policy for prefill nodes in PD mode
     decode_policy: Optional[str] = None  # Specific policy for decode nodes in PD mode
-    worker_startup_timeout_secs: int = 600
+    worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
     cache_threshold: float = 0.3
     balance_abs_threshold: int = 64
@@ -109,6 +109,8 @@ class RouterArgs:
     oracle_pool_min: int = 1
     oracle_pool_max: int = 16
     oracle_pool_timeout_secs: int = 30
+    postgres_db_url: Optional[str] = None
+    postgres_pool_max: int = 16
     # mTLS configuration for worker communication
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
@@ -209,7 +211,7 @@ class RouterArgs:
             f"--{prefix}worker-startup-timeout-secs",
             type=int,
             default=RouterArgs.worker_startup_timeout_secs,
-            help="Timeout in seconds for worker startup",
+            help="Timeout in seconds for worker startup and registration (default: 1800 / 30 minutes). Large models can take significant time to load into GPU memory.",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-check-interval",
@@ -597,6 +599,19 @@ class RouterArgs:
                 os.getenv("ATP_POOL_TIMEOUT_SECS", RouterArgs.oracle_pool_timeout_secs)
             ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
+        )
+        # Postgres configuration
+        parser.add_argument(
+            f"--{prefix}postgres-db-url",
+            type=str,
+            default=os.getenv("POSTGRES_DB_URL"),
+            help="PostgreSQL database connection URL (env: POSTGRES_DB_URL)",
+        )
+        parser.add_argument(
+            f"--{prefix}postgres-pool-max",
+            type=int,
+            default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
+            help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
         )
         # mTLS configuration
         parser.add_argument(
