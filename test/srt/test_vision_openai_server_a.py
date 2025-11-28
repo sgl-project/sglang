@@ -215,12 +215,15 @@ class TestDeepseekOCRServer(TestOpenAIMLLMServerBase):
         self.verify_single_image_response_for_ocr(response)
 
 
+# Delete the mixin classes so that they are not collected by pytest
+del (
+    TestOpenAIMLLMServerBase,
+    ImageOpenAITestMixin,
+    VideoOpenAITestMixin,
+    AudioOpenAITestMixin,
+    OmniOpenAITestMixin,
+)
+
+
 if __name__ == "__main__":
-    del (
-        TestOpenAIMLLMServerBase,
-        ImageOpenAITestMixin,
-        VideoOpenAITestMixin,
-        AudioOpenAITestMixin,
-        OmniOpenAITestMixin,
-    )
     unittest.main()
