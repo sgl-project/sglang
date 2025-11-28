@@ -27,6 +27,11 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
@@ -75,14 +80,21 @@ class Glm4vVisionMLP(nn.Module):
         bias: bool = False,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
+        self.tp_size = (
+            1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        )
+        self.tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.down_proj = RowParallelLinear(
             hidden_features,
@@ -90,6 +102,8 @@ class Glm4vVisionMLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
         )
         self.act_fn = SiluAndMul()
 
@@ -110,6 +124,7 @@ class Glm4vVisionBlock(nn.Module):
         prefix: str = "",
         num_dummy_heads: int = 0,
         rms_norm_eps: float = 1e-5,
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
@@ -125,12 +140,14 @@ class Glm4vVisionBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
+            use_data_parallel=use_data_parallel,
         )
         self.mlp = Glm4vVisionMLP(
             dim,
             intermediate_dim,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -208,9 +225,12 @@ class Glm4vPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         bias: bool = False,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = d_model
+        tp_size = 1 if use_data_parallel else get_tensor_model_parallel_world_size()
+        tp_rank = 0 if use_data_parallel else get_tensor_model_parallel_rank()
         self.proj = ColumnParallelLinear(
             self.hidden_size,
             self.hidden_size,
@@ -218,6 +238,8 @@ class Glm4vPatchMerger(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("proj", prefix),
             gather_output=True,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self.post_projection_norm = nn.LayerNorm(self.hidden_size)
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -226,6 +248,8 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("gate_up_proj", prefix),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self.down_proj = RowParallelLinear(
             context_dim,
@@ -233,6 +257,8 @@ class Glm4vPatchMerger(nn.Module):
             bias=bias,
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self.extra_activation_func = nn.GELU()
 
@@ -381,6 +407,7 @@ class Glm4vVisionModel(nn.Module):
         vision_config: Glm4vVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
 
@@ -394,6 +421,7 @@ class Glm4vVisionModel(nn.Module):
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.out_hidden_size = vision_config.out_hidden_size
+        self.use_data_parallel = use_data_parallel
 
         self.patch_embed = Glm4vVisionPatchEmbed(
             patch_size=patch_size,
@@ -414,6 +442,7 @@ class Glm4vVisionModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
+                    use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(depth)
             ]
@@ -425,6 +454,7 @@ class Glm4vVisionModel(nn.Module):
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
+            use_data_parallel=use_data_parallel,
         )
 
         self.embeddings = Glm4vVisionEmbeddings(vision_config)
@@ -529,6 +559,7 @@ class Glm4vForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.pp_group = get_pp_group()
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.visual = Glm4vVisionModel(
@@ -543,6 +574,7 @@ class Glm4vForConditionalGeneration(nn.Module):
             config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
 
         if config.tie_word_embeddings:
