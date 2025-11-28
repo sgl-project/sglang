@@ -460,7 +460,7 @@ class MTPWorker(TpModelWorker):
             device=self.device,
             hidden_size=self.model_config.hidden_size,
             dtype=self.model_config.dtype,
-            topk=self.topk,
+            topk=self.topk * self.speculative_num_steps,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
@@ -798,15 +798,14 @@ class MTPWorker(TpModelWorker):
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=seq_lens_cpu
         )
+        forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.mtp_model_runner(0)
+        )
+        forward_batch.return_logprob = False
+        forward_batch.return_hidden_states_before_norm = True
         topk_p_list = []
         topk_index_list = []
-
         for step in range(self.speculative_num_steps):
-            forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.mtp_model_runner(step)
-            )
-            forward_batch.return_logprob = False
-            forward_batch.return_hidden_states_before_norm = True
             logits_output, _ = self.mtp_model_runner(step).forward(forward_batch)
             if self.enable_nan_detection:
                 detect_nan(logits_output)
@@ -815,12 +814,13 @@ class MTPWorker(TpModelWorker):
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
             pt = 0
-            for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                input_ids = forward_batch.input_ids[pt: pt + extend_len]
-                forward_batch.input_ids[pt: pt + extend_len] = torch.cat(
-                    (input_ids[1:], topk_index[i].reshape(1))
-                )
-                pt += extend_len
+            if forward_batch.extend_seq_lens is not None:
+                for i, extend_len in enumerate(forward_batch.extend_seq_lens):
+                    input_ids = forward_batch.input_ids[pt: pt + extend_len]
+                    forward_batch.input_ids[pt: pt + extend_len] = torch.cat(
+                        (input_ids[1:], topk_index[i].reshape(1))
+                    )
+                    pt += extend_len
 
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
@@ -884,21 +884,18 @@ class MTPWorker(TpModelWorker):
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
-
+        forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.mtp_model_runner(0)
+        )
+        forward_batch.return_hidden_states_before_norm = True
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
+        else:
+            forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
         topk_p_list = []
         topk_index_list = []
-
+        # Run
         for step in range(self.speculative_num_steps):
-            forward_batch = ForwardBatch.init_new(
-                model_worker_batch, self.mtp_model_runner(step)
-            )
-            forward_batch.return_hidden_states_before_norm = True
-            if forward_batch.seq_lens_cpu is not None:
-                forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
-            else:
-                forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
-
-            # Run
             can_cuda_graph = (
                 len(self.cuda_graph_runner_for_draft_extend_list)
                 and self.cuda_graph_runner_for_draft_extend_list[step].can_run(forward_batch)
@@ -924,12 +921,13 @@ class MTPWorker(TpModelWorker):
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
             pt = 0
-            for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                input_ids = forward_batch.input_ids[pt: pt + extend_len]
-                forward_batch.input_ids[pt: pt + extend_len] = torch.cat(
-                    (input_ids[1:], topk_index[i].reshape(1))
-                )
-                pt += extend_len
+            if forward_batch.extend_seq_lens is not None:
+                for i, extend_len in enumerate(forward_batch.extend_seq_lens):
+                    input_ids = forward_batch.input_ids[pt: pt + extend_len]
+                    forward_batch.input_ids[pt: pt + extend_len] = torch.cat(
+                        (input_ids[1:], topk_index[i].reshape(1))
+                    )
+                    pt += extend_len
 
         forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
         forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
