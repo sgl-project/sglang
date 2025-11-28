@@ -1349,7 +1349,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_pyobj(obj)
+                await self.send_to_scheduler.send_multipart(
+                    [
+                        b"NORM",
+                        pickle.dumps(obj),
+                    ]
+                )
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1363,7 +1368,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_pyobj(obj)
+            await self.send_to_scheduler.send_multipart(
+                [
+                    b"NORM",
+                    pickle.dumps(obj),
+                ]
+            )
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
