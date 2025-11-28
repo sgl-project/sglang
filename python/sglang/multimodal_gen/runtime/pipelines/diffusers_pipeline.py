@@ -7,11 +7,9 @@ through sglang's infrastructure using vanilla diffusers pipelines.
 """
 
 import argparse
+import warnings
 from io import BytesIO
 from typing import Any
-import warnings
-
-from diffusers import DiffusionPipeline
 
 import numpy as np
 import requests
@@ -19,18 +17,18 @@ import torch
 import torchvision.transforms as T
 from PIL import Image
 
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig
-from sglang.multimodal_gen.runtime.pipelines.composed_pipeline_base import (
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
-from sglang.multimodal_gen.runtime.pipelines.executors.pipeline_executor import (
+from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines.executors.sync_executor import (
+from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
     SyncExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines.stages import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,

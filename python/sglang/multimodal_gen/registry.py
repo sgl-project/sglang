@@ -221,7 +221,7 @@ def _get_diffusers_model_info(model_path: str) -> ModelInfo:
 
     Returns a ModelInfo with DiffusersPipeline and generic configs.
     """
-    from sglang.multimodal_gen.configs.pipelines.diffusers_generic import (
+    from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
         DiffusersGenericPipelineConfig,
     )
     from sglang.multimodal_gen.configs.sample.diffusers_generic import (
