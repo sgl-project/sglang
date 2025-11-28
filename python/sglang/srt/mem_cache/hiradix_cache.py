@@ -11,16 +11,18 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.hicache_storage import (
-    compute_node_hash_values,
-    split_node_hash_value,
-)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.radix_cache import (
+    RadixCache,
+    RadixKey,
+    TreeNode,
+    compute_node_hash_values,
+    split_node_hash_value,
+)
 from sglang.srt.metrics.collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
