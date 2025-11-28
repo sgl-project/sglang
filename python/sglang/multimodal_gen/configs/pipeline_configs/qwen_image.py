@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
+CONDITION_IMAGE_SIZE = 384 * 384
+VAE_IMAGE_SIZE = 1024 * 1024
+
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
     bool_mask = mask.bool()
@@ -285,3 +288,91 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         # remove noise over input image
         noise = noise[:, : latents.size(1)]
         return noise
+
+
+class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.I2I
+
+    def _prepare_edit_cond_kwargs(
+        self, batch, prompt_embeds, rotary_emb, device, dtype
+    ):
+        batch_size = batch.latents.shape[0]
+        assert batch_size == 1
+        height = batch.height
+        width = batch.width
+        image = batch.condition_image
+        if not isinstance(image, list):
+            image = [image]
+        vae_image_sizes = []
+        for img in image:
+            image_width, image_height = img.size
+            vae_width, vae_height, _ = calculate_dimensions(
+                VAE_IMAGE_SIZE, image_width / image_height
+            )
+            vae_image_sizes.append((vae_width, vae_height))
+
+        vae_scale_factor = self.get_vae_scale_factor()
+        img_shapes = [
+            [
+                (1, height // vae_scale_factor // 2, width // vae_scale_factor // 2),
+                *[
+                    (
+                        1,
+                        vae_height // vae_scale_factor // 2,
+                        vae_width // vae_scale_factor // 2,
+                    )
+                    for vae_width, vae_height in vae_image_sizes
+                ],
+            ]
+        ] * batch_size
+        txt_seq_lens = [prompt_embeds[0].shape[1]]
+        (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
+            img_shapes, txt_seq_lens, rotary_emb, device, dtype
+        )
+
+        # perform sp shard on noisy image tokens
+        noisy_img_seq_len = (
+            1 * (height // vae_scale_factor // 2) * (width // vae_scale_factor // 2)
+        )
+
+        noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
+        noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
+
+        # concat back the img_cos for input image (since it is not sp-shared later)
+        img_cos = torch.cat([noisy_img_cos, img_cos[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+        img_sin = torch.cat([noisy_img_sin, img_sin[noisy_img_seq_len:, :]], dim=0).to(
+            device=device
+        )
+
+        return {
+            "txt_seq_lens": txt_seq_lens,
+            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
+        }
+
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return self._prepare_edit_cond_kwargs(
+            batch, batch.prompt_embeds, rotary_emb, device, dtype
+        )
+
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return self._prepare_edit_cond_kwargs(
+            batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
+        )
+
+
+    def preprocess_image(self, image, image_processor):
+        if not isinstance(image, list):
+            image = [image]
+        condition_images = []
+        for img in image:
+            image_width, image_height = img.size
+            condition_width, condition_height, _ = calculate_dimensions(
+                CONDITION_IMAGE_SIZE, image_width / image_height
+            )
+            condition_images.append(
+                image_processor.resize(img, condition_height, condition_width)
+            )
+
+        return condition_images
