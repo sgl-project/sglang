@@ -44,6 +44,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -566,6 +567,7 @@ class Glm4vForConditionalGeneration(nn.Module):
             config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
 
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
@@ -574,18 +576,21 @@ class Glm4vForConditionalGeneration(nn.Module):
             config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
-            use_data_parallel=self.use_data_parallel,
         )
 
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+            # ranks other than the last rank will have a placeholder layer
+            self.lm_head = PPMissingLayer()
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
