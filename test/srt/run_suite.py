@@ -135,7 +135,6 @@ suites = {
         TestFile("test_modelopt_export.py", 30),
     ],
     "per-commit-2-gpu": [
-        TestFile("ep/test_moe_ep.py", 140),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
@@ -187,6 +186,7 @@ suites = {
     ],
     "per-commit-4-gpu-deepep": [
         TestFile("ep/test_deepep_small.py", 531),
+        TestFile("ep/test_moe_ep.py", 140),
         # TODO: Add it back after mooncake supports torch 2.9
         # TestFile("ep/test_mooncake_ep_small.py", 450),
     ],
