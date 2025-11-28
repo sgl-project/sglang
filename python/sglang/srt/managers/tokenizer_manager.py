@@ -459,7 +459,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 and obj.input_ids is not None
                 and self.tokenizer is not None
             ):
-                decoded = self.tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+                decoded = self.tokenizer.decode(
+                    obj.input_ids, skip_special_tokens=False
+                )
                 obj.text = decoded
 
         async with self.is_pause_cond:
