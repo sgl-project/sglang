@@ -14,6 +14,7 @@ pub mod service;
 pub mod stores;
 pub mod sync;
 pub mod topology;
+pub mod tree_ops;
 
 pub use crdt::{CRDTMap, CRDTPNCounter, SKey, SyncCRDTMap, SyncPNCounter};
 pub use endpoints::{
@@ -23,6 +24,7 @@ pub use endpoints::{
 pub use service::{broadcast_node_states, gossip, try_ping, ClusterState};
 pub use stores::{
     AppState, AppStore, MembershipState, MembershipStore, PolicyState, PolicyStore, RateLimitStore,
-    StateStores, StoreType, WorkerState, WorkerStore,
+    StateStores, StoreType, WorkerState, WorkerStore, tree_state_key,
 };
+pub use tree_ops::{TreeInsertOp, TreeOperation, TreeRemoveOp, TreeState};
 pub use sync::{HASyncManager, OptionalHASyncManager};

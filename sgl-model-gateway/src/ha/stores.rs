@@ -124,6 +124,11 @@ pub struct PolicyState {
     pub version: u64,
 }
 
+/// Helper function to get tree state key for a model
+pub fn tree_state_key(model_id: &str) -> String {
+    format!("tree:{}", model_id)
+}
+
 /// Membership store
 #[derive(Debug, Clone)]
 pub struct MembershipStore {

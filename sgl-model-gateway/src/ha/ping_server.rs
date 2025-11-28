@@ -591,10 +591,28 @@ impl Gossip for GossipService {
                                                         // Extract actor from StateUpdate
                                                         let actor =
                                                             Some(state_update.actor.clone());
-                                                        sync_manager.apply_remote_policy_state(
-                                                            policy_state,
-                                                            actor,
-                                                        );
+                                                        
+                                                        // Check if this is a tree state update
+                                                        if policy_state.policy_type == "tree_state" {
+                                                            // Deserialize tree state
+                                                            if let Ok(tree_state) = serde_json::from_slice::<
+                                                                super::tree_ops::TreeState,
+                                                            >(
+                                                                &policy_state.config
+                                                            ) {
+                                                                sync_manager.apply_remote_tree_operation(
+                                                                    policy_state.model_id.clone(),
+                                                                    tree_state,
+                                                                    actor,
+                                                                );
+                                                            }
+                                                        } else {
+                                                            // Regular policy state update
+                                                            sync_manager.apply_remote_policy_state(
+                                                                policy_state,
+                                                                actor,
+                                                            );
+                                                        }
                                                     }
                                                 }
                                                 LocalStoreType::RateLimit => {
@@ -823,7 +841,23 @@ impl Gossip for GossipService {
                                                                     stores.policy.insert(key, policy_state.clone(), entry.actor.clone());
                                                                     // Also update sync manager if available
                                                                     if let Some(ref sync_manager) = sync_manager {
-                                                                        sync_manager.apply_remote_policy_state(policy_state, Some(entry.actor.clone()));
+                                                                        // Check if this is a tree state update
+                                                                        if policy_state.policy_type == "tree_state" {
+                                                                            // Deserialize tree state
+                                                                            if let Ok(tree_state) = serde_json::from_slice::<
+                                                                                super::tree_ops::TreeState,
+                                                                            >(
+                                                                                &policy_state.config
+                                                                            ) {
+                                                                                sync_manager.apply_remote_tree_operation(
+                                                                                    policy_state.model_id.clone(),
+                                                                                    tree_state,
+                                                                                    Some(entry.actor.clone()),
+                                                                                );
+                                                                            }
+                                                                        } else {
+                                                                            sync_manager.apply_remote_policy_state(policy_state, Some(entry.actor.clone()));
+                                                                        }
                                                                     }
                                                                 }
                                                             }

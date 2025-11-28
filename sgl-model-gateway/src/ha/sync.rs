@@ -11,8 +11,9 @@ use super::{
     gossip::NodeStatus,
     stores::{
         PolicyState, RateLimitConfig, StateStores, WorkerState, GLOBAL_RATE_LIMIT_COUNTER_KEY,
-        GLOBAL_RATE_LIMIT_KEY,
+        GLOBAL_RATE_LIMIT_KEY, tree_state_key,
     },
+    tree_ops::{TreeOperation, TreeState},
 };
 
 /// HA sync manager for coordinating state synchronization
@@ -319,6 +320,113 @@ impl HASyncManager {
             // Note: This is a workaround since PNCounter doesn't support direct reset
             // In production, you might want to use a different approach like timestamped counters
             self.sync_rate_limit_inc(GLOBAL_RATE_LIMIT_COUNTER_KEY.to_string(), -current_count);
+        }
+    }
+
+    /// Sync tree operation to HA stores
+    /// This adds a tree operation (insert or remove) to the tree state for a specific model
+    pub fn sync_tree_operation(
+        &self,
+        model_id: String,
+        operation: TreeOperation,
+    ) -> Result<(), String> {
+        let key = SKey::new(tree_state_key(&model_id));
+
+        // Get current tree state or create new one
+        let mut tree_state = if let Some(policy_state) = self.stores.policy.get(&key) {
+            // Deserialize existing tree state
+            serde_json::from_slice::<TreeState>(&policy_state.config)
+                .unwrap_or_else(|_| TreeState::new(model_id.clone()))
+        } else {
+            TreeState::new(model_id.clone())
+        };
+
+        // Add the new operation
+        tree_state.add_operation(operation);
+
+        // Serialize and store back
+        let serialized = serde_json::to_vec(&tree_state)
+            .map_err(|e| format!("Failed to serialize tree state: {}", e))?;
+
+        // Get current version if exists
+        let current_version = self
+            .stores
+            .policy
+            .get_metadata(&key)
+            .map(|(v, _)| v)
+            .unwrap_or(0);
+        let new_version = current_version + 1;
+
+        let state = PolicyState {
+            model_id: model_id.clone(),
+            policy_type: "tree_state".to_string(),
+            config: serialized,
+            version: new_version,
+        };
+
+        let actor = self.self_name.clone();
+        self.stores.policy.insert(key, state, actor);
+        debug!(
+            "Synced tree operation to HA: model={} (version: {})",
+            model_id, new_version
+        );
+
+        Ok(())
+    }
+
+    /// Get tree state for a model from HA stores
+    pub fn get_tree_state(&self, model_id: &str) -> Option<TreeState> {
+        let key = SKey::new(tree_state_key(model_id));
+        self.stores
+            .policy
+            .get(&key)
+            .and_then(|policy_state| {
+                serde_json::from_slice::<TreeState>(&policy_state.config).ok()
+            })
+    }
+
+    /// Apply remote tree operation to local policy
+    /// This is called when receiving tree state updates from other nodes
+    pub fn apply_remote_tree_operation(
+        &self,
+        model_id: String,
+        tree_state: TreeState,
+        actor: Option<String>,
+    ) {
+        let key = SKey::new(tree_state_key(&model_id));
+        let actor = actor.unwrap_or_else(|| "remote".to_string());
+
+        // Check if we should update based on version
+        let current_version = self
+            .stores
+            .policy
+            .get_metadata(&key)
+            .map(|(v, _)| v)
+            .unwrap_or(0);
+
+        if tree_state.version > current_version {
+            // Serialize tree state
+            if let Ok(serialized) = serde_json::to_vec(&tree_state) {
+                let state = PolicyState {
+                    model_id: model_id.clone(),
+                    policy_type: "tree_state".to_string(),
+                    config: serialized,
+                    version: tree_state.version,
+                };
+
+                self.stores.policy.insert(key, state, actor.clone());
+                debug!(
+                    "Applied remote tree state update: model={} (version: {} -> {})",
+                    model_id, current_version, tree_state.version
+                );
+            } else {
+                debug!("Failed to serialize remote tree state for model={}", model_id);
+            }
+        } else {
+            debug!(
+                "Skipped remote tree state update: model={} (version {} <= current {})",
+                model_id, tree_state.version, current_version
+            );
         }
     }
 }
