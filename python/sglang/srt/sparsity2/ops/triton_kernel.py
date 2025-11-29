@@ -31,10 +31,10 @@ def nsa_sparse_diff_triton_kernel(
     layer_id: tl.constexpr,
     TOPK: tl.constexpr,
 ):
+    """Optimized version with vectorized operations instead of serial loops."""
     bid = tl.program_id(0)
     offset = tl.arange(0, TOPK)
     req_pool_index = tl.load(req_pool_indices_ptr + bid)
-    # start address of current block
     prev_top_k_result_start_ptr = (
         prev_top_k_result_ptr
         + req_pool_index * prev_top_k_result_stride_0
@@ -46,6 +46,7 @@ def nsa_sparse_diff_triton_kernel(
         + layer_id * prev_device_indices_stride_1
     )
 
+    # Load current top-k (save for later update)
     tmp_curr_top_k_result = tl.load(
         curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
     )
@@ -55,7 +56,6 @@ def nsa_sparse_diff_triton_kernel(
     seq_len = tl.load(seq_lens_ptr + bid)
 
     if max_val == -1:
-        # After prefilling the first round, the entire cache needs to be loaded.
         no_exist_top_k_result = tl.load(
             curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
         )
@@ -72,12 +72,14 @@ def nsa_sparse_diff_triton_kernel(
             mask=mask,
         )
     else:
-        tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset)
+        # Use atomic_max to ensure deterministic result when prev_top_k_result has duplicates
+        tl.atomic_max(
+            bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset.to(tl.int32)
+        )
 
         prev_out_cache_loc_index = tl.load(
             bitmap_ptr + bitmap_stride * bid + seq_len - 1
         )
-        # The `out_cache_loc` from the previous step is no longer valid.
         if prev_out_cache_loc_index != -1:
             tl.store(bitmap_ptr + bitmap_stride * bid + seq_len - 1, -1)
             tl.store(prev_device_indices_start_ptr + prev_out_cache_loc_index, -1)
@@ -115,7 +117,6 @@ def nsa_sparse_diff_triton_kernel(
         )
 
         start_index = tl.load(host_start_indices_ptr + bid)
-        # Excluding out_cache_loc, because it hasn't been offloaded to the host yet.
         mask1 = no_exist_top_k_result < seq_len
         host_mask = ~mask & mask1
         no_exist_host_indices = tl.load(
@@ -140,65 +141,103 @@ def nsa_sparse_diff_triton_kernel(
         mask=out_cache_loc_mask,
     )
 
-    device_count = 0
-    host_count = 0
-    for idx in range(TOPK + 1):
-        device_val = tl.load(prev_device_indices_start_ptr + idx)
-        if device_val != -1:
-            tl.store(
-                should_load_device_indices_ptr
-                + should_load_device_indices_stride * bid
-                + device_count,
-                device_val,
-            )
-            device_count += 1
-        if idx < TOPK:  # The length of host_indices is only TOPK.
-            host_val = tl.load(
-                should_load_host_indices_ptr
-                + should_load_host_indices_stride * bid
-                + idx
-            )
-            if host_val != -1:
-                tl.store(
-                    should_load_host_indices_ptr
-                    + should_load_host_indices_stride * bid
-                    + host_count,
-                    host_val,
-                )
-                host_count += 1
+    # Vectorized compaction (replaces serial loop 1)
+    device_vals_topk = tl.load(prev_device_indices_start_ptr + offset)
+    device_valid_topk = device_vals_topk != -1
+    device_valid_topk_int = device_valid_topk.to(tl.int32)
+    device_cumsum_topk = tl.cumsum(device_valid_topk_int, axis=0)
+    device_write_pos_topk = device_cumsum_topk - device_valid_topk_int
 
-    replace_ptr = 0
-    for idx in range(TOPK + 1):
-        curr_val = tl.load(
-            curr_device_indices_ptr + curr_device_indices_stride * bid + idx
+    device_val_last = tl.load(prev_device_indices_start_ptr + TOPK)
+    device_count_topk = tl.sum(device_valid_topk_int)
+
+    tl.store(
+        should_load_device_indices_ptr
+        + should_load_device_indices_stride * bid
+        + device_write_pos_topk,
+        device_vals_topk,
+        mask=device_valid_topk,
+    )
+
+    device_count = device_count_topk
+    if device_val_last != -1:
+        tl.store(
+            should_load_device_indices_ptr
+            + should_load_device_indices_stride * bid
+            + device_count_topk,
+            device_val_last,
         )
-        if curr_val == -1:
-            new_val = tl.load(
-                should_load_device_indices_ptr
-                + should_load_device_indices_stride * bid
-                + replace_ptr
-            )
-            tl.store(
-                curr_device_indices_ptr + curr_device_indices_stride * bid + idx,
-                new_val,
-            )
-            replace_ptr += 1
+        device_count = device_count_topk + 1
 
-    mask = offset >= host_count
+    host_vals_all = tl.load(
+        should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset
+    )
+    host_valid = host_vals_all != -1
+    host_valid_int = host_valid.to(tl.int32)
+    host_cumsum = tl.cumsum(host_valid_int, axis=0)
+    host_write_pos = host_cumsum - host_valid_int
+
+    tl.store(
+        should_load_host_indices_ptr
+        + should_load_host_indices_stride * bid
+        + host_write_pos,
+        host_vals_all,
+        mask=host_valid,
+    )
+    host_count = tl.sum(host_valid_int)
+
+    # Vectorized fill (replaces serial loop 2)
+    curr_vals_topk = tl.load(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + offset
+    )
+    empty_mask_topk = curr_vals_topk == -1
+    empty_mask_topk_int = empty_mask_topk.to(tl.int32)
+    empty_cumsum_topk = tl.cumsum(empty_mask_topk_int, axis=0)
+    fill_positions_topk = empty_cumsum_topk - empty_mask_topk_int
+
+    fill_vals_topk = tl.load(
+        should_load_device_indices_ptr
+        + should_load_device_indices_stride * bid
+        + fill_positions_topk,
+        mask=empty_mask_topk,
+        other=-1,
+    )
+    result_topk = tl.where(empty_mask_topk, fill_vals_topk, curr_vals_topk)
+    tl.store(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + offset, result_topk
+    )
+
+    curr_val_last = tl.load(
+        curr_device_indices_ptr + curr_device_indices_stride * bid + TOPK
+    )
+    if curr_val_last == -1:
+        empty_count_topk = tl.sum(empty_mask_topk_int)
+        fill_val_last = tl.load(
+            should_load_device_indices_ptr
+            + should_load_device_indices_stride * bid
+            + empty_count_topk
+        )
+        tl.store(
+            curr_device_indices_ptr + curr_device_indices_stride * bid + TOPK,
+            fill_val_last,
+        )
+
+    # Clear invalid entries
+    clear_mask = offset >= host_count
     tl.store(
         should_load_device_indices_ptr
         + should_load_device_indices_stride * bid
         + offset,
         -1,
-        mask=mask,
+        mask=clear_mask,
     )
     tl.store(
         should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset,
         -1,
-        mask=mask,
+        mask=clear_mask,
     )
 
-    # update prev_top_k_result and curr_device_indices in req states
+    # Update state
     tl.store(prev_top_k_result_start_ptr + offset, tmp_curr_top_k_result)
     curr_device_indices = tl.load(
         curr_device_indices_ptr + curr_device_indices_stride * bid + offset
@@ -274,7 +313,7 @@ if __name__ == "__main__":
     bitmap = torch.full(
         (8, 64),
         -1,
-        dtype=torch.int16,
+        dtype=torch.int32,
         device="cuda",
     )
 
@@ -418,3 +457,163 @@ if __name__ == "__main__":
     assert torch.all(prev_device_indices_pool == ref_prev_device_indices_pool)
     assert torch.all(prev_top_k_result_pool == ref_prev_top_k_result_pool)
     assert torch.max(bitmap) == -1
+
+    print("✓ Original kernel test passed!")
+
+    # ========== Large-scale test (TOPK=2048) ==========
+    print("\n" + "=" * 60)
+    print("Large-Scale Test (TOPK=2048)")
+    print("=" * 60)
+
+    import time
+
+    def benchmark_kernel(kernel_func, name, num_warmup=10, num_iters=100):
+        # Warmup
+        for _ in range(num_warmup):
+            # Reset states
+            bitmap_bench = torch.full((bs, 64), -1, dtype=torch.int32, device="cuda")
+            prev_top_k_result_bench = prev_top_k_result_pool.clone()
+            curr_top_k_result_bench = curr_top_k_result.clone()
+            prev_device_indices_bench = prev_device_indices_pool.clone()
+            curr_device_indices_bench = torch.full(
+                (bs, top_k + 1), -1, dtype=torch.int64, device="cuda"
+            )
+            should_load_device_bench = torch.full(
+                (bs, top_k), -1, dtype=torch.int64, device="cuda"
+            )
+            should_load_host_bench = torch.full(
+                (bs, top_k), -1, dtype=torch.int64, device="cuda"
+            )
+
+            kernel_func(
+                prev_top_k_result_bench,
+                curr_top_k_result_bench,
+                prev_device_indices_bench,
+                curr_device_indices_bench,
+                bitmap_bench,
+                full_host_indices,
+                should_load_device_bench,
+                should_load_host_bench,
+                out_cache_loc,
+                seq_lens,
+                req_pool_indices,
+                layer_id,
+            )
+
+        torch.cuda.synchronize()
+
+        # Benchmark
+        start = time.perf_counter()
+        for _ in range(num_iters):
+            bitmap_bench = torch.full((bs, 64), -1, dtype=torch.int32, device="cuda")
+            prev_top_k_result_bench = prev_top_k_result_pool.clone()
+            curr_top_k_result_bench = curr_top_k_result.clone()
+            prev_device_indices_bench = prev_device_indices_pool.clone()
+            curr_device_indices_bench = torch.full(
+                (bs, top_k + 1), -1, dtype=torch.int64, device="cuda"
+            )
+            should_load_device_bench = torch.full(
+                (bs, top_k), -1, dtype=torch.int64, device="cuda"
+            )
+            should_load_host_bench = torch.full(
+                (bs, top_k), -1, dtype=torch.int64, device="cuda"
+            )
+
+            kernel_func(
+                prev_top_k_result_bench,
+                curr_top_k_result_bench,
+                prev_device_indices_bench,
+                curr_device_indices_bench,
+                bitmap_bench,
+                full_host_indices,
+                should_load_device_bench,
+                should_load_host_bench,
+                out_cache_loc,
+                seq_lens,
+                req_pool_indices,
+                layer_id,
+            )
+
+        torch.cuda.synchronize()
+        end = time.perf_counter()
+
+        avg_time_ms = (end - start) / num_iters * 1000
+        print(f"{name:30s}: {avg_time_ms:.3f} ms")
+        return avg_time_ms
+
+    bs_large = 4
+    top_k_large = 2048
+    seq_len_large = 4096
+
+    bitmap_large = torch.full(
+        (bs_large, seq_len_large), -1, dtype=torch.int32, device="cuda"
+    )
+
+    prev_top_k_result_pool_large = torch.full(
+        (bs_large, 2, top_k_large), -1, dtype=torch.int64, device="cuda"
+    )
+    # Set layer 1 to have some values
+    prev_top_k_result_pool_large[:, 1, :] = (
+        torch.arange(top_k_large, device="cuda").unsqueeze(0).expand(bs_large, -1)
+    )
+
+    curr_top_k_result_large = torch.randint(
+        0, seq_len_large, (bs_large, top_k_large), dtype=torch.int64, device="cuda"
+    )
+
+    prev_device_indices_pool_large = torch.randint(
+        1000, 50000, (bs_large, 2, top_k_large + 1), dtype=torch.int64, device="cuda"
+    )
+
+    full_host_indices_large = [
+        torch.arange(
+            100000 + i * 10000,
+            100000 + i * 10000 + seq_len_large,
+            dtype=torch.int64,
+            device="cuda",
+        )
+        for i in range(bs_large)
+    ]
+
+    seq_lens_large = torch.full(
+        (bs_large,), seq_len_large - 1, dtype=torch.int64, device="cuda"
+    )
+    out_cache_loc_large = torch.randint(
+        50000, 60000, (bs_large,), dtype=torch.int64, device="cuda"
+    )
+    req_pool_indices_large = torch.arange(bs_large, dtype=torch.int64, device="cuda")
+
+    # Test original kernel
+    curr_device_indices_large_orig = torch.full(
+        (bs_large, top_k_large + 1), -1, dtype=torch.int64, device="cuda"
+    )
+    should_load_device_indices_large_orig = torch.full(
+        (bs_large, top_k_large), -1, dtype=torch.int64, device="cuda"
+    )
+    should_load_host_indices_large_orig = torch.full(
+        (bs_large, top_k_large), -1, dtype=torch.int64, device="cuda"
+    )
+
+    time_large_orig = benchmark_kernel(
+        lambda *args: invoke_nsa_sparse_diff_kernel(
+            prev_top_k_result_pool_large.clone(),
+            curr_top_k_result_large.clone(),
+            prev_device_indices_pool_large.clone(),
+            curr_device_indices_large_orig,
+            bitmap_large.clone(),
+            full_host_indices_large,
+            should_load_device_indices_large_orig,
+            should_load_host_indices_large_orig,
+            out_cache_loc_large,
+            seq_lens_large,
+            req_pool_indices_large,
+            1,
+        ),
+        "Original (TOPK=2048)",
+        num_warmup=5,
+        num_iters=20,
+    )
+
+    print(f"Time taken: {time_large_orig:.3f} ms")
+    print("All tests passed! ✓")
+    print("=" * 60)

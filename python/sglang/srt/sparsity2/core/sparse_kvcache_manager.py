@@ -1,32 +1,24 @@
-
 from __future__ import annotations
 
 import logging
 import threading
-import time
-from typing import TYPE_CHECKING, Any
 
 import nvtx
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    HostKVCache,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.sparsity2.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -87,11 +79,10 @@ class SparseKVCacheManager:
         self.bitmap = torch.full(
             (max_pool_size, server_args.model_config.context_len),
             -1,
-            dtype=torch.int16,
+            dtype=torch.int32,
             device=server_args.device,
         )
         self.req_states = None
-
 
     @nvtx.annotate(
         "DecodeKVCacheOffloadManager.transform_sparse_top_k_cache", color="red"
@@ -104,6 +95,7 @@ class SparseKVCacheManager:
         seq_lens,
         layer_id,
     ):
+        nxtx_range = nvtx.start_range(message="init_buffer", color="blue")
         bs = top_k_result.shape[0]
         top_k = top_k_result.shape[1]
 
@@ -117,8 +109,12 @@ class SparseKVCacheManager:
         should_load_host_indices = torch.full(
             (bs, top_k), -1, dtype=torch.int64, device=top_k_result.device
         )
+        full_host_indices = [
+            self.req_states.full_host_indices[idx] for idx in req_pool_indices
+        ]
+        nvtx.end_range(nxtx_range)
 
-        full_host_indices = [self.req_states.full_host_indices[idx] for idx in req_pool_indices]
+        nxtx_range1 = nvtx.start_range(message="diff_kernel", color="blue")
         invoke_nsa_sparse_diff_kernel(
             self.req_states.prev_top_k_result,
             top_k_result,
@@ -133,9 +129,15 @@ class SparseKVCacheManager:
             req_pool_indices,
             layer_id,
         )
+        nvtx.end_range(nxtx_range1)
 
-        should_load_device_indices = should_load_device_indices[should_load_device_indices != -1]
-        should_load_host_indices = should_load_host_indices[should_load_host_indices != -1]
+        nxtx_range2 = nvtx.start_range(message="io_kernel", color="blue")
+        should_load_device_indices = should_load_device_indices[
+            should_load_device_indices != -1
+        ]
+        should_load_host_indices = should_load_host_indices[
+            should_load_host_indices != -1
+        ]
         assert len(should_load_device_indices) == len(should_load_host_indices)
         if len(should_load_device_indices) > 0:
             # load cache from cpu
@@ -146,9 +148,8 @@ class SparseKVCacheManager:
                 layer_id,
                 "kernel",
             )
-
+        nvtx.end_range(nxtx_range2)
         return curr_device_indices[:, :-1]
-
 
     def offload_sparse_decode_req_tokens(self, req_pool_indices, out_alloc_len):
         """Offload incremental token KV cache for sparse attention."""
