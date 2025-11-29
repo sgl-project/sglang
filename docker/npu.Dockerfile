@@ -25,9 +25,11 @@ ARG DEVICE_TYPE
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
       echo "Using x86_64 dependencies"; \
       echo "PTA_URL=$PTA_URL_AMD64" >> /etc/environment_new; \
+      echo "BISHENG_NAME_AMD64=$BISHENG_NAME_AMD64" >> /etc/environment_new; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
       echo "Using aarch64 dependencies"; \
       echo "PTA_URL=$PTA_URL_ARM64" >> /etc/environment_new; \
+      echo "BISHENG_NAME=$BISHENG_NAME_ARM64" >> /etc/environment_new; \
     else \
       echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1; \
     fi
