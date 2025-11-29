@@ -163,6 +163,8 @@ def calculate_diff(num_tokens, num_experts=256, block_size=128, topk=8):
     )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    if topk_ids.numel() < num_experts:
+        max_num_tokens_padded = topk_ids.numel() * block_size
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
@@ -327,6 +329,8 @@ def benchmark(num_tokens, num_experts, topk, provider):
         )
 
     max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    if topk_ids.numel() < num_experts:
+        max_num_tokens_padded = topk_ids.numel() * block_size
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )
