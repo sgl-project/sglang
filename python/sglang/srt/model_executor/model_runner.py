@@ -1765,14 +1765,14 @@ class ModelRunner:
                 self.max_total_num_tokens / self.model_config.context_len * 512
             )
             max_running_requests = min(max(heuristic, 2048), 4096)
-            logger.info(
-                "max_running_requests not set, using heuristic: "
-                "min(max(%s, 2048), 4096) = %s",
-                heuristic,
-                max_running_requests,
+            log_info_on_rank0(
+                logger,
+                f"token_pool sizing: heuristic={heuristic} -> clamped to {max_running_requests}",
             )
         else:
-            logger.info("max_running_requests from arg: %s", max_running_requests)
+            log_info_on_rank0(
+                logger, f"token_pool sizing: from arg={max_running_requests}"
+            )
 
         if self.mambaish_config is not None:
             ratio = (
