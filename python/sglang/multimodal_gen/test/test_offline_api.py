@@ -36,7 +36,7 @@ class TestGeneratorAPIBase(unittest.TestCase):
 
     def _run_test(self, name, server_kwargs, test_key: str):
         generator = DiffGenerator.from_pretrained(**server_kwargs)
-        result = generator.generate(prompt="A curious raccoon")
+        result = generator.generate(sampling_params_kwargs={"prompt": "A curious raccoon"})
         self.verify_single_generation_result(result)
 
     def test_single_gpu(self):
@@ -59,7 +59,7 @@ class TestGeneratorAPIBase(unittest.TestCase):
             **self.server_kwargs | dict(num_gpus=2, enable_cfg_parallel=True)
         )
         prompts = ["A curious raccoon", "A curious cat"]
-        results = generator.generate(prompt=prompts)
+        results = generator.generate(sampling_params_kwargs={"prompt": prompts})
 
         self.assertEqual(len(results), len(prompts), "Some generation tasks fail")
         for result in results:

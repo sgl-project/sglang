@@ -405,22 +405,16 @@ class DiffGenerator:
 
     def generate_with_lora(
         self,
-        prompt: str | list[str] | None = None,
-        sampling_params: SamplingParams | None = None,
+        sampling_params_kwargs: dict | None = None,
         *,
         lora_path: str | None = None,
         lora_nickname: str | None = None,
         merge_lora: bool = True,
-        **kwargs,
     ):
         self._ensure_lora_state(
             lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
         )
-        return self.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            **kwargs,
-        )
+        return self.generate(sampling_params_kwargs=sampling_params_kwargs)
 
     def shutdown(self):
         """
