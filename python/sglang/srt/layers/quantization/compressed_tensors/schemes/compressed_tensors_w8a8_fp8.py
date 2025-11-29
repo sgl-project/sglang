@@ -85,55 +85,62 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
-                # Optional padding for AITer kernels
+                # Optional padding for AITer kernels (only needed for TP > 1)
                 # SGLANG_AITER_PAD_K: pad K dimension (for GEMM kernels)
                 # SGLANG_AITER_PAD_N: pad N dimension (for shuffle_weight)
-                # When not set: no padding (default behavior, matches current main)
                 # 
-                # Important: For RowParallelLinear, N dimension is sharded by tp_size.
-                # We need to ensure that after padding, N/tp_size is still aligned.
-                # Solution: multiply N alignment by tp_size before padding.
-                pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
-                pad_n_align = os.environ.get("SGLANG_AITER_PAD_N", "").strip()
+                # TP=1: No padding needed - original dimensions work fine
+                # TP>1: Padding needed to ensure dimensions remain aligned after sharding
+                #   - RowParallelLinear: N dimension sharded, needs N-padding with tp_size awareness
+                #   - ColumnParallelLinear: K dimension sharded, needs K-padding
+                tp_size = getattr(layer, 'tp_size', 1)
                 
-                k = weight.shape[0]
-                n = weight.shape[1]
-                k_aligned = k
-                n_aligned = n
-                
-                # Pad K dimension if requested
-                if pad_k_align and pad_k_align.isdigit():
-                    k_align = int(pad_k_align)
-                    k_aligned = ceil_align(k, k_align)
-                
-                # Pad N dimension if requested (with TP awareness for RowParallel)
-                if pad_n_align and pad_n_align.isdigit():
-                    n_align = int(pad_n_align)
-                    # For RowParallelLinear: N dimension gets sharded by tp_size
-                    # We need to multiply alignment by tp_size to ensure post-shard alignment
-                    # For other layer types (ColumnParallel, etc.), no N-sharding occurs
-                    tp_size = getattr(layer, 'tp_size', 1)
-                    layer_class_name = layer.__class__.__name__
+                # Skip all padding for TP=1 (no sharding, original dims are fine)
+                if tp_size == 1:
+                    layer.weight = Parameter(
+                        shuffle_weight(weight, (16, 16)).t(), requires_grad=False
+                    )
+                else:
+                    # TP > 1: Apply padding if requested
+                    pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+                    pad_n_align = os.environ.get("SGLANG_AITER_PAD_N", "").strip()
                     
-                    # Only apply TP-aware padding for RowParallelLinear
-                    if 'RowParallel' in layer_class_name and tp_size > 1:
-                        n_align_tp_aware = n_align * tp_size
-                        n_aligned = ceil_align(n, n_align_tp_aware)
-                    else:
-                        n_aligned = ceil_align(n, n_align)
-                
-                need_padding = (k_aligned != k) or (n_aligned != n)
-                if need_padding:
-                    # Pad weight: (k, n) -> (k_aligned, n_aligned)
-                    weight = torch.nn.functional.pad(weight, (0, n_aligned - n, 0, k_aligned - k))
+                    k = weight.shape[0]
+                    n = weight.shape[1]
+                    k_aligned = k
+                    n_aligned = n
                     
-                    # Pad weight_scale if needed (K dimension only)
-                    if k_aligned != k and weight_scale.shape[0] == k and len(weight_scale.shape) == 2:
-                        weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, k_aligned - k))
-                
-                layer.weight = Parameter(
-                    shuffle_weight(weight, (16, 16)).t(), requires_grad=False
-                )
+                    # Pad K dimension if requested
+                    if pad_k_align and pad_k_align.isdigit():
+                        k_align = int(pad_k_align)
+                        k_aligned = ceil_align(k, k_align)
+                    
+                    # Pad N dimension if requested (with TP awareness for RowParallel)
+                    if pad_n_align and pad_n_align.isdigit():
+                        n_align = int(pad_n_align)
+                        layer_class_name = layer.__class__.__name__
+                        
+                        # For RowParallelLinear: N dimension gets sharded by tp_size
+                        # Multiply alignment by tp_size to ensure post-shard alignment
+                        if 'RowParallel' in layer_class_name:
+                            n_align_tp_aware = n_align * tp_size
+                            n_aligned = ceil_align(n, n_align_tp_aware)
+                        else:
+                            # For other layer types (ColumnParallel, etc.), no N-sharding
+                            n_aligned = ceil_align(n, n_align)
+                    
+                    need_padding = (k_aligned != k) or (n_aligned != n)
+                    if need_padding:
+                        # Pad weight: (k, n) -> (k_aligned, n_aligned)
+                        weight = torch.nn.functional.pad(weight, (0, n_aligned - n, 0, k_aligned - k))
+                        
+                        # Pad weight_scale if needed (K dimension only)
+                        if k_aligned != k and weight_scale.shape[0] == k and len(weight_scale.shape) == 2:
+                            weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, k_aligned - k))
+                    
+                    layer.weight = Parameter(
+                        shuffle_weight(weight, (16, 16)).t(), requires_grad=False
+                    )
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
 
