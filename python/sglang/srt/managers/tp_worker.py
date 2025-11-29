@@ -389,13 +389,6 @@ class TpModelWorker(BaseTpWorker):
             f"kv_pool={kv_pool.size} sliding_window={self.model_runner.sliding_window_size}",
         )
 
-        if server_args.enable_dp_attention:
-            dp_rank_display = dp_rank if dp_rank is not None else 0
-            log_info_on_rank0(
-                logger,
-                f"DP attention: dp_rank={dp_rank_display}/{server_args.dp_size}",
-            )
-
     def is_dllm(self):
         return hasattr(self, "dllm_algorithm")
 
