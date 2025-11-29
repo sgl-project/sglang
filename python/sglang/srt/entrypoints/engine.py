@@ -466,6 +466,7 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
+        load_format: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -474,6 +475,7 @@ class Engine(EngineBase):
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
+            load_format=load_format,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -734,7 +736,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.17.post2",
+            "0.3.18.post1",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 
