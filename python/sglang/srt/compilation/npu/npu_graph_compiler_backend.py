@@ -17,12 +17,14 @@ from typing import Callable
 import torch
 
 from sglang.srt.compilation.npu.pass_manager import PassManager
+from sglang.srt.compilation.npu.passes.fp16 import SplitQkvRmsnormRopeFuse
 from sglang.srt.compilation.npu.passes.w8a8_int8 import (
     DivFuse,
     EraseCopy,
     NpuAddRmsNormDynamicQuantFuse,
     NpuAddRmsNormQuantFuse,
 )
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 
 class NpuGraphCompilerBackend:
@@ -31,11 +33,46 @@ class NpuGraphCompilerBackend:
 
     def __call__(self, graph: torch.fx.GraphModule, example_inputs) -> Callable:
         if self.model_type == torch.bfloat16:
-            NpuGraphCompilerBackend.apply_passes(graph)
+            self.apply_passes(graph)
         return graph
 
-    def apply_passes(graph_module: torch.fx.GraphModule):
+    def init(self, config):
+        config = config.hf_config
+
+        hidden_size = config.hidden_size
+
+        num_heads = config.num_attention_heads
+        num_kv_heads = config.num_key_value_heads
+
+        head_dim = getattr(config, "head_dim", None)
+        self.rms_norm_eps = config.rms_norm_eps
+
+        total_num_heads = num_heads
+        attn_tp_size = get_attention_tp_size()
+
+        assert total_num_heads % attn_tp_size == 0
+        num_heads = total_num_heads // attn_tp_size
+        total_num_kv_heads = num_kv_heads
+        num_kv_heads = max(1, total_num_kv_heads // attn_tp_size)
+
+        self.head_dim = head_dim or hidden_size // total_num_heads
+        self.q_size = num_heads * self.head_dim
+        self.kv_size = num_kv_heads * self.head_dim
+
+        self.q_shape = (self.head_dim, self.q_size)
+        self.k_shape = (self.head_dim, self.kv_size)
+
+    def apply_passes(self, graph_module: torch.fx.GraphModule):
         passManager = PassManager(graph_module)
+        passManager.add(
+            SplitQkvRmsnormRopeFuse,
+            q_size=self.q_size,
+            kv_size=self.kv_size,
+            head_dim=self.head_dim,
+            q_shape=self.q_shape,
+            k_shape=self.k_shape,
+            variance_epsilon=self.rms_norm_eps,
+        )
         passManager.add(NpuAddRmsNormQuantFuse)
         passManager.add(NpuAddRmsNormDynamicQuantFuse)
         passManager.add(DivFuse)

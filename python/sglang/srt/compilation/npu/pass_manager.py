@@ -20,13 +20,13 @@ class PassManager:
         self.graph_module = graph_module
         self.passes = []
 
-    def add(self, pass_):
-        self.passes.append(pass_)
+    def add(self, pass_, **kwargs):
+        self.passes.append((pass_, kwargs))
 
     def apply(self):
         updated = False
-        for pass_ in self.passes:
-            pass_instance = pass_()
+        for pass_, kwargs in self.passes:
+            pass_instance = pass_(**kwargs)
             results = []
             try:
                 if callable(pass_instance):
