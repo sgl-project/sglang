@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Copyright 2023-2024 SGLang Team
@@ -442,6 +443,7 @@ class Req:
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
+        dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
@@ -683,8 +685,14 @@ class Req:
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
+        # For diffusion LLM
+        self.dllm_ids = []
+        self.dllm_block_offset = 0
+        self.dllm_config = dllm_config
+
     @property
-    def seqlen(self):
+    def seqlen(self) -> int:
+        """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
@@ -751,8 +759,28 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def is_dllm(self):
+        return self.dllm_config is not None
+
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
-        self.fill_ids = self.origin_input_ids + self.output_ids
+        if self.is_dllm():
+            if not self.fill_ids:
+                self.dllm_ids = (
+                    self.origin_input_ids
+                    + [
+                        self.dllm_config.mask_id,
+                    ]
+                    * self.dllm_config.block_size
+                )
+            else:
+                self.dllm_block_offset += self.dllm_config.block_size
+                self.dllm_ids += [
+                    self.dllm_config.mask_id
+                ] * self.dllm_config.block_size
+            self.fill_ids = self.dllm_ids
+        else:
+            self.fill_ids = self.origin_input_ids + self.output_ids
+
         input_len = len(self.fill_ids)
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
@@ -762,18 +790,24 @@ class Req:
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
+            match_result = tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
                     if isinstance(tree_cache, MambaRadixCache)
                     else {}
                 ),
+            )
+            (
+                self.prefix_indices,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length,
+            ) = (
+                match_result.device_indices,
+                match_result.last_device_node,
+                match_result.last_host_node,
+                match_result.host_hit_length,
             )
             self.cache_protected_len = len(self.prefix_indices)
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
@@ -1121,6 +1155,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    # Diffusion LLM
+    dllm_config: Optional[DllmConfig] = None
+
     @classmethod
     def init_new(
         cls,
@@ -1132,6 +1169,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
@@ -1160,6 +1198,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            dllm_config=dllm_config,
         )
 
     def batch_size(self):
@@ -1167,6 +1206,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def is_dllm(self):
+        return self.dllm_config is not None
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1506,8 +1548,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
+    def retract_all(self, server_args: ServerArgs):
+        retracted_reqs = self.reqs
+        for idx in range(len(self.reqs)):
+            self.release_req(idx, len(self.reqs) - idx, server_args)
+
+        self.filter_batch(retracted_reqs)
+        return retracted_reqs
+
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1871,6 +1922,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
+            dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
+            dllm_config=self.dllm_config,
+            reqs=self.reqs,
+            has_grammar=self.has_grammar,
         )
 
     def copy(self):
@@ -1984,3 +2039,12 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # Diffusion LLM
+    dllm_block_offsets: Optional[List[int]] = None
+    dllm_config: Optional[DllmConfig] = None
+
+    # For constrained decoding
+    # FIXME(lsyin): remove this after fully overlap grammar
+    reqs: Optional[List[Req]] = None
+    has_grammar: bool = False

@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -153,7 +154,11 @@ class BaseTpWorker(ABC):
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
         success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
         )
         return success, message
 
@@ -234,6 +239,9 @@ class TpModelWorker(BaseTpWorker):
             ),
             is_draft_model=is_draft_worker,
         )
+
+        if server_args.dllm_algorithm is not None:
+            self.dllm_algorithm = DllmAlgorithm.from_server_args(server_args)
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
@@ -387,6 +395,8 @@ class TpModelWorker(BaseTpWorker):
                 logger,
                 f"DP attention: dp_rank={dp_rank_display}/{server_args.dp_size}",
             )
+    def is_dllm(self):
+        return hasattr(self, "dllm_algorithm")
 
     def forward_batch_generation(
         self,
@@ -416,6 +426,16 @@ class TpModelWorker(BaseTpWorker):
             )
 
         if self.pp_group.is_last_rank:
+            if self.is_dllm():
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    self.dllm_algorithm.run(self.model_runner, forward_batch)
+                )
+                return GenerationBatchResult(
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                )
+
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
