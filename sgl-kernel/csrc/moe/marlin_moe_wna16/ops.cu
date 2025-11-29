@@ -24,7 +24,6 @@
 #endif
 
 #include "kernel.h"
-#include "marlin_template.h"
 #include "kernel_marlin.cuh"
 #include "marlin_template.h"
 
