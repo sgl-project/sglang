@@ -121,11 +121,11 @@ class GPUWorker:
                 output_batch.timings.total_duration_ms = duration_ms
                 PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
-                output_batch = OutputBatch()
+            output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
             return output_batch
-            
+
     def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
         """
         Set the LoRA adapter for the pipeline.

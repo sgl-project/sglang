@@ -106,8 +106,13 @@ def generate_cmd(args: argparse.Namespace):
     # Handle diffusers-specific kwargs passed via CLI
     if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:
         try:
-            sampling_params_kwargs["diffusers_kwargs"] = json.loads(args.diffusers_kwargs)
-            logger.info("Parsed diffusers_kwargs: %s", sampling_params_kwargs["diffusers_kwargs"])
+            sampling_params_kwargs["diffusers_kwargs"] = json.loads(
+                args.diffusers_kwargs
+            )
+            logger.info(
+                "Parsed diffusers_kwargs: %s",
+                sampling_params_kwargs["diffusers_kwargs"],
+            )
         except json.JSONDecodeError as e:
             logger.error("Failed to parse --diffusers-kwargs as JSON: %s", e)
             raise ValueError(
