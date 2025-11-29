@@ -106,10 +106,6 @@ class GPUWorker:
             result = self.pipeline.forward(req, self.server_args)
 
             if isinstance(result, Req):
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
-
                 output_batch = OutputBatch(
                     output=result.output,
                     trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
@@ -125,15 +121,17 @@ class GPUWorker:
                 output_batch.timings.total_duration_ms = duration_ms
                 PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
-            if output_batch is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
-
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
             return output_batch
+            
+     def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
+        """
+        Set the LoRA adapter for the pipeline.
+        """
+        assert self.pipeline is not None
+        self.pipeline.set_lora(lora_nickname, lora_path)
 
     def merge_lora_weights(self) -> None:
         """
