@@ -171,6 +171,10 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
 
+    @property
+    def seqlen(self) -> int:
+        return self.req.seqlen
+
 
 class DecodePreallocQueue:
     """
@@ -930,7 +934,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        new_batch.process_prebuilt(self.server_args, self.model_config)
+        new_batch.process_prebuilt(self.server_args, self.future_map)
 
         return new_batch
 

@@ -564,7 +564,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
             cum_seq_lens_q = torch.cat(
                 (
-                    torch.tensor([0], device=forward_batch.seq_lens.device),
+                    torch.zeros(
+                        1, dtype=torch.int32, device=forward_batch.seq_lens.device
+                    ),
                     torch.cumsum(seq_lens, dim=0),
                 )
             ).int()
