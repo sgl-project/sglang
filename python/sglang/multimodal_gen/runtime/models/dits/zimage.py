@@ -310,7 +310,7 @@ class RopeEmbedder:
         assert ids.ndim == 2
         assert ids.shape[-1] == len(self.axes_dims)
         device = ids.device
-        print(f"313 {ids.shape=}, {self.axes_dims=}, {self.axes_lens=}", flush=True)
+
         if self.freqs_cis is None:
             self.freqs_cis = self.precompute_freqs_cis(
                 self.axes_dims, self.axes_lens, theta=self.theta
