@@ -17,7 +17,7 @@ def fused_topk_npu(
     router_logits: torch.Tensor,
     topk_config: "TopKConfig",
     num_token_non_padded: Optional[torch.Tensor] = None,
-    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
 ) -> TopKOutput:
 
     use_grouped_topk = topk_config.use_grouped_topk
