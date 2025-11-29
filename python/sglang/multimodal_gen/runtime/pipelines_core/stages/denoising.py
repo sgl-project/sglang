@@ -304,6 +304,26 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = True
         self._cached_num_steps = num_inference_steps
 
+    def torch_compile_module(self, module):
+        """
+        Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object has no forward.
+        """
+        if not self.server_args.enable_torch_compile or module is None:
+            return module
+        if not hasattr(module, "forward"):
+            return module
+        try:
+            import torch._inductor.config as _inductor_cfg
+
+            _inductor_cfg.reorder_for_compute_comm_overlap = True
+        except ImportError:
+            pass
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
+        setattr(module, "forward", compiled_forward)
+        return module
+
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
         """Builds a guidance tensor. This method is cached."""
@@ -490,14 +510,7 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
-
-            # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(batch.num_inference_steps)
-
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
-                )
+            self.torch_compile_module(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
@@ -904,6 +917,61 @@ class DenoisingStage(PipelineStage):
 
         return latents
 
+    def _warmup(self, batch: Req, server_args: ServerArgs, prepared_vars: dict):
+        logger.info("Performing 1-step warmup")
+
+        target_dtype = prepared_vars["target_dtype"]
+        autocast_enabled = prepared_vars["autocast_enabled"]
+        timesteps = prepared_vars["timesteps"]
+        seq_len = prepared_vars["seq_len"]
+        reserved_frames_mask = prepared_vars["reserved_frames_mask"]
+        latents = prepared_vars["latents"]
+        image_kwargs = prepared_vars["image_kwargs"]
+        pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
+        neg_cond_kwargs = prepared_vars["neg_cond_kwargs"]
+        guidance = prepared_vars["guidance"]
+
+        with torch.autocast(
+            device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+            dtype=target_dtype,
+            enabled=autocast_enabled,
+        ):
+            t_warmup = timesteps[0]
+            _warmup_ts = self.expand_timestep_before_forward(
+                batch,
+                server_args,
+                t_warmup,
+                target_dtype,
+                seq_len,
+                reserved_frames_mask,
+            )
+            latent_warmup = latents.to(target_dtype)
+            if batch.image_latent is not None:
+                assert (
+                    not server_args.pipeline_config.task_type == ModelTaskType.TI2V
+                ), "image latents should not be provided for TI2V task"
+                latent_warmup = torch.cat(
+                    [latent_warmup, batch.image_latent], dim=1
+                ).to(target_dtype)
+
+            latent_warmup = self.scheduler.scale_model_input(latent_warmup, t_warmup)
+            attn_metadata_warmup = self._build_attn_metadata(0, batch, server_args)
+            with set_forward_context(
+                current_timestep=0,
+                attn_metadata=attn_metadata_warmup,
+                forward_batch=batch,
+            ):
+                self._predict_noise(
+                    current_model=self.transformer,
+                    latent_model_input=latent_warmup,
+                    timestep=_warmup_ts,
+                    target_dtype=target_dtype,
+                    guidance=guidance,
+                    **image_kwargs,
+                    **pos_cond_kwargs,
+                )
+        logger.info("Warmup done.")
+
     @torch.no_grad()
     def forward(
         self,
@@ -942,6 +1010,10 @@ class DenoisingStage(PipelineStage):
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
+
+        # Warmup
+        if server_args.enable_warmup:
+            self._warmup(batch, server_args, prepared_vars)
 
         # Run denoising loop
         denoising_start_time = time.time()

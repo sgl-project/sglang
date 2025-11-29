@@ -49,6 +49,50 @@ class CausalDMDDenoisingStage(DenoisingStage):
         except Exception:
             self.local_attn_size = -1
 
+    def _warmup(
+        self,
+        batch,
+        server_args,
+        current_latents,
+        first_timestep,
+        target_dtype,
+        autocast_enabled,
+        image_kwargs,
+        pos_cond_kwargs,
+        prompt_embeds,
+    ):
+        logger.info("Performing 1-step warmup for Causal DMD denoising")
+        latent_model_input = current_latents.to(target_dtype)
+
+        t_expanded_noise = first_timestep[0] * torch.ones(
+            (latent_model_input.shape[0], 1),
+            device=latent_model_input.device,
+            dtype=torch.long,
+        )
+
+        with torch.autocast(
+            device_type="cuda",
+            dtype=target_dtype,
+            enabled=autocast_enabled,
+        ):
+            with set_forward_context(
+                current_timestep=0,
+                attn_metadata=None,
+                forward_batch=batch,
+            ):
+                _ = self.transformer(
+                    latent_model_input,
+                    prompt_embeds,
+                    t_expanded_noise,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=0,
+                    start_frame=0,
+                    **image_kwargs,
+                    **pos_cond_kwargs,
+                )
+        logger.info("Warmup done.")
+
     def forward(
         self,
         batch: Req,
@@ -135,6 +179,54 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     )
                 )
 
+        # Determine block sizes
+        if not independent_first_frame or (
+            independent_first_frame and batch.image_latent is not None
+        ):
+            if t % self.num_frames_per_block != 0:
+                raise ValueError(
+                    "num_frames must be divisible by num_frames_per_block for causal DMD denoising"
+                )
+            num_blocks = t // self.num_frames_per_block
+            block_sizes = [self.num_frames_per_block] * num_blocks
+            start_index = 0
+        else:
+            if (t - 1) % self.num_frames_per_block != 0:
+                raise ValueError(
+                    "(num_frames - 1) must be divisible by num_frame_per_block when independent_first_frame=True"
+                )
+            num_blocks = (t - 1) // self.num_frames_per_block
+            block_sizes = [1] + [self.num_frames_per_block] * num_blocks
+            start_index = 0
+
+        # Warmup
+        self.warmup(
+            batch,
+            server_args,
+            current_latents=latents[:, :, : block_sizes[0], :, :],
+            first_timestep=timesteps[0:1],
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            prompt_embeds=prompt_embeds,
+        )
+        if server_args.enable_warmup:
+            # Reset cache after warmup
+            for block_index in range(self.num_transformer_blocks):
+                self.crossattn_cache[block_index]["is_init"] = False  # type: ignore
+            for block_index in range(len(self.kv_cache1)):
+                self.kv_cache1[block_index]["global_end_index"] = (
+                    torch.tensor(  # type: ignore
+                        [0], dtype=torch.long, device=latents.device
+                    )
+                )
+                self.kv_cache1[block_index]["local_end_index"] = (
+                    torch.tensor(  # type: ignore
+                        [0], dtype=torch.long, device=latents.device
+                    )
+                )
+
         # Optional: cache context features from provided image latents prior to generation
         current_start_frame = 0
         if getattr(batch, "image_latent", None) is not None:
@@ -200,26 +292,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
         # Base position offset from any cache warm-up
         pos_start_base = current_start_frame
-
-        # Determine block sizes
-        if not independent_first_frame or (
-            independent_first_frame and batch.image_latent is not None
-        ):
-            if t % self.num_frames_per_block != 0:
-                raise ValueError(
-                    "num_frames must be divisible by num_frames_per_block for causal DMD denoising"
-                )
-            num_blocks = t // self.num_frames_per_block
-            block_sizes = [self.num_frames_per_block] * num_blocks
-            start_index = 0
-        else:
-            if (t - 1) % self.num_frames_per_block != 0:
-                raise ValueError(
-                    "(num_frames - 1) must be divisible by num_frame_per_block when independent_first_frame=True"
-                )
-            num_blocks = (t - 1) // self.num_frames_per_block
-            block_sizes = [1] + [self.num_frames_per_block] * num_blocks
-            start_index = 0
 
         # DMD loop in causal blocks
         with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
