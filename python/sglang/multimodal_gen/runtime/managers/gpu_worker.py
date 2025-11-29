@@ -126,7 +126,7 @@ class GPUWorker:
         finally:
             return output_batch
             
-     def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
+    def set_lora(self, lora_nickname: str, lora_path: str | None = None) -> None:
         """
         Set the LoRA adapter for the pipeline.
         """
