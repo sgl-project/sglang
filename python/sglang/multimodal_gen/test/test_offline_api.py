@@ -36,7 +36,9 @@ class TestGeneratorAPIBase(unittest.TestCase):
 
     def _run_test(self, name, server_kwargs, test_key: str):
         generator = DiffGenerator.from_pretrained(**server_kwargs)
-        result = generator.generate(sampling_params_kwargs={"prompt": "A curious raccoon"})
+        result = generator.generate(
+            sampling_params_kwargs={"prompt": "A curious raccoon"}
+        )
         self.verify_single_generation_result(result)
 
     def test_single_gpu(self):
