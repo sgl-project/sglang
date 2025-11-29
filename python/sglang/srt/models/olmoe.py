@@ -90,6 +90,7 @@ class OlmoeMoE(nn.Module):
             reduce_results=True,
             quant_config=quant_config,
             layer_id=layer_id,
+            top_k=top_k,
             prefix=add_prefix("experts", prefix),
         )
 
