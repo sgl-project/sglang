@@ -9,7 +9,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.profile_utils import ProfileManager
