@@ -85,32 +85,33 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
-                # Pad K and N dimensions before shuffle if alignment is specified
                 # shuffle_weight requires BOTH K % 32 == 0 AND N % 32 == 0
+                # K padding is optional (for GEMM kernels), N padding is mandatory (for shuffle_weight)
                 pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+                
+                k = weight.shape[0]
+                n = weight.shape[1]
+                
+                # N dimension: always pad to 32 if needed (required by shuffle_weight)
+                n_aligned = ceil_align(n, 32)
+                
+                # K dimension: pad to user-specified alignment if flag is set
                 if pad_k_align and pad_k_align.isdigit():
                     k_align = int(pad_k_align)
-                    # Ensure alignment is at least 32 (required by shuffle_weight)
-                    k_align = max(k_align, 32)
-                    
-                    # Pad K dimension to user-specified alignment (for GEMM + shuffle)
-                    k = weight.shape[0]
+                    k_align = max(k_align, 32)  # Ensure at least 32 for shuffle_weight
                     k_aligned = ceil_align(k, k_align)
+                else:
+                    # No K padding requested, but still need 32 alignment for shuffle_weight
+                    k_aligned = ceil_align(k, 32)
+                
+                need_padding = (k_aligned != k) or (n_aligned != n)
+                if need_padding:
+                    # Pad weight: (k, n) -> (k_aligned, n_aligned)
+                    weight = torch.nn.functional.pad(weight, (0, n_aligned - n, 0, k_aligned - k))
                     
-                    # Pad N dimension to 32 only (minimum for shuffle_weight)
-                    # N doesn't affect GEMM kernel requirements, so use minimal padding
-                    n = weight.shape[1]
-                    n_aligned = ceil_align(n, 32)
-                    
-                    need_padding = (k_aligned != k) or (n_aligned != n)
-                    if need_padding:
-                        # Pad weight: (k, n) -> (k_aligned, n_aligned)
-                        weight = torch.nn.functional.pad(weight, (0, n_aligned - n, 0, k_aligned - k))
-                        
-                        # Pad weight_scale if needed
-                        # weight_scale is (k, 1) for channel-wise, pad K dimension
-                        if weight_scale.shape[0] == k and len(weight_scale.shape) == 2:
-                            weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, k_aligned - k))
+                    # Pad weight_scale if needed
+                    if weight_scale.shape[0] == k and len(weight_scale.shape) == 2:
+                        weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, k_aligned - k))
                 
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
