@@ -113,10 +113,6 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             start=(cap_ori_len + cap_padding_len + 1, 0, 0),
             device=device,
         ).flatten(0, 2)
-        print(
-            f"122 {image_ori_pos_ids.shape=}, {F_tokens=}, {H_tokens=}, {W_tokens=}, {cap_ori_len=}, {cap_padding_len=}, {device=}",
-            flush=True,
-        )
         image_padding_pos_ids = (
             create_coordinate_grid(
                 size=(1, 1, 1),
@@ -125,10 +121,6 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             )
             .flatten(0, 2)
             .repeat(image_padding_len, 1)
-        )
-        print(
-            f"131 {image_ori_pos_ids.shape=}, {image_padding_pos_ids.shape=}",
-            flush=True,
         )
         image_padded_pos_ids = torch.cat(
             [image_ori_pos_ids, image_padding_pos_ids], dim=0
