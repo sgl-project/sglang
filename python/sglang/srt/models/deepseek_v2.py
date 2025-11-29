@@ -2411,7 +2411,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         if cos_sin_cache is None:
             # AITer path: create tuple of (cos_cache, sin_cache)
             cos_sin_cache = (self.rotary_emb.cos_cache, self.rotary_emb.sin_cache)
-        num_kv_split = forward_batch.attn_backend.num_kv_splits
+        # Different backends have different attribute names
+        num_kv_split = getattr(forward_batch.attn_backend, 'num_kv_splits', 
+                               getattr(forward_batch.attn_backend, 'max_kv_splits', None))
         sm_scale = self.attn_mqa.scaling
         if attn_logits is None:
             attn_logits = torch.empty(
