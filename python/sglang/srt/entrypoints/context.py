@@ -181,6 +181,7 @@ class StreamingHarmonyContext(HarmonyContext):
         self.parser = get_streamable_parser_for_assistant()
         self.encoding = get_encoding()
         self.last_tok = None
+        self.num_processed_tokens = 0
 
     @property
     def messages(self) -> list:
@@ -191,7 +192,20 @@ class StreamingHarmonyContext(HarmonyContext):
             # RequestOutput from SGLang with outputs
             output_token_ids = output["output_ids"]
 
-            for token_id in output_token_ids:
+            # Check if we need to handle cumulative tokens
+            meta_info = output.get("meta_info", {})
+            completion_tokens = meta_info.get("completion_tokens")
+            if (
+                completion_tokens is not None
+                and len(output_token_ids) == completion_tokens
+            ):
+                new_token_ids = output_token_ids[self.num_processed_tokens :]
+                self.num_processed_tokens = len(output_token_ids)
+            else:
+                new_token_ids = output_token_ids
+                self.num_processed_tokens += len(output_token_ids)
+
+            for token_id in new_token_ids:
                 self.parser.process(token_id)
 
         else:
