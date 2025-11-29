@@ -469,7 +469,7 @@ class AscendAttnBackend(AttentionBackend):
                         enable_gqa=use_gqa,
                         causal=causal,
                     )
-        elif self.use_mla and sum(forward_batch.extend_prefix_lens_cpu) > 0:
+        elif sum(forward_batch.extend_prefix_lens_cpu) > 0:
             q, k, v = [
                 data[: forward_batch.num_token_non_padded_cpu] for data in [q, k, v]
             ]
@@ -527,19 +527,9 @@ class AscendAttnBackend(AttentionBackend):
                 -1, layer.tp_k_head_num, self.qk_nope_head_dim + layer.v_head_dim
             )
             k_nope, v = kv.split([self.qk_nope_head_dim, layer.v_head_dim], dim=-1)
-            k_shape = (
-                k_nope.shape[0],
-                layer.tp_k_head_num,
-                self.qk_nope_head_dim + self.qk_rope_head_dim,
-            )
-            k = k_nope.new_empty(*k_shape)
-            k[..., : self.qk_nope_head_dim] = k_nope
-            k[..., self.qk_nope_head_dim :] = k_rope_cached
 
             # 3rd, compute history attn_out and attn_lse
-            k_nope, k_rope = k.split(
-                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-            )
+            k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
             seq_len = torch.stack(
                 [
                     self.forward_metadata.extend_seq_lens_cpu_int,
