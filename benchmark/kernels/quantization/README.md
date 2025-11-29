@@ -28,7 +28,7 @@ For a linear layer `y = xW^T` where `x` is (M, K) and `W` is (N, K):
 - **N**: Output features (weight matrix output dimension)
 - **K**: Input features (weight matrix input dimension)
 
-**Example: Qwen3-VL-32B** (hidden_size=5120, intermediate_size=25600, num_heads=64, num_kv_heads=8, head_dim=128)
+**Example: Qwen3-VL-32B** (hidden_size=5120, intermediate_size=25600, num_heads=64, num_kv_heads=8, head_dim=128) and TP=1
 ```bash
 # QKV projection: Q(8192) + K(1024) + V(1024) = 10240
 python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 10240 --K 5120
@@ -41,6 +41,22 @@ python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 5120 --K 2
 
 # O projection (if separate from QKV)
 python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 5120 --K 8192
+```
+
+If TP=8:
+
+```bash
+# QKV projection: Q(8192) + K(1024) + V(1024) = 10240 / TP=8
+python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 1280 --K 5120
+
+# MLP gate+up (SwiGLU): 2 * intermediate_size = 51200 / TP=8
+python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 6400 --K 5120
+
+# MLP down projection
+python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 5120 --K 3200
+
+# O projection (if separate from QKV)
+python benchmark/kernels/quantization/tuning_block_wise_kernel.py --N 5120 --K 1024
 ```
 
 ## Output
