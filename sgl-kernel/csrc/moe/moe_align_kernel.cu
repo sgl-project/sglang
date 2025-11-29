@@ -243,17 +243,20 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     size_t numel,
     bool pad_sorted_token_ids,
     int32_t max_num_tokens_padded) {
-  // Use an additional group of threads to fill sorted_token_ids
+  // Adapted from
+  // https://github.com/vllm-project/vllm/pull/29642/files#diff-5647b1413f4ae9aacba904eca8f8a8aee9079321eadff4c10101a2c6962dcc53R226
+  // Use an additional group of threads to fill sorted_token_ids.
+  // Since the kernel will use sorted_token_ids afterward,
+  // we fill sorted_token_ids within the same threadblock to make
+  // synchronization easier.
   if (threadIdx.x < fill_threads) {
+    // Initialize sorted_token_ids with numel
     if (pad_sorted_token_ids) {
-      Vec fill_vec;
-      fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
-      int32_t total_vecs = (max_num_tokens_padded + VEC_SIZE - 1) / VEC_SIZE;
-      Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
-      for (int32_t i = threadIdx.x; i < total_vecs; i += fill_threads) {
-        out_ptr[i] = fill_vec;
+      for (int32_t it = threadIdx.x; it < max_num_tokens_padded; it += fill_threads) {
+        sorted_token_ids[it] = numel;
       }
     }
+    // Three __syncthreads() corresponding to the other threads
     __syncthreads();
     __syncthreads();
     __syncthreads();
