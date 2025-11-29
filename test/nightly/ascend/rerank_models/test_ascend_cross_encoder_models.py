@@ -6,7 +6,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=400, suite="nightly-1-npu", nightly=True)
 
@@ -68,9 +68,6 @@ class TestCrossEncoderModels(CustomTestCase):
 
     def test_prefill_logits(self):
         models_to_test = MODELS
-
-        if is_in_ci():
-            models_to_test = [random.choice(MODELS)]
 
         for model, tp_size, prefill_tolerance in models_to_test:
             for attention_backend in ATTENTION_BACKEND:
