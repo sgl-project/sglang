@@ -156,9 +156,6 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         return (img_cos, img_sin), (txt_cos, txt_sin)
 
     def prepare_image_processor_kwargs(self, prompt: str | None, image) -> dict:
-        if not prompt:
-            return {}
-
         prompt_template_encode = (
             "<|im_start|>system\nDescribe the key features of the input image "
             "(color, shape, size, texture, objects, background), then explain how "
@@ -324,9 +321,6 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         return condition_image_sizes
 
     def prepare_image_processor_kwargs(self, prompt: str | None, image) -> dict:
-        if not prompt:
-            return {}
-
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
 
         prompt_template_encode = (

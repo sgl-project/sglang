@@ -111,6 +111,9 @@ class GPUWorker:
                 output_batch.timings.total_duration_ms = duration_ms
                 PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
+            logger.error(
+                f"Error executing request {req.request_id}: {e}", exc_info=True
+            )
             if output_batch is None:
                 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
                     OutputBatch,
