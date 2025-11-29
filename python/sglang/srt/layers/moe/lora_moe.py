@@ -104,16 +104,13 @@ class FusedMoEWithLoRA(nn.Module):
         num_loras = self.lora_a_weights.shape[0]
 
         # Dispatch tokens to experts
-        token_ids, expert_ids, _ = moe_dispatch(
+        token_ids, expert_ids, _, lora_ids = moe_dispatch(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             lora_indices=lora_indices,
             num_experts=num_experts,
             num_loras=num_loras,
         )
-
-        # Get LoRA IDs for dispatched tokens
-        lora_ids = lora_indices[token_ids]
 
 
 

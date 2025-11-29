@@ -23,7 +23,7 @@ def moe_dispatch(
     lora_indices: torch.Tensor,
     num_experts: int,
     num_loras: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Dispatch tokens to experts for MoE computation.
 
@@ -38,6 +38,7 @@ def moe_dispatch(
         sorted_token_ids: Token indices sorted by expert_id
         sorted_expert_ids: Corresponding expert IDs
         sorted_weights: Corresponding router weights
+        sorted_lora_ids: LoRA adapter IDs for each dispatched token
     """
     num_tokens, top_k = topk_ids.shape
     device = topk_ids.device
@@ -46,15 +47,17 @@ def moe_dispatch(
     flat_topk_ids = topk_ids.flatten()
     flat_topk_weights = topk_weights.flatten()
     flat_token_ids = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
+    flat_lora_ids = lora_indices.repeat_interleave(top_k)
 
     # Sort by expert_id only (each expert uses same LoRA adapter logic)
-    composite_key = flat_topk_ids
-
-    # Sort by expert_id to group tokens by expert
-    sorted_indices = torch.argsort(composite_key)
+    sorted_indices = torch.argsort(flat_topk_ids)
 
     sorted_token_ids = flat_token_ids[sorted_indices]
     sorted_expert_ids = flat_topk_ids[sorted_indices]
     sorted_weights = flat_topk_weights[sorted_indices]
 
-    return sorted_token_ids, sorted_expert_ids, sorted_weights
+    if flat_lora_ids.shape != sorted_indices.shape:
+        y = 1 # need to pause
+    sorted_lora_ids = flat_lora_ids[sorted_indices]
+
+    return sorted_token_ids, sorted_expert_ids, sorted_weights, sorted_lora_ids

@@ -285,7 +285,7 @@ class LoRAManager:
 
         # Populate per-token LoRA indices from segment information
         batch_info = self.lora_backend.batch_info
-        num_tokens = forward_batch.batch_size
+        num_tokens = forward_batch.seq_lens_sum  # Total tokens across all sequences
         if batch_info.permutation is None:
             # No reordering (e.g., triton backend): segments are in original order
             token_lora_indices = torch.empty(num_tokens, dtype=torch.int32, device=batch_info.weight_indices.device)
