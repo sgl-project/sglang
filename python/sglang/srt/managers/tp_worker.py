@@ -336,8 +336,6 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
 
-        self._log_capacity_info(server_args, dp_rank)
-
         # Sync random seed across TP workers
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
@@ -375,18 +373,6 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
-        )
-
-    def _log_capacity_info(self, server_args, dp_rank):
-        """Log a summary of token capacity and scheduling limits."""
-        token_pool = self.model_runner.req_to_token_pool
-        kv_pool = self.model_runner.token_to_kv_pool
-
-        log_info_on_rank0(
-            logger,
-            f"Capacity: total_tokens={self.max_total_num_tokens} max_req_len={self.max_req_len} "
-            f"max_running={self.max_running_requests} token_pool={token_pool.size} "
-            f"kv_pool={kv_pool.size} sliding_window={self.model_runner.sliding_window_size}",
         )
 
     def is_dllm(self):
