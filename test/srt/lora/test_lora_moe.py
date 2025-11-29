@@ -592,19 +592,18 @@ class TestMoELoRA(CustomTestCase):
         lora_indices = torch.tensor([0, 0, 1, 1], dtype=torch.int32)  # tokens 0,1 use lora 0; tokens 2,3 use lora 1
 
         # Run dispatch
-        token_ids, expert_ids, weights = moe_dispatch(
+        token_ids, expert_ids, sorted_topk_weights, lora_ids = moe_dispatch(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             lora_indices=lora_indices,
-            num_experts=num_experts,
-            num_loras=2,
         )
 
         # Verify results
         # Should have 4 tokens * 2 experts each = 8 dispatched entries
         self.assertEqual(len(token_ids), 8)
         self.assertEqual(len(expert_ids), 8)
-        self.assertEqual(len(weights), 8)
+        self.assertEqual(len(sorted_topk_weights), 8)
+        self.assertEqual(len(lora_ids), 8)
 
         # Check that tokens are grouped by expert (not by LoRA)
         # All tokens going to expert 0 should come first, then expert 1, etc.
