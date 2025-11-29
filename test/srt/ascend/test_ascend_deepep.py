@@ -6,7 +6,6 @@ from urllib.parse import urlparse
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
@@ -38,13 +37,10 @@ class TestAscendDeepEP(CustomTestCase):
             "--quantization",
             "w8a8_int8",
             "--mem-fraction-static",
-            0.9,
-            "--max-running-requests",
-            32,
+            0.8,
             "--disable-radix-cache",
             "--chunked-prefill-size",
             32768,
-            "--disable-cuda-graph",
             "--tp-size",
             16,
             "--dp-size",
@@ -58,8 +54,9 @@ class TestAscendDeepEP(CustomTestCase):
         ]
 
         cls.extra_envs = {
-            "HCCL_BUFFSIZE": "500",
+            "HCCL_BUFFSIZE": "1000",
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
+            "SGLANG_NPU_USE_MLAPO": "1",
         }
         os.environ.update(cls.extra_envs)
 

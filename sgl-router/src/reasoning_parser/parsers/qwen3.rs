@@ -2,8 +2,10 @@
 // This parser starts with in_reasoning=false, requiring an explicit
 // start token to enter reasoning mode.
 
-use crate::reasoning_parser::parsers::BaseReasoningParser;
-use crate::reasoning_parser::traits::{ParseError, ParserConfig, ParserResult, ReasoningParser};
+use crate::reasoning_parser::{
+    parsers::BaseReasoningParser,
+    traits::{ParseError, ParserConfig, ParserResult, ReasoningParser},
+};
 
 /// Qwen3 reasoning parser.
 ///
@@ -55,6 +57,10 @@ impl ReasoningParser for Qwen3Parser {
     fn model_type(&self) -> &str {
         self.base.model_type()
     }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.base.is_in_reasoning()
+    }
 }
 
 /// QwenThinking parser - variant that assumes reasoning from start.
@@ -105,6 +111,10 @@ impl ReasoningParser for QwenThinkingParser {
 
     fn model_type(&self) -> &str {
         self.base.model_type()
+    }
+
+    fn is_in_reasoning(&self) -> bool {
+        self.base.is_in_reasoning()
     }
 }
 

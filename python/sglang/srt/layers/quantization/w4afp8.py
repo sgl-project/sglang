@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
-from sglang.srt.layers.linear import LinearBase, UnquantizedLinearMethod
+from sglang.srt.layers.linear import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -17,17 +16,15 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import is_npu, set_weight_attrs
-
-_is_npu = is_npu()
-if not _is_npu:
-    from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalDispatchOutput,
         StandardDispatchOutput,
     )
 
@@ -98,9 +95,7 @@ class W4AFp8Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-        from sglang.srt.managers.schedule_batch import global_server_args_dict
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
@@ -137,7 +132,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def create_weights(
         self,
-        layer: EPMoE,
+        layer: Module,
         num_experts: int,
         hidden_size: int,
         intermediate_size_per_partition: int,
@@ -275,17 +270,17 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
-        w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
+        w13_input_scale_max = layer.w13_input_scale.max().to(torch.float32).item()
         new_w13_input_scale = torch.tensor(
             [w13_input_scale_max],
-            dtype=dtype,
+            dtype=torch.float32,
             device=device,
         )
         layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
 
-        w2_input_scale_max = layer.w2_input_scale.max().to(dtype).item()
+        w2_input_scale_max = layer.w2_input_scale.max().to(torch.float32).item()
         new_w2_input_scale = torch.tensor(
-            [w2_input_scale_max], dtype=dtype, device=device
+            [w2_input_scale_max], dtype=torch.float32, device=device
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
@@ -296,7 +291,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def apply(
         self,
-        layer: EPMoE,
+        layer: Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
@@ -307,18 +302,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
 
         topk_weights, topk_ids, _ = topk_output
-        local_topk_ids = topk_ids
-        if get_moe_expert_parallel_world_size() > 1:
-            local_topk_ids = torch.where(
-                topk_ids == -1,
-                layer.num_experts,
-                topk_ids,
-            )
 
         output = cutlass_w4a8_moe(
-            layer.start_expert_id,
-            layer.end_expert_id,
-            layer.num_experts,
             x,
             layer.w13_weight,
             layer.w2_weight,
@@ -326,7 +311,6 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale_inv,
             topk_weights,
             topk_ids,
-            local_topk_ids,
             self.a_strides1,
             self.b_strides1,
             self.c_strides1,
@@ -340,7 +324,85 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             self.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
         )
-        if self.moe_runner_config.routed_scaling_factor is not None:
-            output *= self.moe_runner_config.routed_scaling_factor
         return StandardCombineInput(hidden_states=output)
+
+    def apply_deepep_ll(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ) -> torch.Tensor:
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
+
+        hidden_states, _, topk_ids, _, masked_m, _ = dispatch_output
+
+        output = cutlass_w4a8_moe_deepep_ll(
+            hidden_states,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            topk_ids,
+            masked_m,
+            layer.quant_method.a_strides1,
+            layer.quant_method.b_strides1,
+            layer.quant_method.c_strides1,
+            layer.quant_method.a_strides2,
+            layer.quant_method.b_strides2,
+            layer.quant_method.c_strides2,
+            layer.quant_method.s_strides13,
+            layer.quant_method.s_strides2,
+            layer.quant_method.expert_offsets,
+            layer.quant_method.problem_sizes1,
+            layer.quant_method.problem_sizes2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
+        )
+
+        return output
+
+    def apply_deepep_normal(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPNormalDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+            cutlass_w4a8_moe_deepep_normal,
+        )
+
+        hidden_states, topk_idx, topk_weights = (
+            dispatch_output.hidden_states,
+            dispatch_output.topk_ids,
+            dispatch_output.topk_weights,
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > 0:
+            return cutlass_w4a8_moe_deepep_normal(
+                hidden_states,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                topk_weights,
+                topk_idx,
+                self.a_strides1,
+                self.b_strides1,
+                self.c_strides1,
+                self.a_strides2,
+                self.b_strides2,
+                self.c_strides2,
+                self.s_strides13,
+                self.s_strides2,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+            )
+        else:
+            return hidden_states

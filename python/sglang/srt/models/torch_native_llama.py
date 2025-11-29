@@ -66,8 +66,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
-tp_size = get_tensor_model_parallel_world_size()
-tp_rank = get_tensor_model_parallel_rank()
+tp_size: Optional[int] = None
+tp_rank: Optional[int] = None
 
 
 def gate_up_proj_weight_loader(
@@ -341,6 +341,13 @@ class LlamaModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+
+        global tp_size, tp_rank
+        if tp_size is None:
+            tp_size = get_tensor_model_parallel_world_size()
+        if tp_rank is None:
+            tp_rank = get_tensor_model_parallel_rank()
+
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size

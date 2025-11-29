@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
@@ -16,7 +14,12 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class TritonLoRABackend(BaseLoRABackend):
     name = "triton"
 
-    def __init__(self, max_loras_per_batch: int, device: torch.device):
+    def __init__(
+        self,
+        max_loras_per_batch: int,
+        device: torch.device,
+        **kwargs,
+    ):
         super().__init__(max_loras_per_batch, device)
 
     def run_lora_a_sgemm(
@@ -30,7 +33,7 @@ class TritonLoRABackend(BaseLoRABackend):
         weights: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         return sgemm_lora_b_fwd(x, weights, self.batch_info, base_output)
 
@@ -43,7 +46,7 @@ class TritonLoRABackend(BaseLoRABackend):
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -69,7 +72,7 @@ class TritonLoRABackend(BaseLoRABackend):
         gate_up_lora_b: torch.Tensor,
         base_output: torch.Tensor = None,
         *args,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
@@ -92,16 +95,33 @@ class TritonLoRABackend(BaseLoRABackend):
         return lora_output
 
     def init_cuda_graph_batch_info(
-        self, cuda_graph_batch_info: LoRABatchInfo, max_bs_in_cuda_graph: int
+        self,
+        max_bs_in_cuda_graph: int,
+        num_tokens_per_bs: int,
     ):
-        # Initialize seg_lens and seg_indptr for CUDA graph as they remain constant
-        # across batches.
-        cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph].fill_(1)
-        torch.cumsum(
-            cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
-            dim=0,
-            out=cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
-        )
+        with torch.device("cuda"):
+            self.cuda_graph_batch_info = LoRABatchInfo(
+                bs=max_bs_in_cuda_graph,
+                use_cuda_graph=True,
+                num_segments=None,
+                seg_lens=torch.full(
+                    (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
+                ),
+                seg_indptr=torch.empty(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                max_len=num_tokens_per_bs,
+                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
+                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                permutation=None,
+            )
+
+            # Initialize seg_indptr for CUDA graph as they remain constant
+            # across batches.
+            torch.cumsum(
+                self.cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
+                dim=0,
+                out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
+            )
 
     def prepare_lora_batch(
         self,
@@ -109,7 +129,7 @@ class TritonLoRABackend(BaseLoRABackend):
         weight_indices: list[int],
         lora_ranks: list[int],
         scalings: list[float],
-        batch_info: Optional[LoRABatchInfo] = None,
+        use_cuda_graph: bool,
     ):
         # Use pinned memory to avoid synchronizations during host-to-device transfer
         weight_indices_tensor = torch.tensor(
@@ -124,10 +144,11 @@ class TritonLoRABackend(BaseLoRABackend):
 
         bs = forward_batch.batch_size
 
-        if batch_info is not None:
+        if use_cuda_graph:
             assert (
-                batch_info.use_cuda_graph
-            ), "batch_info.use_cuda_graph must be True when batch_info is provided"
+                self.cuda_graph_batch_info is not None
+            ), "CUDA Graph batch info is not initialized."
+            batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size
         else:

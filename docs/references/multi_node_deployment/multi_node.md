@@ -95,6 +95,6 @@ echo "[INFO] $HEAD_NODE:30000 is ready to accept connections"
 wait
 ```
 
-Then, you can test the server by sending requests following other [documents](https://docs.sglang.ai/backend/openai_api_completions.html).
+Then, you can test the server by sending requests following other [documents](https://docs.sglang.ai/basic_usage/openai_api_completions.html).
 
 Thanks for [aflah02](https://github.com/aflah02) for providing the example, based on his [blog post](https://aflah02.substack.com/p/multi-node-llm-inference-with-sglang).

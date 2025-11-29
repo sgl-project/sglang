@@ -1,11 +1,25 @@
-// Data connector module for response storage
-pub mod response_memory_store;
-pub mod response_noop_store;
-pub mod responses;
+// Data connector module for response storage and conversation storage
+//
+// Simplified module structure:
+// - core.rs: All traits, data types, and errors
+// - memory.rs: All in-memory storage implementations
+// - noop.rs: All no-op storage implementations
+// - oracle.rs: All Oracle ATP storage implementations
+// - factory.rs: Storage creation function
 
-pub use response_memory_store::MemoryResponseStorage;
-pub use response_noop_store::NoOpResponseStorage;
-pub use responses::{
-    ResponseChain, ResponseId, ResponseStorage, ResponseStorageError, SharedResponseStorage,
-    StoredResponse,
+mod common;
+mod core;
+mod factory;
+mod memory;
+mod noop;
+mod oracle;
+mod postgres;
+
+pub use core::{
+    Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
+    ConversationStorage, ListParams, NewConversation, NewConversationItem, ResponseId,
+    ResponseStorage, SortOrder, StoredResponse,
 };
+
+pub use factory::create_storage;
+pub use memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage};

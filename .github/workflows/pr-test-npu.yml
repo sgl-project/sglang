@@ -1,21 +1,10 @@
-name: PR Test (Ascend NPU)
+name: PR Test (NPU)
 
 on:
   push:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - ".github/workflows/pr-test-npu.yml"
   pull_request:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - ".github/workflows/pr-test-npu.yml"
-    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -23,11 +12,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  per-commit-1-ascend-npu:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
+              - "scripts/ci/npu_ci_install_dependency.sh"
+              - "test/srt/ascend/**"
+              - ".github/workflows/pr-test-npu.yml"
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.main_package == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
+  per-commit-1-npu-a2:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-1
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -38,9 +56,10 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host ${CACHING_URL}
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -53,15 +72,23 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-1-ascend-npu
+          python3 run_suite.py --suite per-commit-1-npu-a2
 
-  per-commit-2-ascend-npu:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  per-commit-2-npu-a2:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-2
+    strategy:
+      fail-fast: true
+      matrix:
+        part: [0, 1, 2]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,30 +99,35 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host ${CACHING_URL}
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 90
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-2-ascend-npu
+          python3 run_suite.py --suite per-commit-2-npu-a2 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
-  per-commit-4-ascend-npu:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  per-commit-4-npu-a2:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-4
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-910b-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -106,30 +138,39 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host ${CACHING_URL}
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh 910b
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 120
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-ascend-npu --timeout-per-file 3600
+          python3 run_suite.py --suite per-commit-4-npu-a2 --timeout-per-file 3600
 
-  per-commit-16-ascend-a3:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+  per-commit-16-npu-a3:
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-aarch64-a3-16
+    strategy:
+      fail-fast: true
+      matrix:
+        part: [0, 1]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.2.rc1-a3-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -140,21 +181,25 @@ jobs:
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
           sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
-          pip config set global.trusted-host ${CACHING_URL}
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh
+          bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
       - name: Run test
-        timeout-minutes: 90
+        timeout-minutes: 60
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
+          PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+          STREAMS_PER_DEVICE: 32
         run: |
+          export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd test/srt
-          python3 run_suite.py --suite per-commit-16-ascend-a3 --timeout-per-file 5400
+          python3 run_suite.py --suite per-commit-16-npu-a3 --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2

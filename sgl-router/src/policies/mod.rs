@@ -3,17 +3,20 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use crate::core::Worker;
-use std::fmt::Debug;
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
+use crate::core::Worker;
+
+mod bucket;
 mod cache_aware;
 mod factory;
 mod power_of_two;
 mod random;
 mod registry;
 mod round_robin;
+mod tree;
 
+pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
 pub use power_of_two::PowerOfTwoPolicy;
@@ -108,6 +111,23 @@ impl Default for CacheAwareConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BucketConfig {
+    pub balance_abs_threshold: usize,
+    pub balance_rel_threshold: f32,
+    pub bucket_adjust_interval_secs: usize,
+}
+
+impl Default for BucketConfig {
+    fn default() -> Self {
+        Self {
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.0001,
+            bucket_adjust_interval_secs: 5,
+        }
+    }
+}
+
 /// Helper function to filter healthy workers and return their indices
 pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
     workers
@@ -121,23 +141,29 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[test]
     fn test_get_healthy_worker_indices() {
         let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Arc::new(BasicWorker::new(
-                "http://w3:8000".to_string(),
-                WorkerType::Regular,
-            )),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .api_key("test_api_key")
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .api_key("test_api_key2")
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w3:8000")
+                    .worker_type(WorkerType::Regular)
+                    .api_key("test_api_key")
+                    .build(),
+            ),
         ];
 
         // All healthy initially

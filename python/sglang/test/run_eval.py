@@ -10,9 +10,44 @@ import time
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
+    Eval,
     make_report,
     set_ulimit,
 )
+
+
+def get_thinking_kwargs(args):
+    thinking_mode = getattr(args, "thinking_mode", None)
+    if thinking_mode in THINKING_MODE_CHOICES:
+        if thinking_mode == "deepseek-v3":
+            thinking_param = "thinking"
+        else:
+            thinking_param = "enable_thinking"
+        return {
+            "chat_template_kwargs": {thinking_param: True},
+        }
+    return {}
+
+
+def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
+    # Get thinking kwargs based on user's choice
+    thinking_kwargs = get_thinking_kwargs(args)
+
+    sampler = ChatCompletionSampler(
+        model=args.model,
+        max_tokens=getattr(args, "max_tokens", 2048),
+        base_url=base_url,
+        temperature=getattr(args, "temperature", 0.0),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
+        extra_body=thinking_kwargs,
+    )
+
+    # Run eval
+    tic = time.perf_counter()
+    result = eval_obj(sampler)
+    latency = time.perf_counter() - tic
+
+    return result, latency, sampler
 
 
 def run_eval(args):
@@ -60,21 +95,56 @@ def run_eval(args):
         from sglang.test.simple_eval_humaneval import HumanEval
 
         eval_obj = HumanEval(args.num_examples, args.num_threads)
+    elif args.eval_name == "longbench_v2":
+        from sglang.test.simple_eval_longbench_v2 import LongBenchV2Eval
+
+        # Default to HuggingFace dataset, can be overridden with --dataset-path
+        data_source = args.dataset_path
+        categories = args.categories.split(",") if args.categories else None
+
+        eval_obj = LongBenchV2Eval(
+            model=args.model,
+            data_source=data_source,
+            num_examples=args.num_examples,
+            num_threads=args.num_threads,
+            categories=categories,
+            max_context_length=getattr(args, "max_context_length", None),
+            min_context_length=getattr(args, "min_context_length", None),
+        )
+    elif args.eval_name == "mmmu":
+        # VLM MMMU evaluation with fixed 100 examples by default
+        from sglang.test.simple_eval_mmmu_vlm import MMMUVLMEval
+
+        eval_obj = MMMUVLMEval(args.num_examples, args.num_threads)
     else:
         raise ValueError(f"Invalid eval name: {args.eval_name}")
 
-    sampler = ChatCompletionSampler(
-        model=args.model,
-        max_tokens=getattr(args, "max_tokens", 2048),
-        base_url=base_url,
-        temperature=getattr(args, "temperature", 0.0),
-        reasoning_effort=getattr(args, "reasoning_effort", None),
-    )
+    if getattr(args, "repeat", 1) == 1:
+        result, latency, sampler = run_eval_once(args, base_url, eval_obj)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
 
-    # Run eval
-    tic = time.perf_counter()
-    result = eval_obj(sampler)
-    latency = time.perf_counter() - tic
+        executor = ThreadPoolExecutor(max_workers=args.repeat)
+
+        futures = [
+            executor.submit(run_eval_once, args, base_url, eval_obj)
+            for _ in range(args.repeat)
+        ]
+
+        scores_repeat = []
+
+        for f in futures:
+            result, latency, sampler = f.result()
+            scores_repeat.append(result.score)
+
+        mean_score = sum(scores_repeat) / len(scores_repeat)
+        scores_repeat = [f"{s:.3f}" for s in scores_repeat]
+        print("=" * 20)
+        print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
+        print(f"Scores: {scores_repeat}")
+        print("=" * 20)
+
+        executor.shutdown()
 
     # Dump reports
     metrics = result.metrics | {"score": result.score}
@@ -94,8 +164,12 @@ def run_eval(args):
     print(f"Total latency: {latency:.3f} s")
     print(f"Score: {metrics['score']:.3f}")
 
+    if getattr(args, "return_latency", False):
+        return metrics, latency
     return metrics
 
+
+THINKING_MODE_CHOICES = ["deepseek-r1", "deepseek-v3", "qwen3"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -118,12 +192,47 @@ if __name__ == "__main__":
         type=str,
         help="Name or path of the model. If not set, the default model will request /v1/models for conf.",
     )
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="repeat the evaluation n times"
+    )
     parser.add_argument("--eval-name", type=str, default="mmlu")
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--reasoning-effort", type=str)
+    parser.add_argument(
+        "--thinking-mode",
+        default=None,
+        type=str,
+        choices=THINKING_MODE_CHOICES,
+        help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
+    )
+
+    # LongBench-v2 specific arguments
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default="THUDM/LongBench-v2",
+        help="Path to dataset file or HuggingFace dataset name for LongBench-v2",
+    )
+    parser.add_argument(
+        "--categories",
+        type=str,
+        default=None,
+        help="Comma-separated list of categories to evaluate for LongBench-v2",
+    )
+    parser.add_argument(
+        "--max-context-length",
+        type=int,
+        help="Maximum context length in characters for LongBench-v2",
+    )
+    parser.add_argument(
+        "--min-context-length",
+        type=int,
+        help="Minimum context length in characters for LongBench-v2",
+    )
+
     args = parser.parse_args()
 
     run_eval(args)
