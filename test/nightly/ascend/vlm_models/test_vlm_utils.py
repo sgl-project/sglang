@@ -15,8 +15,7 @@ from sglang.test.test_utils import (
 
 
 class TestVLMModels(CustomTestCase):
-    models = []
-    tp_size = 4
+    model = ""
     mem_fraction_static = 0.35
     other_args = [
         "--trust-remote-code",
@@ -31,7 +30,7 @@ class TestVLMModels(CustomTestCase):
         "ascend",
         "--disable-cuda-graph",
         "--tp-size",
-        self.tp_size,
+        4,
     ]
 
     @classmethod
@@ -101,8 +100,7 @@ class TestVLMModels(CustomTestCase):
 
     def _run_vlm_mmmu_test(
         self,
-        model,
-        output_path,
+        output_path="./logs",
         test_name="",
         custom_env=None,
         log_level="info",
@@ -139,11 +137,11 @@ class TestVLMModels(CustomTestCase):
                 stderr_file = open("/tmp/server_stderr.log", "w")
 
             process = popen_launch_server(
-                model.model,
+                cls.model,
                 base_url=self.base_url,
                 timeout=self.time_out,
                 api_key=self.api_key,
-                other_args=other_args,
+                other_args=cls.other_args,
                 env=process_env,
                 return_stdout_stderr=(
                     (stdout_file, stderr_file) if capture_output else None
@@ -151,7 +149,7 @@ class TestVLMModels(CustomTestCase):
             )
 
             # Run evaluation
-            self.run_mmmu_eval(model.model, output_path, limit)
+            self.run_mmmu_eval(cls.model, output_path, limit)
 
             # Get the result file
             result_file_path = glob.glob(f"{output_path}/*.json")[0]
@@ -222,10 +220,3 @@ class TestVLMModels(CustomTestCase):
                 print(f"Error reading {tag.lower()} file: {e}")
 
         return "\n".join(output_lines)
-
-    def vlm_mmmu_benchmark(self):
-        """Test VLM  against MMMU benchmark."""
-        models_to_test = self.models
-
-        for model in models_to_test:
-            self._run_vlm_mmmu_test(model, "./logs")
