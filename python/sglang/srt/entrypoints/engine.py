@@ -466,6 +466,7 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
+        load_format: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -474,6 +475,7 @@ class Engine(EngineBase):
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
+            load_format=load_format,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)

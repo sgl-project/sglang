@@ -54,6 +54,22 @@ if(DEFINED ENV{CONDA_PREFIX})
         message(FATAL_ERROR "libnuma not found in Conda environment at ${CONDA_LIB_DIR}\n"
                             "Please install it using: conda install libnuma numactl\n")
     endif()
+else()
+    if(DEFINED ENV{VIRTUAL_ENV})
+        set(VENV_LIB_DIR "$ENV{VIRTUAL_ENV}/lib")
+        message(STATUS "Using venv lib dir: ${VENV_LIB_DIR}")
+        link_directories(${VENV_LIB_DIR})
+        set(VENV_INCLUDE_DIR "$ENV{VIRTUAL_ENV}/include")
+        include_directories(${VENV_INCLUDE_DIR})
+    endif()
+    # Look for libnuma in system env paths
+    find_library(NUMA_LIB numa)
+    if(NUMA_LIB)
+        message(STATUS "Found libnuma: ${NUMA_LIB}")
+    else()
+        message(FATAL_ERROR "libnuma not found in system environment\n"
+                            "Please install it using: apt-get install libnuma numactl\n")
+    endif()
 endif()
 
 file(GLOB SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")

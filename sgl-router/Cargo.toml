@@ -106,6 +106,8 @@ deadpool-postgres = "0.14.1"
 [build-dependencies]
 tonic-prost-build = "0.14.2"
 prost-build = "0.14.1"
+chrono = { version = "0.4", features = ["clock"] }
+toml = "0.9"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

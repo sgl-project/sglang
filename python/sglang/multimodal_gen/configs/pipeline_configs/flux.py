@@ -2,7 +2,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-import PIL.Image
+import PIL
 import torch
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
@@ -14,9 +14,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.configs.models.encoders.base import TextEncoderArchConfig
-from sglang.multimodal_gen.configs.models.encoders.mistral import (
-    Mistral3Config,
-    _is_embeddings,
+from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
     _is_transformer_layer,
 )
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig, FluxVAEConfig
@@ -323,7 +321,7 @@ def _prepare_image_ids(
     return image_latent_ids
 
 
-def flux_2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
     hidden_states_layers: list[int] = [10, 20, 30]
 
     out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
@@ -346,7 +344,7 @@ class Flux2MistralTextArchConfig(TextEncoderArchConfig):
         ]
     )
     _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer, _is_embeddings]
+        default_factory=lambda: [_is_transformer_layer]
     )
 
     def __post_init__(self):
@@ -386,7 +384,6 @@ def format_text_input(prompts: List[str], system_message: str = None):
 
 
 def flux_2_preprocess_text(prompt: str):
-    print(f"{prompt=}")
     system_message = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object attribution and actions without speculation."
     return format_text_input([prompt], system_message=system_message)
 
@@ -405,9 +402,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.I2I
 
-    text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (Mistral3Config(),)
-    )
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
@@ -418,7 +412,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (flux_2_postprocess_text,)
+        default_factory=lambda: (flux2_postprocess_text,)
     )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
 
@@ -454,18 +448,21 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds[0]
 
-    def maybe_resize_condition_image(self, width, height, image):
+    def calculate_condition_image_size(
+        self, image, width, height
+    ) -> Optional[tuple[int, int]]:
         target_area: int = 1024 * 1024
-
         if width is not None and height is not None:
             if width * height > target_area:
                 scale = math.sqrt(target_area / (width * height))
                 width = int(width * scale)
                 height = int(height * scale)
-                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
-                width, height = image.size
+                return width, height
 
-        return image, width, height
+        return None
+
+    def resize_condition_image(self, image, target_width, target_height):
+        return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
 

@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
@@ -55,6 +55,8 @@ class Req:
     image_path: str | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
+
+    original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
@@ -216,14 +218,6 @@ class Req:
             self.guidance_scale_2 = self.guidance_scale
 
     def adjust_size(self, server_args: ServerArgs):
-        if self.height is None or self.width is None:
-            _image, width, height = (
-                server_args.pipeline_config.maybe_resize_condition_image(
-                    self.width, self.height, self.condition_image
-                )
-            )
-            self.width = width
-            self.height = height
         if self.height is None or self.width is None:
             self.width = 1280
             self.height = 720
