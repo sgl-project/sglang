@@ -3,6 +3,8 @@
 
 from typing import Callable, List, Optional
 
+import os
+
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
@@ -21,7 +23,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import ceil_align, get_bool_env_var, is_hip
 
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
@@ -83,6 +85,23 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
+                # Pad K dimension before shuffle if alignment is specified
+                # shuffle_weight requires K % 32 == 0
+                pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+                if pad_k_align and pad_k_align.isdigit():
+                    k_align = int(pad_k_align)
+                    # Ensure alignment is at least 32 (required by shuffle_weight)
+                    k_align = max(k_align, 32)
+                    k = weight.shape[0]
+                    k_aligned = ceil_align(k, k_align)
+                    
+                    if k_aligned != k:
+                        # Pad weight: (k, n) -> (k_aligned, n)
+                        weight = torch.nn.functional.pad(weight, (0, 0, 0, k_aligned - k))
+                        # Pad weight_scale: (k, 1) -> (k_aligned, 1)
+                        if weight_scale.shape[0] == k and len(weight_scale.shape) == 2:
+                            weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, k_aligned - k))
+                
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
                 )
