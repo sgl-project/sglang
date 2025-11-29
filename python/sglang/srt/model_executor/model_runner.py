@@ -1519,11 +1519,12 @@ class ModelRunner:
         dp_size: Optional[int] = None,
     ):
         kb_per_token = cell_size / 1024
-        dp_suffix = f" dp={dp_size}" if dp_size else ""
+        dp_suffix = f", dp_size={dp_size}" if dp_size else ""
         log_debug_on_rank0(
             logger,
-            f"KV cache: {layout_label}({layout_detail}) layers={num_layers} dtype={dtype} {kb_per_token:.2f}KB/tok "
-            f"mem={available_mem_gb:.1f}/{total_mem_gb:.1f}GB rest={rest_mem_gb:.1f}GB max_tokens={max_tokens}{dp_suffix}",
+            f"KV cache profile: layout={layout_label}({layout_detail}), layers={num_layers}, dtype={dtype}, "
+            f"per_token={kb_per_token:.2f}KB, gpu_mem={available_mem_gb:.1f}/{total_mem_gb:.1f}GB (avail/total), "
+            f"kv_budget={rest_mem_gb:.1f}GB, max_tokens={max_tokens}{dp_suffix}",
         )
 
     def handle_max_mamba_cache(self, total_rest_memory):
@@ -1759,15 +1760,15 @@ class ModelRunner:
             max_running_requests = min(max(heuristic, 2048), 4096)
             log_debug_on_rank0(
                 logger,
-                f"req_to_token_pool: size={max_running_requests} "
-                f"(heuristic={heuristic}, clamp=[2048,4096]), "
-                f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
+                f"req_to_token_pool (token→KV index mapping): max_reqs={max_running_requests} "
+                f"(heuristic={heuristic}, clamped to [2048,4096]), ctx_len={self.model_config.context_len}, "
+                f"pool_mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
         else:
             log_debug_on_rank0(
                 logger,
-                f"req_to_token_pool: size={max_running_requests} (from arg), "
-                f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
+                f"req_to_token_pool (token→KV index mapping): max_reqs={max_running_requests} (from --max-running-requests), "
+                f"ctx_len={self.model_config.context_len}, pool_mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
 
         if self.mambaish_config is not None:
