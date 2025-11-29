@@ -1403,36 +1403,26 @@ class ModelRunner:
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
 
         layout_label = "MLA" if self.use_mla_backend else "MHA"
-        dtype_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
             layout_detail = (
-                f"kv_lora_rank={self.model_config.kv_lora_rank}, "
-                f"rope_head_dim={self.model_config.qk_rope_head_dim}"
+                f"kv_lora={self.model_config.kv_lora_rank}, "
+                f"rope={self.model_config.qk_rope_head_dim}"
             )
         else:
             kv_heads = self.model_config.get_num_kv_heads(get_attention_tp_size())
-            layout_detail = (
-                f"kv_heads={kv_heads}, head_dim={self.model_config.head_dim}"
-            )
-
-        dp_divisor = (
-            self.server_args.dp_size if self.server_args.enable_dp_attention else 1
-        )
+            layout_detail = f"heads={kv_heads}, dim={self.model_config.head_dim}"
 
         self._log_kv_profile(
             layout_label=layout_label,
             layout_detail=layout_detail,
             num_layers=num_layers,
             dtype=self.kv_cache_dtype,
-            dtype_size=dtype_size,
             cell_size=cell_size,
             available_mem_gb=available_gpu_memory,
             total_mem_gb=total_gpu_memory,
-            mem_fraction_static=self.mem_fraction_static,
             rest_mem_gb=rest_memory,
             max_tokens=max_num_token,
             dp_size=self.server_args.dp_size if self.server_args.enable_dp_attention else None,
-            dp_divisor=dp_divisor if self.server_args.enable_dp_attention else None,
         )
         return max_num_token
 
@@ -1443,42 +1433,29 @@ class ModelRunner:
         layout_detail: str,
         num_layers: int,
         dtype: torch.dtype,
-        dtype_size: int,
         cell_size: int,
         available_mem_gb: float,
         total_mem_gb: float,
-        mem_fraction_static: float,
         rest_mem_gb: float,
         max_tokens: int,
-        dp_size: Optional[int],
-        dp_divisor: Optional[int],
+        dp_size: Optional[int] = None,
     ):
-        per_layer_bytes = cell_size // max(num_layers, 1)
-        bytes_per_token = cell_size
-        message = (
-            "KV profiling: layout=%s (%s) layers=%s dtype=%s elem=%sB "
-            "per_token=%.2fKB per_layer=%.2fKB avail=%.2fGB total=%.2fGB "
-            "mem_static=%.2f rest=%.2fGB max_tokens=%s"
-        )
-        log_args = [
+        kb_per_token = cell_size / 1024
+        dp_suffix = f" dp={dp_size}" if dp_size else ""
+        logger.info(
+            "KV cache: %s(%s) layers=%s dtype=%s %.2fKB/tok "
+            "mem=%.1f/%.1fGB rest=%.1fGB max_tokens=%s%s",
             layout_label,
             layout_detail,
             num_layers,
             dtype,
-            dtype_size,
-            bytes_per_token / 1024,
-            per_layer_bytes / 1024,
+            kb_per_token,
             available_mem_gb,
             total_mem_gb,
-            mem_fraction_static,
             rest_mem_gb,
             max_tokens,
-        ]
-        if dp_size is not None and dp_divisor:
-            tokens_per_dp = max_tokens // max(dp_divisor, 1)
-            message += " dp_size=%s tokens_per_dp=%s"
-            log_args.extend([dp_size, tokens_per_dp])
-        logger.info(message, *log_args)
+            dp_suffix,
+        )
 
     def handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config

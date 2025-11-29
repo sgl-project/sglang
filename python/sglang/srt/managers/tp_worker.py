@@ -286,74 +286,25 @@ class TpModelWorker(BaseTpWorker):
         dp_divisor = server_args.dp_size if server_args.enable_dp_attention else 1
 
         full_tokens, swa_tokens = self.get_tokens_per_layer_info()
-        logger.info(
-            (
-                "TP worker raw token stats tp_rank=%s/%s device=%s full_total=%s "
-                "swa_total=%s sliding_window=%s token_pool_size=%s token_pool_ctx=%s kv_pool_size=%s"
-            ),
-            self.tp_rank,
-            self.tp_size,
-            self.device,
-            full_tokens,
-            swa_tokens,
-            sliding_window,
-            token_pool_size,
-            token_pool_ctx_cap,
-            kv_pool_size,
-        )
 
-        prefill_limit_source = (
-            "arg" if self.max_prefill_tokens is not None else "total_tokens"
-        )
+        # Compute effective prefill tokens
         effective_prefill_tokens = (
             self.max_prefill_tokens
             if self.max_prefill_tokens is not None
             else self.max_total_num_tokens
         )
-        logger.info(
-            "TP worker prefill cap raw=%s source=%s effective=%s",
-            self.max_prefill_tokens,
-            prefill_limit_source,
-            effective_prefill_tokens,
-        )
 
+        # Compute max_running_requests
         if server_args.max_running_requests is None:
-            configured_running_requests_source = "half_total_tokens"
-            configured_running_requests_raw = self.max_total_num_tokens // 2
-            configured_running_requests = configured_running_requests_raw
+            configured_running_requests = self.max_total_num_tokens // 2
+            running_req_source = "total//2"
         else:
-            configured_running_requests_raw = server_args.max_running_requests
-            configured_running_requests = configured_running_requests_raw // dp_divisor
-            configured_running_requests_source = (
-                f"arg//dp({dp_divisor})" if dp_divisor != 1 else "arg"
-            )
+            configured_running_requests = server_args.max_running_requests // dp_divisor
+            running_req_source = "arg" if dp_divisor == 1 else f"arg//dp{dp_divisor}"
 
-        logger.info(
-            (
-                "TP worker running_requests calc raw=%s source=%s dp_divisor=%s "
-                "normalized=%s token_pool_size=%s"
-            ),
-            configured_running_requests_raw,
-            configured_running_requests_source,
-            dp_divisor,
-            configured_running_requests,
-            token_pool_size,
-        )
-
-        self.max_running_requests = min(
-            configured_running_requests,
-            token_pool_size,
-        )
-        running_requests_limit_reason = (
-            "token_pool_size"
-            if self.max_running_requests < configured_running_requests
-            else configured_running_requests_source
-        )
-        logger.info(
-            "TP worker running_requests final=%s limit_reason=%s",
-            self.max_running_requests,
-            running_requests_limit_reason,
-        )
+        self.max_running_requests = min(configured_running_requests, token_pool_size)
+        if self.max_running_requests < configured_running_requests:
+            running_req_source = "token_pool"
 
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
@@ -361,76 +312,45 @@ class TpModelWorker(BaseTpWorker):
             self.max_queued_requests is None or self.max_queued_requests >= 1
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
 
+        # Compute max_req_len
         context_cap = self.model_config.context_len - 1
         memory_cap = self.max_total_num_tokens - 1
         self.max_req_len = min(context_cap, memory_cap)
-        req_len_reason = "context_len" if context_cap <= memory_cap else "memory"
-        logger.info(
-            (
-                "TP worker req_len calc context_len=%s->cap=%s total_tokens=%s->cap=%s "
-                "chosen=%s reason=%s"
-            ),
-            self.model_config.context_len,
-            context_cap,
-            self.max_total_num_tokens,
-            memory_cap,
-            self.max_req_len,
-            req_len_reason,
-        )
+        req_len_by = "ctx" if context_cap <= memory_cap else "mem"
+
         self.max_req_input_len = self.max_req_len - 5
         assert (
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
 
+        # Log pool sizes
         logger.info(
-            (
-                "TP worker capacity tp_rank=%s/%s pp_rank=%s/%s device=%s "
-                "total_tokens=%s prefill_tokens=%s(source=%s raw=%s) "
-                "req_len=%s(reason=%s) req_input_len=%s "
-                "running_requests=%s(limit_reason=%s) queued_requests=%s"
-            ),
-            self.tp_rank,
-            self.tp_size,
-            self.pp_rank,
-            server_args.pp_size,
-            self.device,
+            "Token pools: total=%s kv_pool=%s token_pool=%s(max_ctx=%s) "
+            "sliding_window=%s full_layer_tokens=%s swa_layer_tokens=%s",
             self.max_total_num_tokens,
-            effective_prefill_tokens,
-            prefill_limit_source,
-            self.max_prefill_tokens,
-            self.max_req_len,
-            req_len_reason,
-            self.max_req_input_len,
-            self.max_running_requests,
-            running_requests_limit_reason,
-            self.max_queued_requests,
-        )
-        logger.info(
-            (
-                "TP worker token budget detail tp_rank=%s/%s "
-                "configured_running_requests=%s(source=%s raw=%s dp_divisor=%s) "
-                "token_pool_size=%s token_pool_max_ctx=%s kv_pool_size=%s"
-            ),
-            self.tp_rank,
-            self.tp_size,
-            configured_running_requests,
-            configured_running_requests_source,
-            configured_running_requests_raw,
-            dp_divisor,
+            kv_pool_size,
             token_pool_size,
-            self.model_runner.req_to_token_pool.max_context_len,
-            self.model_runner.token_to_kv_pool.size,
+            token_pool_ctx_cap,
+            sliding_window,
+            full_tokens,
+            swa_tokens,
+        )
+
+        # Log computed limits
+        logger.info(
+            "Limits: max_req_len=%s(by=%s) running_reqs=%s(by=%s) prefill=%s queued=%s",
+            self.max_req_len,
+            req_len_by,
+            self.max_running_requests,
+            running_req_source,
+            effective_prefill_tokens,
+            self.max_queued_requests,
         )
 
         if server_args.enable_dp_attention:
             dp_rank_display = dp_rank if dp_rank is not None else 0
             logger.info(
-                (
-                    "DP attention capacity tp_rank=%s/%s dp_rank=%s/%s "
-                    "tokens_per_rank=%s running_requests_per_rank=%s"
-                ),
-                self.tp_rank,
-                self.tp_size,
+                "DP attention: dp_rank=%s/%s tokens_per_rank=%s running_per_rank=%s",
                 dp_rank_display,
                 server_args.dp_size,
                 self.max_total_num_tokens,
