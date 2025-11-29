@@ -26,9 +26,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mimo_v2_flash import (
-    MiMoV2FlashAttention,
+    MiMoV2Attention,
     MiMoV2FlashForCausalLM,
-    MiMoV2FlashMLP,
+    MiMoV2MLP,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -38,7 +38,7 @@ MiMoV2FlashConfig = None
 logger = logging.getLogger(__name__)
 
 
-class MiMoV2FlashMTPLayer(nn.Module):
+class MiMoV2MTPLayer(nn.Module):
     def __init__(
         self,
         config: MiMoV2FlashConfig,
@@ -54,7 +54,7 @@ class MiMoV2FlashMTPLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
-        self.self_attn = MiMoV2FlashAttention(
+        self.self_attn = MiMoV2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.swa_num_attention_heads,
             num_kv_heads=config.swa_num_key_value_heads,
@@ -80,7 +80,7 @@ class MiMoV2FlashMTPLayer(nn.Module):
             mlp_tp_rank, mlp_tp_size = 0, 1
         else:
             mlp_tp_rank, mlp_tp_size = None, None
-        self.mlp = MiMoV2FlashMLP(
+        self.mlp = MiMoV2MLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -136,7 +136,7 @@ class MiMoV2FlashMTPLayer(nn.Module):
         return hidden_states, residual
 
 
-class MiMoV2FlashModelNextN(nn.Module):
+class MiMoV2ModelNextN(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -159,7 +159,7 @@ class MiMoV2FlashModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.mtp_block = MiMoV2FlashMTPLayer(
+        self.mtp_block = MiMoV2MTPLayer(
             config,
             0,
             quant_config=quant_config,
@@ -204,7 +204,7 @@ class MiMoV2FlashModelNextN(nn.Module):
         return hidden_states
 
 
-class MiMoV2FlashForCausalLMNextN(MiMoV2FlashForCausalLM):
+class MiMoV2MTP(MiMoV2FlashForCausalLM):
 
     def __init__(
         self,
@@ -217,7 +217,7 @@ class MiMoV2FlashForCausalLMNextN(MiMoV2FlashForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
 
-        self.model = MiMoV2FlashModelNextN(
+        self.model = MiMoV2ModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -341,4 +341,4 @@ class MiMoV2FlashForCausalLMNextN(MiMoV2FlashForCausalLM):
         torch.cuda.synchronize()
 
 
-EntryClass = MiMoV2FlashForCausalLMNextN
+EntryClass = MiMoV2MTP

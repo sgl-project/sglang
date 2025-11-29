@@ -227,7 +227,7 @@ class ModelConfig:
             )
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
             "MiMoV2FlashForCausalLM",
-            "MiMoV2FlashForCausalLMNextN",
+            "MiMoV2MTP",
         ]
         if self.is_hybrid_swa_compress:
             self.attention_chunk_size = self.hf_text_config.sliding_window_size
@@ -318,7 +318,7 @@ class ModelConfig:
             is_draft_model
             and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
         ):
-            self.hf_config.architectures[0] = "MiMoV2FlashForCausalLMNextN"
+            self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -1146,7 +1146,7 @@ def is_hybrid_model(
 ):
     if model_architectures[0] in [
         "MiMoV2FlashForCausalLM",
-        "MiMoV2FlashForCausalLMNextN",
+        "MiMoV2MTP",
     ]:
         return 1
     if hybrid_kvcache_ratio is None:
@@ -1180,7 +1180,7 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
-    elif "MiMoV2FlashForCausalLMNextN" in model_architectures:
+    elif "MiMoV2MTP" in model_architectures:
         return [0], []
     else:
         swa_attention_layer_ids = None

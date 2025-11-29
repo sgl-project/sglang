@@ -78,7 +78,7 @@ MiMoV2FlashConfig = None
 logger = logging.getLogger(__name__)
 
 
-class MiMoV2FlashMLP(nn.Module):
+class MiMoV2MLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -172,7 +172,7 @@ class MoEGate(nn.Module):
         return logits
 
 
-class MiMoV2FlashMoE(nn.Module):
+class MiMoV2MoE(nn.Module):
 
     def __init__(
         self,
@@ -387,7 +387,7 @@ class MiMoV2FlashMoE(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
-class MiMoV2FlashAttention(nn.Module):
+class MiMoV2Attention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -569,7 +569,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         )
 
         if self.is_swa_layer():
-            self.self_attn = MiMoV2FlashAttention(
+            self.self_attn = MiMoV2Attention(
                 hidden_size=self.hidden_size,
                 v_scale=getattr(config, "attention_value_scale", None),
                 num_heads=config.swa_num_attention_heads,
@@ -590,7 +590,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
         else:
-            self.self_attn = MiMoV2FlashAttention(
+            self.self_attn = MiMoV2Attention(
                 hidden_size=self.hidden_size,
                 num_heads=self.config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
@@ -615,7 +615,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         is_previous_layer_sparse = self.is_moe_layer(layer_id - 1)
 
         if self.is_layer_sparse:
-            self.mlp = MiMoV2FlashMoE(
+            self.mlp = MiMoV2MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
@@ -626,7 +626,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = MiMoV2FlashMLP(
+            self.mlp = MiMoV2MLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -753,7 +753,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         return output
 
 
-class MiMoV2FlashModel(nn.Module):
+class MiMoV2Model(nn.Module):
     def __init__(
         self,
         config: MiMoV2FlashConfig,
@@ -920,7 +920,7 @@ class MiMoV2FlashForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = MiMoV2FlashModel(
+        self.model = MiMoV2Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
@@ -942,7 +942,7 @@ class MiMoV2FlashForCausalLM(nn.Module):
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, MiMoV2FlashMoE)
+                if isinstance(layer.mlp, MiMoV2MoE)
             }
         )
 

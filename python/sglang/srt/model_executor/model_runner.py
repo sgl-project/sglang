@@ -455,11 +455,7 @@ class ModelRunner:
                 self.model_config.num_attention_layers,
             )
         )
-        # TODO 在config.json里加num_nextn_predict_layers字段，复用上面的逻辑
-        if (
-            self.model_config.hf_config.architectures[0]
-            == "MiMoV2FlashForCausalLMNextN"
-        ):
+        if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
             model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
@@ -1589,7 +1585,7 @@ class ModelRunner:
                 * self.server_args.page_size
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
-        elif "MiMoV2FlashForCausalLMNextN" in self.model_config.hf_config.architectures:
+        elif "MiMoV2MTP" in self.model_config.hf_config.architectures:
             return
         else:
             assert self.sliding_window_size is not None and self.sliding_window_size > 0
@@ -1766,11 +1762,8 @@ class ModelRunner:
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:
                 # Use parameters passed from target worker
-                if (
-                    self.model_config.hf_config.architectures[0]
-                    == "MiMoV2FlashForCausalLMNextN"
-                ):
-                    # MiMoV2FlashForCausalLMNextN uses SWA, so set full KV cache to 0
+                if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
+                    # MiMoV2MTP uses SWA, so set full KV cache to 0
                     self.swa_max_total_num_tokens = (
                         self.server_args.draft_runner_cache_size_swa
                     )
