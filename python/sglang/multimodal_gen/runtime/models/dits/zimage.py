@@ -310,7 +310,7 @@ class RopeEmbedder:
         assert ids.ndim == 2
         assert ids.shape[-1] == len(self.axes_dims)
         device = ids.device
-
+        print(f"313 {ids.shape=}, {self.axes_dims=}, {self.axes_lens=}", flush=True)
         if self.freqs_cis is None:
             self.freqs_cis = self.precompute_freqs_cis(
                 self.axes_dims, self.axes_lens, theta=self.theta
@@ -485,21 +485,11 @@ class ZImageTransformer2DModel(CachableDiT):
 
         all_image_out = []
         all_image_size = []
-        all_image_pos_ids = []
-        all_cap_pos_ids = []
         all_cap_feats_out = []
 
         # ------------ Process Caption ------------
         cap_ori_len = cap_feat.size(0)
         cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
-
-        # padded position ids
-        cap_padded_pos_ids = self.create_coordinate_grid(
-            size=(cap_ori_len + cap_padding_len, 1, 1),
-            start=(1, 0, 0),
-            device=device,
-        ).flatten(0, 2)
-        all_cap_pos_ids.append(cap_padded_pos_ids)
 
         # padded feature
         cap_padded_feat = torch.cat(
@@ -513,35 +503,13 @@ class ZImageTransformer2DModel(CachableDiT):
         all_image_size.append((F, H, W))
 
         F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
-
         image = image.view(C, F_tokens, pF, H_tokens, pH, W_tokens, pW)
         # "c f pf h ph w pw -> (f h w) (pf ph pw c)"
         image = image.permute(1, 3, 5, 2, 4, 6, 0).reshape(
             F_tokens * H_tokens * W_tokens, pF * pH * pW * C
         )
-
         image_ori_len = image.size(0)
         image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
-
-        image_ori_pos_ids = self.create_coordinate_grid(
-            size=(F_tokens, H_tokens, W_tokens),
-            start=(cap_ori_len + cap_padding_len + 1, 0, 0),
-            device=device,
-        ).flatten(0, 2)
-
-        image_padding_pos_ids = (
-            self.create_coordinate_grid(
-                size=(1, 1, 1),
-                start=(0, 0, 0),
-                device=device,
-            )
-            .flatten(0, 2)
-            .repeat(image_padding_len, 1)
-        )
-        image_padded_pos_ids = torch.cat(
-            [image_ori_pos_ids, image_padding_pos_ids], dim=0
-        )
-        all_image_pos_ids.append(image_padded_pos_ids)
 
         # padded feature
         image_padded_feat = torch.cat(
@@ -554,8 +522,6 @@ class ZImageTransformer2DModel(CachableDiT):
             all_image_out,
             all_cap_feats_out,
             all_image_size,
-            all_image_pos_ids,
-            all_cap_pos_ids,
         )
 
     def forward(
@@ -566,9 +532,9 @@ class ZImageTransformer2DModel(CachableDiT):
         guidance=0,
         patch_size=2,
         f_patch_size=1,
+        freqs_cis=None,
         **kwargs,
     ):
-        print(f"{kwargs=}", flush=True)
         assert patch_size in self.all_patch_size
         assert f_patch_size in self.all_f_patch_size
 
@@ -584,14 +550,11 @@ class ZImageTransformer2DModel(CachableDiT):
             x,
             cap_feats,
             x_size,
-            x_pos_ids,
-            cap_pos_ids,
         ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
 
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
-        x_pos_ids = torch.cat(x_pos_ids, dim=0)
-        x_freqs_cis = self.rotary_emb(x_pos_ids)
+        x_freqs_cis = freqs_cis[1]
 
         x = x.unsqueeze(0)
         x_freqs_cis = x_freqs_cis.unsqueeze(0)
@@ -602,8 +565,7 @@ class ZImageTransformer2DModel(CachableDiT):
 
         cap_feats, _ = self.cap_embedder(cap_feats)
 
-        cap_pos_ids = torch.cat(cap_pos_ids, dim=0)
-        cap_freqs_cis = self.rotary_emb(cap_pos_ids)
+        cap_freqs_cis = freqs_cis[0]
 
         cap_feats = cap_feats.unsqueeze(0)
         cap_freqs_cis = cap_freqs_cis.unsqueeze(0)

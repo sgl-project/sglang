@@ -14,7 +14,6 @@ from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
-    shard_rotary_emb_for_sp,
 )
 
 
@@ -75,20 +74,77 @@ class ZImagePipelineConfig(ImagePipelineConfig):
         return latents.view(bs, channels, height, width)
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
-        txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device)
-        img_ids = self._prepare_latent_image_ids(
-            original_height=height,
-            original_width=width,
+        def create_coordinate_grid(size, start=None, device=None):
+            if start is None:
+                start = (0 for _ in size)
+
+            axes = [
+                torch.arange(x0, x0 + span, dtype=torch.int32, device=device)
+                for x0, span in zip(start, size)
+            ]
+            grids = torch.meshgrid(axes, indexing="ij")
+            return torch.stack(grids, dim=-1)
+
+        PATCH_SIZE = 2
+        F_PATCH_SIZE = 1
+        SEQ_MULTI_OF = 32
+
+        cap_ori_len = prompt_embeds.size(0)
+        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
+        cap_padded_pos_ids = create_coordinate_grid(
+            size=(cap_ori_len + cap_padding_len, 1, 1),
+            start=(1, 0, 0),
             device=device,
+        ).flatten(0, 2)
+
+        C = self.dit_config.num_channels_latents
+        F = 1
+        H = height // self.vae_config.arch_config.spatial_compression_ratio
+        W = width // self.vae_config.arch_config.spatial_compression_ratio
+
+        pH, pW = PATCH_SIZE, PATCH_SIZE
+        pF = F_PATCH_SIZE
+        F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
+        image_ori_len = F_tokens * H_tokens * W_tokens
+        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+
+        image_ori_pos_ids = create_coordinate_grid(
+            size=(F_tokens, H_tokens, W_tokens),
+            start=(cap_ori_len + cap_padding_len + 1, 0, 0),
+            device=device,
+        ).flatten(0, 2)
+        print(
+            f"122 {image_ori_pos_ids.shape=}, {F_tokens=}, {H_tokens=}, {W_tokens=}, {cap_ori_len=}, {cap_padding_len=}, {device=}",
+            flush=True,
         )
+        image_padding_pos_ids = (
+            create_coordinate_grid(
+                size=(1, 1, 1),
+                start=(0, 0, 0),
+                device=device,
+            )
+            .flatten(0, 2)
+            .repeat(image_padding_len, 1)
+        )
+        print(
+            f"131 {image_ori_pos_ids.shape=}, {image_padding_pos_ids.shape=}",
+            flush=True,
+        )
+        image_padded_pos_ids = torch.cat(
+            [image_ori_pos_ids, image_padding_pos_ids], dim=0
+        )
+        cap_freqs_cis = rotary_emb(cap_padded_pos_ids)
+        x_freqs_cis = rotary_emb(image_padded_pos_ids)
+        return (cap_freqs_cis, x_freqs_cis)
 
-        # NOTE(mick): prepare it here, to avoid unnecessary computations
-        img_cos, img_sin = rotary_emb.forward(img_ids)
-        img_cos = shard_rotary_emb_for_sp(img_cos)
-        img_sin = shard_rotary_emb_for_sp(img_sin)
-
-        txt_cos, txt_sin = rotary_emb.forward(txt_ids)
-
-        cos = torch.cat([txt_cos, img_cos], dim=0).to(device=device)
-        sin = torch.cat([txt_sin, img_sin], dim=0).to(device=device)
-        return cos, sin
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        return {
+            "freqs_cis": self.get_freqs_cis(
+                batch.prompt_embeds[0],
+                batch.width,
+                batch.height,
+                device,
+                rotary_emb,
+                batch,
+            ),
+        }
