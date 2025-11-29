@@ -764,10 +764,11 @@ def apply_fp8_linear(
             # compressed_tensors_w8a8_fp8.py before shuffle_weight is called.
             # We only need to pad input K dimension here if needed, and unpad output N dimension.
             pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+            pad_n_align = os.environ.get("SGLANG_AITER_PAD_N", "").strip()
             original_n = weight.shape[1]  # Save original N before any operations
+            
+            # Pad input K dimension if weight was padded
             if pad_k_align and pad_k_align.isdigit():
-                k_align = int(pad_k_align)
-                # Weight is already padded during loading, check if input needs padding
                 weight_k = weight.shape[0]
                 input_k = qinput.shape[1]
                 if input_k < weight_k:
@@ -783,7 +784,7 @@ def apply_fp8_linear(
             )
             
             # Unpad output N dimension if weight was padded during loading
-            if pad_k_align and pad_k_align.isdigit():
+            if pad_n_align and pad_n_align.isdigit():
                 if output.shape[1] > original_n:
                     output = output[:, :original_n]
             
