@@ -1,3 +1,4 @@
+import functools
 from typing import Optional
 
 import torch
@@ -70,7 +71,10 @@ def fused_marlin_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+    from sglang.srt.layers.moe.fused_moe_triton import (
+        moe_align_block_size,
+        try_get_optimal_moe_config,
+    )
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
@@ -94,11 +98,17 @@ def fused_marlin_moe(
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
+    get_config_func = functools.partial(
+        try_get_optimal_moe_config,
+        w1.shape,
+        w2.shape,
+        topk_ids.shape[1],
+        None,
+        is_marlin=True,
+    )
+    config = get_config_func(M)
+
+    block_size_m = config["BLOCK_SIZE_M"]
 
     if global_num_experts == -1:
         global_num_experts = E
@@ -144,9 +154,7 @@ def fused_marlin_moe(
         hidden_states,
         intermediate_cache1,
         w1,
-        None,  # b_bias_or_none
         w1_scale,
-        None,  # global_scale_or_none
         w1_zeros,
         g_idx1,
         sort_indices1,
@@ -178,9 +186,7 @@ def fused_marlin_moe(
         intermediate_cache2,
         intermediate_cache3,
         w2,
-        None,  # b_bias_or_none
         w2_scale,
-        None,  # global_scale_or_none
         w2_zeros,
         g_idx2,
         sort_indices2,
