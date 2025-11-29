@@ -209,6 +209,7 @@ class ElasticMempoolOrchestrator:
     def do_resize(
         self, map_allocator: ElasticAllocator, unmap_allocator: ElasticAllocator
     ) -> None:
+        torch.cuda.synchronize()
         logger.info("ElasticMempoolOrchestrator do_resize")
         unmap_page = 0
         unmap_allocator.evict(unmap_allocator.evictable_size())

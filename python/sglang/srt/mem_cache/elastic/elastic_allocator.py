@@ -244,6 +244,8 @@ class ElasticSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator, ElasticAllocat
 
     @override
     def update_size(self):
+        self._kvcache.size = self.full_attn_allocator.size
+        self._kvcache.size_swa = self.swa_attn_allocator.size
         self._size_swa = self.swa_attn_allocator.size
         self._size_full = self.full_attn_allocator.size
         self.scheduler.swa_tokens_per_layer = self._size_swa
