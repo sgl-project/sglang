@@ -345,7 +345,7 @@ def benchmark(num_tokens, num_experts, topk, provider):
     else:  # triton
         # Use original padding calculation for Triton
         max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
-    
+
     # Create tensors
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
