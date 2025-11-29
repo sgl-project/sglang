@@ -225,7 +225,10 @@ class BaseMultimodalProcessor(ABC):
         ]
 
         if SGL_USE_CUDA_IPC:
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(MM_FEATURE_CACHE_SIZE)
+            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+                MM_FEATURE_CACHE_SIZE,
+                self.server_args.mm_item_memory_pool_recycle_interval,
+            )
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
