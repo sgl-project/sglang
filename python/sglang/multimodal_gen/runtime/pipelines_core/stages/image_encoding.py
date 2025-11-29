@@ -246,11 +246,6 @@ class ImageVAEEncodingStage(PipelineStage):
             vae_arch_config, "temporal_compression_ratio", None
         )
         if temporal_compression_ratio in (None, 0):
-            # `scale_factor_temporal` 表示 VAE 在时间维度上的总下采样倍率
-            # （编码时将帧数缩小、解码时再放大），等价于模型里多次 stride/卷积
-            # 的连乘结果。部分配置文件只提供这个值而没有显式的
-            # `temporal_compression_ratio`，因此向后兼容地读取它，确保我们
-            # 的压缩倍率与 VAE 实际的时间缩放行为一致。
             temporal_compression_ratio = getattr(
                 vae_arch_config, "scale_factor_temporal", None
             )
