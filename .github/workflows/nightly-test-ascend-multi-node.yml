@@ -1,0 +1,119 @@
+name: 'e2e nightly test multi_node (Ascend NPU)'
+
+on:
+  workflow_call:
+    inputs:
+      soc_version:
+        required: true
+        type: string
+        description: use a2 or a3
+      runner:
+        required: false
+        type: string
+        default: linux-aarch64-a3-16
+      image:
+        required: false
+        type: string
+        description: base image for pods
+        default: "swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main"
+      test_config_name:
+        required: true
+        type: string
+        description: test config name
+      prefill_size:
+        required: true
+        type: number
+        description: number of prefill nodes
+      decode_size:
+        required: true
+        type: number
+        description: number of decode nodes
+      router_size:
+        required: true
+        type: number
+        description: number of router nodes
+      test_case:
+        required: true
+        type: string
+        description: path of test case file
+
+concurrency:
+  group: ascend-nightly-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.soc_version }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: ${{ inputs.test_config_name }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main-x86
+      env:
+        KUBECONFIG: /data/.cache/kb.yaml
+        KUBECTL: /data/.cache/kubectl
+        NAMESPACE: kube-system
+        ASCEND_TEST_CASE_PATH: "test/srt/ascend_k8s"
+    steps:
+      - name: Install system denpendencies
+        run: |
+          pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple jinja2-cli
+
+      - name: Install kubernetes
+        run: |
+          # Install kubernetes
+          pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple kubernetes
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare scripts
+        run: |
+          # prepare for deepep.yaml
+          image="${{ inputs.image }}"
+          prefill_size="${{ inputs.prefill_size }}"
+          decode_size="${{ inputs.decode_size }}"
+          router_size="${{ inputs.router_size }}"
+          test_case="${{ inputs.test_case }}"
+          echo "{ \"image\": $image,                     \
+                  \"prefill_size\": $prefill_size,       \
+                  \"decode_size\": $decode_size,         \
+                  \"router_size\": $router_size,         \
+                  \"test_case\": \"$test_case\" }"    |\
+              jinja2 ${ASCEND_TEST_CASE_PATH}/deepep.yaml.jinja2 -o ${ASCEND_TEST_CASE_PATH}/deepep.yaml
+
+          # prepare for deepep entrypoint scripts
+          install -D ${ASCEND_TEST_CASE_PATH}/run_ascend_deepep.sh /root/.cache/tests/run_ascend_deepep.sh
+
+      - name: Clear resources
+        run: |
+          cd $ASCEND_TEST_CASE_PATH
+          kubectl delete -f ./deepep.yaml --ignore-not-found=true || true
+
+          pod_name_str="mindx-dls-test-sglang"
+          while true; do            
+            if kubectl get po -A | grep -q "${pod_name_str}"; then
+              echo "Found exist sglang job, sleeping for 30 seconds..."
+              sleep 30
+              kubectl get pods | grep "${pod_name_str}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE
+            else
+              echo "No exist sglang job, start deepep case..."
+              break
+            fi
+          done
+
+      - name: Run test
+        timeout-minutes: 300
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+        run: |
+
+          cd $ASCEND_TEST_CASE_PATH
+          python3 -u run_ascend_ci.py
+
+      - name: Post process
+        if: always()
+        run: |
+          kubectl get pods -n $NAMESPACE
+          cd $ASCEND_TEST_CASE_PATH
+          kubectl delete -f ./deepep.yaml --ignore-not-found=true || true
