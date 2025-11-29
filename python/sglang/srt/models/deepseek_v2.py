@@ -2405,7 +2405,12 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_logits = getattr(metadata, 'attn_logits', None)
         kv_indptr = metadata.kv_indptr
         kv_indices = metadata.kv_indices
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        # For AITer backend, cos_sin_cache doesn't exist - we have separate cos/sin caches
+        # This will be used later in the forward_absorb_fused_mla_rope_core function
+        cos_sin_cache = getattr(self.rotary_emb, 'cos_sin_cache', None)
+        if cos_sin_cache is None:
+            # AITer path: create tuple of (cos_cache, sin_cache)
+            cos_sin_cache = (self.rotary_emb.cos_cache, self.rotary_emb.sin_cache)
         num_kv_split = forward_batch.attn_backend.num_kv_splits
         sm_scale = self.attn_mqa.scaling
         if attn_logits is None:
