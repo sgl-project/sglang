@@ -35,7 +35,7 @@ def get_model_config(model_name: str, tp_size: int):
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
         "Qwen3MoeForCausalLM",
-        "HybridSWACompressedForCausalLM",
+        "MiMoV2FlashForCausalLM",
     ]:
         E = config.n_routed_experts
         topk = config.num_experts_per_tok

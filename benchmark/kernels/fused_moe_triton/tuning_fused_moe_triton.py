@@ -332,7 +332,7 @@ def main(args: argparse.Namespace):
     block_shape = model_config["block_shape"]
     # TODO(yingchun): it's tricky, should read from model config directly, but now the info is missing
     if model_config["architecture"] in [
-        "HybridSWACompressedForCausalLM",
+        "MiMoV2FlashForCausalLM",
     ]:
         block_shape = [128, 128]
 

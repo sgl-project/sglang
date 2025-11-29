@@ -51,7 +51,7 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
-        elif layer_name == "HybridSWACompressedDecoderLayer":
+        elif layer_name == "MiMoV2FlashDecoderLayer":
             # todo
             return OperationsStrategy.concat(
                 [
@@ -232,7 +232,7 @@ def _compute_moe_hybrid_layer_operations_strategy_tbo(
 ) -> OperationsStrategy:
     assert (
         layer.is_layer_sparse
-    ), "HybridSWACompressedDecoderLayer moe only support sparse layers"
+    ), "MiMoV2FlashDecoderLayer moe only support sparse layers"
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_hybrid_prefill(layer)
     elif (
