@@ -28,22 +28,7 @@ jobs:
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: ${GITHUB_WORKSPACE}/test/srt/ascend_k8s/test_ascend_deepseek_r1_w8a8_2p1d_in2048_out_2048.py
-          - name: deepep_deepseek_r1_2p1d_2
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: ${GITHUB_WORKSPACE}/test/srt/ascend_k8s/test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500.py
-          - name: deepep_deepseek_r1_1p1d_1
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: ${GITHUB_WORKSPACE}/test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in2048_out_2048.py
-          - name: deepep_deepseek_r1_1p1d_2
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: ${GITHUB_WORKSPACE}/test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500.py
+            test_case: ${GITHUB_WORKSPACE}/test/srt/ascend_k8s/test_ascend_disaggregation_deepep_k8s_2p1d.py
     uses: ./.github/workflows/nightly-test-ascend-multi-node.yml
     with:
       soc_version: a3
@@ -53,22 +38,4 @@ jobs:
       prefill_size: ${{ matrix.test_config.prefill_size }}
       decode_size: ${{ matrix.test_config.decode_size }}
       router_size: ${{ matrix.test_config.router_size }}
-      test_case: ${{ matrix.test_config.test_case }}
-
-  single-node-tests:
-    name: single-node
-    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    needs: multi-node-tests
-    strategy:
-      fail-fast: false
-      matrix:
-        test_config:
-          - name: deepep_deepseek_r1_single_1
-            test_case: ${GITHUB_WORKSPACE}/test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
-    uses: ./.github/workflows/nightly-test-ascend-single-node.yml
-    with:
-      soc_version: a3
-      runner: linux-aarch64-a3-0
-      image: 'swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main'
-      test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}
