@@ -106,14 +106,21 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     k_align = int(pad_k_align)
                     k_aligned = ceil_align(k, k_align)
                 
-                # Pad N dimension if requested (with TP awareness)
+                # Pad N dimension if requested (with TP awareness for RowParallel)
                 if pad_n_align and pad_n_align.isdigit():
                     n_align = int(pad_n_align)
-                    # For RowParallelLinear: N gets sharded by tp_size
-                    # Multiply alignment by tp_size to ensure post-shard alignment
+                    # For RowParallelLinear: N dimension gets sharded by tp_size
+                    # We need to multiply alignment by tp_size to ensure post-shard alignment
+                    # For other layer types (ColumnParallel, etc.), no N-sharding occurs
                     tp_size = getattr(layer, 'tp_size', 1)
-                    n_align_tp_aware = n_align * tp_size
-                    n_aligned = ceil_align(n, n_align_tp_aware)
+                    layer_class_name = layer.__class__.__name__
+                    
+                    # Only apply TP-aware padding for RowParallelLinear
+                    if 'RowParallel' in layer_class_name and tp_size > 1:
+                        n_align_tp_aware = n_align * tp_size
+                        n_aligned = ceil_align(n, n_align_tp_aware)
+                    else:
+                        n_aligned = ceil_align(n, n_align)
                 
                 need_padding = (k_aligned != k) or (n_aligned != n)
                 if need_padding:
