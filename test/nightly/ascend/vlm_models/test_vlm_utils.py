@@ -18,7 +18,21 @@ class TestVLMModels(CustomTestCase):
     models = []
     tp_size = 4
     mem_fraction_static = 0.35
-    parsed_args = None  # Class variable to store args
+    other_args = [
+        "--trust-remote-code",
+        "--cuda-graph-max-bs",
+        "32",
+        "--enable-multimodal",
+        "--mem-fraction-static",
+        self.mem_fraction_static,
+        "--log-level",
+        log_level,
+        "--attention-backend",
+        "ascend",
+        "--disable-cuda-graph",
+        "--tp-size",
+        self.tp_size,
+    ]
 
     @classmethod
     def setUpClass(cls):
@@ -124,22 +138,6 @@ class TestVLMModels(CustomTestCase):
                 stdout_file = open("/tmp/server_stdout.log", "w")
                 stderr_file = open("/tmp/server_stderr.log", "w")
 
-            # Launch server for testing
-            other_args = [
-                "--trust-remote-code",
-                "--cuda-graph-max-bs",
-                "32",
-                "--enable-multimodal",
-                "--mem-fraction-static",
-                self.mem_fraction_static,
-                "--log-level",
-                log_level,
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-                "--tp-size",
-                self.tp_size,
-            ]
             process = popen_launch_server(
                 model.model,
                 base_url=self.base_url,
