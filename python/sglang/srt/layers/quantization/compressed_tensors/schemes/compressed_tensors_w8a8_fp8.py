@@ -89,6 +89,10 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 # SGLANG_AITER_PAD_K: pad K dimension (for GEMM kernels)
                 # SGLANG_AITER_PAD_N: pad N dimension (for shuffle_weight)
                 # When not set: no padding (default behavior, matches current main)
+                # 
+                # Important: For RowParallelLinear, N dimension is sharded by tp_size.
+                # We need to ensure that after padding, N/tp_size is still aligned.
+                # Solution: multiply N alignment by tp_size before padding.
                 pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
                 pad_n_align = os.environ.get("SGLANG_AITER_PAD_N", "").strip()
                 
@@ -102,10 +106,14 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     k_align = int(pad_k_align)
                     k_aligned = ceil_align(k, k_align)
                 
-                # Pad N dimension if requested
+                # Pad N dimension if requested (with TP awareness)
                 if pad_n_align and pad_n_align.isdigit():
                     n_align = int(pad_n_align)
-                    n_aligned = ceil_align(n, n_align)
+                    # For RowParallelLinear: N gets sharded by tp_size
+                    # Multiply alignment by tp_size to ensure post-shard alignment
+                    tp_size = getattr(layer, 'tp_size', 1)
+                    n_align_tp_aware = n_align * tp_size
+                    n_aligned = ceil_align(n, n_align_tp_aware)
                 
                 need_padding = (k_aligned != k) or (n_aligned != n)
                 if need_padding:
