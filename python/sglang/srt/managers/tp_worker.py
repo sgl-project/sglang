@@ -294,20 +294,20 @@ class TpModelWorker(BaseTpWorker):
             running_limit = self.max_total_num_tokens // 2
             log_debug_on_rank0(
                 logger,
-                f"max_running_requests (concurrent request limit): {running_limit} (default: max_total_tokens//2)",
+                f"max_running_requests: no arg, using total_tokens//2 = {running_limit}",
             )
         else:
             dp_divisor = server_args.dp_size if server_args.enable_dp_attention else 1
             running_limit = server_args.max_running_requests // dp_divisor
             log_debug_on_rank0(
                 logger,
-                f"max_running_requests (concurrent request limit): {running_limit} (from arg {server_args.max_running_requests} / dp_size {dp_divisor})",
+                f"max_running_requests: arg={server_args.max_running_requests} // dp_divisor={dp_divisor} = {running_limit}",
             )
         self.max_running_requests = min(running_limit, token_pool_size)
         if self.max_running_requests < running_limit:
             log_debug_on_rank0(
                 logger,
-                f"max_running_requests: clamped to token_pool_size ({running_limit} → {self.max_running_requests})",
+                f"max_running_requests: clamped by token_pool_size {running_limit} -> {self.max_running_requests}",
             )
 
         assert self.max_running_requests > 0, "max_running_request is zero"
@@ -323,12 +323,12 @@ class TpModelWorker(BaseTpWorker):
         if context_limit <= memory_limit:
             log_debug_on_rank0(
                 logger,
-                f"max_req_len (per-request token limit): {self.max_req_len} (limited by model context_len={self.model_config.context_len})",
+                f"max_req_len: limited by context_len ({self.model_config.context_len} - 1 = {self.max_req_len})",
             )
         else:
             log_debug_on_rank0(
                 logger,
-                f"max_req_len (per-request token limit): {self.max_req_len} (limited by KV memory, max_total_tokens={self.max_total_num_tokens})",
+                f"max_req_len: limited by memory ({self.max_total_num_tokens} - 1 = {self.max_req_len})",
             )
 
         self.max_req_input_len = self.max_req_len - 5
