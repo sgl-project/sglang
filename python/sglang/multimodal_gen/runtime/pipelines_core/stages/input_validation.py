@@ -206,9 +206,16 @@ class InputValidationStage(PipelineStage):
                 image = load_video(batch.image_path)[0]
             else:
                 image = load_image(batch.image_path)
+
+            if not isinstance(image, list):
+                image = [image]
+
             batch.condition_image = image
-            condition_image_width, condition_image_height = image.width, image.height
-            batch.original_condition_image_size = image.size
+            condition_image_width, condition_image_height = (
+                image[0].width,
+                image[0].height,
+            )
+            batch.original_condition_image_size = image[0].size
 
         # self.preprocess_condition_image(batch, server_args, condition_image_width, condition_image_height)
         # NOTE: condition image resizing is only allowed to do in InputValidationStage
@@ -228,13 +235,17 @@ class InputValidationStage(PipelineStage):
                     calculated_width, calculated_height = calculated_size
                     condition_image = (
                         server_args.pipeline_config.resize_condition_image(
-                            image, calculated_width, calculated_height
+                            batch.condition_image, calculated_width, calculated_height
                         )
                     )
                     batch.condition_image = condition_image
 
+                if isinstance(condition_image, list):
+                    condition_image = batch.condition_image[0]
+                else:
+                    condition_image = batch.condition_image
                 # adjust output image size
-                calculated_width, calculated_height = batch.condition_image.size
+                calculated_width, calculated_height = condition_image.size
                 width = calculated_width if batch.width_not_provided else batch.width
                 height = (
                     calculated_height if batch.height_not_provided else batch.height
@@ -251,6 +262,11 @@ class InputValidationStage(PipelineStage):
         ) and batch.condition_image is not None:
             # duplicate with vae_image_processor
             # further processing for ti2v task
+
+            # TODO(yhyang201): support multi images for ti2v task
+            if isinstance(batch.condition_image, list):
+                batch.condition_image = batch.condition_image[0]
+
             img = batch.condition_image
             ih, iw = img.height, img.width
             patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size

@@ -358,3 +358,27 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             )
 
         return condition_images
+
+    def resize_condition_image(self, image, target_width, target_height):
+        if not isinstance(image, list):
+            image = [image]
+        condition_images = []
+        for img, height, width in zip(image, target_height, target_width):
+            condition_images.append(resize(img, height, width, resize_mode="default"))
+        return condition_images
+
+    def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
+        if not isinstance(image, list):
+            image = [image]
+        calculated_widths = []
+        calculated_heights = []
+
+        for img in image:
+            image_width, image_height = img.size
+            calculated_width, calculated_height, _ = calculate_dimensions(
+                CONDITION_IMAGE_SIZE, image_width / image_height
+            )
+            calculated_widths.append(calculated_width)
+            calculated_heights.append(calculated_height)
+
+        return calculated_widths, calculated_heights

@@ -91,7 +91,7 @@ def normalize(images: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
 
 # adapted from diffusers.utils import load_image
 def load_image(
-    image: str | PIL.Image.Image,
+    images: list[str] | list[PIL.Image.Image],
     convert_method: Callable[[PIL.Image.Image], PIL.Image.Image] | None = None,
 ) -> PIL.Image.Image:
     """
@@ -108,31 +108,37 @@ def load_image(
         `PIL.Image.Image`:
             A PIL Image.
     """
-    if isinstance(image, str):
-        if image.startswith("http://") or image.startswith("https://"):
-            with suppress_other_loggers(not_suppress_on_main_rank=True):
-                image = PIL.Image.open(requests.get(image, stream=True).raw)
-        elif os.path.isfile(image):
-            image = PIL.Image.open(image)
+
+    output_images = []
+
+    for image in images:
+        if isinstance(image, str):
+            if image.startswith("http://") or image.startswith("https://"):
+                with suppress_other_loggers(not_suppress_on_main_rank=True):
+                    image = PIL.Image.open(requests.get(image, stream=True).raw)
+            elif os.path.isfile(image):
+                image = PIL.Image.open(image)
+            else:
+                raise ValueError(
+                    f"Incorrect path or URL. URLs must start with `http://` or `https://`, and {image} is not a valid path."
+                )
+        elif isinstance(image, PIL.Image.Image):
+            image = image
         else:
             raise ValueError(
-                f"Incorrect path or URL. URLs must start with `http://` or `https://`, and {image} is not a valid path."
+                "Incorrect format used for the image. Should be a URL linking to an image, a local path, or a PIL image."
             )
-    elif isinstance(image, PIL.Image.Image):
-        image = image
-    else:
-        raise ValueError(
-            "Incorrect format used for the image. Should be a URL linking to an image, a local path, or a PIL image."
-        )
 
-    image = PIL.ImageOps.exif_transpose(image)
+        image = PIL.ImageOps.exif_transpose(image)
 
-    if convert_method is not None:
-        image = convert_method(image)
-    else:
-        image = image.convert("RGB")
+        if convert_method is not None:
+            image = convert_method(image)
+        else:
+            image = image.convert("RGB")
 
-    return image
+        output_images.append(image)
+
+    return output_images
 
 
 # adapted from diffusers.utils import load_video

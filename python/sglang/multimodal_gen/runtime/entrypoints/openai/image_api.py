@@ -160,13 +160,19 @@ async def edits(
     images = image or image_array
     if not images or len(images) == 0:
         raise HTTPException(status_code=422, detail="Field 'image' is required")
-
-    # Save first input image; additional images or mask are not yet used by the pipeline
+    # Save all input images; additional images beyond the first are saved for potential future use
     uploads_dir = os.path.join("outputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    first_image = images[0]
-    input_path = os.path.join(uploads_dir, f"{request_id}_{first_image.filename}")
-    await _save_upload_to_path(first_image, input_path)
+
+    if images is not None and not isinstance(images, list):
+        images = [images]
+
+    input_paths = []
+    for idx, img in enumerate(images):
+        filename = img.filename or f"image_{idx}"
+        input_path = os.path.join(uploads_dir, f"{request_id}_{idx}_{filename}")
+        await _save_upload_to_path(img, input_path)
+        input_paths.append(input_path)
 
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
@@ -175,7 +181,7 @@ async def edits(
         size=size,
         output_format=output_format,
         background=background,
-        image_path=input_path,
+        image_path=input_paths,
     )
     batch = _build_req_from_sampling(sampling)
     save_file_path = await process_generation_batch(scheduler_client, batch)
@@ -186,6 +192,8 @@ async def edits(
             "id": request_id,
             "created_at": int(time.time()),
             "file_path": save_file_path,
+            "input_image_paths": input_paths,  # Store all input image paths
+            "num_input_images": len(input_paths),
         },
     )
 
