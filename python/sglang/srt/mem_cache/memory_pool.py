@@ -568,16 +568,7 @@ class MHATokenToKVPool(KVCache):
 
     def _describe_layout(self) -> Optional[str]:
         total_slots = self.size + self.page_size
-        dtype_info = (
-            f"store_dtype={self.store_dtype}, logical_dtype={self.dtype}"
-            if self.store_dtype != self.dtype
-            else f"dtype={self.dtype}"
-        )
-        return (
-            "NHD token-major "
-            f"(per-layer tensor shape=({total_slots}, {self.head_num}, {self.head_dim}), "
-            f"page_size={self.page_size}, heads={self.head_num}, head_dim={self.head_dim}, {dtype_info})"
-        )
+        return f"NHD(page={self.page_size}) shape=({total_slots}, {self.head_num}, {self.head_dim})"
 
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
@@ -1445,17 +1436,7 @@ class MLATokenToKVPool(KVCache):
 
     def _describe_layout(self) -> Optional[str]:
         total_slots = self.size + self.page_size
-        dtype_info = (
-            f"store_dtype={self.store_dtype}, logical_dtype={self.dtype}"
-            if self.store_dtype != self.dtype
-            else f"dtype={self.dtype}"
-        )
-        return (
-            "N1D token-major "
-            f"(per-layer tensor shape=({total_slots}, 1, {self.kv_cache_dim}), "
-            f"page_size={self.page_size}, kv_lora_rank={self.kv_lora_rank}, "
-            f"rope_head_dim={self.qk_rope_head_dim}, {dtype_info})"
-        )
+        return f"N1D(page={self.page_size}) shape=({total_slots}, 1, {self.kv_cache_dim})"
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
