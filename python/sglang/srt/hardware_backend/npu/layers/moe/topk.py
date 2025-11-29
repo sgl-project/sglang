@@ -18,7 +18,7 @@ def fused_topk_npu(
     topk_config: "TopKConfig",
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional["ExpertLocationDispatchInfo"] = None,
-) -> TopKOutput:
+) -> "TopKOutput":
 
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
