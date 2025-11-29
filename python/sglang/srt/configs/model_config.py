@@ -129,6 +129,22 @@ class ModelConfig:
         )
         if getattr(self.hf_config, "moe_router_dtype", None) is None:
             setattr(self.hf_config, "moe_router_dtype", moe_router_dtype)
+        if (
+            quantization == "fp8"
+            and getattr(self.hf_config, "quantization_config", None) is None
+        ):
+            logger.warning("Quantization config is not found. Using default config.")
+            setattr(
+                self.hf_config,
+                "quantization_config",
+                {
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                    "origin_dtype": torch.get_default_dtype(),
+                },
+            )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
@@ -264,7 +280,7 @@ class ModelConfig:
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
             moe_router_dtype=server_args.moe_router_dtype,
-            is_mtp = server_args.enable_mtp,
+            is_mtp=server_args.enable_mtp,
             **kwargs,
         )
 

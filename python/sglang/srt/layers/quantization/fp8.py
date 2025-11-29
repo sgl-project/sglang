@@ -34,11 +34,11 @@ except ImportError:
     apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
 
-import transformer_engine_torch as tex
 from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
     Float8BlockQuantizer,
     Float8BlockwiseQTensor,
 )
+import transformer_engine_torch as tex
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
