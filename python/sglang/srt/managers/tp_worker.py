@@ -75,17 +75,10 @@ class BaseTpWorker(ABC):
         return self.model_runner.is_hybrid is not None
 
     def get_tokens_per_layer_info(self):
-        full_tokens = getattr(
-            self.model_runner,
-            "full_max_total_num_tokens",
-            self.model_runner.max_total_num_tokens,
+        return (
+            self.model_runner.full_max_total_num_tokens,
+            self.model_runner.swa_max_total_num_tokens,
         )
-        swa_tokens = getattr(
-            self.model_runner,
-            "swa_max_total_num_tokens",
-            full_tokens,
-        )
-        return full_tokens, swa_tokens
 
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)

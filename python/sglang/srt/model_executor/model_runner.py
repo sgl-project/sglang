@@ -1422,6 +1422,44 @@ class ModelRunner:
         )
         tokens_per_dp_rank = max_num_token // max(dp_divisor, 1)
 
+        self._log_kv_profile(
+            layout_label=layout_label,
+            layout_detail=layout_detail,
+            num_layers=num_layers,
+            dtype=self.kv_cache_dtype,
+            dtype_size=dtype_size,
+            per_token_kb=bytes_per_token / 1024,
+            per_layer_kb=per_layer_bytes / 1024,
+            available_mem_gb=available_gpu_memory,
+            total_mem_gb=total_gpu_memory,
+            mem_fraction_static=self.mem_fraction_static,
+            rest_mem_gb=rest_memory,
+            max_tokens=max_num_token,
+            dp_size=self.server_args.dp_size if self.server_args.enable_dp_attention else None,
+            tokens_per_dp=tokens_per_dp_rank
+            if self.server_args.enable_dp_attention
+            else None,
+        )
+        return max_num_token
+
+    def _log_kv_profile(
+        self,
+        *,
+        layout_label: str,
+        layout_detail: str,
+        num_layers: int,
+        dtype: torch.dtype,
+        dtype_size: int,
+        per_token_kb: float,
+        per_layer_kb: float,
+        available_mem_gb: float,
+        total_mem_gb: float,
+        mem_fraction_static: float,
+        rest_mem_gb: float,
+        max_tokens: int,
+        dp_size: Optional[int],
+        tokens_per_dp: Optional[int],
+    ):
         message = (
             "KV profiling: layout=%s (%s) layers=%s dtype=%s elem=%sB "
             "per_token=%.2fKB per_layer=%.2fKB avail=%.2fGB total=%.2fGB "
@@ -1431,22 +1469,20 @@ class ModelRunner:
             layout_label,
             layout_detail,
             num_layers,
-            self.kv_cache_dtype,
+            dtype,
             dtype_size,
-            bytes_per_token / 1024,
-            per_layer_bytes / 1024,
-            available_gpu_memory,
-            total_gpu_memory,
-            self.mem_fraction_static,
-            rest_memory,
-            max_num_token,
+            per_token_kb,
+            per_layer_kb,
+            available_mem_gb,
+            total_mem_gb,
+            mem_fraction_static,
+            rest_mem_gb,
+            max_tokens,
         ]
-        if self.server_args.enable_dp_attention:
+        if dp_size is not None and tokens_per_dp is not None:
             message += " dp_size=%s tokens_per_dp=%s"
-            log_args.extend([self.server_args.dp_size, tokens_per_dp_rank])
-
+            log_args.extend([dp_size, tokens_per_dp])
         logger.info(message, *log_args)
-        return max_num_token
 
     def handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
