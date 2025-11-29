@@ -12,20 +12,18 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_npu_ci(est_time=300, suite="nightly-1-npu", nightly=True)
 
-
-class TestMistral(CustomTestCase):
-    model = "/root/.cache/modelscope/hub/models/mistralai/Mistral-7B-Instruct-v0.2"
+class GSM8KAscendMixin(ABC):
+    model = ""
     accuracy = 0.00
-    other_args = (
+    other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
         "0.8",
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",
-    )
+    ]
 
     @classmethod
     def setUpClass(cls):
@@ -70,7 +68,3 @@ class TestMistral(CustomTestCase):
             self.accuracy,
             f'Accuracy of {self.model} is {str(metrics["accuracy"])}, is lower than {self.accuracy}',
         )
-
-
-if __name__ == "__main__":
-    unittest.main()
