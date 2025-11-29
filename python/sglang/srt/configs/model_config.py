@@ -226,8 +226,8 @@ class ModelConfig:
                 )
             )
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
-            "HybridSWACompressedForCausalLM",
-            "HybridSWACompressedForCausalLMNextN",
+            "MiMoV2FlashForCausalLM",
+            "MiMoV2FlashForCausalLMNextN",
         ]
         if self.is_hybrid_swa_compress:
             self.attention_chunk_size = self.hf_text_config.sliding_window_size
@@ -235,7 +235,7 @@ class ModelConfig:
             #  will be calculated automatically before allocating KV cache.
             self.is_hybrid_swa = (
                 (
-                    self.hf_text_config.attention_chunk_size
+                    self.hf_text_config.sliding_window_size
                     * len(self.swa_attention_layer_ids)
                     / (self.context_len * len(self.full_attention_layer_ids))
                 )
@@ -316,9 +316,9 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoMTP"
         if (
             is_draft_model
-            and self.hf_config.architectures[0] == "HybridSWACompressedForCausalLM"
+            and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
         ):
-            self.hf_config.architectures[0] = "HybridSWACompressedForCausalLMNextN"
+            self.hf_config.architectures[0] = "MiMoV2FlashForCausalLMNextN"
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -569,8 +569,8 @@ class ModelConfig:
         if not self.is_hybrid_swa_compress:
             return 0
 
-        # For HybridSWACompressedForCausalLM models
-        total_num_kv_heads = self.hf_text_config.compression_softmax_num_kv_heads
+        # For MiMoV2FlashForCausalLM models
+        total_num_kv_heads = self.hf_text_config.swa_num_key_value_heads
         return max(1, total_num_kv_heads // tensor_parallel_size)
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
@@ -1145,8 +1145,8 @@ def is_hybrid_model(
     attention_chunk_size: Optional[int],
 ):
     if model_architectures[0] in [
-        "HybridSWACompressedForCausalLM",
-        "HybridSWACompressedForCausalLMNextN",
+        "MiMoV2FlashForCausalLM",
+        "MiMoV2FlashForCausalLMNextN",
     ]:
         return 1
     if hybrid_kvcache_ratio is None:
@@ -1173,14 +1173,14 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
-    elif "HybridSWACompressedForCausalLM" in model_architectures:
+    elif "MiMoV2FlashForCausalLM" in model_architectures:
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
         ]
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
-    elif "HybridSWACompressedForCausalLMNextN" in model_architectures:
+    elif "MiMoV2FlashForCausalLMNextN" in model_architectures:
         return [0], []
     else:
         swa_attention_layer_ids = None

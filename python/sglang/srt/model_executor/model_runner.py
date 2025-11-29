@@ -458,7 +458,7 @@ class ModelRunner:
         # TODO 在config.json里加num_nextn_predict_layers字段，复用上面的逻辑
         if (
             self.model_config.hf_config.architectures[0]
-            == "HybridSWACompressedForCausalLMNextN"
+            == "MiMoV2FlashForCausalLMNextN"
         ):
             model_num_layers = 1
         self.start_layer = getattr(self.model, "start_layer", 0)
@@ -1457,15 +1457,12 @@ class ModelRunner:
                     // scale_block_size
                 )
 
-            if (
-                self.model_config.hf_config.architectures[0]
-                == "HybridSWACompressedForCausalLM"
-            ):
+            if self.model_config.hf_config.architectures[0] == "MiMoV2FlashForCausalLM":
                 cell_size += (
                     self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
                     * (
-                        self.model_config.hf_text_config.compression_softmax_qk_head_dim
-                        + self.model_config.hf_text_config.compression_softmax_v_head_dim
+                        self.model_config.hf_text_config.swa_head_dim
+                        + self.model_config.hf_text_config.swa_v_head_dim
                     )
                     * len(self.model_config.swa_attention_layer_ids)
                     * torch._utils._element_size(self.kv_cache_dtype)
@@ -1592,10 +1589,7 @@ class ModelRunner:
                 * self.server_args.page_size
             )
             self.max_total_num_tokens = self.full_max_total_num_tokens
-        elif (
-            "HybridSWACompressedForCausalLMNextN"
-            in self.model_config.hf_config.architectures
-        ):
+        elif "MiMoV2FlashForCausalLMNextN" in self.model_config.hf_config.architectures:
             return
         else:
             assert self.sliding_window_size is not None and self.sliding_window_size > 0
@@ -1774,9 +1768,9 @@ class ModelRunner:
                 # Use parameters passed from target worker
                 if (
                     self.model_config.hf_config.architectures[0]
-                    == "HybridSWACompressedForCausalLMNextN"
+                    == "MiMoV2FlashForCausalLMNextN"
                 ):
-                    # HybridSWACompressedForCausalLMNextN uses SWA, so set full KV cache to 0
+                    # MiMoV2FlashForCausalLMNextN uses SWA, so set full KV cache to 0
                     self.swa_max_total_num_tokens = (
                         self.server_args.draft_runner_cache_size_swa
                     )
@@ -1809,7 +1803,7 @@ class ModelRunner:
                 self.server_args.draft_runner_cache_size = self.max_total_num_tokens
                 if (
                     self.model_config.hf_config.architectures[0]
-                    == "HybridSWACompressedForCausalLM"
+                    == "MiMoV2FlashForCausalLM"
                 ):
                     self.full_max_total_num_tokens += extra_tokens
                     self.swa_max_total_num_tokens += extra_tokens
@@ -1989,11 +1983,11 @@ class ModelRunner:
                     kwargs = {
                         "swa_head_num": max(
                             1,
-                            self.model_config.hf_text_config.compression_softmax_num_kv_heads
+                            self.model_config.hf_text_config.swa_num_key_value_heads
                             // get_attention_tp_size(),
                         ),
-                        "swa_head_dim": self.model_config.hf_text_config.compression_softmax_qk_head_dim,
-                        "swa_v_head_dim": self.model_config.hf_text_config.compression_softmax_v_head_dim,
+                        "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
+                        "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
                 else:

@@ -1185,6 +1185,12 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
             self.disable_hybrid_swa_memory = True
 
+        elif "MiMoV2FlashForCausalLM" in model_arch and self.enable_hierarchical_cache:
+            # when hybrid model deploy with hierarchical cache, we need to disable hybrid swa memory
+            self.disable_hybrid_swa_memory = True
+            logger.info(
+                "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
+            )
         elif "Llama4" in model_arch and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:

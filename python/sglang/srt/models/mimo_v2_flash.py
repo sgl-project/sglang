@@ -73,12 +73,12 @@ from sglang.srt.utils import (
     make_layers,
 )
 
-HybridSWACompressedConfig = None
+MiMoV2FlashConfig = None
 
 logger = logging.getLogger(__name__)
 
 
-class HybridSWACompressedMLP(nn.Module):
+class MiMoV2FlashMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -172,11 +172,11 @@ class MoEGate(nn.Module):
         return logits
 
 
-class HybridSWACompressedMoE(nn.Module):
+class MiMoV2FlashMoE(nn.Module):
 
     def __init__(
         self,
-        config: HybridSWACompressedConfig,
+        config: MiMoV2FlashConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -387,7 +387,7 @@ class HybridSWACompressedMoE(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
-class HybridSWACompressedAttention(nn.Module):
+class MiMoV2FlashAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -398,7 +398,7 @@ class HybridSWACompressedAttention(nn.Module):
         v_scale: Optional[float] = None,
         sliding_window_size: int = -1,  # if is -1 ,normal attention,else ,window attention
         attention_bias: bool = False,
-        add_swa_attention_sink_bias: bool = False,  # todo sink bias
+        attention_sink_bias: bool = False,
         layer_id: int = 0,
         rope_theta: float = 1000000,
         rope_scaling: Optional[Dict[str, Any]] = None,
@@ -484,7 +484,7 @@ class HybridSWACompressedAttention(nn.Module):
 
         self.attention_sink_bias = (
             torch.nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
-            if add_swa_attention_sink_bias
+            if attention_sink_bias
             else None
         )
 
@@ -549,10 +549,10 @@ class HybridSWACompressedAttention(nn.Module):
         return output
 
 
-class HybridSWACompressedDecoderLayer(nn.Module):
+class MiMoV2FlashDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: HybridSWACompressedConfig,
+        config: MiMoV2FlashConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -568,17 +568,17 @@ class HybridSWACompressedDecoderLayer(nn.Module):
             config, "context_len", getattr(config, "max_position_embeddings", 32768)
         )
 
-        if self.is_compressed_softmax_layer():
-            self.self_attn = HybridSWACompressedAttention(
+        if self.is_swa_layer():
+            self.self_attn = MiMoV2FlashAttention(
                 hidden_size=self.hidden_size,
-                num_heads=config.compression_softmax_num_q_heads,
-                num_kv_heads=config.compression_softmax_num_kv_heads,
-                head_dim=config.compression_softmax_qk_head_dim,
-                v_head_dim=getattr(config, "compression_softmax_v_head_dim", None),
                 v_scale=getattr(config, "attention_value_scale", None),
+                num_heads=config.swa_num_attention_heads,
+                num_kv_heads=config.swa_num_key_value_heads,
+                head_dim=config.swa_head_dim,
+                v_head_dim=getattr(config, "swa_v_head_dim", None),
                 sliding_window_size=config.sliding_window_size,
                 attention_bias=config.attention_bias,
-                add_swa_attention_sink_bias=getattr(
+                attention_sink_bias=getattr(
                     config, "add_swa_attention_sink_bias", False
                 ),
                 layer_id=layer_id,
@@ -590,7 +590,7 @@ class HybridSWACompressedDecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
         else:
-            self.self_attn = HybridSWACompressedAttention(
+            self.self_attn = MiMoV2FlashAttention(
                 hidden_size=self.hidden_size,
                 num_heads=self.config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
@@ -599,6 +599,9 @@ class HybridSWACompressedDecoderLayer(nn.Module):
                 v_scale=getattr(config, "attention_value_scale", None),
                 sliding_window_size=-1,  # normal attention
                 attention_bias=config.attention_bias,
+                attention_sink_bias=getattr(
+                    config, "add_full_attention_sink_bias", False
+                ),
                 layer_id=layer_id,
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
@@ -612,7 +615,7 @@ class HybridSWACompressedDecoderLayer(nn.Module):
         is_previous_layer_sparse = self.is_moe_layer(layer_id - 1)
 
         if self.is_layer_sparse:
-            self.mlp = HybridSWACompressedMoE(
+            self.mlp = MiMoV2FlashMoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
@@ -623,7 +626,7 @@ class HybridSWACompressedDecoderLayer(nn.Module):
                 mlp_tp_rank, mlp_tp_size = 0, 1
             else:
                 mlp_tp_rank, mlp_tp_size = None, None
-            self.mlp = HybridSWACompressedMLP(
+            self.mlp = MiMoV2FlashMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -689,7 +692,7 @@ class HybridSWACompressedDecoderLayer(nn.Module):
             and self.config.moe_layer_freq[layer_idx]
         )
 
-    def is_compressed_softmax_layer(self) -> bool:
+    def is_swa_layer(self) -> bool:
         return self.config.hybrid_layer_pattern[self.layer_id] == 1
 
     def op_comm_prepare_attn(
@@ -750,13 +753,13 @@ class HybridSWACompressedDecoderLayer(nn.Module):
         return output
 
 
-class HybridSWACompressedModel(nn.Module):
+class MiMoV2FlashModel(nn.Module):
     def __init__(
         self,
-        config: HybridSWACompressedConfig,
+        config: MiMoV2FlashConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = HybridSWACompressedDecoderLayer,
+        decoder_layer_type: type[nn.Module] = MiMoV2FlashDecoderLayer,
     ) -> None:
         super().__init__()
         self.config = config
@@ -775,8 +778,8 @@ class HybridSWACompressedModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # Use the provided decoder layer type or default to HybridSWACompressedDecoderLayer
-        decoder_layer_type = decoder_layer_type or HybridSWACompressedDecoderLayer
+        # Use the provided decoder layer type or default to MiMoV2FlashDecoderLayer
+        decoder_layer_type = decoder_layer_type or MiMoV2FlashDecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             layer_fn=lambda idx, prefix: decoder_layer_type(
@@ -887,7 +890,7 @@ class HybridSWACompressedModel(nn.Module):
                 )
 
 
-class HybridSWACompressedForCausalLM(nn.Module):
+class MiMoV2FlashForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -909,7 +912,7 @@ class HybridSWACompressedForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: HybridSWACompressedConfig,
+        config: MiMoV2FlashConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -917,23 +920,9 @@ class HybridSWACompressedForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
-        self.model = HybridSWACompressedModel(
+        self.model = MiMoV2FlashModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-
-        # TODO: temporary used when adapt mimo-v2, should be removed when release.
-        assert not getattr(config, "add_compression_swa_gate", False)
-        assert not getattr(config, "use_compression_softmax", False)
-        assert (
-            not getattr(config, "routed_scaling_factor", None)
-            or config.routed_scaling_factor == 1.0
-        )
-        assert not getattr(config, "add_full_attention_sink_bias", False)
-        assert not getattr(config, "rope_scaling", None)
-        assert not getattr(config, "add_compression_attention_sink_bias", False)
-        assert getattr(config, "hybrid_layer_pattern", None)
-        assert config.head_dim == 192
-        assert not getattr(config, "tie_word_embeddings", None)
 
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -953,7 +942,7 @@ class HybridSWACompressedForCausalLM(nn.Module):
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, HybridSWACompressedMoE)
+                if isinstance(layer.mlp, MiMoV2FlashMoE)
             }
         )
 
@@ -986,7 +975,10 @@ class HybridSWACompressedForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
             )
         else:
             return hidden_states
@@ -1038,7 +1030,6 @@ class HybridSWACompressedForCausalLM(nn.Module):
                 # the checkpoint. Skip them.
                 continue
 
-            # todo :lm head tie weights tp parallelism?
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
                     # Handle pp weight tying here
@@ -1128,4 +1119,4 @@ class HybridSWACompressedForCausalLM(nn.Module):
         )
 
 
-EntryClass = HybridSWACompressedForCausalLM
+EntryClass = MiMoV2FlashForCausalLM

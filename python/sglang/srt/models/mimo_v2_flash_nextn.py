@@ -25,23 +25,23 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.hybrid_swa_compress import (
-    HybridSWACompressedAttention,
-    HybridSWACompressedForCausalLM,
-    HybridSWACompressedMLP,
+from sglang.srt.models.mimo_v2_flash import (
+    MiMoV2FlashAttention,
+    MiMoV2FlashForCausalLM,
+    MiMoV2FlashMLP,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
-HybridSWACompressedConfig = None
+MiMoV2FlashConfig = None
 
 logger = logging.getLogger(__name__)
 
 
-class HybridSWACompressedMTPLayer(nn.Module):
+class MiMoV2FlashMTPLayer(nn.Module):
     def __init__(
         self,
-        config: HybridSWACompressedConfig,
+        config: MiMoV2FlashConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -54,19 +54,15 @@ class HybridSWACompressedMTPLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
-        self.layer_id = layer_id
-        self.self_attn = HybridSWACompressedAttention(
+        self.self_attn = MiMoV2FlashAttention(
             hidden_size=self.hidden_size,
-            num_heads=config.compression_softmax_num_q_heads,
-            num_kv_heads=config.compression_softmax_num_kv_heads,
-            head_dim=config.compression_softmax_qk_head_dim,
-            v_head_dim=getattr(config, "compression_softmax_v_head_dim", None),
-            v_scale=getattr(config, "attention_value_scale", None),
+            num_heads=config.swa_num_attention_heads,
+            num_kv_heads=config.swa_num_key_value_heads,
+            head_dim=config.swa_head_dim,
+            v_head_dim=getattr(config, "swa_v_head_dim", None),
             sliding_window_size=config.sliding_window_size,
             attention_bias=config.attention_bias,
-            add_swa_attention_sink_bias=getattr(
-                config, "add_swa_attention_sink_bias", False
-            ),
+            attention_sink_bias=getattr(config, "add_swa_attention_sink_bias", False),
             layer_id=layer_id,
             rope_theta=getattr(config, "swa_rope_theta", rope_theta),
             rope_scaling=rope_scaling,
@@ -84,7 +80,7 @@ class HybridSWACompressedMTPLayer(nn.Module):
             mlp_tp_rank, mlp_tp_size = 0, 1
         else:
             mlp_tp_rank, mlp_tp_size = None, None
-        self.mlp = HybridSWACompressedMLP(
+        self.mlp = MiMoV2FlashMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -140,7 +136,7 @@ class HybridSWACompressedMTPLayer(nn.Module):
         return hidden_states, residual
 
 
-class HybridSWACompressedModelNextN(nn.Module):
+class MiMoV2FlashModelNextN(nn.Module):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -148,11 +144,6 @@ class HybridSWACompressedModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.warning(
-                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
-            )
-            quant_config = None
 
         self.vocab_size = config.vocab_size
 
@@ -168,7 +159,7 @@ class HybridSWACompressedModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.mtp_block = HybridSWACompressedMTPLayer(
+        self.mtp_block = MiMoV2FlashMTPLayer(
             config,
             0,
             quant_config=quant_config,
@@ -213,7 +204,7 @@ class HybridSWACompressedModelNextN(nn.Module):
         return hidden_states
 
 
-class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
+class MiMoV2FlashForCausalLMNextN(MiMoV2FlashForCausalLM):
 
     def __init__(
         self,
@@ -225,9 +216,8 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        # self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
 
-        self.model = HybridSWACompressedModelNextN(
+        self.model = MiMoV2FlashModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -278,12 +268,7 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
             name = self.map_model_name_to_mtp_param_name(name)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if (
-                    "compression_attention" in name
-                    or "hybrid_softmax_attention" in name
-                    or "compressed_softmax_attn" in name
-                ):
-                    continue
+
                 if weight_name not in name:
                     continue
                 if "mtp_block" not in name:
@@ -325,6 +310,9 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import re
 
+        if "pre_mlp_layernorm" in name:
+            name = name.replace("pre_mlp_layernorm", "post_attention_layernorm")
+
         name_without_prefix = [
             "enorm",
             "hnorm",
@@ -332,10 +320,6 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
             "final_layernorm",
         ]
         pattern = r"model.mtp.layers.(\d+)."
-        pattern_norm = r"pre_mlp_layernorm"
-        group_norm = re.search(pattern_norm, name)
-        if group_norm is not None:
-            name = name.replace(group_norm.group(), "post_attention_layernorm")
         group = re.match(pattern, name)
         if group is not None:
             for sub_name in name_without_prefix:
@@ -357,4 +341,4 @@ class HybridSWACompressedForCausalLMNextN(HybridSWACompressedForCausalLM):
         torch.cuda.synchronize()
 
 
-EntryClass = HybridSWACompressedForCausalLMNextN
+EntryClass = MiMoV2FlashForCausalLMNextN
