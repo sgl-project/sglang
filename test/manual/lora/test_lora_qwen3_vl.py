@@ -2,7 +2,7 @@ import random
 import unittest
 from typing import Sequence
 
-from utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase, ensure_reproducibility
+from lora_utils import TORCH_DTYPES, LoRAAdaptor, LoRAModelCase, ensure_reproducibility
 
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
