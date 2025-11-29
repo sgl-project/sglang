@@ -34,7 +34,7 @@ class AscendMemCacheStore(HiCacheStorage):
             logger.error("Import Ascend MemCache failed: %s", e)
             raise ImportError(
                 "Please install ascend memcache by following the instructions at "
-                "https://gitee.com/ascend/memfabric_hybrid/blob/br_A3_shm_bm_630_develop/README.md "
+                "https://gitcode.com/Ascend/memcache/blob/develop/README.md"
                 "to run SGLang with MemCache."
             ) from e
 
