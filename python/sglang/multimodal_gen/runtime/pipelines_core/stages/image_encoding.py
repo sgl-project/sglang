@@ -236,13 +236,22 @@ class ImageVAEEncodingStage(PipelineStage):
         vae_arch_config = server_args.pipeline_config.vae_config.arch_config
         spatial_compression_ratio = getattr(
             vae_arch_config, "spatial_compression_ratio", None
-        ) or getattr(self.vae, "spatial_compression_ratio")
+        )
+        if spatial_compression_ratio is None or spatial_compression_ratio <= 0:
+            raise ValueError(
+                "VAE arch config must define a positive `spatial_compression_ratio`"
+            )
+
         temporal_compression_ratio = getattr(
             vae_arch_config, "temporal_compression_ratio", None
         )
-        if temporal_compression_ratio is None:
+        if temporal_compression_ratio in (None, 0):
             temporal_compression_ratio = getattr(
-                self.vae, "temporal_compression_ratio", 1
+                vae_arch_config, "scale_factor_temporal", None
+            )
+        if temporal_compression_ratio is None or temporal_compression_ratio <= 0:
+            raise ValueError(
+                "VAE arch config must define a positive `temporal_compression_ratio` or `scale_factor_temporal`"
             )
 
         image = batch.condition_image
