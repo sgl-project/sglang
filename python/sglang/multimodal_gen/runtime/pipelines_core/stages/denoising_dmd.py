@@ -1,5 +1,3 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 import time
 
 import torch
@@ -28,6 +26,77 @@ class DmdDenoisingStage(DenoisingStage):
     def __init__(self, transformer, scheduler) -> None:
         super().__init__(transformer, scheduler)
         self.scheduler = FlowMatchEulerDiscreteScheduler(shift=8.0)
+
+    def _warmup(
+        self,
+        batch,
+        server_args,
+        latents,
+        first_timestep,
+        target_dtype,
+        autocast_enabled,
+        image_kwargs,
+        pos_cond_kwargs,
+        prompt_embeds,
+    ):
+        logger.info("Performing 1-step warmup")
+        # Expand latents for I2V
+
+        noise_latents = latents.clone()
+        latent_model_input = latents.to(target_dtype)
+
+        if batch.image_latent is not None:
+            latent_model_input = torch.cat(
+                [
+                    latent_model_input,
+                    batch.image_latent.permute(0, 2, 1, 3, 4),
+                ],
+                dim=2,
+            ).to(target_dtype)
+        assert not torch.isnan(
+            latent_model_input
+        ).any(), "latent_model_input contains nan"
+
+        # Prepare inputs for transformer
+        t_expand = first_timestep.repeat(latent_model_input.shape[0])
+
+        guidance_expand = self.get_or_build_guidance(
+            latent_model_input.shape[0],
+            target_dtype,
+            get_local_torch_device(),
+        )
+
+        # Predict noise residual
+        with torch.autocast(
+            device_type="cuda",
+            dtype=target_dtype,
+            enabled=autocast_enabled,
+        ):
+            attn_metadata = self._build_attn_metadata(0, batch, server_args)
+
+            batch.is_cfg_negative = False
+            with set_forward_context(
+                current_timestep=0,
+                attn_metadata=attn_metadata,
+                forward_batch=batch,
+            ):
+                # Run transformer
+                pred_noise = self.transformer(
+                    latent_model_input.permute(0, 2, 1, 3, 4),
+                    prompt_embeds,
+                    t_expand,
+                    guidance=guidance_expand,
+                    **image_kwargs,
+                    **pos_cond_kwargs,
+                ).permute(0, 2, 1, 3, 4)
+
+            _ = pred_noise_to_pred_video(
+                pred_noise=pred_noise.flatten(0, 1),
+                noise_input_latent=noise_latents.flatten(0, 1),
+                timestep=t_expand,
+                scheduler=self.scheduler,
+            ).unflatten(0, pred_noise.shape[:2])
+        logger.info("Warmup done.")
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         # 1. to shard latents (B, C, T, H, W) along dim 2
@@ -89,6 +158,20 @@ class DmdDenoisingStage(DenoisingStage):
 
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
         prompt_embeds = prepared_vars["prompt_embeds"]
+
+        # Warmup
+        if server_args.enable_warmup:
+            self._warmup(
+                batch,
+                server_args,
+                latents,
+                timesteps,
+                target_dtype,
+                autocast_enabled,
+                image_kwargs,
+                pos_cond_kwargs,
+                prompt_embeds,
+            )
 
         denoising_loop_start_time = time.time()
         self.start_profile(batch=batch)

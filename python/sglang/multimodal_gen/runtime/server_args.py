@@ -277,6 +277,7 @@ class ServerArgs:
 
     # Compilation
     enable_torch_compile: bool = False
+    enable_warmup: bool = False
 
     disable_autocast: bool = False
 
@@ -542,6 +543,12 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+        parser.add_argument(
+            "--enable-warmup",
+            action=StoreBoolean,
+            default=ServerArgs.enable_warmup,
+            help="Enable denoising stage warmup for the model.",
         )
 
         parser.add_argument(
