@@ -85,29 +85,39 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
-                # Pad K dimension before shuffle if alignment is specified
-                # shuffle_weight requires K % 32 == 0
+                # Pad K and N dimensions before shuffle if alignment is specified
+                # shuffle_weight requires BOTH K % 32 == 0 AND N % 32 == 0
                 pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
                 if pad_k_align and pad_k_align.isdigit():
                     k_align = int(pad_k_align)
                     # Ensure alignment is at least 32 (required by shuffle_weight)
                     k_align = max(k_align, 32)
+                    
+                    # Pad K dimension (shape[0])
                     k = weight.shape[0]
                     k_aligned = ceil_align(k, k_align)
                     
-                    print(f"[DEBUG] Linear weight padding: k={k}, k_aligned={k_aligned}, k%32={k%32}, will_pad={k_aligned != k}")
+                    # Pad N dimension (shape[1]) - also needs to be aligned!
+                    n = weight.shape[1]
+                    n_aligned = ceil_align(n, k_align)
                     
-                    if k_aligned != k:
-                        # Pad weight: (k, n) -> (k_aligned, n)
-                        weight = torch.nn.functional.pad(weight, (0, 0, 0, k_aligned - k))
-                        print(f"[DEBUG] Padded weight from {k} to {k_aligned}, new shape: {weight.shape}")
-                        # Pad weight_scale: (k, 1) -> (k_aligned, 1)
+                    print(f"[DEBUG] Linear weight padding: k={k}, n={n}, k_aligned={k_aligned}, n_aligned={n_aligned}")
+                    print(f"[DEBUG] k%32={k%32}, n%32={n%32}, will_pad_k={k_aligned != k}, will_pad_n={n_aligned != n}")
+                    
+                    need_padding = (k_aligned != k) or (n_aligned != n)
+                    if need_padding:
+                        # Pad weight: (k, n) -> (k_aligned, n_aligned)
+                        weight = torch.nn.functional.pad(weight, (0, n_aligned - n, 0, k_aligned - k))
+                        print(f"[DEBUG] Padded weight from ({k}, {n}) to ({k_aligned}, {n_aligned}), new shape: {weight.shape}")
+                        
+                        # Pad weight_scale if needed
+                        # weight_scale is (k, 1) for channel-wise, pad K dimension
                         if weight_scale.shape[0] == k and len(weight_scale.shape) == 2:
                             weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, k_aligned - k))
                 else:
                     print(f"[DEBUG] SGLANG_AITER_PAD_K not set or invalid: '{pad_k_align}', weight.shape={weight.shape}")
                 
-                print(f"[DEBUG] About to shuffle_weight with shape {weight.shape}, K%32={weight.shape[0]%32}")
+                print(f"[DEBUG] About to shuffle_weight with shape {weight.shape}, K%32={weight.shape[0]%32}, N%32={weight.shape[1]%32}")
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
                 )

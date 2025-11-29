@@ -760,10 +760,11 @@ def apply_fp8_linear(
             # w_scale -> weight scale tensor, shape = (n ,1)
             # dtype -> output dtype
             
-            # Note: Weight K dimension padding is done during model loading in
+            # Note: Weight K and N dimensions are padded during model loading in
             # compressed_tensors_w8a8_fp8.py before shuffle_weight is called.
-            # We only need to pad input here if needed.
+            # We only need to pad input K dimension here if needed, and unpad output N dimension.
             pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+            original_n = weight.shape[1]  # Save original N before any operations
             if pad_k_align and pad_k_align.isdigit():
                 k_align = int(pad_k_align)
                 # Weight is already padded during loading, check if input needs padding
@@ -780,6 +781,12 @@ def apply_fp8_linear(
                 w_scale=weight_scale,
                 dtype=input.dtype,
             )
+            
+            # Unpad output N dimension if weight was padded during loading
+            if pad_k_align and pad_k_align.isdigit():
+                if output.shape[1] > original_n:
+                    output = output[:, :original_n]
+            
             if bias is not None:
                 output += bias
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)
