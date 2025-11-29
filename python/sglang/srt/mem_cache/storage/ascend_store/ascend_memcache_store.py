@@ -29,12 +29,12 @@ class MmcDirect(Enum):
 class AscendMemCacheStore(HiCacheStorage):
     def __init__(self, storage_config: HiCacheStorageConfig):
         try:
-            from memcache import DistributedObjectStore
+            from memcache_hybrid import DistributedObjectStore
         except ImportError as e:
             logger.error("Import Ascend MemCache failed: %s", e)
             raise ImportError(
-                "Please install ascend memcache by following the instructions at "
-                "https://gitee.com/ascend/memfabric_hybrid/blob/br_A3_shm_bm_630_develop/README.md "
+                "Please install ascend memcache_hybrid by following the instructions at "
+                "https://gitcode.com/Ascend/memcache/blob/master/doc/build.md "
                 "to run SGLang with MemCache."
             ) from e
 
