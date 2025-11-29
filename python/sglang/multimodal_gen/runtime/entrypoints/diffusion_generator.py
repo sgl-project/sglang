@@ -253,16 +253,14 @@ class DiffGenerator:
         )
 
         # Extract diffusers_kwargs if passed
-        diffusers_kwargs = kwargs.pop("diffusers_kwargs", None)
+        diffusers_kwargs = sampling_params_kwargs.pop("diffusers_kwargs", None)
 
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
             sampling_params.prompt = p
-            requests.append(
-                prepare_request(
-                    server_args=self.server_args,
-                    sampling_params=sampling_params,
-                )
+            req = prepare_request(
+                server_args=self.server_args,
+                sampling_params=sampling_params,
             )
             # Add diffusers_kwargs to request's extra dict
             if diffusers_kwargs:

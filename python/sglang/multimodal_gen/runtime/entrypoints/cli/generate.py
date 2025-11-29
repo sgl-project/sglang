@@ -130,7 +130,7 @@ def generate_cmd(args: argparse.Namespace):
         **extra_kwargs,
     )
 
-    prompt = sampling_params_kwargs.get("prompt", None)
+    prompt = sampling_params.prompt
     maybe_dump_performance(args, server_args, prompt, results)
 
 
