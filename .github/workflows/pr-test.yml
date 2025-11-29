@@ -1,8 +1,8 @@
 name: PR Test
 
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '0 */3 * * *'  # Run every 3 hours
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -25,9 +25,9 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
-      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -35,6 +35,7 @@ jobs:
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
+        if: github.event_name != 'schedule'
         with:
           filters: |
             main_package:
@@ -51,6 +52,14 @@ jobs:
               - "python/*.toml"
               - ".github/workflows/pr-test.yml"
 
+      - name: Set all changes to true for scheduled runs
+        id: scheduled
+        if: github.event_name == 'schedule'
+        run: |
+          echo "main_package=true" >> $GITHUB_OUTPUT
+          echo "sgl_kernel=false" >> $GITHUB_OUTPUT
+          echo "multimodal_gen=true" >> $GITHUB_OUTPUT
+
       - name: Show filter results in summary (table)
         run: |
           {
@@ -58,9 +67,9 @@ jobs:
             echo ""
             echo "| Component       | Changed |"
             echo "|----------------|---------|"
-            echo "| main_package   | ${{ steps.filter.outputs.main_package }} |"
-            echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel }} |"
-            echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen }} |"
+            echo "| main_package   | ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }} |"
+            echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }} |"
+            echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }} |"
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================== PR Gate ====================================================
