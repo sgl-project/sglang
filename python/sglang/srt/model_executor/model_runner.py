@@ -124,9 +124,13 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.npu_compile_model_runner import NPUCompileModelRunner
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
+)
+from sglang.srt.model_executor.piecewise_npu_graph_runner_decode import (
+    PiecewiseNPUGraphRunnerDecode,
 )
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
@@ -391,6 +395,17 @@ class ModelRunner:
         else:
             self.piecewise_cuda_graph_runner = None
 
+        if _is_npu and (
+            not self.server_args.disable_cuda_graph
+            and self.server_args.enable_torch_compile
+            and not self.model_config.attention_arch == AttentionArch.MLA
+        ):
+            log_info_on_rank0(
+                logger,
+                "Disable torch compile for NPU graph because attention architecture is not suitable",
+            )
+            self.server_args.enable_torch_compile = False
+
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
@@ -532,6 +547,7 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_device_graphs()
+
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
             self.init_device_graphs()
@@ -2144,10 +2160,17 @@ class ModelRunner:
             # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
             return
 
-        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
+        if self.device not in ["cpu", "npu"] and self.server_args.disable_cuda_graph:
             return
 
-        if self.device != "cpu" and self.server_args.disable_cuda_graph:
+        if (
+            self.device == "npu"
+            and self.server_args.disable_cuda_graph
+            and not self.server_args.enable_torch_compile
+        ):
+            return
+
+        if self.server_args.model_impl.lower() == ModelImpl.MINDSPORE:
             return
 
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
@@ -2158,11 +2181,20 @@ class ModelRunner:
         logger.info(
             f"Capture {'cpu graph' if self.device == 'cpu' else 'cuda graph'} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
+
         graph_runners = defaultdict(
             lambda: CudaGraphRunner,
             {
                 "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
+                "npu": (
+                    PiecewiseNPUGraphRunnerDecode
+                    if self.server_args.enable_piecewise_npu_graph_decode
+                    else (
+                        NPUCompileModelRunner
+                        if self.server_args.disable_cuda_graph
+                        else NPUGraphRunner
+                    )
+                ),
             },
         )
         self.graph_runner = graph_runners[self.device](self)
