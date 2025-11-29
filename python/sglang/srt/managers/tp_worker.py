@@ -43,6 +43,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils.common import log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -283,24 +284,22 @@ class TpModelWorker(BaseTpWorker):
         token_pool_size = self.model_runner.req_to_token_pool.size
         if server_args.max_running_requests is None:
             running_limit = self.max_total_num_tokens // 2
-            logger.info(
-                "max_running_requests: no arg, using total_tokens//2 = %s", running_limit
+            log_info_on_rank0(
+                logger,
+                f"max_running_requests: no arg, using total_tokens//2 = {running_limit}",
             )
         else:
             dp_divisor = server_args.dp_size if server_args.enable_dp_attention else 1
             running_limit = server_args.max_running_requests // dp_divisor
-            logger.info(
-                "max_running_requests: arg=%s // dp_divisor=%s = %s",
-                server_args.max_running_requests,
-                dp_divisor,
-                running_limit,
+            log_info_on_rank0(
+                logger,
+                f"max_running_requests: arg={server_args.max_running_requests} // dp_divisor={dp_divisor} = {running_limit}",
             )
         self.max_running_requests = min(running_limit, token_pool_size)
         if self.max_running_requests < running_limit:
-            logger.info(
-                "max_running_requests: clamped by token_pool_size %s -> %s",
-                running_limit,
-                self.max_running_requests,
+            log_info_on_rank0(
+                logger,
+                f"max_running_requests: clamped by token_pool_size {running_limit} -> {self.max_running_requests}",
             )
 
         assert self.max_running_requests > 0, "max_running_request is zero"
@@ -314,16 +313,14 @@ class TpModelWorker(BaseTpWorker):
         memory_limit = self.max_total_num_tokens - 1
         self.max_req_len = min(context_limit, memory_limit)
         if context_limit <= memory_limit:
-            logger.info(
-                "max_req_len: limited by context_len (%s - 1 = %s)",
-                self.model_config.context_len,
-                self.max_req_len,
+            log_info_on_rank0(
+                logger,
+                f"max_req_len: limited by context_len ({self.model_config.context_len} - 1 = {self.max_req_len})",
             )
         else:
-            logger.info(
-                "max_req_len: limited by memory (%s - 1 = %s)",
-                self.max_total_num_tokens,
-                self.max_req_len,
+            log_info_on_rank0(
+                logger,
+                f"max_req_len: limited by memory ({self.max_total_num_tokens} - 1 = {self.max_req_len})",
             )
 
         self.max_req_input_len = self.max_req_len - 5
@@ -377,24 +374,18 @@ class TpModelWorker(BaseTpWorker):
         token_pool = self.model_runner.req_to_token_pool
         kv_pool = self.model_runner.token_to_kv_pool
 
-        logger.info(
-            "Capacity: total_tokens=%s max_req_len=%s max_running=%s "
-            "token_pool=%s(ctx=%s) kv_pool=%s sliding_window=%s",
-            self.max_total_num_tokens,
-            self.max_req_len,
-            self.max_running_requests,
-            token_pool.size,
-            token_pool.max_context_len,
-            kv_pool.size,
-            self.model_runner.sliding_window_size,
+        log_info_on_rank0(
+            logger,
+            f"Capacity: total_tokens={self.max_total_num_tokens} max_req_len={self.max_req_len} "
+            f"max_running={self.max_running_requests} token_pool={token_pool.size}(ctx={token_pool.max_context_len}) "
+            f"kv_pool={kv_pool.size} sliding_window={self.model_runner.sliding_window_size}",
         )
 
         if server_args.enable_dp_attention:
             dp_rank_display = dp_rank if dp_rank is not None else 0
-            logger.info(
-                "DP attention: dp_rank=%s/%s",
-                dp_rank_display,
-                server_args.dp_size,
+            log_info_on_rank0(
+                logger,
+                f"DP attention: dp_rank={dp_rank_display}/{server_args.dp_size}",
             )
 
     def forward_batch_generation(
