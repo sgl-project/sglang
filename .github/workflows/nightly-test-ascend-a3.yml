@@ -4,10 +4,12 @@ on:
   schedule:
       # Run test at 24:00 Beijing time (UTC+8)
       - cron: "0 0 * * *"
-  workflow_dispatch:
   pull_request: 
     branches:
       - 'main'
+    paths:
+      - ".github/workflows/nightly-test-ascend-a3.yml"
+  workflow_dispatch:
 
 concurrency:
   group: ascend-nightly-${{ github.ref }}-a3
@@ -62,7 +64,6 @@ jobs:
       matrix:
         test_config:
           - name: deepep_deepseek_r1_single_1
-            os: linux-aarch64-a3-4
             test_case: ${GITHUB_WORKSPACE}/test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
     uses: ./.github/workflows/nightly-test-ascend-single-node.yml
     with:
