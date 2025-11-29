@@ -16,7 +16,6 @@ class ZImageSamplingParams(SamplingParams):
     # height: int = 720
     # width: int = 1280
     # fps: int = 24
-    num_inference_steps: int = 9
 
     guidance_scale: float = 0.0
 
