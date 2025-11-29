@@ -32,7 +32,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-ascend-multi-node.yml
     with:
       soc_version: a3
-      runner: linux-aarch64-a3-0
+      runner: linux-amd64-cpu-0
       image: 'swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main'
       test_config_name: ${{ matrix.test_config.name }}
       prefill_size: ${{ matrix.test_config.prefill_size }}
