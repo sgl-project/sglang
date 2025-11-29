@@ -180,7 +180,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         **pos_cond_kwargs,
                     )
                 current_start_frame += 1
-                remaining_frames = input_frames - 1
+                input_frames -= 1
             else:
                 remaining_frames = input_frames
 

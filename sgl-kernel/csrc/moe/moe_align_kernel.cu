@@ -347,7 +347,8 @@ void moe_align_block_size(
           num_experts,
           block_size,
           topk_ids.numel(),
-          pad_sorted_token_ids);
+          pad_sorted_token_ids,
+          max_num_tokens_padded);
     } else {
       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
@@ -363,7 +364,8 @@ void moe_align_block_size(
           topk_ids.numel(),
           cumsum_buffer.data_ptr<int32_t>(),
           pad_sorted_token_ids,
-          scan_size);
+          scan_size,
+          max_num_tokens_padded);
 
       const int block_threads = std::min(256, (int)threads);
       const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
