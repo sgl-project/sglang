@@ -1,4 +1,4 @@
-name: Lint
+name: Auto tune
 
 on:
   workflow_dispatch:
