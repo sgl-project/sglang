@@ -11,6 +11,7 @@ __all__ = [
     "register_cpu_ci",
     "register_cuda_ci",
     "register_amd_ci",
+    "register_npu_ci",
     "ut_parse_one_file",
 ]
 
