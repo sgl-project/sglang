@@ -93,16 +93,17 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     # Ensure alignment is at least 32 (required by shuffle_weight)
                     k_align = max(k_align, 32)
                     
-                    # Pad K dimension (shape[0])
+                    # Pad K dimension to user-specified alignment (for GEMM + shuffle)
                     k = weight.shape[0]
                     k_aligned = ceil_align(k, k_align)
                     
-                    # Pad N dimension (shape[1]) - also needs to be aligned!
+                    # Pad N dimension to 32 only (minimum for shuffle_weight)
+                    # N doesn't affect GEMM kernel requirements, so use minimal padding
                     n = weight.shape[1]
-                    n_aligned = ceil_align(n, k_align)
+                    n_aligned = ceil_align(n, 32)
                     
                     print(f"[DEBUG] Linear weight padding: k={k}, n={n}, k_aligned={k_aligned}, n_aligned={n_aligned}")
-                    print(f"[DEBUG] k%32={k%32}, n%32={n%32}, will_pad_k={k_aligned != k}, will_pad_n={n_aligned != n}")
+                    print(f"[DEBUG] k%{k_align}={k%k_align}, n%32={n%32}, will_pad_k={k_aligned != k}, will_pad_n={n_aligned != n}")
                     
                     need_padding = (k_aligned != k) or (n_aligned != n)
                     if need_padding:
