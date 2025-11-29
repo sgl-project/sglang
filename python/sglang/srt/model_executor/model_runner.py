@@ -1637,7 +1637,7 @@ class ModelRunner:
     def init_memory_pool(
         self,
         total_gpu_memory: int,
-        max_num_reqs: Optional[int] = None,
+        max_running_requests: Optional[int] = None,
         max_total_tokens: Optional[int] = None,
     ):
         # Determine the kv cache dtype
@@ -1686,16 +1686,19 @@ class ModelRunner:
         if SGLANG_CI_SMALL_KV_SIZE:
             self.max_total_num_tokens = int(SGLANG_CI_SMALL_KV_SIZE)
 
-        if max_num_reqs is None:
-            max_num_reqs = min(
-                max(
-                    int(
-                        self.max_total_num_tokens / self.model_config.context_len * 512
-                    ),
-                    2048,
-                ),
-                4096,
+        if max_running_requests is None:
+            heuristic = int(
+                self.max_total_num_tokens / self.model_config.context_len * 512
             )
+            max_running_requests = min(max(heuristic, 2048), 4096)
+            logger.info(
+                "max_running_requests not set, using heuristic: "
+                "min(max(%s, 2048), 4096) = %s",
+                heuristic,
+                max_running_requests,
+            )
+        else:
+            logger.info("max_running_requests from arg: %s", max_running_requests)
 
         if self.mambaish_config is not None:
             ratio = (
@@ -1703,32 +1706,32 @@ class ModelRunner:
                 if not self.server_args.disable_radix_cache
                 else 1
             )
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+            max_running_requests = min(
+                max_running_requests, self.server_args.max_mamba_cache_size // ratio
             )
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                max_num_reqs = self.server_args.max_num_reqs
+                max_running_requests = self.server_args.max_num_reqs
             else:
                 # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
                 # can be concurrently allocated, so we should give a headroom for it.
                 self.server_args.draft_runner_cache_size = (
                     self.max_total_num_tokens
                     # draft
-                    + max_num_reqs
+                    + max_running_requests
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
+                    + max_running_requests * self.server_args.speculative_num_draft_tokens
                     # buffer
                     + 100
                 )
                 # Target worker and draft worker shares the same indices for the
                 # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
                 self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-                self.server_args.max_num_reqs = max_num_reqs
+                self.server_args.max_num_reqs = max_running_requests
 
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
@@ -1778,11 +1781,11 @@ class ModelRunner:
                 )
 
                 # subscribe memory for pre-allocated requests
-                # if max_num_reqs <= 32, we pre-allocate 2x requests
-                pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else 0
+                # if max_running_requests <= 32, we pre-allocate 2x requests
+                pre_alloc_size = max_running_requests * 2 if max_running_requests <= 32 else 0
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
-                        size=max_num_reqs,
+                        size=max_running_requests,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
                         device=self.device,
@@ -1793,7 +1796,7 @@ class ModelRunner:
                     )
                 else:
                     self.req_to_token_pool = DecodeReqToTokenPool(
-                        size=max_num_reqs,
+                        size=max_running_requests,
                         max_context_len=self.model_config.context_len
                         + extra_max_context_len,
                         device=self.device,
@@ -1802,7 +1805,7 @@ class ModelRunner:
                     )
             elif config := self.mambaish_config:
                 self.req_to_token_pool = HybridReqToTokenPool(
-                    size=max_num_reqs,
+                    size=max_running_requests,
                     mamba_size=self.server_args.max_mamba_cache_size,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
@@ -1813,7 +1816,7 @@ class ModelRunner:
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
+                    size=max_running_requests,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,
