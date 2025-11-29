@@ -4,26 +4,25 @@ import os
 import random
 import subprocess
 
-from sglang.srt.utils import is_npu, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
 )
 
 
 class TestVLMModels(CustomTestCase):
     model = ""
-    mem_fraction_static = 0.35
+    mmmu_accuracy = 0.00
     other_args = [
         "--trust-remote-code",
         "--cuda-graph-max-bs",
         "32",
         "--enable-multimodal",
         "--mem-fraction-static",
-        self.mem_fraction_static,
+        0.35,
         "--log-level",
         log_level,
         "--attention-backend",
@@ -137,11 +136,11 @@ class TestVLMModels(CustomTestCase):
                 stderr_file = open("/tmp/server_stderr.log", "w")
 
             process = popen_launch_server(
-                cls.model,
+                self.model,
                 base_url=self.base_url,
                 timeout=self.time_out,
                 api_key=self.api_key,
-                other_args=cls.other_args,
+                other_args=self.other_args,
                 env=process_env,
                 return_stdout_stderr=(
                     (stdout_file, stderr_file) if capture_output else None
@@ -149,7 +148,7 @@ class TestVLMModels(CustomTestCase):
             )
 
             # Run evaluation
-            self.run_mmmu_eval(cls.model, output_path, limit)
+            self.run_mmmu_eval(self.model, output_path, limit)
 
             # Get the result file
             result_file_path = glob.glob(f"{output_path}/*.json")[0]
@@ -161,7 +160,7 @@ class TestVLMModels(CustomTestCase):
             # Process the result
             mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
             print(
-                f"Model {model.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}"
+                f"Model {self.model} achieved accuracy{test_name}: {mmmu_accuracy:.4f}"
             )
 
             # Capture server output if requested
@@ -171,7 +170,7 @@ class TestVLMModels(CustomTestCase):
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
                 mmmu_accuracy,
-                model.mmmu_accuracy,
+                self.mmmu_accuracy,
                 f"Model {model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({model.mmmu_accuracy:.4f}){test_name}",
             )
 
