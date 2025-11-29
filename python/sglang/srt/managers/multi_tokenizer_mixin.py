@@ -505,3 +505,6 @@ class SenderWrapper:
         if isinstance(obj, BaseReq):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
         self.send_to_scheduler.send_pyobj(obj)
+
+    def send_multipart(self, parts):
+        self.send_to_scheduler.send_multipart(parts)
