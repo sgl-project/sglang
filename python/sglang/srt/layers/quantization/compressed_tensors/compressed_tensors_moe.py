@@ -297,8 +297,54 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
             )
 
         if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+            # Pad MoE inter_dim before shuffle if alignment is specified
+            # This is the ONLY place we pad MoE weights (during loading, not forward pass)
+            pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+            if pad_k_align and pad_k_align.isdigit():
+                k_align = int(pad_k_align)
+                k_align = max(k_align, 32)  # Ensure alignment is at least 32 for shuffle_weight
+                
+                inter_dim = layer.w2_weight.shape[2]
+                inter_dim_aligned = ceil_align(inter_dim, k_align)
+                
+                if inter_dim_aligned != inter_dim:
+                    # Pad w2_weight: [E, model_dim, inter_dim] -> [E, model_dim, inter_dim_aligned]
+                    layer.w2_weight = torch.nn.Parameter(
+                        torch.nn.functional.pad(layer.w2_weight, (0, inter_dim_aligned - inter_dim)),
+                        requires_grad=False
+                    )
+                    
+                    # Pad w13_weight: [E, inter_dim or inter_dim*2, model_dim]
+                    is_gated = layer.w13_weight.shape[1] == inter_dim * 2
+                    if is_gated:
+                        pad_sizes = [0, 0, 0, inter_dim_aligned * 2 - inter_dim * 2, 0, 0]
+                    else:
+                        pad_sizes = [0, 0, 0, inter_dim_aligned - inter_dim, 0, 0]
+                    layer.w13_weight = torch.nn.Parameter(
+                        torch.nn.functional.pad(layer.w13_weight, pad_sizes),
+                        requires_grad=False
+                    )
+                    
+                    # Pad scales if they exist
+                    if layer.w13_weight_scale.shape[1] == inter_dim * 2:
+                        layer.w13_weight_scale = torch.nn.Parameter(
+                            torch.nn.functional.pad(layer.w13_weight_scale, (0, 0, 0, inter_dim_aligned * 2 - inter_dim * 2, 0, 0)),
+                            requires_grad=False
+                        )
+                    elif layer.w13_weight_scale.shape[1] == inter_dim:
+                        layer.w13_weight_scale = torch.nn.Parameter(
+                            torch.nn.functional.pad(layer.w13_weight_scale, (0, 0, 0, inter_dim_aligned - inter_dim, 0, 0)),
+                            requires_grad=False
+                        )
+                    
+                    if layer.w2_weight_scale.shape[1] == inter_dim:
+                        layer.w2_weight_scale = torch.nn.Parameter(
+                            torch.nn.functional.pad(layer.w2_weight_scale, (0, 0, 0, inter_dim_aligned - inter_dim, 0, 0)),
+                            requires_grad=False
+                        )
+            
             with torch.no_grad():
-                # Pre-shuffle weights
+                # Pre-shuffle weights (already padded if needed)
                 layer.w13_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w13_weight.data, (16, 16)),
                     requires_grad=False,
@@ -345,63 +391,14 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     topk_weights, dtype=torch.float32
                 )  # topk_weights must be FP32 (float32)
             
-            # Pad MoE inter_dim for certain AITer MoE kernels if alignment is specified
-            # SGLANG_AITER_PAD_K can be set to alignment value (e.g., 128, 256)
-            pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
-            if pad_k_align and pad_k_align.isdigit():
-                k_align = int(pad_k_align)
-                
-                # Get original inter_dim from w2_weight: [E, model_dim, inter_dim]
-                inter_dim = layer.w2_weight.shape[2]
-                inter_dim_aligned = ceil_align(inter_dim, k_align)
-                
-                if inter_dim_aligned != inter_dim:
-                    # Pad w2_weight: [E, model_dim, inter_dim] -> [E, model_dim, inter_dim_aligned]
-                    w2_weight = _pad_moe_weight(layer.w2_weight, dim=2, alignment=k_align)
-                    
-                    # Pad w13_weight: [E, inter_dim or inter_dim*2, model_dim]
-                    # Check if gated (inter_dim*2) and pad accordingly
-                    is_gated = layer.w13_weight.shape[1] == inter_dim * 2
-                    if is_gated:
-                        # For gated MoE, pad to inter_dim_aligned*2
-                        pad_sizes = [0, 0, 0, inter_dim_aligned * 2 - inter_dim * 2, 0, 0]
-                    else:
-                        # For non-gated, pad to inter_dim_aligned
-                        pad_sizes = [0, 0, 0, inter_dim_aligned - inter_dim, 0, 0]
-                    w13_weight = torch.nn.functional.pad(layer.w13_weight, pad_sizes)
-                    
-                    # Pad scales similarly
-                    if layer.w13_weight_scale is not None:
-                        scale_dim = layer.w13_weight_scale.shape[1]
-                        if scale_dim == inter_dim * 2:
-                            pad_sizes = [0, 0, 0, inter_dim_aligned * 2 - inter_dim * 2, 0, 0]
-                        elif scale_dim == inter_dim:
-                            pad_sizes = [0, 0, 0, inter_dim_aligned - inter_dim, 0, 0]
-                        else:
-                            pad_sizes = [0, 0, 0, 0, 0, 0]  # No padding if shape doesn't match
-                        w1_scale = torch.nn.functional.pad(layer.w13_weight_scale, pad_sizes)
-                    else:
-                        w1_scale = None
-                    
-                    if layer.w2_weight_scale is not None:
-                        w2_scale = _pad_moe_weight(layer.w2_weight_scale, dim=1, alignment=k_align)
-                    else:
-                        w2_scale = None
-                else:
-                    w13_weight = layer.w13_weight
-                    w2_weight = layer.w2_weight
-                    w1_scale = layer.w13_weight_scale
-                    w2_scale = layer.w2_weight_scale
-            else:
-                w13_weight = layer.w13_weight
-                w2_weight = layer.w2_weight
-                w1_scale = layer.w13_weight_scale
-                w2_scale = layer.w2_weight_scale
+            # Note: MoE weights are already padded during model loading in
+            # process_weights_after_loading if SGLANG_AITER_PAD_K is set.
+            # No need for forward-pass padding here.
             
             output = fused_moe(
                 x,
-                w13_weight,
-                w2_weight,
+                layer.w13_weight,
+                layer.w2_weight,
                 topk_weights,
                 topk_ids,
                 activation=(
@@ -410,8 +407,8 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                     else ActivationType.Gelu
                 ),
                 quant_type=QuantType.per_Token,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
                 a1_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
             )
