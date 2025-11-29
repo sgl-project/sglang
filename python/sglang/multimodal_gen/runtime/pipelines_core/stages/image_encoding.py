@@ -22,7 +22,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlusPipelineConfig,
-    QwenImagePipelineConfig,
     _pack_latents,
     qwen_image_postprocess_text,
 )
@@ -120,8 +119,10 @@ class ImageEncodingStage(PipelineStage):
         )
 
         # Prepare kwargs for image processor
-        image_processor_kwargs = server_args.pipeline_config.prepare_image_processor_kwargs(
-            batch.prompt, image
+        image_processor_kwargs = (
+            server_args.pipeline_config.prepare_image_processor_kwargs(
+                batch.prompt, image
+            )
         )
 
         image_inputs = self.image_processor(
@@ -140,8 +141,10 @@ class ImageEncodingStage(PipelineStage):
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
             # Prepare kwargs for negative prompt
-            neg_image_processor_kwargs = server_args.pipeline_config.prepare_image_processor_kwargs(
-                batch.negative_prompt, image
+            neg_image_processor_kwargs = (
+                server_args.pipeline_config.prepare_image_processor_kwargs(
+                    batch.negative_prompt, image
+                )
             )
 
             neg_image_inputs = self.image_processor(
@@ -277,19 +280,13 @@ class ImageVAEEncodingStage(PipelineStage):
         if isinstance(server_args.pipeline_config, QwenImageEditPlusPipelineConfig):
             all_image_latents = []
             for latent in latent_condition:
-                if (
-                    batch_size > latent.shape[0]
-                    and batch_size % latent.shape[0] == 0
-                ):
+                if batch_size > latent.shape[0] and batch_size % latent.shape[0] == 0:
                     # expand init_latents for batch_size
                     additional_image_per_prompt = batch_size // latent.shape[0]
                     image_latents = torch.cat(
                         [latent] * additional_image_per_prompt, dim=0
                     )
-                elif (
-                    batch_size > latent.shape[0]
-                    and batch_size % latent.shape[0] != 0
-                ):
+                elif batch_size > latent.shape[0] and batch_size % latent.shape[0] != 0:
                     raise ValueError(
                         f"Cannot duplicate `image` of batch size {latent.shape[0]} to {batch_size} text prompts."
                     )
@@ -297,7 +294,8 @@ class ImageVAEEncodingStage(PipelineStage):
                     image_latents = torch.cat([latent], dim=0)
                 image_latent_height, image_latent_width = image_latents.shape[3:]
                 num_channels_latents = (
-                    self.server_args.pipeline_config.dit_config.arch_config.in_channels // 4
+                    self.server_args.pipeline_config.dit_config.arch_config.in_channels
+                    // 4
                 )
                 image_latents = _pack_latents(
                     image_latents,

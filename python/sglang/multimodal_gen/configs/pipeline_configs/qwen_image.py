@@ -158,7 +158,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     def prepare_image_processor_kwargs(self, prompt: str | None, image) -> dict:
         if not prompt:
             return {}
-        
+
         prompt_template_encode = (
             "<|im_start|>system\nDescribe the key features of the input image "
             "(color, shape, size, texture, objects, background), then explain how "
@@ -170,7 +170,6 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         )
         txt = prompt_template_encode.format(prompt)
         return dict(text=[txt], padding=True)
-
 
     def _prepare_cond_kwargs(self, batch, prompt_embeds, rotary_emb, device, dtype):
         batch_size = prompt_embeds[0].shape[0]
@@ -329,7 +328,7 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             return {}
 
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
-        
+
         prompt_template_encode = (
             "<|im_start|>system\nDescribe the key features of the input image "
             "(color, shape, size, texture, objects, background), then explain how "
@@ -339,9 +338,7 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             "<|im_start|>user\n{}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
-        img_prompt_template = (
-            "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
-        )
+        img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
         if isinstance(image, list):
             base_img_prompt = ""
             for i, img in enumerate(image):
@@ -350,9 +347,7 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
             base_img_prompt = img_prompt_template.format(1)
         else:
             base_img_prompt = ""
-        txt = [
-            prompt_template_encode.format(base_img_prompt + p) for p in prompt_list
-        ]
+        txt = [prompt_template_encode.format(base_img_prompt + p) for p in prompt_list]
         return dict(text=txt, padding=True)
 
     def preprocess_image(self, image, image_processor):
