@@ -49,6 +49,7 @@ from sglang.srt.utils.common import (
     is_sm120_supported,
     next_power_of_2,
 )
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -127,7 +128,7 @@ def _sglang_fp4_gemm_fake(
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 
-    @torch.library.register_fake("sgl_kernel::scaled_fp4_quant")
+    @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
     def _sgl_kernel_scaled_fp4_quant_fake(
         output, input, output_scale, input_global_scale
     ):
@@ -139,9 +140,7 @@ CUTEDSL_MOE_SCALAR_INPUT_SCALE = get_bool_env_var(
 )
 
 # TODO make it true by default when the DeepEP PR is merged
-CUTEDSL_MOE_NVFP4_DISPATCH = get_bool_env_var(
-    "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "false"
-)
+MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 FLASHINFER_FP4_GEMM_BACKEND = envs.SGLANG_FLASHINFER_FP4_GEMM_BACKEND.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
@@ -1492,7 +1491,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)
 
-            if CUTEDSL_MOE_NVFP4_DISPATCH:
+            if MOE_NVFP4_DISPATCH:
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
         else:
@@ -1518,7 +1517,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant if CUTEDSL_MOE_NVFP4_DISPATCH else None
+                    layer.w13_input_scale_quant if MOE_NVFP4_DISPATCH else None
                 )
             }
         )
@@ -1655,11 +1654,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             output_dtype = torch.bfloat16
 
+            # If x_sf is not None, x is FP4 packed (half size), so we need * 2
+            # If x_sf is None, x is not packed, so output_col = x.shape[1]
+            output_col = x.shape[1] * 2 if x_sf is not None else x.shape[1]
+
             with use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty(
-                    x.shape[0], x.shape[1] * 2, dtype=output_dtype, device=x.device
+                    x.shape[0], output_col, dtype=output_dtype, device=x.device
                 )
 
             output = flashinfer_cutlass_fused_moe(
@@ -1740,7 +1743,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         out = flashinfer_cutedsl_moe_masked(
             hidden_states=x,
             input_global_scale=(
-                None if CUTEDSL_MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
+                None if MOE_NVFP4_DISPATCH else layer.w13_input_scale_quant
             ),
             w1=layer.w13_weight,
             w1_blockscale=layer.w13_blockscale_swizzled,

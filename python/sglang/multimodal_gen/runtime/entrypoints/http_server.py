@@ -55,6 +55,9 @@ def create_app(server_args: ServerArgs):
 
     app.include_router(health_router)
 
+    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
+
+    app.include_router(common_api.router)
     app.include_router(image_api.router)
     app.include_router(video_api.router)
 
