@@ -459,8 +459,7 @@ template <typename scalar_t2, sglang::ScalarTypeId s_type_id>
 __device__ inline void dequant_fp8_scales(int q, scalar_t2* frag_b);
 
 template <>
-__device__ inline void dequant_fp8_scales<half2, sglang::kFE4M3fn.id()>(
-    int q, half2* frag_b) {
+__device__ inline void dequant_fp8_scales<half2, sglang::kFE4M3fn.id()>(int q, half2* frag_b) {
   int Out1 = (q & 0xFF00FF00) >> 1;
   ;
   q <<= 8;
@@ -472,8 +471,7 @@ __device__ inline void dequant_fp8_scales<half2, sglang::kFE4M3fn.id()>(
 };
 
 template <>
-__device__ inline void dequant_fp8_scales<nv_bfloat162, sglang::kFE4M3fn.id()>(
-    int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant_fp8_scales<nv_bfloat162, sglang::kFE4M3fn.id()>(int q, nv_bfloat162* frag_b) {
   constexpr int FP8_EXPONENT = 4, BF16_EXPONENT = 8;
   constexpr int RIGHT_SHIFT = BF16_EXPONENT - FP8_EXPONENT;
   constexpr int MASK = 0x7F007F00;
@@ -489,8 +487,7 @@ __device__ inline void dequant_fp8_scales<nv_bfloat162, sglang::kFE4M3fn.id()>(
 }
 
 template <>
-__device__ inline void dequant_fp8_scales<nv_bfloat162, sglang::kFE8M0fnu.id()>(
-    int q, nv_bfloat162* frag_b) {
+__device__ inline void dequant_fp8_scales<nv_bfloat162, sglang::kFE8M0fnu.id()>(int q, nv_bfloat162* frag_b) {
   // In this conversion, 2 ** -127 in FP8E8M0 would become 0 in BF16,
   // but we assume that such a extreme value would not occur in real models.
   int Out1 = (q & 0xFF00FF00) >> 1;
