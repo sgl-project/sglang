@@ -199,9 +199,14 @@ class StreamingHarmonyContext(HarmonyContext):
                 completion_tokens is not None
                 and len(output_token_ids) == completion_tokens
             ):
+                # Case 1: When --stream-output is not set.
+                # The output_ids contains all tokens generated so far.
+                # We only need to process the new tokens.
                 new_token_ids = output_token_ids[self.num_processed_tokens :]
                 self.num_processed_tokens = len(output_token_ids)
             else:
+                # Case 2: When --stream-output is set.
+                # The output_ids contains only the new tokens.
                 new_token_ids = output_token_ids
                 self.num_processed_tokens += len(output_token_ids)
 
