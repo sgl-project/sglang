@@ -475,12 +475,14 @@ class ModelRunner:
         full_attention_layer_ids = [
             layer_idx
             for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if layer_idx in self.model_config.full_attention_layer_ids
+            if hasattr(self.model_config, "full_attention_layer_ids")
+            and layer_idx in self.model_config.full_attention_layer_ids
         ]
         swa_attention_layer_ids = [
             layer_idx
             for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if layer_idx in self.model_config.swa_attention_layer_ids
+            if hasattr(self.model_config, "swa_attention_layer_ids")
+            and layer_idx in self.model_config.swa_attention_layer_ids
         ]
         # Update back to model_config.
         self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
