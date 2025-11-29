@@ -418,9 +418,57 @@ class HFRunner:
             else:
                 input_ids = torch.tensor([p], device="cuda")
 
+            ##############################
+            ##########emb lora############
+            ##############################
+            # if lora_paths is not None and lora_paths[i] is not None:
+            #     from peft import PeftModel
+
+            #     model = PeftModel.from_pretrained(
+            #         base_model,
+            #         lora_paths[i],
+            #         torch_dtype=torch_dtype,
+            #         is_trainable=False,
+            #     )
+            # else:
+            #     model = base_model
+
             if lora_paths is not None and lora_paths[i] is not None:
                 from peft import PeftModel
-
+                from transformers import AutoTokenizer
+                
+                # Load LoRA's tokenizer to check vocab size
+                try:
+                    lora_tokenizer = AutoTokenizer.from_pretrained(lora_paths[i])
+                    lora_vocab_size = len(lora_tokenizer)
+                except:
+                    # If LoRA doesn't have tokenizer, try to infer from adapter config
+                    import json
+                    import os
+                    from huggingface_hub import hf_hub_download
+                    
+                    try:
+                        # Download adapter_config.json to check for vocab size info
+                        config_file = hf_hub_download(repo_id=lora_paths[i], filename="adapter_model.bin")
+                        adapter_state = torch.load(config_file.replace("adapter_model.bin", "adapter_model.bin"), map_location="cpu")
+                        # Find vocab size from the embedding layer shape
+                        for key in adapter_state.keys():
+                            if "embed_tokens" in key and "lora_embedding_A" in key:
+                                lora_vocab_size = adapter_state[key].shape[1]
+                                break
+                            elif "lm_head" in key and "lora_B" in key:
+                                lora_vocab_size = adapter_state[key].shape[0]
+                                break
+                        else:
+                            lora_vocab_size = base_model.config.vocab_size
+                    except:
+                        lora_vocab_size = base_model.config.vocab_size
+                
+                # Resize base model embeddings if needed
+                if lora_vocab_size != base_model.config.vocab_size:
+                    print(f"Resizing model embeddings from {base_model.config.vocab_size} to {lora_vocab_size}")
+                    base_model.resize_token_embeddings(lora_vocab_size)
+                
                 model = PeftModel.from_pretrained(
                     base_model,
                     lora_paths[i],
@@ -429,6 +477,9 @@ class HFRunner:
                 )
             else:
                 model = base_model
+            ##############################
+            ##############################
+            ##############################
             if patch_model_do_sample_false:
                 model.generation_config.do_sample = False
             outputs = model.generate(

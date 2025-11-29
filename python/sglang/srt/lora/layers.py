@@ -559,8 +559,80 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             weights=self.lm_head_B_buffer,
             base_output=base_output,
         )
+
+        # lora_output = self.run_lora_b_scatter(
+        #     lora_a_output=lora_a_output,
+        #     base_output=base_output,
+        # )
         
         return lora_output
+
+
+    # def run_lora_b_lm_head(
+    #     self, lora_a_output: torch.Tensor, base_output: torch.Tensor
+    # ) -> torch.Tensor:
+    #     """
+    #     Apply LoRA B weights using efficient scatter operation.
+        
+    #     Instead of full matmul: lora_a_output @ B^T (shape: [s, rank] @ [rank, vocab_size])
+    #     We compute: for each token, scatter lora_a_output weighted by B weights.
+        
+    #     This is the "reverse" of embedding lookup - instead of gathering from vocab,
+    #     we scatter to vocab dimension.
+    #     """
+    #     batch_info = self.lora_backend.batch_info
+        
+    #     # Get token-to-lora mapping (same as embedding case)
+    #     token_weight_indices = self._get_token_weight_indices(lora_a_output, batch_info)
+        
+    #     # Apply scatter operation for each LoRA adapter
+    #     output = base_output.clone() if base_output is not None else torch.zeros(
+    #         (lora_a_output.shape[0], self.vocab_size),
+    #         dtype=lora_a_output.dtype,
+    #         device=lora_a_output.device,
+    #     )
+        
+    #     unique_weight_indices = torch.unique(token_weight_indices)
+        
+    #     for idx in unique_weight_indices:
+    #         token_mask = token_weight_indices == idx
+            
+    #         # Get LoRA B weights for this adapter: (vocab_size, rank)
+    #         lora_b_weights = self.lm_head_B_buffer[idx]  # (vocab_size, rank)
+            
+    #         # Get scaling for this adapter
+    #         scaling = batch_info.scalings[idx]
+            
+    #         # Compute: lora_a_output[token_mask] @ lora_b_weights^T
+    #         # lora_a_output[token_mask]: (num_tokens, rank)
+    #         # lora_b_weights: (vocab_size, rank)
+    #         # Result: (num_tokens, vocab_size)
+    #         lora_contribution = torch.matmul(
+    #             lora_a_output[token_mask],  # (num_tokens, rank)
+    #             lora_b_weights.t()           # (rank, vocab_size)
+    #         ) * scaling
+            
+    #         output[token_mask] += lora_contribution
+        
+    #     return output
+    
+    # def _get_token_weight_indices(
+    #     self, lora_a_output: torch.Tensor, batch_info: LoRABatchInfo
+    # ) -> torch.Tensor:
+    #     """Get token-to-lora mapping (same as embedding case)."""
+    #     token_weight_indices = torch.zeros(
+    #         lora_a_output.shape[0], dtype=torch.int32, device=lora_a_output.device
+    #     )
+        
+    #     current_pos = 0
+    #     for i in range(batch_info.bs):
+    #         seg_len = int(batch_info.seg_lens[i])
+    #         weight_idx = int(batch_info.weight_indices[i])
+    #         token_weight_indices[current_pos : current_pos + seg_len] = weight_idx
+    #         current_pos += seg_len
+        
+    #     return token_weight_indices
+
 
     def forward(self, hidden_states: torch.Tensor):
         # Apply base linear transformation

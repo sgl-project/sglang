@@ -106,7 +106,7 @@ class LoRAAdapter(nn.Module):
             elif "input_embeddings" in name or "output_embeddings" in name:
                 #added token emb
                 self.added_tokens_embeddings[name] = loaded_weight.cpu()
-                assert loaded_weight.shape[0] == self.config.extra_vocab_size, (
+                assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
                     f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
                     f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
                 )

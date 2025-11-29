@@ -70,7 +70,7 @@ class LoRAManager:
         ##############################
         ##########emb lora############
         ##############################
-        lora_extra_vocab_size: int = 0,
+        # lora_extra_vocab_size: int = 0,
         ##############################
         ##############################
         ##############################
@@ -86,7 +86,10 @@ class LoRAManager:
         ##############################
         ##########emb lora############
         ##############################
-        self.lora_extra_vocab_size: int = lora_extra_vocab_size
+        # self.lora_extra_vocab_size: int = lora_extra_vocab_size
+        # Will infer self.lora_extra_vocab_size in the later init_lora_shapes() if it find the value == None
+        # self.lora_added_vocab_size: Optional[int] = None 
+        self.lora_added_tokens_size: Optional[int] = None 
         ##############################
         ##############################
         ##############################
@@ -437,6 +440,26 @@ class LoRAManager:
                 [x.r for x in self.configs.values()],
                 default=0,
             )
+        
+        #############################
+        #########emb lora############
+        #############################
+        # Auto-infer self.lora_added_vocab_size from loaded LoRA configs
+        # This happens automatically without requiring user input
+        # if self.lora_added_vocab_size is None:
+        if self.lora_added_tokens_size is None:
+            inferred_extra_vocab_size = next(
+                (x.lora_added_tokens_size for x in self.configs.values() if x.lora_added_tokens_size > 0),
+                0
+            )
+            if inferred_extra_vocab_size > 0:
+                logger.info(
+                    f"self.lora_added_tokens_size={inferred_extra_vocab_size} from LoRA adapters."
+                )
+            self.lora_added_tokens_size = inferred_extra_vocab_size
+        #############################
+        #############################
+        #############################
 
     def load_lora_weights(self, lora_ref: LoRARef):
         """
@@ -467,7 +490,8 @@ class LoRAManager:
             ##############################
             ##########emb lora############
             ##############################
-            lora_extra_vocab_size=self.lora_extra_vocab_size, # check whether read from the config
+            # lora_added_vocab_size=self.lora_added_vocab_size, # check whether read from the config
+            lora_added_tokens_size = self.lora_added_tokens_size
             ##############################
             ##############################
             ##############################

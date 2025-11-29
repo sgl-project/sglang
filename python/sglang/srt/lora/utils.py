@@ -46,7 +46,7 @@ class LoRAType(Enum):
 
 
 def get_hidden_dim(
-    module_name: str, config: AutoConfig, base_model: torch.nn.Module, layer_idx: int
+    module_name: str, config: AutoConfig, base_model: torch.nn.Module, layer_idx: int, lora_added_vocab_size: int = 0
 ) -> Tuple[int]:
     """
     Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
@@ -56,10 +56,6 @@ def get_hidden_dim(
     ##########emb lora############
     ##############################  
     is_embedding_module = "embed_tokens" in module_name or "lm_head" in module_name
-    print("=========")
-    print(is_embedding_module)
-    print(module_name)
-    print("----")
     ##############################  
     ##############################  
     ##############################  
@@ -68,17 +64,13 @@ def get_hidden_dim(
     ##########emb lora############
     ##############################  
     # if hasattr(base_model, "get_hidden_dim"):
-    # if hasattr(base_model, "get_hidden_dim") and not is_embedding_module:
-    if hasattr(base_model, "get_hidden_dim"):
+    if hasattr(base_model, "get_hidden_dim") and not is_embedding_module:
+    # if hasattr(base_model, "get_hidden_dim"):
     ##############################  
     ##############################  
     ##############################  
-        print(1111)
-        print("=========")
         return base_model.get_hidden_dim(module_name, layer_idx)
     else:
-        print(2222)
-        print("=========")
         """
         WARNING: get_hidden_dim() is not defined,
         which is used to get the hidden dim for different lora modules
@@ -111,16 +103,14 @@ def get_hidden_dim(
         elif "embed_tokens" in module_name:
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
             # if contain extra tokens will be added; otherwise is 0.
-            extra_vocab = getattr(config, 'extra_vocab_size', 0)
-            return config.vocab_size + extra_vocab, config.hidden_size
+            return config.vocab_size + lora_added_vocab_size, config.hidden_size
         
         #Handle lm_head
         # elif "lm_head" in module_name:
         elif "lm_head" in module_name:
             # For lm_head: input is hidden_size, output is vocab_size
             # if contain extra tokens will be added; otherwise is 0.
-            extra_vocab = getattr(config, 'extra_vocab_size', 0)
-            return config.hidden_size, config.vocab_size + extra_vocab
+            return config.hidden_size, config.vocab_size + lora_added_vocab_size
         ##############################
         ##############################
         ############################## 

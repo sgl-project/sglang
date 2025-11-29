@@ -33,9 +33,9 @@ class LoRAConfig:
         ##############################
         ##########emb lora############
         ##############################
-        self.added_tokens = self.get_added_tokens()
-        self.extra_vocab_size = (
-            len(self.added_tokens) if self.added_tokens is not None else 0
+        self.added_tokens_config = self.get_added_tokens_config()
+        self.lora_added_tokens_size = (
+            len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
         ##############################
         ##############################
@@ -56,7 +56,7 @@ class LoRAConfig:
     ##############################
     ##########emb lora############
     ##############################
-    def get_added_tokens(self):
+    def get_added_tokens_config(self):
         """Load added tokens from the LoRA adapter if the file exists."""
         # Determine the weights directory
         if not os.path.isdir(self.path):

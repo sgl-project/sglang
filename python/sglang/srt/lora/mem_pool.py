@@ -66,7 +66,8 @@ class LoRAMemoryPool:
         ##############################
         ##########emb lora############
         ##############################   
-        lora_extra_vocab_size: int, #can be remove?
+        # lora_added_vocab_size: int, #can be remove?
+        lora_added_tokens_size: int
         ##############################   
         ##############################   
         ##############################   
@@ -80,7 +81,9 @@ class LoRAMemoryPool:
         ##############################
         ##########emb lora############
         ##############################
-        self.max_extra_vocab_size: int = lora_extra_vocab_size
+        # self.max_extra_vocab_size: int = lora_added_vocab_size
+        self.lora_added_tokens_size: int = lora_added_tokens_size
+        # self.extra_vocab_size: int = base_hf_config.extra_vocab_size
         ##############################
         ##############################
         ##############################
@@ -147,7 +150,7 @@ class LoRAMemoryPool:
             ##############################
             ##########emb lora############
             ############################## 
-            if config.extra_vocab_size > self.max_extra_vocab_size:
+            if config.lora_added_tokens_size > self.lora_added_tokens_size:
                 return False # can be remove?
             ############################## 
             ############################## 
@@ -190,7 +193,7 @@ class LoRAMemoryPool:
         layer_idx: int,
     ) -> Tuple[int]:
         input_dim, _ = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, 0
+            module_name, self.base_hf_config, base_model, 0, self.lora_added_tokens_size
         )
         # Have not imp self.tp_size > 1 yet. 
         return (
@@ -228,7 +231,7 @@ class LoRAMemoryPool:
         layer_idx: int,
     ) -> Tuple[int]:
         _, output_dim = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, 0
+            module_name, self.base_hf_config, base_model, 0, self.lora_added_tokens_size
         )
         # Have not imp self.tp_size > 1 yet.
         return (
@@ -289,11 +292,11 @@ class LoRAMemoryPool:
                     device=device,
                 )
 
-        if self.max_extra_vocab_size > 0:
+        if self.lora_added_tokens_size > 0:
             self.new_embeddings_buffer["input_embeddings"] = torch.empty(
                 (
                     self.max_loras_per_batch,
-                    self.max_extra_vocab_size,
+                    self.lora_added_tokens_size,
                     self.embedding_dim,
                 ),
                 dtype=self.dtype,
@@ -619,14 +622,14 @@ class LoRAMemoryPool:
         if lora_adapter.embedding_layers:
 
             org_vocab_size = self.base_hf_config.vocab_size
-            extra_vocab_size = lora_adapter.config.extra_vocab_size
+            lora_added_tokens_size = lora_adapter.config.lora_added_tokens_size
             # Only when LoRA is applied to the embedding layer will it have the extra-token issue that needs to be resolved. 
             # Load embeddings weights for extra tokens to buffer
             if lora_adapter.added_tokens_embeddings:
                 for name, weights in lora_adapter.added_tokens_embeddings.items():
                     if "input_embeddings" in name:
                         buffer_view = self.new_embeddings_buffer["input_embeddings"][
-                            buffer_id, :extra_vocab_size
+                            buffer_id, :lora_added_tokens_size
                         ]
                         load_lora_weight_tensor(buffer_view, weights)
             
@@ -634,13 +637,14 @@ class LoRAMemoryPool:
             for name, weights in lora_adapter.embedding_layers.items():
                 target_module = get_target_module_name(name, self.target_modules)
                 # if "lora_embedding_A" in name:
-                if "lora_embedding_A" in name or ("lora_A" in name and target_module == "embed_tokens"):
+                # if "lora_embedding_A" in name or ("lora_A" in name and target_module == "embed_tokens"):
+                if target_module == "embed_tokens" and "lora_embedding_A" in name:
                     buffer_view = self.embedding_A_buffer[target_module][
-                        buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
+                        buffer_id, :lora_rank, : org_vocab_size + lora_added_tokens_size
                     ]
                     load_lora_weight_tensor(buffer_view, weights)
                 # elif "lora_embedding_B" in name:
-                elif "lora_embedding_B" in name or ("lora_B" in name and target_module == "embed_tokens"):
+                elif target_module == "embed_tokens" and "lora_embedding_B" in name:
                     lora_b_weights = weights
                     #[to-do] support TP
                     # if self.tp_size > 1:
@@ -656,14 +660,19 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
 
 
-                if "lora_lm_head_A" in name or ("lora_A" in name and target_module == "lm_head"):
-                    buffer_view = self.embedding_A_buffer[target_module][
+                # name: base_model.model.lm_head.lora_A.weight 
+                # self.target_modules: {'qkv_proj', 'embed_tokens', 'gate_up_proj', 'o_proj', 'lm_head', 'down_proj'}
+                # target_module: lm_head
+                # if "lora_lm_head_A" in name or ("lora_A" in name and target_module == "lm_head"):
+                elif target_module == "lm_head" and "lora_A.weight" in name: 
+                    buffer_view = self.lm_head_A_buffer[target_module][
                         # buffer_id, :, :lora_rank
                         buffer_id, :lora_rank, :
                     ]
                     load_lora_weight_tensor(buffer_view, weights)
                 # elif "lora_embedding_B" in name:
-                elif "lora_lm_head_B" in name or ("lora_B" in name and target_module == "lm_head"):
+                # elif "lora_lm_head_B" in name or ("lora_B" in name and target_module == "lm_head"):
+                elif target_module == "lm_head" and "lora_B.weight" in name: 
                     lora_b_weights = weights
                     #[to-do] support TP
                     # if self.tp_size > 1:
@@ -673,9 +682,9 @@ class LoRAMemoryPool:
                     #             lora_b_weights, self.tp_rank
                     #         )
 
-                    buffer_view = self.embedding_B_buffer[target_module][
+                    buffer_view = self.lm_head_B_buffer[target_module][
                         # buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
-                        buffer_id, : org_vocab_size + extra_vocab_size, :lora_rank
+                        buffer_id, : org_vocab_size + self.lora_added_tokens_size, :lora_rank
                     ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
 
@@ -701,7 +710,7 @@ class LoRAMemoryPool:
         """
 
         if target_module == "added_tokens":
-            if self.max_extra_vocab_size > 0: # change to read from the config
+            if self.lora_added_tokens_size > 0 and self.lora_added_tokens_size != None: # change to read from the config
                 return self.new_embeddings_buffer["input_embeddings"]
             return None
         elif target_module == "embed_tokens":
