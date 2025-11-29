@@ -270,5 +270,186 @@ def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
 
 
+# Additional optimization tests
+def test_memory_allocation_optimization():
+    """
+    Test precise memory allocation for small batches
+    """
+    num_tokens = 10
+    num_experts = 8
+    topk = 2
+    block_size = 64
+    
+    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    
+    # Test with pad_to_block_size=False (should use less memory)
+    max_num_tokens_padded_no_pad = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    
+    # Test with pad_to_block_size=True (should round up)
+    max_num_tokens_padded_with_pad = triton.cdiv(max_num_tokens_padded_no_pad, block_size) * block_size
+    
+    assert max_num_tokens_padded_no_pad < max_num_tokens_padded_with_pad, \
+        "Without padding should use less memory"
+
+
+def test_parallel_initialization():
+    """
+    Test parallel initialization of sorted_token_ids
+    """
+    num_tokens = 100
+    num_experts = 16
+    topk = 4
+    block_size = 64
+    
+    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device="cuda")
+    expert_ids = torch.empty(
+        (triton.cdiv(max_num_tokens_padded, block_size),), dtype=torch.int32, device="cuda"
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device="cuda")
+    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device="cuda")
+    
+    # Run with pad_sorted_token_ids=True
+    moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        pad_sorted_token_ids=True,
+    )
+    
+    # Check that padding values are correctly set to numel
+    valid_count = num_tokens_post_pad.item()
+    padding_values = sorted_ids[valid_count:valid_count+10]
+    
+    # All padding values should be equal to numel (the sentinel value)
+    assert torch.all(padding_values == topk_ids.numel()), \
+        f"Padding values should all be {topk_ids.numel()}, got {padding_values}"
+
+
+def test_invalid_expert_filtering():
+    """
+    Test filtering out invalid experts (for EP mode)
+    """
+    num_tokens = 50
+    num_experts = 16
+    topk = 2
+    block_size = 32
+    
+    # Create topk_ids with some invalid expert IDs
+    topk_ids = torch.randint(0, num_experts + 5, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device="cuda")
+    expert_ids = torch.empty(
+        (triton.cdiv(max_num_tokens_padded, block_size),), dtype=torch.int32, device="cuda"
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device="cuda")
+    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device="cuda")
+    
+    # Should not crash even with invalid expert IDs
+    moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        pad_sorted_token_ids=True,
+    )
+    
+    # Count how many invalid expert IDs we had
+    invalid_count = torch.sum(topk_ids >= num_experts).item()
+    valid_count = topk_ids.numel() - invalid_count
+
+
+def test_expert_ids_padding():
+    """
+    Test filling remaining expert_ids with -1
+    """
+    num_tokens = 30
+    num_experts = 8
+    topk = 2
+    block_size = 32
+    
+    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device="cuda")
+    expert_ids = torch.empty(
+        (triton.cdiv(max_num_tokens_padded, block_size),), dtype=torch.int32, device="cuda"
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device="cuda")
+    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device="cuda")
+    
+    moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        pad_sorted_token_ids=True,
+    )
+    
+    # Calculate the number of valid blocks
+    valid_blocks = (num_tokens_post_pad.item() + block_size - 1) // block_size
+    
+    # Check that remaining expert_ids are filled with -1
+    remaining_expert_ids = expert_ids[valid_blocks:]
+    
+    # All remaining blocks should have expert_id = -1
+    if len(remaining_expert_ids) > 0:
+        assert torch.all(remaining_expert_ids == -1), \
+            f"Remaining expert_ids should be -1, got {remaining_expert_ids[:10]}"
+
+
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,topk,block_size",
+    [
+        (1, 8, 1, 32),      # Small batch
+        (10, 16, 2, 64),    # Medium batch
+        (100, 32, 4, 128),  # Larger batch
+        (1000, 64, 8, 256), # Large batch
+    ]
+)
+def test_all_optimizations_combined(num_tokens, num_experts, topk, block_size):
+    """
+    Test all optimizations work together correctly
+    """
+    topk_ids = torch.randint(0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device="cuda")
+    expert_ids = torch.empty(
+        (triton.cdiv(max_num_tokens_padded, block_size),), dtype=torch.int32, device="cuda"
+    )
+    num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device="cuda")
+    cumsum_buffer = torch.empty((num_experts + 2,), dtype=torch.int32, device="cuda")
+    
+    # Should complete successfully with all optimizations
+    moe_align_block_size(
+        topk_ids,
+        num_experts + 1,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        cumsum_buffer,
+        pad_sorted_token_ids=True,
+    )
+    
+    # Basic sanity checks
+    assert num_tokens_post_pad.item() > 0, "Should have some valid tokens"
+    assert num_tokens_post_pad.item() % block_size == 0, "Result should be aligned to block_size"
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

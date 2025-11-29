@@ -400,7 +400,11 @@ def benchmark(num_tokens, num_experts, topk, provider):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Benchmark moe_align_block_size kernel. "
+                    "Includes optimizations: "
+                    "1) Precise memory allocation 2) Parallel init 3) EP mode filtering 4) expert_ids padding"
+    )
     parser.add_argument(
         "--save_path",
         type=str,
@@ -437,6 +441,15 @@ if __name__ == "__main__":
         num_tokens = 1024
         num_experts = args.num_experts
         topk = args.topk
+
+    print("\n" + "=" * 80)
+    print("MoE Align Block Size Kernel Benchmark")
+    print("Includes optimizations:")
+    print("  1. Precise memory allocation for small batches")
+    print("  2. Parallel initialization of sorted_token_ids")
+    print("  3. EP mode invalid expert filtering")
+    print("  4. expert_ids padding")
+    print("=" * 80 + "\n")
 
     calculate_diff(num_tokens=num_tokens, num_experts=num_experts, topk=topk)
 
