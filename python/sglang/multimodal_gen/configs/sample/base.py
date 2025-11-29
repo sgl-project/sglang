@@ -404,6 +404,30 @@ class SamplingParams:
             help="Random seed for generation",
         )
         parser.add_argument(
+            "--4k",
+            action="store_true",
+            dest="resolution_4k",
+            help="Set resolution to 4K (3840x2160)",
+        )
+        parser.add_argument(
+            "--2k",
+            action="store_true",
+            dest="resolution_2k",
+            help="Set resolution to 2K (2560x1440)",
+        )
+        parser.add_argument(
+            "--1080p",
+            action="store_true",
+            dest="resolution_1080p",
+            help="Set resolution to 1080p (1920x1080)",
+        )
+        parser.add_argument(
+            "--720p",
+            action="store_true",
+            dest="resolution_720p",
+            help="Set resolution to 720p (1280x720)",
+        )
+        parser.add_argument(
             "--num-frames",
             type=int,
             default=SamplingParams.num_frames,
@@ -497,6 +521,20 @@ class SamplingParams:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        # Handle resolution shortcuts
+        if hasattr(args, "resolution_4k") and args.resolution_4k:
+            args.width = 3840
+            args.height = 2160
+        elif hasattr(args, "resolution_2k") and args.resolution_2k:
+            args.width = 2560
+            args.height = 1440
+        elif hasattr(args, "resolution_1080p") and args.resolution_1080p:
+            args.width = 1920
+            args.height = 1080
+        elif hasattr(args, "resolution_720p") and args.resolution_720p:
+            args.width = 1280
+            args.height = 720
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         args.height_not_provided = False
         args.width_not_provided = False
