@@ -4,7 +4,6 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
-from sglang.multimodal_gen.utils import calculate_dimensions
 
 
 @dataclass
@@ -28,9 +27,6 @@ class QwenImageVAEArchConfig(VAEArchConfig):
     scale_factor_spatial: int = 8
     clip_output: bool = True
 
-    def __post_init__(self):
-        self.vae_scale_factor = 2 ** len(self.temperal_downsample)
-
 
 @dataclass
 class QwenImageVAEConfig(VAEConfig):
@@ -42,11 +38,8 @@ class QwenImageVAEConfig(VAEConfig):
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
 
-    def calculate_dimensions(self, image, vae_scale_factor, width, height):
-        width = image.size[0]
-        height = image.size[1]
-        width, height, _ = calculate_dimensions(1024 * 1024, width / height)
-        return width, height
+    def get_vae_scale_factor(self):
+        return 2 ** len(self.arch_config.temperal_downsample)
 
     def __post_init__(self):
         self.blend_num_frames = (
