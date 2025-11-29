@@ -51,7 +51,7 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
-        elif layer_name == "MiMoV2FlashDecoderLayer":
+        elif layer_name == "MiMoV2DecoderLayer":
             # todo
             return OperationsStrategy.concat(
                 [
@@ -230,9 +230,7 @@ def _compute_moe_hybrid_layer_operations_strategy_tbo(
     layer: torch.nn.Module,
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
-    assert (
-        layer.is_layer_sparse
-    ), "MiMoV2FlashDecoderLayer moe only support sparse layers"
+    assert layer.is_layer_sparse, "MiMoV2DecoderLayer moe only support sparse layers"
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_hybrid_prefill(layer)
     elif (

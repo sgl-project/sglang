@@ -549,7 +549,7 @@ class MiMoV2Attention(nn.Module):
         return output
 
 
-class MiMoV2FlashDecoderLayer(nn.Module):
+class MiMoV2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: MiMoV2FlashConfig,
@@ -759,7 +759,7 @@ class MiMoV2Model(nn.Module):
         config: MiMoV2FlashConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        decoder_layer_type: type[nn.Module] = MiMoV2FlashDecoderLayer,
+        decoder_layer_type: type[nn.Module] = MiMoV2DecoderLayer,
     ) -> None:
         super().__init__()
         self.config = config
@@ -778,8 +778,8 @@ class MiMoV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        # Use the provided decoder layer type or default to MiMoV2FlashDecoderLayer
-        decoder_layer_type = decoder_layer_type or MiMoV2FlashDecoderLayer
+        # Use the provided decoder layer type or default to MiMoV2DecoderLayer
+        decoder_layer_type = decoder_layer_type or MiMoV2DecoderLayer
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             layer_fn=lambda idx, prefix: decoder_layer_type(
