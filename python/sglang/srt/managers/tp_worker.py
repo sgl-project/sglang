@@ -278,24 +278,54 @@ class TpModelWorker(BaseTpWorker):
         # Profile number of tokens
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
         self.max_prefill_tokens = server_args.max_prefill_tokens
-        self.max_running_requests = min(
-            (
-                self.max_total_num_tokens // 2
-                if server_args.max_running_requests is None
-                else server_args.max_running_requests
-                // (server_args.dp_size if server_args.enable_dp_attention else 1)
-            ),
-            self.model_runner.req_to_token_pool.size,
-        )
+
+        # Compute max_running_requests
+        token_pool_size = self.model_runner.req_to_token_pool.size
+        if server_args.max_running_requests is None:
+            running_limit = self.max_total_num_tokens // 2
+            logger.info(
+                "max_running_requests: no arg, using total_tokens//2 = %s", running_limit
+            )
+        else:
+            dp_divisor = server_args.dp_size if server_args.enable_dp_attention else 1
+            running_limit = server_args.max_running_requests // dp_divisor
+            logger.info(
+                "max_running_requests: arg=%s // dp_divisor=%s = %s",
+                server_args.max_running_requests,
+                dp_divisor,
+                running_limit,
+            )
+        self.max_running_requests = min(running_limit, token_pool_size)
+        if self.max_running_requests < running_limit:
+            logger.info(
+                "max_running_requests: clamped by token_pool_size %s -> %s",
+                running_limit,
+                self.max_running_requests,
+            )
+
         assert self.max_running_requests > 0, "max_running_request is zero"
         self.max_queued_requests = server_args.max_queued_requests
         assert (
             self.max_queued_requests is None or self.max_queued_requests >= 1
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
-        self.max_req_len = min(
-            self.model_config.context_len - 1,
-            self.max_total_num_tokens - 1,
-        )
+
+        # Compute max_req_len
+        context_limit = self.model_config.context_len - 1
+        memory_limit = self.max_total_num_tokens - 1
+        self.max_req_len = min(context_limit, memory_limit)
+        if context_limit <= memory_limit:
+            logger.info(
+                "max_req_len: limited by context_len (%s - 1 = %s)",
+                self.model_config.context_len,
+                self.max_req_len,
+            )
+        else:
+            logger.info(
+                "max_req_len: limited by memory (%s - 1 = %s)",
+                self.max_total_num_tokens,
+                self.max_req_len,
+            )
+
         self.max_req_input_len = self.max_req_len - 5
         assert (
             self.max_req_len > 0 and self.max_req_input_len > 0

@@ -462,7 +462,7 @@ class KVCache(abc.ABC):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-    def describe_layout(self) -> Optional[str]:
+    def _describe_layout(self) -> Optional[str]:
         return None
 
     def _finalize_allocation_log(self, num_tokens: int):
@@ -470,7 +470,7 @@ class KVCache(abc.ABC):
         Supports both tuple (K, V) size returns and single KV size returns.
         """
         kv_size_bytes = self.get_kv_size_bytes()
-        layout_info = self.describe_layout()
+        layout_info = self._describe_layout()
         layout_suffix = f", layout={layout_info}" if layout_info else ""
         if isinstance(kv_size_bytes, tuple):
             k_size, v_size = kv_size_bytes
@@ -566,7 +566,7 @@ class MHATokenToKVPool(KVCache):
 
         self._finalize_allocation_log(size)
 
-    def describe_layout(self) -> Optional[str]:
+    def _describe_layout(self) -> Optional[str]:
         total_slots = self.size + self.page_size
         dtype_info = (
             f"store_dtype={self.store_dtype}, logical_dtype={self.dtype}"
@@ -1443,7 +1443,7 @@ class MLATokenToKVPool(KVCache):
             # NSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
 
-    def describe_layout(self) -> Optional[str]:
+    def _describe_layout(self) -> Optional[str]:
         total_slots = self.size + self.page_size
         dtype_info = (
             f"store_dtype={self.store_dtype}, logical_dtype={self.dtype}"
