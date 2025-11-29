@@ -1825,8 +1825,12 @@ class ServerArgs:
 
             self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
-            self.disable_cuda_graph = True
-            logger.warning("Cuda graph is disabled for prefill server")
+
+            if not self.enable_piecewise_cuda_graph:
+                self.disable_cuda_graph = True
+                logger.warning(
+                    "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
+                )
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
