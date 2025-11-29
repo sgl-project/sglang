@@ -480,30 +480,22 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, weights)
 
     def get_tensor(
-        self, target_module: str, layer_id: int, lora_type: LoRAType, context: str = None
+        self, target_module: str, layer_id: int, lora_type: LoRAType
     ) -> torch.Tensor:
         """
         Get LoRA tensor buffer (automatically handles both 3D and 4D tensors).
 
         Args:
-            target_module: Target module name (e.g., 'gate_up_proj')
+            target_module: Target module name (e.g., 'gate_up_proj' or 'gate_up_proj_moe' for MoE)
             layer_id: Layer index
             lora_type: LoRAType.LORA_A or LoRAType.LORA_B
-            context: Optional context hint ('moe' or None for auto-detect)
 
         Returns:
             - 3D tensor [num_loras, rank, hidden] for standard modules
             - 4D tensor [num_loras, num_experts, rank, hidden] for MoE modules
         """
         buffer_dict = self.A_buffer if lora_type == LoRAType.LORA_A else self.B_buffer
-
-        # Handle context-specific buffer selection for ambiguous modules
-        ambiguous_modules = {"gate_up_proj", "down_proj"}
-        if target_module in ambiguous_modules:
-            if context == "moe" and f"{target_module}_moe" in buffer_dict:
-                return buffer_dict[f"{target_module}_moe"][layer_id]
-                
-        # Fall back to original key for non-ambiguous modules
+        
         return buffer_dict[target_module][layer_id]
 
     def get_buffer_id(self, lora_uid: str):

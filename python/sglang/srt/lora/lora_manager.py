@@ -325,16 +325,14 @@ class LoRAManager:
                 if isinstance(module, FusedMoEWithLoRA) and all(x in self.target_modules for x in ['gate_up_proj', 'down_proj']):
                     module.set_lora_info(
                         self.memory_pool.get_tensor(
-                            target_module='gate_up_proj',
+                            target_module='gate_up_proj_moe',
                             layer_id=layer_id,
                             lora_type=LoRAType.LORA_A,
-                            context='moe',
                         ),
                         self.memory_pool.get_tensor(
-                            target_module='down_proj',
+                            target_module='down_proj_moe',
                             layer_id=layer_id,
                             lora_type=LoRAType.LORA_B,
-                            context='moe',
                         ),
                     )
                     continue
@@ -343,23 +341,16 @@ class LoRAManager:
                     module_name, self.memory_pool.target_modules
                 )
 
-                # Determine context based on module name
-                context = None
-                if isinstance(module, FusedMoEWithLoRA):
-                    context = "moe"
-
                 module.set_lora_info(
                     self.memory_pool.get_tensor(
                         target_module=target_module,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_A,
-                        context=context,
                     ),
                     self.memory_pool.get_tensor(
                         target_module=target_module,
                         layer_id=layer_id,
                         lora_type=LoRAType.LORA_B,
-                        context=context,
                     ),
                 )
 
