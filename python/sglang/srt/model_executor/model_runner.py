@@ -167,6 +167,7 @@ from sglang.srt.utils import (
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
+    log_debug_on_rank0,
     log_info_on_rank0,
     monkey_patch_p2p_access_check,
     require_attn_tp_gather,
@@ -1519,19 +1520,10 @@ class ModelRunner:
     ):
         kb_per_token = cell_size / 1024
         dp_suffix = f" dp={dp_size}" if dp_size else ""
-        logger.info(
-            "KV cache: %s(%s) layers=%s dtype=%s %.2fKB/tok "
-            "mem=%.1f/%.1fGB rest=%.1fGB max_tokens=%s%s",
-            layout_label,
-            layout_detail,
-            num_layers,
-            dtype,
-            kb_per_token,
-            available_mem_gb,
-            total_mem_gb,
-            rest_mem_gb,
-            max_tokens,
-            dp_suffix,
+        log_debug_on_rank0(
+            logger,
+            f"KV cache: {layout_label}({layout_detail}) layers={num_layers} dtype={dtype} {kb_per_token:.2f}KB/tok "
+            f"mem={available_mem_gb:.1f}/{total_mem_gb:.1f}GB rest={rest_mem_gb:.1f}GB max_tokens={max_tokens}{dp_suffix}",
         )
 
     def handle_max_mamba_cache(self, total_rest_memory):
@@ -1765,14 +1757,14 @@ class ModelRunner:
                 self.max_total_num_tokens / self.model_config.context_len * 512
             )
             max_running_requests = min(max(heuristic, 2048), 4096)
-            log_info_on_rank0(
+            log_debug_on_rank0(
                 logger,
                 f"req_to_token_pool: size={max_running_requests} "
                 f"(heuristic={heuristic}, clamp=[2048,4096]), "
                 f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
             )
         else:
-            log_info_on_rank0(
+            log_debug_on_rank0(
                 logger,
                 f"req_to_token_pool: size={max_running_requests} (from arg), "
                 f"mem={max_running_requests * self.model_config.context_len * 4 / 1e9:.2f}GB",
