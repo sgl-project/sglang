@@ -9,6 +9,7 @@ from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -149,13 +150,12 @@ class ZImageAttention(nn.Module):
 
         # Apply RoPE
         def apply_rotary_emb(
-            x_in: torch.Tensor, freqs_cis: torch.Tensor
-        ) -> torch.Tensor:
-            with torch.amp.autocast("cuda", enabled=False):
-                x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
-                freqs_cis = freqs_cis.unsqueeze(2)
-                x_out = torch.view_as_real(x * freqs_cis).flatten(3)
-                return x_out.type_as(x_in)  # todo
+            x_in: torch.Tensor,
+            freqs_cis: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            cos, sin = freqs_cis
+            x_out = _apply_rotary_emb(x_in, cos, sin, is_neox_style=False)
+            return x_out
 
         if freqs_cis is not None:
             q = apply_rotary_emb(q, freqs_cis)
@@ -286,12 +286,15 @@ class RopeEmbedder:
         assert len(axes_dims) == len(
             axes_lens
         ), "axes_dims and axes_lens must have the same length"
-        self.freqs_cis = None
+
+        self.cos_cached = None
+        self.sin_cached = None
 
     @staticmethod
-    def precompute_freqs_cis(dim: List[int], end: List[int], theta: float = 256.0):
+    def precompute_freqs(dim: List[int], end: List[int], theta: float = 256.0):
         with torch.device("cpu"):
-            freqs_cis = []
+            cos_list = []
+            sin_list = []
             for i, (d, e) in enumerate(zip(dim, end)):
                 freqs = 1.0 / (
                     theta
@@ -299,33 +302,43 @@ class RopeEmbedder:
                 )
                 timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
                 freqs = torch.outer(timestep, freqs).float()
-                freqs_cis_i = torch.polar(torch.ones_like(freqs), freqs).to(
-                    torch.complex64
-                )  # complex64
-                freqs_cis.append(freqs_cis_i)
 
-            return freqs_cis
+                cos_list.append(torch.cos(freqs))
+                sin_list.append(torch.sin(freqs))
 
-    def __call__(self, ids: torch.Tensor):
+            return cos_list, sin_list
+
+    def __call__(self, ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            ids: [batch, len(axes_dims)] or [seq_len, len(axes_dims)]
+        Returns:
+            cos: [batch/seq, head_dim // 2]
+            sin: [batch/seq, head_dim // 2]
+        """
         assert ids.ndim == 2
         assert ids.shape[-1] == len(self.axes_dims)
         device = ids.device
 
-        if self.freqs_cis is None:
-            self.freqs_cis = self.precompute_freqs_cis(
+        if self.cos_cached is None:
+            self.cos_cached, self.sin_cached = self.precompute_freqs(
                 self.axes_dims, self.axes_lens, theta=self.theta
             )
-            self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+            self.cos_cached = [c.to(device) for c in self.cos_cached]
+            self.sin_cached = [s.to(device) for s in self.sin_cached]
         else:
-            # Ensure freqs_cis are on the same device as ids
-            if self.freqs_cis[0].device != device:
-                self.freqs_cis = [freqs_cis.to(device) for freqs_cis in self.freqs_cis]
+            if self.cos_cached[0].device != device:
+                self.cos_cached = [c.to(device) for c in self.cos_cached]
+                self.sin_cached = [s.to(device) for s in self.sin_cached]
 
-        result = []
+        cos_out = []
+        sin_out = []
         for i in range(len(self.axes_dims)):
             index = ids[:, i]
-            result.append(self.freqs_cis[i][index])
-        return torch.cat(result, dim=-1)
+            cos_out.append(self.cos_cached[i][index])
+            sin_out.append(self.sin_cached[i][index])
+
+        return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
 class ZImageTransformer2DModel(CachableDiT):
@@ -557,7 +570,7 @@ class ZImageTransformer2DModel(CachableDiT):
         x_freqs_cis = freqs_cis[1]
 
         x = x.unsqueeze(0)
-        x_freqs_cis = x_freqs_cis.unsqueeze(0)
+        x_freqs_cis = x_freqs_cis
         for layer in self.noise_refiner:
             x = layer(x, x_freqs_cis, adaln_input)
 
@@ -568,12 +581,14 @@ class ZImageTransformer2DModel(CachableDiT):
         cap_freqs_cis = freqs_cis[0]
 
         cap_feats = cap_feats.unsqueeze(0)
-        cap_freqs_cis = cap_freqs_cis.unsqueeze(0)
         for layer in self.context_refiner:
             cap_feats = layer(cap_feats, cap_freqs_cis)
 
         unified = torch.cat([x, cap_feats], dim=1)
-        unified_freqs_cis = torch.cat([x_freqs_cis, cap_freqs_cis], dim=1)
+        unified_freqs_cis = (
+            torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=0),
+            torch.cat([x_freqs_cis[1], cap_freqs_cis[1]], dim=0),
+        )
 
         for layer in self.layers:
             unified = layer(unified, unified_freqs_cis, adaln_input)
