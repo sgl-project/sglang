@@ -15,10 +15,7 @@ if _is_cuda or _is_hip:
 
 
 def moe_align_block_size(
-    topk_ids: torch.Tensor, 
-    block_size: int, 
-    num_experts: int,
-    pad_to_block_size: bool = False,
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -29,9 +26,6 @@ def moe_align_block_size(
         top-k expert indices for each token.
     - block_size: The block size used in block matrix multiplication.
     - num_experts: The total number of experts.
-    - pad_to_block_size: Whether to pad the sorted_ids size to a multiple
-        of block_size. For small batch sizes, setting this to False can
-        save memory.
 
     Returns:
     - sorted_token_ids: A tensor containing the sorted token indices according
@@ -60,15 +54,7 @@ def moe_align_block_size(
     - The padding ensures that the total number of tokens is now divisible
         by block_size for proper block matrix operations.
     """
-    # Optimization 1: More precise memory allocation for small batches
-    # Calculate the minimum required size
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
-    
-    # Only round up to block_size if explicitly requested
-    # This saves memory for small batch sizes
-    if pad_to_block_size:
-        max_num_tokens_padded = triton.cdiv(max_num_tokens_padded, block_size) * block_size
-    
     sorted_ids = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
     )

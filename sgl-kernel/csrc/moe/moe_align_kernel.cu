@@ -29,17 +29,12 @@ __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ cumsum_buffer,
-    size_t numel,
-    int32_t num_experts) {
+    size_t numel) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i] + 1;
-    // Filter out invalid experts (for EP mode)
-    if (expert_id < 0 || expert_id > num_experts) {
-      continue;
-    }
     int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
     sorted_token_ids[rank_post_pad] = i;
   }
@@ -68,8 +63,7 @@ __global__ void moe_align_block_size_kernel(
     size_t numel,
     int32_t* __restrict__ cumsum,
     bool pad_sorted_token_ids,
-    const int32_t scan_size,
-    const int32_t max_num_tokens_padded) {
+    const int32_t scan_size) {
   extern __shared__ int32_t smem[];
   int32_t* shared_counts = smem;                  // [num_experts]
   int32_t* prefix = shared_counts + num_experts;  // [num_experts + 1]
@@ -79,29 +73,14 @@ __global__ void moe_align_block_size_kernel(
   const size_t tid = threadIdx.x;
   const size_t stride = blockDim.x;
 
-  // Optimization 2: Parallel initialization of sorted_token_ids
-  if (pad_sorted_token_ids) {
-    Vec fill_vec;
-    fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
-    int32_t total_vecs = (max_num_tokens_padded + VEC_SIZE - 1) / VEC_SIZE;
-    Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
-    for (int32_t i = tid; i < total_vecs; i += stride) {
-      out_ptr[i] = fill_vec;
-    }
-  }
-
   if (tid < num_experts) {
     shared_counts[tid] = 0;
   }
 
   __syncthreads();
 
-  // Optimization 3: Filter out invalid experts
   for (size_t i = tid; i < numel; i += stride) {
     int expert_id = topk_ids[i] + 1;
-    if (expert_id < 0 || expert_id > num_experts) {
-      continue;
-    }
     atomicAdd(&shared_counts[expert_id], 1);
   }
 
@@ -221,7 +200,6 @@ __global__ void moe_align_block_size_kernel(
   if (tid <= num_experts) {
     cumsum[tid] = prefix[tid];
   }
-  
   // fill expert_ids
   const int32_t num_blocks = s_total_tokens_post_pad / block_size;
   for (int32_t i = tid; i < num_blocks; i += stride) {
@@ -238,11 +216,14 @@ __global__ void moe_align_block_size_kernel(
     expert_ids[i] = left - 2;
   }
 
-  // Optimization 4: Fill remaining expert_ids with -1 (invalid expert)
-  const int32_t expert_ids_size = (max_num_tokens_padded + block_size - 1) / block_size;
-  const int32_t fill_start_idx = num_blocks + tid;
-  for (int32_t i = fill_start_idx; i < expert_ids_size; i += stride) {
-    expert_ids[i] = -1;
+  if (pad_sorted_token_ids) {
+    Vec fill_vec;
+    fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
+    int32_t total_vecs = (s_total_tokens_post_pad + VEC_SIZE - 1) / VEC_SIZE;
+    Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
+    for (int32_t i = tid; i < total_vecs; i += stride) {
+      out_ptr[i] = fill_vec;
+    }
   }
 }
 
@@ -255,8 +236,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     int32_t num_experts,
     int32_t block_size,
     size_t numel,
-    bool pad_sorted_token_ids,
-    const int32_t max_num_tokens_padded) {
+    bool pad_sorted_token_ids) {
   const size_t tid = threadIdx.x;
   const size_t stride = blockDim.x;
 
@@ -264,28 +244,12 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   int32_t* cumsum = shared_mem;
   int32_t* tokens_cnts = (int32_t*)(shared_mem + num_experts + 1);
 
-  // Optimization 2: Parallel initialization of sorted_token_ids
-  if (pad_sorted_token_ids) {
-    Vec fill_vec;
-    fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
-    int32_t total_vecs = (max_num_tokens_padded + VEC_SIZE - 1) / VEC_SIZE;
-    Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
-    for (int32_t i = tid; i < total_vecs; i += stride) {
-      out_ptr[i] = fill_vec;
-    }
-  }
-
   for (int i = 0; i < num_experts; ++i) {
     tokens_cnts[(threadIdx.x + 1) * num_experts + i] = 0;
   }
 
-  // Optimization 3: Filter out invalid experts
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i] + 1;
-    if (expert_id < 0 || expert_id > num_experts) {
-      continue;
-    }
-    ++tokens_cnts[(threadIdx.x + 1) * num_experts + expert_id];
+    ++tokens_cnts[(threadIdx.x + 1) * num_experts + topk_ids[i] + 1];
   }
 
   __syncthreads();
@@ -315,22 +279,20 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     }
   }
 
-  // Optimization 4: Fill remaining expert_ids with -1
-  const int32_t num_valid_blocks = (*total_tokens_post_pad + block_size - 1) / block_size;
-  const int32_t expert_ids_size = (max_num_tokens_padded + block_size - 1) / block_size;
-  const int32_t fill_start_idx = num_valid_blocks + tid;
-  for (int32_t i = fill_start_idx; i < expert_ids_size; i += stride) {
-    expert_ids[i] = -1;
+  if (pad_sorted_token_ids) {
+    Vec fill_vec;
+    fill_vec.x = fill_vec.y = fill_vec.z = fill_vec.w = numel;
+    int32_t total_vecs = (*total_tokens_post_pad + VEC_SIZE - 1) / VEC_SIZE;
+    Vec* out_ptr = reinterpret_cast<Vec*>(sorted_token_ids);
+    for (int32_t i = tid; i < total_vecs; i += stride) {
+      out_ptr[i] = fill_vec;
+    }
   }
 
   __syncthreads();
 
-  // Optimization 3: Filter out invalid experts in sorting phase
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i] + 1;
-    if (expert_id < 0 || expert_id > num_experts) {
-      continue;
-    }
     int32_t rank_post_pad = tokens_cnts[threadIdx.x * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
     ++tokens_cnts[threadIdx.x * num_experts + expert_id];
@@ -352,9 +314,6 @@ void moe_align_block_size(
 
   threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
 
-  // Optimization 1: Pass the actual allocated size to kernel
-  const int32_t max_num_tokens_padded = sorted_token_ids.size(0);
-
   DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     bool small_batch_expert_mode = (topk_ids.numel() < 1024) && (num_experts <= 64);
 
@@ -371,8 +330,7 @@ void moe_align_block_size(
           num_experts,
           block_size,
           topk_ids.numel(),
-          pad_sorted_token_ids,
-          max_num_tokens_padded);
+          pad_sorted_token_ids);
     } else {
       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
 
@@ -388,8 +346,7 @@ void moe_align_block_size(
           topk_ids.numel(),
           cumsum_buffer.data_ptr<int32_t>(),
           pad_sorted_token_ids,
-          scan_size,
-          max_num_tokens_padded);
+          scan_size);
 
       const int block_threads = std::min(256, (int)threads);
       const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
@@ -401,8 +358,7 @@ void moe_align_block_size(
           topk_ids.data_ptr<scalar_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
           cumsum_buffer.data_ptr<int32_t>(),
-          topk_ids.numel(),
-          num_experts);
+          topk_ids.numel());
     }
   });
 }
