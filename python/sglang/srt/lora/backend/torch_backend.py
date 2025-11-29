@@ -191,7 +191,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
                 slice_size,
                 True,
             )
-            slice_offset += slice_offset
+            slice_offset += slice_size
 
         return output_tensor
 
@@ -278,7 +278,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
                     (bs,), dtype=torch.int32, device=self.device
                 ),
                 lora_ranks=torch.empty(
-                    (self.max_loras_per_batch,), dtype=torch.int64, device=self.device
+                    (self.max_loras_per_batch,), dtype=torch.int32, device=self.device
                 ),
                 scalings=torch.empty(
                     (self.max_loras_per_batch,), dtype=torch.float, device=self.device
