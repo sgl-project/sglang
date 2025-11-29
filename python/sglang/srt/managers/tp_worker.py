@@ -385,7 +385,7 @@ class TpModelWorker(BaseTpWorker):
         log_info_on_rank0(
             logger,
             f"Capacity: total_tokens={self.max_total_num_tokens} max_req_len={self.max_req_len} "
-            f"max_running={self.max_running_requests} token_pool={token_pool.size}(ctx={token_pool.max_context_len}) "
+            f"max_running={self.max_running_requests} token_pool={token_pool.size} "
             f"kv_pool={kv_pool.size} sliding_window={self.model_runner.sliding_window_size}",
         )
 
