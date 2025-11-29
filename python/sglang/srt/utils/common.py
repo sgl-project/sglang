@@ -155,8 +155,12 @@ def is_xpu() -> bool:
 
 @lru_cache(maxsize=1)
 def is_npu() -> bool:
-    return hasattr(torch, "npu") and torch.npu.is_available()
-
+    if hasattr(torch, "npu"):
+        if torch.npu.is_available():
+            return True
+        else:
+            raise RuntimeError("torch_npu detected, but NPU device is not available or visible.")
+    return False
 
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
@@ -1844,7 +1848,14 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "CPU device enabled, using torch native backend, low performance expected."
             )
         return "cpu"
-
+    
+    if hasattr(torch, "npu"):
+        if torch.npu.is_available():
+            if device_id == None:
+                return "npu"
+            return "npu:{}".format(device_id)
+        raise RuntimeError("torch_npu detected, but NPU device is not available or visible.")
+    
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
@@ -1854,11 +1865,6 @@ def get_device(device_id: Optional[int] = None) -> str:
         if device_id == None:
             return "xpu"
         return "xpu:{}".format(device_id)
-
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        if device_id == None:
-            return "npu"
-        return "npu:{}".format(device_id)
 
     if is_habana_available():
         try:
