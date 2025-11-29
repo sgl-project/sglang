@@ -11,7 +11,7 @@ from typing import cast
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen import DiffGenerator
-from sglang.multimodal_gen.configs.sample.base import (
+from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
@@ -59,9 +59,7 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     return parser
 
 
-def maybe_dump_performance(
-    args: argparse.Namespace, server_args, sampling_params, results
-):
+def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, results):
     """dump performance if necessary"""
     if not (args.perf_dump_path and results):
         return
@@ -83,7 +81,7 @@ def maybe_dump_performance(
         file_path=args.perf_dump_path,
         timings=timings,
         meta={
-            "prompt": sampling_params.prompt,
+            "prompt": prompt,
             "model": server_args.model_path,
         },
         tag="cli_generate",
@@ -101,6 +99,7 @@ def generate_cmd(args: argparse.Namespace):
         envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
 
     server_args = ServerArgs.from_cli_args(args)
+
     sampling_params = SamplingParams.from_cli_args(args)
     sampling_params.request_id = generate_request_id()
 
@@ -131,7 +130,8 @@ def generate_cmd(args: argparse.Namespace):
         **extra_kwargs,
     )
 
-    maybe_dump_performance(args, server_args, sampling_params, results)
+    prompt = sampling_params_kwargs.get("prompt", None)
+    maybe_dump_performance(args, server_args, prompt, results)
 
 
 class GenerateSubcommand(CLISubcommand):
