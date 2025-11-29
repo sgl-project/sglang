@@ -119,35 +119,10 @@ class ImageEncodingStage(PipelineStage):
             image, self.vae_image_processor
         )
 
-        if batch.prompt:
-            if isinstance(server_args.pipeline_config, QwenImageEditPlusPipelineConfig):
-                prompt = (
-                    [batch.prompt] if isinstance(batch.prompt, str) else batch.prompt
-                )
-                prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
-                img_prompt_template = (
-                    "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
-                )
-                if isinstance(image, list):
-                    base_img_prompt = ""
-                    for i, img in enumerate(image):
-                        base_img_prompt += img_prompt_template.format(i + 1)
-                elif image is not None:
-                    base_img_prompt = img_prompt_template.format(1)
-                else:
-                    base_img_prompt = ""
-                txt = [
-                    prompt_template_encode.format(base_img_prompt + e) for e in prompt
-                ]
-                image_processor_kwargs = dict(text=txt, padding=True)
-            elif isinstance(
-                server_args.pipeline_config, QwenImageEditPipelineConfig
-            ) or isinstance(server_args.pipeline_config, QwenImagePipelineConfig):
-                prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
-                txt = prompt_template_encode.format(batch.prompt)
-                image_processor_kwargs = dict(text=[txt], padding=True)
-        else:
-            image_processor_kwargs = {}
+        # Prepare kwargs for image processor
+        image_processor_kwargs = server_args.pipeline_config.prepare_image_processor_kwargs(
+            batch.prompt, image
+        )
 
         image_inputs = self.image_processor(
             images=prompt_image, return_tensors="pt", **image_processor_kwargs
@@ -164,42 +139,13 @@ class ImageEncodingStage(PipelineStage):
             batch.image_embeds.append(image_embeds)
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
-            # 1. neg prompt embeds
-            if (
-                isinstance(server_args.pipeline_config, QwenImageEditPlusPipelineConfig)
-                and batch.negative_prompt
-            ):
-                neg_prompt = (
-                    [batch.negative_prompt]
-                    if isinstance(batch.negative_prompt, str)
-                    else batch.negative_prompt
-                )
-                prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
-                img_prompt_template = (
-                    "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
-                )
-                if isinstance(image, list):
-                    base_img_prompt = ""
-                    for i, img in enumerate(image):
-                        base_img_prompt += img_prompt_template.format(i + 1)
-                elif image is not None:
-                    base_img_prompt = img_prompt_template.format(1)
-                else:
-                    base_img_prompt = ""
-                txt = [
-                    prompt_template_encode.format(base_img_prompt + e)
-                    for e in neg_prompt
-                ]
-                neg_image_processor_kwargs = dict(text=txt, padding=True)
-            elif batch.negative_prompt:
-                prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
-                txt = prompt_template_encode.format(batch.negative_prompt)
-                neg_image_processor_kwargs = dict(text=[txt], padding=True)
-            else:
-                neg_image_processor_kwargs = {}
+            # Prepare kwargs for negative prompt
+            neg_image_processor_kwargs = server_args.pipeline_config.prepare_image_processor_kwargs(
+                batch.negative_prompt, image
+            )
 
             neg_image_inputs = self.image_processor(
-                images=image, return_tensors="pt", **neg_image_processor_kwargs
+                images=prompt_image, return_tensors="pt", **neg_image_processor_kwargs
             ).to(get_local_torch_device())
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -304,7 +250,7 @@ class ImageVAEEncodingStage(PipelineStage):
             all_latent_conditions = []
 
             for img in images:
-                latent_cond = self._process_single_image(
+                latent = self._process_single_image(
                     img,
                     num_frames,
                     vae_dtype,
@@ -312,7 +258,7 @@ class ImageVAEEncodingStage(PipelineStage):
                     batch.generator,
                     server_args.pipeline_config,
                 )
-                all_latent_conditions.append(latent_cond)
+                all_latent_conditions.append(latent)
 
             latent_condition = all_latent_conditions
 
@@ -330,15 +276,67 @@ class ImageVAEEncodingStage(PipelineStage):
 
         if isinstance(server_args.pipeline_config, QwenImageEditPlusPipelineConfig):
             all_image_latents = []
-            for latent_cond in latent_condition:
-                image_latent = self._duplicate_and_pack_latents(
-                    latent_cond, batch_size, server_args
+            for latent in latent_condition:
+                if (
+                    batch_size > latent.shape[0]
+                    and batch_size % latent.shape[0] == 0
+                ):
+                    # expand init_latents for batch_size
+                    additional_image_per_prompt = batch_size // latent.shape[0]
+                    image_latents = torch.cat(
+                        [latent] * additional_image_per_prompt, dim=0
+                    )
+                elif (
+                    batch_size > latent.shape[0]
+                    and batch_size % latent.shape[0] != 0
+                ):
+                    raise ValueError(
+                        f"Cannot duplicate `image` of batch size {latent.shape[0]} to {batch_size} text prompts."
+                    )
+                else:
+                    image_latents = torch.cat([latent], dim=0)
+                image_latent_height, image_latent_width = image_latents.shape[3:]
+                num_channels_latents = (
+                    self.server_args.pipeline_config.dit_config.arch_config.in_channels // 4
                 )
-                all_image_latents.append(image_latent)
+                image_latents = _pack_latents(
+                    image_latents,
+                    batch_size,
+                    num_channels_latents,
+                    image_latent_height,
+                    image_latent_width,
+                )
+                all_image_latents.append(image_latents)
             image_latents = torch.cat(all_image_latents, dim=1)
         elif isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
-            image_latents = self._duplicate_and_pack_latents(
-                latent_condition, batch_size, server_args
+            if (
+                batch_size > latent_condition.shape[0]
+                and batch_size % latent_condition.shape[0] == 0
+            ):
+                # expand init_latents for batch_size
+                additional_image_per_prompt = batch_size // latent_condition.shape[0]
+                image_latents = torch.cat(
+                    [latent_condition] * additional_image_per_prompt, dim=0
+                )
+            elif (
+                batch_size > latent_condition.shape[0]
+                and batch_size % latent_condition.shape[0] != 0
+            ):
+                raise ValueError(
+                    f"Cannot duplicate `image` of batch size {latent_condition.shape[0]} to {batch_size} text prompts."
+                )
+            else:
+                image_latents = torch.cat([latent_condition], dim=0)
+            image_latent_height, image_latent_width = image_latents.shape[3:]
+            num_channels_latents = (
+                self.server_args.pipeline_config.dit_config.arch_config.in_channels // 4
+            )
+            image_latents = _pack_latents(
+                image_latents,
+                batch_size,
+                num_channels_latents,
+                image_latent_height,
+                image_latent_width,
             )
         elif isinstance(server_args.pipeline_config, Flux2PipelineConfig):
             # Pack each latent and concatenate
@@ -389,8 +387,7 @@ class ImageVAEEncodingStage(PipelineStage):
 
         batch.image_latent = image_latents
 
-        if hasattr(self, "maybe_free_model_hooks"):
-            self.maybe_free_model_hooks()
+        self.maybe_free_model_hooks()
 
         self.vae.to("cpu")
 
