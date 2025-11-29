@@ -95,13 +95,19 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     k = weight.shape[0]
                     k_aligned = ceil_align(k, k_align)
                     
+                    print(f"[DEBUG] Linear weight padding: k={k}, k_aligned={k_aligned}, k%32={k%32}, will_pad={k_aligned != k}")
+                    
                     if k_aligned != k:
                         # Pad weight: (k, n) -> (k_aligned, n)
                         weight = torch.nn.functional.pad(weight, (0, 0, 0, k_aligned - k))
+                        print(f"[DEBUG] Padded weight from {k} to {k_aligned}, new shape: {weight.shape}")
                         # Pad weight_scale: (k, 1) -> (k_aligned, 1)
                         if weight_scale.shape[0] == k and len(weight_scale.shape) == 2:
                             weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, k_aligned - k))
+                else:
+                    print(f"[DEBUG] SGLANG_AITER_PAD_K not set or invalid: '{pad_k_align}', weight.shape={weight.shape}")
                 
+                print(f"[DEBUG] About to shuffle_weight with shape {weight.shape}, K%32={weight.shape[0]%32}")
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
                 )
