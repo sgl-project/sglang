@@ -772,6 +772,13 @@ class NixlKVSender(CommonKVSender):
         # Ensure handles are returned even if poll() is not called again
         self._release_xfer_handles()
 
+    def abort(self):
+        # Decode-side cancellation should release handles immediately instead of
+        # waiting for garbage collection at prefill teardown.
+        self._release_xfer_handles()
+        self.has_sent = False
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
 
