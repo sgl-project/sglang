@@ -35,18 +35,6 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
-
-def _pad_moe_weight(weight: torch.Tensor, dim: int, alignment: int) -> torch.Tensor:
-    """Helper to pad MoE weight tensor along specified dimension."""
-    current_size = weight.shape[dim]
-    aligned_size = ceil_align(current_size, alignment)
-    if aligned_size == current_size:
-        return weight
-    
-    pad_sizes = [0] * (len(weight.shape) * 2)
-    pad_sizes[-(dim * 2 + 1)] = aligned_size - current_size
-    return torch.nn.functional.pad(weight, pad_sizes)
-
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
     from sglang.srt.layers.moe.token_dispatcher import (

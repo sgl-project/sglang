@@ -102,23 +102,16 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                     n = weight.shape[1]
                     n_aligned = ceil_align(n, 32)
                     
-                    print(f"[DEBUG] Linear weight padding: k={k}, n={n}, k_aligned={k_aligned}, n_aligned={n_aligned}")
-                    print(f"[DEBUG] k%{k_align}={k%k_align}, n%32={n%32}, will_pad_k={k_aligned != k}, will_pad_n={n_aligned != n}")
-                    
                     need_padding = (k_aligned != k) or (n_aligned != n)
                     if need_padding:
                         # Pad weight: (k, n) -> (k_aligned, n_aligned)
                         weight = torch.nn.functional.pad(weight, (0, n_aligned - n, 0, k_aligned - k))
-                        print(f"[DEBUG] Padded weight from ({k}, {n}) to ({k_aligned}, {n_aligned}), new shape: {weight.shape}")
                         
                         # Pad weight_scale if needed
                         # weight_scale is (k, 1) for channel-wise, pad K dimension
                         if weight_scale.shape[0] == k and len(weight_scale.shape) == 2:
                             weight_scale = torch.nn.functional.pad(weight_scale, (0, 0, 0, k_aligned - k))
-                else:
-                    print(f"[DEBUG] SGLANG_AITER_PAD_K not set or invalid: '{pad_k_align}', weight.shape={weight.shape}")
                 
-                print(f"[DEBUG] About to shuffle_weight with shape {weight.shape}, K%32={weight.shape[0]%32}, N%32={weight.shape[1]%32}")
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
                 )
