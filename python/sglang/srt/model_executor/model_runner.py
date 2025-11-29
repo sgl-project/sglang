@@ -47,7 +47,10 @@ from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
     is_deepseek_nsa,
 )
-from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
+from sglang.srt.configs.update_config import (
+    adjust_config_for_block_quant,
+    adjust_config_with_unaligned_cpu_tp,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
@@ -780,6 +783,12 @@ class ModelRunner:
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             modelopt_config=modelopt_config,
         )
+
+        # Adjust intermediate sizes for block quantization (applies to all devices)
+        self.model_config = adjust_config_for_block_quant(
+            self.model_config, self.load_config, self.tp_size
+        )
+
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size

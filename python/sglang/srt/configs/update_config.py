@@ -77,6 +77,32 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     return model_config
 
 
+def adjust_config_for_block_quant(
+    model_config: ModelConfig, load_config: LoadConfig, tp_size: int
+) -> ModelConfig:
+    """Adjust intermediate sizes to be divisible by block quantization size.
+
+    For block-wise quantization (e.g., FP8 with weight_block_size), the MoE intermediate
+    size per partition must be divisible by block_n. This function pads intermediate
+    sizes as needed to satisfy this constraint.
+    """
+    weight_block_size = may_get_weight_block_size(model_config, load_config)
+    if weight_block_size is None:
+        return model_config
+
+    intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
+    model_config = update_intermediate_size(
+        model_config, "moe_intermediate_size", intermediate_padding_size
+    )
+    model_config = update_intermediate_size(
+        model_config, "intermediate_size", intermediate_padding_size
+    )
+    model_config = update_intermediate_size(
+        model_config, "intermediate_size_mlp", intermediate_padding_size
+    )
+    return model_config
+
+
 def adjust_config_with_unaligned_cpu_tp(
     model_config: ModelConfig, load_config: LoadConfig, tp_size: int
 ) -> ModelConfig:
