@@ -516,14 +516,18 @@ if __name__ == "__main__":
     # Test GetK
     print("Testing GetK...")
     test_getk = TestGetK()
-    test_getk.test_getk_correctness(num_pages=4, seq_len=256, page_size=64, index_head_dim=128)
+    test_getk.test_getk_correctness(
+        num_pages=4, seq_len=256, page_size=64, index_head_dim=128
+    )
     test_getk.test_getk_sequential_pages()
     print("✓ GetK tests passed\n")
 
     # Test GetS
     print("Testing GetS...")
     test_gets = TestGetS()
-    test_gets.test_gets_correctness(num_pages=4, seq_len=256, page_size=64, index_head_dim=128)
+    test_gets.test_gets_correctness(
+        num_pages=4, seq_len=256, page_size=64, index_head_dim=128
+    )
     test_gets.test_gets_sequential_pages()
     print("✓ GetS tests passed\n")
 
