@@ -71,7 +71,6 @@ def _build_sampling_params_from_request(
         server_args=server_args,
         output_file_name=f"{request_id}.{ext}",
     )
-    print(f"74 {sampling_params.negative_prompt=}", flush=True)
     return sampling_params
 
 
@@ -111,7 +110,6 @@ async def generations(
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
-    print(f"112 {batch.negative_prompt=}", flush=True)
     # Run synchronously for images and save to disk
     save_file_path = await process_generation_batch(scheduler_client, batch)
 
@@ -180,7 +178,6 @@ async def edits(
         image_path=input_path,
     )
     batch = _build_req_from_sampling(sampling)
-    print(f"182 {batch.negative_prompt=}", flush=True)
     save_file_path = await process_generation_batch(scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
