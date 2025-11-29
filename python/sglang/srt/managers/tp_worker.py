@@ -395,6 +395,7 @@ class TpModelWorker(BaseTpWorker):
                 logger,
                 f"DP attention: dp_rank={dp_rank_display}/{server_args.dp_size}",
             )
+
     def is_dllm(self):
         return hasattr(self, "dllm_algorithm")
 

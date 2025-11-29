@@ -1495,7 +1495,11 @@ class ModelRunner:
             total_mem_gb=total_gpu_memory,
             rest_mem_gb=rest_memory,
             max_tokens=max_num_token,
-            dp_size=self.server_args.dp_size if self.server_args.enable_dp_attention else None,
+            dp_size=(
+                self.server_args.dp_size
+                if self.server_args.enable_dp_attention
+                else None
+            ),
         )
         return max_num_token
 
@@ -1794,7 +1798,8 @@ class ModelRunner:
                     * self.server_args.speculative_num_steps
                     * self.server_args.speculative_eagle_topk
                     # verify
-                    + max_running_requests * self.server_args.speculative_num_draft_tokens
+                    + max_running_requests
+                    * self.server_args.speculative_num_draft_tokens
                     # buffer
                     + 100
                 )
@@ -1852,7 +1857,9 @@ class ModelRunner:
 
                 # subscribe memory for pre-allocated requests
                 # if max_running_requests <= 32, we pre-allocate 2x requests
-                pre_alloc_size = max_running_requests * 2 if max_running_requests <= 32 else 0
+                pre_alloc_size = (
+                    max_running_requests * 2 if max_running_requests <= 32 else 0
+                )
                 if config := self.mambaish_config:
                     self.req_to_token_pool = HybridMambaDecodeReqToTokenPool(
                         size=max_running_requests,

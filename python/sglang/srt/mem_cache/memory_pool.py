@@ -572,7 +572,7 @@ class MHATokenToKVPool(KVCache):
 
     def _describe_layout(self) -> Optional[str]:
         total_slots = self.size + self.page_size
-        return f"NHD(page={self.page_size}) shape=({total_slots}, {self.head_num}, {self.head_dim})"
+        return f"shape=({total_slots}, {self.head_num}, {self.head_dim}) page={self.page_size}"
 
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
@@ -1440,7 +1440,7 @@ class MLATokenToKVPool(KVCache):
 
     def _describe_layout(self) -> Optional[str]:
         total_slots = self.size + self.page_size
-        return f"N1D(page={self.page_size}) shape=({total_slots}, 1, {self.kv_cache_dim})"
+        return f"shape=({total_slots}, 1, {self.kv_cache_dim}) page={self.page_size}"
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
