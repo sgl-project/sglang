@@ -11,7 +11,6 @@ References:
 
 import os
 import re
-import sys
 import time
 from typing import Any
 
@@ -27,29 +26,20 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.image_processing_eagle2_5_vl_fast import (
-    Eagle2_5_VLImageProcessorFast,
-)
+from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import logger
-
-# Import HF smart_nframes function
-hf_module_path = '/data/hf/modules/transformers_modules/nvidia/Eagle2.5-8B/9d3e0c4ea4025102aafd16baefcccbbd8a9a87be'
-if os.path.exists(hf_module_path):
-    sys.path.insert(0, hf_module_path)
-    from processing_eagle2_5_vl import smart_nframes
-else:
-    raise RuntimeError("Eagle2.5-8B HF module not found. Please ensure the model is downloaded.")
 
 
 
 # Eagle2.5 video preprocessing (adapted from Qwen-VL)
-async def preprocess_eagle_video(vr) -> tuple[torch.Tensor, dict]:
+async def preprocess_eagle_video(vr, video_config: dict = {}) -> tuple[torch.Tensor, dict]:
     """
     Preprocess video for Eagle2.5 model (adapted from Qwen-VL).
 
     Args:
         vr: VideoReader object from decord
+        video_config: Configuration for video processing
 
     Returns:
         Tuple of (processed_video_tensor, metadata_dict)
@@ -57,7 +47,9 @@ async def preprocess_eagle_video(vr) -> tuple[torch.Tensor, dict]:
     entry_time = time.perf_counter()
 
     total_frames, video_fps = len(vr), vr.get_avg_fps()
-    nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
+    nframes = smart_nframes(
+        video_config, total_frames=total_frames, video_fps=video_fps
+    )
 
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
@@ -67,12 +59,16 @@ async def preprocess_eagle_video(vr) -> tuple[torch.Tensor, dict]:
     video = torch.from_numpy(video_np).pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
 
+
+    # Convert frame indices to time in seconds
+    timestamps = (idx / video_fps).tolist()
+
     # Create metadata
     video_metadata = {
         "fps": video_fps,
+        "timestamps": timestamps,    
         "duration": total_frames / video_fps,
         "total_num_frames": total_frames,
-        "frames_indices": idx,
         "video_backend": "torchvision",
     }
 
@@ -106,25 +102,22 @@ class Eagle2_5_VLProcessor(BaseMultimodalProcessor):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         self._processor: ProcessorMixin
+        # maybe remove this if we never use it
+        self.video_config = server_args.mm_process_config.get("video", {})
 
-        # Replace HF image processor with our local modified version to avoid bug in HF fast processor
-        if hasattr(self._processor, "image_processor"):
-            original_config = getattr(self._processor.image_processor, "__dict__", {})
-            self._processor.image_processor = Eagle2_5_VLImageProcessorFast(
-                **original_config
-            )
+        # Use HF image processor directly (our local modifications are no longer needed)
 
         tokenizer: PreTrainedTokenizerBase = getattr(self._processor, "tokenizer")
 
         # Eagle2.5 uses numbered image placeholders like <image-1>, <image-2>
         # We need regex to match these patterns
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<image>",  # Generic representation
+            image_token="<image>",  # Generic representation that gets replaced by <image-1>, <image-2>, etc.
             image_token_id=getattr(hf_config, "image_token_index", 151667),
             image_token_regex=re.compile(
                 r"<image-\d+>"
             ),  # Match <image-1>, <image-2>, etc.
-            video_token="<video>",  # Generic representation
+            video_token="<video>",  # Generic representation that gets replaced by <video-1>, <video-2>, etc.
             video_token_id=getattr(hf_config, "video_token_id", 151670),
             video_token_regex=re.compile(
                 r"<video-\d+>"
@@ -168,18 +161,28 @@ class Eagle2_5_VLProcessor(BaseMultimodalProcessor):
         base_output = self._postprocess_numbered_placeholders(base_output)
 
         # Preprocess videos for Eagle2.5 (adapted from Qwen-VL approach)
-        video_metadata = None
+        video_kwargs = {}
+
         if base_output.videos:
             videos_processed = [
-                await preprocess_eagle_video(video) for video in base_output.videos
+                await preprocess_eagle_video(video, video_config=self.video_config)
+                for video in base_output.videos
             ]
             base_output.videos, video_metadata = map(list, zip(*videos_processed))
+            
+            # Eagle2.5 specific kwargs
+            videos_kwargs = {
+                "fps": [m["fps"] for m in video_metadata],
+                "timestamps": [m["timestamps"] for m in video_metadata],
+                "max_dynamic_tiles": 1,
+                "min_dynamic_tiles": 1,
+                "use_thumbnail": True,
+            }
 
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output,
             self.mm_tokens,
-            # images_kwargs={"resample": 3},  # Pass resample to HF processor
-            # Alternative: {"images_kwargs": {"resample": 3}} if needed
+            videos_kwargs=video_kwargs,
         )
 
         return {
