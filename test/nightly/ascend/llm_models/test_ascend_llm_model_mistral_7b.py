@@ -18,18 +18,18 @@ register_npu_ci(est_time=300, suite="nightly-1-npu", nightly=True)
 class TestMistral(CustomTestCase):
     model = "/root/.cache/modelscope/hub/models/mistralai/Mistral-7B-Instruct-v0.2"
     accuracy = 0.00
+    other_args = (
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.8",
+        "--attention-backend",
+        "ascend",
+        "--disable-cuda-graph",
+    )
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = (
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                "0.8",
-                "--attention-backend",
-                "ascend",
-                "--disable-cuda-graph",
-        )
         os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
         os.environ["ASCEND_MF_STORE_URL"] = "tcp://127.0.0.1:24666"
         os.environ["HCCL_BUFFSIZE"] = "200"
@@ -46,7 +46,7 @@ class TestMistral(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
+            other_args=cls.other_args,
             env=env,
         )
 
