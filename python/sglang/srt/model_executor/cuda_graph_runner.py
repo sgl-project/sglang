@@ -764,14 +764,18 @@ class CudaGraphRunner:
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
-            self.swa_out_cache_loc.zero_()
+            if self.swa_out_cache_loc is not None:
+                self.swa_out_cache_loc.zero_()
 
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
-        self.swa_out_cache_loc[:raw_num_token].copy_(forward_batch.swa_out_cache_loc)
+        if forward_batch.swa_out_cache_loc is not None:
+            self.swa_out_cache_loc[:raw_num_token].copy_(
+                forward_batch.swa_out_cache_loc
+            )
         self.positions[:raw_num_token].copy_(forward_batch.positions)
 
         seq_lens_cpu = None

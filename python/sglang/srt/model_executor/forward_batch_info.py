@@ -330,7 +330,14 @@ class ForwardBatch:
         model_runner: ModelRunner,
     ):
         from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
-        swa_out_cache_loc = model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(batch.out_cache_loc)
+
+        swa_out_cache_loc = (
+            model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
+                batch.out_cache_loc
+            )
+            if hasattr(model_runner.token_to_kv_pool, "full_to_swa_index_mapping")
+            else None
+        )
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -774,7 +781,11 @@ class ForwardBatch:
             )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
-        self.swa_out_cache_loc = self._pad_tensor_to_size(self.swa_out_cache_loc, num_tokens)
+        self.swa_out_cache_loc = (
+            self._pad_tensor_to_size(self.swa_out_cache_loc, num_tokens)
+            if self.swa_out_cache_loc is not None
+            else None
+        )
 
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)

@@ -420,7 +420,11 @@ class LogitsProcessor(nn.Module):
                     - 1
                 )
             pruned_states = hidden_states[last_index]
-            pruned_states_before_norm = hidden_states_before_norm[last_index]
+            pruned_states_before_norm = (
+                hidden_states_before_norm[last_index]
+                if hidden_states_before_norm is not None
+                else None
+            )
             if aux_hidden_states is not None:
                 aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
             sample_indices = None
@@ -473,7 +477,10 @@ class LogitsProcessor(nn.Module):
                 # by a caller.
                 assert extend_len > start_len
                 pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
-                pruned_states_before_norm.append(hidden_states_before_norm[pt + start_len: pt + extend_len])
+                if hidden_states_before_norm is not None:
+                    pruned_states_before_norm.append(
+                        hidden_states_before_norm[pt + start_len : pt + extend_len]
+                    )
                 # Map each token to its sequence index, for chunked computation
                 # of input logprobs
                 token_to_seq_idx.extend([idx] * (extend_len - start_len))
@@ -534,7 +541,10 @@ class LogitsProcessor(nn.Module):
                 assert False, "Should never reach"
 
         del hidden_states
-        if logits_metadata.return_hidden_states_before_norm and hidden_states_to_store_before_norm is not None:
+        if (
+            logits_metadata.return_hidden_states_before_norm
+            and hidden_states_to_store_before_norm is not None
+        ):
             hidden_states_to_store = hidden_states_to_store_before_norm
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
