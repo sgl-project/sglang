@@ -304,7 +304,16 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
-            component_model_path = os.path.join(self.model_path, load_module_name)
+            # Use custom VAE path if provided, otherwise use default path
+            if module_name == "vae" and server_args.vae_path is not None:
+                component_model_path = server_args.vae_path
+                logger.info(
+                    "Using custom VAE path: %s instead of default path: %s",
+                    component_model_path,
+                    os.path.join(self.model_path, load_module_name),
+                )
+            else:
+                component_model_path = os.path.join(self.model_path, load_module_name)
             module = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
                 component_model_path=component_model_path,

@@ -106,7 +106,10 @@ class DecodingStage(PipelineStage):
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)
-        latents = server_args.pipeline_config.preprocess_decoding(latents)
+        # Store VAE reference in server_args for dynamic detection in preprocess_decoding
+        server_args._current_vae = self.vae
+        # Pass server_args to preprocess_decoding for dynamic VAE type detection
+        latents = server_args.pipeline_config.preprocess_decoding(latents, server_args)
 
         # Decode latents
         with torch.autocast(
@@ -120,7 +123,9 @@ class DecodingStage(PipelineStage):
                 pass
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-            image = self.vae.decode(latents)
+            decode_output = self.vae.decode(latents)
+            # Handle DecoderOutput object (has .sample attribute) or direct tensor
+            image = decode_output.sample if hasattr(decode_output, 'sample') else decode_output
 
         # De-normalize image to [0, 1] range
         image = (image / 2 + 0.5).clamp(0, 1)

@@ -252,6 +252,9 @@ class ServerArgs:
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+
+    # VAE parameters
+    vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -373,6 +376,12 @@ class ServerArgs:
             "--model-dir",
             type=str,
             help="Directory containing StepVideo model",
+        )
+        parser.add_argument(
+            "--vae-path",
+            type=str,
+            default=ServerArgs.vae_path,
+            help="Custom path to VAE model (e.g., for distilled autoencoder). If not specified, VAE will be loaded from the main model path.",
         )
 
         # attention
