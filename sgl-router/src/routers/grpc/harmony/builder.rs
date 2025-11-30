@@ -138,13 +138,20 @@ impl HarmonyBuilder {
     ) -> Result<HarmonyBuildOutput, String> {
         let mut all_messages = Vec::new();
 
+        // Extract and merge all user-provided system messages
+        let system_instructions = self.extract_system_messages(&request.messages);
+
         let sys_msg = self.build_system_message_from_chat(request);
         all_messages.push(sys_msg);
 
-        let dev_msg = self.build_developer_message_from_chat(request.tools.as_ref());
+        let dev_msg = self.build_developer_message_from_chat(
+            request.tools.as_ref(),
+            system_instructions.as_deref()
+        );
         all_messages.push(dev_msg);
 
-        let mut user_messages = self.convert_chat_messages(&request.messages)?;
+        // Convert user messages, skipping system messages (already merged into developer message)
+        let mut user_messages = self.convert_chat_messages_skip_system(&request.messages)?;
         all_messages.append(&mut user_messages);
 
         let conversation = Conversation::from_messages(all_messages.clone());
@@ -349,8 +356,12 @@ impl HarmonyBuilder {
         HarmonyMessage::from_role_and_content(Role::Developer, dev_content)
     }
 
-    fn build_developer_message_from_chat(&self, tools: Option<&Vec<Tool>>) -> HarmonyMessage {
-        self.build_developer_message(tools, None)
+    fn build_developer_message_from_chat(
+        &self,
+        tools: Option<&Vec<Tool>>,
+        instructions: Option<&str>
+    ) -> HarmonyMessage {
+        self.build_developer_message(tools, instructions)
     }
 
     /// Build developer message from Responses request
@@ -482,13 +493,6 @@ impl HarmonyBuilder {
         match item {
             // Regular message (user or assistant)
             ResponseInputOutputItem::Message { role, content, .. } => {
-                let harmony_role = match role.as_str() {
-                    "user" => Role::User,
-                    "assistant" => Role::Assistant,
-                    "system" => Role::System,
-                    _ => Role::User, // Default to user for unknown roles
-                };
-
                 // Extract text from content parts
                 let text_parts: Vec<String> = content
                     .iter()
@@ -501,13 +505,25 @@ impl HarmonyBuilder {
 
                 let text = text_parts.join("\n");
 
+                // Handle system messages: convert to developer role with "Instructions:" prefix
+                // This matches the Python implementation in harmony_utils.py
+                let (harmony_role, final_text) = match role.as_str() {
+                    "system" => {
+                        // System messages become developer instructions
+                        (Role::Developer, format!("Instructions:\n{}", text))
+                    }
+                    "user" => (Role::User, text),
+                    "assistant" => (Role::Assistant, text),
+                    _ => (Role::User, text), // Default to user for unknown roles
+                };
+
                 Ok(HarmonyMessage {
                     author: Author {
                         role: harmony_role,
                         name: None,
                     },
                     recipient: None,
-                    content: vec![Content::Text(TextContent { text })],
+                    content: vec![Content::Text(TextContent { text: final_text })],
                     channel: None,
                     content_type: None,
                 })
@@ -668,6 +684,45 @@ impl HarmonyBuilder {
         }
     }
 
+    /// Extract and merge all system messages from user input
+    ///
+    /// System messages are concatenated with newlines and returned as a single string.
+    /// This follows the Harmony convention of merging multiple system messages into
+    /// developer instructions.
+    fn extract_system_messages(&self, messages: &[ChatMessage]) -> Option<String> {
+        let system_texts: Vec<String> = messages
+            .iter()
+            .filter_map(|msg| {
+                if let ChatMessage::System { content, .. } = msg {
+                    Some(content.to_simple_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if system_texts.is_empty() {
+            None
+        } else {
+            Some(system_texts.join("\n"))
+        }
+    }
+
+    /// Convert OpenAI ChatMessage format to Harmony messages, skipping system messages
+    ///
+    /// System messages are handled separately by merging them into developer instructions.
+    /// This method skips system messages during conversion.
+    ///
+    /// - Assistant messages with tool_calls create multiple messages (one per tool call)
+    /// - Tool role messages use Role::Tool with proper author
+    /// - Tool-related messages use channel="commentary"
+    fn convert_chat_messages_skip_system(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Vec<HarmonyMessage>, String> {
+        self.convert_chat_messages(messages, true)
+    }
+
     /// Convert OpenAI ChatMessage format to Harmony messages
     ///
     /// - Assistant messages with tool_calls create multiple messages (one per tool call)
@@ -676,6 +731,7 @@ impl HarmonyBuilder {
     fn convert_chat_messages(
         &self,
         messages: &[ChatMessage],
+        skip_system: bool,
     ) -> Result<Vec<HarmonyMessage>, String> {
         let mut harmony_messages = Vec::new();
 
@@ -696,7 +752,11 @@ impl HarmonyBuilder {
         for msg in messages {
             match msg {
                 ChatMessage::System { content, name } => {
-                    // System messages stay as-is
+                    // Skip system messages if requested (they're merged into developer instructions)
+                    if skip_system {
+                        continue;
+                    }
+                    // System messages stay as-is (for backward compatibility when not skipping)
                     let harmony_msg = HarmonyMessage {
                         author: Author {
                             role: Role::System,
