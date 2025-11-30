@@ -21,6 +21,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.utils import read_video_frames_opencv
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -149,13 +150,24 @@ async def preprocess_video(
 ) -> torch.Tensor:
     entry_time = time.perf_counter()
 
-    total_frames, video_fps = len(vr), vr.get_avg_fps()
+    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.value:
+        import cv2
+
+        total_frames, video_fps = int(vr.get(cv2.CAP_PROP_FRAME_COUNT)), vr.get(
+            cv2.CAP_PROP_FPS
+        )
+    else:
+        total_frames, video_fps = len(vr), vr.get_avg_fps()
+
     nframes = smart_nframes(
         video_config, total_frames=total_frames, video_fps=video_fps
     )
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
-    video_np = vr.get_batch(idx).asnumpy()
+    if envs.SGLANG_USE_OPENCV_VIDEO_BACKEND.value:
+        video_np = read_video_frames_opencv(vr, idx)
+    else:
+        video_np = vr.get_batch(idx).asnumpy()
     video = torch.from_numpy(video_np).pin_memory()
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
 
