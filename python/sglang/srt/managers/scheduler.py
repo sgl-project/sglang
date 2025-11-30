@@ -398,7 +398,10 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid = self.tp_worker.is_hybrid
-        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
+        self.is_hybrid_gdn = (
+            self.tp_worker.model_runner.hybrid_gdn_config is not None
+            or self.tp_worker.model_runner.hybrid_lightning_attn_config is not None
+        )
 
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
