@@ -1,5 +1,4 @@
 import multiprocessing as mp
-import random
 import unittest
 
 import torch
