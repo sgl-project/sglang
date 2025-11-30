@@ -19,7 +19,7 @@ use crate::{
     },
     routers::{
         grpc::error,
-        openai::{conversations::persist_conversation_items, mcp::ensure_request_mcp_client},
+        openai::{conversations::persist_conversation_items, responses::ensure_request_mcp_client},
     },
 };
 

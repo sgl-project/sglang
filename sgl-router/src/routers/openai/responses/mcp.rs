@@ -16,13 +16,12 @@ use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::utils::event_types;
 use crate::{
     mcp,
     protocols::responses::{
         generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
     },
-    routers::header_utils::apply_request_headers,
+    routers::{header_utils::apply_request_headers, openai::utils::event_types},
 };
 
 // ============================================================================
@@ -30,7 +29,6 @@ use crate::{
 // ============================================================================
 
 /// Configuration for MCP tool calling loops
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct McpLoopConfig {
     /// Maximum iterations as safety limit (internal only, default: 10)
@@ -45,7 +43,7 @@ impl Default for McpLoopConfig {
 }
 
 /// State for tracking multi-turn tool calling loop
-pub(crate) struct ToolLoopState {
+pub struct ToolLoopState {
     /// Current iteration number (starts at 0, increments with each tool call)
     pub iteration: usize,
     /// Total number of tool calls executed
