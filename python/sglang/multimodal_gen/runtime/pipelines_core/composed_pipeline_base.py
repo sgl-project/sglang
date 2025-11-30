@@ -110,9 +110,7 @@ class ComposedPipelineBase(ABC):
         self.post_init_called = True
 
         self.initialize_pipeline(self.server_args)
-        if self.server_args.enable_torch_compile:
-            self.modules["transformer"] = torch.compile(self.modules["transformer"])
-            logger.info("Torch Compile enabled for DiT")
+        # NOTE: torch.compile is managed in the denoising stage to cover lazy-load paths.
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
