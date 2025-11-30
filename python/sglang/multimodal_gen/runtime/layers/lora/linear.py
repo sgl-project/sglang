@@ -399,7 +399,9 @@ def wrap_with_lora_layer(
     """
     transform the given layer to its corresponding LoRA layer
     """
-    supported_layer_types: dict[type[LinearBase] | type[nn.Linear], type[BaseLayerWithLoRA]] = {
+    supported_layer_types: dict[
+        type[LinearBase] | type[nn.Linear], type[BaseLayerWithLoRA]
+    ] = {
         # the order matters
         # VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
         QKVParallelLinear: QKVParallelLinearWithLoRA,
@@ -407,10 +409,10 @@ def wrap_with_lora_layer(
         ColumnParallelLinear: ColumnParallelLinearWithLoRA,
         RowParallelLinear: RowParallelLinearWithLoRA,
         ReplicatedLinear: BaseLayerWithLoRA,
-        nn.Linear: LinearWithLoRA, 
+        nn.Linear: LinearWithLoRA,
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
-        if isinstance(layer, src_layer_type):
+        if isinstance(layer, src_layer_type):  # type: ignore[arg-type]
             ret = lora_layer_type(
                 layer,
                 lora_rank=lora_rank,
