@@ -386,6 +386,54 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             )
             return StandardCombineInput(hidden_states=output)
 
+    def forward_xpu(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        moe_runner_config = self.moe_runner_config
+
+        assert (
+            moe_runner_config.activation == "silu"
+        ), f"activation = {moe_runner_config.activation} is not supported."
+
+        backend = self.runner.runner_backend
+        if backend.is_triton():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
+        else:
+            # syl-kernel-xpu path
+            from sgl_kernel import fused_experts
+
+            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+            topk_weights, topk_ids, _ = topk_output
+            x, topk_weights = apply_topk_weights_cpu(
+                moe_runner_config.apply_router_weight_on_input, topk_weights, x
+            )
+            output = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+            )
+            return StandardCombineInput(hidden_states=output)
+
     def forward_npu(
         self,
         layer: torch.nn.Module,
