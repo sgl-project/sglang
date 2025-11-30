@@ -56,6 +56,7 @@ class LoRAManager:
         base_model: torch.nn.Module,
         base_hf_config: AutoConfig,
         max_loras_per_batch: int,
+        max_loras_prefetch: int,
         load_config: LoadConfig,
         dtype: torch.dtype,
         lora_backend: str = "triton",
@@ -69,6 +70,7 @@ class LoRAManager:
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
+        self.max_loras_prefetch: int = max_loras_prefetch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
         self.device: torch.device = next(self.base_model.parameters()).device
@@ -83,6 +85,7 @@ class LoRAManager:
         backend_type = get_backend_from_name(lora_backend)
         self.lora_backend: BaseLoRABackend = backend_type(
             max_loras_per_batch=max_loras_per_batch,
+            max_loras_prefetch=max_loras_prefetch,
             device=self.device,
             server_args=server_args,
         )
@@ -241,7 +244,7 @@ class LoRAManager:
 
         return required_slots <= mem_pool_vacancy
 
-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
+    def prepare_lora_batch(self, forward_batch: ForwardBatch, prefetch=False):
         # Load active loras into lora memory pool
         cur_uids = set(forward_batch.lora_ids)
 
@@ -251,7 +254,11 @@ class LoRAManager:
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
             lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
+            prefetch=prefetch,
         )
+
+        if prefetch:
+            return
 
         # set up batch info shared by all lora modules
         bs = forward_batch.batch_size
@@ -263,8 +270,8 @@ class LoRAManager:
         )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
-        lora_ranks = [0] * self.max_loras_per_batch
-        scalings = [0] * self.max_loras_per_batch
+        lora_ranks = [0] * (self.max_loras_per_batch + self.max_loras_prefetch)
+        scalings = [0] * (self.max_loras_per_batch + self.max_loras_prefetch)
         for i, uid in enumerate(forward_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
@@ -416,6 +423,7 @@ class LoRAManager:
         self.memory_pool = LoRAMemoryPool(
             base_hf_config=self.base_hf_config,
             max_loras_per_batch=self.max_loras_per_batch,
+            max_loras_prefetch=self.max_loras_prefetch,
             dtype=self.dtype,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,

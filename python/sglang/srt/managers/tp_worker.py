@@ -191,6 +191,28 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
+    def prefetch_lora_adapters(self, prefetch_lora_batch: ModelWorkerBatch):
+        prefetch_fwd = ForwardBatch(
+            forward_mode=prefetch_lora_batch.forward_mode,
+            batch_size=len(prefetch_lora_batch.seq_lens),
+            input_ids=prefetch_lora_batch.input_ids,
+            req_pool_indices=prefetch_lora_batch.req_pool_indices,
+            seq_lens=prefetch_lora_batch.seq_lens,
+            out_cache_loc=prefetch_lora_batch.out_cache_loc,
+            seq_lens_sum=prefetch_lora_batch.seq_lens_sum,
+            seq_lens_cpu=prefetch_lora_batch.seq_lens_cpu,
+            orig_seq_lens=prefetch_lora_batch.orig_seq_lens,
+            lora_ids=prefetch_lora_batch.lora_ids,
+        )
+        assert isinstance(prefetch_lora_batch.extend_seq_lens, list)
+        prefetch_fwd.extend_seq_lens = torch.tensor(
+            prefetch_lora_batch.extend_seq_lens, dtype=torch.int32
+        ).to(self.model_runner.device, non_blocking=True)
+        prefetch_fwd.extend_seq_lens_cpu = prefetch_lora_batch.extend_seq_lens
+
+        result = self.model_runner.prefetch_lora_batch(prefetch_fwd)
+        return result
+
     def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
         return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
 

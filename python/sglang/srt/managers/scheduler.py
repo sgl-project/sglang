@@ -255,6 +255,9 @@ class Scheduler(
         )
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.max_loras_prefetch = server_args.max_loras_prefetch
+        self.prefetch_loras_record = set()
+        self.lora_prefetch_executor = futures.ThreadPoolExecutor(max_workers=1)
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -439,6 +442,8 @@ class Scheduler(
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
+        # For profiling batch timing
+        self.last_batch_end_time = None
         self.last_prefill_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
@@ -1689,6 +1694,10 @@ class Scheduler(
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+
+                PREFETCH_LORA_COUNTDOWN = 20
+                if self.forward_ct % PREFETCH_LORA_COUNTDOWN == 0:
+                    self.prefetch_loras()
             else:
                 ret = None
 
@@ -1941,6 +1950,48 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    def prefetch_loras(self):
+        """Prefetch LoRA adapters for next batch in waiting queue"""
+        upper_bound_bs = min(
+            self.max_loras_prefetch,
+            get_global_server_args().pp_max_micro_batch_size,
+        )
+        running_batch_lora_ids = {req.lora_id for req in self.running_batch.reqs}
+        prefetch_lora_reqs = [
+            req
+            for req in self.waiting_queue[:upper_bound_bs]
+            if (
+                req.lora_id is not None
+                and req.lora_id not in running_batch_lora_ids
+                and req.lora_id not in self.prefetch_loras_record
+            )
+        ]
+
+        if len(prefetch_lora_reqs) == 0:
+            return
+
+        prefetch_batch = ScheduleBatch.init_new(
+            prefetch_lora_reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        prefetch_batch.prepare_for_lora_prefetch()
+        prefetch_model_worker_batch = prefetch_batch.get_model_worker_batch()
+
+        prefetch_lora_ids = {req.lora_id for req in prefetch_lora_reqs}
+        print(f"loras in flight: {prefetch_lora_ids}")
+        self.prefetch_loras_record |= prefetch_lora_ids
+        print(f"loras now in prefetch: {self.prefetch_loras_record}")
+
+        self.lora_prefetch_executor.submit(
+            self.tp_worker.prefetch_lora_adapters,
+            prefetch_model_worker_batch,
+        )
+
     # placeholder for override
     def update_cache_from_scheduler(
         self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
@@ -1951,6 +2002,14 @@ class Scheduler(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        # Profiling: Record batch start time
+        batch_start_time = time.perf_counter()
+
+        # Calculate batch interval (time since last batch ended)
+        batch_interval_ms = None
+        if self.last_batch_end_time is not None:
+            batch_interval_ms = (batch_start_time - self.last_batch_end_time) * 1000
+
         self.forward_ct += 1
 
         # Whether to run the profiler
@@ -2071,6 +2130,29 @@ class Scheduler(
             current_time = time.perf_counter()
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
+
+        # Profiling: Calculate forward time and update last_batch_end_time
+        batch_end_time = time.perf_counter()
+        forward_time_ms = (batch_end_time - batch_start_time) * 1000
+        self.last_batch_end_time = batch_end_time
+
+        # Log batch timing (only if LoRA is enabled to reduce noise)
+        if self.enable_lora and batch.forward_mode != ForwardMode.IDLE:
+            has_lora = hasattr(batch, "lora_ids") and batch.lora_ids
+            lora_info = (
+                f", lora_ids={len(set(batch.lora_ids)) if has_lora else 0}"
+                if has_lora
+                else ""
+            )
+            interval_info = (
+                f", interval={batch_interval_ms:.2f}ms"
+                if batch_interval_ms is not None
+                else ""
+            )
+            logger.info(
+                f"🔵 Batch#{self.forward_ct}: forward={forward_time_ms:.2f}ms{interval_info}, "
+                f"mode={batch.forward_mode}, bs={len(batch.reqs)}{lora_info}"
+            )
 
         return ret
 

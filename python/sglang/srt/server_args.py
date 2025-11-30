@@ -365,6 +365,7 @@ class ServerArgs:
     ] = None
     max_loaded_loras: Optional[int] = None
     max_loras_per_batch: int = 8
+    max_loras_prefetch: int = 4
     lora_eviction_policy: str = "lru"
     lora_backend: str = "csgmv"
     max_lora_chunk_size: Optional[int] = 16
@@ -2801,6 +2802,12 @@ class ServerArgs:
             help="Maximum number of adapters for a running batch, include base-only request.",
         )
         parser.add_argument(
+            "--max-loras-prefetch",
+            type=int,
+            default=4,
+            help="Number of adapters to prefetch from the next batch.",
+        )
+        parser.add_argument(
             "--max-loaded-loras",
             type=int,
             default=ServerArgs.max_loaded_loras,
@@ -4101,6 +4108,7 @@ class ServerArgs:
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"
+        assert self.max_loras_prefetch >= 0, "max_loras_prefetch must be non-negative"
 
         # Enable LoRA if any LoRA paths are provided for backward compatibility.
         if self.lora_paths:
@@ -4180,9 +4188,12 @@ class ServerArgs:
 
             # Validate max_loaded_loras
             if self.max_loaded_loras is not None:
-                assert self.max_loaded_loras >= self.max_loras_per_batch, (
-                    "max_loaded_loras should be greater than or equal to max_loras_per_batch. "
-                    f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}"
+                assert (
+                    self.max_loaded_loras
+                    >= self.max_loras_per_batch + self.max_loras_prefetch
+                ), (
+                    "max_loaded_loras should be greater than or equal to max_loras_per_batch + max_loras_prefetch. "
+                    f"max_loaded_loras={self.max_loaded_loras}, max_loras_per_batch={self.max_loras_per_batch}, max_loras_prefetch={self.max_loras_prefetch}"
                 )
                 assert len(self.lora_paths) <= self.max_loaded_loras, (
                     "The number of LoRA paths should not exceed max_loaded_loras. "
