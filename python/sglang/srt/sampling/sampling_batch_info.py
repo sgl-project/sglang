@@ -200,6 +200,9 @@ class SamplingBatchInfo:
         self.move_vocab_mask = first_grammar.move_vocab_mask
 
     def update_regex_vocab_mask(self):
+        if self.vocab_mask is None:
+            return
+
         # Apply the mask
         for i, grammar in enumerate(self.grammars):
             if grammar and not grammar.finished and not grammar.is_terminated():
