@@ -8,13 +8,8 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
-import logging
 
-# Suppress verbose logging from imageio, which is triggered when saving images.
-logging.getLogger("imageio").setLevel(logging.WARNING)
-logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
-
-from sglang.multimodal_gen.configs.sample.base import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
