@@ -1723,6 +1723,12 @@ class ModelRunner:
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
             )
 
+        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if self.is_draft_worker:
+                max_num_reqs = self.server_args.max_num_reqs
+            else:
+                self.server_args.max_num_reqs = max_num_reqs
+
         if max_total_tokens is not None:
             if max_total_tokens > self.max_total_num_tokens:
                 logging.warning(
