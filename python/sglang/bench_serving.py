@@ -1750,7 +1750,7 @@ def calculate_metrics(
         for output in outputs:
             if not output.success:
                 continue
-                
+
             token_times = [output.start_time + output.ttft]
             current_time = token_times[0]
             for itl_value in output.itl:
@@ -1767,7 +1767,9 @@ def calculate_metrics(
                 (output.start_time + output.latency) - min_start_time
             )
 
-            for second in range(request_start_second, min(request_end_second + 1, duration_seconds)):
+            for second in range(
+                request_start_second, min(request_end_second + 1, duration_seconds)
+            ):
                 concurrent_requests_per_second[second] += 1
 
         if len(tokens_per_second) > 0:
