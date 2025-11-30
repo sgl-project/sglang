@@ -13,9 +13,9 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
-
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
+    ChatCompletionResponse,
     MessageProcessingResult,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -69,6 +69,7 @@ class _MockTemplateManager:
         self.chat_template_name: Optional[str] = "llama-3"
         self.jinja_template_content_format: Optional[str] = None
         self.completion_template_name: Optional[str] = None
+        self.force_reasoning: bool = True
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -99,9 +100,12 @@ class ServingChatTestCase(unittest.TestCase):
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
-        ) as conv_mock, patch.object(self.chat, "_process_messages") as proc_mock:
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            ) as conv_mock,
+            patch.object(self.chat, "_process_messages") as proc_mock,
+        ):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_ins.image_data = conv_ins.audio_data = None
@@ -572,6 +576,137 @@ class ServingChatTestCase(unittest.TestCase):
             payload = json.loads(line[len("data: ") :])
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
+
+    def test_gpt_oss_reasoning_and_tool_call(self):
+        """Ensure a GPT OSS style response with both reasoning and tool_call is handled correctly."""
+
+        self.chat.tool_call_parser = "gpt-oss"
+        self.chat.tokenizer_manager.server_args.reasoning_parser = "gpt-oss"
+
+        # Prepare request with tools
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=False,
+        )
+
+        ret = [
+            {
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "prompt_tokens": 100,
+                    "completion_tokens": 42,
+                    "weight_version": "1.0",
+                },
+                "text": (
+                    "<|channel|>analysis<|message|>Need to use function get_weather.<|end|>"
+                    "<|start|>assistant<|channel|>"
+                    'commentary to=functions.get_weather<|constrain|>json<|message|>{"location": "SF"}<|return|>'
+                ),
+            }
+        ]
+
+        result = self.chat._build_chat_response(req, ret, 0)
+
+        self.assertIsInstance(result, ChatCompletionResponse)
+        self.assertEqual(len(result.choices), 1)
+        self.assertEqual(result.choices[0].message.role, "assistant")
+        self.assertIsNone(result.choices[0].message.content)
+        self.assertEqual(
+            result.choices[0].message.reasoning_content,
+            "Need to use function get_weather.",
+        )
+        self.assertEqual(len(result.choices[0].message.tool_calls), 1)
+        self.assertEqual(result.choices[0].finish_reason, "tool_calls")
+
+    def test_gpt_oss_reasoning_and_tool_call_in_analysis_channel(self):
+        """Ensure a GPT OSS style response with both reasoning and tool_call is handled correctly."""
+
+        self.chat.tool_call_parser = "gpt-oss"
+        self.chat.tokenizer_manager.server_args.reasoning_parser = "gpt-oss"
+
+        # Prepare request with tools
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is the weather?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=False,
+        )
+
+        ret = [
+            {
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "prompt_tokens": 100,
+                    "completion_tokens": 42,
+                    "weight_version": "1.0",
+                },
+                "text": (
+                    "<|channel|>analysis<|message|>Need to use function get_weather.<|end|>"
+                    "<|start|>assistant<|channel|>"
+                    'analysis to=functions.get_weather<|constrain|>json<|message|>{"location": "SF"}<|return|>'
+                ),
+            }
+        ]
+
+        result = self.chat._build_chat_response(req, ret, 0)
+
+        self.assertIsInstance(result, ChatCompletionResponse)
+        self.assertEqual(len(result.choices), 1)
+        self.assertEqual(result.choices[0].message.role, "assistant")
+        self.assertIsNone(result.choices[0].message.content)
+        self.assertEqual(
+            result.choices[0].message.reasoning_content,
+            "Need to use function get_weather.",
+        )
+        self.assertEqual(len(result.choices[0].message.tool_calls), 1)
+        self.assertEqual(result.choices[0].finish_reason, "tool_calls")
+
+    def test_gpt_oss_reasoning_no_tool_call(self):
+        """Ensure a GPT OSS style response with reasoning and no tool_call is handled correctly."""
+
+        self.chat.tool_call_parser = "gpt-oss"
+        self.chat.tokenizer_manager.server_args.reasoning_parser = "gpt-oss"
+
+        # Prepare request with tools
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            stream=False,
+        )
+
+        ret = [
+            {
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "prompt_tokens": 100,
+                    "completion_tokens": 42,
+                    "weight_version": "1.0",
+                },
+                "text": (
+                    "<|channel|>analysis<|message|>Say hi back.<|end|>"
+                    "<|start|>assistant<|channel|>final<|message|>Hi!<|return|>"
+                ),
+            }
+        ]
+
+        result = self.chat._build_chat_response(req, ret, 0)
+
+        self.assertIsInstance(result, ChatCompletionResponse)
+        self.assertEqual(len(result.choices), 1)
+        self.assertEqual(result.choices[0].message.role, "assistant")
+        self.assertEqual(result.choices[0].message.content, "Hi!")  # no return tag
+        self.assertEqual(
+            result.choices[0].message.reasoning_content,
+            "Say hi back.",
+        )
+        self.assertIsNone(result.choices[0].message.tool_calls)
+        self.assertEqual(result.choices[0].finish_reason, "stop")
 
 
 if __name__ == "__main__":
