@@ -294,7 +294,7 @@ class SchedulerProfilerMixin:
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
             self.rpd_profiler = None
-            self.rpd_profiler_path = None
+            self.rpd_profile_path = None
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
