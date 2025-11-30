@@ -266,6 +266,20 @@ class SchedulerPPMixin:
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
+                if self.cur_batch:
+                    tmp_result = GenerationBatchResult(
+                        logits_output=None,
+                        pp_hidden_states_proxy_tensors=None,
+                        next_token_ids=(
+                            next_token_ids if self.pp_group.is_last_rank else None
+                        ),
+                        extend_input_len_per_req=None,
+                        extend_logprob_start_len_per_req=None,
+                        can_run_cuda_graph=result.can_run_cuda_graph,
+                    )
+                    self.send_kv_chunk_pp_disagg_prefill(
+                        self.cur_batch.copy(), tmp_result
+                    )
 
                 if ENABLE_RELEASE:
                     if self.pp_group.is_last_rank:
@@ -294,7 +308,7 @@ class SchedulerPPMixin:
                         extend_logprob_start_len_per_req=None,
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
-                    self.process_batch_result_disagg_prefill(
+                    self.process_batch_result_pp_disagg_prefill(
                         mbs[next_mb_id], output_result
                     )
 
