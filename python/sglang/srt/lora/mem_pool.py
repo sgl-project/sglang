@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import time
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -89,6 +90,12 @@ class LoRAMemoryPool:
         self.buffer_id_to_uid: List[Union[str, None, EmptySlot]] = [EMPTY_SLOT] * (
             self.max_loras_per_batch + self.max_loras_prefetch
         )
+
+        self.device = next(base_model.parameters()).device
+        if self.device.type == "cuda":
+            self.prefetch_stream = torch.cuda.Stream(device=self.device)
+        else:
+            self.prefetch_stream = None
 
         self.init_buffers(base_model)
 
@@ -197,99 +204,110 @@ class LoRAMemoryPool:
         lora_refs: Dict[str, LoRARef],
         prefetch: bool,
     ):
-        start_time = time.perf_counter()
-        num_loaded = 0
-        eviction_time = 0.0
-        loading_time = 0.0
-
-        def get_available_buffer_slot():
-            # 1. Prioritize empty slots
-            start_slot, stop_slot = (
-                (0, self.max_loras_per_batch)
-                if not prefetch
-                else (
-                    self.max_loras_per_batch,
-                    self.max_loras_per_batch + self.max_loras_prefetch,
-                )
+        stream_ctx = (
+            torch.cuda.stream(self.prefetch_stream)
+            if prefetch and self.prefetch_stream is not None
+            else (
+                torch.cuda.stream(torch.cuda.current_stream(self.device))
+                if self.device.type == "cuda"
+                else contextlib.nullcontext()
             )
+        )
 
-            for buffer_id in range(start_slot, stop_slot):
-                if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
-                    return buffer_id
+        with stream_ctx:
+            start_time = time.perf_counter()
+            num_loaded = 0
+            eviction_time = 0.0
+            loading_time = 0.0
 
-            # 2. Memory pool is full, need to evict using policy
-            candidates = set()
+            def get_available_buffer_slot():
+                # 1. Prioritize empty slots
+                start_slot, stop_slot = (
+                    (0, self.max_loras_per_batch)
+                    if not prefetch
+                    else (
+                        self.max_loras_per_batch,
+                        self.max_loras_per_batch + self.max_loras_prefetch,
+                    )
+                )
 
-            for buffer_id in range(self.max_loras_per_batch):
-                uid = self.buffer_id_to_uid[buffer_id]
+                for buffer_id in range(start_slot, stop_slot):
+                    if self.buffer_id_to_uid[buffer_id] == EMPTY_SLOT:
+                        return buffer_id
 
-                # Skip if this adapter is needed by current batch
-                # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
-                if uid in cur_uids:
-                    continue
+                # 2. Memory pool is full, need to evict using policy
+                candidates = set()
 
-                # Skip if this adapter is pinned (base model cannot be pinned, so can be evicted)
-                if uid is not None:
-                    lora_ref = lora_refs.get(uid)
-                    if lora_ref and lora_ref.pinned:
+                for buffer_id in range(self.max_loras_per_batch):
+                    uid = self.buffer_id_to_uid[buffer_id]
+
+                    # Skip if this adapter is needed by current batch
+                    # TODO (lifuhuang): we might consider supporting pinning base model (uid == None) in the future.
+                    if uid in cur_uids:
                         continue
-                candidates.add(uid)
 
-            if not candidates:
-                raise ValueError(
-                    "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
+                    # Skip if this adapter is pinned (base model cannot be pinned, so can be evicted)
+                    if uid is not None:
+                        lora_ref = lora_refs.get(uid)
+                        if lora_ref and lora_ref.pinned:
+                            continue
+                    candidates.add(uid)
+
+                if not candidates:
+                    raise ValueError(
+                        "No available buffer slots found. Please ensure the number of active (pinned) loras is less than max_loras_per_batch."
+                    )
+
+                # Select victim using eviction policy
+                evict_start = time.perf_counter()
+                victim_uid = self.eviction_policy.select_victim(candidates)
+
+                # Evict the selected victim
+                victim_buffer_id = self.uid_to_buffer_id[victim_uid]
+                self.uid_to_buffer_id.pop(victim_uid)
+                self.eviction_policy.remove(victim_uid)
+                self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
+                nonlocal eviction_time
+                eviction_time += (time.perf_counter() - evict_start) * 1000
+                logger.debug(
+                    f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
+                )
+                return victim_buffer_id
+
+            # Mark all adapters in current batch as used (for LRU tracking)
+            for uid in cur_uids:
+                self.eviction_policy.mark_used(uid)
+
+            for uid in cur_uids:
+                if uid not in self.uid_to_buffer_id:
+                    load_start = time.perf_counter()
+                    buffer_id = get_available_buffer_slot()
+                    lora_adapter = lora_adapters.get(uid, None)
+                    self.load_lora_weight_to_buffer(
+                        uid, buffer_id, lora_adapter, lora_modules
+                    )
+                    self.uid_to_buffer_id[uid] = buffer_id
+                    self.buffer_id_to_uid[buffer_id] = uid
+                    num_loaded += 1
+                    load_time = (time.perf_counter() - load_start) * 1000
+                    loading_time += load_time
+                    logger.info(f"🔴 LoRA loading: {load_time:.2f}ms, uid={uid}")
+
+            total_time = (time.perf_counter() - start_time) * 1000
+            if num_loaded > 0:
+                headline = (
+                    f"📊 prepare_lora_batch breakdown"
+                    if not prefetch
+                    else f"🚌 prepare_lora_batch breakdown for prefetch"
                 )
 
-            # Select victim using eviction policy
-            evict_start = time.perf_counter()
-            victim_uid = self.eviction_policy.select_victim(candidates)
-
-            # Evict the selected victim
-            victim_buffer_id = self.uid_to_buffer_id[victim_uid]
-            self.uid_to_buffer_id.pop(victim_uid)
-            self.eviction_policy.remove(victim_uid)
-            self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
-            nonlocal eviction_time
-            eviction_time += (time.perf_counter() - evict_start) * 1000
-            logger.debug(
-                f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
-            )
-            return victim_buffer_id
-
-        # Mark all adapters in current batch as used (for LRU tracking)
-        for uid in cur_uids:
-            self.eviction_policy.mark_used(uid)
-
-        for uid in cur_uids:
-            if uid not in self.uid_to_buffer_id:
-                load_start = time.perf_counter()
-                buffer_id = get_available_buffer_slot()
-                lora_adapter = lora_adapters.get(uid, None)
-                self.load_lora_weight_to_buffer(
-                    uid, buffer_id, lora_adapter, lora_modules
+                logger.info(
+                    f"{headline}, "
+                    f"total={total_time:.2f}ms, "
+                    f"eviction={eviction_time:.2f}ms, "
+                    f"loading={loading_time:.2f}ms, "
+                    f"loaded={num_loaded} adapters"
                 )
-                self.uid_to_buffer_id[uid] = buffer_id
-                self.buffer_id_to_uid[buffer_id] = uid
-                num_loaded += 1
-                load_time = (time.perf_counter() - load_start) * 1000
-                loading_time += load_time
-                logger.info(f"🔴 LoRA loading: {load_time:.2f}ms, uid={uid}")
-
-        total_time = (time.perf_counter() - start_time) * 1000
-        if num_loaded > 0:
-            headline = (
-                f"📊 prepare_lora_batch breakdown"
-                if not prefetch
-                else f"🚌 prepare_lora_batch breakdown for prefetch"
-            )
-
-            logger.info(
-                f"{headline}, "
-                f"total={total_time:.2f}ms, "
-                f"eviction={eviction_time:.2f}ms, "
-                f"loading={loading_time:.2f}ms, "
-                f"loaded={num_loaded} adapters"
-            )
 
     def load_lora_weight_to_buffer(
         self,
