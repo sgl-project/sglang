@@ -91,6 +91,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   m.def(
+      "mla_rope_quantize_fp8_fused(Tensor q_nope, Tensor q_rope, Tensor k_nope, Tensor k_rope, "
+      "Tensor cos_sin_cache, Tensor pos_ids, bool is_neox, Tensor! q_out, "
+      "Tensor!? k_nope_out, Tensor!? k_rope_out, Tensor? kv_buffer, Tensor? kv_cache_loc) -> ()");
+  m.impl("mla_rope_quantize_fp8_fused", torch::kCUDA, &mla_rope_quantize_fp8_fused);
+
+  m.def(
       "downcast_fp8(Tensor k, Tensor v, Tensor k_out, Tensor v_out, Tensor k_scale, Tensor v_scale, Tensor loc, "
       "int mult, int offset) -> ()");
   m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);
