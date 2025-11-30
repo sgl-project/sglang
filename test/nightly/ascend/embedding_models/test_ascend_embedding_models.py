@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     get_similarities,
 )
 
-register_npu_ci(est_time=400, suite="nightly-1-npu", nightly=True)
+register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
 MODELS = [
