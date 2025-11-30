@@ -76,7 +76,8 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
-        self.disabled = True
+        self.disabled = True # This can be modified in-place by context manager
+        self.original_disabled = False # To store the original state
 
         if not custom_ar:
             # disable because of missing custom allreduce library
