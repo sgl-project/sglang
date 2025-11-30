@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
 from typing import Any
 
+import PIL
 import torch
-from diffusers.image_processor import VaeImageProcessor
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models import (
@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.models.vision_utils import get_default_height_width
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
@@ -105,7 +106,7 @@ def shard_rotary_emb_for_sp(emb):
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
 
-    task_type: ModelTaskType
+    task_type: ModelTaskType = ModelTaskType.I2I
 
     model_path: str = ""
     pipeline_config_path: str | None = None
@@ -149,6 +150,8 @@ class PipelineConfig:
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (preprocess_text,)
     )
+
+    # get prompt_embeds from encoder output
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.tensor], ...] = (
         field(default_factory=lambda: (postprocess_text,))
     )
@@ -172,21 +175,26 @@ class PipelineConfig:
     # Compilation
     # enable_torch_compile: bool = False
 
+    # calculate the adjust size for condition image
+    # width: original condition image width
+    # height: original condition image height
+    def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
+        vae_scale_factor = self.vae_config.arch_config.spatial_compression_ratio
+        height, width = get_default_height_width(image, vae_scale_factor, height, width)
+        return width, height
+
+    def resize_condition_image(self, image, target_width, target_height):
+        return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+
     def slice_noise_pred(self, noise, latents):
         return noise
-
-    def adjust_size(self, width, height, image):
-        """
-        image: input image
-        """
-        return width, height
 
     def adjust_num_frames(self, num_frames):
         return num_frames
 
-    # called in ImageEncodingStage, preprocess the image
-    def preprocess_image(self, image, image_processor: VaeImageProcessor):
-        return image
+    # tokenize the prompt
+    def tokenize_prompt(self, prompt: list[str], tokenizer, tok_kwargs) -> dict:
+        return tokenizer(prompt, **tok_kwargs)
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = batch.height // self.vae_config.arch_config.spatial_compression_ratio
@@ -203,8 +211,30 @@ class PipelineConfig:
 
         return shape
 
+    def get_decode_scale_and_shift(self, device, dtype, vae):
+        vae_arch_config = self.vae_config.arch_config
+        scaling_factor = getattr(vae_arch_config, "scaling_factor", None)
+        if scaling_factor is None:
+            scaling_factor = getattr(vae, "scaling_factor", None)
+
+        shift_factor = getattr(vae_arch_config, "shift_factor", None)
+        if shift_factor is None:
+            shift_factor = getattr(vae, "shift_factor", None)
+        return scaling_factor, shift_factor
+
     # called after latents are prepared
     def maybe_pack_latents(self, latents, batch_size, batch):
+        return latents
+
+    def maybe_prepare_latent_ids(self, latents):
+        return None
+
+    # called after vae encode
+    def post_process_vae_encode(self, image_latents, vae):
+        return image_latents
+
+    # called after scale_and_shift, before vae decoding
+    def preprocess_decoding(self, latents):
         return latents
 
     def gather_latents_for_sp(self, latents):
