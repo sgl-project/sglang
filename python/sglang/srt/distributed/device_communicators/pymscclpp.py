@@ -11,24 +11,11 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
 
 from sglang.srt import _custom_ops as ops
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
-_is_cuda = is_cuda()
 _is_hip = is_hip()
-
-mscclpp_is_available = False
-if _is_hip:
-    # TODO(zyksir): mscclpp is untested on AMD and therefore disabled.
-    mscclpp_is_available = False
-if _is_cuda:
-    try:
-        import sgl_kernel  # noqa: F401
-
-        mscclpp_is_available = True
-    except:
-        mscclpp_is_available = False
 
 
 class MscclContextSelection(IntEnum):
@@ -127,7 +114,7 @@ class PyMscclppCommunicator:
         self._IS_CAPTURING = False
         self.disabled = True
 
-        if not mscclpp_is_available:
+        if not ops.IS_MSCCLPP_AR_AVAILABLE:
             # disable because of missing mscclpp library
             # e.g. in a non-cuda environment
             return
