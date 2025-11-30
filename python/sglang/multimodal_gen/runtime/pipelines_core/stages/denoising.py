@@ -790,6 +790,52 @@ class DenoisingStage(PipelineStage):
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
 
+        # Warmup
+        logger.info("Performing 1-step warmup")
+        with torch.autocast(
+            device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+            dtype=target_dtype,
+            enabled=autocast_enabled,
+        ):
+            t_warmup = timesteps[0]
+            _warmup_ts = self.expand_timestep_before_forward(
+                batch,
+                server_args,
+                t_warmup,
+                target_dtype,
+                seq_len,
+                reserved_frames_mask,
+            )
+            latent_warmup = latents.to(target_dtype)
+            if batch.image_latent is not None:
+                assert (
+                    not server_args.pipeline_config.task_type == ModelTaskType.TI2V
+                ), "image latents should not be provided for TI2V task"
+                latent_warmup = torch.cat(
+                    [latent_warmup, batch.image_latent], dim=1
+                ).to(target_dtype)
+
+            latent_warmup = self.scheduler.scale_model_input(latent_warmup, t_warmup)
+            attn_metadata_warmup = self._build_attn_metadata(0, batch, server_args)
+
+            self._predict_noise_with_cfg(
+                self.transformer,
+                latent_warmup,
+                _warmup_ts,
+                batch,
+                0,
+                attn_metadata_warmup,
+                target_dtype,
+                batch.guidance_scale,
+                image_kwargs,
+                pos_cond_kwargs,
+                neg_cond_kwargs,
+                server_args,
+                guidance=guidance,
+                latents=latents,
+            )
+        logger.info("Warmup done.")
+
         # Run denoising loop
         denoising_start_time = time.time()
 
