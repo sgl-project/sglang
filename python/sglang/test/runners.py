@@ -416,7 +416,7 @@ class HFRunner:
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
-                input_ids = tokenizer.encode(p, return_tensors="pt")..to(device)
+                input_ids = tokenizer.encode(p, return_tensors="pt").to(device)
             else:
                 input_ids = torch.tensor([p], device=device)
 
