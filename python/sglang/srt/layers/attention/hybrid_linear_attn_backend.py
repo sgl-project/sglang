@@ -133,7 +133,9 @@ class MambaAttnBackendBase(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        prefix_lens: Optional[torch.Tensor],
     ):
+        assert prefix_lens is None, "DLLM extend is not supported"
         self.forward_metadata = self._capture_metadata(
             bs, req_pool_indices, forward_mode, spec_info
         )
@@ -148,7 +150,9 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        prefix_lens: Optional[torch.Tensor],
     ):
+        assert prefix_lens is None, "DLLM extend is not supported"
         self.forward_metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
@@ -760,7 +764,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        prefix_lens: Optional[torch.Tensor],
     ):
+        assert prefix_lens is None, "DLLM extend is not supported"
         metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
         self.forward_metadata = Mamba2Metadata.prepare_decode(
             metadata.query_start_loc, metadata.mamba_cache_indices, seq_lens
@@ -776,7 +782,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        prefix_lens: Optional[torch.Tensor],
     ):
+        assert prefix_lens is None, "DLLM extend is not supported"
         metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
         )
@@ -846,7 +854,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        prefix_lens: Optional[torch.Tensor],
     ):
+        assert prefix_lens is None, "DLLM extend is not supported"
+
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
@@ -868,7 +879,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        prefix_lens: Optional[torch.Tensor],
     ):
+        assert prefix_lens is None, "DLLM extend is not supported"
+
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,

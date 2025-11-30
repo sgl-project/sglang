@@ -540,6 +540,7 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        prefix_lens: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -635,6 +636,35 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_dllm_extend():
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend="fa2",
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    )
+                )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),  # may add a little overhead in capture stage
+                seq_lens_sum,
+                prefix_lens=prefix_lens,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=True,
+                encoder_lens=encoder_lens,
+                spec_info=None,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -648,6 +678,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        prefix_lens: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -684,6 +715,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+            )
+        elif forward_mode.is_dllm_extend():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=prefix_lens,
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=True,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=None,
             )
         else:
             raise ValueError("Invalid forward mode")
