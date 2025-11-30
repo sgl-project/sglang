@@ -1674,6 +1674,7 @@ def calculate_metrics(
     tokenizer: PreTrainedTokenizerBase,
     backend: str,
     accept_length: Optional[float] = None,
+    plot_throughput: bool = False,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -1776,23 +1777,28 @@ def calculate_metrics(
             max_output_tokens_per_s = float(np.max(tokens_per_second))
             max_concurrent_requests = int(np.max(concurrent_requests_per_second))
 
-        if TERM_PLOTLIB_AVAILABLE:
-            import termplotlib as tpl
+        if plot_throughput:
+            if TERM_PLOTLIB_AVAILABLE:
+                import termplotlib as tpl
 
-            fig = tpl.figure()
-            fig.plot(
-                np.arange(len(tokens_per_second)),
-                tokens_per_second,
-                title="Output tokens per second",
-            )
-            fig.plot(
-                np.arange(len(concurrent_requests_per_second)),
-                concurrent_requests_per_second,
-                title="Concurrent requests per second",
-            )
-            fig.show()
-        else:
-            print("tip: install termplotlib and gnuplot to plot the metrics")
+                fig = tpl.figure()
+                fig.plot(
+                    np.arange(len(tokens_per_second)),
+                    tokens_per_second,
+                    title="Output tokens per second",
+                    xlabel="Time (seconds)",
+                    ylabel="Tokens/s",
+                )
+                fig.plot(
+                    np.arange(len(concurrent_requests_per_second)),
+                    concurrent_requests_per_second,
+                    title="Concurrent requests per second",
+                    xlabel="Time (seconds)",
+                    ylabel="Requests",
+                )
+                fig.show()
+            else:
+                print("tip: install termplotlib and gnuplot to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
@@ -2082,6 +2088,7 @@ async def benchmark(
         tokenizer=tokenizer,
         backend=backend,
         accept_length=accept_length,
+        plot_throughput=args.plot_throughput,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -2299,6 +2306,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
+
+    if not hasattr(args, "plot_throughput"):
+        args.plot_throughput = False
 
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
@@ -2690,6 +2700,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--plot-throughput",
+        action="store_true",
+        help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot.",
     )
     # TODO unify all these
     parser.add_argument(
