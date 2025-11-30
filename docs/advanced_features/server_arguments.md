@@ -272,6 +272,15 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--speculative-ngram-branch-length` | The branch length for ngram speculative decoding. | `18` | Type: int |
 | `--speculative-ngram-capacity` | The cache capacity for ngram speculative decoding. | `10000000` | Type: int |
 
+## Speculative Eagle hidden states dumping
+| Argument | Description | Defaults | Options |
+| ---| --- | --- | --- |
+| `--speculative-eagle-enable-dump-hidden-states` | Enable dumping hidden states generated during EAGLE speculative decoding. | `False` | Bool flag (set to enable) |
+| `--speculative-eagle-hidden-states-dump-path` | Directory path where EAGLE speculative hidden states will be dumped. | `None` | Type: str |
+| `--speculative-eagle-dump-accept-rate-threshold` | Dump hidden states only when EAGLE speculative acceptance rate is below this threshold. | `1.0` | Type: float |
+| `--speculative-eagle-dump-worker-num` | Number of worker processes used for dumping hidden states. | `1` | Type: int |
+| `--speculative-eagle-dump-buffer-pool-size` | Size of the reusable buffer pool used for hidden-state dumping. | `64` | Type: int |
+
 ## Expert parallelism
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |

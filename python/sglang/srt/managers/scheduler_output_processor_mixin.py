@@ -139,20 +139,35 @@ class SchedulerOutputProcessorMixin:
                             )
                         logprob_pt += num_input_logprobs
 
+                    slice_range = slice(
+                        hidden_state_offset,
+                        hidden_state_offset := hidden_state_offset
+                        + len(req.origin_input_ids),
+                    )
+
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
                     ):
                         req.hidden_states.append(
-                            logits_output.hidden_states[
-                                hidden_state_offset : (
-                                    hidden_state_offset := hidden_state_offset
-                                    + len(req.origin_input_ids)
-                                )
-                            ]
+                            logits_output.hidden_states[slice_range]
                             .cpu()
                             .clone()
                             .tolist()
+                        )
+
+                    # Collect hidden states for dumping as torch.Tensor
+                    # These will be concatenated and saved later
+                    if (
+                        self.server_args.speculative_eagle_enable_dump_hidden_states
+                        and logits_output.hidden_states is not None
+                        and logits_output.last_hidden_states is not None
+                    ):
+                        req.hidden_states_for_dump = logits_output.hidden_states[
+                            slice_range
+                        ]
+                        req.last_hidden_states_for_dump = (
+                            logits_output.last_hidden_states[slice_range]
                         )
 
                     if req.grammar is not None:

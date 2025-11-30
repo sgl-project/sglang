@@ -38,6 +38,7 @@ from sglang.srt.speculative.eagle_info import (
     EagleVerifyOutput,
 )
 from sglang.srt.speculative.eagle_utils import (
+    HiddenStateDumper,
     build_tree_kernel_efficient,
     organize_draft_results,
 )
@@ -190,6 +191,16 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+        # Dump hidden states setup
+        if server_args.speculative_eagle_enable_dump_hidden_states:
+            assert server_args.speculative_eagle_hidden_states_dump_path is not None, (
+                "`speculative_eagle_hidden_states_dump_path` must be specified when "
+                "`speculative_eagle_enable_dump_hidden_states` is set"
+            )
+            self.dump_worker = HiddenStateDumper(
+                server_args, tp_rank=self.tp_rank, tp_size=self.tp_size
+            )
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -692,6 +703,12 @@ class EAGLEWorker(TpModelWorker):
             batch_result.can_run_cuda_graph,
         )
 
+        if (
+            self.server_args.speculative_eagle_enable_dump_hidden_states
+            and self.dump_worker.payloads is not None
+        ):
+            self.dump_worker.process_dump_payload()
+
         vocab_mask = None
         if batch.has_grammar:
             # Generate the logit mask for structured output.
@@ -730,6 +747,9 @@ class EAGLEWorker(TpModelWorker):
             res.accepted_indices
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+        logits_output.last_hidden_states = logits_output.last_hidden_states[
+            res.accepted_indices
+        ]
 
         if self.target_worker.model_runner.hybrid_gdn_config is not None:
             accepted_length = (
@@ -780,6 +800,16 @@ class EAGLEWorker(TpModelWorker):
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = res.draft_input
+
+        if self.server_args.speculative_eagle_enable_dump_hidden_states:
+            self.dump_worker.prepare_payload(
+                list(batch.reqs),
+                logits_output.hidden_states,
+                logits_output.last_hidden_states,
+                res.accept_length_per_req_cpu,
+            )
+            if all(req.finished() for req in batch.reqs):
+                self.dump_worker.process_dump_payload()
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
