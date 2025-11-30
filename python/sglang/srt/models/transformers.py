@@ -38,7 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_weights_loader import AutoWeightsLoader
 
 logger = logging.getLogger(__name__)
 
@@ -276,13 +276,22 @@ class TransformersForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if name not in params_dict:
-                name = f"{self.model.base_model_prefix}.{name}"
-            if name in params_dict:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        base_prefix = getattr(self.model, "base_model_prefix", "") or ""
+
+        if base_prefix:
+            full_prefix = f"{base_prefix}."
+
+            def remap():
+                for name, tensor in weights:
+                    target = name if name in params_dict else f"{full_prefix}{name}"
+                    yield target, tensor
+
+            stream = remap()
+        else:
+            stream = weights
+
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(stream)
 
 
 EntryClass = [TransformersForCausalLM]
