@@ -53,6 +53,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
@@ -72,30 +73,12 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import kimi_k2_moe_fused_gate, moe_fused_gate
+    from sgl_kernel import moe_fused_gate
 
-    @torch.library.register_fake("sgl_kernel::kimi_k2_moe_fused_gate")
-    def _kimi_k2_moe_fused_gate(
-        input_tensor,
-        bias,
-        topk,
-        renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
-    ):
-        num_rows = input_tensor.shape[0]
-        topk_weights = input_tensor.new_empty(
-            num_rows,
-            topk,
-            dtype=torch.float32,
-        )
-        topk_ids = input_tensor.new_empty(
-            num_rows,
-            topk,
-            dtype=torch.int32,
-        )
-        return topk_weights, topk_ids
-
+    try:
+        from sgl_kernel import kimi_k2_moe_fused_gate
+    except ImportError as e:
+        pass
 
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
@@ -106,6 +89,7 @@ if _use_aiter:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 # -------------------------------- TopKConfig ---------------------------------------
 
@@ -354,15 +338,14 @@ class TopK(CustomOp):
                 router_logits,
                 k=self.topk_config.top_k,
             )
-            topk_weights = topk_weights.to(torch.float32)
 
             if renormalize:
-                topk_weights_sum = (
-                    topk_weights.sum(dim=-1, keepdim=True)
+                topk_weights = l1_norm(
+                    topk_weights
                     if self.topk_config.num_fused_shared_experts == 0
-                    else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+                    else topk_weights[:, :-1]
                 )
-                topk_weights = topk_weights / topk_weights_sum
+            topk_weights = topk_weights.to(torch.float32)
 
             if expert_location_dispatch_info is not None:
                 topk_ids = topk_ids_logical_to_physical(
@@ -1035,7 +1018,7 @@ def select_experts(
 if _is_cuda:
 
     @torch.library.register_fake("sgl_kernel::moe_fused_gate")
-    def _(
+    def _moe_fused_gate(
         input_tensor,
         bias,
         num_expert_group,
@@ -1051,5 +1034,27 @@ if _is_cuda:
         )
         topk_ids = torch.empty(
             (num_rows, topk), dtype=torch.int32, device=input_tensor.device
+        )
+        return topk_weights, topk_ids
+
+    @register_fake_if_exists("sgl_kernel::kimi_k2_moe_fused_gate")
+    def _kimi_k2_moe_fused_gate(
+        input_tensor,
+        bias,
+        topk,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    ):
+        num_rows = input_tensor.shape[0]
+        topk_weights = input_tensor.new_empty(
+            num_rows,
+            topk,
+            dtype=torch.float32,
+        )
+        topk_ids = input_tensor.new_empty(
+            num_rows,
+            topk,
+            dtype=torch.int32,
         )
         return topk_weights, topk_ids
