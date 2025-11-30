@@ -24,7 +24,7 @@ class TestVLMModels(CustomTestCase):
         "--mem-fraction-static",
         0.35,
         "--log-level",
-        log_level,
+        "info",
         "--attention-backend",
         "ascend",
         "--disable-cuda-graph",
@@ -88,7 +88,7 @@ class TestVLMModels(CustomTestCase):
             "--limit",
             limit,
             "--config",
-            "/__w/sglang/sglang/python/sglang/test/mmmu-val.yaml",
+            "./mmmu-val.yaml",
         ]
 
         subprocess.run(
@@ -102,7 +102,6 @@ class TestVLMModels(CustomTestCase):
         output_path="./logs",
         test_name="",
         custom_env=None,
-        log_level="info",
         capture_output=False,
         limit="50",
     ):
@@ -113,13 +112,11 @@ class TestVLMModels(CustomTestCase):
             output_path: Path for output logs
             test_name: Optional test name for logging
             custom_env: Optional custom environment variables
-            log_level: Log level for server (default: "info")
             capture_output: Whether to capture server stdout/stderr
         """
-        print(f"\nTesting model: {model.model}{test_name}")
+        print(f"\nTesting model: {self.model}{test_name}")
 
         process = None
-        mmmu_accuracy = 0  # Initialize to handle potential exceptions
         server_output = ""
 
         try:
@@ -171,14 +168,14 @@ class TestVLMModels(CustomTestCase):
             self.assertGreaterEqual(
                 mmmu_accuracy,
                 self.mmmu_accuracy,
-                f"Model {model.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({model.mmmu_accuracy:.4f}){test_name}",
+                f"Model {self.model} accuracy ({mmmu_accuracy:.4f}) below expected threshold ({self.mmmu_accuracy:.4f}){test_name}",
             )
 
             return server_output
 
         except Exception as e:
-            print(f"Error testing {model.model}{test_name}: {e}")
-            self.fail(f"Test failed for {model.model}{test_name}: {e}")
+            print(f"Error testing {self.model}{test_name}: {e}")
+            self.fail(f"Test failed for {self.model}{test_name}: {e}")
 
         finally:
             # Ensure process cleanup happens regardless of success/failure
