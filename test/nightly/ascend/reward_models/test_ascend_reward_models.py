@@ -10,7 +10,11 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 MODELS = [
-    ("/root/.cache/modelscope/hub/models/Shanghai_AI_Laboratory/internlm2-7b-reward", 1, 4e-2),
+    (
+        "/root/.cache/modelscope/hub/models/Shanghai_AI_Laboratory/internlm2-7b-reward",
+        1,
+        4e-2
+    ),
     ("/root/.cache/modelscope/hub/models/Howeee/Qwen2.5-1.5B-apeach", 1, 4e-2),
 ]
 TORCH_DTYPES = [torch.float16]
