@@ -4,7 +4,7 @@ import torch
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 from torch._higher_order_ops import auto_functionalized
 
-from sglang.srt.configs.sglang_config import get_current_sglang_config
+from sglang.srt.compilation.sglang_config import get_current_sglang_config
 from sglang.srt.layers.layernorm import RMSNorm
 
 RMS_OP = rmsnorm

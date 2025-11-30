@@ -1,13 +1,19 @@
 import copy
 import logging
+from contextlib import contextmanager
 from dataclasses import replace
 from functools import lru_cache
+from typing import TYPE_CHECKING, Any
 
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.compilation_config import CompilationConfig, CompilationMode
+from sglang.srt.compilation.compilation_config import CompilationConfig, CompilationMode
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.model_config import ModelConfig
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+else:
+    ModelConfig = Any
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,7 @@ _current_sglang_config: SGLangConfig | None = None
 _current_prefix: str | None = None
 
 
+@contextmanager
 def set_current_sglang_config(
     sglang_config: SGLangConfig, check_compile=False, prefix: str | None = None
 ):
@@ -68,13 +75,13 @@ def set_current_sglang_config(
     except Exception:
         raise
     else:
-        # TODO(yuan-luo): custom op check
+        # TODO(): custom op check
         if check_compile:
             pass
 
         if (
             check_compile
-            # TODO(yuan-luo): compilation mode check
+            # TODO(): compilation mode check
             and sglang_config.compilation_config.mode == CompilationMode.SGLANG_COMPILE
         ):
             # If the model supports compilation,
@@ -85,6 +92,7 @@ def set_current_sglang_config(
             logger.warning(
                 "`torch.compile` is turned on, but the model %s"
                 " does not support it. Please open an issue on GitHub"
+                " https://github.com/sgl-project/sglang/issues/new/choose"
                 " if you want it to be supported.",
                 sglang_config.model_config.model,
             )

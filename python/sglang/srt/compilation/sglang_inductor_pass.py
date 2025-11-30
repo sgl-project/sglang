@@ -9,7 +9,7 @@ import torch
 from torch._dynamo.utils import lazy_format_graph_code
 
 from sglang.srt.compilation.inductor_pass import InductorPass
-from sglang.srt.configs.sglang_config import SGLangConfig
+from sglang.srt.compilation.sglang_config import SGLangConfig
 
 logger = logging.getLogger(__name__)
 
