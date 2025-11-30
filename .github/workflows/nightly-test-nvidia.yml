@@ -440,6 +440,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_deepseek_v31
 
       - name: Run DeepSeek v3.2 nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -459,6 +460,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_deepseek_v32
 
       - name: Run Kimi-K2-Thinking nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -478,6 +480,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_kimi_k2_thinking
 
       - name: Run Qwen3-235B nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -497,6 +500,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_qwen3_235b
 
       - name: Run GLM-4.6 nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
@@ -516,6 +520,7 @@ jobs:
           python3 scripts/ci/publish_traces.py --traces-dir test/performance_profiles_glm_4_6
 
       - name: Run MiniMax-M2 nightly performance test
+        if: always()
         timeout-minutes: 180
         env:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
