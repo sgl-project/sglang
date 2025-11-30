@@ -403,7 +403,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 ## Forward hooks
 | Argument | Description | Defaults | Options |
 | --- | --- | --- | --- |
-| `--hooks` | JSON-formatted list of hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
+| `--forward-hooks` | JSON-formatted list of forward hook specifications. Each element must include `target_modules` (list of glob patterns matched against `model.named_modules()` names) and `hook_factory` (Python import path to a factory, e.g. `my_package.hooks:make_hook`). An optional `name` field is used for logging, and an optional `config` object is passed as a `dict` to the factory. | `None` | Type: JSON list |
 
 ## Debug tensor dumps
 | Argument | Description | Defaults | Options |
