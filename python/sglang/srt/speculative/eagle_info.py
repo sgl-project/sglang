@@ -494,7 +494,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             else:
                 batch.out_cache_loc = tgt_cache_loc
             batch.seq_lens.add_(accept_length + 1)
-            batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+            if batch.seq_lens_cpu is not None:
+                batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
@@ -524,7 +525,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     bs,
                 )
                 batch.seq_lens.add_(accept_length + 1)
-                batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
             if len(unfinished_accept_index) > 0:
                 unfinished_accept_index = torch.cat(unfinished_accept_index)
@@ -547,7 +549,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         unfinished_index_device,
                         batch.seq_lens,
                     )
-                    batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+                    if batch.seq_lens_cpu is not None:
+                        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
                     filter_finished_cache_loc_kernel[(bs,)](
                         batch.out_cache_loc,
                         tgt_cache_loc,
@@ -557,6 +560,31 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                         next_power_of_2(self.draft_token_num),
                     )
 
+                idx = unfinished_index_device.view(-1).tolist()
+                offset = get_global_server_args().speculative_num_draft_tokens
+                if (
+                    hasattr(batch.spec_info, "pre_out_locs")
+                    and batch.spec_info.pre_out_locs is not None
+                ):
+                    batch.spec_info.pre_out_locs[0] = [
+                        batch.spec_info.pre_out_locs[0][i] for i in idx
+                    ]
+                if (
+                    hasattr(batch.spec_info, "pre_hiddens")
+                    and batch.spec_info.pre_hiddens is not None
+                ):
+                    selected_indices = []
+                    for i in idx:
+                        start = i * offset
+                        end = start + offset
+                        selected_indices.extend(range(start, end))
+                    batch.spec_info.pre_hiddens = batch.spec_info.pre_hiddens[
+                        selected_indices
+                    ]
+                    batch.spec_info.pre_verify_ids = batch.spec_info.pre_verify_ids[
+                        selected_indices
+                    ]
+
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
@@ -565,11 +593,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     accept_length_cpu=draft_input_accept_length_cpu,
                     accept_length=accept_length[unfinished_index_device],
                     seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],
-                    seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu[unfinished_index],
+                    seq_lens_for_draft_extend_cpu=(
+                        batch.seq_lens_cpu[unfinished_index]
+                        if batch.seq_lens_cpu is not None
+                        else None
+                    ),
                     req_pool_indices_for_draft_extend=batch.req_pool_indices[
                         unfinished_index_device
                     ],
                 )
+
             else:
                 draft_input = EagleDraftInput.create_idle_input(
                     device=batch.device,
@@ -611,6 +644,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b + 1,)
     kv_indptr: torch.Tensor = None
     kv_indices: torch.Tensor = None
+
+    unfinished_index: List[int] = None
+    unfinished_index_device: torch.Tensor = None
 
     # Shape info for padding
     num_tokens_per_batch: int = -1

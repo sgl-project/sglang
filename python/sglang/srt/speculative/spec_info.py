@@ -173,6 +173,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_ngram(self) -> bool:
         return self._has_flag("NGRAM")
 
+    def is_mhmtp(self) -> bool:
+        return self._has_flag("MHMTP")
+
     def create_draft_worker(self, **factory_kwargs: Any) -> Any:
         if self._draft_worker_factory is None:
             return None
@@ -189,6 +192,7 @@ _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
         "STANDALONE", algorithm
     ),
     "NGRAM": lambda algorithm: SpeculativeAlgorithm._add_flag("NGRAM", algorithm),
+    "MHMTP": lambda algorithm: SpeculativeAlgorithm._add_flag("MHMTP", algorithm),
 }
 
 
@@ -285,6 +289,12 @@ def _create_ngram_worker(**kwargs: Any) -> Any:
     return NGRAMWorker(**kwargs)
 
 
+def _create_mtp_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.mhmtp_worker import MhmtpWorker
+
+    return MhmtpWorker(**kwargs)
+
+
 # Register built-in algorithms.
 # Third-party integrations should import `SpeculativeAlgorithm` and either
 # call `register_speculative_algorithm` or use the helpers below to attach
@@ -316,6 +326,12 @@ register_speculative_algorithm(
     flags=("NGRAM",),
 )
 
+register_speculative_algorithm(
+    "MHMTP",
+    worker_cls=_create_mtp_worker,
+    flags=("MHMTP",),
+)
+
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
@@ -323,6 +339,8 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    MHMTP_DRAFT = auto()
+    MHMTP_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -339,6 +357,12 @@ class SpecInput(ABC):
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
         }
+
+    def is_mhmtp_draft_input(self) -> bool:
+        return self.spec_input_type == SpecInputType.MHMTP_DRAFT
+
+    def is_mhmtp_verify_input(self) -> bool:
+        return self.spec_input_type == SpecInputType.MHMTP_VERIFY
 
     @abstractmethod
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
