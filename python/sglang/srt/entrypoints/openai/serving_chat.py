@@ -30,6 +30,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
+    UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -447,6 +448,16 @@ class OpenAIServingChat(OpenAIServingBase):
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
 
+
+    def _get_usage(self, prompt_tokens, completion_tokens, cached_tokens, request):
+        return UsageProcessor.calculate_streaming_usage(
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            n_choices=request.n,
+            enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+        )
+
     async def _generate_chat_stream(
         self,
         adapted_request: GenerateReqInput,
@@ -470,6 +481,7 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        usage = None
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -481,6 +493,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
+                if request.stream_options and request.stream_options.continuous_usage_stats:
+                    usage = self._get_usage(prompt_tokens, completion_tokens, cached_tokens, request)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -514,6 +528,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         created=int(time.time()),
                         choices=[choice_data],
                         model=request.model,
+                        usage=usage,
                     )
                     yield f"data: {chunk.model_dump_json()}\n\n"
 
@@ -537,6 +552,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             created=int(time.time()),
                             choices=[choice_data],
                             model=request.model,
+                            usage=usage,
                         )
 
                         # Add usage stats if continuous_usage_stats is enabled
@@ -564,6 +580,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         content,
                         request,
                         has_tool_calls,
+                        usage,
                     ):
                         if chunk:
                             yield chunk
@@ -592,6 +609,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             created=int(time.time()),
                             choices=[choice_data],
                             model=request.model,
+                            usage=usage,
                         )
 
                         # Add usage stats if continuous_usage_stats is enabled
@@ -633,7 +651,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                     ],
                     model=request.model,
-                    usage=None,
+                    usage=usage,
                 )
                 yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
 
@@ -659,24 +677,18 @@ class OpenAIServingChat(OpenAIServingBase):
                                 )
                             ],
                             model=request.model,
+                            usage=usage,
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
-                usage = UsageProcessor.calculate_streaming_usage(
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
-                )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
-                    usage=usage,
+                    usage=self._get_usage(prompt_tokens, completion_tokens, cached_tokens, request),
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
@@ -1045,6 +1057,7 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
+        usage: Optional[UsageInfo],
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
@@ -1080,6 +1093,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
+                usage=usage,
             )
 
             # Add usage stats if continuous_usage_stats is enabled
@@ -1130,6 +1144,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
+                usage=usage,
             )
 
             # Add usage stats if continuous_usage_stats is enabled
