@@ -193,6 +193,107 @@ def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
     ).sum(dim=1)
 
 
+def moe_gptoss_act(x, alpha: float = 1.702, limit: float = 7.0):
+    x_glu, x_linear = x[..., ::2], x[..., 1::2]
+    # Clamp the input values
+    x_glu = x_glu.clamp(min=None, max=limit)
+    x_linear = x_linear.clamp(min=-limit, max=limit)
+    out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+    # Note we add an extra bias of 1 to the linear layer
+    return out_glu * (x_linear + 1.0)
+
+
+def torch_naive_gptoss_fused_moe(
+    x,
+    w1,
+    w2,
+    w1_bias,
+    w2_bias,
+    topk_weights,
+    topk_ids,
+    activation_alpha,
+    swiglu_limit,
+    len_experts,
+) -> torch.Tensor:
+
+    # Ref code from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/e0828e3cc0a03408724b80c3cc92c8e072db8d01/modeling_deepseek.py#L589
+    cnts = topk_ids.new_zeros((topk_ids.shape[0], len_experts))
+    cnts.scatter_(1, topk_ids.to(torch.int64), 1)
+    tokens_per_expert = cnts.sum(dim=0)
+    idxs = topk_ids.view(-1).argsort()
+
+    sorted_tokens = x[idxs // topk_ids.shape[1]]
+    tokens_per_expert = tokens_per_expert.cpu().numpy()
+
+    outputs = []
+    start_idx = 0
+    for i, num_tokens in enumerate(tokens_per_expert):
+        end_idx = start_idx + num_tokens
+        if num_tokens == 0:
+            continue
+        tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+
+        layer_w13_weight = w1[i]
+        layer_w13_weight_bias = w1_bias[i]
+        layer_w2_weight_bias = w2_bias[i]
+        layer_w2_weight = w2[i]
+
+        gate_up = F.linear(
+            tokens_for_this_expert,
+            layer_w13_weight,
+            bias=layer_w13_weight_bias.to(torch.bfloat16),
+        )
+        gate_up = moe_gptoss_act(gate_up, activation_alpha, swiglu_limit)
+        expert_out = F.linear(
+            gate_up, layer_w2_weight, bias=layer_w2_weight_bias.to(torch.bfloat16)
+        )
+        outputs.append(expert_out)
+        start_idx = end_idx
+
+    outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+    new_x = torch.empty_like(outs)
+
+    new_x[idxs] = outs
+    final_out = (
+        new_x.view(*topk_ids.shape, -1)
+        .type(topk_weights.dtype)
+        .mul_(topk_weights.unsqueeze(dim=-1))
+        .sum(dim=1)
+        .type(new_x.dtype)
+    )
+    return final_out
+
+
+def torch_naive_fused_moe_gptoss(
+    a,
+    w1,
+    w2,
+    w1_bias,
+    w2_bias,
+    topk_weight,
+    topk_ids,
+    renormalize,
+    activation_alpha,
+    swiglu_limit,
+    len_experts,
+):
+    if renormalize:
+        topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
+
+    return torch_naive_gptoss_fused_moe(
+        a,
+        w1,
+        w2,
+        w1_bias,
+        w2_bias,
+        topk_weight,
+        topk_ids,
+        activation_alpha,
+        swiglu_limit,
+        len_experts,
+    )
+
+
 def torch_w8a8_per_column_fused_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, topk):
     """This function performs fused moe with per-column int8 quantization using native torch."""
 
