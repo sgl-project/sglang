@@ -113,7 +113,11 @@ def load_native(library, component_module_path: str, server_args: ServerArgs):
             except AttributeError:
                 # Try class name variation (e.g., Flux2Transformer2DModel -> FluxTransformer2DModel)
                 variant = class_name.replace("Flux2", "Flux")
-                cls = getattr(diffusers, variant) if hasattr(diffusers, variant) else AutoModel
+                if hasattr(diffusers, variant):
+                    cls = getattr(diffusers, variant)
+                else:
+                    # Use AutoModel which handles auto_map via trust_remote_code
+                    cls = AutoModel
             
             return cls.from_pretrained(
                 component_module_path,
