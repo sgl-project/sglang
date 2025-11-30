@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     is_tbo_enabled,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -311,6 +312,15 @@ class _DeepEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
         )
+        if (
+            not get_global_server_args().disable_cuda_graph
+            and get_global_server_args().cuda_graph_max_bs
+            > self.num_max_dispatch_tokens_per_rank
+        ):
+            raise ValueError(
+                f"Maximum captured batch size {get_global_server_args().cuda_graph_max_bs} is larger than num_max_dispatch_tokens_per_rank for deepep {self.num_max_dispatch_tokens_per_rank}. Please set a smaller value for --cuda-graph-max-bs server argument, or increase SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK."
+            )
+
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
