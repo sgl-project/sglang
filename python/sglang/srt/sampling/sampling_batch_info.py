@@ -12,6 +12,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
@@ -40,7 +41,7 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
-    grammars: Optional[List] = None
+    grammars: Optional[List[BaseGrammarObject]] = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
@@ -178,7 +179,7 @@ class SamplingBatchInfo:
     def __len__(self):
         return len(self.temperatures)
 
-    def update_regex_vocab_mask(self):
+    def init_regex_vocab_mask(self):
         if not self.grammars:
             self.vocab_mask = None
             self.apply_mask_func = None
@@ -193,17 +194,19 @@ class SamplingBatchInfo:
             batch_size=len(self.temperatures),
             device=self.device,
         )
-        self.apply_mask_func = (
-            first_grammar.apply_vocab_mask
-        )  # force to use static method
 
+        # force to use static method
+        self.apply_mask_func = first_grammar.apply_vocab_mask
+        self.move_vocab_mask = first_grammar.move_vocab_mask
+
+    def update_regex_vocab_mask(self):
         # Apply the mask
         for i, grammar in enumerate(self.grammars):
             if grammar and not grammar.finished and not grammar.is_terminated():
                 grammar.fill_vocab_mask(self.vocab_mask, i)
 
         # Move the mask to the device if needed
-        self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
+        self.vocab_mask = self.move_vocab_mask(self.vocab_mask, self.device)
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:

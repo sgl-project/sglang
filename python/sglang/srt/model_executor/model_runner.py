@@ -2713,6 +2713,7 @@ class ModelRunner:
         #       was executed after we processed last batch's results.
 
         # Calculate logits bias and apply it to next_token_logits.
+        sampling_info.init_regex_vocab_mask()
         sampling_info.update_regex_vocab_mask()
         sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
