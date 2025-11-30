@@ -821,3 +821,16 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def queue_storage_cleanup(self, keys: List[str]):
+        """
+        Queue storage keys for background cleanup.
+        This method delegates to the storage backend's cleanup mechanism.
+        Args:
+            keys: List of hash keys to be deleted from storage
+        """
+        if not self.enable_storage or not keys:
+            return
+        # Delegate to storage backend's cleanup queue
+        if hasattr(self.storage_backend, "queue_cleanup"):
+            self.storage_backend.queue_cleanup(keys)

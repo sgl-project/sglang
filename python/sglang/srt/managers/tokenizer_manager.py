@@ -1530,7 +1530,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             else:
                 self.dump_requests_before_crash()
                 break
-
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
