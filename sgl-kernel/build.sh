@@ -55,7 +55,7 @@ BUILD_ARGS=()
 
 docker buildx build \
   --builder "${BUILDER_NAME}" \
-  -f sgl-kernel/Dockerfile sgl-kernel \
+  -f Dockerfile sgl-kernel \
   --build-arg BASE_IMG="${BASE_IMG}" \
   --build-arg CUDA_VERSION="${CUDA_VERSION}" \
   --build-arg ARCH="${ARCH}" \
