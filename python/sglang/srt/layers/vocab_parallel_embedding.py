@@ -31,6 +31,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
     is_cpu,
+    is_xpu,
     set_weight_attrs,
 )
 
@@ -38,6 +39,7 @@ DEFAULT_VOCAB_PADDING_SIZE = 64
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
@@ -224,10 +226,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.org_vocab_size = org_num_embeddings or num_embeddings
 
         # Support the case where the vocab size is not divisible by the TP size.
-        if (
-            _is_cpu
-            and pad_vocab_size(self.org_vocab_size, padding_size) % self.tp_size != 0
-        ):
+        if (_is_cpu or _is_xpu) and pad_vocab_size(
+            self.org_vocab_size, padding_size
+        ) % self.tp_size != 0:
             padding_size *= self.tp_size
         self.padding_size = padding_size
 
