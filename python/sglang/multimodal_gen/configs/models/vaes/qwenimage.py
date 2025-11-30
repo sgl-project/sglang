@@ -27,12 +27,6 @@ class QwenImageVAEArchConfig(VAEArchConfig):
     scale_factor_spatial: int = 8
     clip_output: bool = True
 
-    def __post_init__(self):
-        # Some checkpoints omit `temporal_compression_ratio`; fall back to the temporal
-        # scale factor to keep downstream stages from assuming a ratio of 1.
-        if getattr(self, "temporal_compression_ratio", None) in (None, 0):
-            self.temporal_compression_ratio = self.scale_factor_temporal
-
 
 @dataclass
 class QwenImageVAEConfig(VAEConfig):
@@ -57,9 +51,3 @@ class QwenImageVAEConfig(VAEConfig):
             len(self.arch_config.temperal_downsample)
         )
         self.arch_config.spatial_compression_ratio = self.arch_config.vae_scale_factor
-        # Some checkpoints omit `temporal_compression_ratio`; fall back to the temporal
-        # scale factor to keep downstream stages from assuming a ratio of 1.
-        if getattr(self.arch_config, "temporal_compression_ratio", None) in (None, 0):
-            self.arch_config.temporal_compression_ratio = (
-                self.arch_config.scale_factor_temporal
-            )
