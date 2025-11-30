@@ -6,8 +6,8 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_model, default_true, validate_stop, ChatLogProbs, ContentPart, Function,
-        FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
+        default_ignore_eos, default_model, default_true, validate_stop, ChatLogProbs, ContentPart,
+        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
         StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
         Usage,
     },
@@ -261,8 +261,9 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub no_stop_trim: bool,
 
-    /// Ignore end-of-sequence tokens during generation
-    #[serde(default)]
+    /// Ignore end-of-sequence tokens during generation.
+    /// Can be forced to true by setting SGLANG_FORCE_IGNORE_EOS=1 environment variable.
+    #[serde(default = "default_ignore_eos")]
     pub ignore_eos: bool,
 
     /// Continue generating from final assistant message

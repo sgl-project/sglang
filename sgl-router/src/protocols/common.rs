@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use validator;
@@ -16,6 +17,32 @@ pub(crate) fn default_model() -> String {
 /// Helper function for serde default value (returns true)
 pub fn default_true() -> bool {
     true
+}
+
+/// Environment variable to force ignore_eos to true for all requests.
+/// WARNING: This is for research purposes only. Do not use in production.
+static FORCE_IGNORE_EOS: Lazy<bool> = Lazy::new(|| {
+    std::env::var("RESEARCH_ONLY_FORCE_IGNORE_EOS")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+});
+
+/// Default value for ignore_eos field.
+/// Returns true if RESEARCH_ONLY_FORCE_IGNORE_EOS environment variable is set,
+/// otherwise returns false.
+pub fn default_ignore_eos() -> bool {
+    *FORCE_IGNORE_EOS
+}
+
+/// Default value for ignore_eos field when it's an Option<bool>.
+/// Returns Some(true) if RESEARCH_ONLY_FORCE_IGNORE_EOS environment variable is set,
+/// otherwise returns None.
+pub fn default_ignore_eos_option() -> Option<bool> {
+    if *FORCE_IGNORE_EOS {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 // ============================================================================
@@ -447,4 +474,61 @@ pub enum InputIds {
 pub enum LoRAPath {
     Single(Option<String>),
     Batch(Vec<Option<String>>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test struct to verify ignore_eos default behavior
+    #[derive(Debug, Deserialize)]
+    struct TestIgnoreEos {
+        #[serde(default = "default_ignore_eos")]
+        ignore_eos: bool,
+    }
+
+    /// Test struct for Option<bool> variant
+    #[derive(Debug, Deserialize)]
+    struct TestIgnoreEosOption {
+        #[serde(default = "default_ignore_eos_option")]
+        ignore_eos: Option<bool>,
+    }
+
+    #[test]
+    fn test_ignore_eos_default_without_env() {
+        // When RESEARCH_ONLY_FORCE_IGNORE_EOS is not set (or false), default should be false
+        // Note: Since Lazy is initialized once, this test checks the current state
+        let json = r#"{}"#;
+        let parsed: TestIgnoreEos = serde_json::from_str(json).unwrap();
+        // The default value depends on whether RESEARCH_ONLY_FORCE_IGNORE_EOS env var is set
+        // In normal test runs, it should be false
+        assert!(
+            !parsed.ignore_eos || std::env::var("RESEARCH_ONLY_FORCE_IGNORE_EOS").is_ok(),
+            "ignore_eos should be false unless RESEARCH_ONLY_FORCE_IGNORE_EOS is set"
+        );
+    }
+
+    #[test]
+    fn test_ignore_eos_explicit_value_overrides_default() {
+        // When ignore_eos is explicitly set in JSON, it should override the default
+        let json = r#"{"ignore_eos": true}"#;
+        let parsed: TestIgnoreEos = serde_json::from_str(json).unwrap();
+        assert!(parsed.ignore_eos);
+
+        let json = r#"{"ignore_eos": false}"#;
+        let parsed: TestIgnoreEos = serde_json::from_str(json).unwrap();
+        assert!(!parsed.ignore_eos);
+    }
+
+    #[test]
+    fn test_ignore_eos_option_explicit_value() {
+        // When ignore_eos is explicitly set in JSON, it should be Some(value)
+        let json = r#"{"ignore_eos": true}"#;
+        let parsed: TestIgnoreEosOption = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.ignore_eos, Some(true));
+
+        let json = r#"{"ignore_eos": false}"#;
+        let parsed: TestIgnoreEosOption = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.ignore_eos, Some(false));
+    }
 }

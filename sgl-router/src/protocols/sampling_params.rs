@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use validator::Validate;
 
-use super::common::StringOrArray;
+use super::common::{default_ignore_eos_option, StringOrArray};
 
 /// Sampling parameters for text generation
 #[derive(Debug, Clone, Deserialize, Serialize, Default, Validate)]
@@ -34,7 +34,12 @@ pub struct SamplingParams {
     pub repetition_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StringOrArray>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Ignore end-of-sequence tokens during generation.
+    /// Can be forced to true by setting SGLANG_FORCE_IGNORE_EOS=1 environment variable.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default = "default_ignore_eos_option"
+    )]
     pub ignore_eos: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_special_tokens: Option<bool>,

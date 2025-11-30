@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::common::*;
+use super::common::{
+    default_ignore_eos, default_true, GenerationRequest, LogProbs, StreamOptions, StringOrArray,
+    Usage,
+};
 
 // ============================================================================
 // Completions API (v1/completions) - DEPRECATED but still supported
@@ -118,8 +121,9 @@ pub struct CompletionRequest {
     #[serde(default)]
     pub no_stop_trim: bool,
 
-    /// Ignore end-of-sequence tokens during generation
-    #[serde(default)]
+    /// Ignore end-of-sequence tokens during generation.
+    /// Can be forced to true by setting SGLANG_FORCE_IGNORE_EOS=1 environment variable.
+    #[serde(default = "default_ignore_eos")]
     pub ignore_eos: bool,
 
     /// Skip special tokens during detokenization
