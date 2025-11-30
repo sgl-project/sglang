@@ -179,11 +179,11 @@ class SamplingBatchInfo:
     def __len__(self):
         return len(self.temperatures)
 
-    def init_regex_vocab_mask(self):
+    def init_regex_vocab_mask(self) -> Callable[[], None]:
         if not self.grammars:
             self.vocab_mask = None
             self.apply_mask_func = None
-            return
+            return lambda: None
 
         # Find a grammar from the list
         first_grammar = next(grammar for grammar in self.grammars if grammar)
@@ -199,17 +199,16 @@ class SamplingBatchInfo:
         self.apply_mask_func = first_grammar.apply_vocab_mask
         self.move_vocab_mask = first_grammar.move_vocab_mask
 
-    def update_regex_vocab_mask(self):
-        if self.vocab_mask is None:
-            return
+        def update_regex_vocab_callback():
+            # Apply the mask
+            for i, grammar in enumerate(self.grammars):
+                if grammar and not grammar.finished and not grammar.is_terminated():
+                    grammar.fill_vocab_mask(self.vocab_mask, i)
 
-        # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)
+            # Move the mask to the device if needed
+            self.vocab_mask = self.move_vocab_mask(self.vocab_mask, self.device)
 
-        # Move the mask to the device if needed
-        self.vocab_mask = self.move_vocab_mask(self.vocab_mask, self.device)
+        return update_regex_vocab_callback
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
