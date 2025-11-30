@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils import get_device
 
 
 class TestMamba(unittest.TestCase):
@@ -29,7 +30,7 @@ class TestMamba(unittest.TestCase):
         num_layers = 48
         global_interval = 4
         dtype = torch.bfloat16
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [
             i for i in range(global_interval - 1, num_layers, global_interval)
         ]
@@ -57,7 +58,7 @@ class TestMamba(unittest.TestCase):
         max_num_reqs = 10
         mamba_cache_size = 20
         max_context_len = 128
-        device = "cuda"
+        device = get_device()
         global_interval = 4
         num_layers = 48
         full_attention_layer_ids = [
@@ -135,7 +136,7 @@ class TestMamba(unittest.TestCase):
         max_num_reqs = 10
         mamba_cache_size = 20
         max_context_len = 128
-        device = "cuda"
+        device = get_device()
         full_attention_layer_ids = [
             i for i in range(global_interval - 1, num_layers, global_interval)
         ]
