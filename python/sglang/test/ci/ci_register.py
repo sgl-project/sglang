@@ -59,8 +59,12 @@ def register_amd_ci(
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
     return None
 
+
 def register_npu_ci(
-    est_time: float, suite: str, nightly: bool = False, disabled: Optional[str] = None,
+    est_time: float,
+    suite: str,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
     return None
