@@ -32,7 +32,11 @@ from sgl_kernel.elementwise import (
     rmsnorm,
     silu_and_mul,
 )
-from sgl_kernel.expert_specialization import es_fp8_blockwise_scaled_grouped_mm
+from sgl_kernel.expert_specialization import (
+    es_fp8_blockwise_scaled_grouped_mm,
+    es_sm100_mxfp8_blockscaled_grouped_mm,
+    es_sm100_mxfp8_blockscaled_grouped_quant,
+)
 from sgl_kernel.fused_moe import moe_wna16_marlin_gemm
 from sgl_kernel.gemm import (
     awq_dequantize,
