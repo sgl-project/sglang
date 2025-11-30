@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -16,7 +17,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -140,6 +141,25 @@ class DeepEPMoE(FusedMoE):
             self.expert_mask[:-1] = 1
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        if is_in_piecewise_cuda_graph():
+            assert (
+                topk_output.format() == TopKOutputFormat.STANDARD
+            ), "Only standard topk output is supported for piecewise cuda graph"
+            return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
+                hidden_states,
+                topk_output.topk_weights,
+                topk_output.topk_ids,
+                topk_output.router_logits,
+                self.layer_id,
+            )
+        else:
+            return self.forward_impl(hidden_states, topk_output)
+
+    def forward_impl(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,

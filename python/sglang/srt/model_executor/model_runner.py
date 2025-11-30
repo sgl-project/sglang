@@ -353,6 +353,7 @@ class ModelRunner:
             and self.can_run_piecewise_cuda_graph()
         ):
             self.attention_layers = []
+            self.moe_layers = []
             for layer in self.model.model.layers:
                 if hasattr(layer, "self_attn"):
                     if hasattr(layer.self_attn, "attn"):
@@ -360,6 +361,17 @@ class ModelRunner:
                     elif hasattr(layer.self_attn, "attn_mqa"):
                         # For DeepSeek model
                         self.attention_layers.append(layer.self_attn.attn_mqa)
+
+                moe_block = None
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                    moe_block = layer.mlp.experts
+                if hasattr(layer, "block_sparse_moe") and hasattr(
+                    layer.block_sparse_moe, "experts"
+                ):
+                    moe_block = layer.block_sparse_moe.experts
+                if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
+                    moe_block = layer.moe.experts
+                self.moe_layers.append(moe_block)
 
             if len(self.attention_layers) < self.model_config.num_hidden_layers:
                 # TODO(yuwei): support Non-Standard GQA
