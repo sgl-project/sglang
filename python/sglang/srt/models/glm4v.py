@@ -411,6 +411,7 @@ class Glm4vVisionModel(nn.Module):
                     num_heads=self.num_heads,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                    num_dummy_heads=vision_config.num_dummy_heads,
                     rms_norm_eps=vision_config.rms_norm_eps,
                 )
                 for layer_idx in range(depth)
@@ -528,13 +529,12 @@ class Glm4vForConditionalGeneration(nn.Module):
         super().__init__()
 
         self.config = config
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.visual = Glm4vVisionModel(
             config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
         )
-
-        vision_utils.update_vit_attn_dummy_heads_config(self.config)
 
         self.model = Glm4Model(
             config,
