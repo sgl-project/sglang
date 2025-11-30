@@ -31,7 +31,7 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.utils import load_image
+from sglang.srt.utils import is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
 
@@ -65,6 +65,8 @@ with open(os.path.join(dirpath, "long_prompt.txt"), "r") as f:
 DEFAULT_PROMPTS.append(long_prompt)
 
 NUM_TOP_LOGPROBS = 5
+
+device = "npu" if is_npu() else "cuda"
 
 
 def get_dtype_str(torch_dtype):
@@ -114,7 +116,7 @@ def _get_sentence_transformer_embedding_model(
             modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
         )
 
-    return model.cuda()
+    return model.to(device)
 
 
 @dataclass
@@ -259,7 +261,7 @@ class HFRunner:
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.trust_remote_code,
                 low_cpu_mem_usage=True,
-            ).cuda()
+            ).to(device)
         elif self.model_type == "embedding":
             if "gme-qwen2-vl" in model_path.lower():
                 self.model = AutoModelForVision2Seq.from_pretrained(
@@ -267,10 +269,10 @@ class HFRunner:
                     torch_dtype=torch_dtype,
                     trust_remote_code=False,
                     low_cpu_mem_usage=True,
-                ).cuda()
+                ).to(device)
                 self.processor = AutoProcessor.from_pretrained(model_path)
             elif "clip" in model_path.lower():
-                self.model = AutoModel.from_pretrained(model_path).cuda()
+                self.model = AutoModel.from_pretrained(model_path).to(device)
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
@@ -283,7 +285,7 @@ class HFRunner:
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.needs_trust_remote_code(model_path),
-            ).cuda()
+            ).to(device)
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
         self.tokenizer = get_tokenizer(
@@ -326,15 +328,15 @@ class HFRunner:
                                 images=image[0], return_tensors="pt"
                             )
                             logits = self.model.get_image_features(
-                                pixel_values=inputs.data["pixel_values"].cuda(),
+                                pixel_values=inputs.data["pixel_values"].to(device),
                             ).tolist()
                         else:
                             inputs = self.tokenizer(
                                 prompts, padding=True, return_tensors="pt"
                             )
                             logits = self.model.get_text_features(
-                                input_ids=inputs.data["input_ids"].cuda(),
-                                attention_mask=inputs.data["attention_mask"].cuda(),
+                                input_ids=inputs.data["input_ids"].to(device),
+                                attention_mask=inputs.data["attention_mask"].to(device),
                             ).tolist()
                     else:
                         logits = self.model.encode(prompts).tolist()
@@ -342,7 +344,7 @@ class HFRunner:
                 elif self.model_type == "cross_encoder":
                     inputs = self.tokenizer(
                         prompts, padding=True, return_tensors="pt"
-                    ).to("cuda")
+                    ).to(device)
                     scores = self.model(**inputs).logits
                     scores = scores.squeeze().tolist()
                     if not isinstance(scores, list):
@@ -357,7 +359,7 @@ class HFRunner:
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
-                        ).to("cuda")
+                        ).to(device)
                         scores.append(
                             float(self.model(**conv_tokenized).logits[0][0].item())
                         )
@@ -414,9 +416,9 @@ class HFRunner:
 
         for i, p in enumerate(prompts):
             if isinstance(p, str):
-                input_ids = tokenizer.encode(p, return_tensors="pt").cuda()
+                input_ids = tokenizer.encode(p, return_tensors="pt")..to(device)
             else:
-                input_ids = torch.tensor([p], device="cuda")
+                input_ids = torch.tensor([p], device=device)
 
             if lora_paths is not None and lora_paths[i] is not None:
                 from peft import PeftModel
