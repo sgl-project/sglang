@@ -604,14 +604,16 @@ class VAELoader(ComponentLoader):
                     custom_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(custom_module)
                     vae_cls = getattr(custom_module, cls_name)
-                    # Use the custom class's from_pretrained directly
-                    vae = vae_cls.from_pretrained(
-                        component_model_path,
-                        revision=server_args.revision,
-                        trust_remote_code=server_args.trust_remote_code,
-                    )
+                    # Use the custom class's from_pretrained with correct precision
+                    vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+                    with set_default_torch_dtype(vae_dtype):
+                        vae = vae_cls.from_pretrained(
+                            component_model_path,
+                            revision=server_args.revision,
+                            trust_remote_code=server_args.trust_remote_code,
+                        )
                     target_device = self.target_device(server_args.vae_cpu_offload)
-                    vae = vae.to(device=target_device)
+                    vae = vae.to(device=target_device, dtype=vae_dtype)
                     return vae.eval()
             # If auto_map loading fails, raise to fallback to load_native
             raise
