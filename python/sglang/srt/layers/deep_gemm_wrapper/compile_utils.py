@@ -53,7 +53,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     m_max = min(1024 * 128, m_max)
     _BUILTIN_M_LIST = list(range(1, m_max + 1))
 
-    _IS_FIRST_RANK_ON_NODE = ServerArgs.base_gpu_id == gpu_id
+    _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
 
     # Check if is the first rank on node.
     # Default each rank will try compile all Ms to
