@@ -147,7 +147,6 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
     get_global_server_args,
@@ -2706,14 +2705,6 @@ class ModelRunner:
 
         return ret, can_run_graph
 
-    def _preprocess_logits(
-        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
-    ):
-        # Calculate logits bias and apply it to next_token_logits.
-        callback = sampling_info.init_regex_vocab_mask()
-        callback()
-        sampling_info.apply_logits_bias(logits_output.next_token_logits)
-
     def sample(
         self,
         logits_output: LogitsProcessorOutput,
@@ -2735,7 +2726,13 @@ class ModelRunner:
                 axis=-1,
             )
 
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        # Calculate logits bias and apply it to next_token_logits.
+        callback, mask_ready = forward_batch.sampling_info.init_regex_vocab_mask()
+        callback()
+        if mask_ready is not None:
+            mask_ready.wait()
+        forward_batch.sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -2771,8 +2768,9 @@ class ModelRunner:
         if not forward_batch.token_ids_logprobs:
             return
 
-        # Preprocess logits (same as in sample method)
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        # Calculate logits bias and apply it to next_token_logits.
+        forward_batch.sampling_info.init_regex_vocab_mask(use_callback=False)
+        forward_batch.sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
         # Delegate to sampler for logprob-only computation
         # This populates logits_output with requested token probabilities

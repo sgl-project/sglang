@@ -179,11 +179,13 @@ class SamplingBatchInfo:
     def __len__(self):
         return len(self.temperatures)
 
-    def init_regex_vocab_mask(self) -> Callable[[], None]:
+    def init_regex_vocab_mask(
+        self, use_callback: bool = True
+    ) -> Tuple[Callable[[], None], torch.cuda.Event]:
         if not self.grammars:
             self.vocab_mask = None
             self.apply_mask_func = None
-            return lambda: None
+            return lambda: None, None
 
         # Find a grammar from the list
         first_grammar = next(grammar for grammar in self.grammars if grammar)
@@ -197,6 +199,7 @@ class SamplingBatchInfo:
 
         # force to use static method
         self.apply_mask_func = first_grammar.apply_vocab_mask
+        mask_ready = torch.cuda.Event()
 
         def update_regex_vocab_callback():
             # Apply the mask
@@ -208,8 +211,13 @@ class SamplingBatchInfo:
             self.vocab_mask = first_grammar.move_vocab_mask(
                 self.vocab_mask, self.device
             )
+            mask_ready.record()
 
-        return update_regex_vocab_callback
+        if use_callback:
+            return update_regex_vocab_callback, mask_ready
+        else:
+            update_regex_vocab_callback()
+            return lambda: None, mask_ready
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
