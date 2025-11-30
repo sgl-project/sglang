@@ -213,6 +213,7 @@ class PiecewiseCudaGraphRunner:
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
         self.attention_layers = self.model_runner.attention_layers
+        self.moe_layers = self.model_runner.moe_layers
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -310,7 +311,7 @@ class PiecewiseCudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         with set_forward_context(
-            forward_batch, self.attention_layers, self.quant_config
+            forward_batch, self.attention_layers, self.quant_config, self.moe_layers
         ), disable_ca_comm(self.model_runner.tp_group):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -466,7 +467,7 @@ class PiecewiseCudaGraphRunner:
 
             kwargs = {}
             with set_forward_context(
-                forward_batch, self.attention_layers, self.quant_config
+                forward_batch, self.attention_layers, self.quant_config, self.moe_layers
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -601,7 +602,10 @@ class PiecewiseCudaGraphRunner:
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(
-                static_forward_batch, self.attention_layers, self.quant_config
+                static_forward_batch,
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
             ):
                 with set_compiled(True):
                     output = self.model_runner.model.forward(
