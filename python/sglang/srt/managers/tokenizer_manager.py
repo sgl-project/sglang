@@ -454,6 +454,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
+            # FIXME: This is a temporary fix to get the text from the input ids.
+            # We should remove this once we have a proper way.
+            if (
+                self.log_requests_level >= 2
+                and obj.text is None
+                and obj.input_ids is not None
+                and self.tokenizer is not None
+            ):
+                decoded = self.tokenizer.decode(
+                    obj.input_ids, skip_special_tokens=False
+                )
+                obj.text = decoded
+
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
@@ -1610,7 +1623,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
-                if state.obj.stream:
+                if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)

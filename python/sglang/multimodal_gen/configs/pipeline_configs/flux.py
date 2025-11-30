@@ -321,7 +321,7 @@ def _prepare_image_ids(
     return image_latent_ids
 
 
-def flux_2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
     hidden_states_layers: list[int] = [10, 20, 30]
 
     out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
@@ -412,7 +412,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (flux_2_postprocess_text,)
+        default_factory=lambda: (flux2_postprocess_text,)
     )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
 

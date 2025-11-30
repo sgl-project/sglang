@@ -24,6 +24,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanI2V720PConfig,
     WanT2V480PConfig,
     WanT2V720PConfig,
+    ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
@@ -56,6 +57,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -403,6 +405,15 @@ def _register_configs():
             "black-forest-labs/FLUX.2-dev",
         ],
         model_detectors=[lambda id: "flux.2" in id.lower()],
+    )
+    register_configs(
+        model_name="Z-image",
+        sampling_param_cls=ZImageSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        model_paths=[
+            "Tongyi-MAI/Z-Image-Turbo",
+        ],
+        model_detectors=[lambda id: "z-image" in id.lower()],
     )
 
     # Qwen-Image
