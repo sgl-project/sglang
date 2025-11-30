@@ -188,8 +188,8 @@ def run_grid(bs, model, method, tp_size, dtype: str):
     configs = union_of_list_of_dicts(prune_configs_1, prune_configs_2)
 
     print(
-        f"{bs=} || {len(full_configs)=} | {len(prune_configs_1)=} | \
-            {len(prune_configs_2)=} | {len(configs)=}"
+        f"{bs=} || {len(full_configs)=} | {len(prune_configs_1)=} | "
+        f"{len(prune_configs_2)=} | {len(configs)=}"
     )
 
     best_config = None
