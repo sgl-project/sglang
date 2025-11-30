@@ -11,7 +11,6 @@ diffusion models.
 import multiprocessing as mp
 import os
 import time
-from copy import deepcopy
 from typing import Any
 
 import imageio
@@ -20,7 +19,10 @@ import torch
 import torchvision
 from einops import rearrange
 
-from sglang.multimodal_gen.configs.sample.base import DataType, SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
+    SamplingParams,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -208,32 +210,18 @@ class DiffGenerator:
 
     def generate(
         self,
-        prompt: str | list[str] | None = None,
-        sampling_params: SamplingParams | None = None,
-        **kwargs,
+        sampling_params_kwargs: dict | None = None,
     ) -> dict[str, Any] | list[np.ndarray] | list[dict[str, Any]] | None:
         """
         Generate a image/video based on the given prompt.
 
         Args:
-            prompt: The prompt to use for generation (optional if prompt_txt is provided)
-            output_file_name: Name of the file to save. Default is the first 100 characters of the prompt.
-            save_output: Whether to save the output to disk
-            return_frames: Whether to return the raw frames
-            num_inference_steps: Number of denoising steps (overrides server_args)
-            guidance_scale: Classifier-free guidance scale (overrides server_args)
-            num_frames: Number of frames to generate (overrides server_args)
-            height: Height of generated file (overrides server_args)
-            width: Width of generated file (overrides server_args)
-            fps: Frames per second for saved file (overrides server_args)
-            seed: Random seed for generation (overrides server_args)
-            callback: Callback function called after each step
-            callback_steps: Number of steps between each callback
 
         Returns:
             Either the output dictionary, list of frames, or list of results for batch processing
         """
         # 1. prepare requests
+        prompt = sampling_params_kwargs.get("prompt", None)
         prompts: list[str] = []
         # Handle batch processing from text file
         if self.server_args.prompt_file_path is not None:
@@ -258,29 +246,19 @@ class DiffGenerator:
         else:
             raise ValueError("Either prompt or prompt_txt must be provided")
 
-        pretrained_sampling_params = SamplingParams.from_pretrained(
-            self.server_args.model_path, **kwargs
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            self.server_args.model_path,
+            server_args=self.server_args,
+            **sampling_params_kwargs,
         )
-        pretrained_sampling_params._merge_with_user_params(sampling_params)
-        # TODO: simplify
-        data_type = (
-            DataType.IMAGE
-            if self.server_args.pipeline_config.task_type.is_image_gen()
-            or pretrained_sampling_params.num_frames == 1
-            else DataType.VIDEO
-        )
-        pretrained_sampling_params.data_type = data_type
-        pretrained_sampling_params._set_output_file_name()
-        pretrained_sampling_params.adjust(self.server_args)
 
         requests: list[Req] = []
         for output_idx, p in enumerate(prompts):
-            current_sampling_params = deepcopy(pretrained_sampling_params)
-            current_sampling_params.prompt = p
+            sampling_params.prompt = p
             requests.append(
                 prepare_request(
                     server_args=self.server_args,
-                    sampling_params=current_sampling_params,
+                    sampling_params=sampling_params,
                 )
             )
 
