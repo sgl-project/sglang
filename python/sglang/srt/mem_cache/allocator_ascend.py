@@ -112,9 +112,9 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 device=self.device,
             )
             torch.ops.npu.alloc_extend(
-                prefix_lens,
-                seq_lens,
-                last_loc,
+                prefix_lens.to(torch.int64),
+                seq_lens.to(torch.int64),
+                last_loc.to(torch.int64),
                 self.free_pages,
                 self.page_size,
                 out_indices,

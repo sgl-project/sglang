@@ -37,7 +37,6 @@ class WanVideoArchConfig(DiTArchConfig):
         }
     )
 
-    # Reverse mapping for saving checkpoints: custom -> hf
     reverse_param_names_mapping: dict = field(default_factory=lambda: {})
 
     # Some LoRA adapters use the original official layer names instead of hf layer names,

@@ -17,6 +17,10 @@ import unittest
 
 import openai
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=150, suite="nightly-1-gpu", nightly=True)
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

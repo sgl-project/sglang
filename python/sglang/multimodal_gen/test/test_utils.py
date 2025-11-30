@@ -14,7 +14,7 @@ from typing import Optional
 
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -23,6 +23,15 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 )
 
 logger = init_logger(__name__)
+
+
+def is_image_url(image_path: str | Path | None) -> bool:
+    """Check if image_path is a URL."""
+    if image_path is None:
+        return False
+    return isinstance(image_path, str) and (
+        image_path.startswith("http://") or image_path.startswith("https://")
+    )
 
 
 def run_command(command) -> Optional[float]:
@@ -164,7 +173,7 @@ def wait_for_req_perf_record(
     request_id: str,
     prev_len: int,
     log_path: Path,
-    timeout: float = 300.0,
+    timeout: float = 30.0,
 ) -> tuple[RequestPerfRecord | None, int]:
     """
     the stage metrics of this request should be in the performance_log file with {request-id}
@@ -173,7 +182,7 @@ def wait_for_req_perf_record(
     deadline = time.time() + timeout
     while time.time() < deadline:
         records = read_perf_logs(log_path)
-        if len(records) == prev_len + 1:
+        if len(records) >= prev_len + 1:
             # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
             # potential error when there are multiple servers
             return records[-1], len(records)
@@ -183,6 +192,8 @@ def wait_for_req_perf_record(
     if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
         records = read_perf_logs(log_path)
         return None, len(records)
+
+    logger.error(f"record: {records}")
     raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
 
 
@@ -383,8 +394,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_cfg_parallel(self):
         """cfg parallel"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_cfg_parallel",
             args="--num-gpus 2 --enable-cfg-parallel",
@@ -394,8 +403,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_usp(self):
         """usp"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_usp",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=2",
@@ -405,8 +412,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_mixed(self):
         """mixed"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_mixed",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=1 --enable-cfg-parallel",
