@@ -1,13 +1,19 @@
 import copy
 import logging
+from contextlib import contextmanager
 from dataclasses import replace
 from functools import lru_cache
+from typing import TYPE_CHECKING, Any
 
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.compilation_config import CompilationConfig, CompilationMode
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.model_config import ModelConfig
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+else:
+    ModelConfig = Any
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,7 @@ _current_sglang_config: SGLangConfig | None = None
 _current_prefix: str | None = None
 
 
+@contextmanager
 def set_current_sglang_config(
     sglang_config: SGLangConfig, check_compile=False, prefix: str | None = None
 ):

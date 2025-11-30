@@ -415,7 +415,6 @@ class AllReduceFusionPass(SGLangPatternMatcherPass):
         )
 
         self.register_patterns()
-        self.dump_patterns(config, self.patterns)
 
     @enable_fake_mode
     def register_patterns(self):
@@ -431,12 +430,12 @@ class AllReduceFusionPass(SGLangPatternMatcherPass):
                 self.device,
                 self.allreduce_params,
             ).register(self.patterns)
-            AllReduceFusedAddRMSNormPattern(
-                epsilon,
-                self.model_dtype,
-                self.device,
-                self.allreduce_params,
-            ).register(self.patterns)
+            # AllReduceFusedAddRMSNormPattern(
+            #     epsilon,
+            #     self.model_dtype,
+            #     self.device,
+            #     self.allreduce_params,
+            # ).register(self.patterns)
 
             # WARNING: This is a hack to clear the pattern matcher cache
             # and allow multiple values of epsilon.
