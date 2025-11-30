@@ -12,27 +12,32 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     is_in_ci,
     popen_launch_server,
-    run_bench_one_batch,
+    run_bench_offline_throughput,
 )
 
 
-class TestWaveAttnBackend(unittest.TestCase):
+class TestWaveAttnBackend(CustomTestCase):
     def test_latency(self):
-        _, output_throughput, _ = run_bench_one_batch(
+        output_throughput = run_bench_offline_throughput(
             DEFAULT_MODEL_NAME_FOR_TEST,
             [
                 "--attention-backend",
                 "wave",
                 "--enable-torch-compile",
+                "--cuda-graph-max-bs",
+                4,
             ],
         )
+
+        print(f"{output_throughput=}")
 
         if is_in_ci():
             self.assertGreater(output_throughput, 153)
 
-    def _test_mmlu(self):
+    def test_mmlu(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST
         process = popen_launch_server(
