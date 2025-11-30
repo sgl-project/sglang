@@ -127,13 +127,18 @@ class Engine(EngineBase):
         atexit.register(self.shutdown)
 
         # Launch subprocesses
-        tokenizer_manager, template_manager, scheduler_info, port_args = (
-            _launch_subprocesses(server_args=server_args)
-        )
+        (
+            tokenizer_manager,
+            template_manager,
+            scheduler_info,
+            port_args,
+            remote_instance_transfer_engine_info,
+        ) = _launch_subprocesses(server_args=server_args)
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
         self.scheduler_info = scheduler_info
         self.port_args = port_args
+        self.remote_instance_transfer_engine_info = remote_instance_transfer_engine_info
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -910,6 +915,7 @@ def _launch_subprocesses(
 
     # Wait for the model to finish loading
     scheduler_infos = []
+    remote_instance_transfer_engine_info = {}
     for i in range(len(scheduler_pipe_readers)):
         try:
             data = scheduler_pipe_readers[i].recv()
@@ -926,9 +932,24 @@ def _launch_subprocesses(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_infos.append(data)
+        if (
+            "tp_rank" in data
+            and "remote_instance_transfer_engine_session_id" in data
+            and "remote_instance_transfer_engine_weights_info_dict" in data
+        ):
+            remote_instance_transfer_engine_info[data["tp_rank"]] = (
+                data["remote_instance_transfer_engine_session_id"],
+                data["remote_instance_transfer_engine_weights_info_dict"],
+            )
 
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
-    return tokenizer_manager, template_manager, scheduler_info, port_args
+    return (
+        tokenizer_manager,
+        template_manager,
+        scheduler_info,
+        port_args,
+        remote_instance_transfer_engine_info,
+    )
