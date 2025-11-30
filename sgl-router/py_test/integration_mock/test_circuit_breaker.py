@@ -86,6 +86,19 @@ def test_circuit_breaker_half_open_failure_reopens(router_manager, mock_workers)
             timeout=3,
         )
 
+    # should see 500 when worker actually starts, before that should see 503
+    saw_500 = False
+    for _ in range(8):
+        r = post_once()
+        if r.status_code == 500:
+            # Worker starts, continue to circuit breaker test
+            saw_500 = True
+            break
+        assert (
+            r.status_code == 503
+        ), "Should only see 503 when waiting for worker to start"
+    assert saw_500, "Worker didn't start after 8 requests"
+
     opened = False
     for _ in range(8):
         r = post_once()

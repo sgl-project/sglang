@@ -20,6 +20,9 @@ Tests LRU and FIFO eviction behavior.
 import unittest
 
 from sglang.srt.lora.eviction_policy import get_eviction_policy
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
 
 
 class TestLoRAEvictionPolicy(unittest.TestCase):

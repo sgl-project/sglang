@@ -59,7 +59,8 @@ repos:
             python/sglang/srt/grpc/.*_pb2\.py|
             python/sglang/srt/grpc/.*_pb2_grpc\.py|
             python/sglang/srt/grpc/.*_pb2\.pyi|
-            python/sglang/srt/grpc/.*_pb2_grpc\.pyi
+            python/sglang/srt/grpc/.*_pb2_grpc\.pyi|
+            sgl-router/src/tokenizer/chat_template\.rs
           )$
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8

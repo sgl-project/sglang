@@ -11,6 +11,7 @@ import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -239,9 +240,10 @@ class TextEncodingStage(PipelineStage):
                 else {}
             )
 
-            processed_texts: list[str] = []
+            processed_text_list: list[str] = []
             for prompt_str in texts:
-                processed_texts.append(preprocess_func(prompt_str))
+                preprocessed = preprocess_func(prompt_str)
+                processed_text_list.append(preprocessed)
 
             # Prepare tokenizer args
             tok_kwargs = self.prepare_tokenizer_kwargs(
@@ -249,10 +251,15 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
-            text_inputs = tokenizer(processed_texts, **tok_kwargs).to(target_device)
+            text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
+                processed_text_list, tokenizer, tok_kwargs
+            ).to(target_device)
+
             input_ids = text_inputs["input_ids"]
-            is_flux = isinstance(server_args.pipeline_config, FluxPipelineConfig)
-            is_flux_t5 = is_flux and i == 1
+            is_flux_v1 = isinstance(
+                server_args.pipeline_config, FluxPipelineConfig
+            ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
+            is_flux_t5 = is_flux_v1 and i == 1
 
             if is_flux_t5:
                 attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
@@ -263,13 +270,14 @@ class TextEncodingStage(PipelineStage):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     output_hidden_states=True,
+                    use_cache=False,
                 )
             prompt_embeds = postprocess_func(outputs, text_inputs)
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(dtype=dtype)
 
             embeds_list.append(prompt_embeds)
-            if is_flux:
+            if is_flux_v1:
                 pooled_embeds_list.append(outputs.pooler_output)
             if return_attention_mask:
                 attn_masks_list.append(attention_mask)

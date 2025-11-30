@@ -148,7 +148,6 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             )
             self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
 
-        # Scaled dot product attention
         self.attn = USPAttention(
             num_heads=num_heads,
             head_size=self.head_dim,

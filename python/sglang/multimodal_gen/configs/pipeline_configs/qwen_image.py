@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
 
@@ -123,6 +124,18 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         # pack latents
         return _pack_latents(latents, batch_size, num_channels_latents, height, width)
 
+    def get_decode_scale_and_shift(self, device, dtype, vae):
+        vae_arch_config = self.vae_config.arch_config
+        scaling_factor = 1.0 / torch.tensor(
+            vae_arch_config.latents_std, device=device
+        ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(device, dtype)
+        shift_factor = (
+            torch.tensor(vae_arch_config.latents_mean)
+            .view(1, vae_arch_config.z_dim, 1, 1, 1)
+            .to(device, dtype)
+        )
+        return scaling_factor, shift_factor
+
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
         # img_shapes: for global entire image
@@ -190,6 +203,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         return latents
 
 
+@dataclass
 class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     """Configuration for the QwenImageEdit pipeline."""
 
@@ -202,8 +216,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image = batch.pil_image
-        image_size = image[0].size if isinstance(image, list) else image.size
+        image_size = batch.original_condition_image_size
         edit_width, edit_height, _ = calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
         )
@@ -249,6 +262,9 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
         }
 
+    def resize_condition_image(self, image, target_width, target_height):
+        return resize(image, target_height, target_width, resize_mode="default")
+
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_edit_cond_kwargs(
             batch, batch.prompt_embeds, rotary_emb, device, dtype
@@ -259,26 +275,11 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
         )
 
-    def preprocess_image(self, image, image_processor):
-        image_size = image[0].size if isinstance(image, list) else image.size
+    def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
         calculated_width, calculated_height, _ = calculate_dimensions(
-            1024 * 1024, image_size[0] / image_size[1]
+            1024 * 1024, width / height
         )
-        image = image_processor.resize(image, calculated_height, calculated_width)
-        return image
-
-    def adjust_size(self, width, height, image):
-        image_size = image[0].size if isinstance(image, list) else image.size
-        calculated_width, calculated_height, _ = calculate_dimensions(
-            1024 * 1024, image_size[0] / image_size[1]
-        )
-        height = height or calculated_height
-        width = width or calculated_width
-
-        multiple_of = self.get_vae_scale_factor() * 2
-        width = width // multiple_of * multiple_of
-        height = height // multiple_of * multiple_of
-        return width, height
+        return calculated_width, calculated_height
 
     def slice_noise_pred(self, noise, latents):
         # remove noise over input image
