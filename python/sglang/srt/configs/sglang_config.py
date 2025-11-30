@@ -1,5 +1,6 @@
 import copy
 import logging
+from contextlib import contextmanager
 from dataclasses import replace
 from functools import lru_cache
 
@@ -47,6 +48,7 @@ _current_sglang_config: SGLangConfig | None = None
 _current_prefix: str | None = None
 
 
+@contextmanager
 def set_current_sglang_config(
     sglang_config: SGLangConfig, check_compile=False, prefix: str | None = None
 ):

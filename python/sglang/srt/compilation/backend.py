@@ -89,21 +89,24 @@ class CompilerManager:
         graph_index: int,
         runtime_shape: Optional[int] = None,
     ) -> Optional[Callable]:
-        handle = self.cache[(runtime_shape, graph_index, self.compiler.name)]
+        key = (runtime_shape, graph_index, self.compiler.name)
+        handle = self.cache.get(key, None)
+        if handle is None:
+            return None
+
         compiled_graph = self.compiler.load(
             handle, graph, example_inputs, graph_index, runtime_shape
         )
         if runtime_shape is None:
             logger.debug(
-                "Directly load the %s-th graph for dynamic shape from %s via "
-                "handle %s",
+                "Directly load the %s-th graph for dynamic shape from %s via handle %s",
                 graph_index,
                 self.compiler.name,
                 handle,
             )
         else:
             logger.debug(
-                "Directly load the %s-th graph for shape %s from %s via " "handle %s",
+                "Directly load the %s-th graph for shape %s from %s via handle %s",
                 graph_index,
                 str(runtime_shape),
                 self.compiler.name,
@@ -299,7 +302,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         # When True, it annoyingly dumps the torch.fx.Graph on errors.
         self.extra_traceback = False
         self.sglang_config = sglang_config
-        self.compilation_config = sglang_config.compile_config
+        self.compilation_config = sglang_config.compilation_config
 
     def run(self, *args):
         fake_args = [
@@ -329,7 +332,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 self.sglang_backend.compiler_manager.compile(
                     submod,
                     args,
-                    self.inductor_config,
+                    self.sglang_backend.inductor_config,
                     self.compilation_config,
                     graph_index=index,
                     num_graphs=len(self.compile_submod_names),
@@ -340,7 +343,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             self.module.__dict__[target] = CUDAPiecewiseBackend(
                 submod,
                 self.compilation_config,
-                self.inductor_config,
+                self.sglang_backend.inductor_config,
                 self.graph_pool,
                 index,
                 len(self.compile_submod_names),
