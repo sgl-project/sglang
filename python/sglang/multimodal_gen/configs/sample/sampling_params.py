@@ -195,7 +195,7 @@ class SamplingParams:
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError("prompt_path must be a txt file")
 
-    def adjust(
+    def _adjust(
         self,
         server_args: ServerArgs,
     ):
@@ -319,7 +319,7 @@ class SamplingParams:
         sampling_params._merge_with_user_params(user_sampling_params)
         sampling_params.width_not_provided = user_sampling_params.width is None
         sampling_params.height_not_provided = user_sampling_params.height is None
-        sampling_params.adjust(server_args)
+        sampling_params._adjust(server_args)
 
         return sampling_params
 
@@ -421,6 +421,32 @@ class SamplingParams:
             default=SamplingParams.width,
             help="Width of generated output",
         )
+        # resolution shortcuts
+        parser.add_argument(
+            "--4k",
+            action="store_true",
+            dest="resolution_4k",
+            help="Set resolution to 4K (3840x2160)",
+        )
+        parser.add_argument(
+            "--2k",
+            action="store_true",
+            dest="resolution_2k",
+            help="Set resolution to 2K (2560x1440)",
+        )
+        parser.add_argument(
+            "--1080p",
+            action="store_true",
+            dest="resolution_1080p",
+            help="Set resolution to 1080p (1920x1080)",
+        )
+        parser.add_argument(
+            "--720p",
+            action="store_true",
+            dest="resolution_720p",
+            help="Set resolution to 720p (1280x720)",
+        )
+
         parser.add_argument(
             "--fps",
             type=int,
@@ -496,11 +522,25 @@ class SamplingParams:
         return parser
 
     @classmethod
-    def from_cli_args(cls, args: argparse.Namespace):
+    def get_cli_args(cls, args: argparse.Namespace):
+        # handle resolution shortcuts
+        if hasattr(args, "resolution_4k") and args.resolution_4k:
+            args.width = 3840
+            args.height = 2160
+        elif hasattr(args, "resolution_2k") and args.resolution_2k:
+            args.width = 2560
+            args.height = 1440
+        elif hasattr(args, "resolution_1080p") and args.resolution_1080p:
+            args.width = 1920
+            args.height = 1080
+        elif hasattr(args, "resolution_720p") and args.resolution_720p:
+            args.width = 1280
+            args.height = 720
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         args.height_not_provided = False
         args.width_not_provided = False
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        return {attr: getattr(args, attr) for attr in attrs}
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
@@ -575,8 +615,8 @@ class SamplingParams:
 
         # Log sampling parameters
         debug_str = f"""Sampling params:
-                      height: {target_height}
                        width: {target_width}
+                      height: {target_height}
                   num_frames: {self.num_frames}
                       prompt: {self.prompt}
                   neg_prompt: {self.negative_prompt}

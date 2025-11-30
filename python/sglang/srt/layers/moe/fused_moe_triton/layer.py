@@ -1117,7 +1117,7 @@ class FlashInferFP4MoE(FusedMoE):
         topk_config = topk_output.topk_config
 
         hs_fp4, hs_scale_linear = self._quantize_hidden_states_fp4(hidden_states)
-
+        router_logits = router_logits.to(torch.float32)
         routing_method_type = self.routing_method_type
         assert (
             routing_method_type is not None
