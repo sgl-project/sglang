@@ -307,6 +307,9 @@ class ComposedPipelineBase(ABC):
             # Use custom VAE path if provided, otherwise use default path
             if module_name == "vae" and server_args.vae_path is not None:
                 component_model_path = server_args.vae_path
+                # Download from HuggingFace Hub if path doesn't exist locally
+                if not os.path.exists(component_model_path):
+                    component_model_path = maybe_download_model(component_model_path)
                 logger.info(
                     "Using custom VAE path: %s instead of default path: %s",
                     component_model_path,
