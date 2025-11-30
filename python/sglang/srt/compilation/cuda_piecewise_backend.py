@@ -10,8 +10,8 @@ import torch
 import torch.fx as fx
 from sgl_kernel import weak_ref_tensor
 
-from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
+from sglang.srt.configs.compilation_config import CompilationConfig
 
 logger = logging.getLogger(__name__)
 
