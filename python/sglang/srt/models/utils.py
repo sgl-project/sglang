@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import numpy as np
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -59,3 +60,25 @@ def permute_inv(perm: torch.Tensor) -> torch.Tensor:
     inv_perm = torch.empty_like(perm)
     inv_perm[perm] = torch.arange(perm.numel(), device=perm.device, dtype=perm.dtype)
     return inv_perm
+
+
+def compute_cu_seqlens_from_grid_numpy(grid_thw: torch.Tensor) -> torch.Tensor:
+    """
+    Compute cu_seqlens from grid_thw using NumPy.
+
+    grid_thw: [T, 3] int tensor on CPU.
+              columns: [repeat_count, H, W]
+    Returns:
+        cu_seqlens: 1D int32 tensor on CPU, shape [N + 1]
+    """
+    assert (
+        grid_thw.device.type == "cpu"
+    ), "compute_cu_seqlens_from_grid_numpy expects a CPU tensor"
+    arr = grid_thw.numpy()
+
+    cu_seqlens = np.repeat(arr[:, 1] * arr[:, 2], arr[:, 0]).cumsum(
+        axis=0, dtype=np.int32
+    )
+    cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+    cu_seqlens = torch.from_numpy(cu_seqlens)
+    return cu_seqlens
