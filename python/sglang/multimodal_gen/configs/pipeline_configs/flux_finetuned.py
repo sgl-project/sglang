@@ -112,7 +112,8 @@ class Flux2FinetunedPipelineConfig(Flux2PipelineConfig):
             return 1 / latents_bn_std, latents_bn_mean
         else:
             # Distilled/Finetuned VAE: use scaling_factor from config
-            # Try to get scaling_factor from VAE config, fallback to arch_config or default
+            # For decode, we need to divide latents by scaling_factor (symmetric to encode)
+            # So we return scaling_factor directly, not 1/scaling_factor
             scaling_factor = (
                 getattr(vae.config, "scaling_factor", None)
                 if hasattr(vae, "config")
@@ -122,5 +123,5 @@ class Flux2FinetunedPipelineConfig(Flux2PipelineConfig):
             # Create scale tensor with proper shape for broadcasting
             # Shape (1, 1, 1, 1) works for both 4D and 5D latents
             scale = torch.tensor(scaling_factor, device=device, dtype=dtype).view(1, 1, 1, 1)
-            return 1 / scale, None
+            return scale, None
 
