@@ -3,33 +3,17 @@
 import dataclasses
 import logging
 from contextlib import ExitStack
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional
 from unittest.mock import patch
 
 import torch
 import torch.fx as fx
-from sgl_kernel import weak_ref_tensor
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
+from sglang.srt.compilation.weak_ref_tensor import weak_ref_tensors
 
 logger = logging.getLogger(__name__)
-
-
-def weak_ref_tensors(
-    tensors: Union[torch.Tensor, list[torch.Tensor], tuple[torch.Tensor]]
-) -> Union[torch.Tensor, list[Any], tuple[Any], Any]:
-    """
-    Convenience function to create weak references to tensors,
-    for single tensor, list of tensors or tuple of tensors.
-    """
-    if isinstance(tensors, torch.Tensor):
-        return weak_ref_tensor(tensors)
-    if isinstance(tensors, list):
-        return [weak_ref_tensor(t) for t in tensors]
-    if isinstance(tensors, tuple):
-        return tuple(weak_ref_tensor(t) for t in tensors)
-    raise ValueError("Invalid type for tensors")
 
 
 @dataclasses.dataclass
