@@ -302,6 +302,126 @@ void fused_rmsnorm_gated_kernel_impl(
 
 }  // anonymous namespace
 
+template <typename scalar_t>
+void fused_add_layernorm_kernel_impl(
+    scalar_t* __restrict__ input,
+    scalar_t* __restrict__ residual,
+    const scalar_t* __restrict__ weight,
+    float* __restrict__ buffer,
+    int64_t batch_size,
+    int64_t hidden_size,
+    int64_t input_strideN,
+    float eps = 1e-5) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int kVecSize = bVec::size();
+  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+    int tid = at::get_thread_num();
+    float* __restrict__ buffer_ptr = buffer + tid * hidden_size;
+
+    for (int64_t i = begin; i < end; ++i) {
+      // local ptrs
+      scalar_t* __restrict__ input_ptr = input + i * input_strideN;
+      scalar_t* __restrict__ residual_ptr = residual + i * hidden_size;
+
+      // First pass: compute sum for mean
+      fVec sum_fvec = fVec(float(0));
+      float sum_val = float(0);
+
+      int64_t d;
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        bVec r_bvec = bVec::loadu(residual_ptr + d);
+        fVec r_fvec0, r_fvec1;
+        std::tie(r_fvec0, r_fvec1) = at::vec::convert_to_float(r_bvec);
+
+        x_fvec0 += r_fvec0;
+        x_fvec1 += r_fvec1;
+
+        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        out_bvec.store(residual_ptr + d);
+
+        sum_fvec += x_fvec0;
+        sum_fvec += x_fvec1;
+
+        x_fvec0.store(buffer_ptr + d);
+        x_fvec1.store(buffer_ptr + d + fVec::size());
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        float r_val = static_cast<float>(residual_ptr[d]);
+
+        x_val += r_val;
+        residual_ptr[d] = static_cast<scalar_t>(x_val);
+
+        sum_val += x_val;
+        buffer_ptr[d] = x_val;
+      }
+
+      // Compute mean
+      sum_val += vec_reduce_sum(sum_fvec);
+      float mean = sum_val / hidden_size;
+      const fVec mean_fvec = fVec(mean);
+
+      // Second pass: compute variance
+      fVec var_sum_fvec = fVec(float(0));
+      float var_sum_val = float(0);
+
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
+        fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
+
+        fVec diff0 = x_fvec0 - mean_fvec;
+        fVec diff1 = x_fvec1 - mean_fvec;
+
+        var_sum_fvec += diff0 * diff0;
+        var_sum_fvec += diff1 * diff1;
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float diff = buffer_ptr[d] - mean;
+        var_sum_val += diff * diff;
+      }
+
+      // Compute normalization factor
+      var_sum_val += vec_reduce_sum(var_sum_fvec);
+      float variance = var_sum_val / hidden_size;
+      float rsqrt_var = float(1) / std::sqrt(variance + eps);
+      const fVec scale_fvec = fVec(rsqrt_var);
+
+      // Third pass: apply normalization
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
+        fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
+
+        bVec w_bvec = bVec::loadu(weight + d);
+        fVec w_fvec0, w_fvec1;
+        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+
+        x_fvec0 = (x_fvec0 - mean_fvec) * scale_fvec * w_fvec0;
+        x_fvec1 = (x_fvec1 - mean_fvec) * scale_fvec * w_fvec1;
+
+        bVec x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        x_bvec.store(input_ptr + d);
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float normalized = (buffer_ptr[d] - mean) * rsqrt_var;
+        float x_val = normalized * static_cast<float>(weight[d]);
+        input_ptr[d] = static_cast<scalar_t>(x_val);
+      }
+    }
+  });
+}  // anonymous namespace
+
 // input : {batch_size, hidden_size}
 at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   RECORD_FUNCTION("sgl-kernel::l2norm_cpu", std::vector<c10::IValue>({input}));
@@ -404,6 +524,40 @@ void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& 
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_rmsnorm_kernel", [&] {
+    fused_add_rmsnorm_kernel_impl<scalar_t>(
+        input.data_ptr<scalar_t>(),
+        residual.data_ptr<scalar_t>(),
+        weight.data_ptr<scalar_t>(),
+        buffer.data_ptr<float>(),
+        batch_size,
+        hidden_size,
+        input_strideN,
+        eps);
+  });
+}
+
+// input   : {batch_size, hidden_size}
+// residual: {batch_size, hidden_size}
+// weight  : {hidden_size}
+void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps) {
+  RECORD_FUNCTION("sgl-kernel::fused_add_layernorm_cpu", std::vector<c10::IValue>({input, residual, weight}));
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_INPUT(residual);
+  CHECK_INPUT(weight);
+  CHECK_DIM(2, input);
+  CHECK_DIM(2, residual);
+  CHECK_DIM(1, weight);
+  CHECK_EQ(input.size(0), residual.size(0));
+  CHECK_EQ(input.size(1), residual.size(1));
+  CHECK_EQ(input.size(1), weight.size(0));
+  int64_t batch_size = input.size(0);
+  int64_t hidden_size = input.size(1);
+  int64_t input_strideN = input.stride(0);
+
+  int64_t num_threads = at::get_num_threads();
+  at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_layernorm_kernel", [&] {
     fused_add_rmsnorm_kernel_impl<scalar_t>(
         input.data_ptr<scalar_t>(),
         residual.data_ptr<scalar_t>(),
