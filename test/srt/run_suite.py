@@ -332,6 +332,7 @@ suite_xeon = {
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
         TestFile("cpu/test_gemm.py"),
+        TestFile("cpu/test_mamba.py"),
         TestFile("cpu/test_mla.py"),
         TestFile("cpu/test_moe.py"),
         TestFile("cpu/test_norm.py"),
