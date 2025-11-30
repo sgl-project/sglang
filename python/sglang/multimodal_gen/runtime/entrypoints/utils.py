@@ -22,21 +22,24 @@ def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
 ) -> Req:
-    """
-    Settle SamplingParams according to ServerArgs
+    params_dict = shallow_asdict(sampling_params)
 
-    """
-    # Create a copy of inference args to avoid modifying the original
+    diffusers_kwargs = params_dict.pop("diffusers_kwargs", None)
+    extra = params_dict.get("extra") or {}
+    if diffusers_kwargs:
+        extra["diffusers_kwargs"] = diffusers_kwargs
+        params_dict["extra"] = extra
+
     req = Req(
-        **shallow_asdict(sampling_params),
+        **params_dict,
         VSA_sparsity=server_args.VSA_sparsity,
     )
+
     req.adjust_size(server_args)
 
     if req.width <= 0 or req.height <= 0:
         raise ValueError(
-            f"Height, width must be positive integers, got "
-            f"height={req.height}, width={req.width}"
+            f"Height and width must be positive, got height={req.height}, width={req.width}"
         )
 
     return req
