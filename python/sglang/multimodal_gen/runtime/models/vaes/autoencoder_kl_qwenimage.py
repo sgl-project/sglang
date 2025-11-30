@@ -794,7 +794,7 @@ class AutoencoderKLQwenImage(nn.Module):
             base_dim, z_dim, dim_mult, num_res_blocks, attn_scales, self.temperal_upsample, dropout
         )
 
-        self.spatial_compression_ratio = 2 ** len(self.temperal_downsample)
+        self.spatial_compression_ratio = config.arch_config.spatial_compression_ratio
 
         # When decoding a batch of video latents at a time, one can save memory by slicing across the batch dimension
         # to perform decoding of a single video latent at a time.

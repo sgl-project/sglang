@@ -373,14 +373,18 @@ class ImageVAEEncodingStage(PipelineStage):
             image_latents = image_latents.unsqueeze(0)  # (1, N*1024, 128)
             image_latents = image_latents.repeat(batch_size, 1, 1)
         else:
-            latent_height = batch.height // self.vae.spatial_compression_ratio
-            latent_width = batch.width // self.vae.spatial_compression_ratio
+            vae_arch_config = server_args.pipeline_config.vae_config.arch_config
+            spatial_compression_ratio = vae_arch_config.spatial_compression_ratio
+            temporal_compression_ratio = vae_arch_config.temporal_compression_ratio
+
+            latent_height = batch.height // spatial_compression_ratio
+            latent_width = batch.width // spatial_compression_ratio
             mask_lat_size = torch.ones(1, 1, num_frames, latent_height, latent_width)
             mask_lat_size[:, :, list(range(1, num_frames))] = 0
             first_frame_mask = mask_lat_size[:, :, 0:1]
             first_frame_mask = torch.repeat_interleave(
                 first_frame_mask,
-                repeats=self.vae.temporal_compression_ratio,
+                repeats=temporal_compression_ratio,
                 dim=2,
             )
             mask_lat_size = torch.concat(
@@ -389,7 +393,7 @@ class ImageVAEEncodingStage(PipelineStage):
             mask_lat_size = mask_lat_size.view(
                 1,
                 -1,
-                self.vae.temporal_compression_ratio,
+                temporal_compression_ratio,
                 latent_height,
                 latent_width,
             )

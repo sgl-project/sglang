@@ -299,7 +299,6 @@ class SamplingParams:
         from sglang.multimodal_gen.registry import get_model_info
 
         model_info = get_model_info(model_path)
-        logger.debug(f"Found model info: {model_info}")
         if model_info is not None:
             sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         else:
