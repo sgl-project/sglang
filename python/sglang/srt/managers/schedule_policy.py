@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import random
+from bisect import bisect_right
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -342,7 +343,7 @@ class PrefillAdder:
 
         self.reserved_tokens = mixed_with_decode_tokens
 
-        self.req_states = None
+        self.req_token_tracking = None
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
@@ -458,6 +459,81 @@ class PrefillAdder:
             finally:
                 self.tree_cache.dec_lock_ref(last_node)
 
+    def add_one_req_ignore_eos(self, req: Req):
+        # Early exit if not enough tokens for the input
+        if self.ceil_paged_tokens(req.extend_input_len) > self.rem_total_tokens:
+            return AddReqResult.NO_TOKEN
+
+        def add_req_state(r):
+            tokens_remaining = r.sampling_params.max_new_tokens - len(r.output_ids)
+            if tokens_remaining <= 0:
+                return
+
+            tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
+            idx = bisect_right(
+                self.req_token_tracking[0],
+                (tokens_remaining, tokens_occupied),
+            )
+            self.req_token_tracking[0].insert(idx, (tokens_remaining, tokens_occupied))
+            self.req_token_tracking[1] += tokens_remaining
+
+        if self.req_token_tracking is None:
+            self.req_token_tracking = [[], 0]
+            add_req_state(req)
+            if self.running_batch is not None:
+                for r in self.running_batch.reqs:
+                    add_req_state(r)
+            for r in self.can_run_list:
+                add_req_state(r)
+        else:
+            add_req_state(req)
+
+        # A simplified Banker's algorithm to check if we have enough tokens to serve all requests
+        # Skip for swa. The SWA has different memory management as this mechanism underestimates the memory usage.
+        if not self.is_hybrid:
+            available_tokens = (
+                self.rem_total_tokens
+                - self.req_token_tracking[1]
+                - self.ceil_paged_tokens(req.extend_input_len)
+            )
+            tokens_freed = 0
+            for i, (tokens_remaining, tokens_occupied) in enumerate(self.req_states):
+                # emulate request completion based on given generation length for EOS ignoring requests
+                active_bs = len(self.req_states) - i
+                min_available_tokens = (
+                    available_tokens + tokens_freed - tokens_remaining * active_bs
+                )
+                # reserve tokens for corner cases
+                if min_available_tokens <= IGNORE_EOS_RESERVE_TOKENS * active_bs:
+                    return AddReqResult.NO_TOKEN
+                tokens_freed += tokens_occupied
+
+        if (
+            self.rem_chunk_tokens is None  # chunked prefill is disabled
+            or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+        ):
+            # Non-chunked prefill
+            self.can_run_list.append(req)
+            self._update_prefill_budget(
+                0,
+                req.extend_input_len,
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+            )
+        else:
+            if self.rem_chunk_tokens <= 0:
+                return AddReqResult.OTHER
+
+            # Chunked prefill
+            trunc_len = self.rem_chunk_tokens
+
+            req.extend_input_len = trunc_len
+            req.fill_ids = req.fill_ids[:trunc_len]
+            self.can_run_list.append(req)
+            self.new_chunked_req = req
+            self._update_prefill_budget(0, trunc_len, 0)
+
+        return self.budget_state()
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
@@ -466,6 +542,8 @@ class PrefillAdder:
         # therefore, the prefill-batch setting is temporarily set to 1.
         if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
+        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+            return self.add_one_req_ignore_eos(req)
 
         total_token_usage = req.extend_input_len + self._decode_token_usage_estimation(
             req
