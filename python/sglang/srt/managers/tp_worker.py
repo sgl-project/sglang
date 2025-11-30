@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -55,6 +56,38 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
+
+
+def safe_load():
+    import torch.multiprocessing as mp
+
+    # 1) setting process sharing policy
+    try:
+        mp.set_sharing_strategy("file_system")
+        mp.set_start_method("fork", force=True)
+    except Exception:
+        pass
+
+    # 2) using forks method
+    try:
+        mp.set_start_method("fork", force=True)
+    except RuntimeError:
+        pass
+
+    import ctypes
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        PR_SET_PTRACER = 0x59616D61
+        PR_SET_PTRACER_ANY = -1
+        libc.prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0)
+    except Exception:
+        pass
+    pass
+
+
+if os.environ.get("SAFE_LOAD", "0") == "1":
+    safe_load()
 
 
 class BaseTpWorker(ABC):
