@@ -664,7 +664,7 @@ def general_mm_embed_routine(
     tp_group = get_tp_group()
 
     with use_original_ca_comm(tp_group):
-        # In piecewise cuda graph, we disable custom allreduce.
+        # We disable custom allreduce in piecewise cuda graph.
         # However, because we only capture the language model part, the multimodal can still use custom allreduce.
         assert hasattr(language_model, "get_input_embeddings")
         embed_tokens = language_model.get_input_embeddings()

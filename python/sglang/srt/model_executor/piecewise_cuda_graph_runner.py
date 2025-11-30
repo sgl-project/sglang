@@ -85,6 +85,7 @@ def disable_ca_comm(tp_group):
 def use_original_ca_comm(tp_group):
     """
     For the module not in piecewise cuda graph capture, use the original custom allreduce communication.
+    This is a no-op if not using piecewise cuda graph because .disabled == .original_disabled
 
     TODO(Byron): remove this once custom allreduce is enabled in piecewise cuda graph
     """
