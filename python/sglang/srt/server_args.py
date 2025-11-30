@@ -133,6 +133,8 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
+MM_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
@@ -249,6 +251,12 @@ class ServerArgs:
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
+
+    # Encode prefill disaggregation
+    mm_only: bool = False
+    language_only: bool = False
+    mm_transfer_backend: str = MM_TRANSFER_BACKEND_CHOICES[0]
+    encode_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Quantization and data type
     dtype: str = "auto"
@@ -580,6 +588,7 @@ class ServerArgs:
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
+    enable_prefix_mm_cache: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -648,7 +657,10 @@ class ServerArgs:
         self._handle_load_format()
 
         # Handle PD disaggregation.
-        self._handle_disaggregation()
+        self._handle_pd_disaggregation()
+
+        # Handle E disaggregation.
+        self._handle_e_disaggregation()
 
         # Validate tokenizer settings.
         self._handle_tokenizer_batching()
@@ -1795,7 +1807,21 @@ class ServerArgs:
             ):
                 self.load_format = "auto"
 
-    def _handle_disaggregation(self):
+    def _handle_e_disaggregation(self):
+        if self.mm_only and self.language_only:
+            raise ValueError("Cannot set --mm-only and --language-only together")
+        if self.mm_only and not self.disaggregation_mode == "null":
+            raise ValueError(
+                "Cannot set --mm-only and --disaggregation-mode prefill/decode together"
+            )
+        if (
+            self.language_only
+            and self.mm_transfer_backend == "zmq_to_scheduler"
+            and self.pp_size > 1
+        ):
+            raise ValueError("zmq_to_scheduler not support pp_size > 1")
+
+    def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
             assert (
                 self.disaggregation_decode_tp is None
@@ -2176,6 +2202,32 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        )
+
+        # Encode prefill disaggregation
+        parser.add_argument(
+            "--mm-only",
+            action="store_true",
+            help="For VLM, launch encode server only for multimodal part.",
+        )
+        parser.add_argument(
+            "--language-only",
+            action="store_true",
+            help="For VLM, load weights for the language model only.",
+        )
+        parser.add_argument(
+            "--mm-transfer-backend",
+            type=str,
+            default=ServerArgs.mm_transfer_backend,
+            choices=MM_TRANSFER_BACKEND_CHOICES,
+            help="The backend for encoder disaggregation transfer. Default is zmq.",
+        )
+        parser.add_argument(
+            "--encode-urls",
+            nargs="+",
+            type=str,
+            default=[],
+            help="List of encode urls for encoder disaggregation",
         )
 
         # Quantization and data type
@@ -3879,6 +3931,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.mm_enable_dp_encoder,
             help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        )
+        parser.add_argument(
+            "--enable-prefix-mm-cache",
+            action="store_true",
+            default=ServerArgs.enable_prefix_mm_cache,
+            help="Enable prefix multimodal cache.",
         )
 
         # For registering hooks
