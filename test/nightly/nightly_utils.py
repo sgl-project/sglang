@@ -1,10 +1,15 @@
 """Utilities for running nightly performance benchmarks with profiling."""
 
+from __future__ import annotations
+
 import json
 import os
 import subprocess
 import time
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from sglang.bench_tool_call import ToolCallBenchmarkResult
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.nightly_bench_utils import BenchmarkResult, generate_markdown_report
@@ -279,7 +284,11 @@ class NightlyBenchmarkRunner:
 
         finally:
             # Always clean up server process
-            kill_process_tree(process.pid)
+            try:
+                if process and process.poll() is None:
+                    kill_process_tree(process.pid)
+            except Exception as e:
+                print(f"Warning: Failed to kill process {process.pid}: {e}")
 
     def add_report(self, results: List[BenchmarkResult]) -> None:
         """Add benchmark results to the full report.
@@ -290,6 +299,15 @@ class NightlyBenchmarkRunner:
         if results:
             report_part = generate_markdown_report(self.profile_dir, results)
             self.full_report += report_part + "\n"
+
+    def add_tool_call_report(self, tool_call_result) -> None:
+        """Add tool call benchmark results to the full report.
+
+        Args:
+            tool_call_result: ToolCallBenchmarkResult object to add to report
+        """
+        if tool_call_result:
+            self.full_report += "\n" + tool_call_result.to_markdown_report() + "\n"
 
     def write_final_report(self) -> None:
         """Write the final report to GitHub summary if in CI."""
@@ -304,3 +322,114 @@ class NightlyBenchmarkRunner:
             The full markdown report as a string
         """
         return self.full_report
+
+    def run_perf_and_tool_call_benchmark(
+        self,
+        model_path: str,
+        batch_sizes: List[int],
+        input_lens: Tuple[int, ...],
+        output_lens: Tuple[int, ...],
+        other_args: Optional[List[str]] = None,
+        variant: str = "",
+        tool_call_parser: Optional[str] = None,
+        extra_bench_args: Optional[List[str]] = None,
+    ) -> Tuple[List[BenchmarkResult], Optional[ToolCallBenchmarkResult], bool, bool]:
+        """Run performance AND tool call benchmarks with single server launch.
+
+        This method launches the server once and runs both benchmark types,
+        avoiding multiple server starts.
+
+        Args:
+            model_path: Path to the model
+            batch_sizes: List of batch sizes to test
+            input_lens: Tuple of input lengths
+            output_lens: Tuple of output lengths
+            other_args: Arguments to pass to server launch
+            variant: Optional variant suffix (e.g., "basic", "mtp")
+            tool_call_parser: Tool call parser name (e.g., "llama3", "qwen")
+            extra_bench_args: Extra arguments for the benchmark command
+
+        Returns:
+            Tuple of (perf_results, tool_call_results, perf_success, tool_call_success)
+        """
+        from sglang.bench_tool_call import ToolCallBenchmark, ToolCallParser
+
+        benchmark_results = []
+        tool_call_result = None
+        model_description = f"{model_path}" + (f" ({variant})" if variant else "")
+
+        # Build server args, adding tool-call-parser if provided
+        server_args = list(other_args) if other_args else []
+        if tool_call_parser:
+            server_args.extend(["--tool-call-parser", tool_call_parser])
+
+        # Launch server ONCE
+        process = popen_launch_server(
+            model=model_path,
+            base_url=self.base_url,
+            other_args=server_args,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        )
+
+        perf_success = False
+        tool_call_success = True  # Default to True if no tool call benchmark
+
+        try:
+            # 1. Run performance benchmark
+            profile_path_prefix, json_output_file = self.generate_profile_filename(
+                model_path, variant
+            )
+
+            bench_args = list(extra_bench_args) if extra_bench_args else []
+            if variant:
+                bench_args.extend(["--run-name", variant])
+
+            command = self.build_benchmark_command(
+                model_path,
+                batch_sizes,
+                input_lens,
+                output_lens,
+                profile_path_prefix,
+                json_output_file,
+                extra_args=bench_args,
+            )
+
+            result, cmd_success = self.run_benchmark_command(command, model_description)
+
+            if cmd_success:
+                benchmark_results, perf_success = self.load_benchmark_results(
+                    json_output_file, model_description
+                )
+            else:
+                perf_success = False
+
+            # 2. Run tool call benchmark (if parser provided)
+            if tool_call_parser:
+                try:
+                    print(f"Running tool call benchmark for {model_description}...")
+                    benchmark = ToolCallBenchmark(
+                        base_url=f"{self.base_url}/v1",
+                        model=model_path,
+                        parser=ToolCallParser(tool_call_parser),
+                    )
+                    tool_call_result = benchmark.run_benchmark()
+                    tool_call_success = tool_call_result.success_rate >= 0.7
+                    print(
+                        f"Tool call benchmark: {tool_call_result.passed_tests}/{tool_call_result.total_tests} "
+                        f"passed ({tool_call_result.success_rate:.1%})"
+                    )
+                except Exception as e:
+                    print(
+                        f"Error running tool call benchmark for {model_description}: {e}"
+                    )
+                    tool_call_success = False
+
+            return benchmark_results, tool_call_result, perf_success, tool_call_success
+
+        finally:
+            # Always clean up server process
+            try:
+                if process and process.poll() is None:
+                    kill_process_tree(process.pid)
+            except Exception as e:
+                print(f"Warning: Failed to kill process {process.pid}: {e}")
