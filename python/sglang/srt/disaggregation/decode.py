@@ -949,18 +949,15 @@ class SchedulerDisaggregationDecodeMixin:
             # if there are still retracted requests, we do not allocate new requests
             return
 
-        if not hasattr(self, "polling_count"):
-            self.polling_count = 0
-            self.polling_interval = (
-                self.server_args.disaggregation_decode_polling_interval
-            )
-
-        self.polling_count = (self.polling_count + 1) % self.polling_interval
-
-        if self.polling_count % self.polling_interval == 0:
-            req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
-            self.disagg_decode_transfer_queue.extend(req_conns)
-            alloc_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
-            self.waiting_queue.extend(alloc_reqs)
+        if self.decode_polling_interval > 1:
+            self.decode_polling_count = (
+                self.decode_polling_count + 1
+            ) % self.decode_polling_interval
+            if self.decode_polling_count != 0:
+                return
+        req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
+        self.disagg_decode_transfer_queue.extend(req_conns)
+        alloc_reqs = (
+            self.disagg_decode_transfer_queue.pop_transferred()
+        )  # the requests which kv has arrived
+        self.waiting_queue.extend(alloc_reqs)
