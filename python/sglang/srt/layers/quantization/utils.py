@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union, Callable
 
 import numpy
 import torch
@@ -561,3 +561,9 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
         g_idx.to(device=orig_device),
         sort_indices.to(device=orig_device),
     )
+
+def get_torch_compile_disable_decorator(is_disable) -> Callable:
+    if is_disable:
+        return torch._dynamo.disable
+    else:
+        return lambda func: func
