@@ -448,6 +448,14 @@ class ToolChoice(BaseModel):
     type: Literal["function"] = Field(default="function", examples=["function"])
 
 
+class ZaiThinking(BaseModel):
+    """The zai thinking definition."""
+
+    type: Literal["enabled", "disabled"] = Field(
+        default="enabled", examples=["enabled", "disabled"]
+    )
+
+
 class ChatCompletionRequest(BaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -686,6 +694,9 @@ class ChatCompletionRequest(BaseModel):
                 sampling_params[constraint_type] = constraint_value
 
         return sampling_params
+
+    # For zai thinking
+    thinking: Optional[ZaiThinking] = None
 
 
 class ChatMessage(BaseModel):
