@@ -74,6 +74,12 @@ def is_completion_template_defined() -> bool:
     return completion_template_name is not None
 
 
+def set_completion_template_name(template_name: str) -> None:
+    """Set the global completion template name."""
+    global completion_template_name
+    completion_template_name = template_name
+
+
 def generate_completion_prompt_from_request(request: CompletionRequest) -> str:
     global completion_template_name
     if request.suffix == "":
