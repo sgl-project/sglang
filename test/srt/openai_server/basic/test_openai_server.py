@@ -779,6 +779,283 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert isinstance(getattr(models[0], "max_model_len", None), int)
 
 
+class TestOpenAIServerv1ResponsesFunctionCalling(CustomTestCase):
+    """Test Responses API with custom function calling support."""
+
+    # System message to guide the model to use tools properly
+    SYSTEM_MESSAGE = (
+        "You are a helpful assistant with tool calling capabilities. "
+        "Only reply with a tool call if the function exists in the library provided by the user. "
+        "If it doesn't exist, just reply directly in natural language. "
+        "When you receive a tool call response, use the output to format an answer to the original user question. "
+        "You have access to the following functions. "
+        "To call a function, please respond with JSON for a function call. "
+        'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}. '
+        "Do not use variables.\n\n"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--tool-call-parser",
+                "llama3",
+            ],
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def get_function_tools(self):
+        """Get function tools in Responses API format."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather for a given location",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {
+                                "type": "string",
+                                "description": "The city name to get weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                                "description": "Temperature unit",
+                            },
+                        },
+                        "required": ["city"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "description": "Compute the sum of two numbers",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {
+                                "type": "integer",
+                                "description": "First number",
+                            },
+                            "b": {
+                                "type": "integer",
+                                "description": "Second number",
+                            },
+                        },
+                        "required": ["a", "b"],
+                    },
+                },
+            },
+        ]
+
+    def test_responses_api_with_function_tools(self):
+        """Test Responses API accepts function tools and returns valid response."""
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": self.SYSTEM_MESSAGE},
+                {"role": "user", "content": "What is 3 + 5?"},
+            ],
+            "tools": self.get_function_tools(),
+            "tool_choice": "auto",
+            "temperature": 0,
+            "max_output_tokens": 256,
+        }
+
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 200, f"Request failed: {r.text}")
+
+        body = r.json()
+        self.assertEqual(body.get("object"), "response")
+        self.assertIn("output", body)
+        self.assertIn("status", body)
+
+    def test_responses_api_function_tool_call_parsing(self):
+        """Test that function tool calls are correctly parsed with expected name and arguments.
+
+        This is a strict test that verifies:
+        1. The model outputs a function_call (not just a message)
+        2. The function call has the correct name (get_weather)
+        3. The function call arguments contain the expected city
+
+        Uses tool_choice="required" to force function calling via JSON schema constraint,
+        making the test deterministic.
+        """
+        import json
+
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Use tool_choice="required" to force the model to call a function
+        # This activates JSON schema constraint for deterministic output
+        payload = {
+            "model": self.model,
+            "input": [
+                {"role": "system", "content": self.SYSTEM_MESSAGE},
+                {"role": "user", "content": "What is the weather in Tokyo?"},
+            ],
+            "tools": self.get_function_tools(),
+            "tool_choice": "required",
+            "temperature": 0,
+            "max_output_tokens": 256,
+        }
+
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 200, f"Request failed: {r.text}")
+
+        body = r.json()
+        self.assertEqual(body.get("object"), "response")
+
+        # Check output items
+        output = body.get("output", [])
+        self.assertIsInstance(output, list)
+
+        # Find function_call items
+        function_calls = [item for item in output if item.get("type") == "function_call"]
+
+        # With tool_choice="required", we MUST have at least one function call
+        self.assertGreaterEqual(
+            len(function_calls),
+            1,
+            f"Expected at least one function_call with tool_choice='required', "
+            f"got output: {json.dumps(output, indent=2)}",
+        )
+
+        # Verify the function call structure
+        fc = function_calls[0]
+
+        # Must have required fields
+        self.assertIn("name", fc, f"Function call missing 'name': {fc}")
+        self.assertIn("call_id", fc, f"Function call missing 'call_id': {fc}")
+        self.assertIn("arguments", fc, f"Function call missing 'arguments': {fc}")
+
+        # Function name should be get_weather (since we asked about weather)
+        self.assertEqual(
+            fc["name"],
+            "get_weather",
+            f"Expected function 'get_weather' for weather query, got: {fc['name']}",
+        )
+
+        # Parse and verify arguments
+        args = fc["arguments"]
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                self.fail(f"Could not parse arguments as JSON: {args}")
+
+        # Must have 'city' argument
+        self.assertIn("city", args, f"Expected 'city' in get_weather arguments, got: {args}")
+
+        # City should contain Tokyo (case-insensitive)
+        city_value = args["city"].lower()
+        self.assertIn(
+            "tokyo",
+            city_value,
+            f"Expected 'tokyo' in city argument, got: {args['city']}",
+        )
+
+    def test_responses_api_tool_choice_none(self):
+        """Test that tool_choice='none' prevents tool calls."""
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "input": "What is 3 + 5?",
+            "tools": self.get_function_tools(),
+            "tool_choice": "none",
+            "temperature": 0,
+            "max_output_tokens": 128,
+        }
+
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 200, f"Request failed: {r.text}")
+
+        body = r.json()
+        self.assertEqual(body.get("object"), "response")
+
+        # With tool_choice="none", should not have function_call items
+        output = body.get("output", [])
+        function_calls = [item for item in output if item.get("type") == "function_call"]
+        self.assertEqual(
+            len(function_calls),
+            0,
+            f"Expected no function_call with tool_choice='none', got: {function_calls}",
+        )
+
+    def test_responses_api_builtin_tools_ignored(self):
+        """Test that built-in tools (web_search_preview) are accepted but don't cause errors."""
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # Include a built-in tool (should be skipped during conversion)
+        tools = [
+            {"type": "web_search_preview"},
+            {
+                "type": "function",
+                "function": {
+                    "name": "test_func",
+                    "description": "Test function",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+
+        payload = {
+            "model": self.model,
+            "input": "Hello",
+            "tools": tools,
+            "tool_choice": "auto",
+            "temperature": 0,
+            "max_output_tokens": 64,
+        }
+
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 200, f"Request failed: {r.text}")
+
+        body = r.json()
+        self.assertEqual(body.get("object"), "response")
+
+    # NOTE: Streaming with tools is tested via raw requests, but the OpenAI SDK
+    # validates the response.completed event's tools field against its schema,
+    # which expects a different format (FunctionTool.name at top level instead
+    # of nested in function field). This causes validation errors in pytest.
+    # Streaming functionality is already tested in TestOpenAIServerv1Responses.
+    # TODO: Add streaming test once OpenAI SDK compatibility is resolved.
+
+
 class TestOpenAIV1Rerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
