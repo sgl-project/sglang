@@ -65,7 +65,9 @@ pub fn create_test_app(
             .router_config(router_config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
-            .tokenizer(None) // tokenizer
+            .tokenizer_registry(Arc::new(
+                sglang_router_rs::tokenizer::registry::TokenizerRegistry::new(),
+            )) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
             .tool_parser_factory(None) // tool_parser_factory
             .worker_registry(worker_registry)
@@ -193,7 +195,9 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
             .router_config(router_config)
             .client(client)
             .rate_limiter(None)
-            .tokenizer(None)
+            .tokenizer_registry(Arc::new(
+                sglang_router_rs::tokenizer::registry::TokenizerRegistry::new(),
+            ))
             .reasoning_parser_factory(None)
             .tool_parser_factory(None)
             .worker_registry(worker_registry)

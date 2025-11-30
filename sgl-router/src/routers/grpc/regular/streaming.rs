@@ -29,6 +29,7 @@ use crate::{
         utils,
     },
     tokenizer::{
+        registry::TokenizerRegistry,
         stop::{SequenceDecoderOutput, StopSequenceDecoder},
         traits::Tokenizer,
     },
@@ -38,7 +39,7 @@ use crate::{
 /// Shared streaming processor for both single and dual dispatch modes
 #[derive(Clone)]
 pub struct StreamingProcessor {
-    tokenizer: Arc<dyn Tokenizer>,
+    tokenizer_registry: Arc<TokenizerRegistry>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
@@ -47,14 +48,14 @@ pub struct StreamingProcessor {
 
 impl StreamingProcessor {
     pub fn new(
-        tokenizer: Arc<dyn Tokenizer>,
+        tokenizer_registry: Arc<TokenizerRegistry>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
     ) -> Self {
         Self {
-            tokenizer,
+            tokenizer_registry,
             tool_parser_factory,
             reasoning_parser_factory,
             configured_tool_parser,
@@ -256,17 +257,27 @@ impl StreamingProcessor {
                     }
 
                     // Get or create stop decoder for this index
-                    let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
-                        let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim) =
-                            stop_params;
-                        utils::create_stop_decoder(
-                            &self.tokenizer,
-                            stop.as_ref(),
-                            stop_token_ids.as_ref(),
-                            skip_special_tokens,
-                            no_stop_trim,
-                        )
-                    });
+                    let stop_decoder = match stop_decoders.entry(index) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            // Resolve tokenizer from registry
+                            let tokenizer =
+                                self.tokenizer_registry.get(model).ok_or_else(|| {
+                                    format!("Tokenizer not found for model: {}", model)
+                                })?;
+
+                            let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim) =
+                                stop_params;
+                            let decoder = utils::create_stop_decoder(
+                                &tokenizer,
+                                stop.as_ref(),
+                                stop_token_ids.as_ref(),
+                                skip_special_tokens,
+                                no_stop_trim,
+                            );
+                            e.insert(decoder)
+                        }
+                    };
 
                     // Process tokens through stop decoder
                     let (chunk_text, _should_stop) =
@@ -278,13 +289,25 @@ impl StreamingProcessor {
 
                     // Process logprobs if present
                     let choice_logprobs = if let Some(proto_logprobs) = chunk.output_logprobs() {
-                        match utils::convert_proto_to_openai_logprobs(
-                            proto_logprobs,
-                            &self.tokenizer,
-                        ) {
-                            Ok(logprobs) => Some(logprobs),
-                            Err(e) => {
-                                warn!("Failed to process logprobs: {}", e);
+                        // Resolve tokenizer from registry
+                        match self.tokenizer_registry.get(model) {
+                            Some(tokenizer) => {
+                                match utils::convert_proto_to_openai_logprobs(
+                                    proto_logprobs,
+                                    &tokenizer,
+                                ) {
+                                    Ok(logprobs) => Some(logprobs),
+                                    Err(e) => {
+                                        warn!("Failed to process logprobs: {}", e);
+                                        None
+                                    }
+                                }
+                            }
+                            None => {
+                                warn!(
+                                    "Tokenizer not found for model '{}', skipping logprobs",
+                                    model
+                                );
                                 None
                             }
                         }
@@ -610,10 +633,24 @@ impl StreamingProcessor {
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
+        // Resolve tokenizer from registry
+        let model = &dispatch.model;
+        let tokenizer = match self.tokenizer_registry.get(model) {
+            Some(tok) => tok,
+            None => {
+                // Send error and return early
+                let error_msg = format!("Tokenizer not found for model: {}", model);
+                let error_chunk = format!("data: {{\"error\": \"{}\"}}\n\n", error_msg);
+                let _ = tx.send(Ok(Bytes::from(error_chunk)));
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+                return build_sse_response(rx);
+            }
+        };
+
         // Spawn background task based on execution mode
         match execution_result {
             context::ExecutionResult::Single { stream } => {
-                let tokenizer = self.tokenizer.clone();
+                let tokenizer = tokenizer.clone();
                 let request_id = dispatch.request_id.clone();
                 let weight_version = dispatch
                     .weight_version
@@ -640,7 +677,7 @@ impl StreamingProcessor {
             }
             context::ExecutionResult::Dual { prefill, decode } => {
                 // For PD mode, need to handle prefill stream for input_logprobs
-                let tokenizer = self.tokenizer.clone();
+                let tokenizer = tokenizer.clone();
                 let request_id = dispatch.request_id.clone();
                 let weight_version = dispatch
                     .weight_version
