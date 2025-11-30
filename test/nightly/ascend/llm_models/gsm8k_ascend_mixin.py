@@ -1,3 +1,4 @@
+from abc import ABC
 import os
 import unittest
 from types import SimpleNamespace
