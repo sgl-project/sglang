@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 try:
     from lmcache.integration.sglang.sglang_adapter import (
@@ -207,25 +208,81 @@ class LMCRadixCache(RadixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(req, is_insert=is_insert)
-        if not is_insert:
+        kv_committed_len = req.pop_committed_kv_cache()
+        if self.disable:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        kv_committed_len = req.pop_committed_kv_cache()
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.req_pool_idx, : len(token_ids)
         ]
+
+        keys = convert_to_bigram_key(req.fill_ids) if self.is_eagle else req.fill_ids
+        keys = self._page_align_keys(keys)
+        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
+        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+
+        if is_insert:
+            priority = getattr(req, "priority", 0) or 0
+            new_prefix_len = self.insert(radix_key, values, priority=priority)
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : new_prefix_len]
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : len(keys)]
+            )
+
+        self._store_finished_request(
+            req=req,
+            is_insert=is_insert,
+            kv_committed_len=kv_committed_len,
+            token_ids=token_ids,
+            kv_indices=kv_indices,
+        )
+
+        self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
+
+        self.req_to_token_pool.free(req.req_pool_idx)
+        self.dec_lock_ref(req.last_node)
+
+    def _store_finished_request(
+        self,
+        *,
+        req: Req,
+        is_insert: bool,
+        kv_committed_len: int,
+        token_ids: list[int],
+        kv_indices: torch.Tensor,
+    ) -> None:
+        """Store finished KV to LMCache while pool resources are still valid."""
+
+        should_store = (
+            is_insert
+            and not self.disable
+            and kv_committed_len > 0
+            and req.req_pool_idx is not None
+        )
+        if not should_store:
+            return
+
+        committed_indices = kv_indices[:kv_committed_len].clone()
 
         match_result = self.match_prefix(RadixKey(token_ids, req.extra_key))
         new_last_node = match_result.last_device_node
-        assert new_last_node is not None
+        if new_last_node is None:
+            return
 
         self.inc_lock_ref(new_last_node)
         store_md = StoreMetadata(
             last_node=new_last_node,
             token_ids=token_ids,
-            kv_indices=kv_indices,
+            kv_indices=committed_indices,
             offset=0,
         )
         with torch.cuda.stream(self.store_stream):
