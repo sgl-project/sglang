@@ -122,10 +122,14 @@ class OpenAIServingEmbedding(OpenAIServingBase):
             # Other types (should not happen but handle gracefully)
             prompt_kwargs = {"input_ids": prompt}
 
+        # Extract custom request attributes from raw request headers
+        custom_request_attributes = self.extract_custom_request_attributes(raw_request)
+
         adapted_request = EmbeddingReqInput(
             **prompt_kwargs,
             rid=request.rid,
             priority=request.priority,
+            custom_request_attributes=custom_request_attributes,
             dimensions=request.dimensions,
         )
 
