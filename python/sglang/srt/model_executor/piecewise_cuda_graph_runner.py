@@ -70,15 +70,29 @@ def disable_ca_comm(tp_group):
 
     TODO(yuwei): Fix this
     """
-    old_disabled = None
+    original_disabled = tp_group.ca_comm.disabled
+    tp_group.ca_comm.original_disabled = original_disabled
     try:
         if tp_group.ca_comm is not None:
-            old_disabled = tp_group.ca_comm.disabled
             tp_group.ca_comm.disabled = True
         yield
     finally:
-        if tp_group.ca_comm is not None and old_disabled is not None:
-            tp_group.ca_comm.disabled = old_disabled
+        if tp_group.ca_comm is not None and original_disabled is not None:
+            tp_group.ca_comm.disabled = original_disabled
+
+
+@contextmanager
+def use_original_ca_comm(tp_group):
+    """
+    For the module not in piecewise cuda graph capture, use the original custom allreduce communication.
+
+    TODO(Byron): remove this once custom allreduce is enabled in piecewise cuda graph
+    """
+    current_disabled = tp_group.ca_comm.disabled
+    original_disabled = tp_group.ca_comm.original_disabled
+    tp_group.ca_comm.disabled = original_disabled
+    yield
+    tp_group.ca_comm.disabled = current_disabled
 
 
 @contextmanager
