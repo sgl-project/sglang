@@ -60,7 +60,7 @@ jobs:
           pip install sentence_transformers accelerate
           cd test
           python3 run_suite.py --hw npu --suite nightly-1-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
-  
+     
   # nightly-2-npu-a3:
   #   if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
   #   runs-on: linux-aarch64-a3-2
@@ -87,11 +87,11 @@ jobs:
   #         cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
   #         # copy download through proxy
   #         curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
-      
+
   #     - name: Print Log Information
   #       run: |
   #         bash scripts/ci/npu_log_print.sh
-      
+
   #     - name: Run test
   #       timeout-minutes: 240
   #       env:
@@ -106,7 +106,7 @@ jobs:
   #         pip install accelerate
   #         cd test
   #         python3 run_suite.py --hw npu --suite nightly-2-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
-  
+
   nightly-4-npu-a3:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-4
@@ -134,11 +134,11 @@ jobs:
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
-      
+
       - name: Print Log Information
         run: |
           bash scripts/ci/npu_log_print.sh
-      
+
       - name: Run test
         timeout-minutes: 240
         env:
@@ -163,7 +163,7 @@ jobs:
           cd ../
           cd test
           python3 run_suite.py --hw npu --suite nightly-4-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
-  
+
   # nightly-8-npu-a3:
   #   if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
   #   runs-on: linux-aarch64-a3-8
@@ -190,11 +190,11 @@ jobs:
   #         cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
   #         # copy download through proxy
   #         curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
-      
+
   #     - name: Print Log Information
   #       run: |
   #         bash scripts/ci/npu_log_print.sh
-      
+
   #     - name: Run test
   #       timeout-minutes: 240
   #       env:
@@ -218,7 +218,7 @@ jobs:
   #         cd ../
   #         cd test
   #         python3 run_suite.py --hw npu --suite nightly-8-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
-  
+
   # nightly-16-npu-a3:
   #   if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
   #   runs-on: linux-aarch64-a3-16
@@ -245,11 +245,11 @@ jobs:
   #         cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
   #         # copy download through proxy
   #         curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
-      
+
   #     - name: Print Log Information
   #       run: |
   #         bash scripts/ci/npu_log_print.sh
-      
+
   #     - name: Run test
   #       timeout-minutes: 240
   #       env:
