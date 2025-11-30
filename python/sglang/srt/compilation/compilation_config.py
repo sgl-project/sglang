@@ -25,6 +25,7 @@ class CompilationMode:
     shape specialization, and custom passes."""
 
 
+@dataclass
 class PassConfig:
     """Configuration for custom Inductor passes.
     This is separate from general `CompilationConfig` so that inductor passes
@@ -69,8 +70,19 @@ class CompilationConfig:
         certain small batchsizes, where inductor is good at optimizing.
     """
 
+    # Sizes to capture cudagraph.
+    # - None (default): capture sizes are inferred from sglang config.
+    # - list[int]: capture sizes are specified as given.
+    capture_sizes: List[int]
+
+    compiler: str = "eager"
+
+    enable_debug_mode: bool = False
+
     # Top-level Compilation control
     level: Optional[int] = None
+
+    mode: CompilationMode | None = None
 
     # The backend for compilation. It needs to be a string:
     # (empty string): use the default backend ("inductor" on CUDA-alike
@@ -82,32 +94,32 @@ class CompilationConfig:
     # Inductor capture
     use_inductor: bool = True
 
+    """Fine-grained control over which custom ops to enable/disable. Use 'all'
+    to enable all, 'none' to disable all. Also specify a list of custom op
+    names to enable (prefixed with a '+'), or disable (prefixed with a '-').
+    Examples:
+
+    - 'all,-op1' to enable all except op1
+    - 'none,+op1,+op2' to enable only op1 and op2
+
+    By default, all custom ops are enabled when running without Inductor and
+    disabled when running with Inductor: mode>=SGLANG_COMPILE and backend="inductor".
+    Inductor generates (fused) Triton kernels for disabled custom ops."""
+    splitting_ops: list[str] | None = None
+
+    use_inductor_graph_partition: bool = False
+
     inductor_compile_config: dict = field(default_factory=dict)
 
     inductor_passes: dict[str, str] = field(default_factory=dict)
-
-    # Sizes to capture cudagraph.
-    # - None (default): capture sizes are inferred from sglang config.
-    # - list[int]: capture sizes are specified as given.
-    cudagraph_capture_sizes: list[int] | None = None
 
     pass_config: PassConfig = field(default_factory=PassConfig)
 
     # time taken for compilation
     compilation_time: float = field(default=0.0, init=False)
 
-    compiler: str = ""
-
-    def __init__(
-        self,
-        capture_sizes: List[int],
-        compiler: str = "eager",
-        enable_debug_mode: bool = False,
-    ):
-        self.traced_files = set()
-        self.capture_sizes = capture_sizes
-        self.compiler = compiler
-        self.enable_debug_mode = enable_debug_mode
-
     def get_capture_sizes(self):
         return self.capture_sizes
+
+    def get_enable_debug_mode(self):
+        return self.enable_debug_mode

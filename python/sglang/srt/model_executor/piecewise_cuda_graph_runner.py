@@ -31,9 +31,8 @@ from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     set_forward_context,
 )
-from sglang.srt.configs.compilation_config import CompilationConfig
+from sglang.srt.compilation.sglang_config import SGLangConfig
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.sglang_config import SGLangConfig
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (

@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional, Union
 
 import torch
 
-from sglang.srt.configs.sglang_config import SGLangConfig
+from sglang.srt.compilation.sglang_config import SGLangConfig
 from sglang.srt.utils.common import rank0_log
 
 logger = logging.getLogger(__name__)
