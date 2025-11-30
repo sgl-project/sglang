@@ -230,6 +230,7 @@ RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -
     bear \
     ccache \
     less \
+    gnuplot \
     && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -258,7 +259,8 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --break-sy
     pre-commit \
     pandas \
     matplotlib \
-    tabulate
+    tabulate \
+    termplotlib
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
