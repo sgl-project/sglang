@@ -482,17 +482,31 @@ class LlavaBaseForCausalLM(nn.Module):
             # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }
+
+        if (
+            self.vision_feature_select_strategy == "default"
+            or self.vision_feature_select_strategy == "patch"
+            or self.vision_feature_select_strategy == "full"
+        ):
+            pass
+        # -------------------------------------------------------------
+        elif self.vision_feature_select_strategy == "cls_patch":
+            self.image_feature_len += 1
+        else:
+            raise ValueError(
+                f"Unexpected select feature: {self.vision_feature_select_strategy}"
+            )
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
-            if "projector" in name or "vision_tower" in name or "image_newline" in name:
-                for weight_name, param_name in projector_weights.items():
-                    if weight_name in name:
-                        name = name.replace(weight_name, param_name)
+            for part in ("language_model", "vision_tower"):
+                if name.startswith(part):
+                    name = name[len(part + ".") :]
+                    getattr(self, part).load_weights([(name, loaded_weight)])
+                    break
+            else:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-            else:
-                self.language_model.load_weights([(name, loaded_weight)])
 
     @property
     def num_patches_per_side(self):
@@ -809,11 +823,14 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         weight name remapping as the weights are already properly structured with
         'language_model' and 'vision_tower' prefixes in the safetensors files.
         """
+        # FIX: Explicitly allow "default" which is common in HF configs
         if (
-            self.vision_feature_select_strategy == "patch"
+            self.vision_feature_select_strategy == "default"
+            or self.vision_feature_select_strategy == "patch"
             or self.vision_feature_select_strategy == "full"
         ):
             pass
+        # -------------------------------------------------------------
         elif self.vision_feature_select_strategy == "cls_patch":
             self.image_feature_len += 1
         else:

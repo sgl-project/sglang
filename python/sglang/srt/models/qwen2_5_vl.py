@@ -521,9 +521,14 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
+
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+
+        if pixel_values.shape[-1] == self.visual.out_hidden_size:
+            return pixel_values
+        
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
 
         assert pixel_values.dim() == 2, pixel_values.dim()

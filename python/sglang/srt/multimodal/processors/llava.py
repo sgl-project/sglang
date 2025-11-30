@@ -114,6 +114,35 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         *args,
         **kwargs,
     ):
+        # FIX: Handle precomputed embeddings (dictionaries)
+        # If the input is already a dictionary, we skip the CPU image processor.
+        # We also need to infer 'image_sizes' from 'pixel_values' if missing,
+        # because pad_input_ids requires it.
+        if isinstance(image_data, list) and len(image_data) > 0 and isinstance(image_data[0], dict):
+            mm_items = []
+            for item in image_data:
+                # Ensure image_sizes exists in model_specific_data
+                if "image_sizes" not in item:
+                    # Infer size from pixel_values (B, C, H, W) or (C, H, W)
+                    if "pixel_values" in item:
+                        pv = item["pixel_values"]
+                        if len(pv.shape) == 4:
+                            h, w = pv.shape[2], pv.shape[3]
+                        else:
+                            h, w = pv.shape[1], pv.shape[2]
+                        # SGLang expects a list of sizes [(W, H)]
+                        item["image_sizes"] = [(w, h)]
+                    else:
+                        # Fallback default if no pixel_values (unlikely in this test)
+                        item["image_sizes"] = [(336, 336)]
+                
+                mm_items.append(MultimodalDataItem(
+                    feature=item["feature"],
+                    modality=Modality.IMAGE,
+                    model_specific_data=item
+                ))
+            return {"mm_items": mm_items}
+
         modalities = request_obj.modalities or ["image"]
         aspect_ratio = getattr(self.hf_config, "image_aspect_ratio", None)
         grid_pinpoints = (
@@ -180,6 +209,8 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
     models = [LlavaForConditionalGeneration, Mistral3ForConditionalGeneration]
 
     def _get_sgl_processor_cls(self, model_type: str):
+        if model_type == "clip_vision_model":
+            return LlavaImageProcessor
         if hf_name := HF_MAPPING_NAMES.get(model_type):
             sgl_mm_processor_set = sgl_mm_processor_utils.PROCESSOR_MAPPING.values()
             sgl_processor_cls = list(

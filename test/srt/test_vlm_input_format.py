@@ -188,7 +188,8 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
 
 
 class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
-    model_path = "google/gemma-3-4b-it"
+    # model_path = "google/gemma-3-4b-it"
+    model_path = "/root/.cache/modelscope/hub/models/LLM-Research/gemma-3-4b-it"
     chat_template = "gemma-it"
 
     @classmethod
@@ -268,7 +269,7 @@ class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCa
 
 class TestLlavaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     model_path = "llava-hf/llava-1.5-7b-hf"
-    chat_template = "vicuna_v1"
+    chat_template = "vicuna_v1.1"
 
     @classmethod
     def _init_visual(cls):
