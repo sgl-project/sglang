@@ -506,5 +506,5 @@ class SenderWrapper:
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
         self.send_to_scheduler.send_pyobj(obj)
 
-    def send_multipart(self, parts):
-        self.send_to_scheduler.send_multipart(parts)
+    def send_multipart(self, parts, copy=False):
+        self.send_to_scheduler.send_multipart(parts, copy=copy)
