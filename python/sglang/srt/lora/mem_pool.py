@@ -638,13 +638,13 @@ class LoRAMemoryPool:
                 target_module = get_target_module_name(name, self.target_modules)
                 # if "lora_embedding_A" in name:
                 # if "lora_embedding_A" in name or ("lora_A" in name and target_module == "embed_tokens"):
-                if target_module == "embed_tokens" and "lora_embedding_A" in name:
+                if target_module == "embed_tokens" and "embed_tokens" in name and ("lora_embedding_A" in name or "lora_A" in name):
                     buffer_view = self.embedding_A_buffer[target_module][
-                        buffer_id, :lora_rank, : org_vocab_size + lora_added_tokens_size
+                        buffer_id, :lora_rank, :(org_vocab_size+lora_added_tokens_size)
                     ]
                     load_lora_weight_tensor(buffer_view, weights)
                 # elif "lora_embedding_B" in name:
-                elif target_module == "embed_tokens" and "lora_embedding_B" in name:
+                elif target_module == "embed_tokens" and "embed_tokens" in name and ("lora_embedding_B" in name or "lora_B" in name):
                     lora_b_weights = weights
                     #[to-do] support TP
                     # if self.tp_size > 1:
@@ -664,7 +664,7 @@ class LoRAMemoryPool:
                 # self.target_modules: {'qkv_proj', 'embed_tokens', 'gate_up_proj', 'o_proj', 'lm_head', 'down_proj'}
                 # target_module: lm_head
                 # if "lora_lm_head_A" in name or ("lora_A" in name and target_module == "lm_head"):
-                elif target_module == "lm_head" and "lora_A.weight" in name: 
+                elif target_module == "lm_head" and "lm_head" in name and ("lora_embedding_A" in name or "lora_A" in name): 
                     buffer_view = self.lm_head_A_buffer[target_module][
                         # buffer_id, :, :lora_rank
                         buffer_id, :lora_rank, :
@@ -672,7 +672,7 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, weights)
                 # elif "lora_embedding_B" in name:
                 # elif "lora_lm_head_B" in name or ("lora_B" in name and target_module == "lm_head"):
-                elif target_module == "lm_head" and "lora_B.weight" in name: 
+                elif target_module == "lm_head" and "lm_head" in name and ("lora_embedding_B" in name or "lora_B" in name): 
                     lora_b_weights = weights
                     #[to-do] support TP
                     # if self.tp_size > 1:
@@ -684,7 +684,7 @@ class LoRAMemoryPool:
 
                     buffer_view = self.lm_head_B_buffer[target_module][
                         # buffer_id, :lora_rank, : org_vocab_size + extra_vocab_size
-                        buffer_id, : org_vocab_size + self.lora_added_tokens_size, :lora_rank
+                        buffer_id, :(org_vocab_size + self.lora_added_tokens_size), :lora_rank
                     ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
 

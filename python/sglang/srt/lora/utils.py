@@ -51,24 +51,8 @@ def get_hidden_dim(
     """
     Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
     """
-    
-    ##############################
-    ##########emb lora############
-    ##############################  
-    is_embedding_module = "embed_tokens" in module_name or "lm_head" in module_name
-    ##############################  
-    ##############################  
-    ##############################  
 
-    ##############################
-    ##########emb lora############
-    ##############################  
-    # if hasattr(base_model, "get_hidden_dim"):
-    if hasattr(base_model, "get_hidden_dim") and not is_embedding_module:
-    # if hasattr(base_model, "get_hidden_dim"):
-    ##############################  
-    ##############################  
-    ##############################  
+    if hasattr(base_model, "get_hidden_dim"):
         return base_model.get_hidden_dim(module_name, layer_idx)
     else:
         """
@@ -100,14 +84,16 @@ def get_hidden_dim(
         ############################## 
         #Handle embed_tokens
         # elif "embed_tokens" in module_name:
-        elif "embed_tokens" in module_name:
+        # elif "embed_tokens" in module_name:
+        elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
             # if contain extra tokens will be added; otherwise is 0.
             return config.vocab_size + lora_added_vocab_size, config.hidden_size
         
         #Handle lm_head
         # elif "lm_head" in module_name:
-        elif "lm_head" in module_name:
+        # elif "lm_head" in module_name:
+        elif module_name == "lm_head":
             # For lm_head: input is hidden_size, output is vocab_size
             # if contain extra tokens will be added; otherwise is 0.
             return config.hidden_size, config.vocab_size + lora_added_vocab_size
