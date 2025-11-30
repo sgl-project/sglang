@@ -24,3 +24,4 @@ class CacheInitParams:
 
     enable_metrics: bool = False
     enable_kv_cache_events: bool = False
+    gpu_id: int = 0
