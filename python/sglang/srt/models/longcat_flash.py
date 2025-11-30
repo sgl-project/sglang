@@ -32,7 +32,7 @@
 
 import concurrent.futures
 import logging
-from typing import Iterable, Optional, Tuple, List
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -552,7 +552,7 @@ class LongcatFlashModel(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
-        
+
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -1035,7 +1035,7 @@ class LongcatFlashForCausalLM(nn.Module):
             num_layers=config.num_hidden_layers,
             num_logical_experts=config.n_routed_experts,
         )
-    
+
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if layer_ids is None:
             self.capture_aux_hidden_states = True
