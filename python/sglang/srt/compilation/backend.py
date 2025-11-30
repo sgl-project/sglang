@@ -15,14 +15,14 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.inductor_pass import InductorPass
 from sglang.srt.compilation.npu_piecewise_backend import NPUPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
-from sglang.srt.configs.compilation_config import CompilationConfig
-from sglang.srt.configs.sglang_config import SGLangConfig
+from sglang.srt.compilation.sglang_config import SGLangConfig
 from sglang.srt.utils.common import is_npu, rank0_log
 
 logger = logging.getLogger(__name__)
@@ -105,21 +105,24 @@ class CompilerManager:
         graph_index: int,
         runtime_shape: Optional[int] = None,
     ) -> Optional[Callable]:
-        handle = self.cache[(runtime_shape, graph_index, self.compiler.name)]
+        key = (runtime_shape, graph_index, self.compiler.name)
+        handle = self.cache.get(key, None)
+        if handle is None:
+            return None
+
         compiled_graph = self.compiler.load(
             handle, graph, example_inputs, graph_index, runtime_shape
         )
         if runtime_shape is None:
             logger.debug(
-                "Directly load the %s-th graph for dynamic shape from %s via "
-                "handle %s",
+                "Directly load the %s-th graph for dynamic shape from %s via handle %s",
                 graph_index,
                 self.compiler.name,
                 handle,
             )
         else:
             logger.debug(
-                "Directly load the %s-th graph for shape %s from %s via " "handle %s",
+                "Directly load the %s-th graph for shape %s from %s via handle %s",
                 graph_index,
                 str(runtime_shape),
                 self.compiler.name,
@@ -315,7 +318,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
         # When True, it annoyingly dumps the torch.fx.Graph on errors.
         self.extra_traceback = False
         self.sglang_config = sglang_config
-        self.compilation_config = sglang_config.compile_config
+        self.compilation_config = sglang_config.compilation_config
 
     def run(self, *args):
         fake_args = [
@@ -345,7 +348,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
                 self.sglang_backend.compiler_manager.compile(
                     submod,
                     args,
-                    self.inductor_config,
+                    self.sglang_backend.inductor_config,
                     self.compilation_config,
                     graph_index=index,
                     num_graphs=len(self.compile_submod_names),
@@ -356,7 +359,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
             self.module.__dict__[target] = make_backend(
                 submod,
                 self.compilation_config,
-                self.inductor_config,
+                self.sglang_backend.inductor_config,
                 self.graph_pool,
                 index,
                 len(self.compile_submod_names),
@@ -485,7 +488,7 @@ class SGLangBackend:
 
         self.split_gm, self.piecewise_graphs = split_graph(
             graph,
-            self.compile_config.split_ops,
+            self.compilation_config.split_ops,
         )
         from torch._dynamo.utils import lazy_format_graph_code
 

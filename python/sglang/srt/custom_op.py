@@ -4,8 +4,11 @@ The definition of CustomOps for multi hardware dispatching.
 TODO: Move this to python/sglang/srt/layers/custom_op.py
 """
 
+import logging
+
 from torch import nn
 
+from sglang.srt.compilation.sglang_config import get_cached_compilation_config
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -21,6 +24,8 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
+logger = logging.getLogger(__name__)
 
 
 class CustomOp(nn.Module):
@@ -106,3 +111,38 @@ class CustomOp(nn.Module):
             return self.forward_xpu
         else:
             return self.forward_native
+
+    @classmethod
+    def enabled(cls) -> bool:
+        # if no name, then it was not registered
+        compilation_config = get_cached_compilation_config()
+        custom_ops = compilation_config.custom_ops
+        if not hasattr(cls, "name"):
+            logger.warning_once(
+                "Custom op %s was not registered, which means it won't appear "
+                "in the op registry. It will be enabled/disabled based on the "
+                "global settings.",
+                cls.__name__,
+            )
+            return CustomOp.default_on()
+
+        enabled = f"+{cls.name}" in custom_ops
+        disabled = f"-{cls.name}" in custom_ops
+        assert not (enabled and disabled), f"Cannot enable and disable {cls.name}"
+
+        return (CustomOp.default_on() or enabled) and not disabled
+
+    @staticmethod
+    def default_on() -> bool:
+        """
+        Behavior controlled by `CompilationConfig.custom_ops`: On by default if
+        'all', off by default if 'none'.
+        When PyTorch Inductor is used, 'none' is the default value,
+        otherwise 'all'.
+        """
+        compilation_config = get_cached_compilation_config()
+        count_none = compilation_config.custom_ops.count("none")
+        count_all = compilation_config.custom_ops.count("all")
+        # assert count_none + count_all == 1
+
+        return not count_none > 0 or count_all > 0

@@ -5,14 +5,12 @@ import hashlib
 import inspect
 import json
 import logging
-import time
 import types
 from contextlib import contextmanager
 from typing import Any, Callable, Optional, Union
 
 import torch
 from torch import fx
-from torch._dynamo.utils import lazy_format_graph_code
 from torch._inductor.custom_graph_pass import CustomGraphPass
 from torch._subclasses.fake_tensor import FakeTensorMode, unset_fake_temporarily
 
@@ -111,35 +109,6 @@ class CallableInductorPass(InductorPass):
 
     def uuid(self) -> Any:
         return self._uuid
-
-
-class SGLangInductorPass(InductorPass):
-
-    def __init__(
-        self,
-    ):
-        self.pass_name = self.__class__.__name__
-
-    def dump_graph(self, graph: torch.fx.Graph, stage: str):
-        lazy_format_graph_code(stage, graph.owning_module)
-
-    def begin(self):
-        self._start_time = time.perf_counter_ns()
-
-    def end_and_log(self):
-        self._end_time = time.perf_counter_ns()
-        duration_ms = float(self._end_time - self._start_time) / 1.0e6
-        logger.debug("%s completed in %.1f ms", self.pass_name, duration_ms)
-
-
-class PrinterInductorPass(SGLangInductorPass):
-
-    def __init__(self, name: str):
-        super().__init__()
-        self.name = name
-
-    def __call__(self, graph: torch.fx.Graph):
-        self.dump_graph(graph, self.name)
 
 
 def enable_fake_mode(fn: Callable[..., Any]) -> Callable[..., Any]:

@@ -9,8 +9,8 @@ from torch._inductor.pattern_matcher import PatternMatcherPass
 
 from sglang.srt.compilation.inductor_pass import enable_fake_mode
 from sglang.srt.compilation.matcher_utils import MatcherFusedAddRMSNorm, MatcherRMSNorm
+from sglang.srt.compilation.sglang_config import SGLangConfig
 from sglang.srt.compilation.sglang_inductor_pass import SGLangPatternMatcherPass
-from sglang.srt.configs.sglang_config import SGLangConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -52,8 +52,7 @@ if flashinfer_comm is not None:
     # to use flashinfer fused allreduce
     _FI_MAX_SIZES = {
         2: 64 * MiB,  # 64MB
-        4: MiB,  # 1MB
-        6: MiB // 2,  # 512KB
+        4: 2 * MiB,  # 2MB
         8: MiB // 2,  # 512KB
     }
 
@@ -61,7 +60,7 @@ if flashinfer_comm is not None:
     # when world size is not in _FI_MAX_SIZES
     _DEFAULT_FI_MAX_SIZE = MiB // 2
 
-    def call_trtllm_fused_allreduce_norm(
+    def call_flashinfer_fused_allreduce_norm(
         allreduce_in: torch.Tensor,
         residual: torch.Tensor,
         rms_gamma: torch.Tensor,
@@ -165,7 +164,7 @@ if flashinfer_comm is not None:
                 # and fused AR + RMS norm + quant without fused add
                 allreduce_in.copy_(allreduce_out)
 
-    def call_trtllm_fused_allreduce_norm_fake(
+    def call_flashinfer_fused_allreduce_norm_fake(
         allreduce_in: torch.Tensor,
         residual: torch.Tensor,
         rms_gamma: torch.Tensor,
@@ -187,7 +186,7 @@ if flashinfer_comm is not None:
 
     direct_register_custom_op(
         op_name="flashinfer_trtllm_fused_allreduce_norm",
-        op_func=call_trtllm_fused_allreduce_norm,
+        op_func=call_flashinfer_fused_allreduce_norm,
         mutates_args=[
             "allreduce_in",
             "residual",
@@ -195,11 +194,11 @@ if flashinfer_comm is not None:
             "quant_out",
             "scale_out",
         ],
-        fake_impl=call_trtllm_fused_allreduce_norm_fake,
+        fake_impl=call_flashinfer_fused_allreduce_norm_fake,
     )
     flashinfer_trtllm_fused_allreduce_norm = (
         # TODO(yuan-luo): SGLang kernel
-        # flashinfer_trtllm_fused_allreduce_norm
+        torch.ops.sglang.flashinfer_trtllm_fused_allreduce_norm.default
     )
 
 
@@ -415,7 +414,6 @@ class AllReduceFusionPass(SGLangPatternMatcherPass):
         )
 
         self.register_patterns()
-        self.dump_patterns(config, self.patterns)
 
     @enable_fake_mode
     def register_patterns(self):
@@ -431,12 +429,12 @@ class AllReduceFusionPass(SGLangPatternMatcherPass):
                 self.device,
                 self.allreduce_params,
             ).register(self.patterns)
-            AllReduceFusedAddRMSNormPattern(
-                epsilon,
-                self.model_dtype,
-                self.device,
-                self.allreduce_params,
-            ).register(self.patterns)
+            # AllReduceFusedAddRMSNormPattern(
+            #     epsilon,
+            #     self.model_dtype,
+            #     self.device,
+            #     self.allreduce_params,
+            # ).register(self.patterns)
 
             # WARNING: This is a hack to clear the pattern matcher cache
             # and allow multiple values of epsilon.
