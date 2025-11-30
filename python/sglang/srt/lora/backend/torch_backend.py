@@ -1,17 +1,13 @@
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.torch_ops import sgmv_expand, sgmv_expand_slice, sgmv_shrink
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_npu
-
-if is_npu():
-    import sgl_kernel_npu  # noqa: F401
-    import torch_npu  # noqa: F401
 
 
-class AscendLoRABackend(BaseLoRABackend):
-    name = "ascend"
+class TorchNativeLoRABackend(BaseLoRABackend):
+    name = "torch_native"
 
     def __init__(
         self,
@@ -31,20 +27,20 @@ class AscendLoRABackend(BaseLoRABackend):
         output_tensor = torch.zeros(
             (total_seq_len, weight_out_dim), dtype=x.dtype, device=x.device
         )
-        torch.ops.npu.sgmv_shrink(
+        sgmv_shrink(
             x,
             weights,
-            self.batch_info.weight_indices,
-            self.batch_info.seg_lens,
             output_tensor,
+            self.batch_info.seg_lens,
+            self.batch_info.weight_indices,
             1.0,
         )
-        scaling = (
-            self.batch_info.scalings.gather(0, self.batch_info.weight_indices)
-            .repeat_interleave(self.batch_info.seg_lens, output_size=total_seq_len)
-            .unsqueeze(-1)
-        )
-        output_tensor *= scaling
+        scaling = torch.repeat_interleave(
+            self.batch_info.scalings[self.batch_info.weight_indices],
+            self.batch_info.seg_lens,
+            output_size=total_seq_len,
+        ).unsqueeze(-1)
+        output_tensor = output_tensor * scaling
 
         return output_tensor
 
@@ -66,14 +62,13 @@ class AscendLoRABackend(BaseLoRABackend):
         else:
             output_tensor = base_output
 
-        torch.ops.npu.sgmv_expand(
+        sgmv_expand(
             x,
             weights,
-            self.batch_info.weight_indices,
-            self.batch_info.seg_lens,
             output_tensor,
-            0,
-            weight_out_dim,
+            self.batch_info.seg_lens,
+            self.batch_info.weight_indices,
+            True,
         )
 
         return output_tensor
@@ -108,34 +103,34 @@ class AscendLoRABackend(BaseLoRABackend):
         lora_a_output = torch.zeros(
             total_seq_len, weight_intermediate_dim, dtype=x.dtype, device=x.device
         )
-        torch.ops.npu.sgmv_shrink(
+        sgmv_shrink(
             x,
             qkv_lora_a,
-            self.batch_info.weight_indices,
-            self.batch_info.seg_lens,
             lora_a_output,
+            self.batch_info.seg_lens,
+            self.batch_info.weight_indices,
             1.0,
         )
-
-        scaling = (
-            self.batch_info.scalings.gather(0, self.batch_info.weight_indices)
-            .repeat_interleave(self.batch_info.seg_lens, output_size=total_seq_len)
-            .unsqueeze(-1)
-        )
-        lora_a_output *= scaling
+        scaling = torch.repeat_interleave(
+            self.batch_info.scalings[self.batch_info.weight_indices],
+            self.batch_info.seg_lens,
+            output_size=total_seq_len,
+        ).unsqueeze(-1)
+        lora_a_output = lora_a_output * scaling
 
         for slice_id in range(num_slices):
             slice_offset = output_offset_cpu[slice_id]
             slice_offset_next = output_offset_cpu[slice_id + 1]
             slice_size = slice_offset_next - slice_offset
-            torch.ops.npu.sgmv_expand(
+            sgmv_expand_slice(
                 lora_a_output[:, (max_rank * slice_id) : (max_rank * (slice_id + 1))],
                 qkv_lora_b[:, slice_offset:slice_offset_next],
-                self.batch_info.weight_indices,
-                self.batch_info.seg_lens,
                 output_tensor,
+                self.batch_info.seg_lens,
+                self.batch_info.weight_indices,
                 slice_offset,
                 slice_size,
+                True,
             )
 
         return output_tensor
@@ -169,33 +164,32 @@ class AscendLoRABackend(BaseLoRABackend):
         lora_a_output = torch.zeros(
             total_seq_len, weight_intermediate_dim, dtype=x.dtype, device=x.device
         )
-
-        torch.ops.npu.sgmv_shrink(
+        sgmv_shrink(
             x,
             gate_up_lora_a,
-            self.batch_info.weight_indices,
-            self.batch_info.seg_lens,
             lora_a_output,
+            self.batch_info.seg_lens,
+            self.batch_info.weight_indices,
             1.0,
         )
-
-        scaling = (
-            self.batch_info.scalings.gather(0, self.batch_info.weight_indices)
-            .repeat_interleave(self.batch_info.seg_lens, output_size=total_seq_len)
-            .unsqueeze(-1)
-        )
-        lora_a_output *= scaling
+        scaling = torch.repeat_interleave(
+            self.batch_info.scalings[self.batch_info.weight_indices],
+            self.batch_info.seg_lens,
+            output_size=total_seq_len,
+        ).unsqueeze(-1)
+        lora_a_output = lora_a_output * scaling
 
         slice_offset = 0
         for slice_id in range(num_slices):
-            torch.ops.npu.sgmv_expand(
+            sgmv_expand_slice(
                 lora_a_output[:, (max_rank * slice_id) : (max_rank * (slice_id + 1))],
                 gate_up_lora_b[:, slice_offset : slice_offset + slice_size],
-                self.batch_info.weight_indices,
-                self.batch_info.seg_lens,
                 output_tensor,
+                self.batch_info.seg_lens,
+                self.batch_info.weight_indices,
                 slice_offset,
                 slice_size,
+                True,
             )
             slice_offset += slice_size
 
@@ -206,8 +200,8 @@ class AscendLoRABackend(BaseLoRABackend):
         max_bs_in_cuda_graph: int,
         num_tokens_per_bs: int,
     ):
-        with torch.device("npu"):
-            self.npu_graph_batch_info = LoRABatchInfo(
+        with torch.device("cuda"):
+            self.cuda_graph_batch_info = LoRABatchInfo(
                 bs=max_bs_in_cuda_graph,
                 use_cuda_graph=True,
                 num_segments=None,
@@ -222,12 +216,12 @@ class AscendLoRABackend(BaseLoRABackend):
                 permutation=None,
             )
 
-            # Initialize seg_indptr for NPU graph as they remain constant
+            # Initialize seg_indptr for CUDA graph as they remain constant
             # across batches.
             torch.cumsum(
-                self.npu_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
+                self.cuda_graph_batch_info.seg_lens[:max_bs_in_cuda_graph],
                 dim=0,
-                out=self.npu_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
+                out=self.cuda_graph_batch_info.seg_indptr[1 : max_bs_in_cuda_graph + 1],
             )
 
     def prepare_lora_batch(
@@ -253,9 +247,9 @@ class AscendLoRABackend(BaseLoRABackend):
 
         if use_cuda_graph:
             assert (
-                self.npu_graph_batch_info is not None
-            ), "NPU Graph batch info is not initialized."
-            batch_info = self.npu_graph_batch_info
+                self.cuda_graph_batch_info is not None
+            ), "CUDA Graph batch info is not initialized."
+            batch_info = self.cuda_graph_batch_info
             batch_info.bs = forward_batch.batch_size
             batch_info.num_segments = forward_batch.batch_size
         else:
