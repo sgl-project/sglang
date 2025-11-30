@@ -197,7 +197,6 @@ class SamplingBatchInfo:
 
         # force to use static method
         self.apply_mask_func = first_grammar.apply_vocab_mask
-        self.move_vocab_mask = first_grammar.move_vocab_mask
 
         def update_regex_vocab_callback():
             # Apply the mask
@@ -206,7 +205,9 @@ class SamplingBatchInfo:
                     grammar.fill_vocab_mask(self.vocab_mask, i)
 
             # Move the mask to the device if needed
-            self.vocab_mask = self.move_vocab_mask(self.vocab_mask, self.device)
+            self.vocab_mask = first_grammar.move_vocab_mask(
+                self.vocab_mask, self.device
+            )
 
         return update_regex_vocab_callback
 
