@@ -818,7 +818,11 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+        if (
+            self.draft_worker is None
+            or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_suffix()
+        ):
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
             draft_token_to_kv_pool = (

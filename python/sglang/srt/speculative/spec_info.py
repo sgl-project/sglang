@@ -173,6 +173,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_ngram(self) -> bool:
         return self._has_flag("NGRAM")
 
+    def is_suffix(self) -> bool:
+        return self._has_flag("SUFFIX")
+
     def create_draft_worker(self, **factory_kwargs: Any) -> Any:
         if self._draft_worker_factory is None:
             return None
@@ -189,6 +192,7 @@ _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
         "STANDALONE", algorithm
     ),
     "NGRAM": lambda algorithm: SpeculativeAlgorithm._add_flag("NGRAM", algorithm),
+    "SUFFIX": lambda algorithm: SpeculativeAlgorithm._add_flag("SUFFIX", algorithm),
 }
 
 
@@ -285,6 +289,12 @@ def _create_ngram_worker(**kwargs: Any) -> Any:
     return NGRAMWorker(**kwargs)
 
 
+def _create_suffix_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.suffix_worker import SuffixWorker
+
+    return SuffixWorker(**kwargs)
+
+
 # Register built-in algorithms.
 # Third-party integrations should import `SpeculativeAlgorithm` and either
 # call `register_speculative_algorithm` or use the helpers below to attach
@@ -316,6 +326,12 @@ register_speculative_algorithm(
     flags=("NGRAM",),
 )
 
+register_speculative_algorithm(
+    "SUFFIX",
+    worker_cls=_create_suffix_worker,
+    flags=("SUFFIX",),
+)
+
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
@@ -323,6 +339,7 @@ class SpecInputType(IntEnum):
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
     NGRAM_VERIFY = auto()
+    SUFFIX_VERIFY = auto()
 
 
 class SpecInput(ABC):
@@ -338,6 +355,7 @@ class SpecInput(ABC):
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
             SpecInputType.NGRAM_VERIFY,
+            SpecInputType.SUFFIX_VERIFY,
         }
 
     @abstractmethod
