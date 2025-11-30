@@ -327,6 +327,9 @@ class Envs:
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
+    # Numa
+    SGLANG_NUMA_BIND_V2 = EnvBool(True)
+
     # fmt: on
 
 
