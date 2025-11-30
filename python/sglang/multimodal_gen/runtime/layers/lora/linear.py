@@ -410,7 +410,7 @@ def wrap_with_lora_layer(
         nn.Linear: LinearWithLoRA, 
     }
     for src_layer_type, lora_layer_type in supported_layer_types.items():
-        if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
+        if isinstance(layer, src_layer_type):
             ret = lora_layer_type(
                 layer,
                 lora_rank=lora_rank,
