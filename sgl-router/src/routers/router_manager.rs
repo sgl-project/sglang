@@ -334,14 +334,30 @@ impl RouterTrait for RouterManager {
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        let models = self.worker_registry.get_models();
+        let model_names = self.worker_registry.get_models();
 
-        if models.is_empty() {
+        if model_names.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
         } else {
+            // Convert model names to OpenAI-compatible model objects
+            let models: Vec<Value> = model_names
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "id": name,
+                        "object": "model",
+                        "owned_by": "local"
+                    })
+                })
+                .collect();
+
             (
                 StatusCode::OK,
-                serde_json::json!({ "models": models }).to_string(),
+                serde_json::json!({
+                    "object": "list",
+                    "data": models
+                })
+                .to_string(),
             )
                 .into_response()
         }
