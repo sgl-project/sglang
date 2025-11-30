@@ -113,13 +113,21 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        req.routed_experts = (
-                            get_global_experts_capturer().get_routed_experts(
-                                req_pool_idx=req.req_pool_idx,
-                                seqlen=req.seqlen,
-                                req_to_token_pool=self.req_to_token_pool,
-                            )
-                        )
+                        if req.return_routed_experts:
+                            if self.server_args.r3_use_storage_backup:
+                                get_global_experts_capturer().sync_fwd_experts_buffer_host_to_storage(
+                                    req_pool_idx=req.req_pool_idx,
+                                    seqlen=req.seqlen,
+                                    rid=req.rid,
+                                )
+                            else:
+                                req.routed_experts = (
+                                    get_global_experts_capturer().get_routed_experts(
+                                        req_pool_idx=req.req_pool_idx,
+                                        seqlen=req.seqlen,
+                                        req_to_token_pool=self.req_to_token_pool,
+                                    )
+                                )
 
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.completion_time = time.perf_counter()
@@ -342,11 +350,25 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
-                req.routed_experts = get_global_experts_capturer().get_routed_experts(
-                    req_pool_idx=req.req_pool_idx,
-                    seqlen=req.seqlen,
-                    req_to_token_pool=self.req_to_token_pool,
-                )
+                if (
+                    req.return_routed_experts
+                    and self.attn_tp_rank == 0
+                    and self.pp_rank == 0
+                ):
+                    if self.server_args.r3_use_storage_backup:
+                        get_global_experts_capturer().sync_fwd_experts_buffer_host_to_storage(
+                            req_pool_idx=req.req_pool_idx,
+                            seqlen=req.seqlen,
+                            rid=req.rid,
+                        )
+                    else:
+                        req.routed_experts = (
+                            get_global_experts_capturer().get_routed_experts(
+                                req_pool_idx=req.req_pool_idx,
+                                seqlen=req.seqlen,
+                                req_to_token_pool=self.req_to_token_pool,
+                            )
+                        )
 
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes

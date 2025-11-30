@@ -550,6 +550,9 @@ class ModelRunner:
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=max_running_requests,
                 device=self.device,
+                use_storage_backup=self.server_args.r3_use_storage_backup,
+                storage_backup_path=self.server_args.r3_storage_backup_path,
+                req_to_token_pool=self.req_to_token_pool,
             )
         )
 

@@ -571,6 +571,10 @@ class ServerArgs:
     decrypted_config_file: Optional[str] = None
     decrypted_draft_config_file: Optional[str] = None
 
+    # R3 Related
+    r3_use_storage_backup: bool = False
+    r3_storage_backup_path: str = ""
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3665,6 +3669,15 @@ class ServerArgs:
             type=str,
             default=ServerArgs.decrypted_draft_config_file,
             help="The path of the decrypted draft config file.",
+        )
+        parser.add_argument(
+            "--r3-use-storage-backup",
+            action="store_true",
+        )
+        parser.add_argument(
+            "--r3-storage-backup-path",
+            type=str,
+            default=ServerArgs.r3_storage_backup_path,
         )
 
     @classmethod
