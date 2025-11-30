@@ -115,6 +115,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -201,6 +202,8 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
+
+LAST_UPDATE = False
 
 
 @dataclass
@@ -990,6 +993,7 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
+        global LAST_UPDATE
         disable_consecutive_prefill_overlap = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
         )
@@ -1002,6 +1006,8 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if LAST_UPDATE:
+                continue
 
             if self._engine_paused:
                 continue
@@ -1169,6 +1175,7 @@ class Scheduler(
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        global LAST_UPDATE
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
             if is_health_check_generate_req(recv_req) and (
@@ -1181,6 +1188,10 @@ class Scheduler(
 
             output = self._request_dispatcher(recv_req)
             if output is not None:
+                if isinstance(output, UpdateWeightsFromTensorReqOutput):
+                    LAST_UPDATE = True
+                else:
+                    LAST_UPDATE = False
                 if isinstance(output, RpcReqOutput):
                     if self.recv_from_rpc is not None:
                         self.recv_from_rpc.send_pyobj(output)
