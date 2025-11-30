@@ -1786,15 +1786,13 @@ def calculate_metrics(
                     np.arange(len(tokens_per_second)),
                     tokens_per_second,
                     title="Output tokens per second",
-                    xlabel="Time (seconds)",
-                    ylabel="Tokens/s",
+                    xlabel="Time (s)",
                 )
                 fig.plot(
                     np.arange(len(concurrent_requests_per_second)),
                     concurrent_requests_per_second,
                     title="Concurrent requests per second",
-                    xlabel="Time (seconds)",
-                    ylabel="Requests",
+                    xlabel="Time (s)",
                 )
                 fig.show()
             else:
