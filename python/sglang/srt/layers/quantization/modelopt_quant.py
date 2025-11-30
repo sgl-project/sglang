@@ -1010,20 +1010,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
 
         input_scale = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            data=torch.zeros(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
 
         layer.register_parameter("input_scale", input_scale)
 
         weight_scale_2 = PerTensorScaleParameter(
-            data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+            data=torch.zeros(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight_scale_2", weight_scale_2)
 
         weight_scale = ModelWeightParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 output_size_per_partition,
                 input_size_per_partition // self.quant_config.group_size,
                 dtype=weight_dtype,
