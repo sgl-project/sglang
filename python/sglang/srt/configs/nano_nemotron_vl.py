@@ -83,6 +83,12 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         )
 
         self.downsample_ratio = downsample_ratio
+
+        self.num_image_token = int(
+            (self.image_size * self.downsample_ratio // self.patch_size) ** 2
+        )
+        """Example: `(512 * 0.5 / 16) ** 2 = 16 * 16 = 256`"""
+
         self.video_context_token = video_context_token
         self.img_context_token = img_context_token
         self.template = template  # TODO move out of here and into the tokenizer
