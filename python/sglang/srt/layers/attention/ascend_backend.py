@@ -105,6 +105,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         self.mtp_mask = torch.tril(torch.ones(2048, 2048, dtype=torch.bool)).npu()
         self.mtp_mask = ~self.mtp_mask
+        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -124,6 +125,9 @@ class AscendAttnBackend(AttentionBackend):
                 forward_batch.extend_seq_lens.cpu().int()
             )
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        self.forward_metadata.seq_lens_cpu_list = (
+            self.forward_metadata.seq_lens_cpu_int.tolist()
+        )
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_draft_extend()
@@ -712,7 +716,7 @@ class AscendAttnBackend(AttentionBackend):
                 topk_indices,
             )
 
-        if self.graph_mode:
+        if self.graph_mode and (not self.enable_torch_compile):
             return self.forward_decode_graph(
                 q,
                 k,
@@ -752,7 +756,7 @@ class AscendAttnBackend(AttentionBackend):
                     atten_mask=None,
                     block_size=self.page_size,
                     block_table=self.forward_metadata.block_tables,
-                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_list,
                     scale=layer.scaling,
                 )
             else:
