@@ -64,6 +64,7 @@ elif _is_npu:
     else:
         useMindIETurbo = True
 
+    NPU_FORMAT_FRACTAL_NZ = 29
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
 
 logger = logging.getLogger(__name__)
@@ -730,8 +731,11 @@ class NPU_W8A8LinearMethodImpl:
         if self.transpose_weight:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
-        layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
-        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29)
+        if hasattr(layer, "weight_offset"):
+            layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
+        layer.weight.data = torch_npu.npu_format_cast(
+            layer.weight.data, NPU_FORMAT_FRACTAL_NZ
+        )
 
 
 class NPU_W8A8LinearMethodMTImpl:
@@ -923,8 +927,11 @@ class NPU_W8A8DynamicLinearMethodImpl:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
-        layer.weight_offset.data = layer.weight_offset.data.flatten()
-        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29)
+        if hasattr(layer, "weight_offset"):
+            layer.weight_offset.data = layer.weight_offset.data.flatten()
+        layer.weight.data = torch_npu.npu_format_cast(
+            layer.weight.data, NPU_FORMAT_FRACTAL_NZ
+        )
 
 
 class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
@@ -1099,11 +1106,21 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
         )
-        layer.w13_weight_offset = Parameter(
-            layer.w13_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+        if hasattr(layer, "w13_weight_offset"):
+            layer.w13_weight_offset = torch.nn.Parameter(
+                layer.w13_weight_offset.data.squeeze(-1).contiguous(),
+                requires_grad=False,
+            )
+        if hasattr(layer, "w2_weight_offset"):
+            layer.w2_weight_offset = torch.nn.Parameter(
+                layer.w2_weight_offset.data.squeeze(-1).contiguous(),
+                requires_grad=False,
+            )
+        layer.w13_weight.data = torch_npu.npu_format_cast(
+            layer.w13_weight.data, NPU_FORMAT_FRACTAL_NZ
         )
-        layer.w2_weight_offset = Parameter(
-            layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+        layer.w2_weight.data = torch_npu.npu_format_cast(
+            layer.w2_weight.data, NPU_FORMAT_FRACTAL_NZ
         )
 
         if get_bool_env_var("ENABLE_ASCEND_MOE_NZ"):
