@@ -6,8 +6,8 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - ".github/workflows/nightly-test-npu.yml"
+    # paths:
+    #   - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
 
 concurrency:
@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  nightly-test-npu-1-a3:
+  nightly-1-npu-a3:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-2
     strategy:
@@ -36,6 +36,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
           bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
@@ -57,10 +58,10 @@ jobs:
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           pip install sentence_transformers accelerate
-          cd test/srt
-          python3 run_suite.py --suite nightly-test-npu-1-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-1-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
   
-  # nightly-test-npu-2-a3:
+  # nightly-2-npu-a3:
   #   if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
   #   runs-on: linux-aarch64-a3-2
   #   strategy:
@@ -103,10 +104,10 @@ jobs:
   #       run: |
   #         export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
   #         pip install accelerate
-  #         cd test/srt
-  #         python3 run_suite.py --suite nightly-test-npu-2-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+  #         cd test
+  #         python3 run_suite.py --hw npu --suite nightly-2-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
   
-  nightly-test-npu-4-a3:
+  nightly-4-npu-a3:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     runs-on: linux-aarch64-a3-4
     strategy:
@@ -127,6 +128,7 @@ jobs:
           pip config set global.index-url http://${CACHING_URL}/pypi/simple
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
           bash scripts/ci/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
@@ -159,10 +161,10 @@ jobs:
           sleep 120
           export PYTHONPATH=$PYTHONPATH:$(pwd)
           cd ../
-          cd test/srt
-          python3 run_suite.py --suite nightly-test-npu-4-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+          cd test
+          python3 run_suite.py --hw npu --suite nightly-4-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
   
-  # nightly-test-npu-8-a3:
+  # nightly-8-npu-a3:
   #   if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
   #   runs-on: linux-aarch64-a3-8
   #   strategy:
@@ -214,10 +216,10 @@ jobs:
   #         sleep 120
   #         export PYTHONPATH=$PYTHONPATH:$(pwd)
   #         cd ../
-  #         cd test/srt
-  #         python3 run_suite.py --suite nightly-test-npu-8-a3 --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+  #         cd test
+  #         python3 run_suite.py --hw npu --suite nightly-8-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
   
-  # nightly-test-npu-16-a3:
+  # nightly-16-npu-a3:
   #   if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
   #   runs-on: linux-aarch64-a3-16
   #   strategy:
@@ -269,17 +271,17 @@ jobs:
   #         sleep 120
   #         export PYTHONPATH=$PYTHONPATH:$(pwd)
   #         cd ../
-  #         cd test/srt
-  #         python3 run_suite.py --suite nightly-test-npu-16-a3 --continue-on-error --timeout-per-file 7200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
+  #         cd test
+  #         python3 run_suite.py --hw npu --suite nightly-16-npu-a3 --nightly --continue-on-error --timeout-per-file 3600 --auto-partition-id ${{ matrix.part }} --auto-partition-size 1
 
   # check-all-jobs:
   #   if: github.repository == 'sgl-project/sglang' && always()
   #   needs:
-  #     - nightly-test-npu-1-a3
-  #     - nightly-test-npu-2-a3
-  #     - nightly-test-npu-4-a3
-  #     - nightly-test-npu-8-a3
-  #     - nightly-test-npu-16-a3
+  #     - nightly-1-npu-a3
+  #     - nightly-2-npu-a3
+  #     - nightly-4-npu-a3
+  #     - nightly-8-npu-a3
+  #     - nightly-16-npu-a3
   #   runs-on: ubuntu-latest
   #   container:
   #     image: docker.m.daocloud.io/ubuntu:22.04
