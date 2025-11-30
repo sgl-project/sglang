@@ -1,7 +1,6 @@
 import glob
 import json
 import os
-import random
 import subprocess
 
 from sglang.srt.utils import kill_process_tree
