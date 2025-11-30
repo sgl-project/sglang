@@ -135,6 +135,7 @@ suites = {
         TestFile("test_modelopt_export.py", 30),
     ],
     "per-commit-2-gpu": [
+        TestFile("ep/test_moe_ep.py", 140),
         TestFile("hicache/test_hicache_storage_3fs_backend.py", 200),
         TestFile("hicache/test_hicache_storage_file_backend.py", 200),
         TestFile("hicache/test_hicache_storage_mooncake_backend.py", 300),
@@ -201,9 +202,6 @@ suites = {
     ],
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
-        TestFile(
-            "ep/test_moe_ep.py", 140
-        ),  # Temporarily disabled, need to fix ep errors
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
         TestFile("models/test_dummy_grok_models.py"),
         TestFile(
