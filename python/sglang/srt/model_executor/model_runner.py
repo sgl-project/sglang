@@ -153,7 +153,7 @@ from sglang.srt.utils.offloader import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.weight_sync.p2p_transfer import P2PTransferEngine
+from sglang.srt.weight_sync.p2p_transfer import P2PTransferManager
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -1212,7 +1212,7 @@ class ModelRunner:
             remote_port: the port of the weights update engine.
         """
         try:
-            self.p2p_transfer_engine = P2PTransferEngine(
+            self.p2p_transfer_manager = P2PTransferManager(
                 hostname=get_local_ip_auto(),
                 gpu_id=self.gpu_id,
                 ib_device=self.server_args.p2p_transfer_ib_device,
@@ -1251,7 +1251,7 @@ class ModelRunner:
 
                 if (get_global_server_args().enable_p2p_transfer):
                     weight_length = weight.numel() * weight.element_size()
-                    handle = self.p2p_transfer_engine.submit_transfer_task(
+                    handle = self.p2p_transfer_manager.submit_transfer_task(
                         session_id=session_id if session_id is not None else "",
                         ptr=weight.data_ptr(),
                         length=weight_length,

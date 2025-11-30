@@ -1,9 +1,9 @@
 """
-Performance comparison test for P2PTransferEngine vs P2PTransferManager with Qwen3-32B model.
+Test suite for P2PTransferManager with Qwen3-32B model.
 
-This test compares the performance of:
-1. P2PTransferEngine (single MooncakeTransferEngine)
-2. P2PTransferManager (pool of MooncakeTransferEngines)
+This test validates:
+1. Manager connectivity test (simple correctness)
+2. Manager performance test with Qwen3-32B model
 
 Test scenarios:
 - 1 training + 1 rollout process
@@ -34,7 +34,7 @@ import zmq
 
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.utils.common import format_tcp_address
-from sglang.srt.weight_sync.p2p_transfer import P2PTransferEngine, P2PTransferManager
+from sglang.srt.weight_sync.p2p_transfer import P2PTransferManager
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +92,6 @@ def simple_rollout_process(
     world_size: int,
     result_queue: mp.Queue,
     barrier: mp.Barrier,
-    use_manager: bool,
     training_hostname: str = "127.0.0.1",
     training_port: int = 50000,
 ):
@@ -101,21 +100,13 @@ def simple_rollout_process(
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
 
-        impl_type = "Manager" if use_manager else "Engine"
-        logger.info(f"[SimpleRollout-{rank}] Using {impl_type} on GPU {rank}")
+        logger.info(f"[SimpleRollout-{rank}] Using Manager on GPU {rank}")
 
-        if use_manager:
-            transfer_impl = P2PTransferManager(
-                hostname="127.0.0.1",
-                gpu_id=rank,
-                ib_device=None,
-            )
-        else:
-            transfer_impl = P2PTransferEngine(
-                hostname="127.0.0.1",
-                gpu_id=rank,
-                ib_device=None,
-            )
+        transfer_impl = P2PTransferManager(
+            hostname="127.0.0.1",
+            gpu_id=rank,
+            ib_device=None,
+        )
 
         weight = create_simple_weight(128, device, dtype=torch.float16)
         original_data = weight.clone()
@@ -152,7 +143,6 @@ def simple_worker_process(
     world_size: int,
     result_queue: mp.Queue,
     barrier: mp.Barrier,
-    use_manager: bool,
     training_port: int = 50000,
 ):
     """Entry point for simple correctness test worker."""
@@ -162,64 +152,11 @@ def simple_worker_process(
     if rank == 0:
         simple_training_process(rank, world_size, result_queue, barrier, "127.0.0.1", training_port)
     else:
-        simple_rollout_process(rank, world_size, result_queue, barrier, use_manager, "127.0.0.1", training_port)
+        simple_rollout_process(rank, world_size, result_queue, barrier, "127.0.0.1", training_port)
 
 
 class TestP2PTransferCorrectness(unittest.TestCase):
     """Basic correctness tests with small weights."""
-
-    def test_engine_correctness(self):
-        """Test P2PTransferEngine correctness with single small weight."""
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-            self.skipTest("Requires at least 2 CUDA devices")
-
-        world_size = 2
-        training_port = 50100
-
-        logger.info("\n" + "="*80)
-        logger.info("Testing P2PTransferEngine Correctness (single 128x128 weight)")
-        logger.info("="*80 + "\n")
-
-        result_queue = mp.Queue()
-        barrier = mp.Barrier(world_size)
-
-        context = mp.spawn(
-            simple_worker_process,
-            args=(world_size, result_queue, barrier, False, training_port),
-            nprocs=world_size,
-            join=False,
-        )
-
-        results = {}
-        timeout = 30
-        start_time = time.time()
-
-        while len(results) < (world_size - 1):
-            try:
-                remaining_time = timeout - (time.time() - start_time)
-                if remaining_time <= 0:
-                    break
-                key, value = result_queue.get(timeout=min(5, remaining_time))
-                results[key] = value
-            except Exception:
-                if all(not p.is_alive() for p in context.processes):
-                    break
-
-        context.join()
-
-        for key in results:
-            if "error" in key:
-                self.fail(f"Process error: {key} = {results[key]}")
-
-        self.assertIn("rollout_1_success", results)
-        self.assertTrue(results["rollout_1_success"], "Data should have changed after transfer")
-
-        logger.info("✓ P2PTransferEngine correctness test passed\n")
-
-        result_queue.close()
-        result_queue.join_thread()
-        gc.collect()
-        torch.cuda.empty_cache()
 
     def test_manager_correctness(self):
         """Test P2PTransferManager correctness with single small weight."""
@@ -238,7 +175,7 @@ class TestP2PTransferCorrectness(unittest.TestCase):
 
         context = mp.spawn(
             simple_worker_process,
-            args=(world_size, result_queue, barrier, True, training_port),
+            args=(world_size, result_queue, barrier, training_port),
             nprocs=world_size,
             join=False,
         )
@@ -552,32 +489,22 @@ def rollout_process(
     num_updates: int,
     result_queue: mp.Queue,
     barrier: mp.Barrier,
-    use_manager: bool,
     training_hostname: str = "127.0.0.1",
     training_port: int = 50000,
 ):
-    """Rollout process using either Engine or Manager."""
+    """Rollout process using P2PTransferManager."""
     try:
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
 
-        impl_type = "Manager" if use_manager else "Engine"
-        logger.info(f"[Rollout-{rank}] Initializing with {impl_type} on GPU {rank}")
+        logger.info(f"[Rollout-{rank}] Initializing with Manager on GPU {rank}")
 
-        if use_manager:
-            transfer_impl = P2PTransferManager(
-                hostname="127.0.0.1",
-                gpu_id=rank,
-                ib_device=None,
-            )
-            logger.info(f"[Rollout-{rank}] Using Manager with {transfer_impl.engine_pool_size} engines")
-        else:
-            transfer_impl = P2PTransferEngine(
-                hostname="127.0.0.1",
-                gpu_id=rank,
-                ib_device=None,
-            )
-            logger.info(f"[Rollout-{rank}] Using Engine")
+        transfer_impl = P2PTransferManager(
+            hostname="127.0.0.1",
+            gpu_id=rank,
+            ib_device=None,
+        )
+        logger.info(f"[Rollout-{rank}] Using Manager with {transfer_impl.engine_pool_size} engines")
 
         weights = create_qwen3_full_model(config, device, dtype=torch.float16)
 
@@ -650,13 +577,13 @@ def rollout_process(
 
         stats = {
             'rank': rank,
-            'impl_type': impl_type,
+            'impl_type': 'Manager',
             'num_updates': num_updates,
             'avg_total_time': avg_total_time,
             'avg_wait_time': avg_wait_time,
             'avg_bandwidth_gbps': avg_bandwidth,
             'total_bytes': total_bytes,
-            'engine_pool_size': transfer_impl.engine_pool_size if use_manager else 1,
+            'engine_pool_size': transfer_impl.engine_pool_size,
             'all_transfers': all_transfer_times,
         }
 
@@ -679,7 +606,6 @@ def worker_process(
     num_updates: int,
     result_queue: mp.Queue,
     barrier: mp.Barrier,
-    use_manager: bool,
     training_port: int = 50000,
 ):
     """Entry point for each worker process."""
@@ -694,79 +620,183 @@ def worker_process(
     else:
         rollout_process(
             rank, world_size, config, num_updates,
-            result_queue, barrier, use_manager, "127.0.0.1", training_port
+            result_queue, barrier, "127.0.0.1", training_port
         )
+
+
+def multi_training_worker_process(
+    rank: int,
+    world_size: int,
+    config: Qwen3_32BConfig,
+    num_updates: int,
+    result_queue: mp.Queue,
+    barrier: mp.Barrier,
+    num_training: int = 2,
+    base_training_port: int = 50300,
+):
+    """
+    Entry point for multi-training to single-rollout scenario.
+
+    Args:
+        rank: Process rank
+        world_size: Total number of processes
+        num_training: Number of training processes
+        base_training_port: Base port for training processes (each uses base + rank)
+    """
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+
+    if rank < num_training:
+        # This is a training process
+        training_port = base_training_port + rank
+        training_process(
+            rank, world_size, config, num_updates,
+            result_queue, barrier, "127.0.0.1", training_port
+        )
+    else:
+        # This is the rollout process
+        multi_source_rollout_process(
+            rank, world_size, config, num_updates,
+            result_queue, barrier, num_training, base_training_port
+        )
+
+
+def multi_source_rollout_process(
+    rank: int,
+    world_size: int,
+    config: Qwen3_32BConfig,
+    num_updates: int,
+    result_queue: mp.Queue,
+    barrier: mp.Barrier,
+    num_training: int = 2,
+    base_training_port: int = 50300,
+):
+    """
+    Rollout process that receives weights from multiple training processes.
+
+    This tests the Manager's ability to handle concurrent transfers from multiple sources.
+    """
+    try:
+        torch.cuda.set_device(rank)
+        device = torch.device(f"cuda:{rank}")
+
+        logger.info(f"[Rollout-{rank}] Initializing with Manager on GPU {rank}")
+        logger.info(f"[Rollout-{rank}] Will receive from {num_training} training processes")
+
+        transfer_impl = P2PTransferManager(
+            hostname="127.0.0.1",
+            gpu_id=rank,
+            ib_device=None,
+        )
+        logger.info(f"[Rollout-{rank}] Using Manager with {transfer_impl.engine_pool_size} engines")
+
+        # Create separate weight buffers for each training process
+        weights_per_training = {}
+        for training_idx in range(num_training):
+            weights_per_training[training_idx] = create_qwen3_full_model(config, device, dtype=torch.float16)
+
+        total_params = sum(w.numel() for w in weights_per_training[0].values()) * num_training
+        total_size_mb = sum(w.numel() * w.element_size() for w in weights_per_training[0].values()) * num_training / 1e6
+        logger.info(f"[Rollout-{rank}] Allocated buffers for {num_training} sources: {total_params/1e9:.2f}B params, {total_size_mb:.2f}MB")
+
+        barrier.wait()
+
+        all_transfer_times = []
+
+        for update_idx in range(num_updates):
+            update_start = time.time()
+
+            # Submit tasks for all training sources concurrently
+            all_handles = []
+            submission_start = time.time()
+
+            for training_idx in range(num_training):
+                session_id = f"127.0.0.1:{base_training_port + training_idx}"
+                weights = weights_per_training[training_idx]
+
+                for weight_name, weight_tensor in weights.items():
+                    ptr = weight_tensor.data_ptr()
+                    length = weight_tensor.numel() * weight_tensor.element_size()
+
+                    handle = transfer_impl.submit_transfer_task(
+                        session_id=session_id,
+                        ptr=ptr,
+                        length=length,
+                    )
+                    all_handles.append((training_idx, weight_name, handle))
+
+            submission_end = time.time()
+
+            logger.info(
+                f"[Rollout-{rank}] Submitted {len(all_handles)} transfer tasks from {num_training} sources in "
+                f"{(submission_end - submission_start)*1000:.2f}ms"
+            )
+
+            # Wait for all transfers to complete
+            wait_start = time.time()
+            for training_idx, weight_name, handle in all_handles:
+                handle.wait()
+
+            torch.cuda.synchronize()
+            wait_end = time.time()
+
+            update_end = time.time()
+
+            total_time = update_end - update_start
+            wait_time = wait_end - wait_start
+            total_bytes = sum(w.numel() * w.element_size() for w in weights_per_training[0].values()) * num_training
+
+            all_transfer_times.append({
+                'update_idx': update_idx,
+                'total_time': total_time,
+                'submission_time': submission_end - submission_start,
+                'wait_time': wait_time,
+                'num_tasks': len(all_handles),
+                'num_sources': num_training,
+                'total_bytes': total_bytes,
+            })
+
+            logger.info(
+                f"[Rollout-{rank}] Update {update_idx + 1}/{num_updates} completed: "
+                f"total={total_time*1000:.2f}ms, submission={(submission_end - submission_start)*1000:.2f}ms, "
+                f"wait={wait_time*1000:.2f}ms, bandwidth={(total_bytes * 8) / (total_time * 1e9):.2f}Gbps, "
+                f"tasks={len(all_handles)}, sources={num_training}"
+            )
+
+            barrier.wait()
+
+        avg_total_time = np.mean([t['total_time'] for t in all_transfer_times])
+        avg_wait_time = np.mean([t['wait_time'] for t in all_transfer_times])
+        total_bytes = all_transfer_times[0]['total_bytes']
+        avg_bandwidth = (total_bytes * 8) / (avg_total_time * 1e9)
+
+        stats = {
+            'rank': rank,
+            'impl_type': 'Manager',
+            'num_updates': num_updates,
+            'num_sources': num_training,
+            'avg_total_time': avg_total_time,
+            'avg_wait_time': avg_wait_time,
+            'avg_bandwidth_gbps': avg_bandwidth,
+            'total_bytes': total_bytes,
+            'engine_pool_size': transfer_impl.engine_pool_size,
+            'all_transfers': all_transfer_times,
+        }
+
+        result_queue.put((f"rollout_{rank}_stats", stats))
+
+        logger.info(
+            f"[Rollout-{rank}] All updates completed. Avg time: {avg_total_time*1000:.2f}ms, "
+            f"Avg bandwidth: {avg_bandwidth:.2f}Gbps, Sources: {num_training}"
+        )
+
+    except Exception as e:
+        logger.error(f"[Rollout-{rank}] Error: {e}", exc_info=True)
+        result_queue.put((f"rollout_{rank}_error", str(e)))
 
 
 class TestP2PTransferPerformance(unittest.TestCase):
-    """Performance comparison tests for Engine vs Manager."""
-
-    def test_engine_1v1_qwen3(self):
-        """Test P2PTransferEngine: 1 training + 1 rollout with Qwen3-32B."""
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-            self.skipTest("Requires at least 2 CUDA devices")
-
-        world_size = 2
-        config = Qwen3_32BConfig()
-        num_updates = 3
-        training_port = 50200
-
-        logger.info(
-            f"\n{'='*80}\n"
-            f"Testing P2PTransferEngine (1v1)\n"
-            f"Config: {world_size} processes, {num_updates} updates\n"
-            f"{'='*80}\n"
-        )
-
-        result_queue = mp.Queue()
-        barrier = mp.Barrier(world_size)
-
-        context = mp.spawn(
-            worker_process,
-            args=(world_size, config, num_updates, result_queue, barrier, False, training_port),
-            nprocs=world_size,
-            join=False,
-        )
-
-        results = {}
-        timeout = 120
-        start_time = time.time()
-
-        while len(results) < (world_size - 1):
-            try:
-                remaining_time = timeout - (time.time() - start_time)
-                if remaining_time <= 0:
-                    break
-                key, value = result_queue.get(timeout=min(10, remaining_time))
-                results[key] = value
-            except Exception:
-                if all(not p.is_alive() for p in context.processes):
-                    break
-
-        context.join()
-
-        for key in results:
-            if "error" in key:
-                self.fail(f"Process error: {key} = {results[key]}")
-
-        if "rollout_1_stats" in results:
-            stats = results["rollout_1_stats"]
-            logger.info(
-                f"\n{'='*80}\n"
-                f"P2PTransferEngine (1v1) Results:\n"
-                f"  Impl: {stats['impl_type']}\n"
-                f"  Engine pool size: {stats['engine_pool_size']}\n"
-                f"  Avg total time: {stats['avg_total_time']*1000:.2f}ms\n"
-                f"  Avg wait time: {stats['avg_wait_time']*1000:.2f}ms\n"
-                f"  Avg bandwidth: {stats['avg_bandwidth_gbps']:.2f}Gbps\n"
-                f"  Total data: {stats['total_bytes']/1e6:.2f}MB\n"
-                f"{'='*80}\n"
-            )
-
-        result_queue.close()
-        result_queue.join_thread()
-        gc.collect()
-        torch.cuda.empty_cache()
+    """Performance tests for P2PTransferManager."""
 
     def test_manager_1v1_qwen3(self):
         """Test P2PTransferManager: 1 training + 1 rollout with Qwen3-32B."""
@@ -790,7 +820,7 @@ class TestP2PTransferPerformance(unittest.TestCase):
 
         context = mp.spawn(
             worker_process,
-            args=(world_size, config, num_updates, result_queue, barrier, True, training_port),
+            args=(world_size, config, num_updates, result_queue, barrier, training_port),
             nprocs=world_size,
             join=False,
         )
@@ -835,71 +865,6 @@ class TestP2PTransferPerformance(unittest.TestCase):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def test_engine_1v2_qwen3(self):
-        """Test P2PTransferEngine: 1 training + 2 rollouts with Qwen3-32B."""
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
-            self.skipTest("Requires at least 3 CUDA devices")
-
-        world_size = 3
-        config = Qwen3_32BConfig()
-        num_updates = 2
-        training_port = 50202
-
-        logger.info(
-            f"\n{'='*80}\n"
-            f"Testing P2PTransferEngine (1v2)\n"
-            f"Config: {world_size} processes, {num_updates} updates\n"
-            f"{'='*80}\n"
-        )
-
-        result_queue = mp.Queue()
-        barrier = mp.Barrier(world_size)
-
-        context = mp.spawn(
-            worker_process,
-            args=(world_size, config, num_updates, result_queue, barrier, False, training_port),
-            nprocs=world_size,
-            join=False,
-        )
-
-        results = {}
-        timeout = 120
-        start_time = time.time()
-
-        while len(results) < (world_size - 1):
-            try:
-                remaining_time = timeout - (time.time() - start_time)
-                if remaining_time <= 0:
-                    break
-                key, value = result_queue.get(timeout=min(10, remaining_time))
-                results[key] = value
-            except Exception:
-                if all(not p.is_alive() for p in context.processes):
-                    break
-
-        context.join()
-
-        for key in results:
-            if "error" in key:
-                self.fail(f"Process error: {key} = {results[key]}")
-
-        logger.info(f"\n{'='*80}\nP2PTransferEngine (1v2) Results:\n")
-        for rank in range(1, world_size):
-            if f"rollout_{rank}_stats" in results:
-                stats = results[f"rollout_{rank}_stats"]
-                logger.info(
-                    f"Rollout-{rank} ({stats['impl_type']}): "
-                    f"avg_time={stats['avg_total_time']*1000:.2f}ms, "
-                    f"bandwidth={stats['avg_bandwidth_gbps']:.2f}Gbps, "
-                    f"pool_size={stats['engine_pool_size']}"
-                )
-        logger.info(f"{'='*80}\n")
-
-        result_queue.close()
-        result_queue.join_thread()
-        gc.collect()
-        torch.cuda.empty_cache()
-
     def test_manager_1v2_qwen3(self):
         """Test P2PTransferManager: 1 training + 2 rollouts with Qwen3-32B."""
         if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
@@ -922,7 +887,7 @@ class TestP2PTransferPerformance(unittest.TestCase):
 
         context = mp.spawn(
             worker_process,
-            args=(world_size, config, num_updates, result_queue, barrier, True, training_port),
+            args=(world_size, config, num_updates, result_queue, barrier, training_port),
             nprocs=world_size,
             join=False,
         )
@@ -959,6 +924,76 @@ class TestP2PTransferPerformance(unittest.TestCase):
                     f"pool_size={stats['engine_pool_size']}"
                 )
         logger.info(f"{'='*80}\n")
+
+        result_queue.close()
+        result_queue.join_thread()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def test_manager_2v1_qwen3(self):
+        """Test P2PTransferManager: 2 trainings + 1 rollout with Qwen3-32B (multi-to-one)."""
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
+            self.skipTest("Requires at least 3 CUDA devices")
+
+        world_size = 3
+        num_training = 2
+        config = Qwen3_32BConfig()
+        num_updates = 2
+        base_training_port = 50300
+
+        logger.info(
+            f"\n{'='*80}\n"
+            f"Testing P2PTransferManager (2v1 - multi-to-one)\n"
+            f"Config: {world_size} processes ({num_training} training + 1 rollout), {num_updates} updates\n"
+            f"{'='*80}\n"
+        )
+
+        result_queue = mp.Queue()
+        barrier = mp.Barrier(world_size)
+
+        context = mp.spawn(
+            multi_training_worker_process,
+            args=(world_size, config, num_updates, result_queue, barrier, num_training, base_training_port),
+            nprocs=world_size,
+            join=False,
+        )
+
+        results = {}
+        timeout = 120
+        start_time = time.time()
+
+        # Only waiting for rollout process (rank = num_training)
+        while len(results) < 1:
+            try:
+                remaining_time = timeout - (time.time() - start_time)
+                if remaining_time <= 0:
+                    break
+                key, value = result_queue.get(timeout=min(10, remaining_time))
+                results[key] = value
+            except Exception:
+                if all(not p.is_alive() for p in context.processes):
+                    break
+
+        context.join()
+
+        for key in results:
+            if "error" in key:
+                self.fail(f"Process error: {key} = {results[key]}")
+
+        if f"rollout_{num_training}_stats" in results:
+            stats = results[f"rollout_{num_training}_stats"]
+            logger.info(
+                f"\n{'='*80}\n"
+                f"P2PTransferManager (2v1 - multi-to-one) Results:\n"
+                f"  Impl: {stats['impl_type']}\n"
+                f"  Engine pool size: {stats['engine_pool_size']}\n"
+                f"  Number of sources: {stats['num_sources']}\n"
+                f"  Avg total time: {stats['avg_total_time']*1000:.2f}ms\n"
+                f"  Avg wait time: {stats['avg_wait_time']*1000:.2f}ms\n"
+                f"  Avg bandwidth: {stats['avg_bandwidth_gbps']:.2f}Gbps\n"
+                f"  Total data: {stats['total_bytes']/1e6:.2f}MB\n"
+                f"{'='*80}\n"
+            )
 
         result_queue.close()
         result_queue.join_thread()

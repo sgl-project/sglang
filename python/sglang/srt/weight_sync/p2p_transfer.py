@@ -61,331 +61,6 @@ class TransferTask:
         self.handle = TransferHandle(task_id, socket_cache, socket_lock)
         self.engine_idx: Optional[int] = None  # Engine index for P2PTransferManager
 
-class P2PTransferEngine:
-
-    def __init__(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
-        # Initialize the underlying Mooncake transfer engine
-        self._init_transfer_engine(
-            hostname=hostname,
-            gpu_id=gpu_id,
-            ib_device=ib_device,
-        )
-
-        # Initialize thread pool and transfer queues
-        cpu_count = os.cpu_count() or 8
-        transfer_thread_pool_size = get_int_env_var(
-            "SGLANG_P2P_THREAD_POOL_SIZE",
-            min(max(4, int(0.5 * cpu_count) // 8), 12),
-        )
-        transfer_queue_size = get_int_env_var("SGLANG_P2P_QUEUE_SIZE", 4)
-
-        self.transfer_queues = [Queue() for _ in range(transfer_queue_size)]
-
-        assert transfer_thread_pool_size >= transfer_queue_size, (
-            f"SGLANG_P2P_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
-            f"greater than or equal to SGLANG_P2P_QUEUE_SIZE={transfer_queue_size}."
-        )
-
-        self.executors = [
-            concurrent.futures.ThreadPoolExecutor(
-                transfer_thread_pool_size // transfer_queue_size
-            )
-            for _ in range(transfer_queue_size)
-        ]
-
-        # Track registered memory regions per session
-        self.registered_ptrs: Dict[str, set] = defaultdict(set)
-        self.registration_lock = threading.Lock()
-
-        # Socket cache to avoid race conditions (each task gets its own socket)
-        self.socket_cache: Dict[str, Dict] = {}
-        self.socket_lock = threading.Lock()
-
-        # Task counter for generating unique task IDs
-        self.task_counter = 0
-        self.task_counter_lock = threading.Lock()
-
-        # Start worker threads for each queue
-        for queue, executor in zip(self.transfer_queues, self.executors):
-            threading.Thread(
-                target=self.transfer_worker, args=(queue, executor), daemon=True
-            ).start()
-
-        logger.info(
-            f"P2P transfer engine initialized with {transfer_thread_pool_size} workers "
-            f"and {transfer_queue_size} queues"
-        )
-
-    def _generate_task_id(self) -> str:
-        """Generate a unique task ID"""
-        with self.task_counter_lock:
-            task_id = f"task_{self.task_counter}"
-            self.task_counter += 1
-        return task_id
-
-    def submit_transfer_task(
-        self, session_id: str, ptr: int, length: int
-    ) -> TransferHandle:
-        """
-        Submit a transfer task to the queue for processing.
-        Returns a handle that can be used to wait for completion.
-
-        The task will be picked up by an idle worker thread which will:
-        1. Register the memory region
-        2. Send sync_status to training side with ip:port and registered ptr
-
-        Args:
-            session_id: Remote training process address (ip:port) for ZMQ communication
-            ptr: Local memory pointer to register
-            length: Buffer length
-        """
-        task_id = self._generate_task_id()
-        try:
-            remote_ip, remote_port = session_id.split(":")[0], int(session_id.split(":")[1])
-        except Exception as e:
-            raise ValueError(f"Invalid session_id format: {session_id}") from e
-
-        # Get local Mooncake transfer session_id
-        local_transfer_session_id = self.engine.get_session_id()
-
-        task = TransferTask(
-            task_id=task_id,
-            training_p2p_session_id=session_id,
-            rollout_transfer_session_id=local_transfer_session_id,
-            ptr=ptr,
-            length=length,
-            socket_cache=self.socket_cache,
-            socket_lock=self.socket_lock
-        )
-
-        # Shard task to queue based on session_id
-        queue_idx = hash(session_id) % len(self.transfer_queues)
-        self.transfer_queues[queue_idx].put(task)
-
-        logger.debug(
-            f"Submitted transfer task {task_id} for session {session_id}, ptr={ptr:#x}, "
-            f"length={length} to queue {queue_idx}"
-        )
-
-        return task.handle
-
-    def transfer_worker(self, queue: Queue, executor: concurrent.futures.ThreadPoolExecutor):
-        """
-        Worker thread that processes transfer tasks from the queue.
-        """
-        while True:
-            try:
-                task: TransferTask = queue.get()
-
-                # Process the task in the executor
-                future = executor.submit(self._process_transfer_task, task)
-
-                # Wait for completion and mark the handle
-                try:
-                    future.result()
-                    task.handle._mark_done(True)
-                except Exception as e:
-                    logger.error(
-                        f"Transfer task failed for session {task.training_p2p_session_id} : {e}"
-                    )
-                    task.handle._mark_done(False)
-
-            except Exception as e:
-                logger.error(f"Transfer worker failed: {e}")
-                # Don't crash the worker thread, continue processing
-
-    def _process_transfer_task(self, task: TransferTask):
-        """
-        Process a single transfer task:
-        1. Register memory region if not already registered
-        2. Send sync_status to training side with connection info and ptr
-        3. Wait for success confirmation from training side
-        """
-        training_p2p_session_id = task.training_p2p_session_id
-        rollout_transfer_session_id = task.rollout_transfer_session_id
-        ptr = task.ptr
-        length = task.length
-
-        # Register memory region if not already registered
-        with self.registration_lock:
-            if ptr not in self.registered_ptrs[training_p2p_session_id]:
-                logger.debug(
-                    f"Registering memory region for session {training_p2p_session_id}: "
-                    f"ptr={ptr:#x}, length={length}"
-                )
-                self.engine.register(ptr, length)
-                self.registered_ptrs[training_p2p_session_id].add(ptr)
-            else:
-                logger.debug(
-                    f"Memory region already registered for session {training_p2p_session_id}: ptr={ptr:#x}"
-                )
-
-        # Send sync_status to training side and wait for confirmation
-        self._send_sync_status_and_wait(
-            task_id=task.task_id,
-            training_p2p_session_id=training_p2p_session_id,
-            rollout_transfer_session_id=rollout_transfer_session_id,
-            ptr=ptr,
-            length=length
-        )
-
-    def _send_sync_status_and_wait(
-        self,
-        task_id: str,
-        training_p2p_session_id: str,
-        rollout_transfer_session_id: str,
-        ptr: int,
-        length: int
-    ):
-        """
-        Send sync_status message to training side and wait for confirmation.
-
-        Workflow:
-        1. Send sync_status with local Mooncake session_id and registered ptr to training side
-        2. Wait for training side to send back success/failure confirmation
-        3. Socket is cleaned up after successful transfer
-
-        Args:
-            task_id: Unique task identifier
-            remote_ip: Training process IP
-            remote_port: Training process ZMQ port
-            remote_p2p_session_id: Training process address for P2P communication (ip:port)
-            local_transfer_session_id: Local Mooncake transfer engine session_id
-            ptr: Registered memory pointer
-            length: Buffer length
-        """
-        # Create a temporary socket and cache it for this task
-        context = zmq.Context()
-        socket = context.socket(zmq.DEALER)
-        remote_ip, remote_port = training_p2p_session_id.split(":")[0], int(training_p2p_session_id.split(":")[1])
-        socket.connect(format_tcp_address(remote_ip, remote_port))
-
-        # Cache the socket for later cleanup
-        with self.socket_lock:
-            self.socket_cache[task_id] = {
-                'socket': socket,
-                'context': context,
-                'remote_ip': remote_ip,
-                'remote_port': remote_port,
-            }
-
-        try:
-            # Send sync_status to training side
-            # Include our Mooncake session_id so training can connect to us for RDMA
-            socket.send_json(
-                {
-                    "type": "sync_status",
-                    "p2p_session_id": training_p2p_session_id,
-                    "status": "ready",
-                    "ip": self.engine.hostname,
-                    "transfer_session_id": rollout_transfer_session_id,
-                    "ptr": ptr,
-                    "length": length,
-                    "task_id": task_id,
-                }
-            )
-            logger.info(
-                f"Sent sync_status to {remote_ip}:{remote_port} for session {training_p2p_session_id}, "
-                f"task_id={task_id}, rollout_transfer_session_id={rollout_transfer_session_id}, ptr={ptr:#x}"
-            )
-
-            # Wait for confirmation from training side
-            # Set a timeout to avoid hanging forever
-            socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30 seconds timeout
-
-            logger.debug(f"Waiting for confirmation from {remote_ip}:{remote_port} for task {task_id}")
-
-            # DEALER receives from ROUTER: the message may have multiple frames
-            # ROUTER sends: [identity, empty_delimiter, payload]
-            # DEALER receives: [empty_delimiter, payload] (identity is automatically stripped)
-            try:
-                frames = socket.recv_multipart()
-                logger.debug(f"Received {len(frames)} frames: {[len(f) for f in frames]}")
-
-                # Find the JSON payload (skip empty frames)
-                response = None
-                for i, frame in enumerate(frames):
-                    if len(frame) > 0:
-                        try:
-                            response = zmq.utils.jsonapi.loads(frame)
-                            logger.debug(f"Parsed JSON from frame {i}: {response}")
-                            break
-                        except Exception:
-                            logger.debug(f"Frame {i} is not JSON: {repr(frame[:100])}")
-                            continue
-
-                if response is None:
-                    raise RuntimeError(f"No valid JSON found in {len(frames)} frames")
-
-            except Exception as json_error:
-                logger.error(f"Failed to receive/parse response: {json_error}")
-                raise json_error
-
-            # Check response status
-            response_type = response.get("type", "")
-            response_status = response.get("status", "")
-
-            if response_type == "transfer_complete" and response_status == "success":
-                logger.info(
-                    f"Received success confirmation from {remote_ip}:{remote_port} "
-                    f"for task {task_id}, transfer session {rollout_transfer_session_id}"
-                )
-                # Clean up the socket after successful transfer
-                with self.socket_lock:
-                    if task_id in self.socket_cache:
-                        self.socket_cache.pop(task_id)
-                socket.close()
-                context.term()
-                logger.debug(f"Released socket for task {task_id}")
-            else:
-                error_msg = response.get("error", "Unknown error")
-                logger.error(
-                    f"Received failure confirmation from {remote_ip}:{remote_port} "
-                    f"for task {task_id}: {error_msg}"
-                )
-                raise RuntimeError(
-                    f"Transfer failed for task {task_id}: {error_msg}"
-                )
-
-        except zmq.Again:
-            # Timeout waiting for response
-            logger.error(
-                f"Timeout waiting for confirmation from {remote_ip}:{remote_port} "
-                f"for task {task_id}"
-            )
-            # Clean up socket on timeout
-            with self.socket_lock:
-                if task_id in self.socket_cache:
-                    self.socket_cache.pop(task_id)
-            socket.close()
-            context.term()
-            raise RuntimeError(
-                f"Timeout waiting for transfer confirmation for task {task_id}"
-            )
-        except Exception as e:
-            # If sending or receiving fails, clean up the socket immediately
-            logger.error(
-                f"Error in sync_status_and_wait for task {task_id}: {e}"
-            )
-            with self.socket_lock:
-                if task_id in self.socket_cache:
-                    self.socket_cache.pop(task_id)
-            socket.close()
-            context.term()
-            raise e
-
-    def _init_transfer_engine(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
-        """Initialize the underlying Mooncake transfer engine"""
-        self.engine = MooncakeTransferEngine(
-            hostname=hostname,
-            gpu_id=gpu_id,
-            ib_device=ib_device,
-        )
-
-    def get_session_id(self):
-        """Get the session ID from the underlying transfer engine"""
-        return self.engine.get_session_id()
-
 
 class P2PTransferManager:
     """
@@ -396,8 +71,8 @@ class P2PTransferManager:
 
     Key design difference from P2PTransferEngine:
     - Uses a pool of MooncakeTransferEngine instances instead of a single one
-    - Each engine in the pool handles transfers for different sessions (via hashing)
-    - NO task queues or executors - direct synchronous processing
+    - Task queue-based scheduling: selects idle engines for tasks
+    - If all engines are busy, tasks wait in queue
     - Each engine has its own lock for thread-safe access
     """
 
@@ -438,22 +113,92 @@ class P2PTransferManager:
         self.task_counter = 0
         self.task_counter_lock = threading.Lock()
 
+        # Task queue and engine status tracking
+        self.task_queue = Queue()
+        self.engine_busy = [False] * self.engine_pool_size
+        self.engine_status_lock = threading.Lock()
+
+        # Start scheduler thread
+        self.scheduler_thread = threading.Thread(
+            target=self._scheduler_worker,
+            daemon=True
+        )
+        self.scheduler_thread.start()
+
         logger.info(
             f"P2PTransferManager initialized with {self.engine_pool_size} transfer engines "
-            f"on {hostname}:{gpu_id}"
+            f"on {hostname}:{gpu_id} (task queue-based scheduling)"
         )
 
-    def _get_engine_index(self, session_id: str) -> int:
+    def _get_engine_index(self) -> Optional[int]:
         """
-        Get the engine index for a given session ID using consistent hashing.
-
-        Args:
-            session_id: Session identifier
+        Get an idle engine index from the pool.
 
         Returns:
-            Index of the engine to use for this session
+            Index of an idle engine, or None if all engines are busy
         """
-        return hash(session_id) % self.engine_pool_size
+        with self.engine_status_lock:
+            for idx in range(self.engine_pool_size):
+                if not self.engine_busy[idx]:
+                    self.engine_busy[idx] = True
+                    return idx
+        return None
+
+    def _release_engine(self, engine_idx: int):
+        """
+        Mark an engine as idle after task completion.
+
+        Args:
+            engine_idx: Index of the engine to release
+        """
+        with self.engine_status_lock:
+            self.engine_busy[engine_idx] = False
+
+    def _scheduler_worker(self):
+        """
+        Scheduler thread that continuously processes tasks from the queue.
+        Waits for idle engines and assigns tasks to them.
+        """
+        while True:
+            try:
+                # Block until a task is available
+                task_info = self.task_queue.get()
+
+                # Wait for an idle engine
+                engine_idx = None
+                while engine_idx is None:
+                    engine_idx = self._get_engine_index()
+                    if engine_idx is None:
+                        # All engines busy, wait a bit before retrying
+                        threading.Event().wait(0.01)
+
+                # Unpack task info
+                task_id, session_id, ptr, length, handle, socket_cache, socket_lock = task_info
+
+                logger.debug(
+                    f"Scheduler assigned task {task_id} to engine {engine_idx} "
+                    f"(session={session_id})"
+                )
+
+                # Start processing the task in a background thread
+                thread = threading.Thread(
+                    target=self._process_transfer_task_with_release,
+                    args=(
+                        task_id,
+                        session_id,
+                        ptr,
+                        length,
+                        engine_idx,
+                        handle,
+                        socket_cache,
+                        socket_lock
+                    ),
+                    daemon=True
+                )
+                thread.start()
+
+            except Exception as e:
+                logger.error(f"Scheduler worker error: {e}", exc_info=True)
 
     def _generate_task_id(self) -> str:
         """Generate a unique task ID"""
@@ -466,10 +211,11 @@ class P2PTransferManager:
         self, session_id: str, ptr: int, length: int
     ) -> TransferHandle:
         """
-        Submit a transfer task for processing.
+        Submit a transfer task to the queue for processing.
         Returns a handle that can be used to wait for completion.
 
-        This method spawns a background thread to handle the transfer asynchronously.
+        The task will be queued and assigned to an idle engine by the scheduler.
+        If all engines are busy, the task waits in the queue.
 
         Args:
             session_id: Remote training process address (ip:port) for ZMQ communication
@@ -484,38 +230,51 @@ class P2PTransferManager:
         except Exception as e:
             raise ValueError(f"Invalid session_id format: {session_id}") from e
 
-        # Get the appropriate engine for this session
-        engine_idx = self._get_engine_index(session_id)
-
         # Create handle for this transfer
-        # Use a simple dict as socket cache per task
         socket_cache: Dict[str, Dict] = {}
         socket_lock = threading.Lock()
         handle = TransferHandle(task_id, socket_cache, socket_lock)
 
-        # Start background thread to process the transfer
-        thread = threading.Thread(
-            target=self._process_transfer_task,
-            args=(
-                task_id,
-                session_id,
-                ptr,
-                length,
-                engine_idx,
-                handle,
-                socket_cache,
-                socket_lock
-            ),
-            daemon=True
-        )
-        thread.start()
+        # Put task into queue - scheduler will assign it to an idle engine
+        task_info = (task_id, session_id, ptr, length, handle, socket_cache, socket_lock)
+        self.task_queue.put(task_info)
 
         logger.debug(
-            f"Submitted transfer task {task_id} for session {session_id}, ptr={ptr:#x}, "
-            f"length={length}, using engine {engine_idx}"
+            f"Queued transfer task {task_id} for session {session_id}, ptr={ptr:#x}, "
+            f"length={length}"
         )
 
         return handle
+
+    def _process_transfer_task_with_release(
+        self,
+        task_id: str,
+        session_id: str,
+        ptr: int,
+        length: int,
+        engine_idx: int,
+        handle: TransferHandle,
+        socket_cache: Dict,
+        socket_lock: threading.Lock
+    ):
+        """
+        Wrapper that processes a transfer task and releases the engine after memory registration.
+
+        The engine is released as soon as memory region is registered, without waiting
+        for the ZMQ sync communication to complete. This allows the engine to be reused
+        for other registration tasks while the current task continues its sync process.
+        """
+        try:
+            self._process_transfer_task(
+                task_id, session_id, ptr, length, engine_idx,
+                handle, socket_cache, socket_lock
+            )
+        except Exception as e:
+            logger.error(
+                f"Transfer task {task_id} failed for session {session_id}: {e}",
+                exc_info=True
+            )
+            handle._mark_done(False)
 
     def _process_transfer_task(
         self,
@@ -533,49 +292,58 @@ class P2PTransferManager:
 
         Steps:
         1. Register memory region if not already registered
-        2. Send sync_status to training side
-        3. Wait for confirmation
-        4. Mark handle as done
+        2. Release engine (so it can be reused for other registrations)
+        3. Send sync_status to training side
+        4. Wait for confirmation
+        5. Mark handle as done
         """
-        try:
-            # Get the engine's session_id
-            local_transfer_session_id = self.engine_pool[engine_idx].get_session_id()
+        # Get the engine's session_id
+        local_transfer_session_id = self.engine_pool[engine_idx].get_session_id()
 
-            # Register memory region if not already registered
-            with self.registration_locks[engine_idx]:
-                if ptr not in self.registered_ptrs[engine_idx][session_id]:
-                    logger.debug(
-                        f"Registering memory region on engine {engine_idx} for session {session_id}: "
-                        f"ptr={ptr:#x}, length={length}"
-                    )
-                    self.engine_pool[engine_idx].register(ptr, length)
-                    self.registered_ptrs[engine_idx][session_id].add(ptr)
-                else:
-                    logger.debug(
-                        f"Memory region already registered on engine {engine_idx} for session {session_id}: ptr={ptr:#x}"
-                    )
+        # Register memory region if not already registered
+        with self.registration_locks[engine_idx]:
+            if ptr not in self.registered_ptrs[engine_idx][session_id]:
+                logger.debug(
+                    f"Registering memory region on engine {engine_idx} for session {session_id}: "
+                    f"ptr={ptr:#x}, length={length}"
+                )
+                self.engine_pool[engine_idx].register(ptr, length)
+                self.registered_ptrs[engine_idx][session_id].add(ptr)
+            else:
+                logger.debug(
+                    f"Memory region already registered on engine {engine_idx} for session {session_id}: ptr={ptr:#x}"
+                )
 
-            # Send sync_status and wait for confirmation
-            self._send_sync_status_and_wait(
-                task_id=task_id,
-                training_p2p_session_id=session_id,
-                rollout_transfer_session_id=local_transfer_session_id,
-                ptr=ptr,
-                length=length,
-                engine_idx=engine_idx,
-                socket_cache=socket_cache,
-                socket_lock=socket_lock
-            )
+        # Release engine immediately after registration is done
+        # The engine can now be reused for other registration tasks
+        self._release_engine(engine_idx)
+        logger.debug(f"Released engine {engine_idx} after memory registration for task {task_id}")
 
-            # Mark as successfully completed
-            handle._mark_done(True)
+        # Send sync_status and wait for confirmation
+        # This can take time, but doesn't need the engine anymore
+        self._send_sync_status_and_wait(
+            task_id=task_id,
+            training_p2p_session_id=session_id,
+            rollout_transfer_session_id=local_transfer_session_id,
+            ptr=ptr,
+            length=length,
+            engine_idx=engine_idx,
+            socket_cache=socket_cache,
+            socket_lock=socket_lock
+        )
 
-        except Exception as e:
-            logger.error(
-                f"Transfer task {task_id} failed for session {session_id}: {e}",
-                exc_info=True
-            )
-            handle._mark_done(False)
+        # Mark as successfully completed
+        handle._mark_done(True)
+
+        # Deregiter memory region
+        with self.registration_locks[engine_idx]:
+            if ptr in self.registered_ptrs[engine_idx][session_id]:
+                logger.debug(
+                    f"Deregistering memory region on engine {engine_idx} for session {session_id}: ptr={ptr:#x}"
+                )
+                self.engine_pool[engine_idx].deregister(ptr)
+                self.registered_ptrs[engine_idx][session_id].remove(ptr)
+
 
     def _send_sync_status_and_wait(
         self,
