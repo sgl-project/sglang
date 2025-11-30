@@ -38,7 +38,7 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
                     ib_device_str = f.read()
             else:
                 # File doesn't exist, treat as old format
-                return ib_device_str
+                raise RuntimeError(f"File {ib_device_str} does not exist.")
         except (IOError, OSError) as e:
             # File reading failed, raise exception
             raise RuntimeError(f"Failed to read JSON file {ib_device_str}: {e}") from e
