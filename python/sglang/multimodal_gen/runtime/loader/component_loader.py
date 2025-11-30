@@ -101,17 +101,32 @@ def load_native(library, component_module_path: str, server_args: ServerArgs):
             revision=server_args.revision,
         )
     elif library == "diffusers":
-        import diffusers
+        from diffusers import AutoModel
 
         config = get_diffusers_component_config(model_path=component_module_path)
         class_name = config.pop("_class_name", None)
+        
         if class_name:
-            cls = getattr(diffusers, class_name)
+            import diffusers
+            try:
+                cls = getattr(diffusers, class_name)
+            except AttributeError:
+                # Try class name variation (e.g., Flux2Transformer2DModel -> FluxTransformer2DModel)
+                variant = class_name.replace("Flux2", "Flux")
+                cls = getattr(diffusers, variant) if hasattr(diffusers, variant) else AutoModel
+            
             return cls.from_pretrained(
-                component_module_path, revision=server_args.revision, **config
+                component_module_path,
+                revision=server_args.revision,
+                trust_remote_code=server_args.trust_remote_code,
+                **config
             )
         else:
-            raise ValueError("Cannot determine class name for generic diffusers loader")
+            return AutoModel.from_pretrained(
+                component_module_path,
+                revision=server_args.revision,
+                trust_remote_code=server_args.trust_remote_code,
+            )
     else:
         raise ValueError(f"Unsupported library: {library}")
 
