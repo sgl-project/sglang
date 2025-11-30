@@ -70,15 +70,17 @@ def disable_ca_comm(tp_group):
 
     TODO(yuwei): Fix this
     """
+    if tp_group.ca_comm is None:
+        yield
+        return
+
     original_disabled = tp_group.ca_comm.disabled
     tp_group.ca_comm.original_disabled = original_disabled
     try:
-        if tp_group.ca_comm is not None:
-            tp_group.ca_comm.disabled = True
+        tp_group.ca_comm.disabled = True
         yield
     finally:
-        if tp_group.ca_comm is not None and original_disabled is not None:
-            tp_group.ca_comm.disabled = original_disabled
+        tp_group.ca_comm.disabled = original_disabled
 
 
 @contextmanager
@@ -89,11 +91,17 @@ def use_original_ca_comm(tp_group):
 
     TODO(Byron): remove this once custom allreduce is enabled in piecewise cuda graph
     """
+    if tp_group.ca_comm is None:
+        yield
+        return
+
     current_disabled = tp_group.ca_comm.disabled
     original_disabled = tp_group.ca_comm.original_disabled
-    tp_group.ca_comm.disabled = original_disabled
-    yield
-    tp_group.ca_comm.disabled = current_disabled
+    try:
+        tp_group.ca_comm.disabled = original_disabled
+        yield
+    finally:
+        tp_group.ca_comm.disabled = current_disabled
 
 
 @contextmanager
