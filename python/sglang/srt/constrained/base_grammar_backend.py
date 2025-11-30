@@ -113,6 +113,9 @@ class BaseGrammarObject:
         """
         raise NotImplementedError()
 
+    def accept_token_length(self) -> int:
+        raise NotImplementedError()
+
 
 INVALID_GRAMMAR_OBJ = BaseGrammarObject()
 
