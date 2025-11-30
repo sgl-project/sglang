@@ -202,8 +202,16 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
+        # Will be set in register_mem_pool_host
+        self.is_mla_backend = is_mla_model
+
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        super().register_mem_pool_host(mem_pool_host)
+        # Store layout for use in preprocessing
+        self.mem_pool_layout = mem_pool_host.layout
 
     def get(
         self,
@@ -230,12 +238,30 @@ class HiCacheFile(HiCacheStorage):
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
-        return [
-            self.get(key, target_location)
-            for key, target_location in zip(
-                keys, target_locations or [None] * len(keys)
-            )
-        ]
+        results = []
+        for key, target_location in zip(keys, target_locations or [None] * len(keys)):
+            # Stage 1: Build file path
+            suffixed_key = self._get_suffixed_key(key)
+            tensor_path = os.path.join(self.file_path, f"{suffixed_key}.bin")
+
+            try:
+                # Stage 2: Make contiguous
+                expected = target_location.numel() * target_location.element_size()
+
+                # Stage 3: Convert to numpy view
+                buf = memoryview(target_location.view(torch.uint8).contiguous().numpy())
+
+                # Stage 4: File I/O
+                with open(tensor_path, "rb", buffering=0) as f:
+                    if f.readinto(buf) != expected:
+                        results.append(None)
+                        continue
+
+                results.append(target_location)
+            except FileNotFoundError:
+                results.append(None)
+
+        return results
 
     def set(
         self,
@@ -244,14 +270,25 @@ class HiCacheFile(HiCacheStorage):
         target_location: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        # Stage 1: Check if exists
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
             return True
 
+        # Stage 2: Build file path
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
+
         try:
-            value.contiguous().view(dtype=torch.uint8).numpy().tofile(tensor_path)
+            # Stage 3: Make contiguous
+            contiguous_value = value.contiguous()
+
+            # Stage 4: Convert to numpy view
+            numpy_view = contiguous_value.view(dtype=torch.uint8).numpy()
+
+            # Stage 5: File I/O
+            numpy_view.tofile(tensor_path)
+
             return True
         except Exception as e:
             logger.error(f"Failed to save tensor {key}: {e}")
@@ -267,11 +304,18 @@ class HiCacheFile(HiCacheStorage):
         for key, value in zip(keys, values):
             if not self.set(key, value):
                 return False
+
         return True
 
     def exists(self, key: str) -> bool:
-        key = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
+        """Check if key exists in storage. For v1 interface, check .batch.bin file."""
+        suffixed_key = self._get_suffixed_key(key)
+        # Check batch file first (v1 interface)
+        batch_file_path = os.path.join(self.file_path, f"{suffixed_key}.batch.bin")
+        if os.path.exists(batch_file_path):
+            return True
+        # Fallback to individual file (old interface)
+        tensor_path = os.path.join(self.file_path, f"{suffixed_key}.bin")
         return os.path.exists(tensor_path)
 
     def clear(self) -> bool:
@@ -285,3 +329,118 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """True batch get: read multiple tensors from one batch file."""
+        if not keys or len(host_indices) == 0:
+            return [False] * len(keys) if keys else []
+
+        # Optimized: inline preprocessing to avoid function call overhead
+        assert len(keys) > 0
+        assert len(host_indices) % self.mem_pool_host.page_size == 0
+        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+
+        page_num = len(keys)
+        results = []
+
+        for i in range(page_num):
+            key = keys[i]
+
+            # Stage 1: Build file path
+            batch_file_path = os.path.join(
+                self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
+            )
+
+            # Stage 2: Get tensor from memory pool
+            page_start_idx = i * self.mem_pool_host.page_size
+            actual_idx = host_indices[page_start_idx].item()
+            page_tensor = self.mem_pool_host.get_data_page(actual_idx, flat=True)
+
+            # Stage 3: Make contiguous
+            if not page_tensor.is_contiguous():
+                page_tensor = page_tensor.contiguous()
+
+            try:
+                # Stage 4: Convert to numpy view
+                numpy_view = page_tensor.view(torch.uint8).numpy()
+                expected_size = page_tensor.numel() * page_tensor.element_size()
+
+                # Stage 5: File I/O
+                with open(batch_file_path, "rb", buffering=0) as f:
+                    if f.readinto(memoryview(numpy_view)) != expected_size:
+                        results.append(False)
+                        continue
+
+                results.append(True)
+            except FileNotFoundError:
+                results.append(False)
+            except Exception as e:
+                logger.error(f"Failed to read batch file for {key}: {e}")
+                results.append(False)
+
+        return results
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """True batch set: merge multiple tensors into one file and use batch I/O."""
+        if not keys or len(host_indices) == 0:
+            return []
+
+        # Optimized: inline preprocessing to avoid function call overhead
+        assert len(keys) > 0
+        assert len(host_indices) % self.mem_pool_host.page_size == 0
+        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+
+        page_num = len(keys)
+        write_results = []
+
+        for i in range(page_num):
+            key = keys[i]
+
+            # Stage 1: Build file path
+            batch_file_path = os.path.join(
+                self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
+            )
+
+            # Stage 2: Check if file exists
+            if os.path.exists(batch_file_path):
+                write_results.append(True)
+                continue
+
+            try:
+                # Stage 3: Get tensor from memory pool
+                page_start_idx = i * self.mem_pool_host.page_size
+                actual_idx = host_indices[page_start_idx].item()
+                page_tensor = self.mem_pool_host.get_data_page(actual_idx, flat=True)
+
+                # Stage 4: Make contiguous
+                if not page_tensor.is_contiguous():
+                    page_tensor = page_tensor.contiguous()
+
+                # Stage 5: Handle MHA/MLA format
+                # Optimized: For both MHA and MLA, write entire page_tensor at once
+                # MHA: page_tensor already contains K (first half) and V (second half) in correct order
+                # This avoids split and two separate writes, reducing system calls
+                # Stage 6: Convert to numpy view (already done above for both MHA/MLA)
+                numpy_view = page_tensor.view(torch.uint8).numpy()
+
+                # Stage 7: File I/O - single write operation (matches old interface pattern)
+                # Use tofile(path) directly (same as old interface, no file handle overhead)
+                # This writes K and V together in one operation for MHA
+                numpy_view.tofile(batch_file_path)
+
+                write_results.append(True)
+            except Exception as e:
+                logger.error(f"Failed to write batch for key {key}: {e}")
+                write_results.append(False)
+
+        return write_results
