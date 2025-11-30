@@ -2018,6 +2018,7 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
+    # The current code does not support the `action="store_false"` parameter type. see #14085 for more details.
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
