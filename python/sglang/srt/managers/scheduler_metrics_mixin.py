@@ -401,7 +401,7 @@ class SchedulerMetricsMixin:
         if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
             num_tokens = max(full_num_used, swa_num_used)
-        elif self.is_hybrid_gdn:
+        elif self.is_ssm_model:
             num_tokens = self._get_mamba_token_info()[0]
         else:
             num_tokens = self._get_token_info()[0]
