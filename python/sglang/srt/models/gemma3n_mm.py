@@ -491,12 +491,22 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
             loaded_params.add(name)
         return loaded_params
 
-    lora_pattern = re.compile(
+    _lora_pattern = re.compile(
         r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
     )
 
-    def should_apply_lora(self, module_name: str) -> bool:
-        return bool(self.lora_pattern.match(module_name))
+    def _should_apply_lora(self, module_name: str) -> bool:
+        return bool(self._lora_pattern.match(module_name))
+
+    def map_lora_module_name(self, module_name: str) -> Optional[str]:
+        """
+        Returns the LoRA weight name corresponding to the given model module if LoRA
+        should be applied to it.
+        """
+        if not self._should_apply_lora(module_name):
+            return None
+
+        return module_name.split(".")[-1]
 
     def get_hidden_dim(self, module_name, layer_idx):
         # return input_dim, output_dim
