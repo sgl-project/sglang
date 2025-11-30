@@ -898,3 +898,38 @@ def can_auto_enable_marlin_fp8() -> bool:
         return 80 <= sm < 89
     except Exception:
         return False
+
+
+def apply_fp8_ptpc_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    input_scale_ub: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
+    use_per_token_if_dynamic: bool = False,
+    pad_output: Optional[bool] = None,
+    compressed_tensor_quant: bool = False,
+) -> torch.Tensor:
+    # View input as 2D matrix for fp8 methods
+    input_2d = input.view(-1, input.shape[-1])
+
+    # weight is transposed (K, N)
+    output_shape = [*input.shape[:-1], weight.shape[1]]
+
+    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
+
+    per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
+    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
+
+    if not (per_tensor_weights and per_tensor_activations):
+        # weight is in (N, K)
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    output = aiter.gemm_a8w8_bpreshuffle(
+        q_input, weight, x_scale, weight_scale, None, input.dtype
+    )
+    if bias is not None:
+        output = output + bias
+    return output.view(*output_shape)
