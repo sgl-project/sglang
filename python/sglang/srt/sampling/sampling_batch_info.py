@@ -47,7 +47,7 @@ class SamplingBatchInfo:
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
-    acc_linear_penalties: torch.Tensor = None  # Used in the overlap mode
+    accumulated_linear_penalties: torch.Tensor = None  # Used in the overlap mode
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -213,19 +213,19 @@ class SamplingBatchInfo:
 
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
-            self.acc_linear_penalties = torch.zeros(
+            self.accumulated_linear_penalties = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
                 device=self.temperatures.device,
             )
-            self.penalizer_orchestrator.apply(self.acc_linear_penalties)
+            self.penalizer_orchestrator.apply(self.accumulated_linear_penalties)
         else:
-            self.acc_linear_penalties = None
+            self.accumulated_linear_penalties = None
 
     def apply_logits_bias(self, logits: torch.Tensor):
-        if self.acc_linear_penalties is not None:
+        if self.accumulated_linear_penalties is not None:
             # Used in the overlap mode
-            logits.add_(self.acc_linear_penalties)
+            logits.add_(self.accumulated_linear_penalties)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
