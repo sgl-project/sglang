@@ -13,6 +13,8 @@
 # ==============================================================================
 """Utilities for Huggingface Transformers."""
 
+from __future__ import annotations
+
 import contextlib
 import json
 import logging
@@ -20,78 +22,86 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    AutoTokenizer,
-    GenerationConfig,
-    PretrainedConfig,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerBase,
-    PreTrainedTokenizerFast,
-)
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.srt.configs import (
-    ChatGLMConfig,
-    DbrxConfig,
-    DeepseekVL2Config,
-    DotsOCRConfig,
-    DotsVLMConfig,
-    ExaoneConfig,
-    FalconH1Config,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiLinearConfig,
-    KimiVLConfig,
-    LongcatFlashConfig,
-    MultiModalityConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Olmo3Config,
-    Qwen3NextConfig,
-    Step3VLConfig,
-)
-from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
-from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+from sglang.utils import LazyImport
 
-_CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
-    ChatGLMConfig,
-    DbrxConfig,
-    ExaoneConfig,
-    DeepseekVL2Config,
-    MultiModalityConfig,
-    KimiVLConfig,
-    InternVLChatConfig,
-    Step3VLConfig,
-    LongcatFlashConfig,
-    Olmo3Config,
-    KimiLinearConfig,
-    Qwen3NextConfig,
-    FalconH1Config,
-    DotsVLMConfig,
-    DotsOCRConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    DeepseekVLV2Config,
-    JetNemotronConfig,
-    JetVLMConfig,
-]
+if TYPE_CHECKING:
+    from transformers import (
+        PretrainedConfig,
+        PreTrainedTokenizer,
+        PreTrainedTokenizerFast,
+    )
 
-_CONFIG_REGISTRY = {
-    config_cls.model_type: config_cls for config_cls in _CONFIG_REGISTRY
-}
+AutoConfig = LazyImport("transformers", "AutoConfig")
+AutoTokenizer = LazyImport("transformers", "AutoTokenizer")
+AutoProcessor = LazyImport("transformers", "AutoProcessor")
+GenerationConfig = LazyImport("transformers", "GenerationConfig")
+PreTrainedTokenizerFast = LazyImport("transformers", "PreTrainedTokenizerFast")
+PreTrainedTokenizerBase = LazyImport("transformers", "PreTrainedTokenizerBase")
+SiglipVisionConfig = LazyImport("transformers", "SiglipVisionConfig")
 
-for name, cls in _CONFIG_REGISTRY.items():
-    with contextlib.suppress(ValueError):
-        AutoConfig.register(name, cls)
+
+def _register_custom_configs():
+    from sglang.srt.configs import (
+        ChatGLMConfig,
+        DbrxConfig,
+        DeepseekVL2Config,
+        DotsOCRConfig,
+        DotsVLMConfig,
+        ExaoneConfig,
+        FalconH1Config,
+        JetNemotronConfig,
+        JetVLMConfig,
+        KimiLinearConfig,
+        KimiVLConfig,
+        LongcatFlashConfig,
+        MultiModalityConfig,
+        NemotronH_Nano_VL_V2_Config,
+        NemotronHConfig,
+        Olmo3Config,
+        Qwen3NextConfig,
+        Step3VLConfig,
+    )
+    from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+    from sglang.srt.configs.internvl import InternVLChatConfig
+
+    _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
+        ChatGLMConfig,
+        DbrxConfig,
+        ExaoneConfig,
+        DeepseekVL2Config,
+        MultiModalityConfig,
+        KimiVLConfig,
+        InternVLChatConfig,
+        Step3VLConfig,
+        LongcatFlashConfig,
+        Olmo3Config,
+        KimiLinearConfig,
+        Qwen3NextConfig,
+        FalconH1Config,
+        DotsVLMConfig,
+        DotsOCRConfig,
+        NemotronH_Nano_VL_V2_Config,
+        NemotronHConfig,
+        DeepseekVLV2Config,
+        JetNemotronConfig,
+        JetVLMConfig,
+    ]
+
+    _CONFIG_REGISTRY = {
+        config_cls.model_type: config_cls for config_cls in _CONFIG_REGISTRY
+    }
+    for name, cls in _CONFIG_REGISTRY.items():
+        with contextlib.suppress(ValueError):
+            AutoConfig.register(name, cls)
+
+    return _CONFIG_REGISTRY
 
 
 def download_from_hf(
@@ -202,6 +212,8 @@ def get_config(
     model_override_args: Optional[dict] = None,
     **kwargs,
 ):
+    _CONFIG_REGISTRY = _register_custom_configs()
+
     is_gguf = check_gguf_file(model)
     if is_gguf:
         kwargs["gguf_file"] = model
@@ -234,8 +246,6 @@ def get_config(
         # Phi4MMForCausalLM uses a hard-coded vision_config. See:
         # https://github.com/vllm-project/vllm/blob/6071e989df1531b59ef35568f83f7351afb0b51e/vllm/model_executor/models/phi4mm.py#L71
         # We set it here to support cases where num_attention_heads is not divisible by the TP size.
-        from transformers import SiglipVisionConfig
-
         vision_config = {
             "hidden_size": 1152,
             "image_size": 448,
@@ -277,6 +287,10 @@ def get_config(
 
     # Special architecture mapping check for GGUF models
     if is_gguf:
+        from transformers.models.auto.modeling_auto import (
+            MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
+        )
+
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
             raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
         model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
@@ -463,6 +477,10 @@ def get_processor(
     use_fast: Optional[bool] = True,
     **kwargs,
 ):
+    from sglang.srt.multimodal.customized_mm_processor_utils import (
+        _CUSTOMIZED_MM_PROCESSOR,
+    )
+
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
 
