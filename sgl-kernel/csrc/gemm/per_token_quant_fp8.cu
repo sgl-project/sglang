@@ -48,9 +48,8 @@ __global__ void per_token_quant_fp8_kernel(
 
   float warp_max = warpReduceMax(max_value);
 
-  __shared__ float scale;
-  scale = warp_max / FP8_E4M3_MAX;
-  // Broadcast scale
+  float scale = warp_max / FP8_E4M3_MAX;
+  // store scale
   if (lane_id == 0) {
     token_scale[0] = scale;
   }
