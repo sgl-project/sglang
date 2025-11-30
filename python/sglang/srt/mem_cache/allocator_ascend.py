@@ -8,7 +8,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 
 def alloc_extend_kernel_ascend(
@@ -104,21 +104,24 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return None
 
         if num_new_pages_item < 200:
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
 
             out_indices = torch.empty(
                 (extend_num_tokens,),
                 dtype=torch.int64,
                 device=self.device,
             )
-            torch.ops.npu.alloc_extend(
-                prefix_lens.to(torch.int64),
-                seq_lens.to(torch.int64),
-                last_loc.to(torch.int64),
+            max_num_extend_tokens = next_power_of_2(extend_num_tokens)
+            bs = prefix_lens.shape[0]
+            alloc_extend_kernel[(bs,)](
+                prefix_lens,
+                seq_lens,
+                last_loc,
                 self.free_pages,
-                self.page_size,
                 out_indices,
-                num_new_pages,
+                next_power_of_2(bs),
+                self.page_size,
+                max_num_extend_tokens,
             )
 
         else:
