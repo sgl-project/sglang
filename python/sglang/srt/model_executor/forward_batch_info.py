@@ -198,14 +198,14 @@ class CaptureHiddenMode(IntEnum):
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor,
     num_tokens_per_dp: int,
-    attn_tp_rank: int,
-    attn_tp_size: int,
 ) -> torch.Tensor:
     """Compute local non-padded token count for this attention-TP rank.
     
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
     """
+    attn_tp_rank = get_attention_tp_rank()
+    attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
     
     return torch.clamp(
@@ -515,34 +515,7 @@ class ForwardBatch:
 
         return ret
     
-    def prepare_num_token_non_padded_for_attn_tp(
-        self,
-        *,
-        require_gathered_buffer: bool,
-        nsa_enable_prefill_cp: bool,
-    ) -> None:
-        """Convert num_token_non_padded from global to local for this attention-TP rank.
-
-        Only adjusts when gathered buffers are used and NSA prefill CP is disabled.
-        Safe to call unconditionally - early returns if adjustment isn't needed.
-        """
-        if self.num_token_non_padded is None:
-            return
-
-        if not (require_gathered_buffer and not nsa_enable_prefill_cp):
-            return
-
-        self.adjust_num_token_non_padded_for_attn_tp(
-            attn_tp_rank=get_attention_tp_rank(),
-            attn_tp_size=get_attention_tp_size(),
-        )
-
-    def adjust_num_token_non_padded_for_attn_tp(
-            self,
-            *,
-            attn_tp_rank: int,
-            attn_tp_size: int,
-    ) -> None:
+    def adjust_num_token_non_padded_for_attn_tp(self) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
         dp_rank = get_attention_dp_rank()
         num_tokens_per_dp = int(self.global_num_tokens_gpu[dp_rank].item())
@@ -550,8 +523,6 @@ class ForwardBatch:
         local = compute_local_num_token_non_padded(
             global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
-            attn_tp_rank=attn_tp_rank,
-            attn_tp_size=attn_tp_size,
         )
 
         self.num_token_non_padded = local

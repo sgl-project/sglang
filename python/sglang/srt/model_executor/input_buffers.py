@@ -128,8 +128,6 @@ class GraphInputBuffers:
         require_gathered_buffer: bool,
         num_tokens_per_bs: int,
         nsa_enable_prefill_cp: bool,
-        attn_tp_rank: int,
-        attn_tp_size: int,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Optional[torch.Tensor]:
@@ -167,8 +165,6 @@ class GraphInputBuffers:
                 local = compute_local_num_token_non_padded(
                     global_num_token_non_padded=forward_batch.num_token_non_padded,
                     num_tokens_per_dp=num_tokens_per_dp,
-                    attn_tp_rank=attn_tp_rank,
-                    attn_tp_size=attn_tp_size,
                 )
                 self.num_token_non_padded.copy_(local)
             else:
