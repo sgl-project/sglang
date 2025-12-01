@@ -1,8 +1,4 @@
 ARG CUDA_VERSION=12.9.1
-
-########################################################
-########## Base Image with System Dependencies ########
-########################################################
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
 
 ARG TARGETARCH
@@ -544,11 +540,6 @@ COPY --from=framework /sgl-workspace /sgl-workspace
 COPY --from=framework /usr/lib/libgdrapi.so* /usr/lib/
 COPY --from=framework /usr/bin/gdrcopy_* /usr/bin/
 COPY --from=framework /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
-
-# Copy essential binaries
-COPY --from=framework /usr/local/bin/diff-so-fancy /usr/local/bin/
-COPY --from=framework /usr/local/bin/yank /usr/local/bin/
-COPY --from=framework /usr/local/bin/just /usr/local/bin/
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
