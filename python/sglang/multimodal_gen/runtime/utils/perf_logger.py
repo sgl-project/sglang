@@ -261,6 +261,3 @@ class PerformanceLogger:
 
         except (OSError, PermissionError) as e:
             print(f"WARNING: Failed to log performance record: {e}", file=sys.stderr)
-
-
- 

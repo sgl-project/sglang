@@ -114,7 +114,19 @@ class DenoisingStage(PipelineStage):
         )
         attn_head_size = hidden_size // num_attention_heads
 
-        # torch compile (removed)
+        # torch compile
+        if self.server_args.enable_torch_compile:
+            full_graph = False
+            self.transformer = torch.compile(
+                self.transformer, mode="max-autotune", fullgraph=full_graph
+            )
+            self.transformer_2 = (
+                torch.compile(
+                    self.transformer_2, mode="max-autotune", fullgraph=full_graph
+                )
+                if transformer_2 is not None
+                else None
+            )
 
         self.scheduler = scheduler
         self.vae = vae
@@ -189,7 +201,10 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
-            # torch compile (removed)
+            if self.server_args.enable_torch_compile:
+                self.transformer = torch.compile(
+                    self.transformer, mode="max-autotune", fullgraph=True
+                )
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
