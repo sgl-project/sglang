@@ -388,7 +388,7 @@ class TestPiecewiseCudaGraphFusedMoE(CustomTestCase):
                 "eager",
                 "--tp",
                 "2",
-                "--ep",
+                "--ep-size",
                 "2",
             ],
         )
