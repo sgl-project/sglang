@@ -514,6 +514,12 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latents = _patchify_latents(image_latents)
         return image_latents
 
+    def _check_vae_has_bn(self, vae):
+        """Check if VAE has bn attribute (cached check to avoid repeated hasattr calls)."""
+        if not hasattr(self, "_vae_has_bn_cache"):
+            self._vae_has_bn_cache = hasattr(vae, "bn") and vae.bn is not None
+        return self._vae_has_bn_cache
+
     def preprocess_decoding(self, latents, server_args=None):
         """Preprocess latents before decoding.
 
@@ -521,14 +527,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         - Standard Flux2 VAE (has bn): needs unpatchify (128 channels -> 32 channels)
         - Distilled VAE (no bn): keeps patchified latents (128 channels)
         """
-        # Check if VAE has bn attribute to determine if it's a standard or distilled VAE
         vae = getattr(server_args, "_current_vae", None) if server_args else None
-        if vae is not None and hasattr(vae, "bn") and vae.bn is not None:
-            # Standard Flux2 VAE: needs unpatchify
+        if vae is not None and self._check_vae_has_bn(vae):
             return _unpatchify_latents(latents)
-        else:
-            # Distilled VAE or unknown: keep patchified latents
-            return latents
+        return latents
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         """Get scale and shift for decoding.
@@ -539,30 +541,25 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         """
         vae_arch_config = self.vae_config.arch_config
 
-        # Check if VAE has bn attribute (standard Flux2 VAE)
-        if hasattr(vae, "bn") and vae.bn is not None:
+        if self._check_vae_has_bn(vae):
             # Standard Flux2 VAE: use BatchNorm statistics
-            latents_bn_mean = (
-                vae.bn.running_mean.view(1, -1, 1, 1)
-                .to(device=device)
-                .to(device, dtype)
-            )
+            latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(device, dtype)
             latents_bn_std = torch.sqrt(
                 vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps
             ).to(device, dtype)
             return 1 / latents_bn_std, latents_bn_mean
-        else:
-            # Distilled VAE or unknown: use scaling_factor
-            scaling_factor = (
-                getattr(vae.config, "scaling_factor", None)
-                if hasattr(vae, "config")
-                else getattr(vae, "scaling_factor", None)
-            ) or getattr(vae_arch_config, "scaling_factor", 0.13025)
 
-            scale = torch.tensor(scaling_factor, device=device, dtype=dtype).view(
-                1, 1, 1, 1
-            )
-            return 1 / scale, None
+        # Distilled VAE or unknown: use scaling_factor
+        scaling_factor = (
+            getattr(vae.config, "scaling_factor", None)
+            if hasattr(vae, "config")
+            else getattr(vae, "scaling_factor", None)
+        ) or getattr(vae_arch_config, "scaling_factor", 0.13025)
+
+        scale = torch.tensor(scaling_factor, device=device, dtype=dtype).view(
+            1, 1, 1, 1
+        )
+        return 1 / scale, None
 
     def post_denoising_loop(self, latents, batch):
         latent_ids = batch.latent_ids
