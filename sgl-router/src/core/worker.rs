@@ -171,11 +171,17 @@ pub trait Worker: Send + Sync + fmt::Debug {
     }
 
     /// Get the model ID this worker serves
+    /// Checks ModelCards first, then falls back to labels
     fn model_id(&self) -> &str {
+        // Check ModelCards first
         self.metadata()
-            .labels
-            .get("model_id")
-            .map(|s| s.as_str())
+            .models
+            .first()
+            .map(|m| m.id.as_str())
+            .or_else(|| {
+                // Fall back to labels
+                self.metadata().labels.get("model_id").map(|s| s.as_str())
+            })
             .unwrap_or("unknown")
     }
 
@@ -197,76 +203,32 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(1.0)
     }
 
-    /// Get the tokenizer path for this worker (gRPC mode only)
-    fn tokenizer_path(&self) -> Option<&str> {
-        self.metadata()
-            .labels
-            .get("tokenizer_path")
-            .map(|s| s.as_str())
-    }
-
-    /// Get the reasoning parser type for this worker (gRPC mode only)
-    fn reasoning_parser(&self) -> Option<&str> {
-        self.metadata()
-            .labels
-            .get("reasoning_parser")
-            .map(|s| s.as_str())
-    }
-
-    /// Get the tool parser type for this worker (gRPC mode only)
-    fn tool_parser(&self) -> Option<&str> {
-        self.metadata()
-            .labels
-            .get("tool_parser")
-            .map(|s| s.as_str())
-    }
-
-    /// Get the chat template for this worker (gRPC mode only)
-    fn chat_template(&self) -> Option<&str> {
-        self.metadata()
-            .labels
-            .get("chat_template")
-            .map(|s| s.as_str())
-    }
-
-    // =========================================================================
-    // Phase 1.4: Model-aware methods (check ModelCard first, fall back to labels)
-    // =========================================================================
-
     /// Get tokenizer path for a specific model.
-    /// Priority: ModelCard.tokenizer_path > labels["tokenizer_path"]
     fn tokenizer_path_for_model(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.tokenizer_path.as_deref())
-            .or_else(|| self.tokenizer_path())
     }
 
     /// Get reasoning parser for a specific model.
-    /// Priority: ModelCard.reasoning_parser > labels["reasoning_parser"]
     fn reasoning_parser_for_model(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.reasoning_parser.as_deref())
-            .or_else(|| self.reasoning_parser())
     }
 
     /// Get tool parser for a specific model.
-    /// Priority: ModelCard.tool_parser > labels["tool_parser"]
     fn tool_parser_for_model(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.tool_parser.as_deref())
-            .or_else(|| self.tool_parser())
     }
 
     /// Get chat template for a specific model.
-    /// Priority: ModelCard.chat_template > labels["chat_template"]
     fn chat_template_for_model(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.chat_template.as_deref())
-            .or_else(|| self.chat_template())
     }
 
     /// Get the default provider type for this worker.
@@ -1084,10 +1046,11 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         ConnectionMode::Http => None,
     };
 
+    let model_id = worker.model_id();
     WorkerInfo {
         id: worker.url().to_string(),
         url: worker.url().to_string(),
-        model_id: worker.model_id().to_string(),
+        model_id: model_id.to_string(),
         priority: worker.priority(),
         cost: worker.cost(),
         worker_type: worker_type_str.to_string(),
@@ -1095,10 +1058,12 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         load: worker.load(),
         connection_mode: format!("{:?}", worker.connection_mode()),
         runtime_type,
-        tokenizer_path: worker.tokenizer_path().map(String::from),
-        reasoning_parser: worker.reasoning_parser().map(String::from),
-        tool_parser: worker.tool_parser().map(String::from),
-        chat_template: worker.chat_template().map(String::from),
+        tokenizer_path: worker.tokenizer_path_for_model(model_id).map(String::from),
+        reasoning_parser: worker
+            .reasoning_parser_for_model(model_id)
+            .map(String::from),
+        tool_parser: worker.tool_parser_for_model(model_id).map(String::from),
+        chat_template: worker.chat_template_for_model(model_id).map(String::from),
         bootstrap_port,
         metadata: worker.metadata().labels.clone(),
         job_status: None,
@@ -2115,25 +2080,25 @@ mod tests {
 
     #[test]
     fn test_worker_tokenizer_path_for_model() {
+        use super::ModelCard;
         use crate::core::BasicWorkerBuilder;
 
-        // Create a worker with a model that has tokenizer_path
-        let mut labels = std::collections::HashMap::new();
-        labels.insert(
-            "tokenizer_path".to_string(),
-            "default/tokenizer".to_string(),
-        );
+        // Create a worker with a ModelCard that has tokenizer_path
+        let model_card =
+            ModelCard::new("my-model").with_tokenizer_path("my-model/tokenizer".to_string());
 
         let worker = BasicWorkerBuilder::new("http://test:8080")
-            .labels(labels)
+            .model(model_card)
             .build();
 
-        // No models configured - should fall back to labels
+        // Should find the tokenizer_path from the ModelCard
         assert_eq!(
-            worker.tokenizer_path_for_model("any-model"),
-            Some("default/tokenizer")
+            worker.tokenizer_path_for_model("my-model"),
+            Some("my-model/tokenizer")
         );
-        assert_eq!(worker.tokenizer_path(), Some("default/tokenizer"));
+
+        // Unknown model should return None
+        assert_eq!(worker.tokenizer_path_for_model("unknown-model"), None);
     }
 
     #[test]
@@ -2141,17 +2106,8 @@ mod tests {
         use super::{ModelCard, ProviderType};
         use crate::core::BasicWorkerBuilder;
 
-        // Build worker with labels as fallback
-        let mut labels = std::collections::HashMap::new();
-        labels.insert(
-            "tokenizer_path".to_string(),
-            "fallback/tokenizer".to_string(),
-        );
-        labels.insert("chat_template".to_string(), "fallback_template".to_string());
-
-        let mut worker = BasicWorkerBuilder::new("http://test:8080")
-            .labels(labels)
-            .build();
+        // Build worker (labels are not used for model config anymore)
+        let mut worker = BasicWorkerBuilder::new("http://test:8080").build();
 
         // Add model cards to the worker's metadata
         let model_with_config = ModelCard::new("gpt-4o")
@@ -2184,23 +2140,14 @@ mod tests {
             Some(&ProviderType::OpenAI)
         );
 
-        // Model without explicit config should fall back to labels
-        assert_eq!(
-            worker.tokenizer_path_for_model("llama-3.1"),
-            Some("fallback/tokenizer")
-        );
-        assert_eq!(
-            worker.chat_template_for_model("llama-3.1"),
-            Some("fallback_template")
-        );
+        // Model without explicit config should return None (no fallback to labels)
+        assert_eq!(worker.tokenizer_path_for_model("llama-3.1"), None);
+        assert_eq!(worker.chat_template_for_model("llama-3.1"), None);
         assert_eq!(worker.reasoning_parser_for_model("llama-3.1"), None);
         assert_eq!(worker.tool_parser_for_model("llama-3.1"), None);
 
-        // Unknown model should also fall back to labels
-        assert_eq!(
-            worker.tokenizer_path_for_model("unknown"),
-            Some("fallback/tokenizer")
-        );
+        // Unknown model should return None
+        assert_eq!(worker.tokenizer_path_for_model("unknown"), None);
     }
 
     #[test]
@@ -2262,5 +2209,31 @@ mod tests {
         // Set a default provider
         worker.metadata.default_provider = Some(ProviderType::OpenAI);
         assert_eq!(worker.default_provider(), Some(&ProviderType::OpenAI));
+    }
+
+    #[test]
+    fn test_worker_model_id_with_model_cards() {
+        use super::ModelCard;
+        use crate::core::BasicWorkerBuilder;
+
+        // Test 1: No models, no labels → "unknown"
+        let worker = BasicWorkerBuilder::new("http://test:8080").build();
+        assert_eq!(worker.model_id(), "unknown");
+
+        // Test 2: No models but has label → uses label
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .label("model_id", "label-model")
+            .build();
+        assert_eq!(worker.model_id(), "label-model");
+
+        // Test 3: Has ModelCards → uses first ModelCard
+        let mut worker = BasicWorkerBuilder::new("http://test:8080")
+            .label("model_id", "label-model")
+            .build();
+        worker.metadata.models = vec![
+            ModelCard::new("card-model-1"),
+            ModelCard::new("card-model-2"),
+        ];
+        assert_eq!(worker.model_id(), "card-model-1");
     }
 }
