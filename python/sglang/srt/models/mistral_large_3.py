@@ -56,7 +56,8 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
                     name = re.sub(k, v, name)
                     break
             else:
-
+                import logging
+                logging.warning(f"Unrecognized weight: {name}. Skipping.")
                 continue
 
             # Note(Andy): Unlike Llama, this implementation uses

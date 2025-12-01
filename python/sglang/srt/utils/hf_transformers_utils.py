@@ -197,16 +197,12 @@ def _load_mistral_large_3_for_causal_LM(
     parser = mistral_utils.MistralConfigParser()
     config_dict, _ = parser.parse(local_path)
 
-    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
-    os.makedirs(tmp_path, exist_ok=True)
-
-    unique_path = os.path.join(tmp_path, f"mistral_large_3_{os.getpid()}")
-    with open(unique_path, "w") as f:
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as f:
         json.dump(config_dict, f)
-
-    loaded_config = AutoConfig.from_pretrained(
-        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
+        f.flush()
+        loaded_config = AutoConfig.from_pretrained(
+            f.name, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
     text_config = getattr(loaded_config, "text_config", None)
     if text_config is not None and isinstance(text_config, dict):
         text_config = AutoConfig.for_model(**text_config)
