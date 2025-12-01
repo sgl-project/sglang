@@ -330,6 +330,25 @@ class Indexer(CustomOp):
         topk_result = metadata.topk_transform(logits, self.index_topk)
         return topk_result
 
+    def _should_chunk_mqa_logits(
+        self, num_q: int, num_k: int, device: torch.device
+    ) -> Tuple[bool, int]:
+        """
+        Detect whether we need to chunk the MQA logits computation to avoid OOM
+        Return: (need_chunk, free_mem)
+        """
+        # Quick static check for normal batches
+        if num_q * num_k < 8_000_000:  # 8M elements ≈ 32MB logits
+            return False, 0
+
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        bytes_per_elem = 4  # float32
+        logits_bytes = num_q * num_k * bytes_per_elem
+
+        # Logits should not exceed 50% of free memory or 30% of total memory
+        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
+        return need_chunk, free_mem
+
     def _get_topk_ragged(
         self,
         forward_batch: ForwardBatch,
@@ -409,24 +428,86 @@ class Indexer(CustomOp):
         # ks = [0, 0, 0, 10, 10]
         # ke = [8, 9, 10, 13, 14]
 
-        logits = deep_gemm.fp8_mqa_logits(
-            q_fp8[:q_offset],
-            kv_fp8,
-            weights[:q_offset],
-            ks,
-            ke,
-            clean_logits=False,
-        )
-
         token_nums, _, _ = q_fp8.shape
-        assert logits.shape[0] == len(seq_lens_expanded)
-        assert logits.shape[1] == k_offset
+        device = q_fp8.device
 
-        raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+        # Check if we need to chunk to avoid OOM
+        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
+
+        if not need_chunk:
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8[:q_offset],
+                kv_fp8,
+                weights[:q_offset],
+                ks,
+                ke,
+                clean_logits=False,
+            )
+            assert logits.shape[0] == len(seq_lens_expanded)
+            assert logits.shape[1] == k_offset
+
+            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            topk_result = torch.full(
+                (token_nums, self.index_topk),
+                -1,
+                device=device,
+                dtype=torch.int32,
+            )
+            topk_result[:q_offset] = raw_topk_result
+            return topk_result
+
+        # Chunk path
+        bytes_per_elem = 4  # float32
+        bytes_per_row = k_offset * bytes_per_elem
+        # Reserve 50% of free memory for logits
+        max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+        max_rows = min(max_rows, q_offset)
+
+        global_topk_offset = metadata.attn_metadata.topk_indices_offset
+
+        assert (
+            seq_lens_expanded.shape[0] == q_offset
+        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        if global_topk_offset is not None:
+            assert (
+                global_topk_offset.shape[0] >= q_offset
+            ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+
         topk_result = torch.full(
-            (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
+            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
         )
-        topk_result[:q_offset] = raw_topk_result
+
+        start = 0
+        while start < q_offset:
+            end = min(start + max_rows, q_offset)
+
+            logits_chunk = deep_gemm.fp8_mqa_logits(
+                q_fp8[start:end],
+                kv_fp8,
+                weights[start:end],
+                ks[start:end],
+                ke[start:end],
+                clean_logits=False,
+            )
+
+            lengths_chunk = seq_lens_expanded[start:end]
+
+            topk_offset_chunk = (
+                global_topk_offset[start:end]
+                if global_topk_offset is not None
+                else None
+            )
+
+            raw_topk_chunk = metadata.topk_transform(
+                logits_chunk,
+                self.index_topk,
+                ks=ks[start:end],
+                ke_offset=lengths_chunk,
+                topk_indices_offset_override=topk_offset_chunk,
+            )
+            topk_result[start:end] = raw_topk_chunk
+            start = end
+
         return topk_result
 
     def _forward_cuda_k_only(
