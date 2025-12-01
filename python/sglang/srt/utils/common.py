@@ -2844,6 +2844,8 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
@@ -2852,7 +2854,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend == "none":
+        elif get_moe_a2a_backend().is_none():
             return True
         else:
             return (
@@ -2867,8 +2869,10 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+    
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
