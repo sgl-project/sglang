@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
-from sglang.srt.layers.quantization.utils import requantize_with_max_scale
+from sglang.srt.layers.quantization.utils.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
 
 __all__ = ["QuarkW8A8Fp8"]
