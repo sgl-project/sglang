@@ -175,7 +175,9 @@ class TransformersForCausalLM(nn.Module):
         )
         # FIX: Handle models (like CLIP) that do not have num_key_value_heads.
         # Fallback to num_attention_heads (Standard Multi-Head Attention).
-        num_kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        num_kv_heads = getattr(
+            config, "num_key_value_heads", config.num_attention_heads
+        )
 
         self.attention_instances = [
             RadixAttention(
@@ -245,7 +247,10 @@ class TransformersForCausalLM(nn.Module):
         # CLIPVisionModel might return valid embeddings via get_input_embeddings
         # but raises NotImplementedError on set_input_embeddings.
         try:
-            if not hasattr(module, "get_input_embeddings") or module.get_input_embeddings() is None:
+            if (
+                not hasattr(module, "get_input_embeddings")
+                or module.get_input_embeddings() is None
+            ):
                 return
 
             # Use native set input embeddings
@@ -255,14 +260,14 @@ class TransformersForCausalLM(nn.Module):
                 org_num_embeddings=self.config.vocab_size,
                 quant_config=None,
             )
-            
+
             self.log_replacement(
                 "input embedding", self.model.get_input_embeddings(), new_module
             )
-            
+
             # This line raises NotImplementedError for CLIP, which we now catch.
             self.model.set_input_embeddings(new_module)
-            
+
         except (NotImplementedError, AttributeError):
             # Gracefully skip if the model doesn't support embedding replacement
             return

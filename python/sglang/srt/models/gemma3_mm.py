@@ -300,7 +300,10 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         # -------------------------------------------------------------
         # FIX: Check if the input is already precomputed embeddings
         # If the last dimension matches the text hidden size, it's an embedding.
-        if len(all_pixel_values) > 0 and all_pixel_values[0].shape[-1] == self.config.text_config.hidden_size:
+        if (
+            len(all_pixel_values) > 0
+            and all_pixel_values[0].shape[-1] == self.config.text_config.hidden_size
+        ):
             return torch.cat(all_pixel_values, dim=0)
         # -------------------------------------------------------------
 

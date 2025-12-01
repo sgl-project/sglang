@@ -118,7 +118,11 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         # If the input is already a dictionary, we skip the CPU image processor.
         # We also need to infer 'image_sizes' from 'pixel_values' if missing,
         # because pad_input_ids requires it.
-        if isinstance(image_data, list) and len(image_data) > 0 and isinstance(image_data[0], dict):
+        if (
+            isinstance(image_data, list)
+            and len(image_data) > 0
+            and isinstance(image_data[0], dict)
+        ):
             mm_items = []
             for item in image_data:
                 # Ensure image_sizes exists in model_specific_data
@@ -135,12 +139,14 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     else:
                         # Fallback default if no pixel_values (unlikely in this test)
                         item["image_sizes"] = [(336, 336)]
-                
-                mm_items.append(MultimodalDataItem(
-                    feature=item["feature"],
-                    modality=Modality.IMAGE,
-                    model_specific_data=item
-                ))
+
+                mm_items.append(
+                    MultimodalDataItem(
+                        feature=item["feature"],
+                        modality=Modality.IMAGE,
+                        model_specific_data=item,
+                    )
+                )
             return {"mm_items": mm_items}
 
         modalities = request_obj.modalities or ["image"]
