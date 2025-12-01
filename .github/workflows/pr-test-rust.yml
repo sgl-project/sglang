@@ -295,6 +295,7 @@ jobs:
 
       - name: Run Python E2E response API tests
         run: |
+          python3 -m pip install pytest-rerunfailures
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
           source "$HOME/.cargo/env"
