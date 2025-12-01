@@ -19,10 +19,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
     """
     Detector for DeepSeek V3.2 model function call format.
 
-    The DeepSeek V3.2 format uses XML-like DSML tags to delimit function calls
-    with parameter tags for arguments.
+    The DeepSeek V3.2 format uses XML-like DSML tags to delimit function calls.
+    Supports two parameter formats:
 
-    Format Structure:
+    Format 1 - XML Parameter Tags:
     ```
     <｜DSML｜function_calls>
         <｜DSML｜invoke name="function_name">
@@ -31,6 +31,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
     </｜DSML｜invoke>
     </｜DSML｜function_calls>
     ```
+
+    Format 2 - Direct JSON:
+    ```
+    <｜DSML｜function_calls>
+        <｜DSML｜invoke name="function_name">
+        {
+            "param_name": "value"
+        }
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+    ```
+
     Examples:
     ```
     <｜DSML｜function_calls>
@@ -38,12 +50,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
         <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
     </｜DSML｜invoke>
     </｜DSML｜function_calls>
+
+    <｜DSML｜function_calls>
+        <｜DSML｜invoke name="get_favorite_tourist_spot">
+        { "city": "San Francisco" }
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
     ```
 
     Key Components:
     - Tool Calls Section: Wrapped between `<｜DSML｜function_calls>` and `</｜DSML｜function_calls>`
     - Individual Tool Call: Wrapped between `<｜DSML｜invoke name="...">` and `</｜DSML｜invoke>`
-    - Parameters: `<｜DSML｜parameter name="..." string="true">value</｜DSML｜parameter>`
+    - Parameters: Either XML tags or direct JSON format
     - Supports multiple tool calls
 
     Reference: DeepSeek V3.2 format specification
@@ -64,7 +82,27 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return self.bot_token in text
 
     def _parse_parameters_from_xml(self, invoke_content: str) -> dict:
-        """Parse parameters from XML-like format to JSON dict."""
+        """
+        Parse parameters from either XML-like format or JSON format to dict.
+
+        Supports two formats:
+        1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
+        2. Direct JSON: { "key": "value" }
+        """
+        # First, try to parse as direct JSON (new format)
+        invoke_content_stripped = invoke_content.strip()
+        if invoke_content_stripped.startswith("{") and invoke_content_stripped.endswith(
+            "}"
+        ):
+            try:
+                parameters = json.loads(invoke_content_stripped)
+                if isinstance(parameters, dict):
+                    return parameters
+            except (json.JSONDecodeError, ValueError):
+                # If JSON parsing fails, fall through to XML parsing
+                pass
+
+        # Fall back to XML parameter tag parsing (original format)
         parameters = {}
         param_matches = re.findall(self.parameter_regex, invoke_content, re.DOTALL)
         for param_name, param_type, param_value in param_matches:
@@ -369,38 +407,76 @@ if __name__ == "__main__":
     print(f"Normal text: {result.normal_text}")
     print(f"Tool calls: {result.calls}")
 
+    # Test JSON format compatibility
     print("\n" + "=" * 60)
-    print("=== V31 Detector 对比测试 ===")
+    print("=== Testing JSON Format Compatibility ===")
     print("=" * 60)
 
-    # Test 1: 一次性解析
-    print("\n[V31] 一次性解析:")
-    v31_result = v31_detector.detect_and_parse(text_v31, tools)
-    print(f"  Normal text: {v31_result.normal_text}")
-    print(f"  Tool calls: {v31_result.calls}")
+    text_json_format = """I'll help you with information about San Francisco and get its favorite tourist spot for you.
 
-    # Test 2: 模拟真实的 JSON 增量流式场景
-    print("\n[V31] 流式解析（模拟 JSON 增量）:")
-    v31_detector_stream = DeepSeekV31Detector()
-    # 按照 JSON 逐渐构建的方式分割
-    v31_chunks = [
-        "I'll help you.\n\n",
-        "<｜tool▁calls▁begin｜>",
-        "<｜tool▁call▁begin｜>",
-        "get_current_weather",
-        "<｜tool▁sep｜>",
-        '{"city"',
-        ': "Boston"',
-        ', "state"',
-        ':"MA"',
-        ',"unit"',
-        ':"celsius"}',
-        "<｜tool▁call▁end｜>",
-        "<｜tool▁calls▁end｜>",
-        "<｜end▁of▁sentence｜>",
-    ]
+    <｜DSML｜function_calls>
+        <｜DSML｜invoke name="get_favorite_tourist_spot">
+        {
+            "city": "San Francisco"
+        }
+    </｜DSML｜invoke>
+        <｜DSML｜invoke name="search">
+        {
+            "query": "WebNav benchmark",
+            "topn": 10,
+            "source": "web"
+        }
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+    """
 
-    for i, chunk in enumerate(v31_chunks):
-        result = v31_detector_stream.parse_streaming_increment(chunk, tools)
-        if result.calls:
-            print(f"  Chunk {i} ({repr(chunk[:20])}...): {result.calls}")
+    detector_json = DeepSeekV32Detector()
+    result_json = detector_json.detect_and_parse(text_json_format, tools)
+    print(f"Normal text: {result_json.normal_text}")
+    print(f"Tool calls: {result_json.calls}")
+
+    # Test streaming with JSON format
+    print("\n=== Testing JSON Format Streaming ===")
+    detector_json_stream = DeepSeekV32Detector()
+    for i in range(0, len(text_json_format), chunk_size):
+        chunk = text_json_format[i : i + chunk_size]
+        streamed_chunk = detector_json_stream.parse_streaming_increment(chunk, tools)
+        if streamed_chunk.normal_text or streamed_chunk.calls:
+            print(f"Chunk: {repr(chunk)}")
+            print(f"  Result: {streamed_chunk}")
+
+    # print("\n" + "=" * 60)
+    # print("=== V31 Detector 对比测试 ===")
+    # print("=" * 60)
+
+    # # Test 1: 一次性解析
+    # print("\n[V31] 一次性解析:")
+    # v31_result = v31_detector.detect_and_parse(text_v31, tools)
+    # print(f"  Normal text: {v31_result.normal_text}")
+    # print(f"  Tool calls: {v31_result.calls}")
+
+    # # Test 2: 模拟真实的 JSON 增量流式场景
+    # print("\n[V31] 流式解析（模拟 JSON 增量）:")
+    # v31_detector_stream = DeepSeekV31Detector()
+    # # 按照 JSON 逐渐构建的方式分割
+    # v31_chunks = [
+    #     "I'll help you.\n\n",
+    #     "<｜tool▁calls▁begin｜>",
+    #     "<｜tool▁call▁begin｜>",
+    #     "get_current_weather",
+    #     "<｜tool▁sep｜>",
+    #     '{"city"',
+    #     ': "Boston"',
+    #     ', "state"',
+    #     ':"MA"',
+    #     ',"unit"',
+    #     ':"celsius"}',
+    #     "<｜tool▁call▁end｜>",
+    #     "<｜tool▁calls▁end｜>",
+    #     "<｜end▁of▁sentence｜>",
+    # ]
+
+    # for i, chunk in enumerate(v31_chunks):
+    #     result = v31_detector_stream.parse_streaming_increment(chunk, tools)
+    #     if result.calls:
+    #         print(f"  Chunk {i} ({repr(chunk[:20])}...): {result.calls}")
