@@ -1867,7 +1867,6 @@ class ModelOptModelLoader(DefaultModelLoader):
                 if get_tensor_model_parallel_rank() == 0:
                     mtq.print_quant_summary(model)
             except AssertionError:
-                # If parallel state is not initialized, just print the summary
                 mtq.print_quant_summary(model)
 
             # Save checkpoint if path provided

@@ -1166,8 +1166,6 @@ def rank0_log(msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.info(msg)
     except AssertionError:
-        # If parallel state is not initialized (e.g., using model loader directly),
-        # just log the message directly
         logger.info(msg)
 
 
