@@ -91,6 +91,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
+
         if invoke_content_stripped.startswith("{") and invoke_content_stripped.endswith(
             "}"
         ):
@@ -227,13 +228,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
 
-                # Ensure we have enough entries in our tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
+                # Don't pre-allocate arrays until we actually complete a tool call
+                # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
 
-                # Parse current parameters from XML
+                # Parse current parameters from XML/JSON
                 current_params = self._parse_parameters_from_xml(invoke_content)
                 current_args_json = json.dumps(current_params, ensure_ascii=False)
 
@@ -242,6 +240,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # Only emit the tool call when it's complete (saw </｜DSML｜invoke>)
                     # This ensures each function returns at most once
                     calls_for_this_invoke: list[ToolCallItem] = []
+
+                    # Check if invoke_content is empty or whitespace only
+                    # If so, skip this tool call entirely (it's likely incomplete or malformed)
+                    if not invoke_content.strip():
+                        # Remove the incomplete tool call from buffer
+                        self._buffer = current_text[invoke_match.end() :]
+                        current_text = self._buffer
+                        continue
 
                     # Send tool name
                     calls_for_this_invoke.append(
@@ -253,6 +259,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     )
 
                     # Send parameters as complete JSON
+                    # Always send parameters, even if empty, to maintain consistency
                     calls_for_this_invoke.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -260,6 +267,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
                             parameters=current_args_json,
                         )
                     )
+
+                    # Ensure arrays are large enough for current tool
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
 
                     # Update the stored arguments
                     self.prev_tool_call_arr[self.current_tool_id] = {
@@ -282,11 +295,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._last_arguments = ""
                     self.current_tool_name_sent = False
 
-                    # Ensure arrays are large enough for next tool
-                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                        self.prev_tool_call_arr.append({})
-                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                        self.streamed_args_for_tool.append("")
+                    # Don't pre-allocate arrays for the next tool
+                    # Only allocate when we actually complete a tool call
+                    # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
 
                     # Continue loop to check for more invoke blocks
                     continue
