@@ -73,6 +73,16 @@ TRITON_MOE_MODELS = {
     "mistralai/Mistral-7B-Instruct-v0.3",
 }
 
+# Models that require K/N dimension padding for AITer compatibility
+AITER_PAD_K_MODELS = {
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
+    "zai-org/GLM-4.5-Air-FP8",
+}
+AITER_PAD_N_MODELS = {
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",
+    "zai-org/GLM-4.5-Air-FP8",
+}
+
 
 def popen_launch_server_wrapper(base_url, model, is_tp2):
     other_args = ["--log-level-http", "warning", "--trust-remote-code"]
@@ -147,6 +157,13 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     )
                     os.environ["SGLANG_USE_AITER"] = (
                         "0" if model in TRITON_MOE_MODELS else "1"
+                    )
+                    # Set K/N padding flags for models that need them
+                    os.environ["SGLANG_AITER_PAD_K"] = (
+                        "128" if model in AITER_PAD_K_MODELS else ""
+                    )
+                    os.environ["SGLANG_AITER_PAD_N"] = (
+                        "32" if model in AITER_PAD_N_MODELS else ""
                     )
 
                     process = popen_launch_server_wrapper(self.base_url, model, is_tp2)

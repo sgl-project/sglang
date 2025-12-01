@@ -1,5 +1,7 @@
 from typing import Callable, List, Optional, Tuple
 
+import os
+
 import torch
 
 from sglang.srt.environ import envs
@@ -825,6 +827,22 @@ def apply_fp8_linear(
             # x_scale -> input scale tensor, shape = (m, 1)
             # w_scale -> weight scale tensor, shape = (n ,1)
             # dtype -> output dtype
+            
+            # Note: Weight K and N dimensions are padded during model loading in
+            # compressed_tensors_w8a8_fp8.py before shuffle_weight is called.
+            # We only need to pad input K dimension here if needed, and unpad output N dimension.
+            pad_k_align = os.environ.get("SGLANG_AITER_PAD_K", "").strip()
+            pad_n_align = os.environ.get("SGLANG_AITER_PAD_N", "").strip()
+            original_n = weight.shape[1]  # Save original N before any operations
+            
+            # Pad input K dimension if weight was padded
+            if pad_k_align and pad_k_align.isdigit():
+                weight_k = weight.shape[0]
+                input_k = qinput.shape[1]
+                if input_k < weight_k:
+                    # Pad input to match padded weight: (m, k) -> (m, weight_k)
+                    qinput = torch.nn.functional.pad(qinput, (0, weight_k - input_k))
+            
             output = gemm_a8w8_bpreshuffle(
                 XQ=qinput,
                 WQ=weight.T,
@@ -832,6 +850,12 @@ def apply_fp8_linear(
                 w_scale=weight_scale,
                 dtype=input.dtype,
             )
+            
+            # Unpad output N dimension if weight was padded during loading
+            if pad_n_align and pad_n_align.isdigit():
+                if output.shape[1] > original_n:
+                    output = output[:, :original_n]
+            
             if bias is not None:
                 output += bias
             return _process_scaled_mm_output(output, input_2d.shape, output_shape)
