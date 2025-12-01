@@ -3,7 +3,7 @@
 
 import dataclasses
 
-from sglang.multimodal_gen.configs.sample.base import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
 
 @dataclasses.dataclass
