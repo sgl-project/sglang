@@ -61,7 +61,7 @@ class NPUW8A8LinearMethod(LinearMethodBase):
             data=torch.empty(1, dtype=params_dtype),
             weight_loader=weight_loader,
         )
-        input_scale.ignore_warning = True
+        input_offset.ignore_warning = True
         layer.register_parameter("input_offset", input_offset)
 
         quant_bias = ChannelQuantScaleParameter(
