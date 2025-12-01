@@ -74,6 +74,16 @@ class EnvField:
     def value(self):
         return self.get()
 
+    def __bool__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
+    def __len__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
 
 class EnvTuple(EnvField):
     def parse(self, value: str) -> tuple[str, ...]:
@@ -143,6 +153,7 @@ class Envs:
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
+    SGLANG_PROFILE_V2 = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
@@ -327,6 +338,9 @@ class Envs:
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
+    # Numa
+    SGLANG_NUMA_BIND_V2 = EnvBool(True)
+
     # fmt: on
 
 
@@ -383,6 +397,30 @@ def example_with_subprocess():
     assert output == "None"
 
 
+def example_with_implicit_bool_avoidance():
+    @contextmanager
+    def assert_throws(message_matcher: str):
+        try:
+            yield
+        except Exception as e:
+            assert message_matcher in str(e), f"{e=}"
+            print(f"assert_throws find expected error: {e}")
+            return
+        raise AssertionError(f"assert_throws do not see exceptions")
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.SGLANG_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if (1 != 1) or envs.SGLANG_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.SGLANG_TEST_RETRACT or (1 == 1):
+            pass
+
+
 def examples():
     # Example usage for envs
     envs.SGLANG_TEST_RETRACT.clear()
@@ -412,6 +450,7 @@ def examples():
 
     example_with_exit_stack()
     example_with_subprocess()
+    example_with_implicit_bool_avoidance()
 
 
 if __name__ == "__main__":
