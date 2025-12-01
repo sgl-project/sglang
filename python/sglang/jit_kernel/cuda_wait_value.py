@@ -51,11 +51,12 @@ def test_wait_before_record(event: Event | torch.cuda.Event):
 
 
 def main():
-    import os
     import threading
     import time
 
-    block_thead = threading.Thread(target=test_wait_before_record, args=(Event(),))
+    block_thead = threading.Thread(
+        target=test_wait_before_record, args=(Event(),), daemon=True
+    )
     block_thead.start()
 
     non_block_thread = threading.Thread(
@@ -72,8 +73,6 @@ def main():
     assert not non_block_thread.is_alive(), "torch.cuda.Event should not block"
     print("=" * 40)
     print("Test completed successfully.")
-
-    os._exit(0)
 
 
 if __name__ == "__main__":
