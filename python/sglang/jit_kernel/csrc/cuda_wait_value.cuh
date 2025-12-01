@@ -13,6 +13,8 @@ __global__ void wait_flag_kernel(const int32_t* flag, int32_t target) {
   while (*vflag != target) {
 #if __CUDA_ARCH__ >= 700
     __nanosleep(100);
+#else
+    // Note: This falls back to an inefficient busy-wait on pre-Volta architectures.
 #endif
   }
 }
