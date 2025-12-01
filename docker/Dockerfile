@@ -1,8 +1,4 @@
 ARG CUDA_VERSION=12.9.1
-
-########################################################
-########## Base Image with System Dependencies ########
-########################################################
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
 
 ARG TARGETARCH
@@ -23,6 +19,7 @@ ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.5.3
 ARG CUDA_VERSION
+ARG NVSHMEM_VERSION=3.4.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -217,15 +214,22 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
         python3 -m pip uninstall -y torch torchaudio torchvision ; \
         python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
+        python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
+        python3 -m pip install nixl-cu13 ; \
     else \
         echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 # Download NVSHMEM and DeepEP sources
+# We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 RUN set -eux; \
-    if [ "${CUDA_VERSION%%.*}" != "13" ]; then \
-        pip install nvidia-nvshmem-cu12==3.4.5 ; \
+    if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+      pip install nvidia-nvshmem-cu12==${NVSHMEM_VERSION} ; \
+    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} ; \
+    else \
+      echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ; \
     fi && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
         git clone https://github.com/fzyzcjy/DeepEP.git && \
@@ -328,6 +332,15 @@ RUN --mount=type=cache,target=/var/cache/apt \
     less \
     rdma-core \
     openssh-server \
+    gnuplot \
+    infiniband-diags \
+    perftest \
+    ibverbs-providers \
+    libibumad3 \
+    libibverbs1 \
+    libnl-3-200 \
+    libnl-route-3-200 \
+    librdmacm1 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -353,7 +366,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pre-commit \
     pandas \
     matplotlib \
-    tabulate
+    tabulate \
+    termplotlib
 
 # Install external development tools with retry logic
 # diff-so-fancy
@@ -508,11 +522,6 @@ COPY --from=framework /sgl-workspace /sgl-workspace
 COPY --from=framework /usr/lib/libgdrapi.so* /usr/lib/
 COPY --from=framework /usr/bin/gdrcopy_* /usr/bin/
 COPY --from=framework /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
-
-# Copy essential binaries
-COPY --from=framework /usr/local/bin/diff-so-fancy /usr/local/bin/
-COPY --from=framework /usr/local/bin/yank /usr/local/bin/
-COPY --from=framework /usr/local/bin/just /usr/local/bin/
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so

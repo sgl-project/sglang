@@ -173,7 +173,7 @@ python -m sglang.bench_serving -h
 ```
 
 Additionally, the requests can be formed with
-[OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
+[OpenAI Completions API](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
 ## Example: Running DeepSeek-V3.1-Terminus
