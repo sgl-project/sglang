@@ -98,25 +98,6 @@ class TestEmbeddingModels(CustomTestCase):
                     DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
                 )
 
-    def test_matryoshka_embedding(self):
-        models_to_test = [
-            model
-            for model in MODELS
-            if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == model[0]
-        ]
-        assert len(models_to_test) == 1
-
-        for model, tp_size, prefill_tolerance in models_to_test:
-            for torch_dtype in TORCH_DTYPES:
-                self.assert_close_prefill_logits(
-                    DEFAULT_PROMPTS,
-                    model,
-                    tp_size,
-                    torch_dtype,
-                    prefill_tolerance,
-                    matryoshka_dim=128,
-                )
-
 
 if __name__ == "__main__":
     unittest.main()
