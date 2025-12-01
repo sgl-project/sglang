@@ -9,18 +9,39 @@ import torch
 from sglang.multimodal_gen.configs.models.base import ArchConfig, ModelConfig
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
 
 @dataclass
 class EncoderArchConfig(ArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [])
     architectures: list[str] = field(default_factory=lambda: [])
-    _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.TORCH_SDPA,
-        }
-    )
+    if _is_hip:
+        _supported_attention_backends: set[AttentionBackendEnum] = field(
+            default_factory=lambda: {
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+        )
+    else:
+        _supported_attention_backends: set[AttentionBackendEnum] = field(
+            default_factory=lambda: {
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+            }
+        )
     output_hidden_states: bool = False
     use_return_dict: bool = True
 
