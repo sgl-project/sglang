@@ -45,6 +45,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
+from sglang.srt.model_executor.cuda_graph_runner import (
+    get_global_graph_memory_pool,
+    set_global_graph_memory_pool,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -141,19 +145,6 @@ def patch_model(model: torch.nn.Module, compiler: str):
         yield model
     finally:
         _to_torch(model, reverse=True, num_tokens=16)
-
-
-# Reuse this memory pool across all cuda graph runners.
-global_graph_memory_pool = None
-
-
-def get_global_graph_memory_pool():
-    return global_graph_memory_pool
-
-
-def set_global_graph_memory_pool(val):
-    global global_graph_memory_pool
-    global_graph_memory_pool = val
 
 
 def set_torch_compile_config():
