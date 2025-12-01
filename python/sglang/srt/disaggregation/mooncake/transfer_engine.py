@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import List, Optional
 
 from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
@@ -11,12 +12,13 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     """
     Parse IB device string and get IB devices for a specific GPU ID.
 
-    Supports both formats:
+    Supports all the following formats:
     1. Old format: "ib0, ib1, ib2"
     2. New format: {0: "ib0, ib1", 1: "ib2, ib3", 2: "ib4"}
+    3. JSON file: path to a JSON file containing the mapping
 
     Args:
-        ib_device_str: The original IB device string
+        ib_device_str: The original IB device string or path to JSON file
         gpu_id: The GPU ID to get devices for
 
     Returns:
@@ -26,6 +28,20 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
         return None
 
     ib_device_str = ib_device_str.strip()
+
+    # Check if it's a JSON file first and load its content
+    is_json_file = ib_device_str.endswith(".json")
+    if is_json_file:
+        try:
+            if os.path.isfile(ib_device_str):
+                with open(ib_device_str, "r") as f:
+                    ib_device_str = f.read()
+            else:
+                # File doesn't exist, treat as old format
+                raise RuntimeError(f"File {ib_device_str} does not exist.")
+        except (IOError, OSError) as e:
+            # File reading failed, raise exception
+            raise RuntimeError(f"Failed to read JSON file {ib_device_str}: {e}") from e
 
     # Check if it's JSON format (new format)
     try:
@@ -59,6 +75,11 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
                 )
 
     except json.JSONDecodeError:
+        if is_json_file:
+            # It was supposed to be a JSON file but failed to parse
+            raise RuntimeError(
+                f"Failed to parse JSON content from file {ib_device_str}"
+            )
         # Not JSON format, treat as old format - return same devices for all GPUs
         return ib_device_str
 

@@ -1528,6 +1528,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         if page_size == 1:
             return len(requests)
+
+        if not self.spec_algorithm.is_none():
+            # A loose bound that err towards safety
+            server_args = get_global_server_args()
+            thresh = server_args.speculative_num_draft_tokens + (
+                (server_args.speculative_eagle_topk or 1)
+                * (server_args.speculative_num_steps or 1)
+            )
+            return sum(
+                1 for req in requests if ((req.seqlen + thresh) % page_size) <= thresh
+            )
+
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
         return (

@@ -1203,8 +1203,8 @@ def configure_logger(server_args, prefix: str = ""):
             custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
-    format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
+    maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
+    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,

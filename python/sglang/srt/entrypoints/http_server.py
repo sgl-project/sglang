@@ -693,6 +693,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         profile_by_stage=obj.profile_by_stage,
         merge_profiles=obj.merge_profiles,
         profile_prefix=obj.profile_prefix,
+        profile_stages=obj.profile_stages,
     )
     return Response(
         content="Start profiling.\n",

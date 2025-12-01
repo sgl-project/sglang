@@ -581,8 +581,6 @@ def traverse_tree(
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
 
-    allocate_token_bitmask.fill_(0)
-
     def dfs(
         curr: int,
         retrieve_next_token: torch.Tensor,

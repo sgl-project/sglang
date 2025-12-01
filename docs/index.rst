@@ -96,6 +96,7 @@ Its core features include:
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
    references/learn_more.md
+   references/post_training_integration.md
 
 .. toctree::
    :maxdepth: 1
