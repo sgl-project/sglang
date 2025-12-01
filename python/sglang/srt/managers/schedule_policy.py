@@ -667,14 +667,17 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
+        valid_running_reqs = (
+            r for r in self.running_batch.reqs if r not in self.preempt_list
+        )
         if server_args.schedule_low_priority_values_first:
-            sorted_running_reqs = sorted(
-                self.running_batch.reqs,
+            sorted_valid_running_reqs = sorted(
+                valid_running_reqs,
                 key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
             )
         else:
-            sorted_running_reqs = sorted(
-                self.running_batch.reqs,
+            sorted_valid_running_reqs = sorted(
+                valid_running_reqs,
                 key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
             )
         preemptible_reqs = []
@@ -683,9 +686,7 @@ class PrefillAdder:
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
-        for running_req in sorted_running_reqs:
-            if running_req in self.preempt_list:
-                continue
+        for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
             priority_diff = req.priority - running_req.priority
             if server_args.schedule_low_priority_values_first:
@@ -695,6 +696,10 @@ class PrefillAdder:
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(
                     running_req
                 )
+                if min_tokens_to_remove <= 0:
+                    break
+            else:
+                break
 
         # Check max token count limit can be met
         if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:
