@@ -274,7 +274,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         }
 
     def preprocess_condition_image(
-        self, image, target_width, target_height, vae_image_processor
+        self, image, target_width, target_height, _vae_image_processor
     ):
         return resize(image, target_height, target_width, resize_mode="default"), (
             target_width,
