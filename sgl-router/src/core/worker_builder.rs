@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    model_card::ModelCard,
     model_type::ModelType,
     worker::{
         BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
@@ -18,6 +19,7 @@ pub struct BasicWorkerBuilder {
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,
     labels: HashMap<String, String>,
+    models: Vec<ModelCard>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<GrpcClient>,
@@ -33,6 +35,7 @@ impl BasicWorkerBuilder {
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
+            models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -48,6 +51,7 @@ impl BasicWorkerBuilder {
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
+            models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -105,6 +109,18 @@ impl BasicWorkerBuilder {
     /// Set gRPC client for gRPC workers
     pub fn grpc_client(mut self, client: GrpcClient) -> Self {
         self.grpc_client = Some(client);
+        self
+    }
+
+    /// Set models this worker can serve
+    pub fn models(mut self, models: Vec<ModelCard>) -> Self {
+        self.models = models;
+        self
+    }
+
+    /// Add a single model this worker can serve
+    pub fn model(mut self, model: ModelCard) -> Self {
+        self.models.push(model);
         self
     }
 
@@ -155,7 +171,7 @@ impl BasicWorkerBuilder {
             health_config: self.health_config,
             bootstrap_host,
             bootstrap_port,
-            models: Vec::new(),                 // Empty = accepts any model
+            models: self.models,                // Empty = accepts any model
             default_provider: None,             // Native/passthrough
             default_model_type: ModelType::LLM, // Standard LLM capabilities
         };
@@ -185,6 +201,7 @@ pub struct DPAwareWorkerBuilder {
     connection_mode: ConnectionMode,
     runtime_type: RuntimeType,
     labels: HashMap<String, String>,
+    models: Vec<ModelCard>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
     grpc_client: Option<GrpcClient>,
@@ -202,6 +219,7 @@ impl DPAwareWorkerBuilder {
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
+            models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -224,6 +242,7 @@ impl DPAwareWorkerBuilder {
             connection_mode: ConnectionMode::Http,
             runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
+            models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -284,10 +303,23 @@ impl DPAwareWorkerBuilder {
         self
     }
 
+    /// Set models this worker can serve
+    pub fn models(mut self, models: Vec<ModelCard>) -> Self {
+        self.models = models;
+        self
+    }
+
+    /// Add a single model this worker can serve
+    pub fn model(mut self, model: ModelCard) -> Self {
+        self.models.push(model);
+        self
+    }
+
     /// Build the DPAwareWorker instance
     pub fn build(self) -> DPAwareWorker {
         let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
         let mut builder = BasicWorkerBuilder::new(worker_url)
+            .models(self.models)
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
             .runtime_type(self.runtime_type)
