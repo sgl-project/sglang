@@ -97,11 +97,6 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
-from sglang.srt.managers.mm_utils import (
-    external_mm_preprocess_routine,
-    resolve_external_mm_data_embedding_funcs,
-    should_use_external_mm_preprocess,
-)
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -372,40 +367,6 @@ class ModelRunner:
         self._model_update_group = {}
         self._weights_send_group = {}
 
-        if (
-            self.server_args.enable_piecewise_cuda_graph
-            and self.can_run_piecewise_cuda_graph()
-        ):
-            self.attention_layers = []
-            for layer in self.model.model.layers:
-                if hasattr(layer, "self_attn"):
-                    if hasattr(layer.self_attn, "attn"):
-                        self.attention_layers.append(layer.self_attn.attn)
-                    elif hasattr(layer.self_attn, "attn_mqa"):
-                        # For DeepSeek model
-                        self.attention_layers.append(layer.self_attn.attn_mqa)
-                # For hybrid model
-                elif hasattr(layer, "attn"):
-                    self.attention_layers.append(layer.attn)
-                elif hasattr(layer, "linear_attn"):
-                    self.attention_layers.append(layer.linear_attn)
-                # For InternVL model
-                elif hasattr(layer, "attention"):
-                    if hasattr(layer.attention, "attn"):
-                        self.attention_layers.append(layer.attention.attn)
-
-            if len(self.attention_layers) < self.model_config.num_hidden_layers:
-                # TODO(yuwei): support Non-Standard GQA
-                log_info_on_rank0(
-                    logger,
-                    "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
-                )
-                self.piecewise_cuda_graph_runner = None
-            else:
-                self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
-        else:
-            self.piecewise_cuda_graph_runner = None
-
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
@@ -582,6 +543,9 @@ class ModelRunner:
                 eagle_aux_hidden_state_layer_ids = None
 
             self.model.set_eagle3_layers_to_capture(eagle_aux_hidden_state_layer_ids)
+
+        # Initialize piecewise CUDA graph
+        self.init_piecewise_cuda_graphs()
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -1725,25 +1689,8 @@ class ModelRunner:
 
         if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
             if self.is_draft_worker:
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 max_num_reqs = self.server_args.max_num_reqs
             else:
-                # We are sharing the `token_to_kv_pool`, and both verify and draft tokens
-                # can be concurrently allocated, so we should give a headroom for it.
-                self.server_args.draft_runner_cache_size = (
-                    self.max_total_num_tokens
-                    # draft
-                    + max_num_reqs
-                    * self.server_args.speculative_num_steps
-                    * self.server_args.speculative_eagle_topk
-                    # verify
-                    + max_num_reqs * self.server_args.speculative_num_draft_tokens
-                    # buffer
-                    + 100
-                )
-                # Target worker and draft worker shares the same indices for the
-                # token_to_kv_pool, so we should make sure to match max_total_num_tokens.
-                self.max_total_num_tokens = self.server_args.draft_runner_cache_size
                 self.server_args.max_num_reqs = max_num_reqs
 
         if max_total_tokens is not None:
@@ -2475,6 +2422,58 @@ class ModelRunner:
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
+    def init_piecewise_cuda_graphs(self):
+        """Initialize piecewise CUDA graph runner."""
+        self.piecewise_cuda_graph_runner = None
+
+        if (
+            not self.server_args.enable_piecewise_cuda_graph
+            or not self.can_run_piecewise_cuda_graph()
+        ):
+            return
+
+        # Collect attention layers from the model
+        self.attention_layers = []
+        for layer in self.model.model.layers:
+            if hasattr(layer, "self_attn"):
+                if hasattr(layer.self_attn, "attn"):
+                    self.attention_layers.append(layer.self_attn.attn)
+                elif hasattr(layer.self_attn, "attn_mqa"):
+                    # For DeepSeek model
+                    self.attention_layers.append(layer.self_attn.attn_mqa)
+            # For hybrid model
+            elif hasattr(layer, "attn"):
+                self.attention_layers.append(layer.attn)
+            elif hasattr(layer, "linear_attn"):
+                self.attention_layers.append(layer.linear_attn)
+            # For InternVL model
+            elif hasattr(layer, "attention"):
+                if hasattr(layer.attention, "attn"):
+                    self.attention_layers.append(layer.attention.attn)
+
+        if len(self.attention_layers) < self.model_config.num_hidden_layers:
+            # TODO(yuwei): support Non-Standard GQA
+            log_info_on_rank0(
+                logger,
+                "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
+            )
+            return
+
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        logger.info(
+            f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
+        )
+
+        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        mem_usage = before_mem - after_mem
+        logger.info(
+            f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+        )
+
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
         cpu_ids_by_node = get_cpu_ids_by_node()
@@ -2548,15 +2547,6 @@ class ModelRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-
-        if self.is_multimodal and should_use_external_mm_preprocess(self.model):
-            data_embedding_funcs = resolve_external_mm_data_embedding_funcs(self.model)
-            forward_batch = external_mm_preprocess_routine(
-                forward_batch=forward_batch,
-                multimodal_model=self.model,
-                data_embedding_funcs=data_embedding_funcs,
-            )
-
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
