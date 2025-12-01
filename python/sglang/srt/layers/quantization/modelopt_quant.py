@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import logging
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
-from flashinfer.fused_moe.core import ActivationType
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
@@ -86,8 +86,15 @@ except ImportError:
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
 except ImportError:
     flashinfer_cutlass_fused_moe = None
+
+    # Define a minimal ActivationType enum if flashinfer is not available
+    class ActivationType(IntEnum):
+        Swiglu = 3
+        Relu2 = 6
+
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
@@ -1620,8 +1627,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
             }
         )
-        assert_dim = 2 if layer.moe_runner_config.is_gated else 1
         # Validate weight scales
+        assert_dim = 2 if layer.moe_runner_config.is_gated else 1
         for name, weight_scale in [
             ("w13", layer.w13_weight_scale),
             ("w2", layer.w2_weight_scale),

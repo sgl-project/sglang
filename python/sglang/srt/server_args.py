@@ -1512,7 +1512,7 @@ class ServerArgs:
                 "modelopt_fp4",
                 "modelopt_fp8",
                 None,
-            ], "modelopt_fp4/8 quantization is required for Flashinfer Cutlass MOE"
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
