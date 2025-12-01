@@ -860,7 +860,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 )
 
     def failure_exception(self):
-        raise Exception("NIXL KVReceiver Exception")
+        raise RuntimeError("NIXL KVReceiver Exception")
 
 
 class NixlKVBootstrapServer(CommonKVBootstrapServer):
