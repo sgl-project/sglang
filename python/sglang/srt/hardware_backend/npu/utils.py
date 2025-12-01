@@ -1,15 +1,24 @@
 import functools
 import logging
+from enum import IntEnum
 from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
+
+
+class NPUACLFormat(IntEnum):
+    ACL_FORMAT_UNDEFINED = -1
+    ACL_FORMAT_ND = 2
+    ACL_FORMAT_FRACTAL_NZ = 29
 
 
 def _call_once(fn: Callable):
@@ -56,7 +65,7 @@ def init_npu_backend():
     Initialize NPU backend. This function should be called only once.
     """
 
-    assert is_npu(), "NPU backend initialization called on non-NPU device."
+    assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     import sgl_kernel_npu  # noqa: F401
     import torch_npu
@@ -67,3 +76,29 @@ def init_npu_backend():
 
     torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
+
+
+def npu_format_cast(
+    tensor: torch.Tensor,
+    acl_format: NPUACLFormat = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+) -> torch.Tensor:
+    """
+    Cast a tensor to a specific NPU ACL format.
+
+    Args:
+        tensor (torch.Tensor): The input tensor.
+        acl_format (NPUACLFormat): The target NPU ACL format.
+
+    Returns:
+        torch.Tensor: The tensor cast to the specified NPU ACL format.
+    """
+
+    if not _is_npu:
+        return tensor
+
+    if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
+        return tensor
+
+    import torch_npu
+
+    return torch_npu.npu_format_cast(tensor, acl_format.value)
