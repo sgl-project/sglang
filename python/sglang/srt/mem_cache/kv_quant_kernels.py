@@ -407,7 +407,7 @@ def _dequantize_kv_int4_kernel(
     )
     
     # Load packed uint8 values
-    packed_vals = tl.load(quantized_ptr + quant_offset, mask=dim_mask, other=0).to(tl.int32)
+    packed_vals = tl.load(quantized_ptr + quant_offset, mask=dim_mask, other=0)
     
     # Unpack: lower nibble (bits 0-3) and upper nibble (bits 4-7)
     q_vals1 = (packed_vals & 0x0F).to(tl.float32)
