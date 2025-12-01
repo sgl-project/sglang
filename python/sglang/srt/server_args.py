@@ -579,7 +579,6 @@ class ServerArgs:
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
-    mm_item_memory_pool_recycle_interval: float = 0.05
     enable_broadcast_mm_inputs_process: bool = False
 
     # For checkpoint decryption
@@ -3859,12 +3858,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mm_per_request_timeout,
             help="The timeout for each multi-modal request in seconds.",
-        )
-        parser.add_argument(
-            "--mm-item-memory-pool-recycle-interval",
-            type=float,
-            default=ServerArgs.mm_item_memory_pool_recycle_interval,
-            help="The interval to recycle mm item in memory pool in seconds.",
         )
         parser.add_argument(
             "--enable-broadcast-mm-inputs-process",

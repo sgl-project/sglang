@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils import get_float_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,12 @@ MM_FEATURE_CACHE_SIZE = (
     4 * 1024 * 1024 * 1024
     if not get_int_env_var("SGLANG_MM_FEATURE_CACHE_MB")
     else get_int_env_var("SGLANG_MM_FEATURE_CACHE_MB") * 1024 * 1024
+)
+
+MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
+    0.05
+    if not get_float_env_var("SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC")
+    else get_float_env_var("SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC")
 )
 
 SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
@@ -76,7 +82,7 @@ class MmItemMemoryChunk:
 
 
 class MmItemMemoryPool:
-    def __init__(self, memory_size, recycle_interval: float = 0.05):
+    def __init__(self, memory_size, recycle_interval):
         self.memory_pool = torch.empty(
             memory_size, dtype=torch.int8, device="cuda"
         ).contiguous()
@@ -98,7 +104,7 @@ class MmItemMemoryPool:
 
         logger.debug(
             f"[MmItemMemoryPool] init: memory_size={memory_size}, "
-            f"recycle_interval={self._recycle_interval}s"
+            f"recycle_interval={recycle_interval}s"
         )
 
     def shutdown(self):
