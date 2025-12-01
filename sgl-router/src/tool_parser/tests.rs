@@ -640,7 +640,7 @@ mod qwen_coder_tests {
             println!("Chunk {}: {:?}", i, chunk);
             println!("  Calls: {:?}", result.calls);
             println!("  Normal text: {:?}", result.normal_text);
-            
+
             for call in &result.calls {
                 all_calls.push(call.clone());
             }
@@ -667,7 +667,7 @@ mod qwen_coder_tests {
         // Verify final arguments format
         let final_args = &parser.streamed_args_for_tool[0];
         println!("Final streamed args: {}", final_args);
-        
+
         // Should be valid JSON: {"city": "Paris", "units": "metric"}
         let parsed: serde_json::Value = serde_json::from_str(final_args).unwrap();
         assert_eq!(parsed["city"], "Paris");
@@ -696,7 +696,7 @@ mod qwen_coder_tests {
             let result = parser.parse_incremental(chunk, &tools).await.unwrap();
             println!("Chunk {}: {:?}", i, chunk);
             println!("  Calls: {:?}", result.calls);
-            
+
             for call in &result.calls {
                 all_calls.push(call.clone());
             }
@@ -705,7 +705,7 @@ mod qwen_coder_tests {
         // Verify incremental streaming worked
         // Should have incremental updates for partial values
         let param_calls: Vec<_> = all_calls.iter().filter(|c| c.name.is_none()).collect();
-        
+
         // Should have more calls due to incremental streaming
         assert!(param_calls.len() >= 2, "Should have parameter calls including incremental updates");
 

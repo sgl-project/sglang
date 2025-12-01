@@ -245,7 +245,7 @@ impl QwenCoderParser {
             // First, try to find and parse any complete parameter blocks in the buffer
             // This handles cases where parameters arrive in chunks but are complete
             let mut processed_ranges: Vec<(usize, usize)> = Vec::new();
-            
+
             for cap in self.xml_param_pattern.captures_iter(&self.buffer) {
                 if let (Some(key_match), Some(value_match)) = (cap.get(1), cap.get(2)) {
                     let key = key_match.as_str().trim().to_string();
@@ -257,7 +257,7 @@ impl QwenCoderParser {
                         let full_match = cap.get(0).unwrap();
                         let start = full_match.start();
                         let end = full_match.end();
-                        
+
                         // Try to parse value as JSON (similar to Python's _safe_val which tries json.loads)
                         // This will parse numbers, booleans, null, objects, arrays, and strings
                         let json_value = match serde_json::from_str::<Value>(value) {
@@ -308,13 +308,13 @@ impl QwenCoderParser {
 
                         // Update streamed parameters
                         self.xml_streamed_parameters.insert(key.clone(), json_value);
-                        
+
                         // Clear incremental streaming state for this parameter since it's now complete
                         if self.xml_streaming_parameter_key.as_ref() == Some(&key) {
                             self.xml_streaming_parameter_key = None;
                             self.xml_streamed_parameter_value.clear();
                         }
-                        
+
                         // Record the range to remove from buffer
                         processed_ranges.push((start, end));
                     }
@@ -400,7 +400,7 @@ impl QwenCoderParser {
                         &mut self.streamed_args_for_tool[self.current_tool_id as usize];
                     let key_pattern = format!("\"{}\"", key);
                     let was_streamed = current_args.contains(&key_pattern);
-                    
+
                     if !was_streamed {
                         // Parameter wasn't streamed yet, send complete JSON fragment
                     let value_json = serde_json::to_string(&json_value)
@@ -444,7 +444,7 @@ impl QwenCoderParser {
                             } else {
                                 ""
                             };
-                            
+
                             if !value_start_marker.is_empty() {
                                 if let Some(marker_pos) = current_args[key_pos..].find(value_start_marker) {
                                     let value_start = key_pos + marker_pos + value_start_marker.len();
@@ -460,7 +460,7 @@ impl QwenCoderParser {
                                         }
                                         // Trim again in case there were spaces before \\n
                                         trimmed_value = trimmed_value.trim_end().to_string();
-                                        
+
                                         // If there's trailing whitespace or \\n, replace it
                                         if value_in_args != trimmed_value {
                                             let before_value = &current_args[..value_start];
@@ -471,7 +471,7 @@ impl QwenCoderParser {
                                 }
                             }
                         }
-                        
+
                         // Ensure string is closed
                         let final_trimmed = current_args.trim_end();
                         if !final_trimmed.ends_with('"') && !final_trimmed.ends_with('}') {
@@ -506,7 +506,7 @@ impl QwenCoderParser {
                     // Extract value up to next XML tag (to avoid including </parameter> in value)
                     let next_tag_pos = self.buffer.find('<').unwrap_or(self.buffer.len());
                     let mut new_content = self.buffer[..next_tag_pos].to_string();
-                    
+
                     // Always trim trailing whitespace from new_content to avoid accumulating newlines
                     // This prevents newlines from being accumulated during streaming
                     let trimmed_new = new_content.trim_end();
@@ -516,7 +516,7 @@ impl QwenCoderParser {
                         // Also trim current value to keep them in sync
                         self.current_parameter_value = self.current_parameter_value.trim_end().to_string();
                     }
-                    
+
                     if new_content != self.current_parameter_value {
                         // Calculate incremental value (only new characters)
                         // current_parameter_value is already trimmed, so use it directly
@@ -526,21 +526,21 @@ impl QwenCoderParser {
                             // Value changed unexpectedly, use full new content
                             &new_content
                         };
-                        
+
                         if !incremental.is_empty() {
                             let key = &self.current_parameter_key;
-                            
+
                             // Escape incremental value for JSON string using serde_json
                             // This is more reliable than manual replace chains
                             let escaped = serde_json::to_string(incremental)
                                 .unwrap_or_else(|_| incremental.replace('"', "\\\""))
                                 .trim_matches('"')
                                 .to_string();
-                            
+
                             // Stream only the incremental value (not full JSON fragment)
                             let current_args =
                                 &mut self.streamed_args_for_tool[self.current_tool_id as usize];
-                            
+
                             if current_args.is_empty() {
                                 // First parameter - start JSON object
                                 let fragment = format!("{{\"{}\": \"{}", key, escaped);
@@ -553,11 +553,11 @@ impl QwenCoderParser {
                             } else {
                                 // Check if we're starting a new parameter or continuing current one
                                 let trimmed = current_args.trim_end();
-                                
+
                                 // Check if current_args already contains this key (parameter already started)
                                 let key_pattern = format!("\"{}\"", key);
                                 let key_already_in_args = trimmed.contains(&key_pattern);
-                                
+
                                 if key_already_in_args {
                                     // This parameter was already started, just append incremental value
                                     // Check if we're in the middle of the value (string not closed)
@@ -618,10 +618,10 @@ impl QwenCoderParser {
                                     }
                                 }
                             }
-                            
+
                             // Update accumulated value
                             self.current_parameter_value = new_content;
-                            
+
                             // Remove processed content from buffer to avoid re-processing
                             // new_content is from buffer[..next_tag_pos], so remove that part
                             self.buffer = self.buffer[next_tag_pos..].to_string();
