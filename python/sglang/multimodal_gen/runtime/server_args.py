@@ -278,6 +278,16 @@ class ServerArgs:
     # Compilation
     enable_torch_compile: bool = False
 
+    # cache-dit acceleration parameters
+    enable_cache_dit: bool = False
+    cache_dit_Fn: int = 1  # Number of first blocks to always compute
+    cache_dit_Bn: int = 0  # Number of last blocks to always compute
+    cache_dit_warmup: int = 8  # Warmup steps before caching
+    cache_dit_rdt: float = 0.35  # Residual difference threshold
+    cache_dit_mc: int = 3  # Maximum continuous cached steps
+    cache_dit_taylorseer: bool = True  # Enable TaylorSeer calibrator
+    cache_dit_ts_order: int = 1  # TaylorSeer order (1 or 2)
+
     disable_autocast: bool = False
 
     # VSA parameters
@@ -542,6 +552,58 @@ class ServerArgs:
             default=ServerArgs.enable_torch_compile,
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
+        )
+
+        # cache-dit acceleration parameters
+        parser.add_argument(
+            "--enable-cache-dit",
+            action=StoreBoolean,
+            default=ServerArgs.enable_cache_dit,
+            help="Enable cache-dit acceleration for DiT inference. "
+            "Provides 1.5x-3.5x speedup by caching transformer block outputs.",
+        )
+        parser.add_argument(
+            "--cache-dit-Fn",
+            type=int,
+            default=ServerArgs.cache_dit_Fn,
+            help="Number of first transformer blocks to always compute (DBCache F parameter).",
+        )
+        parser.add_argument(
+            "--cache-dit-Bn",
+            type=int,
+            default=ServerArgs.cache_dit_Bn,
+            help="Number of last transformer blocks to always compute (DBCache B parameter).",
+        )
+        parser.add_argument(
+            "--cache-dit-warmup",
+            type=int,
+            default=ServerArgs.cache_dit_warmup,
+            help="Number of warmup steps before caching starts (DBCache W parameter).",
+        )
+        parser.add_argument(
+            "--cache-dit-rdt",
+            type=float,
+            default=ServerArgs.cache_dit_rdt,
+            help="Residual difference threshold for cache invalidation (DBCache R parameter).",
+        )
+        parser.add_argument(
+            "--cache-dit-mc",
+            type=int,
+            default=ServerArgs.cache_dit_mc,
+            help="Maximum continuous cached steps (DBCache MC parameter).",
+        )
+        parser.add_argument(
+            "--cache-dit-taylorseer",
+            action=StoreBoolean,
+            default=ServerArgs.cache_dit_taylorseer,
+            help="Enable TaylorSeer calibrator for cache-dit.",
+        )
+        parser.add_argument(
+            "--cache-dit-ts-order",
+            type=int,
+            default=ServerArgs.cache_dit_ts_order,
+            choices=[1, 2],
+            help="TaylorSeer Taylor expansion order (1 or 2).",
         )
 
         parser.add_argument(

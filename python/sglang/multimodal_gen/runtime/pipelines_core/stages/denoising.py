@@ -59,6 +59,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.pipelines_core.cache_dit_integration import (
+    CacheDitConfig,
+    enable_cache_on_transformer,
+    is_cache_dit_available,
+    get_cache_summary,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
@@ -151,6 +157,86 @@ class DenoisingStage(PipelineStage):
 
         # misc
         self.profiler = None
+
+        # cache-dit state (for delayed mounting and idempotent control)
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+
+    def _maybe_enable_cache_dit(
+        self, server_args: ServerArgs, num_inference_steps: int
+    ) -> None:
+        """Enable cache-dit on the transformer if configured (idempotent).
+
+        This method should be called AFTER the transformer is fully loaded
+        and BEFORE torch.compile is applied.
+
+        Args:
+            server_args: Server configuration.
+            num_inference_steps: Number of inference steps for this batch.
+        """
+        # Idempotent check: already enabled
+        if self._cache_dit_enabled:
+            if self._cached_num_steps != num_inference_steps:
+                logger.warning(
+                    "num_inference_steps changed from %d to %d after cache-dit was enabled. "
+                    "Continuing with initial configuration (steps=%d).",
+                    self._cached_num_steps,
+                    num_inference_steps,
+                    self._cached_num_steps,
+                )
+            return
+
+        # Check if cache-dit is enabled in config
+        if not getattr(server_args, "enable_cache_dit", False):
+            return
+
+        # Safety: disable in distributed environments (not yet validated)
+        try:
+            from sglang.multimodal_gen.runtime.distributed import get_world_size
+
+            if get_world_size() > 1:
+                logger.warning(
+                    "cache-dit is disabled in distributed environment (world_size=%d). "
+                    "Distributed support will be added in a future version.",
+                    get_world_size(),
+                )
+                return
+        except Exception:
+            pass  # If we can't get world_size, assume single GPU
+
+        # Check if cache-dit is available
+        if not is_cache_dit_available():
+            logger.warning(
+                "cache-dit is not installed. Please install it with: pip install cache-dit"
+            )
+            return
+
+        # Build config from server_args
+        config = CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=getattr(server_args, "cache_dit_Fn", 1),
+            Bn_compute_blocks=getattr(server_args, "cache_dit_Bn", 0),
+            max_warmup_steps=getattr(server_args, "cache_dit_warmup", 8),
+            residual_diff_threshold=getattr(server_args, "cache_dit_rdt", 0.35),
+            max_continuous_cached_steps=getattr(server_args, "cache_dit_mc", 3),
+            enable_taylorseer=getattr(server_args, "cache_dit_taylorseer", True),
+            taylorseer_order=getattr(server_args, "cache_dit_ts_order", 1),
+            num_inference_steps=num_inference_steps,
+        )
+
+        
+        self.transformer = enable_cache_on_transformer(
+            self.transformer,
+            config,
+            model_name="transformer",
+        )
+        self._cache_dit_enabled = True
+        self._cached_num_steps = num_inference_steps
+        logger.info(
+            "cache-dit enabled successfully on transformer (steps=%d)",
+            num_inference_steps,
+        )
+        
 
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
@@ -314,6 +400,10 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
+
+            # Enable cache-dit BEFORE torch.compile (delayed mounting)
+            self._maybe_enable_cache_dit(server_args, batch.num_inference_steps)
+
             if self.server_args.enable_torch_compile:
                 self.transformer = torch.compile(
                     self.transformer, mode="max-autotune", fullgraph=True
@@ -321,6 +411,9 @@ class DenoisingStage(PipelineStage):
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
+        else:
+            # If already loaded, still try to enable cache-dit once (idempotent)
+            self._maybe_enable_cache_dit(server_args, batch.num_inference_steps)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -930,6 +1023,9 @@ class DenoisingStage(PipelineStage):
         """
         Prepare extra kwargs for the scheduler step / denoise step.
 
+        Handles wrapped functions (e.g., by cache-dit) by extracting
+        the original function signature.
+
         Args:
             func: The function to prepare kwargs for.
             kwargs: The kwargs to prepare.
@@ -937,11 +1033,29 @@ class DenoisingStage(PipelineStage):
         Returns:
             The prepared kwargs.
         """
+        import functools
+
+        # Try to get the original function signature if func is wrapped
+        target_func = func
+
+        # Handle functools.partial (used by cache-dit)
+        # func.args[0] is the transformer instance
+        if isinstance(func, functools.partial) and func.args:
+            transformer_instance = func.args[0]
+            if hasattr(transformer_instance, '_original_forward'):
+                target_func = transformer_instance._original_forward
+
+        # Handle functools.wraps
+        while hasattr(target_func, '__wrapped__'):
+            target_func = target_func.__wrapped__
+
+        sig = inspect.signature(target_func)
+        params = sig.parameters
         extra_step_kwargs = {}
         for k, v in kwargs.items():
-            accepts = k in set(inspect.signature(func).parameters.keys())
-            if accepts:
+            if k in params:
                 extra_step_kwargs[k] = v
+
         return extra_step_kwargs
 
     def progress_bar(
