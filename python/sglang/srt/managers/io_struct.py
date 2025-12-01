@@ -1312,6 +1312,17 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 
 @dataclass
+class CheckWeightsReqInput(BaseReq):
+    action: str
+
+
+@dataclass
+class CheckWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class SlowDownReqInput(BaseReq):
     forward_sleep_time: Optional[float]
 

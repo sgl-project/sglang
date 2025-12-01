@@ -20,6 +20,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V480PConfig,
     WanT2V720PConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 
 __all__ = [
     "HunyuanConfig",
@@ -34,4 +35,5 @@ __all__ = [
     "StepVideoT2VConfig",
     "SelfForcingWanT2V480PConfig",
     "StableDiffusion3PipelineConfig",
+    "ZImagePipelineConfig",
 ]

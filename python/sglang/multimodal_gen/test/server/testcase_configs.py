@@ -243,6 +243,19 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
     ),
     DiffusionTestCase(
+        "flux_2_image_t2i",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.2-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+        ),
+        DiffusionSamplingParams(
+            prompt="A futuristic cityscape at sunset with flying cars",
+            output_size="1024x1024",
+        ),
+    ),
+    DiffusionTestCase(
         "stable_diffusion_3_medium_t2i",
         DiffusionServerArgs(
             model_path="stabilityai/stable-diffusion-3-medium-diffusers",
@@ -268,6 +281,19 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
     #         output_size="1024x1024",
     #     ),
     # ),
+    DiffusionTestCase(
+        "zimage_image_t2i",
+        DiffusionServerArgs(
+            model_path="Tongyi-MAI/Z-Image-Turbo",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+        ),
+        DiffusionSamplingParams(
+            prompt="Doraemon is eating dorayaki.",
+            output_size="1024x1024",
+        ),
+    ),
     # === Text and Image to Image (TI2I) ===
     # TODO: Timeout with Torch2.9. Add back when it can pass CI
     # DiffusionTestCase(

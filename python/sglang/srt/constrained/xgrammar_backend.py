@@ -305,3 +305,39 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     def reset(self):
         self.grammar_compiler.clear_cache()
+
+
+def demo_test():
+    from transformers import AutoConfig, AutoTokenizer
+
+    from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_NAME_FOR_TEST)
+    hf_config = AutoConfig.from_pretrained(DEFAULT_MODEL_NAME_FOR_TEST)
+
+    # Should use vocab size from model config
+    vocab_size = hf_config.vocab_size
+    eos_token_id = tokenizer.eos_token_id
+
+    backend = XGrammarGrammarBackend(
+        tokenizer, vocab_size=vocab_size, model_eos_token_ids=[eos_token_id]
+    )
+    regex = r"hello (world|there)"
+    grammar = backend.dispatch_regex(regex)
+    tokens = [
+        tokenizer.encode(t, add_special_tokens=False)[0] for t in ["hello", " world"]
+    ]
+
+    # Test termination
+    grammar.accept_token(tokens[0])  # accept "hello"
+    grammar.accept_token(tokens[1])  # accept " world"
+    grammar.accept_token(eos_token_id)  # accept EOS
+    assert grammar.is_terminated()
+
+    # Test rollback the terminated state
+    grammar.rollback(1)
+    assert not grammar.is_terminated()
+
+
+if __name__ == "__main__":
+    demo_test()

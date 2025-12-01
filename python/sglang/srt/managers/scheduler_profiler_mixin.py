@@ -6,10 +6,12 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.srt.utils.profile_utils import ProfileManager
 
 _is_npu = is_npu()
 if _is_npu:
@@ -27,6 +29,14 @@ logger = logging.getLogger(__name__)
 
 class SchedulerProfilerMixin:
     def init_profiler(self):
+        if envs.SGLANG_PROFILE_V2.get():
+            self._profile_manager = ProfileManager(
+                tp_rank=self.tp_rank,
+                cpu_group=self.cpu_group,
+                gpu_id=self.gpu_id,
+            )
+            return
+
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[Path] = None
         self.profiler_activities: Optional[List[str]] = None
@@ -60,6 +70,20 @@ class SchedulerProfilerMixin:
         merge_profiles: bool = False,
         profile_prefix: str = "",
     ) -> ProfileReqOutput:
+        if envs.SGLANG_PROFILE_V2.get():
+            return self._profile_manager.configure(
+                output_dir=output_dir,
+                start_step=start_step,
+                num_steps=num_steps,
+                activities=activities,
+                with_stack=with_stack,
+                record_shapes=record_shapes,
+                profile_by_stage=profile_by_stage,
+                profile_id=profile_id,
+                merge_profiles=merge_profiles,
+                profile_prefix=profile_prefix,
+            )
+
         if self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
@@ -105,6 +129,9 @@ class SchedulerProfilerMixin:
     def start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        if envs.SGLANG_PROFILE_V2.get():
+            return self._profile_manager.manual_start()
+
         stage_str = f" for {stage.name}" if stage else ""
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
@@ -212,6 +239,9 @@ class SchedulerProfilerMixin:
     def stop_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        if envs.SGLANG_PROFILE_V2.get():
+            return self._profile_manager.manual_stop()
+
         if not self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
@@ -264,7 +294,7 @@ class SchedulerProfilerMixin:
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
             self.rpd_profiler = None
-            self.rpd_profiler_path = None
+            self.rpd_profile_path = None
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
@@ -294,6 +324,10 @@ class SchedulerProfilerMixin:
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch):
+        if envs.SGLANG_PROFILE_V2.get():
+            self._profile_manager.step(forward_mode=batch.forward_mode)
+            return
+
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
                 if self.profiler_prefill_ct == 0:
