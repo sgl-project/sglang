@@ -1160,12 +1160,12 @@ def set_ulimit(target_soft_limit=65535):
 
 
 def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_rank,
+        model_parallel_is_initialized,
+    )
 
-    try:
-        if get_tensor_model_parallel_rank() == 0:
-            logger.info(msg)
-    except AssertionError:
+    if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
 
 
