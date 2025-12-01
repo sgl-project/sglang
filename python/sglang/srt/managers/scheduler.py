@@ -273,6 +273,7 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.need_prefetch_storage = self.enable_hicache_storage
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -756,6 +757,7 @@ class Scheduler(
                 self.tree_cache = AscendHiRadixCache(
                     params=params, server_args=server_args
                 )
+                self.need_prefetch_storage = False
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
@@ -1446,9 +1448,9 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
+        if self.need_prefetch_storage:
             req.init_next_round_input(self.tree_cache)
-            if req.last_node != self.tree_cache.root_node and req.last_node.backuped:
+            if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
                 # otherwise, the allocated GPU memory must be locked for integrity
                 last_hash = req.last_host_node.get_last_hash_value()
@@ -1751,6 +1753,7 @@ class Scheduler(
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
+            self.enable_hierarchical_cache,
         )
 
         if self.chunked_req is not None:
@@ -1797,7 +1800,6 @@ class Scheduler(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
-                enable_hierarchical_cache=self.enable_hierarchical_cache,
             )
 
             if res != AddReqResult.CONTINUE:

@@ -329,9 +329,11 @@ class PrefillAdder:
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
+        enable_hierarchical_cache: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
+        self.enable_hierarchical_cache = enable_hierarchical_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
@@ -568,11 +570,7 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self,
-        req: Req,
-        has_chunked_req: bool,
-        truncation_align_size: Optional[int],
-        enable_hierarchical_cache: bool = False,
+        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
@@ -603,7 +601,7 @@ class PrefillAdder:
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
-            if enable_hierarchical_cache:
+            if self.enable_hierarchical_cache:
                 new_indices = self.tree_cache.init_load_back(req)
                 if new_indices is not None:
                     req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
