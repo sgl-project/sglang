@@ -558,65 +558,43 @@ class VAELoader(ComponentLoader):
 
         target_device = self.target_device(server_args.vae_cpu_offload)
 
-        # Try to load from ModelRegistry first
-        try:
-            vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-            with (
-                set_default_torch_dtype(
-                    PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-                ),
-                skip_init_modules(),
-            ):
-                vae = vae_cls(vae_config).to(target_device)
-
-            # Find all safetensors files
-            safetensors_list = _list_safetensors_files(component_model_path)
-            # TODO(PY)
-            assert (
-                len(safetensors_list) == 1
-            ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-            loaded = safetensors_load_file(safetensors_list[0])
-            vae.load_state_dict(
-                loaded, strict=False
-            )  # We might only load encoder or decoder
-
-            return vae.eval()
-        except Exception:
-            # If ModelRegistry doesn't have the class, try to load from auto_map
-            # Get config again to access auto_map (since we popped _class_name earlier)
-            full_config = get_diffusers_component_config(
-                model_path=component_model_path
-            )
-            auto_map = full_config.get("auto_map", {})
-            auto_model_map = auto_map.get("AutoModel")
-            if auto_model_map:
-                # Load custom class from auto_map
-                module_path, cls_name = auto_model_map.rsplit(".", 1)
-                custom_module_file = os.path.join(
-                    component_model_path, f"{module_path}.py"
+        # Check for auto_map first (custom VAE classes)
+        auto_map = config.get("auto_map", {})
+        auto_model_map = auto_map.get("AutoModel")
+        if auto_model_map:
+            module_path, cls_name = auto_model_map.rsplit(".", 1)
+            custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
+            spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
+            custom_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(custom_module)
+            vae_cls = getattr(custom_module, cls_name)
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            with set_default_torch_dtype(vae_dtype):
+                vae = vae_cls.from_pretrained(
+                    component_model_path,
+                    revision=server_args.revision,
+                    trust_remote_code=server_args.trust_remote_code,
                 )
-                if os.path.exists(custom_module_file):
-                    spec = importlib.util.spec_from_file_location(
-                        "_custom", custom_module_file
-                    )
-                    custom_module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(custom_module)
-                    vae_cls = getattr(custom_module, cls_name)
-                    # Use the custom class's from_pretrained with correct precision
-                    vae_dtype = PRECISION_TO_TYPE[
-                        server_args.pipeline_config.vae_precision
-                    ]
-                    with set_default_torch_dtype(vae_dtype):
-                        vae = vae_cls.from_pretrained(
-                            component_model_path,
-                            revision=server_args.revision,
-                            trust_remote_code=server_args.trust_remote_code,
-                        )
-                    target_device = self.target_device(server_args.vae_cpu_offload)
-                    vae = vae.to(device=target_device, dtype=vae_dtype)
-                    return vae.eval()
-            # If auto_map loading fails, raise to fallback to load_native
-            raise
+            vae = vae.to(device=target_device, dtype=vae_dtype)
+            return vae.eval()
+
+        # Load from ModelRegistry (standard VAE classes)
+        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        with (
+            set_default_torch_dtype(
+                PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            ),
+            skip_init_modules(),
+        ):
+            vae = vae_cls(vae_config).to(target_device)
+
+        safetensors_list = _list_safetensors_files(component_model_path)
+        assert (
+            len(safetensors_list) == 1
+        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
+        loaded = safetensors_load_file(safetensors_list[0])
+        vae.load_state_dict(loaded, strict=False)
+        return vae.eval()
 
 
 class TransformerLoader(ComponentLoader):
