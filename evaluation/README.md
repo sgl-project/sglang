@@ -26,6 +26,7 @@
    cd sglang
    pip install --upgrade pip
    cd sgl-kernel
+   pip uninstall sgl-kernel
    python setup_rocm.py install
    export PYTHONPATH=<you_sglang_path/sglang/python>
    ```
