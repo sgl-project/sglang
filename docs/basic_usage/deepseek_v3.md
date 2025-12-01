@@ -153,7 +153,7 @@ python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --tru
 The precompilation process typically takes around 10 minutes to complete.
 
 ### Multi-token Prediction
-**Description**: SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](https://docs.sglang.ai/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved by **1.8x** for batch size 1 and **1.5x** for batch size 32 respectively on H200 TP8 setting.
+**Description**: SGLang implements DeepSeek V3 Multi-Token Prediction (MTP) based on [EAGLE speculative decoding](https://docs.sglang.io/advanced_features/speculative_decoding.html#EAGLE-Decoding). With this optimization, the decoding speed can be improved by **1.8x** for batch size 1 and **1.5x** for batch size 32 respectively on H200 TP8 setting.
 
 **Usage**:
 Add arguments `--speculative-algorithm`, `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` to enable this feature. For example:
@@ -176,7 +176,7 @@ python3 -m sglang.launch_server \
 
 ### Reasoning Content for DeepSeek R1 & V3.1
 
-See [Reasoning Parser](https://docs.sglang.ai/advanced_features/separate_reasoning.html) and [Thinking Parameter for DeepSeek V3.1](https://docs.sglang.ai/basic_usage/openai_api_completions.html#Example:-DeepSeek-V3-Models).
+See [Reasoning Parser](https://docs.sglang.io/advanced_features/separate_reasoning.html) and [Thinking Parameter for DeepSeek V3.1](https://docs.sglang.io/basic_usage/openai_api_completions.html#Example:-DeepSeek-V3-Models).
 
 
 ### Function calling for DeepSeek Models
