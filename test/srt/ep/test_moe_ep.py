@@ -66,8 +66,6 @@ class TestEpDeepGEMM(CustomTestCase):
                 "fp8",
                 "--moe-runner-backend",
                 "deep_gemm",
-                "--moe-a2a-backend",
-                "deepep",
             ],
         )
 
