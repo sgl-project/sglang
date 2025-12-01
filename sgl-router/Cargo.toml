@@ -19,6 +19,14 @@ crate-type = ["rlib"]
 name = "sglang-router"
 path = "src/main.rs"
 
+[[bin]]
+name = "smg"
+path = "src/main.rs"
+
+[[bin]]
+name = "amg"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive", "env"] }
 axum = { version = "0.8.4", features = ["macros", "ws", "tracing"] }
@@ -98,6 +106,8 @@ deadpool-postgres = "0.14.1"
 [build-dependencies]
 tonic-prost-build = "0.14.2"
 prost-build = "0.14.1"
+chrono = { version = "0.4", features = ["clock"] }
+toml = "0.9"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
