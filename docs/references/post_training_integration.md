@@ -1,10 +1,10 @@
 # Post-Training Integration
 
-SGLang has become the de facto inference backend for modern LLM training frameworks, powering state-of-the-art models across the industry. From GLM-4.6 to Qwen3, leading models leverage SGLang's high-performance inference during reinforcement learning and post-training workflows. 
+SGLang has become the de facto inference backend for modern LLM training frameworks, powering state-of-the-art models across the industry. From GLM-4.6 to Qwen3, leading models leverage SGLang's high-performance inference during reinforcement learning and post-training workflows.
 
 What makes SGLang essential for post-training?
 
-- Open-To-Use Refit Functionality: diversed method for colocate or disaggregate
+- Open-To-Use Refit Functionality: diverse method for colocate or disaggregate
 - Easy To Postpone Generation: enable partial rollout and dedicated rollout control
 - Fine-Grained Engine Sleep And Wake Up: facilitate maxium-powered rollout and training
 - Training Serving Alignment: ensure the performance consistency in training and serving
@@ -25,7 +25,7 @@ These capabilities, combined with native integration support across major framew
 - [**Tunix**](https://github.com/google/tunix): Google's JAX-native library for LLM post-training with SFT, DPO, PPO, and GRPO support
 - [**RL2**](https://github.com/ChenmienTan/RL2): Ray Less Reinforcement Learning, a concise library of post-training for large language models
 
- 
+
 ## Collaboration
 
 Due to the privacy of the design parternes, we cannot list the companies that adopt SGLang for post-training. However, we are happy to share the details with you if you are interested and trust the choice among 10+ top companies and frontier labs across US and China. If you are interested in integrating SGLang with your training framework or need technical support, we're here to help! Reach out to us at **rl_team@lmsys.org** for partnerships, integration guidance, and custom feature development.
