@@ -196,11 +196,9 @@ class PipelineConfig:
         """
         preprocess the condition image, returns (image, final_image_width, final_image_height)
         """
-        return (
-            image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS),
-            target_width,
-            target_height,
-        )
+        return image.resize(
+            (target_width, target_height), PIL.Image.Resampling.LANCZOS
+        ), (target_width, target_height)
 
     def prepare_image_processor_kwargs(self, batch):
         return {}

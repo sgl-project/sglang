@@ -207,13 +207,6 @@ class ImageVAEEncodingStage(PipelineStage):
         if batch.condition_image is None:
             return batch
 
-        assert batch.condition_image is not None and isinstance(
-            batch.condition_image, PIL.Image.Image
-        )
-        assert batch.height is not None and isinstance(batch.height, int)
-        assert batch.width is not None and isinstance(batch.width, int)
-        assert batch.num_frames is not None and isinstance(batch.num_frames, int)
-
         num_frames = batch.num_frames
 
         self.vae = self.vae.to(get_local_torch_device())
@@ -345,6 +338,15 @@ class ImageVAEEncodingStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage inputs."""
         result = VerificationResult()
+
+        assert batch.condition_image is not None and (
+            isinstance(batch.condition_image, PIL.Image.Image)
+            or isinstance(batch.condition_image, torch.Tensor)
+        )
+        assert batch.height is not None and isinstance(batch.height, int)
+        assert batch.width is not None and isinstance(batch.width, int)
+        assert batch.num_frames is not None and isinstance(batch.num_frames, int)
+
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)

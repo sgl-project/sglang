@@ -478,7 +478,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         img = vae_image_processor.preprocess(
             img, height=image_height, width=image_width, resize_mode="crop"
         )
-        return img, image_width, image_height
+        return img, (image_width, image_height)
 
     def postprocess_image_latent(self, latent_condition, batch):
         batch_size = batch.batch_size

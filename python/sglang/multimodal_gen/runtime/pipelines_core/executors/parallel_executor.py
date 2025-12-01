@@ -55,6 +55,7 @@ class ParallelExecutor(PipelineExecutor):
         server_args: ServerArgs,
     ) -> Req:
         rank = get_classifier_free_guidance_rank()
+        cfg_rank = get_classifier_free_guidance_rank()
         cfg_group = get_cfg_group()
 
         # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
