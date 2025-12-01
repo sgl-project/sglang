@@ -13,9 +13,11 @@ use minijinja::{
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
-    Environment, Value,
+    value::Kwargs,
+    Environment, Error as MinijinjaError, ErrorKind, Value,
 };
-use serde_json;
+use serde::Serialize;
+use serde_json::{self, ser::PrettyFormatter, Value as JsonValue};
 
 /// Chat template content format
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -349,6 +351,104 @@ pub struct ChatTemplateParams<'a> {
     pub template_kwargs: Option<&'a HashMap<String, serde_json::Value>>,
 }
 
+/// Custom tojson filter compatible with HuggingFace transformers' implementation.
+///
+/// HuggingFace transformers registers a custom `tojson` filter that accepts additional
+/// keyword arguments beyond what standard Jinja2 provides:
+/// - `ensure_ascii` (bool): Whether to escape non-ASCII characters (ignored in Rust, always UTF-8)
+/// - `indent` (int): Number of spaces for indentation (pretty-printing)
+/// - `separators` (ignored): Custom separators for JSON output
+/// - `sort_keys` (bool): Whether to sort dictionary keys
+///
+/// This is necessary for compatibility with chat templates from HuggingFace Hub models.
+/// See: https://github.com/huggingface/transformers/blob/main/src/transformers/utils/chat_template_utils.py
+fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, MinijinjaError> {
+    let _ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
+    let indent: Option<i64> = kwargs.get("indent")?;
+    let _separators: Option<Value> = kwargs.get("separators")?;
+    let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
+
+    // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
+    kwargs.assert_all_used()?;
+
+    let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
+        MinijinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("Failed to convert to JSON value: {}", e),
+        )
+    })?;
+
+    // Helper to serialize with custom indentation
+    fn serialize_with_indent<T: Serialize>(
+        value: &T,
+        spaces: usize,
+    ) -> std::result::Result<String, MinijinjaError> {
+        let indent_str = vec![b' '; spaces];
+        let formatter = PrettyFormatter::with_indent(&indent_str);
+        let mut buf = Vec::new();
+        let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        value.serialize(&mut serializer).map_err(|e| {
+            MinijinjaError::new(
+                ErrorKind::InvalidOperation,
+                format!("Failed to serialize JSON: {}", e),
+            )
+        })?;
+        String::from_utf8(buf).map_err(|e| {
+            MinijinjaError::new(
+                ErrorKind::InvalidOperation,
+                format!("Invalid UTF-8 in JSON output: {}", e),
+            )
+        })
+    }
+
+    // Serialize with options
+    let json_str: std::result::Result<String, MinijinjaError> = {
+        let sorted_json;
+        let value_to_serialize = if sort_keys.unwrap_or(false) {
+            sorted_json = sort_json_keys(&json_value);
+            &sorted_json
+        } else {
+            &json_value
+        };
+
+        if let Some(spaces) = indent {
+            if spaces < 0 {
+                return Err(MinijinjaError::new(
+                    ErrorKind::InvalidOperation,
+                    "indent cannot be negative",
+                ));
+            }
+            serialize_with_indent(value_to_serialize, spaces as usize)
+        } else {
+            serde_json::to_string(value_to_serialize).map_err(|e| {
+                MinijinjaError::new(
+                    ErrorKind::InvalidOperation,
+                    format!("Failed to serialize JSON: {}", e),
+                )
+            })
+        }
+    };
+
+    json_str.map(Value::from_safe_string)
+}
+
+/// Recursively sort all object keys in a JSON value
+fn sort_json_keys(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(map) => {
+            let mut sorted: serde_json::Map<String, JsonValue> = serde_json::Map::new();
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                sorted.insert(key.clone(), sort_json_keys(&map[key]));
+            }
+            JsonValue::Object(sorted)
+        }
+        JsonValue::Array(arr) => JsonValue::Array(arr.iter().map(sort_json_keys).collect()),
+        _ => value.clone(),
+    }
+}
+
 /// Chat template processor using Jinja2 - simple wrapper like HuggingFace
 pub struct ChatTemplateProcessor {
     template: String,
@@ -378,6 +478,11 @@ impl ChatTemplateProcessor {
 
         // Enable Python method compatibility (e.g., str.startswith, str.endswith)
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+
+        // Register custom tojson filter compatible with HuggingFace transformers
+        // This overrides minijinja's built-in tojson to support additional kwargs
+        // like ensure_ascii, separators, and sort_keys that HuggingFace templates use
+        env.add_filter("tojson", tojson_filter);
 
         // Get the template
         let tmpl = env

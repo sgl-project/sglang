@@ -1,4 +1,4 @@
-Popular Model Usage (DeepSeeek, GPT-OSS, Llama, Qwen, and more)
+Popular Model Usage (DeepSeek, GPT-OSS, Llama, Qwen, and more)
 ===============================================================
 
 .. toctree::
