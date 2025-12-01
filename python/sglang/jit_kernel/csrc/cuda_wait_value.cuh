@@ -15,14 +15,14 @@ __global__ void wait_flag_kernel(const std::int32_t* flag, std::int32_t target) 
   }
 }
 
-auto stream_wait_value(const tvm::ffi::TensorView flag, std::uint32_t value) -> void {
+auto stream_wait_value(const tvm::ffi::TensorView flag, std::int32_t value) -> void {
   using namespace host;
 
   auto length = SymbolicSize{"length"};
-  TensorMatcher({length}).with_dtype<int32_t, uint32_t>().with_device<kDLCUDA>().verify(flag);
+  TensorMatcher({length}).with_dtype<int32_t>().with_device<kDLCUDA>().verify(flag);
   RuntimeCheck(length.unwrap() >= 1, "wait_flag expects a non-empty tensor.");
 
-  auto* ptr = static_cast<std::uint32_t*>(flag.data_ptr());
+  auto* ptr = static_cast<std::int32_t*>(flag.data_ptr());
   const auto stream = LaunchKernel::resolve_device(flag.device());
 
   constexpr int blocks = 1;
