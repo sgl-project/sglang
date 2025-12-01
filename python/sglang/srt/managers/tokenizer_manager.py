@@ -320,7 +320,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
         )
-        self.is_multi_tokenizer = False
         if self.server_args.tokenizer_worker_num == 1:
             self.send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
@@ -332,7 +331,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             send_to_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
-            self.is_multi_tokenizer = True
 
             # Make sure that each request carries the tokenizer_ipc_name for response routing
             self.send_to_scheduler = SenderWrapper(port_args, send_to_scheduler)
@@ -1075,11 +1073,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 TokenizerManager.extract_feature_tensors(tokenized_obj)
             )
         # Send the request
-        if self.is_multi_tokenizer:
-            if isinstance(obj, BaseReq):
-                obj.http_worker_ipc = (
-                    self.send_to_scheduler.port_args.tokenizer_ipc_name
-                )
         if has_feature_tensors:
             parts = [
                 b"FEAT",
@@ -1347,11 +1340,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if not abort_all and rid not in self.rid_to_state:
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        if self.is_multi_tokenizer:
-            if isinstance(req, BaseReq):
-                req.http_worker_ipc = (
-                    self.send_to_scheduler.port_args.tokenizer_ipc_name
-                )
         self.send_to_scheduler.send_multipart([b"NORM", pickle.dumps(req)], copy=False)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
@@ -1362,11 +1350,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def pause_generation(self, obj: PauseGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = True
-            if self.is_multi_tokenizer:
-                if isinstance(obj, BaseReq):
-                    obj.http_worker_ipc = (
-                        self.send_to_scheduler.port_args.tokenizer_ipc_name
-                    )
             if obj.mode != "abort":
                 await self.send_to_scheduler.send_multipart(
                     [
@@ -1387,11 +1370,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            if self.is_multi_tokenizer:
-                if isinstance(obj, BaseReq):
-                    obj.http_worker_ipc = (
-                        self.send_to_scheduler.port_args.tokenizer_ipc_name
-                    )
             await self.send_to_scheduler.send_multipart(
                 [
                     b"NORM",
@@ -1437,11 +1415,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        if self.is_multi_tokenizer:
-            if isinstance(obj, BaseReq):
-                obj.http_worker_ipc = (
-                    self.send_to_scheduler.port_args.tokenizer_ipc_name
-                )
         self.send_to_scheduler.send_multipart([b"NORM", pickle.dumps(obj)], copy=False)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
@@ -1482,13 +1455,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        obj = FreezeGCReq()
-        if self.is_multi_tokenizer:
-            if isinstance(obj, BaseReq):
-                obj.http_worker_ipc = (
-                    self.send_to_scheduler.port_args.tokenizer_ipc_name
-                )
-        self.send_to_scheduler.send_multipart([b"NORM", pickle.dumps(obj)], copy=False)
+        self.send_to_scheduler.send_multipart([b"NORM", pickle.dumps(FreezeGCReq())], copy=False)
         freeze_gc("Tokenizer Manager")
         return None
 
@@ -2545,11 +2512,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             await asyncio.sleep(self.server_args.load_watch_interval)
             loads = await self.get_load_communicator(GetLoadReqInput())
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
-            if self.is_multi_tokenizer:
-                if isinstance(load_udpate_req, BaseReq):
-                    load_udpate_req.http_worker_ipc = (
-                        self.send_to_scheduler.port_args.tokenizer_ipc_name
-                    )
             self.send_to_scheduler.send_multipart(
                 [b"NORM", pickle.dumps(load_udpate_req)], copy=False
             )
