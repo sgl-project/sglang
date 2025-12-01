@@ -1,5 +1,3 @@
-from typing import List
-
 import torch
 import triton
 import triton.language as tl
@@ -12,7 +10,6 @@ def nsa_sparse_diff_triton_kernel(
     prev_device_indices_ptr,
     curr_device_indices_ptr,
     bitmap_ptr,
-    host_start_indices_ptr,
     full_host_indices_ptr,
     should_load_device_indices_ptr,
     should_load_host_indices_ptr,
@@ -26,6 +23,7 @@ def nsa_sparse_diff_triton_kernel(
     prev_device_indices_stride_1: tl.constexpr,
     curr_device_indices_stride: tl.constexpr,
     bitmap_stride: tl.constexpr,
+    full_host_indices_stride: tl.constexpr,
     should_load_device_indices_stride: tl.constexpr,
     should_load_host_indices_stride: tl.constexpr,
     layer_id: tl.constexpr,
@@ -46,6 +44,20 @@ def nsa_sparse_diff_triton_kernel(
         + layer_id * prev_device_indices_stride_1
     )
 
+    # Refill -1
+    tl.store(curr_device_indices_ptr + curr_device_indices_stride * bid + offset, -1)
+    tl.store(curr_device_indices_ptr + curr_device_indices_stride * bid + TOPK, -1)
+    tl.store(
+        should_load_device_indices_ptr
+        + should_load_device_indices_stride * bid
+        + offset,
+        -1,
+    )
+    tl.store(
+        should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset,
+        -1,
+    )
+
     # Load current top-k (save for later update)
     tmp_curr_top_k_result = tl.load(
         curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
@@ -60,9 +72,11 @@ def nsa_sparse_diff_triton_kernel(
             curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
         )
         mask = no_exist_top_k_result < seq_len
-        start_index = tl.load(host_start_indices_ptr + bid)
         no_exist_host_indices = tl.load(
-            full_host_indices_ptr + start_index + no_exist_top_k_result, mask=mask
+            full_host_indices_ptr
+            + req_pool_index * full_host_indices_stride
+            + no_exist_top_k_result,
+            mask=mask,
         )
         tl.store(
             should_load_host_indices_ptr
@@ -116,11 +130,13 @@ def nsa_sparse_diff_triton_kernel(
             curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset
         )
 
-        start_index = tl.load(host_start_indices_ptr + bid)
         mask1 = no_exist_top_k_result < seq_len
         host_mask = ~mask & mask1
         no_exist_host_indices = tl.load(
-            full_host_indices_ptr + start_index + no_exist_top_k_result, mask=host_mask
+            full_host_indices_ptr
+            + req_pool_index * full_host_indices_stride
+            + no_exist_top_k_result,
+            mask=host_mask,
         )
         tl.store(
             should_load_host_indices_ptr
@@ -255,7 +271,7 @@ def invoke_nsa_sparse_diff_kernel(
     prev_device_indices_pool: torch.Tensor,
     curr_device_indices: torch.Tensor,
     bitmap: torch.Tensor,
-    full_host_indices: List[torch.Tensor],
+    full_host_indices: torch.Tensor,
     should_load_device_indices: torch.Tensor,
     should_load_host_indices: torch.Tensor,
     out_cache_loc: torch.Tensor,
@@ -265,18 +281,6 @@ def invoke_nsa_sparse_diff_kernel(
 ):
     bs = curr_top_k_result.shape[0]
     top_k = curr_top_k_result.shape[1]
-
-    host_start_indices = [0] + [
-        len(full_host_indices[idx]) for idx in range(len(full_host_indices))
-    ][:-1]
-    host_start_indices = torch.tensor(
-        host_start_indices,
-        dtype=torch.int64,
-        device=bitmap.device,
-    )
-    host_start_indices = torch.cumsum(host_start_indices, dim=-1)
-    full_host_indices = torch.cat(full_host_indices)
-
     grid = (bs,)
     nsa_sparse_diff_triton_kernel[grid](
         prev_top_k_result_pool,
@@ -284,7 +288,6 @@ def invoke_nsa_sparse_diff_kernel(
         prev_device_indices_pool,
         curr_device_indices,
         bitmap,
-        host_start_indices,
         full_host_indices,
         should_load_device_indices,
         should_load_host_indices,
@@ -298,6 +301,7 @@ def invoke_nsa_sparse_diff_kernel(
         prev_device_indices_pool.stride(1),
         curr_device_indices.stride(0),
         bitmap.stride(0),
+        full_host_indices.stride(0),
         should_load_device_indices.stride(0),
         should_load_host_indices.stride(0),
         layer_id,
@@ -346,8 +350,8 @@ if __name__ == "__main__":
         dtype=torch.int64,
         device="cuda",
     )
-    full_host_indices = [
-        torch.tensor(
+    full_host_indices = torch.tensor(
+        [
             [
                 1000,
                 1001,
@@ -366,16 +370,36 @@ if __name__ == "__main__":
                 1014,
                 1015,
                 1016,
+                -1,
+                -1,
+                -1,
             ],
-            dtype=torch.int64,
-            device="cuda",
-        ),
-        torch.tensor(
-            [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011],
-            dtype=torch.int64,
-            device="cuda",
-        ),
-    ]
+            [
+                2000,
+                2001,
+                2002,
+                2003,
+                2004,
+                2005,
+                2006,
+                2007,
+                2008,
+                2009,
+                2010,
+                2011,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+            ],
+        ],
+        dtype=torch.int64,
+        device="cuda",
+    )
 
     seq_lens = torch.tensor([17, 12], dtype=torch.int64, device="cuda")
     out_cache_loc = torch.tensor([9017, 8012], dtype=torch.int64, device="cuda")
@@ -574,6 +598,8 @@ if __name__ == "__main__":
         )
         for i in range(bs_large)
     ]
+
+    full_host_indices_large = torch.cat(full_host_indices_large, dim=0)
 
     seq_lens_large = torch.full(
         (bs_large,), seq_len_large - 1, dtype=torch.int64, device="cuda"

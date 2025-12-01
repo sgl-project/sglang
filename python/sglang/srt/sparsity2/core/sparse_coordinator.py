@@ -31,6 +31,7 @@ class RequestTrackers:
         device: torch.device,
         num_layers: int,
         min_sparse_prompt_len: int,
+        max_context_len: int,
     ):
         self.device = device
         self.num_layers = num_layers
@@ -45,10 +46,31 @@ class RequestTrackers:
             max_pool_size, dtype=torch.int64, device=device
         )
 
-        self.full_host_indices = [
-            torch.tensor([], dtype=torch.int64, device=device)
-            for _ in range(max_pool_size)
-        ]
+        self.full_host_indices = torch.full(
+            (max_pool_size, max_context_len),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.curr_device_indices = torch.full(
+            (max_pool_size, self.top_k + 1),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.should_load_device_indices = torch.full(
+            (max_pool_size, self.top_k),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        self.should_load_host_indices = torch.full(
+            (max_pool_size, self.top_k),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+
         self.prev_top_k_result = torch.full(
             (max_pool_size, num_layers, self.top_k),
             -1,
@@ -68,9 +90,10 @@ class RequestTrackers:
         self.prompt_lens[idx] = prompt_len
         self.decode_steps[idx] = 0
         self.last_extracted_token[idx] = 0
-        self.full_host_indices[idx] = torch.tensor(
-            [], dtype=torch.int64, device=self.device
-        )
+        self.full_host_indices[idx].fill_(-1)
+        self.curr_device_indices[idx].fill_(-1)
+        self.should_load_device_indices[idx].fill_(-1)
+        self.should_load_host_indices[idx].fill_(-1)
         self.prev_top_k_result[idx].fill_(-1)
         self.prev_device_indices[idx].fill_(-1)
 
@@ -79,11 +102,11 @@ class RequestTrackers:
         self.prompt_lens[idx] = 0
         self.decode_steps[idx] = 0
         self.last_extracted_token[idx] = 0
-
-        host_indices = self.full_host_indices[idx]
-        self.full_host_indices[idx] = torch.tensor(
-            [], dtype=torch.int64, device=self.device
-        )
+        host_indices = self.full_host_indices[idx][self.full_host_indices[idx] != -1]
+        self.full_host_indices[idx].fill_(-1)
+        self.curr_device_indices[idx].fill_(-1)
+        self.should_load_device_indices[idx].fill_(-1)
+        self.should_load_host_indices[idx].fill_(-1)
         self.prev_top_k_result[idx].fill_(-1)
         self.prev_device_indices[idx].fill_(-1)
 
@@ -134,6 +157,7 @@ class SparseCoordinator:
             device,
             end_layer - start_layer + 1,
             self.config.min_sparse_prompt_len,
+            self.req_to_token_pool.max_context_len,
         )
         if self.sparse_kv_cache_manager is not None:
             self.sparse_kv_cache_manager.req_states = self.states
@@ -220,6 +244,7 @@ class SparseCoordinator:
             self.sparse_kv_cache_manager.offload_sparse_decode_req_tokens(
                 forward_batch.req_pool_indices[offload_mask],
                 forward_batch.out_cache_loc[offload_mask],
+                forward_batch.seq_lens[offload_mask] - 1,
             )
 
     def _should_check_offload(self, forward_batch: "ForwardBatch") -> bool:

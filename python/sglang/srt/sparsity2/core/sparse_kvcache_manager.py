@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import TYPE_CHECKING
 
 import nvtx
 import torch
@@ -19,6 +20,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.sparsity2.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
+
+if TYPE_CHECKING:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -97,33 +101,16 @@ class SparseKVCacheManager:
     ):
         nxtx_range = nvtx.start_range(message="init_buffer", color="blue")
         bs = top_k_result.shape[0]
-        top_k = top_k_result.shape[1]
-
-        # need to register buffer for cuda graph
-        curr_device_indices = torch.full(
-            (bs, top_k + 1), -1, dtype=torch.int64, device=top_k_result.device
-        )
-        should_load_device_indices = torch.full(
-            (bs, top_k), -1, dtype=torch.int64, device=top_k_result.device
-        )
-        should_load_host_indices = torch.full(
-            (bs, top_k), -1, dtype=torch.int64, device=top_k_result.device
-        )
-        full_host_indices = [
-            self.req_states.full_host_indices[idx] for idx in req_pool_indices
-        ]
-        nvtx.end_range(nxtx_range)
-
         nxtx_range1 = nvtx.start_range(message="diff_kernel", color="blue")
         invoke_nsa_sparse_diff_kernel(
             self.req_states.prev_top_k_result,
             top_k_result,
             self.req_states.prev_device_indices,
-            curr_device_indices,
+            self.req_states.curr_device_indices,
             self.bitmap,
-            full_host_indices,
-            should_load_device_indices,
-            should_load_host_indices,
+            self.req_states.full_host_indices,
+            self.req_states.should_load_device_indices,
+            self.req_states.should_load_host_indices,
             out_cache_loc,
             seq_lens - 1,
             req_pool_indices,
@@ -132,9 +119,11 @@ class SparseKVCacheManager:
         nvtx.end_range(nxtx_range1)
 
         nxtx_range2 = nvtx.start_range(message="io_kernel", color="blue")
+        should_load_device_indices = self.req_states.should_load_device_indices[:bs]
         should_load_device_indices = should_load_device_indices[
             should_load_device_indices != -1
         ]
+        should_load_host_indices = self.req_states.should_load_host_indices[:bs]
         should_load_host_indices = should_load_host_indices[
             should_load_host_indices != -1
         ]
@@ -149,9 +138,11 @@ class SparseKVCacheManager:
                 "kernel",
             )
         nvtx.end_range(nxtx_range2)
-        return curr_device_indices[:, :-1]
+        return self.req_states.curr_device_indices[:bs, :-1]
 
-    def offload_sparse_decode_req_tokens(self, req_pool_indices, out_alloc_len):
+    def offload_sparse_decode_req_tokens(
+        self, req_pool_indices, out_alloc_len, seq_lens
+    ):
         """Offload incremental token KV cache for sparse attention."""
 
         self.request_counter += 1
@@ -161,7 +152,11 @@ class SparseKVCacheManager:
             node_id=ack_id,
         )
         assert host_indices is not None, "Host out of memory"
-        self.sparse_decode_ongoing_offload[ack_id] = (host_indices, req_pool_indices)
+        self.sparse_decode_ongoing_offload[ack_id] = (
+            host_indices,
+            req_pool_indices,
+            seq_lens,
+        )
         return ack_id
 
     def check_sparse_offload_progress(self):
@@ -187,20 +182,21 @@ class SparseKVCacheManager:
         finish_event.synchronize()
 
         # update full_host_indices
-        host_indices, req_pool_indices = self.sparse_decode_ongoing_offload.pop(
-            ack_list[0]
+        host_indices, req_pool_indices, seq_lens = (
+            self.sparse_decode_ongoing_offload.pop(ack_list[0])
         )
-        for i in range(len(req_pool_indices)):
-            full_host_indices = self.req_states.full_host_indices[req_pool_indices[i]]
-            if len(host_indices) > 0:
-                host_idx_i = host_indices[i].to(self.req_states.device).reshape(-1)
-                self.req_states.full_host_indices[req_pool_indices[i]] = torch.cat(
-                    [full_host_indices, host_idx_i]
-                )
-            else:
-                logger.warning(
-                    f"Host indices is empty for request {req_pool_indices[i]}"
-                )
+        self.req_states.full_host_indices[req_pool_indices, seq_lens] = host_indices
+        # for i in range(len(req_pool_indices)):
+        #     full_host_indices = self.req_states.full_host_indices[req_pool_indices[i]]
+        #     if len(host_indices) > 0:
+        #         host_idx_i = host_indices[i].to(self.req_states.device).reshape(-1)
+        #         self.req_states.full_host_indices[req_pool_indices[i]] = torch.cat(
+        #             [full_host_indices, host_idx_i]
+        #         )
+        #     else:
+        #         logger.warning(
+        #             f"Host indices is empty for request {req_pool_indices[i]}"
+        #         )
 
     def offload_prefill_full_kv_cache(self, req):
         offloaded_len = len(req.origin_input_ids)
@@ -245,6 +241,6 @@ class SparseKVCacheManager:
         finish_event.synchronize()
 
         (host_indices, req) = self.sparse_prefill_ongoing_offload.pop(ack_list[0])
-        self.req_states.full_host_indices[req.req_pool_idx] = host_indices.to(
-            self.req_states.device
+        self.req_states.full_host_indices[req.req_pool_idx][: len(host_indices)] = (
+            host_indices.to(self.req_states.device)
         )
