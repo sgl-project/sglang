@@ -217,15 +217,15 @@ class NPUW8A8Int8DynamicMoEMethod(FusedMoEMethodBase):
         layer.w2_weight.data = npu_format_cast(layer.w2_weight.data)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
         self.moe_runner_config = moe_runner_config
 
     def apply(
         self,
         layer,
-        dispatch_output: StandardDispatchOutput,
-    ) -> CombineInput:
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -517,15 +517,15 @@ class NPUW4A8Int4DynamicMoEMethod(FusedMoEMethodBase):
         layer.w2_weight.data = self.pack_to_int32(layer.w2_weight.data)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
         self.moe_runner_config = moe_runner_config
 
     def apply(
         self,
         layer,
-        dispatch_output: StandardDispatchOutput,
-    ) -> CombineInput:
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
         # FIXME W4A8 only support with deepep
         raise NotImplementedError(
             f"W4A8 only support with deepep for now, please enable --moe-a2a-backend deepep"
@@ -770,15 +770,15 @@ class NPUW4A16Int4DynamicMoEMethod(FusedMoEMethodBase):
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
     def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
         self.moe_runner_config = moe_runner_config
 
     def apply(
         self,
         layer,
-        dispatch_output: StandardDispatchOutput,
-    ) -> CombineInput:
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
