@@ -618,7 +618,11 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
         try:
             body = {
                 "activities": getattr(args, "profile_activities", []),
+                "num_steps": getattr(args, "profile_num_steps", None),
+                "profile_by_stage": getattr(args, "profile_by_stage", None),
+                "profile_stages": getattr(args, "profile_stages", None),
             }
+            print(f"async_request_profile {api_url=} {body=}")
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
@@ -1966,12 +1970,13 @@ async def benchmark(
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
         else:
-            print("Stopping profiler...")
-            profile_output = await async_request_profile(
-                api_url=base_url + "/stop_profile"
-            )
-            if profile_output.success:
-                print("Profiler stopped")
+            if getattr(args, "profile_num_steps", None) is None:
+                print("Stopping profiler...")
+                profile_output = await async_request_profile(
+                    api_url=base_url + "/stop_profile"
+                )
+                if profile_output.success:
+                    print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -2612,6 +2617,9 @@ if __name__ == "__main__":
         default=["CPU", "GPU"],
         choices=["CPU", "GPU", "CUDA_PROFILER"],
     )
+    parser.add_argument("--profile-num-steps", type=int, default=None)
+    parser.add_argument("--profile-by-stage", action="store_true", default=False)
+    parser.add_argument("--profile-stages", nargs="+", default=None)
     parser.add_argument(
         "--lora-name",
         type=str,

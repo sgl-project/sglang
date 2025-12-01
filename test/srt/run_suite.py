@@ -144,6 +144,7 @@ suites = {
         TestFile("models/test_glm4_moe_models.py", 100),
         TestFile("models/test_kimi_linear_models.py", 90),
         TestFile("rl/test_update_weights_from_distributed.py", 103),
+        TestFile("test_constrained_decoding_spec_reasoning.py", 60),
         TestFile("test_data_parallelism.py", 73),
         TestFile("test_disaggregation_basic.py", 400),
         TestFile("test_dp_attention.py", 350),
@@ -213,6 +214,7 @@ suites = {
         TestFile("test_gpt_oss_common.py"),
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_vision_openai_server_common.py"),
+        TestFile("test_profile_v2.py"),
     ],
 }
 
