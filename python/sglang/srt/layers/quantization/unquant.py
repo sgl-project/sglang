@@ -445,6 +445,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         if self.moe_runner_config.custom_act_fn is not None:
             hidden_states = self.moe_runner_config.custom_act_fn(layer, hidden_states)
         elif self.moe_runner_config.activation == "silu":
+            hidden_states = torch_npu.npu_swiglu(hidden_states)
+        else:
             from sglang.srt.layers.activation import GeluAndMul
 
             hidden_states = GeluAndMul()(hidden_states)
