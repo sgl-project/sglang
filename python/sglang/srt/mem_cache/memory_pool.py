@@ -672,6 +672,24 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
 
+        if _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+            self.k_scale_buffer = [
+                torch.zeros(
+                    (self.size + self.page_size, 1, 1),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.v_scale_buffer = [
+                torch.zeros(
+                    (self.size + self.page_size, 1, 1),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                for _ in range(self.layer_num)
+            ]
+
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
@@ -750,6 +768,11 @@ class MHATokenToKVPool(KVCache):
         torch.cuda.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
+        if _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+            return (
+                self.k_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.k_scale_buffer[layer_id - self.start_layer],
+            )
         # for internal use of referencing
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
@@ -764,6 +787,11 @@ class MHATokenToKVPool(KVCache):
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
+        if _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+            return (
+                self.v_buffer[layer_id - self.start_layer].view(self.dtype),
+                self.v_scale_buffer[layer_id - self.start_layer],
+            )
         # for internal use of referencing
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
@@ -794,12 +822,20 @@ class MHATokenToKVPool(KVCache):
         else:
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+            if _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+                from sglang.srt.layers.quantization.fp8_utils import input_to_float8
+
+                cache_k_fp8, cache_k_scale = input_to_float8(cache_k, dtype=self.dtype)
+                cache_k = cache_k_fp8
+                cache_v_fp8, cache_v_scale = input_to_float8(cache_v, dtype=self.dtype)
+                cache_v = cache_v_fp8
+            else:
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
@@ -813,6 +849,11 @@ class MHATokenToKVPool(KVCache):
             with self.device_module.stream(self.alt_stream):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
+        elif _is_cpu and _is_amx_available and self.dtype == torch.float8_e4m3fn:
+            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+            self.k_scale_buffer[layer_id - self.start_layer][loc] = cache_k_scale
+            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_scale
         else:
             self.k_buffer[layer_id - self.start_layer][loc] = cache_k
             self.v_buffer[layer_id - self.start_layer][loc] = cache_v
