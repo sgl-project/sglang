@@ -7,8 +7,10 @@
 
 namespace {
 
-__global__ void wait_flag_kernel(const std::int32_t* flag, std::int32_t target) {
-  while (atomicAdd((int*)flag, 0) != target) {
+__global__ void wait_flag_kernel(const int32_t* flag, int32_t target) {
+  const volatile int32_t* vflag = (volatile const int32_t*)flag;
+
+  while (*vflag != target) {
 #if __CUDA_ARCH__ >= 700
     __nanosleep(100);
 #endif
