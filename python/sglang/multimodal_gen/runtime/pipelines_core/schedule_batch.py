@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
