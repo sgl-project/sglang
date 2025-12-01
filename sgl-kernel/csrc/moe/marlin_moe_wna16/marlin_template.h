@@ -481,7 +481,8 @@ __global__ void Marlin(
               sh_block_topk_weights[idx] =
                   __hmul2(global_scale, Dtype::num2num2(Dtype::float2num(topk_weights_ptr[sh_block_sorted_ids[idx]])));
             } else {
-              sh_block_topk_weights[idx] = Dtype::num2num2(Dtype::float2num(topk_weights_ptr[sh_block_sorted_ids[idx]]));
+              sh_block_topk_weights[idx] =
+                  Dtype::num2num2(Dtype::float2num(topk_weights_ptr[sh_block_sorted_ids[idx]]));
             }
           }
         }
