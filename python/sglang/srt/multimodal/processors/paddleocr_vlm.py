@@ -12,11 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.models.paddleocr_vl import PaddleOCRVLForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import (
-    MultimodalSpecialTokens,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 
 
