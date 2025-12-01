@@ -72,9 +72,7 @@ class TimestepPreparationStage(PipelineStage):
         sigmas = batch.sigmas
         n_tokens = batch.n_tokens
 
-        sigmas = server_args.pipeline_config.prepare_sigmas(
-            sigmas, num_inference_steps
-        )
+        sigmas = server_args.pipeline_config.prepare_sigmas(sigmas, num_inference_steps)
 
         # Prepare extra kwargs for set_timesteps
         extra_set_timesteps_kwargs = {}

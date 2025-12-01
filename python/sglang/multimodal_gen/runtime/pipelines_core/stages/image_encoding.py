@@ -302,7 +302,6 @@ class ImageVAEEncodingStage(PipelineStage):
         latent_condition -= shift_factor
         latent_condition = latent_condition * scaling_factor
 
-        # TODO: abstract this
         batch.image_latent = server_args.pipeline_config.postprocess_image_latent(latent_condition, batch)
 
         self.maybe_free_model_hooks()
