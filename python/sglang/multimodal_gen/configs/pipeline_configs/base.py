@@ -415,38 +415,6 @@ class PipelineConfig:
             self.dit_config, args, f"{prefix_with_dot}dit_config", pop_args=True
         )
 
-    @staticmethod
-    def _is_finetuned_vae(vae_path: str) -> bool:
-        """
-        Detect if a VAE is a fine-tuned/distilled model by checking its config.
-        
-        Args:
-            vae_path: Path to VAE model (local or HuggingFace model ID)
-            
-        Returns:
-            True if VAE appears to be a fine-tuned/distilled model
-        """
-        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-            get_diffusers_component_config,
-            maybe_download_model,
-        )
-        import os
-        
-        if not os.path.exists(vae_path):
-            vae_path = maybe_download_model(vae_path)
-        
-        config = get_diffusers_component_config(model_path=vae_path)
-        
-        auto_map = config.get("auto_map", {})
-        if auto_map and "AutoModel" in auto_map:
-            return True
-        
-        class_name = config.get("_class_name", "")
-        if "Tiny" in class_name or "Distilled" in class_name or "Finetuned" in class_name:
-            return True
-        
-        return False
-
     @classmethod
     def from_kwargs(
         cls, kwargs: dict[str, Any], config_cli_prefix: str = ""
@@ -487,24 +455,16 @@ class PipelineConfig:
         pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
         
-        # Check if this is a Flux2 model with custom VAE
+        # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
         if (
             pipeline_config_cls.__name__ == "Flux2PipelineConfig"
             and vae_path is not None
+            and "FLUX.2-Tiny-AutoEncoder" in vae_path
         ):
-            # Try to detect if VAE is a fine-tuned/distilled model
-            logger.debug(f"Checking if VAE '{vae_path}' is a fine-tuned model...")
-            if cls._is_finetuned_vae(vae_path):
-                from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
-                    Flux2FinetunedPipelineConfig,
-                )
-                pipeline_config_cls = Flux2FinetunedPipelineConfig
-                logger.info(
-                    f"Detected fine-tuned VAE at '{vae_path}'. "
-                    "Using Flux2FinetunedPipelineConfig for better compatibility."
-                )
-            else:
-                logger.debug(f"VAE '{vae_path}' is not detected as fine-tuned, using standard Flux2PipelineConfig.")
+            from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
+                Flux2FinetunedPipelineConfig,
+            )
+            pipeline_config_cls = Flux2FinetunedPipelineConfig
 
         pipeline_config = pipeline_config_cls()
 
