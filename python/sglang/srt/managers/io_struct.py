@@ -1144,6 +1144,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional format specification for loading
+    load_format: Optional[str] = None
 
 
 @dataclass
@@ -1307,6 +1309,17 @@ class ResumeMemoryOccupationReqInput(BaseReq):
 @dataclass
 class ResumeMemoryOccupationReqOutput(BaseReq):
     pass
+
+
+@dataclass
+class CheckWeightsReqInput(BaseReq):
+    action: str
+
+
+@dataclass
+class CheckWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
 
 
 @dataclass
