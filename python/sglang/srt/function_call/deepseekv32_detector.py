@@ -1,0 +1,406 @@
+import json
+import logging
+import re
+from typing import List
+
+from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.core_types import (
+    StreamingParseResult,
+    StructureInfo,
+    ToolCallItem,
+    _GetInfoFunc,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class DeepSeekV32Detector(BaseFormatDetector):
+    """
+    Detector for DeepSeek V3.2 model function call format.
+
+    The DeepSeek V3.2 format uses XML-like DSML tags to delimit function calls
+    with parameter tags for arguments.
+
+    Format Structure:
+    ```
+    <｜DSML｜function_calls>
+        <｜DSML｜invoke name="function_name">
+        <｜DSML｜parameter name="param_name" string="true">value</｜DSML｜parameter>
+        ...
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+    ```
+    Examples:
+    ```
+    <｜DSML｜function_calls>
+        <｜DSML｜invoke name="get_favorite_tourist_spot">
+        <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+    ```
+
+    Key Components:
+    - Tool Calls Section: Wrapped between `<｜DSML｜function_calls>` and `</｜DSML｜function_calls>`
+    - Individual Tool Call: Wrapped between `<｜DSML｜invoke name="...">` and `</｜DSML｜invoke>`
+    - Parameters: `<｜DSML｜parameter name="..." string="true">value</｜DSML｜parameter>`
+    - Supports multiple tool calls
+
+    Reference: DeepSeek V3.2 format specification
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.bot_token = "<｜DSML｜function_calls>"
+        self.eot_token = "</｜DSML｜function_calls>"
+        self.invoke_begin_regex = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>'
+        self.invoke_end_token = "</｜DSML｜invoke>"
+        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
+        self._last_arguments = ""
+        self.current_tool_id = -1
+
+    def has_tool_call(self, text: str) -> bool:
+        """Check if the text contains a deepseek v32 format tool call."""
+        return self.bot_token in text
+
+    def _parse_parameters_from_xml(self, invoke_content: str) -> dict:
+        """Parse parameters from XML-like format to JSON dict."""
+        parameters = {}
+        param_matches = re.findall(self.parameter_regex, invoke_content, re.DOTALL)
+        for param_name, param_type, param_value in param_matches:
+            # Convert value based on type
+            if param_type == "true":  # string type
+                parameters[param_name] = param_value.strip()
+            else:
+                # Try to parse as JSON for other types
+                try:
+                    parameters[param_name] = json.loads(param_value.strip())
+                except (json.JSONDecodeError, ValueError):
+                    parameters[param_name] = param_value.strip()
+        return parameters
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        """
+        One-time parsing: Detects and parses tool calls in the provided text.
+
+        :param text: The complete text to parse.
+        :param tools: List of available tools.
+        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        """
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+        if self.bot_token not in text:
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+        calls = []
+        try:
+            # Extract content between function_calls tags
+            function_calls_match = re.search(
+                r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>",
+                text,
+                re.DOTALL,
+            )
+            if not function_calls_match:
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+
+            function_calls_content = function_calls_match.group(1)
+
+            # Find all invoke blocks
+            invoke_pattern = (
+                r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
+            )
+            invoke_matches = re.findall(
+                invoke_pattern, function_calls_content, re.DOTALL
+            )
+
+            for func_name, invoke_content in invoke_matches:
+                # Parse parameters from XML format
+                func_args = self._parse_parameters_from_xml(invoke_content)
+                # construct match_result for parse_base_json
+                match_result = {"name": func_name, "parameters": func_args}
+                calls.extend(self.parse_base_json(match_result, tools))
+
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except Exception as e:
+            logger.error(f"Error in detect_and_parse: {e}")
+            # return the normal text if parsing fails
+            return StreamingParseResult(normal_text=text)
+
+    def parse_streaming_increment(
+        self, new_text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
+        """
+        Streaming incremental parsing tool calls for DeepSeekV32 format.
+        Supports multiple consecutive invoke blocks.
+        """
+        self._buffer += new_text
+        current_text = self._buffer
+
+        # Check if we have a tool call or any DSML-related content
+        # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
+        # If we see these markers anywhere, we should keep buffering
+        has_tool_call = (
+            self.bot_token in current_text or "<｜DSML｜invoke" in current_text
+        )
+
+        # Check if buffer contains any DSML markers or ends with potential tag prefix
+        # This handles partial/streaming DSML content
+        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
+        potentially_dsml = any(marker in current_text for marker in dsml_markers)
+
+        # Also check if text ends with start of a tag (to handle "<" arriving separately)
+        dsml_prefixes = ["<", "<｜", "</", "</｜"]
+        ends_with_prefix = any(
+            current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
+        )
+
+        if not has_tool_call and not potentially_dsml and not ends_with_prefix:
+            self._buffer = ""
+            for e_token in [self.eot_token, self.invoke_end_token]:
+                if e_token in new_text:
+                    new_text = new_text.replace(e_token, "")
+            return StreamingParseResult(normal_text=new_text)
+
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+
+        all_calls: list[ToolCallItem] = []
+        try:
+            # Loop to handle multiple consecutive invoke blocks
+            while True:
+                # Try to match an invoke block (may be partial)
+                invoke_match = re.search(
+                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
+                    string=current_text,
+                    flags=re.DOTALL,
+                )
+
+                if not invoke_match:
+                    break
+
+                func_name = invoke_match.group(1).strip()
+                invoke_content = invoke_match.group(2)
+                # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
+                is_tool_end = bool(invoke_match.group(3))
+
+                # Initialize state if this is the first tool call
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = [""]
+
+                # Ensure we have enough entries in our tracking arrays
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+
+                # Parse current parameters from XML
+                current_params = self._parse_parameters_from_xml(invoke_content)
+                current_args_json = json.dumps(current_params, ensure_ascii=False)
+
+                # Check if tool call is complete (has closing tag)
+                if is_tool_end:
+                    # Only emit the tool call when it's complete (saw </｜DSML｜invoke>)
+                    # This ensures each function returns at most once
+                    calls_for_this_invoke: list[ToolCallItem] = []
+
+                    # Send tool name
+                    calls_for_this_invoke.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=func_name,
+                            parameters="",
+                        )
+                    )
+
+                    # Send parameters as complete JSON
+                    calls_for_this_invoke.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=current_args_json,
+                        )
+                    )
+
+                    # Update the stored arguments
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": func_name,
+                        "arguments": current_params,
+                    }
+                    self.streamed_args_for_tool[self.current_tool_id] = (
+                        current_args_json
+                    )
+
+                    # Remove the completed tool call from buffer
+                    self._buffer = current_text[invoke_match.end() :]
+                    current_text = self._buffer  # Update for next iteration
+
+                    # Add calls for this invoke to all_calls
+                    all_calls.extend(calls_for_this_invoke)
+
+                    # Move to next tool call
+                    self.current_tool_id += 1
+                    self._last_arguments = ""
+                    self.current_tool_name_sent = False
+
+                    # Ensure arrays are large enough for next tool
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+
+                    # Continue loop to check for more invoke blocks
+                    continue
+                else:
+                    # Tool call not complete yet, don't return anything
+                    # Wait for more chunks until we see </｜DSML｜invoke>
+                    break
+
+            # No more invoke blocks found
+            return StreamingParseResult(normal_text="", calls=all_calls)
+
+        except Exception as e:
+            logger.error(f"Error in parse_streaming_increment: {e}")
+            return StreamingParseResult(normal_text=current_text)
+
+    def structure_info(self) -> _GetInfoFunc:
+        return lambda name: StructureInfo(
+            begin=f'<｜DSML｜invoke name="{name}">',
+            end="</｜DSML｜invoke>",
+            trigger=f'<｜DSML｜invoke name="{name}">',
+        )
+
+
+if __name__ == "__main__":
+    from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.server_args import PortArgs, ServerArgs
+
+    detector = DeepSeekV32Detector()
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Searches for information related to query and displays topn results.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query string",
+                        },
+                        "topn": {
+                            "type": "integer",
+                            "description": "Number of top results to display",
+                            "default": 10,
+                        },
+                        "source": {
+                            "type": "string",
+                            "description": "Source to search within",
+                            "enum": ["web", "news"],
+                            "default": "web",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_favorite_tourist_spot",
+                "description": "Return the favorite tourist spot for a given city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        },
+    ]
+    tools = [Tool.model_validate(tool) for tool in tools]
+    # print(tools)
+
+    text = """I'll help you with information about San Francisco and get its favorite tourist spot for you.\n\n
+    <｜DSML｜function_calls>\n
+        <｜DSML｜invoke name="get_favorite_tourist_spot">\n
+            <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n
+        </｜DSML｜invoke>\n
+        <｜DSML｜invoke name="search">
+            <｜DSML｜parameter name="query" string="true">WebNav benchmark</｜DSML｜parameter>
+            <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+            <｜DSML｜parameter name="source" string="true">web</｜DSML｜parameter>
+        </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+    """
+    # cp /data/sglang/python/sglang/srt/function_call/deepseekv32_detector.py /sgl-workspace/sglang/python/sglang/srt/function_call/deepseekv32_detector.py
+    # cp /data/sglang/python/sglang/srt/function_call/function_call_parser.py /sgl-workspace/sglang/python/sglang/srt/function_call/function_call_parser.py
+
+    # 增加一个旧的v31的例子作为对比
+    text_v31 = """I'll help you with information about San Francisco and get its favorite tourist spot for you.\n\n
+    <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_current_weather<｜tool▁sep｜>{"city": "Boston", "state":"MA","unit":"celsius"}<｜tool▁call▁end｜>
+    <｜tool▁calls▁end｜><｜end▁of▁sentence｜>
+    """
+    v31_detector = DeepSeekV31Detector()
+    # print(detector.detect_and_parse(text, tools))
+    # print(v31_detector.detect_and_parse(text_v31, tools))
+
+    server_args = ServerArgs(model_path="deepseek-ai/DeepSeek-V3.2")
+    port_args = PortArgs.init_new(server_args)
+    tokenizer_manager = TokenizerManager(server_args, port_args)
+
+    # Simulate streaming by character chunks (more realistic)
+    print("=== Testing streaming character by character ===")
+    detector_char = DeepSeekV32Detector()
+    chunk_size = 5  # simulate token-like chunks
+    for i in range(0, len(text), chunk_size):
+        chunk = text[i : i + chunk_size]
+        streamed_chunk = detector_char.parse_streaming_increment(chunk, tools)
+        if streamed_chunk.normal_text or streamed_chunk.calls:
+            print(f"Chunk: {repr(chunk)}")
+            print(f"  Result: {streamed_chunk}")
+
+    print("\n=== Testing detect_and_parse (one-time) ===")
+    result = detector.detect_and_parse(text, tools)
+    print(f"Normal text: {result.normal_text}")
+    print(f"Tool calls: {result.calls}")
+
+    print("\n" + "=" * 60)
+    print("=== V31 Detector 对比测试 ===")
+    print("=" * 60)
+
+    # Test 1: 一次性解析
+    print("\n[V31] 一次性解析:")
+    v31_result = v31_detector.detect_and_parse(text_v31, tools)
+    print(f"  Normal text: {v31_result.normal_text}")
+    print(f"  Tool calls: {v31_result.calls}")
+
+    # Test 2: 模拟真实的 JSON 增量流式场景
+    print("\n[V31] 流式解析（模拟 JSON 增量）:")
+    v31_detector_stream = DeepSeekV31Detector()
+    # 按照 JSON 逐渐构建的方式分割
+    v31_chunks = [
+        "I'll help you.\n\n",
+        "<｜tool▁calls▁begin｜>",
+        "<｜tool▁call▁begin｜>",
+        "get_current_weather",
+        "<｜tool▁sep｜>",
+        '{"city"',
+        ': "Boston"',
+        ', "state"',
+        ':"MA"',
+        ',"unit"',
+        ':"celsius"}',
+        "<｜tool▁call▁end｜>",
+        "<｜tool▁calls▁end｜>",
+        "<｜end▁of▁sentence｜>",
+    ]
+
+    for i, chunk in enumerate(v31_chunks):
+        result = v31_detector_stream.parse_streaming_increment(chunk, tools)
+        if result.calls:
+            print(f"  Chunk {i} ({repr(chunk[:20])}...): {result.calls}")
