@@ -245,7 +245,6 @@ class ImageVAEEncodingStage(PipelineStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        print(f"{video_condition.shape=}")
         # Encode Image
         with torch.autocast(
             device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
@@ -272,7 +271,6 @@ class ImageVAEEncodingStage(PipelineStage):
         latent_condition = self.retrieve_latents(
             encoder_output, generator, sample_mode=sample_mode
         )
-        print(f"284 {latent_condition.shape=}")
         latent_condition = server_args.pipeline_config.postprocess_vae_encode(
             latent_condition, self.vae
         )

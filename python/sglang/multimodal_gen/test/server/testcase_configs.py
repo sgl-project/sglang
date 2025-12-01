@@ -125,7 +125,7 @@ class DiffusionServerArgs:
 class DiffusionSamplingParams:
     """Configuration for a single model/scenario test case."""
 
-    output_size: str = "1024x1024"  # output image dimensions (or video resolution)
+    output_size: str = ""
 
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
@@ -320,7 +320,6 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt="Convert 2D style to 3D style",
-            output_size="1024x1536",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
         ),
     ),
