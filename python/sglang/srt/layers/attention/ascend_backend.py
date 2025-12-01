@@ -76,8 +76,10 @@ class AscendAttnMaskBuilder:
         self.mtp_mask = self.generate_mask_flag(mtp_mask_len).to(self.device)
 
         # Initialize RingMla mask
-        rangmla_len = 2048
-        self.ringmla_mask = self.generate_mask_flag(rangmla_len).to(self.device)
+        rangmla_mask_len = 512
+        self.ringmla_mask = self.generate_attn_mask(
+            rangmla_mask_len, "norm", torch.bfloat16
+        ).to(self.device)
 
         # Initialize mixed chunk mask cache
         mixed_chunk_cache_len = 8192
@@ -238,11 +240,12 @@ class AscendAttnBackend(AttentionBackend):
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
             model_runner, self.device, self.use_fia
         )
-        self.mask, self.fia_mask, self.mtp_mask, self.mix_mask = (
+        self.mask, self.fia_mask, self.mtp_mask, self.mix_mask, self.ringmla_mask = (
             self.ascend_attn_mask_builder.mask,
             self.ascend_attn_mask_builder.fia_mask,
             self.ascend_attn_mask_builder.mtp_mask,
             self.ascend_attn_mask_builder.mix_mask_cache,
+            self.ascend_attn_mask_builder.ringmla_mask,
         )
 
     def get_verify_buffers_to_fill_after_draft(self):
