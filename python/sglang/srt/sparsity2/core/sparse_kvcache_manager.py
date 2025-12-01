@@ -139,7 +139,7 @@ class SparseKVCacheManager:
                 "kernel",
             )
         nvtx.end_range(nxtx_range2)
-        return self.req_states.curr_device_indices[:, :-1]
+        return self.req_states.curr_device_indices[:bs, :-1]
 
     def offload_sparse_decode_req_tokens(
         self, req_pool_indices, out_alloc_len, seq_lens
