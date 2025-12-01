@@ -544,10 +544,6 @@ class ModelConfig:
                         with open(quant_config_file) as f:
                             quant_config_dict = json.load(f)
                         quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
-                except huggingface_hub.errors.OfflineModeIsEnabled:
-                    logger.warning(
-                        "Offline mode is enabled, skipping hf_quant_config.json check"
-                    )
                 except Exception as e:
                     logger.warning(
                         f"Failed to check hf_quant_config.json: {self.model_path} {e}"
