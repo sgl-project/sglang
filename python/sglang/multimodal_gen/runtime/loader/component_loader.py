@@ -66,7 +66,7 @@ def _normalize_module_type(module_type: str) -> str:
     if module_type.endswith("_2"):
         return module_type[:-2]
     if module_type.endswith("_3"):
-        return module_type[:-3]
+        return module_type[:-2]
     return module_type
 
 
