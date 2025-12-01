@@ -6,8 +6,9 @@
 #include <cstdint>
 
 namespace {
-__global__ void wait_flag_kernel(const std::uint32_t* flag, std::uint32_t target) {
-  while (atomicAdd((unsigned int*)flag, 0) != target) {
+
+__global__ void wait_flag_kernel(const std::int32_t* flag, std::int32_t target) {
+  while (atomicAdd((int*)flag, 0) != target) {
 #if __CUDA_ARCH__ >= 700
     __nanosleep(100);
 #endif
