@@ -30,7 +30,7 @@ from numpy import float64
 
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -329,22 +329,13 @@ class LRUList:
 
 
 class SWARadixCache(BasePrefixCache):
-    def __init__(
-        self,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: SWATokenToKVPoolAllocator,
-        sliding_window_size: int,
-        page_size: int,
-        disable: bool = False,
-        is_eagle: bool = False,
-        enable_metrics: bool = False,
-    ):
-        assert isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.page_size = page_size
-        self.disable = disable
-        self.is_eagle = is_eagle
+    def __init__(self, params: CacheInitParams, sliding_window_size: int):
+        assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+        self.req_to_token_pool = params.req_to_token_pool
+        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.page_size = params.page_size
+        self.disable = params.disable
+        self.is_eagle = params.is_eagle
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -355,15 +346,15 @@ class SWARadixCache(BasePrefixCache):
             self.key_match_fn = _key_match_page_size1
             self.get_child_key_fn = get_child_key
         else:
-            self.key_match_fn = partial(_key_match_paged, page_size=page_size)
-            self.get_child_key_fn = partial(get_child_key, page_size=page_size)
+            self.key_match_fn = partial(_key_match_paged, page_size=self.page_size)
+            self.get_child_key_fn = partial(get_child_key, page_size=self.page_size)
 
-        if is_eagle:
+        if self.is_eagle:
             self.key_convert_fn = convert_to_bigram_key
         else:
             self.key_convert_fn = lambda key: key
 
-        if enable_metrics:
+        if params.enable_metrics:
             self.init_metrics_collector()
 
         self.sliding_window_size = sliding_window_size
@@ -550,9 +541,14 @@ class SWARadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(
+        match_result = self.match_prefix(
             RadixKey(page_aligned_token_ids, req.extra_key)
         )
+        (new_indices, new_last_node) = (
+            match_result.device_indices,
+            match_result.last_device_node,
+        )
+
         assert old_prefix_len <= len(
             new_indices
         ), f"{req.prefix_indices=}, {new_indices=}"
