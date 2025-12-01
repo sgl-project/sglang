@@ -113,7 +113,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        if req.return_routed_experts:
+                        if req.return_routed_experts and self.attn_tp_rank == 0:
                             if self.server_args.r3_use_storage_backup:
                                 get_global_experts_capturer().sync_fwd_experts_buffer_host_to_storage(
                                     req_pool_idx=req.req_pool_idx,
@@ -350,11 +350,7 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             if req.finished():
-                if (
-                    req.return_routed_experts
-                    and self.attn_tp_rank == 0
-                    and self.pp_rank == 0
-                ):
+                if req.return_routed_experts and self.attn_tp_rank == 0:
                     if self.server_args.r3_use_storage_backup:
                         get_global_experts_capturer().sync_fwd_experts_buffer_host_to_storage(
                             req_pool_idx=req.req_pool_idx,

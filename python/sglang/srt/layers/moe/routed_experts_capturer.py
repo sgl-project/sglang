@@ -235,6 +235,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             with self.lock:
                 self.inflight_count -= 1
 
+    # TODO: use object store instead of local disk
     # Notice: this may create a lot of small files on disk. Make sure the storage can handle it and
     # remove the files when no longer needed.
     def sync_to_disk_thread_func(self):
