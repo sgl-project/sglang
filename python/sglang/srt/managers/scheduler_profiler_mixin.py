@@ -69,6 +69,7 @@ class SchedulerProfilerMixin:
         profile_id: str,
         merge_profiles: bool = False,
         profile_prefix: str = "",
+        profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
         if envs.SGLANG_PROFILE_V2.get():
             return self._profile_manager.configure(
@@ -82,6 +83,7 @@ class SchedulerProfilerMixin:
                 profile_id=profile_id,
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
+                profile_stages=profile_stages,
             )
 
         if self.profile_in_progress:
@@ -377,6 +379,7 @@ class SchedulerProfilerMixin:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.profile_stages,
                 )
             else:
                 self.init_profile(
