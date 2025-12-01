@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from turtle import color
 from typing import TYPE_CHECKING, Any
 
 import nvtx
@@ -23,7 +24,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.sparsity2.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
+from sglang.srt.sparsity2.ops.triton_kernel import invoke_nsa_sparse_diff_kernel, invoke_nsa_sparse_diff_kernel_optimized
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -104,6 +105,7 @@ class SparseKVCacheManager:
         seq_lens,
         layer_id,
     ):
+        nxtx_range = nvtx.start_range(message="init_buffer",color="blue")
         bs = top_k_result.shape[0]
         top_k = top_k_result.shape[1]
 
@@ -117,9 +119,11 @@ class SparseKVCacheManager:
         should_load_host_indices = torch.full(
             (bs, top_k), -1, dtype=torch.int64, device=top_k_result.device
         )
-
         full_host_indices = [self.req_states.full_host_indices[idx] for idx in req_pool_indices]
-        invoke_nsa_sparse_diff_kernel(
+        nvtx.end_range(nxtx_range)
+        
+        nxtx_range1 = nvtx.start_range(message="diff_kernel",color="blue")
+        invoke_nsa_sparse_diff_kernel_optimized(
             self.req_states.prev_top_k_result,
             top_k_result,
             self.req_states.prev_device_indices,
@@ -133,7 +137,9 @@ class SparseKVCacheManager:
             req_pool_indices,
             layer_id,
         )
+        nvtx.end_range(nxtx_range1)
 
+        nxtx_range2 = nvtx.start_range(message="io_kernel",color="blue")
         should_load_device_indices = should_load_device_indices[should_load_device_indices != -1]
         should_load_host_indices = should_load_host_indices[should_load_host_indices != -1]
         assert len(should_load_device_indices) == len(should_load_host_indices)
@@ -146,7 +152,7 @@ class SparseKVCacheManager:
                 layer_id,
                 "kernel",
             )
-
+        nvtx.end_range(nxtx_range2)
         return curr_device_indices[:, :-1]
 
 
