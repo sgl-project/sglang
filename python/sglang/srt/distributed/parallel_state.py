@@ -1286,7 +1286,7 @@ class GroupCoordinator:
 
     def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
         """Sends a tensor to the destination rank in a non-blocking way"""
-        """NOTE: `dst` is the local rank of the destination rank."""
+        """NOTE: `dst` is the global rank of the destination."""
         if dst is None:
             dst = self.ranks[(self.rank_in_group + 1) % self.world_size]
 
@@ -1300,7 +1300,7 @@ class GroupCoordinator:
         self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
-        """NOTE: `src` is the local rank of the source rank."""
+        """NOTE: `src` is the global rank of the source."""
         if src is None:
             src = self.ranks[(self.rank_in_group - 1) % self.world_size]
 
