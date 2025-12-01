@@ -927,9 +927,33 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
+    type: Literal["web_search_preview", "code_interpreter", "function"] = Field(
         description="Type of tool to enable"
     )
+    # Function tool fields (required when type="function")
+    name: Optional[str] = Field(
+        default=None,
+        description="Name of the function (required for function type)",
+    )
+    description: Optional[str] = Field(
+        default=None,
+        description="Description of what the function does",
+    )
+    parameters: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="JSON Schema for function parameters",
+    )
+    strict: Optional[bool] = Field(
+        default=None,
+        description="Whether to enforce strict schema validation",
+    )
+
+    @model_validator(mode="after")
+    def validate_function_fields(self) -> "ResponseTool":
+        """Validate that function tools have required fields."""
+        if self.type == "function" and not self.name:
+            raise ValueError("Function tools must have a 'name' field")
+        return self
 
 
 ResponseInputOutputItem: TypeAlias = Union[
@@ -969,7 +993,7 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
