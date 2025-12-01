@@ -2631,7 +2631,9 @@ def run_scheduler_process(
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    if (numa_node := server_args.numa_node) is not None:
+    if (
+        numa_node := server_args.numa_node
+    ) is not None and not envs.SGLANG_NUMA_BIND_V2.get():
         numa_bind_to_node(numa_node[gpu_id])
 
     # Set up tracing
