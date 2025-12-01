@@ -518,7 +518,7 @@ class ForwardBatch:
     def adjust_num_token_non_padded_for_attn_tp(self) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
         dp_rank = get_attention_dp_rank()
-        num_tokens_per_dp = int(self.global_num_tokens_gpu[dp_rank].item())
+        num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank].item()
 
         local = compute_local_num_token_non_padded(
             global_num_token_non_padded=self.num_token_non_padded,
