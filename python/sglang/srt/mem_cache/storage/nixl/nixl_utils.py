@@ -106,7 +106,7 @@ class NixlRegistration:
                 return []
             return [(0, 0, 0, file_manager.get_file_path(key))]
         else:  # OBJ
-            return [(0, 0, key)]
+            return [(0, 0, 0, key)]
 
     def _register_memory(
         self,
