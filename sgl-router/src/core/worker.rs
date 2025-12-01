@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use tokio::{sync::RwLock, time};
 
-use super::{CircuitBreaker, WorkerError, WorkerResult};
+use super::{
+    CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
+};
 use crate::{
     core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
     metrics::RouterMetrics,
@@ -389,6 +391,50 @@ pub struct WorkerMetadata {
     pub bootstrap_host: String,
     /// Cached bootstrap port (from WorkerType::Prefill)
     pub bootstrap_port: Option<u16>,
+    /// Models this worker can serve.
+    /// If empty, worker accepts any model (backward compatible behavior).
+    pub models: Vec<ModelCard>,
+    /// Default provider for this worker (used when model doesn't specify one).
+    /// `None` means native/passthrough.
+    pub default_provider: Option<ProviderType>,
+    /// Default model type for unknown models (defaults to LLM capabilities).
+    pub default_model_type: ModelType,
+}
+
+impl WorkerMetadata {
+    /// Find a model card by ID (including aliases)
+    pub fn find_model(&self, model_id: &str) -> Option<&ModelCard> {
+        self.models.iter().find(|m| m.matches(model_id))
+    }
+
+    /// Check if this worker can serve a given model.
+    /// If models list is empty, worker accepts any model (backward compatible).
+    pub fn supports_model(&self, model_id: &str) -> bool {
+        self.models.is_empty() || self.find_model(model_id).is_some()
+    }
+
+    /// Check if this worker supports an endpoint for a given model.
+    /// Falls back to default_model_type if model not found.
+    pub fn supports_endpoint(&self, model_id: &str, endpoint: Endpoint) -> bool {
+        if let Some(model) = self.find_model(model_id) {
+            model.supports_endpoint(endpoint)
+        } else {
+            self.default_model_type.supports_endpoint(endpoint)
+        }
+    }
+
+    /// Get the provider for a given model.
+    /// Returns the model's provider if found, otherwise the worker's default provider.
+    pub fn provider_for_model(&self, model_id: &str) -> Option<&ProviderType> {
+        self.find_model(model_id)
+            .and_then(|m| m.provider.as_ref())
+            .or(self.default_provider.as_ref())
+    }
+
+    /// Get all model IDs this worker can serve
+    pub fn model_ids(&self) -> impl Iterator<Item = &str> {
+        self.models.iter().map(|m| m.id.as_str())
+    }
 }
 
 /// Basic worker implementation
@@ -1797,5 +1843,202 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+
+    // === Phase 1.3: WorkerMetadata model methods tests ===
+
+    #[test]
+    fn test_worker_metadata_empty_models_accepts_all() {
+        let metadata = WorkerMetadata {
+            url: "http://test:8080".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
+            labels: std::collections::HashMap::new(),
+            health_config: HealthConfig::default(),
+            api_key: None,
+            bootstrap_host: "test".to_string(),
+            bootstrap_port: None,
+            models: Vec::new(), // Empty = accepts any model
+            default_provider: None,
+            default_model_type: ModelType::LLM,
+        };
+
+        // Empty models list should accept any model
+        assert!(metadata.supports_model("any-model"));
+        assert!(metadata.supports_model("gpt-4"));
+        assert!(metadata.supports_model("llama-3.1"));
+    }
+
+    #[test]
+    fn test_worker_metadata_find_model() {
+        use super::ModelCard;
+
+        let model1 = ModelCard::new("meta-llama/Llama-3.1-8B")
+            .with_alias("llama-3.1-8b")
+            .with_alias("llama3.1");
+        let model2 = ModelCard::new("gpt-4o");
+
+        let metadata = WorkerMetadata {
+            url: "http://test:8080".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
+            labels: std::collections::HashMap::new(),
+            health_config: HealthConfig::default(),
+            api_key: None,
+            bootstrap_host: "test".to_string(),
+            bootstrap_port: None,
+            models: vec![model1, model2],
+            default_provider: None,
+            default_model_type: ModelType::LLM,
+        };
+
+        // Find by primary ID
+        assert!(metadata.find_model("meta-llama/Llama-3.1-8B").is_some());
+        assert!(metadata.find_model("gpt-4o").is_some());
+
+        // Find by alias
+        assert!(metadata.find_model("llama-3.1-8b").is_some());
+        assert!(metadata.find_model("llama3.1").is_some());
+
+        // Not found
+        assert!(metadata.find_model("unknown-model").is_none());
+    }
+
+    #[test]
+    fn test_worker_metadata_supports_model_with_list() {
+        use super::ModelCard;
+
+        let model1 = ModelCard::new("model-a").with_alias("alias-a");
+        let model2 = ModelCard::new("model-b");
+
+        let metadata = WorkerMetadata {
+            url: "http://test:8080".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
+            labels: std::collections::HashMap::new(),
+            health_config: HealthConfig::default(),
+            api_key: None,
+            bootstrap_host: "test".to_string(),
+            bootstrap_port: None,
+            models: vec![model1, model2],
+            default_provider: None,
+            default_model_type: ModelType::LLM,
+        };
+
+        // Should support listed models
+        assert!(metadata.supports_model("model-a"));
+        assert!(metadata.supports_model("alias-a"));
+        assert!(metadata.supports_model("model-b"));
+
+        // Should not support unlisted models
+        assert!(!metadata.supports_model("model-c"));
+    }
+
+    #[test]
+    fn test_worker_metadata_supports_endpoint() {
+        use super::{Endpoint, ModelCard};
+
+        let embed_model =
+            ModelCard::new("text-embedding-3-small").with_model_type(ModelType::EMBEDDINGS);
+        let llm_model = ModelCard::new("gpt-4o").with_model_type(ModelType::LLM);
+
+        let metadata = WorkerMetadata {
+            url: "http://test:8080".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
+            labels: std::collections::HashMap::new(),
+            health_config: HealthConfig::default(),
+            api_key: None,
+            bootstrap_host: "test".to_string(),
+            bootstrap_port: None,
+            models: vec![embed_model, llm_model],
+            default_provider: None,
+            default_model_type: ModelType::LLM,
+        };
+
+        // Embedding model supports embeddings but not chat
+        assert!(metadata.supports_endpoint("text-embedding-3-small", Endpoint::Embeddings));
+        assert!(!metadata.supports_endpoint("text-embedding-3-small", Endpoint::Chat));
+
+        // LLM model supports chat but not embeddings
+        assert!(metadata.supports_endpoint("gpt-4o", Endpoint::Chat));
+        assert!(!metadata.supports_endpoint("gpt-4o", Endpoint::Embeddings));
+
+        // Unknown model falls back to default_model_type (LLM)
+        assert!(metadata.supports_endpoint("unknown", Endpoint::Chat));
+        assert!(!metadata.supports_endpoint("unknown", Endpoint::Embeddings));
+    }
+
+    #[test]
+    fn test_worker_metadata_provider_for_model() {
+        use super::{ModelCard, ProviderType};
+
+        let openai_model = ModelCard::new("gpt-4o").with_provider(ProviderType::OpenAI);
+        let native_model = ModelCard::new("llama-3.1"); // No provider = native
+
+        let metadata = WorkerMetadata {
+            url: "http://test:8080".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
+            labels: std::collections::HashMap::new(),
+            health_config: HealthConfig::default(),
+            api_key: None,
+            bootstrap_host: "test".to_string(),
+            bootstrap_port: None,
+            models: vec![openai_model, native_model],
+            default_provider: Some(ProviderType::XAI), // Default for unknown models
+            default_model_type: ModelType::LLM,
+        };
+
+        // OpenAI model returns OpenAI provider
+        assert_eq!(
+            metadata.provider_for_model("gpt-4o"),
+            Some(&ProviderType::OpenAI)
+        );
+
+        // Native model returns None (model has no provider)
+        // But falls back to worker's default_provider
+        assert_eq!(
+            metadata.provider_for_model("llama-3.1"),
+            Some(&ProviderType::XAI)
+        );
+
+        // Unknown model returns worker's default_provider
+        assert_eq!(
+            metadata.provider_for_model("unknown"),
+            Some(&ProviderType::XAI)
+        );
+    }
+
+    #[test]
+    fn test_worker_metadata_model_ids() {
+        use super::ModelCard;
+
+        let model1 = ModelCard::new("model-a");
+        let model2 = ModelCard::new("model-b");
+        let model3 = ModelCard::new("model-c");
+
+        let metadata = WorkerMetadata {
+            url: "http://test:8080".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
+            labels: std::collections::HashMap::new(),
+            health_config: HealthConfig::default(),
+            api_key: None,
+            bootstrap_host: "test".to_string(),
+            bootstrap_port: None,
+            models: vec![model1, model2, model3],
+            default_provider: None,
+            default_model_type: ModelType::LLM,
+        };
+
+        let ids: Vec<&str> = metadata.model_ids().collect();
+        assert_eq!(ids, vec!["model-a", "model-b", "model-c"]);
     }
 }
