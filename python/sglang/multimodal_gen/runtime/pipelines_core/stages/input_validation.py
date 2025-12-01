@@ -46,7 +46,6 @@ class InputValidationStage(PipelineStage):
     """
 
     def __init__(self, vae_image_processor=None):
-
         super().__init__()
         self.vae_image_processor = vae_image_processor
 
