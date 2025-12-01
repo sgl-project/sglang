@@ -175,10 +175,6 @@ RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
-# In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
-# latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0" --extra-index-url https://pypi.org/simple/
-
 # Python tools
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     datamodel_code_generator \
@@ -206,6 +202,10 @@ elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl-cu13 ; \
     python3 -m pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} --force-reinstall --no-deps; \
 fi
+
+# In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
+# latest flashinfer_cutedsl. After drivers on CI runners are updated, move this dependency to pyproject.toml
+RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps
 
 # Install development tools and utilities
 RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -y \
