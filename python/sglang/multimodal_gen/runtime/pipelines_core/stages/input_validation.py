@@ -41,6 +41,11 @@ class InputValidationStage(PipelineStage):
     In this stage, input image and output image may be resized
     """
 
+    def __init__(self, vae_image_processor=None):
+
+        super().__init__()
+        self.vae_image_processor = vae_image_processor
+
     def _generate_seeds(self, batch: Req, server_args: ServerArgs):
         """Generate seeds for the inference"""
         seed = batch.seed
@@ -226,15 +231,19 @@ class InputValidationStage(PipelineStage):
                 # resize condition image if necessary
                 if calculated_size is not None:
                     calculated_width, calculated_height = calculated_size
-                    condition_image = (
-                        server_args.pipeline_config.resize_condition_image(
-                            image, calculated_width, calculated_height
+                    print(f"{calculated_width=} {calculated_height=}")
+                    condition_image, calculated_size = (
+                        server_args.pipeline_config.preprocess_condition_image(
+                            image,
+                            calculated_width,
+                            calculated_height,
+                            self.vae_image_processor,
                         )
                     )
                     batch.condition_image = condition_image
 
                 # adjust output image size
-                calculated_width, calculated_height = batch.condition_image.size
+                calculated_width, calculated_height = calculated_size
                 width = calculated_width if batch.width_not_provided else batch.width
                 height = (
                     calculated_height if batch.height_not_provided else batch.height

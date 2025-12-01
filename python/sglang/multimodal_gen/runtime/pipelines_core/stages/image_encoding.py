@@ -11,7 +11,6 @@ import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
@@ -51,7 +50,6 @@ class ImageEncodingStage(PipelineStage):
         image_processor,
         image_encoder=None,
         text_encoder=None,
-        vae_image_processor=None,
     ) -> None:
         """
         Initialize the prompt encoding stage.
@@ -61,7 +59,6 @@ class ImageEncodingStage(PipelineStage):
         """
         super().__init__()
         self.image_processor = image_processor
-        self.vae_image_processor = vae_image_processor
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
@@ -255,6 +252,7 @@ class ImageVAEEncodingStage(PipelineStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
+        print(f"{video_condition.shape=}")
         # Encode Image
         with torch.autocast(
             device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
@@ -275,13 +273,13 @@ class ImageVAEEncodingStage(PipelineStage):
         # TODO: verify
         sample_mode = (
             "argmax"
-            if server_args.pipeline_config.task_type == ModelTaskType.I2I
+            if server_args.pipeline_config.task_type.is_image_gen()
             else "sample"
         )
         latent_condition = self.retrieve_latents(
             encoder_output, generator, sample_mode=sample_mode
         )
-
+        print(f"284 {latent_condition.shape=}")
         latent_condition = server_args.pipeline_config.postprocess_vae_encode(
             latent_condition, self.vae
         )
