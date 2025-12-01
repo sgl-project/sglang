@@ -204,28 +204,28 @@ pub trait Worker: Send + Sync + fmt::Debug {
     }
 
     /// Get tokenizer path for a specific model.
-    fn tokenizer_path_for_model(&self, model_id: &str) -> Option<&str> {
+    fn tokenizer_path(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.tokenizer_path.as_deref())
     }
 
     /// Get reasoning parser for a specific model.
-    fn reasoning_parser_for_model(&self, model_id: &str) -> Option<&str> {
+    fn reasoning_parser(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.reasoning_parser.as_deref())
     }
 
     /// Get tool parser for a specific model.
-    fn tool_parser_for_model(&self, model_id: &str) -> Option<&str> {
+    fn tool_parser(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.tool_parser.as_deref())
     }
 
     /// Get chat template for a specific model.
-    fn chat_template_for_model(&self, model_id: &str) -> Option<&str> {
+    fn chat_template(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.chat_template.as_deref())
@@ -1058,12 +1058,10 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         load: worker.load(),
         connection_mode: format!("{:?}", worker.connection_mode()),
         runtime_type,
-        tokenizer_path: worker.tokenizer_path_for_model(model_id).map(String::from),
-        reasoning_parser: worker
-            .reasoning_parser_for_model(model_id)
-            .map(String::from),
-        tool_parser: worker.tool_parser_for_model(model_id).map(String::from),
-        chat_template: worker.chat_template_for_model(model_id).map(String::from),
+        tokenizer_path: worker.tokenizer_path(model_id).map(String::from),
+        reasoning_parser: worker.reasoning_parser(model_id).map(String::from),
+        tool_parser: worker.tool_parser(model_id).map(String::from),
+        chat_template: worker.chat_template(model_id).map(String::from),
         bootstrap_port,
         metadata: worker.metadata().labels.clone(),
         job_status: None,
@@ -2079,7 +2077,7 @@ mod tests {
     // === Phase 1.4: Worker trait model-aware methods tests ===
 
     #[test]
-    fn test_worker_tokenizer_path_for_model() {
+    fn test_worker_tokenizer_path() {
         use super::ModelCard;
         use crate::core::BasicWorkerBuilder;
 
@@ -2093,12 +2091,12 @@ mod tests {
 
         // Should find the tokenizer_path from the ModelCard
         assert_eq!(
-            worker.tokenizer_path_for_model("my-model"),
+            worker.tokenizer_path("my-model"),
             Some("my-model/tokenizer")
         );
 
         // Unknown model should return None
-        assert_eq!(worker.tokenizer_path_for_model("unknown-model"), None);
+        assert_eq!(worker.tokenizer_path("unknown-model"), None);
     }
 
     #[test]
@@ -2122,32 +2120,23 @@ mod tests {
         worker.metadata.models = vec![model_with_config, model_without_config];
 
         // Model with explicit config should use ModelCard values
-        assert_eq!(
-            worker.tokenizer_path_for_model("gpt-4o"),
-            Some("gpt4o/tokenizer")
-        );
-        assert_eq!(
-            worker.chat_template_for_model("gpt-4o"),
-            Some("gpt4o_template")
-        );
-        assert_eq!(
-            worker.reasoning_parser_for_model("gpt-4o"),
-            Some("gpt4o_reasoning")
-        );
-        assert_eq!(worker.tool_parser_for_model("gpt-4o"), Some("gpt4o_tools"));
+        assert_eq!(worker.tokenizer_path("gpt-4o"), Some("gpt4o/tokenizer"));
+        assert_eq!(worker.chat_template("gpt-4o"), Some("gpt4o_template"));
+        assert_eq!(worker.reasoning_parser("gpt-4o"), Some("gpt4o_reasoning"));
+        assert_eq!(worker.tool_parser("gpt-4o"), Some("gpt4o_tools"));
         assert_eq!(
             worker.provider_for_model("gpt-4o"),
             Some(&ProviderType::OpenAI)
         );
 
         // Model without explicit config should return None (no fallback to labels)
-        assert_eq!(worker.tokenizer_path_for_model("llama-3.1"), None);
-        assert_eq!(worker.chat_template_for_model("llama-3.1"), None);
-        assert_eq!(worker.reasoning_parser_for_model("llama-3.1"), None);
-        assert_eq!(worker.tool_parser_for_model("llama-3.1"), None);
+        assert_eq!(worker.tokenizer_path("llama-3.1"), None);
+        assert_eq!(worker.chat_template("llama-3.1"), None);
+        assert_eq!(worker.reasoning_parser("llama-3.1"), None);
+        assert_eq!(worker.tool_parser("llama-3.1"), None);
 
         // Unknown model should return None
-        assert_eq!(worker.tokenizer_path_for_model("unknown"), None);
+        assert_eq!(worker.tokenizer_path("unknown"), None);
     }
 
     #[test]
