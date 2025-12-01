@@ -18,7 +18,7 @@ from __future__ import annotations
 import bisect
 import gc
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Union
 
 import torch
@@ -58,27 +58,6 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-@contextmanager
-def disable_ca_comm(tp_group):
-    """
-    Context manager to temporarily disable custom allreduce communication.
-
-    This is used during Piecewise CUDA graph capture to avoid custom allreduce operations
-    that may not be compatible with graph capture.
-
-    TODO(yuwei): Fix this
-    """
-    old_disabled = None
-    try:
-        if tp_group.ca_comm is not None:
-            old_disabled = tp_group.ca_comm.disabled
-            tp_group.ca_comm.disabled = True
-        yield
-    finally:
-        if tp_group.ca_comm is not None and old_disabled is not None:
-            tp_group.ca_comm.disabled = old_disabled
 
 
 @contextmanager
@@ -219,7 +198,11 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        with enable_piecewise_cuda_graph():
+        # Get ca_comm context for proper IPC buffer registration during CUDA graph capture
+        ca_comm = self.model_runner.tp_group.ca_comm
+        maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
+
+        with enable_piecewise_cuda_graph(), maybe_ca_context:
             with patch_model(
                 self.model_runner.model.model, self.compile_config.compiler
             ) as patched_model:
@@ -311,7 +294,7 @@ class PiecewiseCudaGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         with set_forward_context(
             forward_batch, self.attention_layers, self.quant_config
-        ), disable_ca_comm(self.model_runner.tp_group):
+        ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -339,9 +322,7 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(
-            self.model_runner.server_args.enable_cudagraph_gc
-        ), disable_ca_comm(self.model_runner.tp_group):
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -476,7 +457,9 @@ class PiecewiseCudaGraphRunner:
                 )
             return
 
-        for _ in range(3):
+        # Run 2 times (not 3) since warmup_torch_compile() already triggered first_run.
+        # With 2 runs: Run 1 = warmup, Run 2 = capture. No replay during capture.
+        for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
@@ -596,7 +579,7 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        with enable_piecewise_cuda_graph(), disable_ca_comm(self.model_runner.tp_group):
+        with enable_piecewise_cuda_graph():
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
