@@ -170,6 +170,11 @@ RUN pip install IPython \
     && pip install torchao==0.9.0 \
     && pip install pybind11
 
+RUN git clone https://github.com/feifeibear/long-context-attention.git long-context-attention \
+    && cd long-context-attention \
+    && git checkout 7a52abd669efb35e550680a239e1745b620b2bae \
+    && pip install -e .
+
 RUN pip uninstall -y sgl_kernel sglang
 RUN git clone ${SGL_REPO} \
     && cd sglang \
