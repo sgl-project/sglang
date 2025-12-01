@@ -20,4 +20,4 @@ What makes SGLang essential for training? Beyond industry-leading throughput via
 
 ## Collaboration
 
-Interested in integrating SGLang with your training framework or need technical support? We're here to help! Reach out to us at **sglang@lmsys.org** for partnerships, integration guidance, and custom feature development.
+Interested in integrating SGLang with your training framework or need technical support? We're here to help! Reach out to us at **rl_team@lmsys.org** for partnerships, integration guidance, and custom feature development.
