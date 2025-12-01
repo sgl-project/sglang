@@ -331,7 +331,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Health check
         self.server_status = ServerStatus.Starting
-        self.gracefully_exit = False
+        self.gracefully_exit = asyncio.Event()
         self.last_receive_tstamp = 0
 
         # For load balancing
@@ -2021,8 +2021,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         return filename
 
     async def sigterm_watchdog(self):
-        while not self.gracefully_exit:
-            await asyncio.sleep(5)
+        await self.gracefully_exit.wait()
 
         # Drain requests
         while True:
@@ -2289,7 +2288,7 @@ class SignalHandler:
         logger.warning(
             f"SIGTERM received. {signum=} {frame=}. Draining requests and shutting down..."
         )
-        self.tokenizer_manager.gracefully_exit = True
+        self.tokenizer_manager.gracefully_exit.set()
 
     def running_phase_sigquit_handler(self, signum=None, frame=None):
         logger.error(
