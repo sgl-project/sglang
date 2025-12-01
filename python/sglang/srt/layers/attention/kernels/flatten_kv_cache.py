@@ -79,19 +79,10 @@ def _flatten_kv_cache_quant_sglang(
     batch_id = tl.program_id(1)  # Which sequence in batch
     head_id = tl.program_id(2)   # Which head
     
-    num_batches = tl.num_programs(1)
-    
-    # Get sequence length for this batch item
     seqlen = tl.load(cache_seqlens_ptr + batch_id)
-    
-    # Get starting position in flattened output
     start_loc = tl.load(cu_seqlens_k_ptr + batch_id)
     
-    # For last batch, may need to fill to OUT_SIZE to prevent NaN
-    if batch_id == num_batches - 1:
-        seqlen = OUT_SIZE - start_loc
     
-    # Skip if this block is beyond the sequence length
     if block_id * BLOCK_SIZE >= seqlen:
         return
     
@@ -111,10 +102,10 @@ def _flatten_kv_cache_quant_sglang(
         mask_dk_packed = offs_dk < HALF_HDK
         mask_dv_packed = offs_dv < HALF_HDV
     else:
-        offs_dk = tl.arange(0, BLOCK_DK) % HEAD_DIM_K
-        offs_dv = tl.arange(0, BLOCK_DV) % HEAD_DIM_V
-        mask_dk_packed = None
-        mask_dv_packed = None
+        offs_dk = tl.arange(0, BLOCK_DK)
+        offs_dv = tl.arange(0, BLOCK_DV)
+        mask_dk_packed = offs_dk < HEAD_DIM_K
+        mask_dv_packed = offs_dv < HEAD_DIM_V
     
     # Output token offsets (in flattened space)
     offs_out_tok = block_id * BLOCK_SIZE + offs_tok
