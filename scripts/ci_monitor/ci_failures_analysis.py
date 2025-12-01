@@ -60,16 +60,22 @@ class SGLangFailuresAnalyzer:
         ]
 
     def get_recent_runs(self, limit: int = 500) -> List[Dict]:
-        """Fetch recent workflow runs from GitHub API."""
-        print(f"Fetching {limit} recent workflow runs...")
+        """
+        Fetch recent workflow runs from GitHub API.
+        Keeps fetching until we have 'limit' runs from target workflows.
+        """
+        print(
+            f"Fetching until we have {limit} runs from target workflows (PR Test, PR Test AMD, PR Test Xeon)..."
+        )
 
-        all_runs = []
+        filtered_runs = []
         page = 1
         per_page = 100
+        max_pages = 100  # Safety limit to prevent infinite loops (10,000 total runs)
 
-        while len(all_runs) < limit:
+        while len(filtered_runs) < limit and page <= max_pages:
             url = f"{self.base_url}/repos/{self.repo}/actions/runs"
-            params = {"per_page": min(per_page, limit - len(all_runs)), "page": page}
+            params = {"per_page": per_page, "page": page}
 
             try:
                 response = self.session.get(url, params=params, timeout=30)
@@ -77,12 +83,25 @@ class SGLangFailuresAnalyzer:
                 data = response.json()
 
                 if not data.get("workflow_runs"):
+                    print("No more workflow runs available")
                     break
 
-                all_runs.extend(data["workflow_runs"])
-                print(f"Fetched {len(all_runs)} runs so far...")
+                # Filter this batch to target workflows
+                batch_filtered = [
+                    run
+                    for run in data["workflow_runs"]
+                    if run.get("name") in self.target_workflows
+                    and run.get("status") == "completed"
+                ]
 
+                filtered_runs.extend(batch_filtered)
+                print(
+                    f"Fetched {len(filtered_runs)} target workflow runs so far (scanned page {page})..."
+                )
+
+                # If GitHub returned fewer than per_page, we've reached the end
                 if len(data["workflow_runs"]) < per_page:
+                    print("Reached end of available workflow runs")
                     break
 
                 page += 1
@@ -92,15 +111,12 @@ class SGLangFailuresAnalyzer:
                 print(f"Error fetching workflow runs: {e}")
                 break
 
-        # Filter to target workflows only
-        filtered_runs = [
-            run
-            for run in all_runs
-            if run.get("name") in self.target_workflows
-            and run.get("status") == "completed"
-        ]
+        if page > max_pages:
+            print(
+                f"Warning: Reached max pages limit ({max_pages}). Consider reducing --limit or increasing max_pages."
+            )
 
-        print(f"Filtered to {len(filtered_runs)} completed target workflow runs")
+        print(f"Collected {len(filtered_runs)} completed target workflow runs")
         return filtered_runs[:limit]
 
     def get_jobs_for_run(self, run_id: int) -> List[Dict]:
@@ -717,6 +733,78 @@ class SGLangFailuresAnalyzer:
         else:
             return f"Step Failed: {step_name[:50]}"
 
+    def construct_cron_failures_on_main(
+        self, runs: List[Dict], overall_job_streak_data: Dict[str, Dict]
+    ) -> Tuple[Dict[str, Dict], Dict[str, int]]:
+        """
+        Analyses consecutive failures for each job triggered by cron on main branch only.
+        Compares error signatures with overall data to detect if main-branch failures
+        have same or different error patterns than PR-triggered failures.
+
+        Args:
+            runs: All workflow runs (will be filtered to cron-triggered only)
+            overall_job_streak_data: Overall job streak data (from all runs) for comparison
+
+        Returns:
+            Tuple of (main_streak_data, job_current_streaks_main)
+            - main_streak_data: Same structure as job_streak_data, plus 'matches_overall_error' field
+            - job_current_streaks_main: Dict mapping job name to current streak count on main
+        """
+        print(
+            "\nAnalyzing consecutive failures on main branch (cron-triggered runs only)..."
+        )
+
+        # Filter to only cron-triggered runs (scheduled runs)
+        # Scheduled/cron runs have event == 'schedule'
+        cron_runs = [run for run in runs if run.get("event") == "schedule"]
+
+        print(
+            f"Found {len(cron_runs)} cron-triggered runs out of {len(runs)} total runs"
+        )
+
+        # Debug: Show first 3 filtered cron runs to verify
+        if cron_runs:
+            print("\n=== DEBUG: First 3 cron runs found ===")
+            for i, run in enumerate(cron_runs[:3]):
+                print(f"\nCron Run {i+1}:")
+                print(f"  run_number: {run.get('run_number')}")
+                print(f"  name: {run.get('name')}")
+                print(f"  event: {run.get('event')}")
+                print(f"  head_branch: {run.get('head_branch')}")
+                print(f"  status: {run.get('status')}")
+                print(f"  conclusion: {run.get('conclusion')}")
+            print("=== END DEBUG ===\n")
+
+        if not cron_runs:
+            print("No cron-triggered runs found")
+            return {}, {}
+
+        # Reuse existing analyze_consecutive_failures on filtered runs
+        main_streak_data, job_current_streaks_main = self.analyze_consecutive_failures(
+            cron_runs
+        )
+
+        # Now add comparison with overall data for at-a-glance diagnostics
+        for job_name, main_data in main_streak_data.items():
+            matches_overall_error = False
+
+            if job_name in overall_job_streak_data:
+                main_top_errors = main_data.get("top_error_signatures", [])
+                overall_top_errors = overall_job_streak_data[job_name].get(
+                    "top_error_signatures", []
+                )
+
+                if main_top_errors and overall_top_errors:
+                    # Check if the most common error on main matches the most common overall error
+                    main_top_error = main_top_errors[0][0]
+                    overall_top_error = overall_top_errors[0][0]
+                    matches_overall_error = main_top_error == overall_top_error
+
+            # Add comparison flag to the data
+            main_data["matches_overall_error"] = matches_overall_error
+
+        return main_streak_data, job_current_streaks_main
+
     def analyze_consecutive_failures(
         self, runs: List[Dict]
     ) -> Tuple[Dict[str, Dict], Dict[str, int]]:
@@ -1008,6 +1096,7 @@ class SGLangFailuresAnalyzer:
         runner_alerts: Optional[List[Dict]] = None,
         runner_streak_data: Optional[Dict[str, Dict]] = None,
         runner_instance_streak_data: Optional[Dict[str, Dict]] = None,
+        main_streak_data: Optional[Dict[str, Dict]] = None,
         output_file: Optional[str] = None,
     ):
         """Generate detailed failure analysis report."""
@@ -1031,6 +1120,19 @@ class SGLangFailuresAnalyzer:
             f"Jobs with Active Failure Streaks: {sum(1 for j in sorted_jobs if j[1]['current_streak'] > 0)}"
         )
         print(f"Job Alerts Triggered: {len(job_alerts)}")
+
+        # Add counter for main branch cron jobs
+        if main_streak_data:
+            main_jobs_count = len(main_streak_data)
+            main_jobs_with_streaks = sum(
+                1 for j in main_streak_data.values() if j["current_streak"] > 0
+            )
+            print(
+                f"Jobs on Main Branch (cron-triggered): {main_jobs_count} ({main_jobs_with_streaks} with active streaks)"
+            )
+        else:
+            print(f"Jobs on Main Branch (cron-triggered): 0 (no cron runs found)")
+
         if runner_stats:
             print(f"Total Runners Analyzed: {len(runner_stats)}")
             print(
@@ -1191,6 +1293,80 @@ class SGLangFailuresAnalyzer:
                     "\nNothing to display (no runners with consecutive failure streak > 2)"
                 )
 
+        # Main Branch Health Section: Jobs failing on cron-triggered main branch runs
+        if main_streak_data:
+            # Sort by current streak (descending)
+            sorted_main_jobs = sorted(
+                main_streak_data.items(),
+                key=lambda x: (x[1]["current_streak"], x[1]["failure_rate"]),
+                reverse=True,
+            )
+
+            # Show ALL jobs with ANY active streak on main (even streak=1 is concerning on main)
+            broken_main_jobs = [
+                (name, data)
+                for name, data in sorted_main_jobs
+                if data["current_streak"] >= 1
+            ]
+
+            if broken_main_jobs:
+                print("\n" + "=" * 150)
+                print(
+                    f"## MAIN BRANCH HEALTH: Failing Jobs on Scheduled Main Branch Runs ({len(broken_main_jobs)} jobs)"
+                )
+                print("=" * 150)
+                print(
+                    f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Match':<7} {'Top Errors':<50}"
+                )
+                print("-" * 150)
+                for job_name, data in broken_main_jobs[:15]:
+                    display_name = (
+                        job_name if len(job_name) <= 38 else job_name[:35] + "..."
+                    )
+
+                    # Get first and last failure info
+                    first_failure = data.get("first_failure_in_streak")
+                    first_failure_str = (
+                        f"Run #{first_failure['run_number']}"
+                        if first_failure
+                        else "N/A"
+                    )
+
+                    last_failure = data.get("last_failure_in_streak")
+                    last_failure_str = (
+                        f"Run #{last_failure['run_number']}" if last_failure else "N/A"
+                    )
+
+                    # Visual indicator for error signature match
+                    # ✓ = same error on main and overall (consistent failure pattern)
+                    # ✗ = different errors (main has different failure than PRs)
+                    matches = data.get("matches_overall_error", False)
+                    match_indicator = "✓" if matches else "✗"
+
+                    # Format top errors - don't truncate
+                    top_errors = data.get("top_error_signatures", [])
+                    if top_errors:
+                        error_display = ", ".join(
+                            [f"{err[0]} ({err[1]})" for err in top_errors]
+                        )
+                    else:
+                        error_display = "N/A"
+
+                    print(
+                        f"{display_name:<40} {data['current_streak']:<8} {data['max_streak']:<6} {first_failure_str:<13} {last_failure_str:<13} {match_indicator:<7} {error_display:<50}"
+                    )
+
+                print(
+                    "\n  Legend: Match column - ✓ = same error as overall failures, ✗ = different error signature on main"
+                )
+            else:
+                print("\n" + "=" * 100)
+                print("## MAIN BRANCH HEALTH: Scheduled Main Branch Runs")
+                print("=" * 100)
+                print(
+                    f"\n  ✓ All {len(sorted_main_jobs)} jobs passing on main branch scheduled runs!"
+                )
+
         # Section 1: Currently Broken Jobs (streak >= 2)
         broken_jobs = [
             (name, data) for name, data in sorted_jobs if data["current_streak"] >= 2
@@ -1344,6 +1520,14 @@ class SGLangFailuresAnalyzer:
                 overall_avg_queue = sum(all_avg_queue_times) / len(all_avg_queue_times)
                 overall_p90_queue = sum(all_p90_queue_times) / len(all_p90_queue_times)
 
+        # Calculate main branch stats
+        main_jobs_count = len(main_streak_data) if main_streak_data else 0
+        main_jobs_with_streaks = (
+            sum(1 for j in main_streak_data.values() if j["current_streak"] > 0)
+            if main_streak_data
+            else 0
+        )
+
         report_data = {
             "summary": {
                 "total_jobs": len(sorted_jobs),
@@ -1357,6 +1541,8 @@ class SGLangFailuresAnalyzer:
                 "analysis_timestamp": datetime.now().isoformat(),
                 "avg_queue_time_seconds": overall_avg_queue,
                 "p90_queue_time_seconds": overall_p90_queue,
+                "main_jobs_count": main_jobs_count,
+                "main_jobs_with_streaks": main_jobs_with_streaks,
             },
             "job_streak_data": {
                 job_name: {
@@ -1377,6 +1563,7 @@ class SGLangFailuresAnalyzer:
                 runner_instance_streak_data if runner_instance_streak_data else {}
             ),
             "runner_alerts": runner_alerts if runner_alerts else [],
+            "main_streak_data": main_streak_data if main_streak_data else {},
         }
 
         # Save to JSON only if output file is specified
@@ -1424,6 +1611,21 @@ class SGLangFailuresAnalyzer:
             summary_lines.append(
                 f"| Job Alerts Triggered | {report_data['summary']['job_alerts_triggered']} |"
             )
+
+            # Add main branch job counter
+            main_jobs_count = report_data["summary"].get("main_jobs_count", 0)
+            main_jobs_with_streaks = report_data["summary"].get(
+                "main_jobs_with_streaks", 0
+            )
+            if main_jobs_count > 0:
+                summary_lines.append(
+                    f"| Jobs on Main Branch (cron-triggered) | {main_jobs_count} ({main_jobs_with_streaks} with active streaks) |"
+                )
+            else:
+                summary_lines.append(
+                    f"| Jobs on Main Branch (cron-triggered) | 0 (no cron runs found) |"
+                )
+
             summary_lines.append(
                 f"| Total Runners Analyzed | {report_data['summary']['total_runners']} |"
             )
@@ -1594,6 +1796,84 @@ class SGLangFailuresAnalyzer:
                         "Nothing to display (no runners with consecutive failure streak > 2)"
                     )
                     summary_lines.append("")
+                    summary_lines.append("")
+
+            # Main Branch Health Section: Jobs failing on cron-triggered main branch runs
+            if report_data.get("main_streak_data"):
+                # Sort by current streak (descending)
+                sorted_main_jobs = sorted(
+                    report_data["main_streak_data"].items(),
+                    key=lambda x: (x[1]["current_streak"], x[1]["failure_rate"]),
+                    reverse=True,
+                )
+
+                # Show ALL jobs with ANY active streak on main (even streak=1 is concerning on main)
+                broken_main_jobs = [
+                    (name, data)
+                    for name, data in sorted_main_jobs
+                    if data["current_streak"] >= 1
+                ]
+
+                if broken_main_jobs:
+                    summary_lines.append(
+                        f"## MAIN BRANCH HEALTH: Failing Jobs on Scheduled Main Branch Runs ({len(broken_main_jobs)} jobs)"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "| Job Name | Streak | Max | First Failure | Last Failure | Match | Top Errors |"
+                    )
+                    summary_lines.append(
+                        "|----------|--------|-----|---------------|--------------|-------|------------|"
+                    )
+                    for job_name, data in broken_main_jobs[:15]:
+                        display_name = (
+                            job_name if len(job_name) <= 35 else job_name[:32] + "..."
+                        )
+
+                        # Get first and last failure info
+                        first_failure = data.get("first_failure_in_streak")
+                        if first_failure:
+                            first_failure_str = f"[Run #{first_failure['run_number']}]({first_failure.get('job_url', first_failure['url'])})"
+                        else:
+                            first_failure_str = "N/A"
+
+                        last_failure = data.get("last_failure_in_streak")
+                        if last_failure:
+                            last_failure_str = f"[Run #{last_failure['run_number']}]({last_failure.get('job_url', last_failure['url'])})"
+                        else:
+                            last_failure_str = "N/A"
+
+                        # Visual indicator for error signature match
+                        matches = data.get("matches_overall_error", False)
+                        match_indicator = "✓" if matches else "✗"
+
+                        # Format top errors as bullet list
+                        top_errors = data.get("top_error_signatures", [])
+                        if top_errors:
+                            error_str = "<br>".join(
+                                [f"• {err[0]} ({err[1]})" for err in top_errors]
+                            )
+                        else:
+                            error_str = "N/A"
+
+                        summary_lines.append(
+                            f"| `{display_name}` | {data['current_streak']} | {data['max_streak']} | "
+                            f"{first_failure_str} | {last_failure_str} | {match_indicator} | {error_str} |"
+                        )
+
+                    summary_lines.append("")
+                    summary_lines.append(
+                        "**Legend:** Match column - ✓ = same error as overall failures, ✗ = different error signature on main"
+                    )
+                    summary_lines.append("")
+                else:
+                    summary_lines.append(
+                        "## MAIN BRANCH HEALTH: Scheduled Main Branch Runs"
+                    )
+                    summary_lines.append("")
+                    summary_lines.append(
+                        f"✓ All {len(sorted_main_jobs)} jobs passing on main branch scheduled runs!"
+                    )
                     summary_lines.append("")
 
             # Section 1: Currently Broken Jobs - Only show if there are broken jobs
@@ -1817,6 +2097,11 @@ def main():
         # Skip aggregation to show individual job shards
         print(f"\nTotal jobs (including shards): {len(job_streak_data)}")
 
+        # Analyze consecutive failures on main branch (cron-triggered only)
+        main_streak_data, main_current_streaks = (
+            analyzer.construct_cron_failures_on_main(runs, job_streak_data)
+        )
+
         # Analyze runner health and consecutive failures
         (
             runner_stats,
@@ -1844,6 +2129,7 @@ def main():
             runner_alerts,
             runner_streak_data,
             runner_instance_streak_data,
+            main_streak_data,
             args.output,
         )
 
