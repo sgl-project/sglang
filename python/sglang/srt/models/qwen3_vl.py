@@ -731,7 +731,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
             )
         else:
-            init_all_vision_forward_metadata(self.visual, image_grid_thw, pixel_values)
+            if _use_aiter:
+                init_all_vision_forward_metadata(self.visual, image_grid_thw, pixel_values)
             image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
@@ -743,21 +744,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        if _use_aiter:
-            for i, block in enumerate(self.visual.blocks):
-                if i == 0:
-                    vision_forward_metadata = block.attn.init_vision_forward_metadata(
-                        video_grid_thw, pixel_values
-                    )
-                else:
-                    block.attn.set_vision_forward_metadata(vision_forward_metadata)
-
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
                 self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
             )
         else:
-            init_all_vision_forward_metadata(self.visual, video_grid_thw, pixel_values)
+            if _use_aiter:
+                init_all_vision_forward_metadata(self.visual, video_grid_thw, pixel_values)
             video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
