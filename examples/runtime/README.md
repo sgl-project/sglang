@@ -16,12 +16,12 @@ The below examples will mostly need you to start a server in a separate terminal
 
 ## Engine
 
-The `engine` folder contains that examples that show how to use [Offline Engine API](https://docs.sglang.ai/basic_usage/offline_engine_api.html#Offline-Engine-API) for common workflows.
+The `engine` folder contains that examples that show how to use [Offline Engine API](https://docs.sglang.io/basic_usage/offline_engine_api.html#Offline-Engine-API) for common workflows.
 
 * `custom_server.py`: An example how to deploy a custom server.
 * `embedding.py`: An example how to extract embeddings.
 * `launch_engine.py`: An example how to launch the Engine.
-* `offline_batch_inference_eagle.py`: An example how to perform speculative decoding using [EAGLE](https://docs.sglang.ai/advanced_features/speculative_decoding.html).
+* `offline_batch_inference_eagle.py`: An example how to perform speculative decoding using [EAGLE](https://docs.sglang.io/advanced_features/speculative_decoding.html).
 * `offline_batch_inference_torchrun.py`: An example how to perform inference using [torchrun](https://pytorch.org/docs/stable/elastic/run.html).
 * `offline_batch_inference_vlm.py`: An example how to use VLMs with the engine.
 * `offline_batch_inference.py`: An example how to use the engine to perform inference on a batch of examples.

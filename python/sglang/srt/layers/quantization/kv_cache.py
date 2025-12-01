@@ -9,7 +9,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.layers.radix_attention import RadixAttention
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ class BaseKVCacheMethod(QuantizeMethodBase):
     def apply(self, layer: torch.nn.Module) -> torch.Tensor:
         raise RuntimeError(f"{self.__class__.__name__}.apply should not be called.")
 
-    def process_weights_after_loading(self, layer: RadixAttention) -> None:
+    def process_weights_after_loading(self, layer) -> None:
         if layer.k_scale > 0.0 and layer.v_scale > 0.0:
             # We prefer to use separate k_scale and v_scale if present
             k_scale = layer.k_scale.to("cpu").tolist()

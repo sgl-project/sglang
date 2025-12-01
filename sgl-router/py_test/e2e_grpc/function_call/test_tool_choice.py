@@ -70,8 +70,7 @@ class TestToolChoiceLlama32(CustomTestCase):
 
     def setUp(self):
         self.client = openai.Client(base_url=self.base_url, api_key=self.api_key)
-        # TODO: Update the logic here when router /v1/models response format matching the openai api standard
-        self.model_name = self.client.models.list().models[0]
+        self.model_name = self.client.models.list().data[0].id
 
     def _is_flaky_test(self):
         """Check if the current test is marked as flaky for this class"""

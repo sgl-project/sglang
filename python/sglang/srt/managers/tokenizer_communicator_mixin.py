@@ -22,6 +22,8 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    CheckWeightsReqInput,
+    CheckWeightsReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
@@ -183,6 +185,9 @@ class TokenizerCommunicatorMixin:
         self.resume_memory_occupation_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.check_weights_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.slow_down_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -257,6 +262,10 @@ class TokenizerCommunicatorMixin:
                     self.resume_memory_occupation_communicator.handle_recv,
                 ),
                 (
+                    CheckWeightsReqOutput,
+                    self.check_weights_communicator.handle_recv,
+                ),
+                (
                     SlowDownReqOutput,
                     self.slow_down_communicator.handle_recv,
                 ),
@@ -316,6 +325,7 @@ class TokenizerCommunicatorMixin:
         profile_by_stage: bool = False,
         merge_profiles: bool = False,
         profile_prefix: Optional[str] = None,
+        profile_stages: Optional[List[str]] = None,
     ):
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
@@ -336,6 +346,7 @@ class TokenizerCommunicatorMixin:
             profile_id=str(time.time()),
             merge_profiles=merge_profiles,
             profile_prefix=profile_prefix,
+            profile_stages=profile_stages,
         )
         return await self._execute_profile(req)
 
@@ -404,6 +415,14 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
+                result = (await self.update_weights_from_distributed_communicator(obj))[
+                    0
+                ]
+                return result.success, result.message
+
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
@@ -456,6 +475,12 @@ class TokenizerCommunicatorMixin:
 
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
+
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
+                result = (await self.update_weights_from_tensor_communicator(obj))[0]
+                return result.success, result.message
 
         # This means that weight sync
         # cannot run while requests are in progress.
@@ -655,6 +680,15 @@ class TokenizerCommunicatorMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def check_weights(
+        self: TokenizerManager,
+        obj: CheckWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> CheckWeightsReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.check_weights_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def slow_down(
         self: TokenizerManager,
