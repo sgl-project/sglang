@@ -663,19 +663,14 @@ def general_mm_embed_routine(
     # However, because we only capture the language model part, the multimodal can still use custom allreduce.
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
-    if (
-        not hasattr(language_model, "pp_group")
-        or language_model.pp_group.is_first_rank
-    ):
+    if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
             and forward_batch.contains_mm_inputs()
         ):
             mm_inputs_list = [
-                mm_input
-                for mm_input in forward_batch.mm_inputs
-                if mm_input is not None
+                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
             ]
             extend_prefix_lens = [
                 prefix_len
@@ -700,9 +695,7 @@ def general_mm_embed_routine(
             )
             # add for qwen3_vl deepstack
             if use_deepstack:
-                kwargs["input_deepstack_embeds"] = other_info[
-                    "input_deepstack_embeds"
-                ]
+                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
             # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
             # just being defensive here
             forward_batch.mm_inputs = None
