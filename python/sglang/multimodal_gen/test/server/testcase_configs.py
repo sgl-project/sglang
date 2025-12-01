@@ -242,6 +242,19 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             output_size="1024x1024",
         ),
     ),
+    DiffusionTestCase(
+        "stable_diffusion_3_medium_t2i",
+        DiffusionServerArgs(
+            model_path="stabilityai/stable-diffusion-3-medium-diffusers",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+        ),
+        DiffusionSamplingParams(
+            prompt="A futuristic cityscape at sunset with flying cars",
+            output_size="1024x1024",
+        ),
+    ),
     # DiffusionTestCase(
     #     "flux_2_image_t2i",
     #     DiffusionServerArgs(
