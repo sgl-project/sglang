@@ -659,8 +659,6 @@ def general_mm_embed_routine(
         Hidden states from language model forward pass
     """
 
-    # We disable custom allreduce in piecewise cuda graph.
-    # However, because we only capture the language model part, the multimodal can still use custom allreduce.
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
