@@ -17,7 +17,7 @@ MODELS = [
     ),
     ("/root/.cache/modelscope/hub/models/Howeee/Qwen2.5-1.5B-apeach", 1, 4e-2),
 ]
-TORCH_DTYPES = [torch.float16]
+TORCH_DTYPES = [torch.bfloat16]
 
 PROMPT = (
     "What is the range of the numeric output of a sigmoid node in a neural network?"

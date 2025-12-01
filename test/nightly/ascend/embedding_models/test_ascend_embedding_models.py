@@ -16,7 +16,7 @@ MODELS = [
     ("/root/.cache/modelscope/hub/models/iic/gte_Qwen2-1.5B-instruct", 1, 1e-5),
     ("/root/.cache/modelscope/hub/models/Qwen/Qwen3-Embedding-8B", 1, 1e-5),
 ]
-TORCH_DTYPES = [torch.float16]
+TORCH_DTYPES = [torch.bfloat16]
 
 
 class TestEmbeddingModels(CustomTestCase):

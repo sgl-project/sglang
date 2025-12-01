@@ -13,7 +13,7 @@ MODELS = [
     ("/root/.cache/modelscope/hub/models/BAAI/bge-reranker-v2-m3", 1, 1e-2),
 ]
 ATTENTION_BACKEND = ["ascend"]
-TORCH_DTYPES = [torch.float16]
+TORCH_DTYPES = [torch.bfloat16]
 
 
 class TestCrossEncoderModels(CustomTestCase):
