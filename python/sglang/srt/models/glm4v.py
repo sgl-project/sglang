@@ -106,6 +106,7 @@ class Glm4vVisionBlock(nn.Module):
         num_heads: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        attn_qkv_bias: bool = True,
         num_dummy_heads: int = 0,
         rms_norm_eps: float = 1e-5,
     ) -> None:
@@ -118,7 +119,8 @@ class Glm4vVisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            proj_bias=True,
+            proj_bias=False,
+            qkv_bias=attn_qkv_bias,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -412,6 +414,7 @@ class Glm4vVisionModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
+                    attn_qkv_bias=vision_config.attention_bias,
                 )
                 for layer_idx in range(depth)
             ]
