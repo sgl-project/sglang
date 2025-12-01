@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
+CONDITION_IMAGE_SIZE = 384 * 384
+VAE_IMAGE_SIZE = 1024 * 1024
+
 
 def _extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
     bool_mask = mask.bool()
@@ -152,6 +155,19 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
 
         return (img_cos, img_sin), (txt_cos, txt_sin)
 
+    def prepare_image_processor_kwargs(self, prompt: str | None, image) -> dict:
+        prompt_template_encode = (
+            "<|im_start|>system\nDescribe the key features of the input image "
+            "(color, shape, size, texture, objects, background), then explain how "
+            "the user's text instruction should alter or modify the image. Generate "
+            "a new image that meets the user's requirements while maintaining "
+            "consistency with the original input where appropriate.<|im_end|>\n"
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        txt = prompt_template_encode.format(prompt)
+        return dict(text=[txt], padding=True)
+
     def _prepare_cond_kwargs(self, batch, prompt_embeds, rotary_emb, device, dtype):
         batch_size = prompt_embeds[0].shape[0]
         height = batch.height
@@ -209,6 +225,13 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.I2I
 
+    def _get_condition_image_sizes(self, batch) -> list[tuple[int, int]]:
+        image_size = batch.original_condition_image_size
+        edit_width, edit_height, _ = calculate_dimensions(
+            VAE_IMAGE_SIZE, image_size[0] / image_size[1]
+        )
+        return [(edit_width, edit_height)]
+
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype
     ):
@@ -216,25 +239,17 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image_size = batch.original_condition_image_size
-        edit_width, edit_height, _ = calculate_dimensions(
-            1024 * 1024, image_size[0] / image_size[1]
-        )
         vae_scale_factor = self.get_vae_scale_factor()
+        condition_image_sizes = self._get_condition_image_sizes(batch)
 
         img_shapes = [
             [
-                (
-                    1,
-                    height // vae_scale_factor // 2,
-                    width // vae_scale_factor // 2,
-                ),
-                (
-                    1,
-                    edit_height // vae_scale_factor // 2,
-                    edit_width // vae_scale_factor // 2,
-                ),
-            ],
+                (1, height // vae_scale_factor // 2, width // vae_scale_factor // 2),
+                *[
+                    (1, h // vae_scale_factor // 2, w // vae_scale_factor // 2)
+                    for w, h in condition_image_sizes
+                ],
+            ]
         ] * batch_size
         txt_seq_lens = [prompt_embeds[0].shape[1]]
         (img_cos, img_sin), (txt_cos, txt_sin) = QwenImagePipelineConfig.get_freqs_cis(
@@ -285,3 +300,61 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         # remove noise over input image
         noise = noise[:, : latents.size(1)]
         return noise
+
+
+class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
+    task_type: ModelTaskType = ModelTaskType.I2I
+
+    def _get_condition_image_sizes(self, batch) -> list[tuple[int, int]]:
+        image = batch.condition_image
+        if not isinstance(image, list):
+            image = [image]
+
+        condition_image_sizes = []
+        for img in image:
+            image_width, image_height = img.size
+            edit_width, edit_height, _ = calculate_dimensions(
+                VAE_IMAGE_SIZE, image_width / image_height
+            )
+            condition_image_sizes.append((edit_width, edit_height))
+
+        return condition_image_sizes
+
+    def prepare_image_processor_kwargs(self, prompt: str | None, image) -> dict:
+        prompt_list = [prompt] if isinstance(prompt, str) else prompt
+
+        prompt_template_encode = (
+            "<|im_start|>system\nDescribe the key features of the input image "
+            "(color, shape, size, texture, objects, background), then explain how "
+            "the user's text instruction should alter or modify the image. Generate "
+            "a new image that meets the user's requirements while maintaining "
+            "consistency with the original input where appropriate.<|im_end|>\n"
+            "<|im_start|>user\n{}<|im_end|>\n"
+            "<|im_start|>assistant\n"
+        )
+        img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
+        if isinstance(image, list):
+            base_img_prompt = ""
+            for i, img in enumerate(image):
+                base_img_prompt += img_prompt_template.format(i + 1)
+        elif image is not None:
+            base_img_prompt = img_prompt_template.format(1)
+        else:
+            base_img_prompt = ""
+        txt = [prompt_template_encode.format(base_img_prompt + p) for p in prompt_list]
+        return dict(text=txt, padding=True)
+
+    def preprocess_image(self, image, image_processor):
+        if not isinstance(image, list):
+            image = [image]
+        condition_images = []
+        for img in image:
+            image_width, image_height = img.size
+            condition_width, condition_height, _ = calculate_dimensions(
+                CONDITION_IMAGE_SIZE, image_width / image_height
+            )
+            condition_images.append(
+                image_processor.resize(img, condition_height, condition_width)
+            )
+
+        return condition_images

@@ -189,6 +189,12 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
+    def preprocess_image(self, image, image_processor):
+        return image
+
+    def prepare_image_processor_kwargs(self, prompt: str | None, image) -> dict:
+        return {}
+
     def adjust_num_frames(self, num_frames):
         return num_frames
 

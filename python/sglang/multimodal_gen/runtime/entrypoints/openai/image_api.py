@@ -79,6 +79,7 @@ def _build_req_from_sampling(s: SamplingParams) -> Req:
         request_id=s.request_id,
         data_type=s.data_type,
         prompt=s.prompt,
+        negative_prompt=s.negative_prompt,
         image_path=s.image_path,
         height=s.height,
         width=s.width,
@@ -177,7 +178,6 @@ async def edits(
         image_path=input_path,
     )
     batch = _build_req_from_sampling(sampling)
-
     save_file_path = await process_generation_batch(scheduler_client, batch)
 
     await IMAGE_STORE.upsert(

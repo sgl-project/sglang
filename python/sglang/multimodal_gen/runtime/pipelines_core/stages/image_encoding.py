@@ -11,14 +11,17 @@ import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
+    PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
     _prepare_image_ids,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
-    QwenImagePipelineConfig,
+    QwenImageEditPlusPipelineConfig,
     _pack_latents,
     qwen_image_postprocess_text,
 )
@@ -111,18 +114,19 @@ class ImageEncodingStage(PipelineStage):
 
         image = batch.condition_image
 
-        if batch.prompt and (
-            isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig)
-            or isinstance(server_args.pipeline_config, QwenImagePipelineConfig)
-        ):
-            prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
-            txt = prompt_template_encode.format(batch.prompt)
-            image_processor_kwargs = dict(text=[txt], padding=True)
-        else:
-            image_processor_kwargs = {}
+        prompt_image = server_args.pipeline_config.preprocess_image(
+            image, self.vae_image_processor
+        )
+
+        # Prepare kwargs for image processor
+        image_processor_kwargs = (
+            server_args.pipeline_config.prepare_image_processor_kwargs(
+                batch.prompt, image
+            )
+        )
 
         image_inputs = self.image_processor(
-            images=image, return_tensors="pt", **image_processor_kwargs
+            images=prompt_image, return_tensors="pt", **image_processor_kwargs
         ).to(cuda_device)
         if self.image_encoder:
             # if an image encoder is provided
@@ -136,16 +140,15 @@ class ImageEncodingStage(PipelineStage):
             batch.image_embeds.append(image_embeds)
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
-            # 1. neg prompt embeds
-            if batch.prompt:
-                prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
-                txt = prompt_template_encode.format(batch.negative_prompt)
-                neg_image_processor_kwargs = dict(text=[txt], padding=True)
-            else:
-                neg_image_processor_kwargs = {}
+            # Prepare kwargs for negative prompt
+            neg_image_processor_kwargs = (
+                server_args.pipeline_config.prepare_image_processor_kwargs(
+                    batch.negative_prompt, image
+                )
+            )
 
             neg_image_inputs = self.image_processor(
-                images=image, return_tensors="pt", **neg_image_processor_kwargs
+                images=prompt_image, return_tensors="pt", **neg_image_processor_kwargs
             ).to(get_local_torch_device())
 
             with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -235,32 +238,6 @@ class ImageVAEEncodingStage(PipelineStage):
         self.vae = self.vae.to(get_local_torch_device())
 
         image = batch.condition_image
-        image = self.preprocess(
-            image,
-        ).to(get_local_torch_device(), dtype=torch.float32)
-
-        # (B, C, H, W) -> (B, C, 1, H, W)
-        image = image.unsqueeze(2)
-
-        if num_frames == 1:
-            video_condition = image
-        else:
-            video_condition = torch.cat(
-                [
-                    image,
-                    image.new_zeros(
-                        image.shape[0],
-                        image.shape[1],
-                        num_frames - 1,
-                        image.shape[3],
-                        image.shape[4],
-                    ),
-                ],
-                dim=2,
-            )
-        video_condition = video_condition.to(
-            device=get_local_torch_device(), dtype=torch.float32
-        )
 
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
@@ -268,59 +245,68 @@ class ImageVAEEncodingStage(PipelineStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        # Encode Image
-        with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
-        ):
-            if server_args.pipeline_config.vae_tiling:
-                self.vae.enable_tiling()
-            # if server_args.vae_sp:
-            #     self.vae.enable_parallel()
-            if not vae_autocast_enabled:
-                video_condition = video_condition.to(vae_dtype)
-            encoder_output: DiagonalGaussianDistribution = self.vae.encode(
-                video_condition
+        if server_args.pipeline_config.vae_tiling:
+            self.vae.enable_tiling()
+
+        if isinstance(server_args.pipeline_config, QwenImageEditPlusPipelineConfig):
+            images = image if isinstance(image, list) else [image]
+            all_latent_conditions = []
+
+            for img in images:
+                latent = self._process_single_image(
+                    img,
+                    num_frames,
+                    vae_dtype,
+                    vae_autocast_enabled,
+                    batch.generator,
+                    server_args.pipeline_config,
+                )
+                all_latent_conditions.append(latent)
+
+            latent_condition = all_latent_conditions
+
+        else:
+            latent_condition = self._process_single_image(
+                image,
+                num_frames,
+                vae_dtype,
+                vae_autocast_enabled,
+                batch.generator,
+                server_args.pipeline_config,
             )
-
-        generator = batch.generator
-        if generator is None:
-            raise ValueError("Generator must be provided")
-        # TODO: verify
-        sample_mode = (
-            "argmax"
-            if server_args.pipeline_config.task_type == ModelTaskType.I2I
-            else "sample"
-        )
-        latent_condition = self.retrieve_latents(
-            encoder_output, generator, sample_mode=sample_mode
-        )
-
-        latent_condition = self.server_args.pipeline_config.post_process_vae_encode(
-            latent_condition, self.vae
-        )
-
-        scaling_factor, shift_factor = (
-            self.server_args.pipeline_config.get_decode_scale_and_shift(
-                device=latent_condition.device,
-                dtype=latent_condition.dtype,
-                vae=self.vae,
-            )
-        )
-
-        # apply shift & scale if needed
-        if isinstance(shift_factor, torch.Tensor):
-            shift_factor = shift_factor.to(latent_condition.device)
-
-        if isinstance(scaling_factor, torch.Tensor):
-            scaling_factor = scaling_factor.to(latent_condition.device)
-
-        latent_condition -= shift_factor
-        latent_condition = latent_condition * scaling_factor
 
         batch_size = batch.batch_size
 
-        # TODO: abstract this
-        if isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
+        if isinstance(server_args.pipeline_config, QwenImageEditPlusPipelineConfig):
+            all_image_latents = []
+            for latent in latent_condition:
+                if batch_size > latent.shape[0] and batch_size % latent.shape[0] == 0:
+                    # expand init_latents for batch_size
+                    additional_image_per_prompt = batch_size // latent.shape[0]
+                    image_latents = torch.cat(
+                        [latent] * additional_image_per_prompt, dim=0
+                    )
+                elif batch_size > latent.shape[0] and batch_size % latent.shape[0] != 0:
+                    raise ValueError(
+                        f"Cannot duplicate `image` of batch size {latent.shape[0]} to {batch_size} text prompts."
+                    )
+                else:
+                    image_latents = torch.cat([latent], dim=0)
+                image_latent_height, image_latent_width = image_latents.shape[3:]
+                num_channels_latents = (
+                    self.server_args.pipeline_config.dit_config.arch_config.in_channels
+                    // 4
+                )
+                image_latents = _pack_latents(
+                    image_latents,
+                    batch_size,
+                    num_channels_latents,
+                    image_latent_height,
+                    image_latent_width,
+                )
+                all_image_latents.append(image_latents)
+            image_latents = torch.cat(all_image_latents, dim=1)
+        elif isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig):
             if (
                 batch_size > latent_condition.shape[0]
                 and batch_size % latent_condition.shape[0] == 0
@@ -421,8 +407,8 @@ class ImageVAEEncodingStage(PipelineStage):
     def preprocess(
         self,
         image: torch.Tensor | PIL.Image.Image,
+        pipeline_config: PipelineConfig,
     ) -> torch.Tensor:
-
         if isinstance(image, PIL.Image.Image):
             image = pil_to_numpy(image)  # to np
             image = numpy_to_pt(image)  # to pt
@@ -451,3 +437,84 @@ class ImageVAEEncodingStage(PipelineStage):
         #     "image_latent", batch.image_latent, [V.is_tensor, V.with_dims(5)]
         # )
         return result
+
+    def _process_single_image(
+        self,
+        image: PIL.Image.Image,
+        num_frames: int,
+        vae_dtype: torch.dtype,
+        vae_autocast_enabled: bool,
+        generator: torch.Generator | None,
+        pipeline_config: PipelineConfig,
+    ) -> torch.Tensor:
+        image = self.preprocess(
+            image,
+            pipeline_config,
+        ).to(get_local_torch_device(), dtype=torch.float32)
+
+        # (B, C, H, W) -> (B, C, 1, H, W)
+        image = image.unsqueeze(2)
+
+        if num_frames == 1:
+            video_condition = image
+        else:
+            video_condition = torch.cat(
+                [
+                    image,
+                    image.new_zeros(
+                        image.shape[0],
+                        image.shape[1],
+                        num_frames - 1,
+                        image.shape[3],
+                        image.shape[4],
+                    ),
+                ],
+                dim=2,
+            )
+        video_condition = video_condition.to(
+            device=get_local_torch_device(), dtype=torch.float32
+        )
+
+        # Encode Image
+        with torch.autocast(
+            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+        ):
+            if not vae_autocast_enabled:
+                video_condition = video_condition.to(vae_dtype)
+            encoder_output: DiagonalGaussianDistribution = self.vae.encode(
+                video_condition
+            )
+
+        if generator is None:
+            raise ValueError("Generator must be provided")
+        # TODO: verify
+        sample_mode = (
+            "argmax" if pipeline_config.task_type == ModelTaskType.I2I else "sample"
+        )
+        latent_condition = self.retrieve_latents(
+            encoder_output, generator, sample_mode=sample_mode
+        )
+
+        latent_condition = self.server_args.pipeline_config.post_process_vae_encode(
+            latent_condition, self.vae
+        )
+
+        scaling_factor, shift_factor = (
+            self.server_args.pipeline_config.get_decode_scale_and_shift(
+                device=latent_condition.device,
+                dtype=latent_condition.dtype,
+                vae=self.vae,
+            )
+        )
+
+        # apply shift & scale if needed
+        if isinstance(shift_factor, torch.Tensor):
+            shift_factor = shift_factor.to(latent_condition.device)
+
+        if isinstance(scaling_factor, torch.Tensor):
+            scaling_factor = scaling_factor.to(latent_condition.device)
+
+        latent_condition -= shift_factor
+        latent_condition = latent_condition * scaling_factor
+
+        return latent_condition
