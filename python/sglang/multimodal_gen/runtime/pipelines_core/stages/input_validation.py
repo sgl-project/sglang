@@ -11,11 +11,7 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.runtime.models.vision_utils import (
-    load_image,
-    load_video,
-    resize,
-)
+from sglang.multimodal_gen.runtime.models.vision_utils import load_image, load_video
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -106,61 +102,52 @@ class InputValidationStage(PipelineStage):
             height = height // multiple_of * multiple_of
             batch.width = width
             batch.height = height
-        else:
-            if isinstance(server_args.pipeline_config, WanI2V480PConfig):
-                # TODO: could we merge with above?
-                # resize image only, Wan2.1 I2V
-                max_area = 720 * 1280
-                aspect_ratio = condition_image_height / condition_image_width
-                mod_value = (
-                    server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
-                    * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
-                )
-                height = (
-                    round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                )
-                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+        elif server_args.pipeline_config.task_type == ModelTaskType.TI2V:
+            # duplicate with vae_image_processor
+            # further processing for ti2v task
+            img = batch.condition_image
+            ih, iw = img.height, img.width
+            patch_size = server_args.pipeline_config.dit_config.arch_config.patch_size
+            vae_stride = (
+                server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
+            )
+            dh, dw = patch_size[1] * vae_stride, patch_size[2] * vae_stride
+            max_area = 704 * 1280
+            ow, oh = best_output_size(iw, ih, dw, dh, max_area)
 
-                batch.condition_image = batch.condition_image.resize((width, height))
-                batch.height = height
-                batch.width = width
+            scale = max(ow / iw, oh / ih)
+            img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
+            logger.info("resized img height: %s, img width: %s", img.height, img.width)
 
-            if server_args.pipeline_config.task_type == ModelTaskType.TI2V:
-                # duplicate with vae_image_processor
-                # further processing for ti2v task
-                img = batch.condition_image
-                ih, iw = img.height, img.width
-                patch_size = (
-                    server_args.pipeline_config.dit_config.arch_config.patch_size
-                )
-                vae_stride = (
-                    server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
-                )
-                dh, dw = patch_size[1] * vae_stride, patch_size[2] * vae_stride
-                max_area = 704 * 1280
-                ow, oh = best_output_size(iw, ih, dw, dh, max_area)
+            # center-crop
+            x1 = (img.width - ow) // 2
+            y1 = (img.height - oh) // 2
+            img = img.crop((x1, y1, x1 + ow, y1 + oh))
+            assert img.width == ow and img.height == oh
 
-                scale = max(ow / iw, oh / ih)
-                img = img.resize((round(iw * scale), round(ih * scale)), Image.LANCZOS)
-                logger.info(
-                    "resized img height: %s, img width: %s", img.height, img.width
-                )
+            # to tensor
+            img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device).unsqueeze(1)
+            img = img.unsqueeze(0)
+            batch.height = oh
+            batch.width = ow
+            # TODO: should we store in a new field: pixel values?
+            batch.condition_image = img
 
-                # center-crop
-                x1 = (img.width - ow) // 2
-                y1 = (img.height - oh) // 2
-                img = img.crop((x1, y1, x1 + ow, y1 + oh))
-                assert img.width == ow and img.height == oh
+        elif isinstance(server_args.pipeline_config, WanI2V480PConfig):
+            # TODO: could we merge with above?
+            # resize image only, Wan2.1 I2V
+            max_area = 720 * 1280
+            aspect_ratio = condition_image_height / condition_image_width
+            mod_value = (
+                server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
+                * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
+            )
+            height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+            width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-                # to tensor
-                img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device).unsqueeze(1)
-                img = img.unsqueeze(0)
-                batch.height = oh
-                batch.width = ow
-                # TODO: should we store in a new field: pixel values?
-                height = batch.height
-                width = batch.width
-                batch.condition_image = resize(img, height, width)
+            batch.condition_image = batch.condition_image.resize((width, height))
+            batch.height = height
+            batch.width = width
 
     def forward(
         self,
