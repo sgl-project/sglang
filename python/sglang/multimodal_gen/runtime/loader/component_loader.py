@@ -189,6 +189,16 @@ class ComponentLoader(ABC):
         """
         return load_native(transformers_or_diffusers, component_model_path, server_args)
 
+    def load_customized(
+        self, component_model_path: str, server_args: ServerArgs, module_name: str
+    ):
+        """
+        Load the customized version component, implemented and optimized in SGL-diffusion
+        """
+        raise NotImplementedError(
+            f"load_customized not implemented for {self.__class__.__name__}"
+        )
+
     @abstractmethod
     def load_customized(
         self, model_path: str, server_args: ServerArgs, module_name: str
@@ -539,34 +549,7 @@ class VAELoader(ComponentLoader):
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
     ):
-        """
-        Load a VAE model from the specified path.
-
-        This method supports two loading strategies:
-        1. Custom VAE classes (via auto_map): If the model's config.json contains an
-           "auto_map" entry pointing to a custom VAE class (e.g., Flux2TinyAutoEncoder),
-           it dynamically imports and loads the custom class using its from_pretrained method.
-        2. Standard VAE classes: Falls back to ModelRegistry to resolve and load standard
-           VAE classes (e.g., AutoencoderKLFlux2), then loads weights from safetensors files.
-
-        The loaded VAE is configured with the appropriate device placement, precision,
-        and moved to evaluation mode.
-
-        Args:
-            component_model_path: Path to the VAE model directory (must contain config.json
-                and safetensors weight files for standard VAEs).
-            server_args: Server configuration containing pipeline config, precision settings,
-                device offload preferences, and other inference parameters.
-            *args: Additional arguments (currently unused, for interface compatibility).
-
-        Returns:
-            torch.nn.Module: The loaded VAE model in evaluation mode, placed on the target
-                device with the specified precision.
-
-        Raises:
-            AssertionError: If the model config doesn't contain a _class_name attribute,
-                or if multiple safetensors files are found (for standard VAE loading).
-        """
+        """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(model_path=component_model_path)
         class_name = config.pop("_class_name", None)
         assert (
