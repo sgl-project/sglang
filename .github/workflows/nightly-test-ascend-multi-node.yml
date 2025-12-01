@@ -61,6 +61,7 @@ jobs:
         run: |
           # Install kubernetes
           pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple kubernetes
+          cp /data/.cache/kubectl /usr/local/sbin/
 
       - name: Checkout code
         uses: actions/checkout@v4
