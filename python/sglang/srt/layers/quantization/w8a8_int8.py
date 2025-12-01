@@ -309,9 +309,9 @@ class W8A8Int8Config(QuantizationConfig):
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
             return (
-                NPUW8A8DynamicLinearMethod(self)
+                NPUW8A8DynamicLinearMethod()
                 if self.is_dynamic
-                else NPUW8A8LinearMethod(self)
+                else NPUW8A8LinearMethod()
             )
         elif isinstance(layer, FusedMoE):
             prefix_in_quant_config = prefix + ".0.down_proj.weight"
