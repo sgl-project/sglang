@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Tuple,
+    runtime_checkable,
+)
 
 import torch
 
@@ -118,8 +126,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back(
         self,
+        last_host_node: Any,
+        host_hit_length: int,
         req: Req,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.
         """

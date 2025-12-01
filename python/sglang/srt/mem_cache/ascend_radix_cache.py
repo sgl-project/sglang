@@ -1,7 +1,7 @@
 import heapq
 import logging
 import time
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 
 from torch import Tensor
 
@@ -103,14 +103,13 @@ class AscendHiRadixCache(RadixCache):
     def load_back(
         self,
         rid: str,
-        node: TreeNode,
+        last_hit_node: TreeNode,
         new_input_tokens: List[int],
         extra_key: Optional[str] = None,
         priority: int = 0,
     ) -> tuple[Tensor | None, TreeNode]:
         start_time = time.perf_counter()
 
-        last_hit_node = node
         # protect the last_hit_node from eviction
         self.inc_lock_ref(last_hit_node)
 
@@ -129,7 +128,7 @@ class AscendHiRadixCache(RadixCache):
             rid=rid,
             new_input_tokens=new_input_tokens,
             device_indices=device_indices,
-            last_hash=node.get_last_hash_value(),
+            last_hash=last_hit_node.get_last_hash_value(),
         )
 
         if free_device_indices is not None and cached_device_indices is not None:
@@ -170,18 +169,19 @@ class AscendHiRadixCache(RadixCache):
 
     def init_load_back(
         self,
+        last_host_node: Any,
+        host_hit_length: int,
         req: Req,
-        mem_quota: Optional[int] = None,
-    ):
+    ) -> Tuple[Tensor | None, Any]:
         matched_len = len(req.prefix_indices)
         new_input_tokens = req.fill_ids[matched_len:]
         new_input_len = len(new_input_tokens)
         if new_input_len <= self.page_size:
-            return None
+            return None, req.last_node
 
         remainder = new_input_len % self.page_size
         if remainder == 0:
-            # to avoid input tokens = 0 while hit the entire input tokens
+            # to avoid input tokens length = 0 while hit the entire input tokens
             new_input_tokens = new_input_tokens[: (new_input_len - self.page_size)]
         else:
             new_input_tokens = new_input_tokens[: (new_input_len - remainder)]
@@ -193,21 +193,18 @@ class AscendHiRadixCache(RadixCache):
                 req.rid, last_node, new_input_tokens, req.extra_key, priority
             )
             if loading_values is not None:
-                req.last_node = last_node
-
                 logger.debug(
                     f"init_load_back finished, "
                     f"{len(loading_values)} tokens for node {last_node.id}"
                 )
-                return loading_values
+                return loading_values, last_node
         else:
-            logger.error(f"should not enter branch")
             # should not enter this branch
+            logger.error(f"should not enter branch")
             while last_node.evicted:
                 last_node = last_node.parent
 
-        req.last_node = last_node
-        return None
+        return None, last_node
 
     def ready_to_load_host_cache(self) -> int:
         """

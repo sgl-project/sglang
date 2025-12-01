@@ -14,33 +14,24 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 logger = logging.getLogger(__name__)
 
 
-def get_hash_str_v1(token_ids: List[int], prior_hash: str = None) -> str:
-    hasher = hashlib.sha256()
-
-    if prior_hash:
-        hasher.update(bytes.fromhex(prior_hash))
-
-    arr = array.array("L", token_ids)
-    batch_bytes = arr.tobytes()
-    hasher.update(batch_bytes)
-
-    return hasher.hexdigest()
-
-
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
         hasher.update(bytes.fromhex(prior_hash))
 
+    flatten_token_ids = []
     for t in token_ids:
         if isinstance(t, tuple):
             # EAGLE bigram mode: hash both elements to uniquely identify the bigram
-            for elem in t:
-                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
+            flatten_token_ids.extend(t)
         else:
             # Regular mode: single integer token
-            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+            flatten_token_ids.append(t)
+
+    arr = array.array("I", flatten_token_ids)
+    batch_bytes = arr.tobytes()
+    hasher.update(batch_bytes)
 
     return hasher.hexdigest()
 
@@ -119,7 +110,7 @@ class HiCacheStorage(ABC):
         keys: List[str],
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> List[torch.Tensor | int | None] | int:
+    ) -> List[torch.Tensor | None] | int:
         """
         Retrieve values for multiple keys.
         Returns a list of tensors or None for each key.
@@ -148,7 +139,7 @@ class HiCacheStorage(ABC):
         values: Optional[Any] = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
-    ) -> bool | List[int]:
+    ) -> bool | int:
         """
         Store multiple key-value pairs.
         Returns True if all operations were successful, False otherwise.
@@ -166,7 +157,7 @@ class HiCacheStorage(ABC):
     # TODO: Use a finer-grained return type (e.g., List[bool])
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> int | List[int]:
+    ) -> int:
         """
         Check if the keys exist in the storage.
         return the number of consecutive existing keys from the start.

@@ -1,6 +1,6 @@
 import logging
 from queue import Empty
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import torch
 from torch import Tensor
@@ -17,7 +17,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig, get_hash_str_v1
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageConfig, get_hash_str
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.storage import StorageBackendFactory
 
@@ -34,7 +34,7 @@ def get_hash_list(
         token_ids[i : i + page_size] for i in range(0, len(token_ids), page_size)
     )
     for group in token_groups:
-        last_hash = get_hash_str_v1(group, last_hash)
+        last_hash = get_hash_str(group, last_hash)
         hashes.append(last_hash)
     return hashes
 
@@ -143,17 +143,15 @@ class AscendHiCacheController:
             return 0
 
         try:
-            write_results = self._memcpy_between_device_and_storage(
+            succ_pages_num = self._memcpy_between_device_and_storage(
                 hash_keys, device_indices, "write"
             )
             if self.tp_world_size > 1 and self.is_mla_model is False:
                 # only mha model need all reduce
-                write_results = self._allreduce_results(write_results)
+                succ_pages_num = self._allreduce_results(succ_pages_num)
 
-            # fresh hash keys and its len get successfully
-            # self._parse_success_hashes_from_l3_results(hash_keys, [len(hash_keys[0])], write_results)
-
-            return write_results.count(1) * self.page_size
+            logger.debug(f"success write {succ_pages_num} pages")
+            return succ_pages_num * self.page_size
         except Empty:
             return 0
 
@@ -199,18 +197,13 @@ class AscendHiCacheController:
             else:
                 hit_hash_keys = op.hash_keys[:hit_hash_len]
                 device_indices = op.device_indices[:hit_token_len]
-                load_results = self._memcpy_between_device_and_storage(
+                succ_pages_num = self._memcpy_between_device_and_storage(
                     hit_hash_keys, device_indices, "load"
                 )
                 if self.tp_world_size > 1:
-                    load_results = self._allreduce_results(load_results)
+                    succ_pages_num = self._allreduce_results(succ_pages_num)
 
-                # fresh hash keys and its len get successfully
-                hash_len = self._parse_success_hashes_from_l3_results(
-                    hit_hash_keys, load_results
-                )
-
-                token_len = hash_len * self.page_size
+                token_len = succ_pages_num * self.page_size
                 hit_device_indices = op.device_indices[:token_len]
                 free_device_indices = op.device_indices[token_len:]
 
@@ -224,9 +217,7 @@ class AscendHiCacheController:
             )
             return None, op.device_indices
 
-    def _allreduce_results(
-        self, result: Union[List[int], int]
-    ) -> Union[List[int], int]:
+    def _allreduce_results(self, result: int) -> int:
         result_tensor = torch.tensor(result, dtype=torch.int)
         torch.distributed.all_reduce(
             result_tensor,
@@ -234,34 +225,30 @@ class AscendHiCacheController:
             group=self.load_tp_group,
         )
 
-        if isinstance(result, int):
-            return result_tensor.item()
-        else:
-            return result_tensor.tolist()
+        return result_tensor.item()
 
     def _storage_hit_query(self, operation: LoadStorageOperation) -> int:
-        flatten_hash_keys = operation.hash_keys
         if not operation.hash_keys:
             return 0
 
-        exist_results = []
-        total_len = len(flatten_hash_keys)
+        total_len = len(operation.hash_keys)
+        total_hit_num = 0
         for start in range(0, total_len, self.storage_batch_size):
             end = min(start + self.storage_batch_size, total_len)
-            batch_hashes = flatten_hash_keys[start:end]
-            hit_results = self.storage_backend.batch_exists(batch_hashes)
-            exist_results.extend(hit_results)
+            batch_hashes = operation.hash_keys[start:end]
+            hit_num = self.storage_backend.batch_exists(batch_hashes)
+            total_hit_num += hit_num
+            if hit_num < len(batch_hashes):
+                break
 
-        return self._parse_success_hashes_from_l3_results(
-            flatten_hash_keys, exist_results
-        )
+        return total_hit_num
 
     def _memcpy_between_device_and_storage(
         self,
         hash_keys: List[str],
         device_indices: torch.Tensor,
         direction: str,
-    ) -> list[int]:
+    ) -> int:
         assert hash_keys
 
         batch_memcpy = None
@@ -275,20 +262,22 @@ class AscendHiCacheController:
         ptr_list, element_size_list = self._get_page_buffer_meta(device_indices)
         assert total_elements == len(ptr_list)
         assert total_elements == len(element_size_list)
-        results = []
+        total_succ_num = 0
         for start in range(0, total_elements, self.storage_batch_size):
             end = min(start + self.storage_batch_size, total_elements)
             batch_hashes = hash_keys[start:end]
             target_locations = ptr_list[start:end]
             target_sizes = element_size_list[start:end]
-            memcpy_results = batch_memcpy(
+            succ_num = batch_memcpy(
                 keys=batch_hashes,
                 target_locations=target_locations,
                 target_sizes=target_sizes,
             )
-            results.extend(memcpy_results)
+            total_succ_num += succ_num
+            if succ_num < len(batch_hashes):
+                break
 
-        return results
+        return total_succ_num
 
     def _parse_success_hashes_from_l3_results(
         self,

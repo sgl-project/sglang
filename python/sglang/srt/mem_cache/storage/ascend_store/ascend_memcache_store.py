@@ -162,19 +162,13 @@ class AscendMemCacheStore(HiCacheStorage):
         local_rank = 0 if self.is_mla_model else self.local_rank
         return [f"{key}_{local_rank}" for key in keys]
 
-    def _batch_postprocess(self, results: List[int], reverse=False) -> List[int]:
-        if reverse:
-            return [int(res == 0) for res in results]
-        else:
-            return [int(res != 0) for res in results]
-
     def batch_set(
         self,
         keys: List[str],
         values: Optional[List[torch.Tensor]] = None,
         target_locations: Optional[List[List[int]]] = None,
         target_sizes: Optional[List[List[int]]] = None,
-    ) -> List[int]:
+    ) -> int:
 
         assert len(keys) > 0
         assert len(keys) == len(target_locations) == len(target_sizes)
@@ -192,7 +186,7 @@ class AscendMemCacheStore(HiCacheStorage):
                     f"all keys is already in memcache, "
                     f"duration {float((end - start) * 1000):.3f}ms"
                 )
-            return [1] * len(keys)
+            return len(keys)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -228,7 +222,10 @@ class AscendMemCacheStore(HiCacheStorage):
                 f"speed {float(total_size) / 1024 / 1024 / 1024 / (end - start):.3f}GB/s"
             )
 
-        return self._batch_postprocess(exist_result, True)
+        for i in range(len(keys)):
+            if exist_result[i] != 1:
+                return i
+        return len(keys)
 
     def get(
         self,
@@ -243,7 +240,7 @@ class AscendMemCacheStore(HiCacheStorage):
         keys: List[str],
         target_locations: Optional[List[List[int]]] = None,
         target_sizes: Optional[List[List[int]]] = None,
-    ) -> List[int]:
+    ) -> int:
         assert len(keys) > 0
         assert len(keys) == len(target_locations) == len(target_sizes)
         key_strs = self._batch_preprocess(keys)
@@ -266,14 +263,17 @@ class AscendMemCacheStore(HiCacheStorage):
                 f"duration {(end - start) * 1000:.3f}ms, "
                 f"speed {float(total_size) / 1024 / 1024 / 1024 / (end - start):.3f}GB/s"
             )
-        return self._batch_postprocess(get_result, True)
+        for i in range(len(keys)):
+            if get_result[i] != 0:
+                return i
+        return len(keys)
 
     def exists(self, key) -> bool:
         return self.store.is_exist(key)
 
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> List[int]:
+    ) -> int:
         assert len(keys) > 0
         query_keys = self._batch_preprocess(keys)
         start = time.time()
@@ -285,8 +285,10 @@ class AscendMemCacheStore(HiCacheStorage):
                 f"exist is {exist_result.count(1)}, "
                 f"duration {(end - start) * 1000:.3f}ms"
             )
-
-        return self._batch_postprocess(exist_result)
+        for i in range(len(query_keys)):
+            if exist_result[i] != 1:
+                return i
+        return len(query_keys)
 
     def delete(self, key) -> None:
         d_key = f"{key}_{self.local_rank}"

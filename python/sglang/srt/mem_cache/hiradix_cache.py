@@ -463,29 +463,30 @@ class HiRadixCache(RadixCache):
 
     def init_load_back(
         self,
+        last_node: TreeNode,
+        host_hit_length: int,
         req: Req,
         mem_quota: Optional[int] = None,
     ):
-        if req.host_hit_length <= 0:
-            return None
+        if host_hit_length <= 0:
+            return None, req.last_node
 
-        _ = req.host_hit_length  # unused, but kept for compatibility
-
-        last_node = req.last_host_node
+        _ = host_hit_length  # unused, but kept for compatibility
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
-                req.last_node = last_node
-                return loading_values
+                return loading_values, last_node
 
             while last_node.evicted:
                 last_node = last_node.parent
 
-        req.last_node = last_node
-        return None
+        return (
+            torch.empty((0,), dtype=torch.int64, device=self.device),
+            last_node,
+        )
 
     def ready_to_load_host_cache(self) -> int:
         """

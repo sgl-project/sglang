@@ -602,7 +602,9 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if self.enable_hierarchical_cache:
-                new_indices = self.tree_cache.init_load_back(req)
+                new_indices, req.last_node = self.tree_cache.init_load_back(
+                    req.last_host_node, req.host_hit_length, req
+                )
                 if new_indices is not None:
                     req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                     req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
