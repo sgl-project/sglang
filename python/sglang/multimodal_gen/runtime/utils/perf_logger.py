@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from dateutil.tz import UTC
-import torch
 
 import sglang
 import sglang.multimodal_gen.envs as envs
@@ -136,19 +135,9 @@ class StageProfiler:
         self.logger = logger
         self.simple_log = simple_log
         self.start_time = 0.0
-        # GPU event timing (for logging) - initialized lazily
-        self._start_event: Optional[torch.cuda.Event] = None
-        self._end_event: Optional[torch.cuda.Event] = None
 
         # Check env var at runtime to ensure we pick up changes (e.g. from CLI args)
         self.metrics_enabled = envs.SGLANG_DIFFUSION_STAGE_LOGGING
-        # When enabled and CUDA is available, stage logs (not metrics) use CUDA events time
-        # to better reflect GPU execution time. Metrics recording still uses wall time.
-        self.use_cuda_event_for_log = True
-        
-        # bool(
-        #     int(os.environ.get("SGLANG_DIFFUSION_STAGE_LOGGING_USE_CUDA_EVENT", "0"))
-        # )
 
     def __enter__(self):
         if self.simple_log:
@@ -157,51 +146,13 @@ class StageProfiler:
         if (self.metrics_enabled and self.timings) or self.simple_log:
             self.start_time = time.perf_counter()
 
-        # Prepare CUDA event timers only for logging when requested
-        if (
-            self.simple_log
-            and self.use_cuda_event_for_log
-            and torch.cuda.is_available()
-        ):
-            try:
-                # Ensure no preceding kernels bleed into timing
-                torch.cuda.synchronize()
-                self._start_event = torch.cuda.Event(enable_timing=True)
-                self._end_event = torch.cuda.Event(enable_timing=True)
-                self._start_event.record()
-            except Exception:
-                # Fallback silently to wall clock
-                self._start_event = None
-                self._end_event = None
-
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if not ((self.metrics_enabled and self.timings) or self.simple_log):
             return False
 
-        # Wall time (used for metrics to keep existing semantics)
         execution_time_s = time.perf_counter() - self.start_time
-
-        # Determine the value to log: prefer CUDA event timing if enabled and available
-        log_time_s = execution_time_s
-        if (
-            self.simple_log
-            and self.use_cuda_event_for_log
-            and torch.cuda.is_available()
-            and (self._start_event is not None)
-            and (self._end_event is None or isinstance(self._end_event, torch.cuda.Event))
-        ):
-            try:
-                if self._end_event is None:
-                    self._end_event = torch.cuda.Event(enable_timing=True)
-                self._end_event.record()
-                torch.cuda.synchronize()
-                ms = self._start_event.elapsed_time(self._end_event)
-                log_time_s = ms / 1000.0
-            except Exception:
-                # Keep wall time if CUDA timing fails
-                log_time_s = execution_time_s
 
         if exc_type:
             self.logger.error(
@@ -215,7 +166,7 @@ class StageProfiler:
 
         if self.simple_log:
             self.logger.info(
-                f"[{self.stage_name}] finished in {log_time_s:.4f} seconds"
+                f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds"
             )
 
         if self.metrics_enabled and self.timings:
@@ -312,38 +263,4 @@ class PerformanceLogger:
             print(f"WARNING: Failed to log performance record: {e}", file=sys.stderr)
 
 
-class CudaEventsTimer:
-    """
-    Context manager for precise GPU timing using CUDA events.
-
-    Usage:
-        timings = {}
-        with CudaEventsTimer("section_name", timings):
-            ...  # GPU work
-        # timings["section_name"] -> seconds (float)
-    """
-
-    def __init__(self, name: str, sink: Optional[Dict[str, float]] = None):
-        self.name = name
-        self.sink = sink
-        self._start_event: Optional[torch.cuda.Event] = None
-        self._end_event: Optional[torch.cuda.Event] = None
-        self.seconds: float = 0.0
-
-    def __enter__(self):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            self._start_event = torch.cuda.Event(enable_timing=True)
-            self._end_event = torch.cuda.Event(enable_timing=True)
-            self._start_event.record()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if torch.cuda.is_available() and self._start_event is not None and self._end_event is not None:
-            self._end_event.record()
-            torch.cuda.synchronize()
-            ms = self._start_event.elapsed_time(self._end_event)
-            self.seconds = ms / 1000.0
-            if self.sink is not None:
-                self.sink[self.name] = self.seconds
-        return False
+ 

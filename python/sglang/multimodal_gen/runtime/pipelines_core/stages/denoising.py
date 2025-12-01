@@ -59,7 +59,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler, CudaEventsTimer
+from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 try:
@@ -114,28 +114,7 @@ class DenoisingStage(PipelineStage):
         )
         attn_head_size = hidden_size // num_attention_heads
 
-        # torch compile
-        if self.server_args.enable_torch_compile:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except Exception:
-                pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-            )
-            # Only compile when it's a module-like object (has forward). Wrap forward like xDiT.
-            if hasattr(self.transformer, "forward"):
-                compiled_forward = torch.compile(
-                    getattr(self.transformer, "forward"), mode=mode
-                )
-                setattr(self.transformer, "forward", compiled_forward)
-            if transformer_2 is not None and hasattr(self.transformer_2, "forward"):
-                compiled_forward_2 = torch.compile(
-                    getattr(self.transformer_2, "forward"), mode=mode
-                )
-                setattr(self.transformer_2, "forward", compiled_forward_2)
+        # torch compile (removed)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -210,22 +189,7 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
-            if self.server_args.enable_torch_compile and hasattr(
-                self.transformer, "forward"
-            ):
-                try:
-                    import torch._inductor.config as _inductor_cfg
-
-                    _inductor_cfg.reorder_for_compute_comm_overlap = True
-                except Exception:
-                    pass
-                mode = os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                )
-                compiled_forward = torch.compile(
-                    getattr(self.transformer, "forward"), mode=mode
-                )
-                setattr(self.transformer, "forward", compiled_forward)
+            # torch compile (removed)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
@@ -830,9 +794,7 @@ class DenoisingStage(PipelineStage):
         # Run denoising loop
         denoising_start_time = time.time()
 
-        gpu_timings: dict[str, float] = {}
-        with CudaEventsTimer("denoising_total_gpu", gpu_timings):
-            self.start_profile(batch=batch)
+        self.start_profile(batch=batch)
 
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = timesteps.cpu()
@@ -935,13 +897,6 @@ class DenoisingStage(PipelineStage):
         self.stop_profile(batch)
 
         denoising_end_time = time.time()
-
-        # Record total GPU time as a stage metric (seconds -> record_stage expects seconds)
-        if getattr(batch, "timings", None) is not None and "denoising_total_gpu" in gpu_timings:
-            try:
-                batch.timings.record_stage("denoising_total_gpu", gpu_timings["denoising_total_gpu"])
-            except Exception:
-                pass
 
         if num_timesteps > 0:
             self.log_info(
