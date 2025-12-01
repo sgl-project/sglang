@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -57,6 +58,7 @@ class ProfileManager:
         profile_id: str,
         merge_profiles: bool,
         profile_prefix: str,
+        profile_stages: Optional[List[str]] = None,
     ):
         # not supported yet
         assert start_step is None
@@ -81,7 +83,7 @@ class ProfileManager:
 
         self.stage_based_trigger.configure(
             num_steps=num_steps,
-            interesting_stages=["prefill", "decode"],
+            interesting_stages=profile_stages or ["prefill", "decode"],
         )
 
         return ProfileReqOutput(success=True, message="Succeeded")
