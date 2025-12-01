@@ -520,14 +520,13 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             self._vae_has_bn_cache = hasattr(vae, "bn") and vae.bn is not None
         return self._vae_has_bn_cache
 
-    def preprocess_decoding(self, latents, server_args=None):
+    def preprocess_decoding(self, latents, server_args=None, vae=None):
         """Preprocess latents before decoding.
 
         Dynamically adapts based on VAE type:
         - Standard Flux2 VAE (has bn): needs unpatchify (128 channels -> 32 channels)
         - Distilled VAE (no bn): keeps patchified latents (128 channels)
         """
-        vae = getattr(server_args, "_current_vae", None) if server_args else None
         if vae is not None and self._check_vae_has_bn(vae):
             return _unpatchify_latents(latents)
         return latents

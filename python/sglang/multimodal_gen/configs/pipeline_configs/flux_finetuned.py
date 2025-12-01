@@ -37,7 +37,7 @@ class Flux2FinetunedPipelineConfig(Flux2PipelineConfig):
     """
 
     def preprocess_decoding(
-        self, latents: torch.Tensor, server_args=None
+        self, latents: torch.Tensor, server_args=None, vae=None
     ) -> torch.Tensor:
         """
         Preprocess latents before decoding.
@@ -51,7 +51,8 @@ class Flux2FinetunedPipelineConfig(Flux2PipelineConfig):
 
         Args:
             latents: Input latents tensor, can be 4D or 5D
-            server_args: Server arguments containing VAE reference
+            server_args: Server arguments (optional, for compatibility)
+            vae: VAE model instance for dynamic type detection
 
         Returns:
             Preprocessed latents ready for VAE decoding
@@ -65,7 +66,6 @@ class Flux2FinetunedPipelineConfig(Flux2PipelineConfig):
                 latents = latents.permute(0, 2, 1, 3, 4).contiguous()
                 latents = latents.view(batch_size * frames, channels, height, width)
 
-        vae = getattr(server_args, "_current_vae", None) if server_args else None
         if vae is not None and self._check_vae_has_bn(vae):
             latents = _unpatchify_latents(latents)
         return latents

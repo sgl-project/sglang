@@ -234,7 +234,7 @@ class PipelineConfig:
         return image_latents
 
     # called after scale_and_shift, before vae decoding
-    def preprocess_decoding(self, latents, server_args=None):
+    def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
     def gather_latents_for_sp(self, latents):
