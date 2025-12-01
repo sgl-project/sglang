@@ -4,7 +4,6 @@ import logging
 import multiprocessing as mp
 import os
 import pickle
-import sys
 import time
 import traceback
 from typing import Dict, List, Optional, Set, Tuple
@@ -62,16 +61,12 @@ class TensorWrapper:
         self.shape = list(tensor.shape)
         self.dtype = tensor.dtype
 
-        # Create buffer view based on Python version
-        if sys.version_info >= (3, 12):
-            data_ptr = tensor.data_ptr()
-            total_bytes = tensor.numel() * tensor.element_size()
-            self._buffer = memoryview(
-                (ctypes.c_char * total_bytes).from_address(data_ptr)
-            )
-        else:
-            # For Python 3.10, just use numpy - it already supports buffer protocol
-            self._buffer = np.asarray(tensor)
+    def __buffer__(self):
+        data_ptr = self.tensor.data_ptr()
+        total_bytes = self.tensor.numel() * self.tensor.element_size()
+        c_obj = (ctypes.c_char * total_bytes).from_address(data_ptr)
+        c_obj._keep_alive_ref = self
+        return memoryview(c_obj)
 
 
 def _convert(data):
@@ -272,7 +267,9 @@ class MMEncoder:
         else:
             new_mm_data = mm_data.copy_without_embedding()
             embedding_tensor = TensorWrapper(mm_data.embedding)
-            socket.send_multipart([pickle.dumps(new_mm_data), embedding_tensor._buffer])
+            socket.send_multipart(
+                [pickle.dumps(new_mm_data), embedding_tensor.__buffer__()]
+            )
 
     async def encode(self, mm_items, req_id, num_parts, part_idx):
         start_time = time.time()
