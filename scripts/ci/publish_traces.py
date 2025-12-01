@@ -7,7 +7,9 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -46,25 +48,25 @@ def make_github_request(url, token, method="GET", data=None):
 
 def verify_token_permissions(repo_owner, repo_name, token):
     """Verify that the token has necessary permissions for the repository"""
-    print("Verifying token permissions...")
+    print("Verifying token permissions...", flush=True)
 
     # Check if we can access the repository
     try:
         url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
         response = make_github_request(url, token)
         repo_data = json.loads(response)
-        print(f"Repository access verified: {repo_data['full_name']}")
+        print(f"Repository access verified: {repo_data['full_name']}", flush=True)
     except Exception as e:
-        print(f"Failed to access repository: {e}")
+        print(f"Failed to access repository: {e}", flush=True)
         return False
 
     # Check if we can read the repository contents
     try:
         url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/contents"
         response = make_github_request(url, token)
-        print("Repository contents access verified")
+        print("Repository contents access verified", flush=True)
     except Exception as e:
-        print(f"Failed to access repository contents: {e}")
+        print(f"Failed to access repository contents: {e}", flush=True)
         return False
 
     return True
@@ -112,25 +114,55 @@ def create_blob(repo_owner, repo_name, content, token, max_retries=3):
                 raise
 
 
-def create_tree(repo_owner, repo_name, base_tree_sha, files, token, max_retries=3):
-    """Create a new tree with files"""
+def create_tree(
+    repo_owner, repo_name, base_tree_sha, files, token, max_retries=3, max_workers=10
+):
+    """Create a new tree with files using parallel blob creation"""
     url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/git/trees"
 
-    tree_items = []
-    for i, (file_path, content) in enumerate(files):
-        # Create blob first to get SHA
+    # Thread-safe counter for progress reporting
+    completed_count = [0]
+    total_files = len(files)
+    progress_lock = threading.Lock()
+
+    def create_blob_for_file(file_info):
+        """Create a blob for a single file and return tree item"""
+        file_path, content = file_info
         blob_sha = create_blob(repo_owner, repo_name, content, token)
-        tree_items.append(
-            {
-                "path": file_path,
-                "mode": "100644",
-                "type": "blob",
-                "sha": blob_sha,
-            }
-        )
-        # Progress indicator for large uploads
-        if (i + 1) % 10 == 0 or (i + 1) == len(files):
-            print(f"Created {i + 1}/{len(files)} blobs...")
+
+        # Update progress with thread safety
+        with progress_lock:
+            completed_count[0] += 1
+            count = completed_count[0]
+            if count % 10 == 0 or count == total_files:
+                print(f"Created {count}/{total_files} blobs...", flush=True)
+
+        return {
+            "path": file_path,
+            "mode": "100644",
+            "type": "blob",
+            "sha": blob_sha,
+        }
+
+    # Create blobs in parallel
+    tree_items = []
+    print(f"Creating blobs in parallel (max_workers={max_workers})...", flush=True)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_file = {executor.submit(create_blob_for_file, f): f[0] for f in files}
+
+        # Collect results as they complete
+        for future in as_completed(future_to_file):
+            file_path = future_to_file[future]
+            try:
+                tree_item = future.result()
+                tree_items.append(tree_item)
+            except Exception as e:
+                print(f"Failed to create blob for {file_path}: {e}", flush=True)
+                raise
+
+    print(f"All {total_files} blobs created successfully", flush=True)
 
     data = {"base_tree": base_tree_sha, "tree": tree_items}
 
@@ -142,7 +174,8 @@ def create_tree(repo_owner, repo_name, base_tree_sha, files, token, max_retries=
             if attempt < max_retries - 1:
                 wait_time = 2**attempt
                 print(
-                    f"Tree creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s..."
+                    f"Tree creation failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s...",
+                    flush=True,
                 )
                 time.sleep(wait_time)
             else:
@@ -231,7 +264,7 @@ def copy_trace_files(source_dir, target_base_path):
     files_to_upload = []
 
     if not os.path.exists(source_dir):
-        print(f"Warning: Traces directory {source_dir} does not exist")
+        print(f"Warning: Traces directory {source_dir} does not exist", flush=True)
         return files_to_upload
 
     # Walk through source directory and find .json.gz files
@@ -257,7 +290,7 @@ def publish_traces(traces_dir, run_id, run_number):
     # Get environment variables
     token = os.getenv("GITHUB_TOKEN")
     if not token:
-        print("Error: GITHUB_TOKEN environment variable not set")
+        print("Error: GITHUB_TOKEN environment variable not set", flush=True)
         sys.exit(1)
 
     # Repository configuration
@@ -270,15 +303,16 @@ def publish_traces(traces_dir, run_id, run_number):
     files_to_upload = copy_trace_files(traces_dir, target_base_path)
 
     if not files_to_upload:
-        print("No trace files found to upload")
+        print("No trace files found to upload", flush=True)
         return
 
-    print(f"Found {len(files_to_upload)} files to upload")
+    print(f"Found {len(files_to_upload)} files to upload", flush=True)
 
     # Verify token permissions before proceeding
     if not verify_token_permissions(repo_owner, repo_name, token):
         print(
-            "Token permission verification failed. Please check the token permissions."
+            "Token permission verification failed. Please check the token permissions.",
+            flush=True,
         )
         sys.exit(1)
 
@@ -289,17 +323,17 @@ def publish_traces(traces_dir, run_id, run_number):
         try:
             # Get current branch head
             branch_sha = get_branch_sha(repo_owner, repo_name, branch, token)
-            print(f"Current branch head: {branch_sha}")
+            print(f"Current branch head: {branch_sha}", flush=True)
 
             # Get current tree
             tree_sha = get_tree_sha(repo_owner, repo_name, branch_sha, token)
-            print(f"Current tree SHA: {tree_sha}")
+            print(f"Current tree SHA: {tree_sha}", flush=True)
 
             # Create new tree with all files
             new_tree_sha = create_tree(
                 repo_owner, repo_name, tree_sha, files_to_upload, token
             )
-            print(f"Created new tree: {new_tree_sha}")
+            print(f"Created new tree: {new_tree_sha}", flush=True)
 
             # Create commit
             commit_message = f"Nightly traces for run {run_id} at {run_number} ({len(files_to_upload)} files)"
@@ -311,13 +345,13 @@ def publish_traces(traces_dir, run_id, run_number):
                 commit_message,
                 token,
             )
-            print(f"Created commit: {commit_sha}")
+            print(f"Created commit: {commit_sha}", flush=True)
 
             # Update branch reference
             update_branch_ref(repo_owner, repo_name, branch, commit_sha, token)
-            print("Updated branch reference")
+            print("Updated branch reference", flush=True)
 
-            print("Successfully published all traces in a single commit")
+            print("Successfully published all traces in a single commit", flush=True)
             return
 
         except Exception as e:
@@ -340,11 +374,15 @@ def publish_traces(traces_dir, run_id, run_number):
 
             if is_retryable and attempt < max_retries - 1:
                 print(
-                    f"Attempt {attempt + 1}/{max_retries} failed ({error_type}). Retrying in {retry_delay} seconds..."
+                    f"Attempt {attempt + 1}/{max_retries} failed ({error_type}). Retrying in {retry_delay} seconds...",
+                    flush=True,
                 )
                 time.sleep(retry_delay)
             else:
-                print(f"Failed to publish traces after {attempt + 1} attempts: {e}")
+                print(
+                    f"Failed to publish traces after {attempt + 1} attempts: {e}",
+                    flush=True,
+                )
                 raise
 
 
@@ -366,13 +404,14 @@ def main():
 
     if not run_id or not run_number:
         print(
-            "Error: GITHUB_RUN_ID and GITHUB_RUN_NUMBER environment variables must be set"
+            "Error: GITHUB_RUN_ID and GITHUB_RUN_NUMBER environment variables must be set",
+            flush=True,
         )
         sys.exit(1)
 
     # Use traces directory
     traces_dir = args.traces_dir
-    print(f"Processing traces from directory: {traces_dir}")
+    print(f"Processing traces from directory: {traces_dir}", flush=True)
 
     # Publish traces
     publish_traces(traces_dir, run_id, run_number)

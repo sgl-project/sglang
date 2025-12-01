@@ -205,6 +205,8 @@ class TestDeepseekV32NasBackend_pure_tp(CustomTestCase):
         cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         # Pure TP configuration without --dp and --enable-dp-attention
+        # Use fp8_e4m3 kv-cache to enable RAGGED topk transform method
+        # which is required for the chunked MQA logits path
         other_args = [
             "--trust-remote-code",
             "--attention-backend",
@@ -213,6 +215,8 @@ class TestDeepseekV32NasBackend_pure_tp(CustomTestCase):
             "flashmla_sparse",
             "--nsa-decode-backend",
             "flashmla_kv",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
             "--tp",
             "8",
         ]
@@ -247,7 +251,7 @@ class TestDeepseekV32NasBackend_pure_tp(CustomTestCase):
                     "variant": "pure_tp",
                     "prefill_backend": "flashmla_sparse",
                     "decode_backend": "flashmla_kv",
-                    "kv_cache": "fp16",
+                    "kv_cache": "fp8_e4m3",
                     "accuracy": metrics["accuracy"],
                 }
             )
