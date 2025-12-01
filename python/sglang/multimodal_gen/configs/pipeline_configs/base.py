@@ -191,7 +191,7 @@ class PipelineConfig:
 
     ## For ImageVAEEncodingStage
     def preprocess_condition_image(
-        self, image, target_width, target_height, vae_image_processor
+        self, image, target_width, target_height, _vae_image_processor
     ):
         """
         preprocess the condition image, returns (image, final_image_width, final_image_height)
