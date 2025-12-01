@@ -42,6 +42,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -100,6 +101,17 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+        )
+
+    def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.MIXED
+            or (
+                self == ForwardMode.DRAFT_EXTEND_V2
+                if include_draft_extend_v2
+                else False
+            )
         )
 
     def is_decode(self):
@@ -339,6 +351,9 @@ class ForwardBatch:
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
+    # Record the split metadata of the sequence number of NSA context parallels.
+    nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
+
     @classmethod
     def init_new(
         cls,
@@ -426,8 +441,17 @@ class ForwardBatch:
             )
             return ret
 
-        # Override the positions with spec_info
-        if (
+        # Override the positions with diffusion LLM or spec_info
+        if batch.dllm_config is not None:
+            block_size = batch.dllm_config.block_size
+            ret.positions = torch.tensor(
+                [
+                    [i for i in range(block_offset, block_offset + block_size)]
+                    for block_offset in batch.dllm_block_offsets
+                ],
+                dtype=torch.int32,
+            ).to(device, non_blocking=True)
+        elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):
