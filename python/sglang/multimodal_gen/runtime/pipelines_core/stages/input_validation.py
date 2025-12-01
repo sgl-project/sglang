@@ -194,7 +194,7 @@ class InputValidationStage(PipelineStage):
             )
 
         # Validate guidance scale if using classifier-free guidance
-        if batch.do_classifier_free_guidance and batch.guidance_scale <= 0:
+        if batch.do_classifier_free_guidance and batch.guidance_scale < 0:
             raise ValueError(
                 f"Guidance scale must be positive, but got {batch.guidance_scale}"
             )
@@ -318,7 +318,7 @@ class InputValidationStage(PipelineStage):
         result.add_check(
             "guidance_scale",
             batch.guidance_scale,
-            lambda x: not batch.do_classifier_free_guidance or V.positive_float(x),
+            lambda x: not batch.do_classifier_free_guidance or V.non_negative_float(x),
         )
         return result
 
