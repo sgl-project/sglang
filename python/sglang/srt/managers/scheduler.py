@@ -2003,7 +2003,7 @@ class Scheduler(
                     ).Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu()
+                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
 
@@ -2087,7 +2087,7 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu()
+            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
     def process_batch_result(
         self,
@@ -2631,7 +2631,9 @@ def run_scheduler_process(
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
-    if (numa_node := server_args.numa_node) is not None:
+    if (
+        numa_node := server_args.numa_node
+    ) is not None and not envs.SGLANG_NUMA_BIND_V2.get():
         numa_bind_to_node(numa_node[gpu_id])
 
     # Set up tracing

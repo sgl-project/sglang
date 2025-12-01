@@ -284,6 +284,17 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
 
 
+def get_float_env_var(name: str, default: float = 0.0) -> float:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def support_triton(backend: str) -> bool:
     return backend not in ["torch_native", "intel_amx"]
 
@@ -1203,8 +1214,8 @@ def configure_logger(server_args, prefix: str = ""):
             custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
-    format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
+    maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
+    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
