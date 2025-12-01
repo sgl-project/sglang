@@ -6,7 +6,7 @@ end to end attention solution with aiter kernels
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, List
 
 import torch
 import triton
@@ -304,6 +304,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
+            prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
             if self.is_multimodal:
                 extend_no_prefix = False
@@ -336,6 +337,8 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.seq_lens,
                     forward_batch.seq_lens_sum,
                     prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens_cpu=forward_batch.seq_lens_cpu,
                     encoder_lens=forward_batch.encoder_lens,
                     spec_info=None,
                 )
@@ -891,6 +894,8 @@ class AiterIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: Optional[List[int]],
+        seq_lens_cpu: Optional[torch.Tensor],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
     ):
@@ -903,6 +908,8 @@ class AiterIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_sum: int,
         prefix_lens: torch.Tensor,
+        prefix_lens_cpu: Optional[List[int]],
+        seq_lens_cpu: Optional[torch.Tensor],
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
     ):
@@ -939,14 +946,25 @@ class AiterIndicesUpdaterPrefill:
                 kv_indices,
                 self.req_to_token.shape[1],
             )
+            if seq_lens_cpu is None:
+                token_num = kv_indptr[-1]
+                kv_indices[token_num:] = kv_indices[0]
+            else:
+                token_num = torch.cumsum(seq_lens_cpu, dim=0)[-1]
+                kv_indices[token_num:] = kv_indices[0]
 
-            token_num = kv_indptr[-1]
-            kv_indices[token_num:] = kv_indices[0]
-
-            self.max_kv_len = torch.max(paged_kernel_lens).item()
+            if seq_lens_cpu is None:
+                self.max_kv_len = torch.max(paged_kernel_lens).item()
+            else:
+                self.max_kv_len = torch.max(seq_lens_cpu).item()
 
             extend_lens = seq_lens - prefix_lens
-            self.max_q_len = torch.max(extend_lens).item()
+            if seq_lens_cpu is not None and prefix_lens_cpu is not None:
+                prefix_lens_cpu_torch = torch.tensor(prefix_lens_cpu)
+                extend_lens_cpu = seq_lens_cpu - prefix_lens_cpu_torch
+                self.max_q_len = torch.max(extend_lens_cpu).item()
+            else:
+                self.max_q_len = torch.max(extend_lens).item()
 
             qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
