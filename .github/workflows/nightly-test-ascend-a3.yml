@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ascend-nightly-${{ github.ref }}-a3
+  group: ascend-nightly-test-${{ github.ref }}-a3
   cancel-in-progress: true
 
 jobs:

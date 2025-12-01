@@ -42,7 +42,7 @@ on:
         description: path of test case file
 
 concurrency:
-  group: ascend-nightly-${{ github.ref }}-${{ inputs.soc_version }}
+  group: ascend-nightly-multinode-${{ github.ref }}-${{ inputs.soc_version }}
   cancel-in-progress: true
 
 jobs:
