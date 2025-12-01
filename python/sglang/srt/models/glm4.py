@@ -450,7 +450,10 @@ class Glm4ForCausalLM(nn.Module):
                 )
             else:
                 emb_token_weight = self.pp_group.recv(
-                    size=(config.vocab_size, config.hidden_size),
+                    size=(
+                        config.vocab_size // get_tensor_model_parallel_world_size(),
+                        config.hidden_size,
+                    ),
                     dtype=next(self.model.parameters()).dtype,
                     src=self.pp_group.first_rank,
                 )
