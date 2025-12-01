@@ -45,11 +45,10 @@ class FILOStrategy(EvictionStrategy):
 
 class AdapterMixStrategy(EvictionStrategy):
 
-    cold_count: int = 0
-    hot_count: int = 0
-    last_update_time: float = time.monotonic()
-
     def __init__(self, time_threshold):
+        self.cold_count = 0
+        self.hot_count = 0
+        self.last_update_time = 0
         self.time_threshold = time_threshold
         self.min_time_threshold = max(30, self.time_threshold >> 4)
         self.max_time_threshold = min(self.time_threshold << 4, 600)
