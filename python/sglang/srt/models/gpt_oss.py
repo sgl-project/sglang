@@ -79,6 +79,7 @@ _is_npu = is_npu()
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
 
+
 # When using the Ascend backend, the silu activation function (torch_npu.npu_swiglu)
 # caused precision issues with the GPT-OSS model; switching to a custom implementation
 # of the swiglu activation function resolved the problem.
@@ -327,7 +328,7 @@ class GptOssAttention(nn.Module):
         extra_args = {}
         if _is_cuda:
             extra_args = {
-                "fused_set_kv_buffer_arg" : (
+                "fused_set_kv_buffer_arg": (
                     create_fused_set_kv_buffer_arg(
                         value=v,
                         layer=self.attn,
