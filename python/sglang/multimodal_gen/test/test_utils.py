@@ -10,18 +10,28 @@ import sys
 import time
 import unittest
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Optional
 
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.performance_logger import (
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    RequestPerfRecord,
     get_diffusion_perf_log_dir,
 )
 
 logger = init_logger(__name__)
+
+
+def is_image_url(image_path: str | Path | None) -> bool:
+    """Check if image_path is a URL."""
+    if image_path is None:
+        return False
+    return isinstance(image_path, str) and (
+        image_path.startswith("http://") or image_path.startswith("https://")
+    )
 
 
 def run_command(command) -> Optional[float]:
@@ -142,82 +152,49 @@ def prepare_perf_log() -> tuple[Path, Path]:
     return log_dir, log_path
 
 
-def read_perf_records(log_path: Path) -> list[dict]:
+def read_perf_logs(log_path: Path) -> list[RequestPerfRecord]:
     if not log_path.exists():
         return []
-    records: list[dict] = []
+    records: list[RequestPerfRecord] = []
     with log_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                record_dict = json.loads(line)
+                records.append(RequestPerfRecord(**record_dict))
             except json.JSONDecodeError:
                 continue
     return records
 
 
-def wait_for_perf_record(
-    tag: str,
-    prev_len: int,
-    log_path: Path,
-    timeout: float = 120.0,
-) -> tuple[dict, int]:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        records = read_perf_records(log_path)
-        if len(records) > prev_len:
-            for rec in records[prev_len:]:
-                if rec.get("tag") == tag:
-                    return rec, len(records)
-        time.sleep(0.5)
-    raise AssertionError(
-        f"Timeout waiting for perf log entry '{tag}' (start_len={prev_len})"
-    )
-
-
-def wait_for_stage_metrics(
+def wait_for_req_perf_record(
     request_id: str,
     prev_len: int,
-    expected_count: int,
     log_path: Path,
-    timeout: float = 120.0,
-) -> tuple[dict[str, float], int]:
+    timeout: float = 30.0,
+) -> tuple[RequestPerfRecord | None, int]:
+    """
+    the stage metrics of this request should be in the performance_log file with {request-id}
+    """
+    logger.info(f"Waiting for req perf record with request id: {request_id}")
     deadline = time.time() + timeout
-    metrics: dict[str, float] = {}
     while time.time() < deadline:
-        records = read_perf_records(log_path)
-        for rec in records[prev_len:]:
-            if (
-                rec.get("tag") == "pipeline_stage_metric"
-                and rec.get("request_id") == request_id
-            ):
-                stage = rec.get("stage")
-                duration = rec.get("duration_ms")
-                if stage is not None and duration is not None:
-                    metrics[str(stage)] = float(duration)
-        if len(metrics) >= expected_count:
-            return metrics, len(records)
+        records = read_perf_logs(log_path)
+        if len(records) >= prev_len + 1:
+            # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
+            # potential error when there are multiple servers
+            return records[-1], len(records)
+
         time.sleep(0.5)
-    raise AssertionError(
-        f"Timeout waiting for stage metrics for request {request_id} "
-        f"(collected={len(metrics)} expected={expected_count})"
-    )
 
+    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+        records = read_perf_logs(log_path)
+        return None, len(records)
 
-def sample_step_indices(
-    step_map: dict[int, float], fractions: Sequence[float]
-) -> list[int]:
-    if not step_map:
-        return []
-    max_idx = max(step_map.keys())
-    indices = set()
-    for fraction in fractions:
-        idx = min(max_idx, max(0, int(round(fraction * max_idx))))
-        if idx in step_map:
-            indices.add(idx)
-    return sorted(indices)
+    logger.error(f"record: {records}")
+    raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
 
 
 def validate_image(b64_json: str) -> None:
@@ -417,8 +394,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_cfg_parallel(self):
         """cfg parallel"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_cfg_parallel",
             args="--num-gpus 2 --enable-cfg-parallel",
@@ -428,8 +403,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_usp(self):
         """usp"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_usp",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=2",
@@ -439,8 +412,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_mixed(self):
         """mixed"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_mixed",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=1 --enable-cfg-parallel",

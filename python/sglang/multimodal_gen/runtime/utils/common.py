@@ -2,6 +2,7 @@
 
 import importlib
 import ipaddress
+import logging
 import os
 import platform
 import signal
@@ -14,9 +15,8 @@ import psutil
 import torch
 import zmq
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
+# use the native logger to avoid circular import
+logger = logging.getLogger(__name__)
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -308,30 +308,6 @@ def set_cuda_arch():
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
 
 
-def get_bool_env_var(env_var_name: str, default: str | bool = "false") -> bool:
-    raw_value = os.getenv(env_var_name, None)
-    if raw_value is None:
-        raw_value = str(default)
-
-    value_str = str(raw_value).strip().lower()
-    truthy = {"1", "true", "yes", "y", "t", "on"}
-    falsy = {"0", "false", "no", "n", "f", "off", ""}
-
-    if value_str in truthy:
-        return True
-    if value_str in falsy:
-        return False
-
-    default_bool = str(default).strip().lower() in truthy
-    logger.warning(
-        "Unrecognized boolean for %s=%r; falling back to default=%r",
-        env_var_name,
-        raw_value,
-        default_bool,
-    )
-    return default_bool
-
-
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -348,12 +324,11 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name, default)
-    value = value.lower()
+    value = str(value).strip().lower()
 
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
+    truthy_values = {"1", "true", "yes", "y", "t", "on"}
+    falsy_values = {"0", "false", "no", "n", "f", "off", ""}
 
     if (value not in truthy_values) and (value not in falsy_values):
         if value not in _warned_bool_env_var_keys:
