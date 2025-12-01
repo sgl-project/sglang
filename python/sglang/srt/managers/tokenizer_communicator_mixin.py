@@ -6,6 +6,7 @@ import logging
 import time
 import uuid
 from collections import deque
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -415,15 +416,11 @@ class TokenizerCommunicatorMixin:
 
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
-            if self.is_pause:
-                results = await self.update_weights_from_distributed_communicator(obj)
-            else:
-                # This means that weight sync
-                # cannot run while requests are in progress.
-                async with self.model_update_lock.writer_lock:
-                    results = await self.update_weights_from_distributed_communicator(
-                        obj
-                    )
+            is_paused = self.is_pause
+
+        lock_context = self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        async with lock_context:
+            results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
@@ -475,13 +472,11 @@ class TokenizerCommunicatorMixin:
 
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
-            if self.is_pause:
-                results = await self.update_weights_from_tensor_communicator(obj)
-            else:
-                # This means that weight sync
-                # cannot run while requests are in progress.
-                async with self.model_update_lock.writer_lock:
-                    results = await self.update_weights_from_tensor_communicator(obj)
+            is_paused = self.is_pause
+
+        lock_context = self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        async with lock_context:
+            results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = _Communicator.merge_results(results)
         if success and obj.weight_version is not None:
