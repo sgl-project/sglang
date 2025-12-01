@@ -1485,16 +1485,19 @@ class ModelRunner:
             total_tokens = (
                 self.max_total_num_tokens * self.model_config.num_hidden_layers
             )
-            swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
+            # swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
             # Solve the equations:
             # 1. swa_max_total_num_tokens * swa_layers_num + full_max_total_num_tokens * full_layers_num == total_tokens
             # 2. full_max_total_num_tokens * swa_full_tokens_ratio == swa_max_total_num_tokens
-            denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+            # hack here
+            # denominator = swa_full_tokens_ratio * swa_layers_num + full_layers_num
+            denominator = swa_layers_num + full_layers_num
             self.full_max_total_num_tokens = int(total_tokens / denominator)
-            self.swa_max_total_num_tokens = int(
-                self.full_max_total_num_tokens * swa_full_tokens_ratio
-            )
+            # self.swa_max_total_num_tokens = int(
+            #     self.full_max_total_num_tokens * swa_full_tokens_ratio
+            # )
+            self.swa_max_total_num_tokens = self.full_max_total_num_tokens
             self.max_total_num_tokens = self.full_max_total_num_tokens
 
         logger.info(

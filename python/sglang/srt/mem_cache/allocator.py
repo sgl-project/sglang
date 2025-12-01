@@ -202,8 +202,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache.swa_kv_pool,
             need_sort,
         )
-        self.full_to_swa_index_mapping = torch.empty(
+        assert size == size_swa
+        # self.full_to_swa_index_mapping = torch.empty(
+        #     size + size_swa + 1,
+        #     dtype=torch.int64,
+        #     device=device,
+        # )
+        self.full_to_swa_index_mapping = torch.arange(
+            0,
             size + size_swa + 1,
+            1,
             dtype=torch.int64,
             device=device,
         )
@@ -250,7 +258,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
-        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        # assert alloc_full_indices[0] == alloc_swa_indices[0]
+        # self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
@@ -258,7 +267,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
-            self.free_swa(free_index)
+            self.swa_attn_allocator.free(free_index)
         else:
             self.free_group.append(free_index)
         assert (
@@ -267,10 +276,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: torch.Tensor):
-        swa_indices = self.full_to_swa_index_mapping[free_index]
-        swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        # swa_indices = self.full_to_swa_index_mapping[free_index]
+        # swa_indices = swa_indices[swa_indices > 0]
+        # self.swa_attn_allocator.free(swa_indices)
+        # self.full_to_swa_index_mapping[free_index] = 0
+        pass
 
     def backup_state(self):
         return [
@@ -286,7 +296,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
-        self.full_to_swa_index_mapping.fill_(0)
+        # self.full_to_swa_index_mapping.fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
 
