@@ -231,7 +231,7 @@ class LoRAMemoryPool:
             # 2. Memory pool is full, need to evict using policy
             candidates = set()
 
-            for buffer_id in range(self.max_loras_per_batch):
+            for buffer_id in range(start_slot, stop_slot):
                 uid = self.buffer_id_to_uid[buffer_id]
 
                 # Skip if this adapter is needed by current batch
