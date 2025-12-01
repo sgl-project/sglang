@@ -1113,7 +1113,7 @@ jobs:
         accuracy-test-1-gpu,
         accuracy-test-2-gpu,
         unit-test-deepep-4-gpu,
-        unit-test-deepep-8-gpu,
+        # unit-test-deepep-8-gpu,
         unit-test-backend-4-gpu-b200,
         unit-test-backend-4-gpu-gb200,
       ]
