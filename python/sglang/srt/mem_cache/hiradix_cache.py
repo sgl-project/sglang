@@ -338,7 +338,8 @@ class HiRadixCache(RadixCache):
         start_time = time.perf_counter()
         leaves = self._collect_leaves_device()
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node, start_time), node)
+            for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -367,7 +368,7 @@ class HiRadixCache(RadixCache):
                     break
             else:
                 # all children are evicted or no children
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self.eviction_strategy.get_priority(x.parent, start_time)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
         if self.cache_controller.write_policy == "write_back":
