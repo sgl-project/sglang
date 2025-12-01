@@ -15,6 +15,7 @@
 
 import logging
 import sre_parse
+from dataclasses import InitVar, dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
@@ -23,71 +24,58 @@ TOP_K_ALL = 1 << 30
 logger = logging.getLogger(__name__)
 
 
+@dataclass
 class SamplingParams:
     """
     The sampling parameters.
 
-    See docs/backend/sampling_params.md or
-    https://docs.sglang.ai/backend/sampling_params.html
+    See docs/basic_usage/sampling_params.md or
+    https://docs.sglang.ai/basic_usage/sampling_params.html
     for the documentation.
     """
 
-    def __init__(
-        self,
-        max_new_tokens: int = 128,
-        stop: Optional[Union[str, List[str]]] = None,
-        stop_token_ids: Optional[List[int]] = None,
-        stop_regex: Optional[Union[str, List[str]]] = None,
-        temperature: float = 1.0,
-        top_p: float = 1.0,
-        top_k: int = -1,
-        min_p: float = 0.0,
-        frequency_penalty: float = 0.0,
-        presence_penalty: float = 0.0,
-        repetition_penalty: float = 1.0,
-        min_new_tokens: int = 0,
-        n: int = 1,
-        json_schema: Optional[str] = None,
-        regex: Optional[str] = None,
-        ebnf: Optional[str] = None,
-        structural_tag: Optional[str] = None,
-        ignore_eos: bool = False,
-        skip_special_tokens: bool = True,
-        spaces_between_special_tokens: bool = True,
-        no_stop_trim: bool = False,
-        custom_params: Optional[Dict[str, Any]] = None,
-        stream_interval: Optional[int] = None,
-        logit_bias: Optional[Dict[str, float]] = None,
-        sampling_seed: int = 42,
-    ) -> None:
-        self.max_new_tokens = max_new_tokens
+    max_new_tokens: int = 128
+    stop_token_ids: Optional[List[int]] = None
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
+    min_p: float = 0.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_new_tokens: int = 0
+    n: int = 1
+    json_schema: Optional[str] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    structural_tag: Optional[str] = None
+    ignore_eos: bool = False
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    no_stop_trim: bool = False
+    custom_params: Optional[Dict[str, Any]] = None
+    stream_interval: Optional[int] = None
+    logit_bias: Optional[Dict[str, float]] = None
+    sampling_seed: int = 42
+
+    # init vars
+    stop: InitVar[Optional[Union[str, List[str]]]] = None
+    stop_regex: InitVar[Optional[Union[str, List[str]]]] = None
+
+    # non-init vars that will be set in later function
+    stop_strs: Optional[Union[str, List[str]]] = field(init=False, default=None)
+    stop_regex_strs: Optional[Union[str, List[str]]] = field(init=False, default=None)
+    stop_str_max_len: int = field(init=False, default=0)
+    stop_regex_max_len: int = field(init=False, default=0)
+
+    def __post_init__(self, stop, stop_regex):
         self.stop_strs = stop
-        if stop_token_ids:
-            self.stop_token_ids = set(stop_token_ids)
+        self.stop_regex_strs = stop_regex
+
+        if self.stop_token_ids:
+            self.stop_token_ids = set(self.stop_token_ids)
         else:
             self.stop_token_ids = None
-        self.stop_regex_strs = stop_regex
-        self.temperature = temperature
-        self.top_p = top_p
-        self.top_k = top_k
-        self.min_p = min_p
-        self.frequency_penalty = frequency_penalty
-        self.presence_penalty = presence_penalty
-        self.repetition_penalty = repetition_penalty
-        self.min_new_tokens = min_new_tokens
-        self.regex = regex
-        self.n = n
-        self.json_schema = json_schema
-        self.ebnf = ebnf
-        self.structural_tag = structural_tag
-        self.ignore_eos = ignore_eos
-        self.skip_special_tokens = skip_special_tokens
-        self.spaces_between_special_tokens = spaces_between_special_tokens
-        self.no_stop_trim = no_stop_trim
-        self.custom_params = custom_params
-        self.stream_interval = stream_interval
-        self.logit_bias = logit_bias
-        self.sampling_seed = sampling_seed
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
