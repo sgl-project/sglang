@@ -470,24 +470,20 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     def postprocess_image_latent(self, latent_condition, batch):
         batch_size = batch.batch_size
-        # Pack each latent and concatenate
-        image_latents = [latent_condition]
         # get image_latent_ids right after scale & shift
-        image_latent_ids = _prepare_image_ids(image_latents)
+        image_latent_ids = _prepare_image_ids([latent_condition])
         image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
         image_latent_ids = image_latent_ids.to(get_local_torch_device())
         batch.condition_image_latent_ids = image_latent_ids
 
-        packed_latents = []
-        for latent in image_latents:
-            # latent: (1, 128, 32, 32)
-            packed = self.maybe_pack_latents(latent, None, None)  # (1, 1024, 128)
-            packed = packed.squeeze(0)  # (1024, 128) - remove batch dim
-            packed_latents.append(packed)
+        # latent: (1, 128, 32, 32)
+        packed = self.maybe_pack_latents(
+            latent_condition, None, batch
+        )  # (1, 1024, 128)
+        packed = packed.squeeze(0)  # (1024, 128) - remove batch dim
 
         # Concatenate all reference tokens along sequence dimension
-        image_latents = torch.cat(packed_latents, dim=0)  # (N*1024, 128)
-        image_latents = image_latents.unsqueeze(0)  # (1, N*1024, 128)
+        image_latents = packed.unsqueeze(0)  # (1, N*1024, 128)
         image_latents = image_latents.repeat(batch_size, 1, 1)
         return image_latents
 

@@ -104,7 +104,9 @@ class ImageEncodingStage(PipelineStage):
 
         image = batch.condition_image
 
-        image_processor_kwargs = server_args.pipeline_config.prepare_image_processor_kwargs(batch)
+        image_processor_kwargs = (
+            server_args.pipeline_config.prepare_image_processor_kwargs(batch)
+        )
 
         image_inputs = self.image_processor(
             images=image, return_tensors="pt", **image_processor_kwargs
@@ -250,8 +252,8 @@ class ImageVAEEncodingStage(PipelineStage):
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-                                   vae_dtype != torch.float32
-                               ) and not server_args.disable_autocast
+            vae_dtype != torch.float32
+        ) and not server_args.disable_autocast
 
         # Encode Image
         with torch.autocast(
@@ -302,7 +304,9 @@ class ImageVAEEncodingStage(PipelineStage):
         latent_condition -= shift_factor
         latent_condition = latent_condition * scaling_factor
 
-        batch.image_latent = server_args.pipeline_config.postprocess_image_latent(latent_condition, batch)
+        batch.image_latent = server_args.pipeline_config.postprocess_image_latent(
+            latent_condition, batch
+        )
 
         self.maybe_free_model_hooks()
 
