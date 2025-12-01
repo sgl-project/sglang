@@ -49,7 +49,6 @@ from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    BaseReq,
     BatchEmbeddingOutput,
     BatchMultimodalOutput,
     BatchStrOutput,
@@ -1455,7 +1454,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self.send_to_scheduler.send_multipart([b"NORM", pickle.dumps(FreezeGCReq())], copy=False)
+        self.send_to_scheduler.send_multipart(
+            [b"NORM", pickle.dumps(FreezeGCReq())], copy=False
+        )
         freeze_gc("Tokenizer Manager")
         return None
 

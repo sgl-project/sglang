@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import pickle
 import signal
 import threading
 import time
@@ -25,6 +26,7 @@ from typing import List, Optional
 
 import psutil
 import setproctitle
+import torch
 import zmq
 
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
@@ -498,7 +500,45 @@ class DataParallelController:
         while True:
             while True:
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    parts = self.recv_from_tokenizer.recv_multipart(
+                        flags=zmq.NOBLOCK, copy=False
+                    )
+                    if not parts:
+                        break
+                    # Check message type
+                    msg_type = bytes(parts[0])
+
+                    if msg_type == b"NORM":
+                        # Normal message
+                        recv_req = pickle.loads(parts[1])
+
+                    elif msg_type == b"FEAT":
+                        # Message with optimized feature tensors
+                        recv_req = pickle.loads(parts[1])
+                        feature_infos = pickle.loads(parts[2])
+
+                        # Reconstruct tensors
+                        for i, feature_info in enumerate(feature_infos):
+                            buffer_idx = 3 + i
+                            buffer = (
+                                parts[buffer_idx].buffer
+                                if hasattr(parts[buffer_idx], "buffer")
+                                else parts[buffer_idx]
+                            )
+
+                            dtype = feature_info["dtype"]
+                            shape = feature_info["shape"]
+                            tensor = torch.frombuffer(buffer, dtype=dtype).reshape(
+                                shape
+                            )
+
+                            idx = feature_info["idx"]
+                            if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
+                                mm_items = recv_req.mm_inputs.get("mm_items", [])
+                                if idx < len(mm_items):
+                                    mm_items[idx].feature = tensor
+                    else:
+                        logger.warning(f"Unknown message type: {msg_type}")
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
