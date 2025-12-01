@@ -204,7 +204,7 @@ class PipelineConfig:
         latent_height = batch.height // spatial_compression_ratio
         latent_width = batch.width // spatial_compression_ratio
         mask_lat_size = torch.ones(1, 1, num_frames, latent_height, latent_width)
-        mask_lat_size[:, :, list(range(1, num_frames))] = 0
+        mask_lat_size[:, :, 1:] = 0
         first_frame_mask = mask_lat_size[:, :, 0:1]
         first_frame_mask = torch.repeat_interleave(
             first_frame_mask,
