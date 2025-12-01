@@ -574,7 +574,10 @@ class DenoisingStage(PipelineStage):
         return latents, trajectory_tensor
 
     def start_profile(self, batch: Req):
-        if not batch.profile:
+        # Skip local profiling when:
+        # - profiling is disabled, or
+        # - global stages profiling is enabled (to avoid nested/duplicate profilers)
+        if (not batch.profile) or bool(getattr(batch, "full_stages", False)):
             return
 
         logger.info("Starting Profiler...")
@@ -584,7 +587,7 @@ class DenoisingStage(PipelineStage):
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
         # Enable a full-coverage mode (no schedule/step) when requested
-        self._profile_full = bool(getattr(batch, "profile_full", False))
+        self._profile_full = bool(getattr(batch, "full_denoise", False))
         # Ensure log directory exists for trace files/handlers
         try:
             os.makedirs("./logs", exist_ok=True)
@@ -866,18 +869,18 @@ class DenoisingStage(PipelineStage):
                         # Predict noise residual
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
                         noise_pred = self._predict_noise_with_cfg(
-                            current_model=current_model,
-                            latent_model_input=latent_model_input,
-                            timestep=timestep,
-                            batch=batch,
-                            timestep_index=i,
-                            attn_metadata=attn_metadata,
-                            target_dtype=target_dtype,
-                            current_guidance_scale=current_guidance_scale,
-                            image_kwargs=image_kwargs,
-                            pos_cond_kwargs=pos_cond_kwargs,
-                            neg_cond_kwargs=neg_cond_kwargs,
-                            server_args=server_args,
+                            current_model,
+                            latent_model_input,
+                            timestep,
+                            batch,
+                            i,
+                            attn_metadata,
+                            target_dtype,
+                            current_guidance_scale,
+                            image_kwargs,
+                            pos_cond_kwargs,
+                            neg_cond_kwargs,
+                            server_args,
                             guidance=guidance,
                             latents=latents,
                         )
@@ -1388,7 +1391,7 @@ class DenoisingStage(PipelineStage):
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )
-        result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
+        result.add_check("guidance_scale", batch.guidance_scale, V.positive_float)
         result.add_check("eta", batch.eta, V.non_negative_float)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         result.add_check(

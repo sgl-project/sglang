@@ -171,7 +171,8 @@ class Req:
 
     # profile
     profile: bool = False
-    profile_full: bool = False
+    full_denoise: bool = False
+    full_stages: bool = False
     num_profiled_timesteps: int = 8
 
     # global pipeline profile

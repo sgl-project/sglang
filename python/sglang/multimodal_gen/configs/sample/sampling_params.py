@@ -125,10 +125,13 @@ class SamplingParams:
 
     # Profiling
     profile: bool = False
-    profile_full: bool = False
     num_profiled_timesteps: int = 2
-
-    # Global pipeline profiling (covers the whole pipeline execution)
+    # New profiling switches (CLI-driven)
+    # --profile --full-stages => profile entire pipeline stages (was global_profile)
+    # --profile --full-denoise => profile full denoising stage (maps to profile_full)
+    full_stages: bool = False
+    full_denoise: bool = False
+    # Hidden compatibility fields for executors (no CLI)
     global_profile: bool = False
     global_profile_full: bool = False
 
@@ -287,6 +290,21 @@ class SamplingParams:
                 )
                 self.num_frames = new_num_frames
 
+        # Normalize profiling flags:
+        # - --profile --full-denoise -> full denoise profiling
+        # - --profile --full-stages  -> profile entire pipeline stages (legacy global_profile)
+        if self.profile:
+            # full denoising takes precedence over step-scheduled profiling
+            # full denoise: executor-controlled via batch.full_denoise (denoising.py reads this)
+            # keep num_profiled_timesteps for scheduled profiling if not full denoise
+            # Map new full-stages flag to legacy globals for compatibility
+            self.global_profile = bool(self.full_stages)
+            self.global_profile_full = False
+        else:
+            # Disable all profiling-related flags if profile is off
+            self.global_profile = False
+            self.global_profile_full = False
+
         self._set_output_file_name()
         self.log(server_args=server_args)
 
@@ -354,23 +372,21 @@ class SamplingParams:
             default=SamplingParams.profile,
             help="Enable torch profiler for denoising stage",
         )
+        # denoising profiling mode selection
         parser.add_argument(
-            "--profile-full",
+            "--full-denoise",
             action="store_true",
-            default=SamplingParams.profile_full,
-            help="Profile the entire denoising stage without schedule/step (exports ./logs/full.trace.json.gz)",
+            dest="full_denoise",
+            default=SamplingParams.full_denoise,
+            help="With --profile, profile the entire denoising stage (no schedule/step).",
         )
+        # pipeline-wide profiling (replaces legacy global_profile)
         parser.add_argument(
-            "--global-profile",
+            "--full-stages",
             action="store_true",
-            default=SamplingParams.global_profile,
-            help="Enable global profiler for the entire pipeline execution",
-        )
-        parser.add_argument(
-            "--global-profile-full",
-            action="store_true",
-            default=SamplingParams.global_profile_full,
-            help="Profile the entire pipeline without schedule/step (exports ./logs/pipeline.full.trace.json.gz)",
+            dest="full_stages",
+            default=SamplingParams.full_stages,
+            help="With --profile, profile all pipeline stages (equivalent to legacy global profiling).",
         )
         parser.add_argument(
             "--debug",
@@ -563,7 +579,33 @@ class SamplingParams:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         args.height_not_provided = False
         args.width_not_provided = False
-        return {attr: getattr(args, attr) for attr in attrs}
+        # Build result dict robustly against removed/renamed CLI flags (profile_full removed)
+        result: dict[str, Any] = {}
+        field_map = {f.name: f for f in dataclasses.fields(cls)}
+        for attr in attrs:
+            if hasattr(args, attr):
+                result[attr] = getattr(args, attr)
+                continue
+            # Map new flags to legacy/internal fields for compatibility
+            # The following legacy globals are no longer exposed via CLI, but keep defaults stable
+            if attr == "global_profile":
+                result[attr] = getattr(args, "full_stages", False)
+                continue
+            if attr == "global_profile_full":
+                result[attr] = False
+                continue
+            if attr == "full_denoise":
+                result[attr] = getattr(args, "full_denoise", False)
+                continue
+            # Fallback to dataclass default if present
+            f = field_map[attr]
+            if f.default is not dataclasses.MISSING:
+                result[attr] = f.default
+            elif f.default_factory is not dataclasses.MISSING:  # type: ignore[attr-defined]
+                result[attr] = f.default_factory()  # type: ignore[misc]
+            else:
+                result[attr] = None
+        return result
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)

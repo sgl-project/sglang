@@ -64,8 +64,8 @@ class ParallelExecutor(PipelineExecutor):
         cfg_rank = get_classifier_free_guidance_rank()
         cfg_group = get_cfg_group()
 
-        do_global_profile = bool(getattr(batch, "global_profile", False))
-        global_full = bool(getattr(batch, "global_profile_full", False))
+        # New profiling flag: profile all stages when both profile and full_stages are set
+        do_full_stages_profile = bool(getattr(batch, "profile", False) and getattr(batch, "full_stages", False))
 
         def _run_all_stages():
             nonlocal batch
@@ -95,7 +95,7 @@ class ParallelExecutor(PipelineExecutor):
                         batch = stage(batch, server_args)
             return batch
 
-        if do_global_profile:
+        if do_full_stages_profile:
             try:
                 os.makedirs("./logs", exist_ok=True)
             except Exception:
@@ -104,71 +104,25 @@ class ParallelExecutor(PipelineExecutor):
             if torch.cuda.is_available():
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-            if global_full:
-                with torch.profiler.profile(
-                    activities=activities,
-                    record_shapes=True,
-                    with_stack=True,
-                ) as prof:
-                    batch = _run_all_stages()
-                if rank == 0:
-                    try:
-                        os.makedirs("./logs", exist_ok=True)
-                    except Exception:
-                        pass
-                    request_id = getattr(batch, "request_id", "global_profile")
-                    world_rank = get_world_rank()
-                    trace_path = os.path.abspath(
-                        f"./logs/{request_id}-global-rank{world_rank}.trace.json.gz"
-                    )
-                    logger.info("Saving global profiler trace to: %s", trace_path)
-                    prof.export_chrome_trace(trace_path)
-            else:
-                with torch.profiler.profile(
-                    activities=activities,
-                    schedule=torch.profiler.schedule(
-                        skip_first=0, wait=0, warmup=0, active=len(stages), repeat=1
-                    ),
-                    record_shapes=True,
-                    with_stack=True,
-                ) as prof:
-                    # run with stepping per stage
-                    for stage in stages:
-                        with Timer(stage.__class__.__name__):
-                            paradigm = stage.parallelism_type
-                            if paradigm == StageParallelismType.MAIN_RANK_ONLY:
-                                if rank == 0:
-                                    batch = stage(batch, server_args)
-                                torch.distributed.barrier()
-                            elif paradigm == StageParallelismType.CFG_PARALLEL:
-                                obj_list = [batch] if rank == 0 else []
-                                broadcasted_list = broadcast_pyobj(
-                                    obj_list,
-                                    rank=rank,
-                                    dist_group=cfg_group.cpu_group,
-                                    src=0,
-                                )
-                                if rank != 0:
-                                    batch = broadcasted_list[0]
-                                batch = stage(batch, server_args)
-                                torch.distributed.barrier()
-                            elif paradigm == StageParallelismType.REPLICATED:
-                                batch = stage(batch, server_args)
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        prof.step()
-                if rank == 0:
-                    try:
-                        os.makedirs("./logs", exist_ok=True)
-                    except Exception:
-                        pass
-                    request_id = getattr(batch, "request_id", "global_profile")
-                    world_rank = get_world_rank()
-                    trace_path = os.path.abspath(
-                        f"./logs/{request_id}-global.stages-rank{world_rank}.trace.json.gz"
-                    )
-                    logger.info("Saving global (stages) profiler trace to: %s", trace_path)
-                    prof.export_chrome_trace(trace_path)
+            # Directly profile the entire pipeline execution (no per-stage stepping)
+            with torch.profiler.profile(
+                activities=activities,
+                record_shapes=True,
+                with_stack=True,
+            ) as prof:
+                batch = _run_all_stages()
+            if rank == 0:
+                try:
+                    os.makedirs("./logs", exist_ok=True)
+                except Exception:
+                    pass
+                request_id = getattr(batch, "request_id", "full_stages")
+                world_rank = get_world_rank()
+                trace_path = os.path.abspath(
+                    f"./logs/{request_id}-global-rank{world_rank}.trace.json.gz"
+                )
+                logger.info("Saving stages profiler trace to: %s", trace_path)
+                prof.export_chrome_trace(trace_path)
         else:
             batch = _run_all_stages()
 
