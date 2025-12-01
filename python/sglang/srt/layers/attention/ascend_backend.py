@@ -41,10 +41,8 @@ class ForwardMetadata:
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
 
-    # prefill prefix cache
+    # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
-    prefix_len_list: Optional[List[int]] = None
-    prefix_block_tables: Optional[torch.Tensor] = None
     flatten_block_tables: Optional[torch.Tensor] = None
 
 
@@ -76,9 +74,9 @@ class AscendAttnMaskBuilder:
         self.mtp_mask = self.generate_mask_flag(mtp_mask_len).to(self.device)
 
         # Initialize RingMla mask
-        rangmla_mask_len = 512
+        ringmla_mask_len = 512
         self.ringmla_mask = self.generate_attn_mask(
-            rangmla_mask_len, "norm", torch.bfloat16
+            ringmla_mask_len, "norm", torch.bfloat16
         ).to(self.device)
 
         # Initialize mixed chunk mask cache
@@ -296,9 +294,6 @@ class AscendAttnBackend(AttentionBackend):
         ):
             self.forward_metadata.prefix_lens = (
                 forward_batch.extend_prefix_lens.int().to("cpu")
-            )
-            self.forward_metadata.prefix_len_list = (
-                self.forward_metadata.prefix_lens.tolist()
             )
             seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
             flatten_tlbs = torch.empty(0, dtype=torch.int32)
