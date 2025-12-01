@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    model_type::ModelType,
     worker::{
         BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
         WorkerType,
@@ -154,6 +155,9 @@ impl BasicWorkerBuilder {
             health_config: self.health_config,
             bootstrap_host,
             bootstrap_port,
+            models: Vec::new(),                 // Empty = accepts any model
+            default_provider: None,             // Native/passthrough
+            default_model_type: ModelType::LLM, // Standard LLM capabilities
         };
 
         let grpc_client = Arc::new(RwLock::new(self.grpc_client.map(Arc::new)));
