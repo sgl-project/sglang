@@ -2593,15 +2593,11 @@ class ModelRunner:
         ):
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
-        if forward_batch.num_token_non_padded is not None:
-            attn_tp_size = get_attention_tp_size()
-            attn_tp_rank = get_attention_tp_rank()
-
-            if require_gathered_buffer and not is_nsa_enable_prefill_cp:
-                forward_batch.adjust_num_token_non_padded_for_attn_tp(
-                    attn_tp_rank=attn_tp_rank,
-                    attn_tp_size=attn_tp_size,
-                )
+        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+        forward_batch.prepare_num_token_non_padded_for_attn_tp(
+            require_gathered_buffer=require_gathered_buffer,
+            nsa_enable_prefill_cp=is_nsa_enable_prefill_cp(),
+        )
             
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
