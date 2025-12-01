@@ -937,10 +937,17 @@ class ServerArgs:
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
 
-        if model_arch in ["MistralLarge3ForCausalLM", "PixtralForConditionalGeneration"]:
+        if model_arch in [
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+        ]:
             self.dtype = "bfloat16"
 
-        if model_arch in ["DeepseekV3ForCausalLM", "MistralLarge3ForCausalLM", "PixtralForConditionalGeneration"]:
+        if model_arch in [
+            "DeepseekV3ForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+        ]:
             if is_deepseek_nsa(hf_config):
                 if (
                     self.attention_backend is None
