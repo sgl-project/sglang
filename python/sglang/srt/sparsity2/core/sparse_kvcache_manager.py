@@ -19,9 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.sparsity2.ops.triton_kernel import (
-    invoke_nsa_sparse_diff_kernel_optimized,
-)
+from sglang.srt.sparsity2.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
 
 if TYPE_CHECKING:
     pass
@@ -85,7 +83,7 @@ class SparseKVCacheManager:
         self.bitmap = torch.full(
             (max_pool_size, server_args.model_config.context_len),
             -1,
-            dtype=torch.int16,
+            dtype=torch.int32,
             device=server_args.device,
         )
         self.req_states = None
@@ -101,9 +99,10 @@ class SparseKVCacheManager:
         seq_lens,
         layer_id,
     ):
+        nxtx_range = nvtx.start_range(message="init_buffer", color="blue")
         bs = top_k_result.shape[0]
         nxtx_range1 = nvtx.start_range(message="diff_kernel", color="blue")
-        invoke_nsa_sparse_diff_kernel_optimized(
+        invoke_nsa_sparse_diff_kernel(
             self.req_states.prev_top_k_result,
             top_k_result,
             self.req_states.prev_device_indices,
