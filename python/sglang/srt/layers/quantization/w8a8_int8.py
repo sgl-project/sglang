@@ -10,8 +10,8 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.hardware_backend.npu.layers.quantization.linear_method_npu import (
-    NPUW8A8DynamicLinearMethod,
-    NPUW8A8LinearMethod,
+    NPUW8A8Int8DynamicLinearMethod,
+    NPUW8A8Int8LinearMethod,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
@@ -309,9 +309,9 @@ class W8A8Int8Config(QuantizationConfig):
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
             return (
-                NPUW8A8DynamicLinearMethod()
+                NPUW8A8Int8DynamicLinearMethod()
                 if self.is_dynamic
-                else NPUW8A8LinearMethod()
+                else NPUW8A8Int8LinearMethod()
             )
         elif isinstance(layer, FusedMoE):
             prefix_in_quant_config = prefix + ".0.down_proj.weight"
