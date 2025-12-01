@@ -120,7 +120,7 @@ class ModelSlimConfig(QuantizationConfig):
 
     @classmethod
     def get_name(self) -> str:
-        return "w8a8_int8"
+        return "modelslim"
 
     @classmethod
     def get_config_filenames(cls) -> List[str]:
