@@ -24,6 +24,21 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_npu = is_npu()
+_is_xpu = is_xpu()
 
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 
@@ -455,4 +470,7 @@ TWO_GPU_CASES_B = [
 ]
 
 # Load global configuration
-BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+if _is_cuda:
+    BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+elif _is_hip:
+    BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines_amd.json"))
