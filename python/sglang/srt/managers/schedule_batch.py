@@ -1528,6 +1528,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         if page_size == 1:
             return len(requests)
+
+        if not self.spec_algorithm.is_none():
+            # A loose bound that err towards safety
+            server_args = get_global_server_args()
+            thresh = server_args.speculative_num_draft_tokens + (
+                (server_args.speculative_eagle_topk or 1)
+                * (server_args.speculative_num_steps or 1)
+            )
+            return sum(
+                1 for req in requests if ((req.seqlen + thresh) % page_size) <= thresh
+            )
+
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
         return (
@@ -1924,6 +1936,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dimensions=self.dimensions,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
+            reqs=self.reqs,
+            has_grammar=self.has_grammar,
         )
 
     def copy(self):
@@ -2041,3 +2055,8 @@ class ModelWorkerBatch:
     # Diffusion LLM
     dllm_block_offsets: Optional[List[int]] = None
     dllm_config: Optional[DllmConfig] = None
+
+    # For constrained decoding
+    # FIXME(lsyin): remove this after fully overlap grammar
+    reqs: Optional[List[Req]] = None
+    has_grammar: bool = False
