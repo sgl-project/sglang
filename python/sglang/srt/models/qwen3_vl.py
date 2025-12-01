@@ -556,18 +556,12 @@ class Qwen3VLMoeVisionModel(nn.Module):
                 residual=residual,
             )
             if layer_num in self.deepstack_visual_indexes:
-                # x += residual
-                # deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
-                #     x,
-                # )
                 deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
                     x, residual=residual
                 )
                 deepstack_feature_lists.append(deepstack_feature)
                 num_deepstack_captured += 1
-        # last_layer_id = len(self.blocks) - 1
-        # if last_layer_id not in self.deepstack_visual_indexes:
-        #     x += residual
+
         x = self.merger(x, residual=residual)
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
