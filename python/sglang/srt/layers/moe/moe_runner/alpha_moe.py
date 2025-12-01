@@ -83,7 +83,7 @@ class AlphaMoeRunnerCore(MoeRunnerCore):
         assert block_shape[0] == 128
         assert block_shape[1] == 128
         assert use_fp8_w8a8
-        assert hidden_states[1].shape % 128 == 0
+        assert hidden_states.shape[1] % 128 == 0
         assert activation == "silu"
 
         out_hidden_states = alpha_moe_fused_moe(
