@@ -2124,7 +2124,7 @@ class ModelRunner:
                     :, : self.server_args.ds_heavy_channel_num
                 ]
                 .contiguous()
-                .cuda()
+                .to(self.device)
             )
 
     def kernel_warmup(self):
