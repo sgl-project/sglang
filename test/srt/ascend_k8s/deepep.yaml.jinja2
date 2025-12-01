@@ -116,10 +116,12 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.annotations['huawei.com/ascend-1980']
+          - name: SGLANG_SOURCE_PATH
+            value: "{{ sglang_source_path }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
-               bash /root/.cache/tests/run_ascend_deepep.sh {{ test_case }}
+               bash $SGLANG_SOURCE_PATH/test/srt/ascend_k8s/run_ascend_deepep.sh {{ test_case }}
           resources:
             requests:
               huawei.com/ascend-1980: 16
@@ -183,10 +185,12 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.annotations['huawei.com/ascend-1980']
+          - name: SGLANG_SOURCE_PATH
+            value: "{{ sglang_source_path }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
-               bash /root/.cache/tests/run_ascend_deepep.sh {{ test_case }}
+               bash $SGLANG_SOURCE_PATH/test/srt/ascend_k8s/run_ascend_deepep.sh {{ test_case }}
           resources:
             requests:
               huawei.com/ascend-1980: 16
@@ -250,10 +254,12 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.annotations['huawei.com/ascend-1980']
+          - name: SGLANG_SOURCE_PATH
+            value: "{{ sglang_source_path }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
-               bash /root/.cache/tests/run_ascend_deepep.sh {{ test_case }}
+               bash $SGLANG_SOURCE_PATH/test/srt/ascend_k8s/run_ascend_deepep.sh {{ test_case }}
           resources:
             requests:
               cpu: "4"

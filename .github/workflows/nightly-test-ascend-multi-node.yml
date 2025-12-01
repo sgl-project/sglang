@@ -15,7 +15,7 @@ on:
         required: false
         type: string
         description: base image for pods
-        default: "swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main"
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3"
       test_config_name:
         required: true
         type: string
@@ -32,13 +32,17 @@ on:
         required: true
         type: number
         description: number of router nodes
+      sglang_source_path:
+        required: true
+        type: string
+        description: sglang source path in container
       test_case:
         required: true
         type: string
         description: path of test case file
 
 concurrency:
-  group: ascend-nightly-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.soc_version }}
+  group: ascend-nightly-${{ github.ref }}-${{ inputs.soc_version }}
   cancel-in-progress: true
 
 jobs:
@@ -61,7 +65,7 @@ jobs:
         run: |
           # Install kubernetes
           pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple kubernetes
-          cp /data/.cache/kubectl /usr/local/sbin/
+          cp $KUBECTL /usr/local/sbin/
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -73,16 +77,15 @@ jobs:
           prefill_size="${{ inputs.prefill_size }}"
           decode_size="${{ inputs.decode_size }}"
           router_size="${{ inputs.router_size }}"
-          test_case="${{ inputs.test_case }}"
-          echo "{ \"image\": $image,                     \
-                  \"prefill_size\": $prefill_size,       \
-                  \"decode_size\": $decode_size,         \
-                  \"router_size\": $router_size,         \
-                  \"test_case\": \"$test_case\" }"    |\
+          sglang_source_path="${{ inputs.sglang_source_path }}"
+          test_case="${{ inputs.test_case }}"          
+          echo "{ \"image\": $image,                                        \
+                  \"prefill_size\": $prefill_size,                          \
+                  \"decode_size\": $decode_size,                            \
+                  \"router_size\": $router_size,                            \
+                  \"sglang_source_path\": \"$sglang_source_path\",          \
+                  \"test_case\": \"$test_case\" }"                         |\
               jinja2 ${ASCEND_TEST_CASE_PATH}/deepep.yaml.jinja2 -o ${ASCEND_TEST_CASE_PATH}/deepep.yaml
-
-          # prepare for deepep entrypoint scripts
-          install -D ${ASCEND_TEST_CASE_PATH}/run_ascend_deepep.sh /root/.cache/tests/run_ascend_deepep.sh
 
       - name: Clear resources
         run: |
@@ -90,8 +93,8 @@ jobs:
           kubectl delete -f ./deepep.yaml --ignore-not-found=true || true
 
           pod_name_str="mindx-dls-test-sglang"
-          while true; do            
-            if kubectl get po -A | grep -q "${pod_name_str}"; then
+          while true; do
+            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_str}"; then
               echo "Found exist sglang job, sleeping for 30 seconds..."
               sleep 30
               kubectl get pods | grep "${pod_name_str}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE
