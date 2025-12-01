@@ -66,33 +66,42 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
     return output
 
 
-def _get_prefix_suffix(prompt: str) -> Tuple[str, str]:
-    """Split the prompt into prefix and suffix."""
-    prefix = prompt.split("<")[0]
-    suffix = prompt.split(">", 1)[1]
-    return prefix, suffix
-
-
 async def process_sample(
     client: Any, sample: dict, sampling_params: dict, lora_path: Optional[str] = None
 ) -> Tuple[dict, str]:
     """Send a single sample to the LLM and return (sample, response)."""
     prompt = sample["final_input_prompt"]
-    prefix, suffix = _get_prefix_suffix(prompt)
-    image = sample["image"]
-    assert image is not None
-    image_path = sample["image_path"]
+
+    image_paths = sample["image_paths"]
+    # Split the prompt by <image> tags to interleave images and text
+    # matches <image 1>, <image 2> etc.
+    parts = re.split(r"(<image[^>]*>)", prompt)
+
+    content = []
+    for part in parts:
+        if part.startswith("<image"):
+            # Extract the index from the tag (e.g. <image 1> -> 1)
+            numbers = re.findall(r"\d+", part)
+            if numbers:
+                idx = int(numbers[0]) - 1
+                if 0 <= idx < len(image_paths):
+                    content.append(
+                        {"type": "image_url", "image_url": {"url": image_paths[idx]}}
+                    )
+            else:
+                # Handle cases like <image> without number if necessary, or ignore
+                pass
+        else:
+            if part.strip() != "":
+                content.append({"type": "text", "text": part.strip()})
+
     extra_body = None if lora_path is None else {"lora_path": lora_path}
     response = await client.chat.completions.create(
         model="default",
         messages=[
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": prefix},
-                    {"type": "image_url", "image_url": {"url": image_path}},
-                    {"type": "text", "text": suffix},
-                ],
+                "content": content,
             }
         ],
         temperature=0,
@@ -100,6 +109,8 @@ async def process_sample(
         max_tokens=sampling_params["max_new_tokens"],
         extra_body=extra_body,
     )
+    print(f"110 {response.choices[0].message.content=}")
+    print()
     return sample, response.choices[0].message.content
 
 

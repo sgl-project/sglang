@@ -77,7 +77,7 @@ def main(args):
     def few_shot_gsm8k(s, question):
         s += few_shot_examples + question
         s += sgl.gen(
-            "answer", max_tokens=512, stop=["Question", "Assistant:", "<|separator|>"]
+            "answer", max_tokens=4096, stop=["Question", "Assistant:", "<|separator|>"]
         )
 
     #####################################
@@ -95,8 +95,18 @@ def main(args):
     latency = time.perf_counter() - tic
 
     preds = []
+    # --- Modified Loop Start ---
+    print(f"\nScanning for INVALID answers (where parsed value is {INVALID})...")
     for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+        pred_value = get_answer_value(states[i]["answer"])
+        preds.append(pred_value)
+
+        # Check if the result is invalid and print the content if so
+        if pred_value == INVALID:
+            print(f"\n[Invalid Output Found] Index: {i}")
+            print(f"Raw Content: {repr(states[i]['answer'])}")
+            print("-" * 40)
+    # --- Modified Loop End ---
 
     # Compute accuracy
     acc = np.mean(np.array(preds) == np.array(labels))
