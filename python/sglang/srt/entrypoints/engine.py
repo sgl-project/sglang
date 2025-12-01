@@ -76,6 +76,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
+    numa_utils,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -846,7 +847,9 @@ def _launch_subprocesses(
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess():
+                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                        server_args, gpu_id
+                    ):
                         proc.start()
 
                 scheduler_procs.append(proc)

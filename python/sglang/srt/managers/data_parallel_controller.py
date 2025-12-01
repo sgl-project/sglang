@@ -43,6 +43,7 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.tracing.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.tracing.trace_metric_wrapper import RequestStage, TraceMetricContext
+from sglang.srt.utils import numa_utils
 from sglang.srt.utils.common import (
     bind_port,
     configure_ipv6,
@@ -445,7 +446,9 @@ class DataParallelController:
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess():
+                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                        server_args, gpu_id
+                    ):
                         proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
