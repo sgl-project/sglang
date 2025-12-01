@@ -1288,9 +1288,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         async with self.is_pause_cond:
             is_paused = self.is_pause
 
-        lock_context = self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
         async with lock_context:
-            success, message, num_paused_requests = await self._wait_for_model_update_from_disk(obj)
+            success, message, num_paused_requests = (
+                await self._wait_for_model_update_from_disk(obj)
+            )
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)

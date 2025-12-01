@@ -418,7 +418,9 @@ class TokenizerCommunicatorMixin:
         async with self.is_pause_cond:
             is_paused = self.is_pause
 
-        lock_context = self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
         async with lock_context:
             results = await self.update_weights_from_distributed_communicator(obj)
 
@@ -474,7 +476,9 @@ class TokenizerCommunicatorMixin:
         async with self.is_pause_cond:
             is_paused = self.is_pause
 
-        lock_context = self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        lock_context = (
+            self.model_update_lock.writer_lock if not is_paused else nullcontext()
+        )
         async with lock_context:
             results = await self.update_weights_from_tensor_communicator(obj)
 
