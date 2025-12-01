@@ -13,7 +13,7 @@ MODELS = [
     (
         "/root/.cache/modelscope/hub/models/Shanghai_AI_Laboratory/internlm2-7b-reward",
         1,
-        4e-2
+        4e-2,
     ),
     ("/root/.cache/modelscope/hub/models/Howeee/Qwen2.5-1.5B-apeach", 1, 4e-2),
 ]
