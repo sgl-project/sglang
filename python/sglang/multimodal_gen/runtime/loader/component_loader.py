@@ -21,9 +21,6 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
-from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
-    StableDiffusion3PipelineConfig,
-)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
@@ -391,55 +388,47 @@ class TextEncoderLoader(ComponentLoader):
         _clean_hf_config_inplace(model_config)
         logger.info("HF model config: %s", model_config)
 
-        is_stable_diffusion3 = isinstance(
-            server_args.pipeline_config, StableDiffusion3PipelineConfig
-        )
-        if is_stable_diffusion3:
-            if not ("2" in module_name or "3" in module_name):
-                encoder_config = server_args.pipeline_config.text_encoder_configs[0]
-                encoder_config.update_model_arch(model_config)
-                for key, value in diffusers_pretrained_config.__dict__.items():
-                    setattr(encoder_config.arch_config, key, value)
-                encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
-            elif "2" in module_name:
-                encoder_config = server_args.pipeline_config.text_encoder_configs[1]
-                encoder_config.update_model_arch(model_config)
-                encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
-            else:
-                assert len(server_args.pipeline_config.text_encoder_configs) == 3
-                encoder_config = server_args.pipeline_config.text_encoder_configs[2]
-                encoder_config.update_model_arch(model_config)
-                encoder_dtype = server_args.pipeline_config.text_encoder_precisions[2]
-            # TODO(will): add support for other dtypes
-            return self.load_model(
-                component_model_path,
-                encoder_config,
-                server_args,
-                encoder_dtype,
+        # Get encoder index based on module name
+        encoder_index = self._get_encoder_index(module_name)
+        assert encoder_index != -1
+        # Validate encoder index bounds
+        if encoder_index >= len(server_args.pipeline_config.text_encoder_configs):
+            raise ValueError(
+                f"Module {module_name} requires encoder index {encoder_index}, "
+                f"but only {len(server_args.pipeline_config.text_encoder_configs)} "
+                f"encoders are configured"
             )
 
-        def is_not_first_encoder(module_name):
-            return "2" in module_name
+        encoder_config = server_args.pipeline_config.text_encoder_configs[encoder_index]
+        encoder_config.update_model_arch(model_config)
 
-        # TODO(mick): had to throw an exception for different text-encoder arch
-        if not is_not_first_encoder(module_name):
-            encoder_config = server_args.pipeline_config.text_encoder_configs[0]
-            encoder_config.update_model_arch(model_config)
+        # as same as before
+        if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():
                 setattr(encoder_config.arch_config, key, value)
-            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[0]
-        else:
-            assert len(server_args.pipeline_config.text_encoder_configs) == 2
-            encoder_config = server_args.pipeline_config.text_encoder_configs[1]
-            encoder_config.update_model_arch(model_config)
-            encoder_dtype = server_args.pipeline_config.text_encoder_precisions[1]
-        # TODO(will): add support for other dtypes
+
+        encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
+            encoder_index
+        ]
+
         return self.load_model(
             component_model_path,
             encoder_config,
             server_args,
             encoder_dtype,
         )
+
+    def _get_encoder_index(self, module_name: str) -> int:
+        """Determine encoder index based on module name."""
+        if "text_encoder_3" in module_name:
+            return 2
+        elif "text_encoder_2" in module_name:
+            return 1
+        elif "text_encoder" in module_name:
+            return 0
+        else:
+            # Default fallback - should not normally reach here for text encoders
+            return -1
 
     def load_model(
         self,
@@ -610,9 +599,35 @@ class VAELoader(ComponentLoader):
 
         # Find all safetensors files
         safetensors_list = _list_safetensors_files(component_model_path)
-        if isinstance(server_args.pipeline_config, StableDiffusion3PipelineConfig):
-            precision = server_args.pipeline_config.vae_precision
-            base_name = "diffusion_pytorch_model"
+
+        # Use pipeline-specific weight selection strategy
+        safetensors_list = self._select_vae_weights(
+            safetensors_list, component_model_path, server_args.pipeline_config
+        )
+
+        # TODO(PY)
+        assert (
+            len(safetensors_list) == 1
+        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
+        loaded = safetensors_load_file(safetensors_list[0])
+        vae.load_state_dict(
+            loaded, strict=False
+        )  # We might only load encoder or decoder
+
+        return vae.eval()
+
+    def _select_vae_weights(
+        self, safetensors_list, component_model_path, pipeline_config
+    ):
+        """Select appropriate VAE weights based on pipeline configuration."""
+        # Check if pipeline has specific VAE weight selection strategy
+        if (
+            hasattr(pipeline_config, "vae_precision")
+            and hasattr(pipeline_config, "use_precision_specific_weights")
+            and hasattr(pipeline_config, "vae_model_name")
+        ):
+            precision = pipeline_config.vae_precision
+            base_name = pipeline_config.vae_model_name
 
             # Priority: fp16 > full precision > any matching file
             if precision == "fp16":
@@ -625,18 +640,10 @@ class VAELoader(ComponentLoader):
                     str(component_model_path), f"{base_name}.safetensors"
                 )
                 target_files = [full_path] if os.path.exists(full_path) else []
-            safetensors_list = target_files
+            return target_files if target_files else safetensors_list
 
-        # TODO(PY)
-        assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        loaded = safetensors_load_file(safetensors_list[0])
-        vae.load_state_dict(
-            loaded, strict=False
-        )  # We might only load encoder or decoder
-
-        return vae.eval()
+        # Default: return all found safetensors files
+        return safetensors_list
 
 
 class TransformerLoader(ComponentLoader):

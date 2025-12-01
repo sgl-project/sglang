@@ -76,7 +76,8 @@ class StableDiffusion3PipelineConfig(PipelineConfig):
 
     # SD3 specific parameters
     guidance_scale: float = 7.0
-
+    use_precision_specific_weights = True
+    vae_model_name = "diffusion_pytorch_model"
     task_type: ModelTaskType = ModelTaskType.T2I
 
     def __post_init__(self):
