@@ -521,7 +521,7 @@ class PiecewiseCudaGraphRunner:
 
         out_cache_loc_swa = (
             self.out_cache_loc_swa[:static_num_tokens]
-            if forward_batch.out_cache_loc_swa is not None
+            if self.out_cache_loc_swa is not None
             else None
         )
 
