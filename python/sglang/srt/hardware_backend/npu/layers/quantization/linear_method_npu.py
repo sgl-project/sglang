@@ -54,12 +54,14 @@ class NPUW8A8LinearMethod(LinearMethodBase):
             data=torch.empty(1, dtype=params_dtype),
             weight_loader=weight_loader,
         )
+        input_scale.ignore_warning = True
         layer.register_parameter("input_scale", input_scale)
 
         input_offset = PerTensorScaleParameter(
             data=torch.empty(1, dtype=params_dtype),
             weight_loader=weight_loader,
         )
+        input_scale.ignore_warning = True
         layer.register_parameter("input_offset", input_offset)
 
         quant_bias = ChannelQuantScaleParameter(
@@ -121,7 +123,7 @@ class NPUW8A8LinearMethod(LinearMethodBase):
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
 
-        expanding_factor = layer.weight.data.shape[1]
+        expanding_factor = layer.weight.data.shape[0]
         layer.aclnn_input_scale = torch.nn.Parameter(
             layer.input_scale.data.repeat(expanding_factor).to(device="npu"),
             requires_grad=False,
