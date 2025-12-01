@@ -108,6 +108,10 @@ class ImageEncodingStage(PipelineStage):
             server_args.pipeline_config.prepare_image_processor_kwargs(batch)
         )
 
+        image = server_args.pipeline_config.preprocess_image(
+            image, self.vae_image_processor
+        )
+
         image_inputs = self.image_processor(
             images=image, return_tensors="pt", **image_processor_kwargs
         ).to(cuda_device)
@@ -124,12 +128,9 @@ class ImageEncodingStage(PipelineStage):
         elif self.text_encoder:
             # if a text encoder is provided, e.g. Qwen-Image-Edit
             # 1. neg prompt embeds
-            if batch.prompt:
-                prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
-                txt = prompt_template_encode.format(batch.negative_prompt)
-                neg_image_processor_kwargs = dict(text=[txt], padding=True)
-            else:
-                neg_image_processor_kwargs = {}
+            neg_image_processor_kwargs = (
+                server_args.pipeline_config.prepare_image_processor_kwargs(batch)
+            )
 
             neg_image_inputs = self.image_processor(
                 images=image, return_tensors="pt", **neg_image_processor_kwargs
@@ -150,6 +151,8 @@ class ImageEncodingStage(PipelineStage):
                     image_grid_thw=neg_image_inputs.image_grid_thw,
                     output_hidden_states=True,
                 )
+
+            # abstract this
             batch.prompt_embeds.append(
                 self.encoding_qwen_image_edit(outputs, image_inputs)
             )
@@ -191,37 +194,14 @@ class ImageVAEEncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
 
-    def forward(
+    def _process_single_image(
         self,
+        image: PIL.Image.Image,
+        num_frames: int,
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
-        """
-        Encode pixel representations into latent space.
+    ) -> torch.Tensor:
 
-        Args:
-            batch: The current batch information.
-            server_args: The inference arguments.
-
-        Returns:
-            The batch with encoded outputs.
-        """
-
-        if batch.condition_image is None:
-            return batch
-
-        assert batch.condition_image is not None and isinstance(
-            batch.condition_image, PIL.Image.Image
-        )
-        assert batch.height is not None and isinstance(batch.height, int)
-        assert batch.width is not None and isinstance(batch.width, int)
-        assert batch.num_frames is not None and isinstance(batch.num_frames, int)
-
-        num_frames = batch.num_frames
-
-        self.vae = self.vae.to(get_local_torch_device())
-
-        image = batch.condition_image
         image = self.preprocess(
             image,
         ).to(get_local_torch_device(), dtype=torch.float32)
@@ -304,14 +284,56 @@ class ImageVAEEncodingStage(PipelineStage):
         latent_condition -= shift_factor
         latent_condition = latent_condition * scaling_factor
 
-        batch.image_latent = server_args.pipeline_config.postprocess_image_latent(
+        image_latent = server_args.pipeline_config.postprocess_image_latent(
             latent_condition, batch
         )
 
+        return image_latent
+
+    def forward(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Encode pixel representations into latent space.
+
+        Args:
+            batch: The current batch information.
+            server_args: The inference arguments.
+
+        Returns:
+            The batch with encoded outputs.
+        """
+
+        if batch.condition_image is None:
+            return batch
+
+        assert isinstance(batch.condition_image, list)
+        assert len(batch.condition_image) > 0
+        assert all(isinstance(img, PIL.Image.Image) for img in batch.condition_image)
+
+        assert batch.height is not None and isinstance(batch.height, int)
+        assert batch.width is not None and isinstance(batch.width, int)
+        assert batch.num_frames is not None and isinstance(batch.num_frames, int)
+
+        num_frames = batch.num_frames
+
+        self.vae = self.vae.to(get_local_torch_device())
+
+        image_latents = []
+        for image in batch.condition_image:
+            latent = self._process_single_image(
+                image=image, num_frames=num_frames, batch=batch, server_args=server_args
+            )
+            image_latents.append(latent)
+
+        if server_args.pipeline_config.support_multi_image_input():
+            batch.image_latent = image_latents
+        else:
+            batch.image_latent = image_latents[0]
         self.maybe_free_model_hooks()
-
         self.vae.to("cpu")
-
         return batch
 
     def retrieve_latents(
