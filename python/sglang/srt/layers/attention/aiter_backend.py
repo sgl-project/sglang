@@ -766,7 +766,7 @@ class AiterAttnBackend(AttentionBackend):
             bs0 = forward_batch.batch_size + 1
 
             k, v = ragged_layout_trans(
-                self.forward_metadata.kv_indptr[0:bs0],
+                self.forward_metadata.kv_indptr[:bs0],
                 self.forward_metadata.kv_indices,
                 k_cache,
                 v_cache
@@ -778,8 +778,8 @@ class AiterAttnBackend(AttentionBackend):
                 v,
                 self.qo_indptr[:bs0],
                 self.forward_metadata.kv_indptr[:bs0],
-                self.forward_metadata.max_q_len, #max_len_extend,
-                self.forward_metadata.max_kv_len, #max_len_in_batch,
+                self.forward_metadata.max_q_len,
+                self.forward_metadata.max_kv_len,
                 causal=True,
                 logits_soft_cap=self.logits_soft_cap,
                 alibi_slopes=None,
