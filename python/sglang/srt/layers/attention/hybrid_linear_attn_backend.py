@@ -96,7 +96,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 if forward_batch.spec_info.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
-                    retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                    # retrieve_next_token is None during dummy run so skip tensor creation
+                    if retrieve_next_token is not None:
+                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
@@ -545,7 +547,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer_id = kwargs["layer_id"]
 
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = layer_cache.conv
+        conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
@@ -628,33 +630,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
         retrieve_parent_token = self.forward_metadata.retrieve_parent_token
 
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
-        conv_states = mamba_cache_params.conv
+        conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
-            intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window
+            intermediate_conv_window_cache = (
+                mamba_cache_params.intermediate_conv_window[0]
+            )
             has_initial_states = torch.ones(
                 seq_len // forward_batch.spec_info.draft_token_num,
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-            conv_states_to_use = conv_states.clone()
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
-            conv_states_to_use = conv_states
 
         if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
-            mixed_qkv_reshaped = (
-                mixed_qkv.view(batch_size, draft_token_num, -1)
-                .transpose(1, 2)
-                .contiguous()
-            )
+            mixed_qkv_reshaped = mixed_qkv.view(
+                batch_size, draft_token_num, -1
+            ).transpose(1, 2)
             mixed_qkv_processed = causal_conv1d_update(
                 mixed_qkv_reshaped,
-                conv_states_to_use,
+                conv_states,
                 conv_weights,
                 bias,
                 activation,
@@ -664,16 +664,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = (
-                mixed_qkv_processed.transpose(1, 2).contiguous().view(seq_len, -1)
-            )
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv.transpose(0, 1),
                 conv_weights,
                 bias,
                 activation=activation,
-                conv_states=conv_states_to_use,
+                conv_states=conv_states,
                 has_initial_state=has_initial_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
@@ -973,10 +971,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
         )
 
-        conv_states = mamba_caches.conv
+        conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal
         intermediate_state_cache = mamba_caches.intermediate_ssm
-        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window
+        intermediate_conv_window_cache = mamba_caches.intermediate_conv_window[0]
 
         # SSM state updates (chunked to reduce peak memory)
         valid_mask = accepted_indices >= 0

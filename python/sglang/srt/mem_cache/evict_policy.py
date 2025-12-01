@@ -95,3 +95,13 @@ class AdapterMixStrategy(EvictionStrategy):
                 )
 
         return
+
+
+class PriorityStrategy(EvictionStrategy):
+    """Priority-aware eviction: lower priority values evicted first, then LRU within same priority."""
+
+    def get_priority(
+        self, node: "TreeNode", now_time: Optional[float] = None
+    ) -> Tuple[int, float]:
+        # Return (priority, last_access_time) so lower priority nodes are evicted first
+        return (node.priority, node.last_access_time)
