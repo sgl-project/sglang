@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import logging
 import os
@@ -215,6 +216,67 @@ class HiCacheFile(HiCacheStorage):
         # Store layout for use in preprocessing
         self.mem_pool_layout = mem_pool_host.layout
 
+    def _batch_preprocess(self, keys, host_indices):
+        """Preprocess keys and host_indices to get buffer metadata for zero-copy operations.
+        Uses get_page_buffer_meta() to get memory pointers and sizes directly.
+        Similar to mooncake_store's _batch_preprocess but adapted for file backend.
+        
+        Returns:
+            ptr_list: List of memory pointers (for MHA: K and V pairs, for MLA: single pointer per page)
+            element_size_list: List of sizes for each pointer
+        """
+        assert len(keys) > 0
+        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        # Get buffer metadata (pointers and sizes) for zero-copy access
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
+        return ptr_list, element_size_list
+
+    def _batch_exist(self, keys: List[str]) -> List[bool]:
+        """Check if batch files exist for given keys.
+        Returns a list of booleans indicating existence for each key.
+        Similar to mooncake_store's _batch_exist but for file backend.
+        """
+        exist_results = []
+        for key in keys:
+            batch_file_path = os.path.join(
+                self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
+            )
+            exist_results.append(os.path.exists(batch_file_path))
+        return exist_results
+
+    def _write_from_ptr(self, file_path: str, ptr: int, size: int) -> bool:
+        """Write data from a memory pointer to a file using ctypes.
+        This is a true zero-copy operation - no tensor operations involved.
+        """
+        try:
+            buffer = (ctypes.c_uint8 * size).from_address(ptr)
+            with open(file_path, "wb", buffering=0) as f:
+                f.write(buffer)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write from pointer to {file_path}: {e}")
+            return False
+
+    def _write_kv_pair_from_ptrs(
+        self, file_path: str, k_ptr: int, k_size: int, v_ptr: int, v_size: int
+    ) -> bool:
+        """Write K and V data from memory pointers to a single file.
+        For MHA models, we need to write K and V together in one file.
+        This is a true zero-copy operation.
+        """
+        try:
+            with open(file_path, "wb", buffering=0) as f:
+                # Write K data
+                k_buffer = (ctypes.c_uint8 * k_size).from_address(k_ptr)
+                f.write(k_buffer)
+                # Write V data
+                v_buffer = (ctypes.c_uint8 * v_size).from_address(v_ptr)
+                f.write(v_buffer)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write KV pair from pointers to {file_path}: {e}")
+            return False
+
     def get(
         self,
         key: str,
@@ -393,56 +455,77 @@ class HiCacheFile(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        """True batch set: merge multiple tensors into one file and use batch I/O."""
+        """True batch set: merge multiple tensors into one file and use batch I/O.
+        Reference implementation from mooncake_store to avoid contiguous() calls.
+        Uses get_page_buffer_meta() to get memory pointers directly for zero-copy operations.
+        """
         if not keys or len(host_indices) == 0:
             return []
 
-        # Optimized: inline preprocessing to avoid function call overhead
         assert len(keys) > 0
         assert len(host_indices) % self.mem_pool_host.page_size == 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
 
         page_num = len(keys)
-        write_results = []
-
+        
+        # Stage 1: Get buffer metadata (pointers and sizes) using get_page_buffer_meta
+        # This is the key difference - we use the built-in method instead of manual address calculation
+        ptr_list, element_size_list = self._batch_preprocess(keys, host_indices)
+        
+        # Stage 2: Check which files already exist (similar to mooncake_store's _batch_exist)
+        exist_results = self._batch_exist(keys)
+        
+        # Stage 3: Prepare write operations only for non-existing keys
+        write_keys = []
+        write_indices = []
+        write_results = [False] * page_num
+        
         for i in range(page_num):
-            key = keys[i]
-
-            # Stage 1: Build file path
-            batch_file_path = os.path.join(
-                self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
-            )
-
-            # Stage 2: Check if file exists
-            if os.path.exists(batch_file_path):
-                write_results.append(True)
-                continue
-
-            try:
-                # Stage 3: Get tensor from memory pool
-                page_start_idx = i * self.mem_pool_host.page_size
-                actual_idx = host_indices[page_start_idx].item()
-                page_tensor = self.mem_pool_host.get_data_page(actual_idx, flat=True)
-
-                # Stage 4: Make contiguous
-                if not page_tensor.is_contiguous():
-                    page_tensor = page_tensor.contiguous()
-
-                # Stage 5: Handle MHA/MLA format
-                # Optimized: For both MHA and MLA, write entire page_tensor at once
-                # MHA: page_tensor already contains K (first half) and V (second half) in correct order
-                # This avoids split and two separate writes, reducing system calls
-                # Stage 6: Convert to numpy view (already done above for both MHA/MLA)
-                numpy_view = page_tensor.view(torch.uint8).numpy()
-
-                # Stage 7: File I/O - single write operation (matches old interface pattern)
-                # Use tofile(path) directly (same as old interface, no file handle overhead)
-                # This writes K and V together in one operation for MHA
-                numpy_view.tofile(batch_file_path)
-
-                write_results.append(True)
-            except Exception as e:
-                logger.error(f"Failed to write batch for key {key}: {e}")
-                write_results.append(False)
-
+            if exist_results[i]:
+                # File already exists, mark as success
+                write_results[i] = True
+            else:
+                # File doesn't exist, need to write
+                write_keys.append(keys[i])
+                write_indices.append(i)
+        
+        # Stage 4: Write only non-existing files using pointers directly
+        if self.is_mla_backend:
+            # MLA: one pointer per page
+            for key, idx in zip(write_keys, write_indices):
+                batch_file_path = os.path.join(
+                    self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
+                )
+                try:
+                    # MLA returns one pointer per page
+                    ptr = ptr_list[idx]
+                    size = element_size_list[idx]
+                    success = self._write_from_ptr(batch_file_path, ptr, size)
+                    write_results[idx] = success
+                except Exception as e:
+                    logger.error(f"Failed to write batch for key {key}: {e}")
+                    write_results[idx] = False
+        else:
+            # MHA: K and V pointer pairs per page
+            for key, idx in zip(write_keys, write_indices):
+                batch_file_path = os.path.join(
+                    self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
+                )
+                try:
+                    # MHA returns K and V as pairs: [K0, V0, K1, V1, ...]
+                    # For each page, we have K and V pointers
+                    k_idx = idx * 2
+                    v_idx = idx * 2 + 1
+                    k_ptr = ptr_list[k_idx]
+                    k_size = element_size_list[k_idx]
+                    v_ptr = ptr_list[v_idx]
+                    v_size = element_size_list[v_idx]
+                    success = self._write_kv_pair_from_ptrs(
+                        batch_file_path, k_ptr, k_size, v_ptr, v_size
+                    )
+                    write_results[idx] = success
+                except Exception as e:
+                    logger.error(f"Failed to write batch for key {key}: {e}")
+                    write_results[idx] = False
+        
         return write_results
