@@ -37,27 +37,43 @@ class Event:
         stream_wait_value(self.flag, value)
 
 
-def main():
-    import time
-
-    event = Event()
+def test_wait_before_record(event: Event | torch.cuda.Event):
     stream_a = torch.cuda.Stream()
     stream_b = torch.cuda.Stream()
 
     with torch.cuda.stream(stream_a):
-        print("Stream A: waiting event to be recorded")
         event.wait()
 
-    print("Stream B: waiting 5 seconds before recording event")
+    stream_a.synchronize()
+
     with torch.cuda.stream(stream_b):
-        for _ in range(5):
-            time.sleep(1)
-            print(".", end="", flush=True)
-        print("\nStream B: recording event")
         event.record()
 
-    stream_a.synchronize()
-    print("Stream A: event recorded, proceeding")
+
+def main():
+    import os
+    import threading
+    import time
+
+    block_thead = threading.Thread(target=test_wait_before_record, args=(Event(),))
+    block_thead.start()
+
+    non_block_thread = threading.Thread(
+        target=test_wait_before_record, args=(torch.cuda.Event(),)
+    )
+    non_block_thread.start()
+
+    print("Checking if custom Event blocks the stream...", flush=True)
+    for _ in range(5):
+        print(f"{block_thead.is_alive()=}, {non_block_thread.is_alive()=}", flush=True)
+        time.sleep(1)
+
+    assert block_thead.is_alive(), "Custom Event did not block as expected"
+    assert not non_block_thread.is_alive(), "torch.cuda.Event should not block"
+    print("=" * 40)
+    print("Test completed successfully.")
+
+    os._exit(0)
 
 
 if __name__ == "__main__":
