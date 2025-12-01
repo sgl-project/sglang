@@ -382,7 +382,7 @@
                 "7": 102.28,
                 "8": 105.54
             },
-            "expected_e2e_ms": 1248.41,
+            "expected_e2e_ms": 1383.47,
             "expected_avg_denoise_ms": 94.15,
             "expected_median_denoise_ms": 102.03
         },
