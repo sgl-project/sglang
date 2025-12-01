@@ -74,22 +74,22 @@ class TestNightlyDeepseekV32Performance(unittest.TestCase):
                     '{"enable_multithread_load": true}',
                 ],
             },
-            # {
-            #     "name": "pure_tp",
-            #     "other_args": [
-            #         "--trust-remote-code",
-            #         "--tp",
-            #         "8",
-            #         "--attention-backend",
-            #         "nsa",
-            #         "--nsa-prefill-backend",
-            #         "flashmla_sparse",
-            #         "--nsa-decode-backend",
-            #         "flashmla_kv",
-            #         "--model-loader-extra-config",
-            #         '{"enable_multithread_load": true}',
-            #     ],
-            # },
+            {
+                "name": "pure_tp",
+                "other_args": [
+                    "--trust-remote-code",
+                    "--tp",
+                    "8",
+                    "--attention-backend",
+                    "nsa",
+                    "--nsa-prefill-backend",
+                    "flashmla_sparse",
+                    "--nsa-decode-backend",
+                    "flashmla_kv",
+                    "--model-loader-extra-config",
+                    '{"enable_multithread_load": true}',
+                ],
+            },
         ]
 
         cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
