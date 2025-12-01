@@ -2,21 +2,12 @@ from __future__ import annotations
 
 import logging
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, cast
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.hardware_backend.npu.layers.quantization.fused_moe_method_npu import (
-    NPUW4A16Int4DynamicMoEMethod,
-    NPUW8A8Int8DynamicMoEMethod,
-)
-from sglang.srt.hardware_backend.npu.layers.quantization.linear_method_npu import (
-    NPUW8A8Int8DynamicLinearMethod,
-    NPUW8A8Int8LinearMethod,
-)
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -27,18 +18,13 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
-    apply_module_patch,
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_npu,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -49,52 +35,11 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_is_npu = is_npu()
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
-elif _is_npu:
-    import torch_npu
-    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
 
 logger = logging.getLogger(__name__)
-
-
-# func refers to RMSNorm.__init__
-def npu_wrapper_rmsnorm_init(func):
-    def init(self, hidden_size: int, **extra_args) -> None:
-        func(self, hidden_size, **extra_args)
-        self.ignore_anti = True
-        # The Ascend w8a8_int8 quantization requires adding a bias in rmsnorm
-        self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
-
-    return init
-
-
-# func refers to RMSNorm.forward_oot
-def npu_wrapper_rmsnorm_forward(func):
-    def _rmsnorm_forward_oot(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if not x.is_contiguous():
-            x = x.contiguous()
-        if residual is not None:
-            out, residual_out = add_rmsnorm_bias(
-                x,
-                residual,
-                self.weight.data,
-                self.bias,
-                self.variance_epsilon,
-            )
-            return out.to(x.dtype), residual_out
-
-        out = torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
-        out = out + self.bias
-        return out.to(x.dtype)
-
-    return _rmsnorm_forward_oot
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -108,59 +53,20 @@ class W8A8Int8Config(QuantizationConfig):
         super().__init__()
         self.quant_description = quant_config
         self.is_dynamic = quant_config.get("is_dynamic", False)
-        self.is_moe_w4_dynamic = False
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
-        self.target_scheme_map = (
-            CompressedTensorsConfig._quantization_scheme_map_from_config(
-                config=quant_config
-            )
-        )
-        target = "MoEGMM" if "MoEGMM" in self.target_scheme_map else "Linear"
-        target_scheme = self.target_scheme_map.get(target, None)
-        if target_scheme is None:
-            self.is_moe_w4_dynamic = False
-        else:
-            weight_quant = target_scheme.get("weights")
-            input_quant = target_scheme.get("input_activations")
-            self.is_moe_w4_dynamic = self.is_dynamic_token_w4(weight_quant, input_quant)
-            self.is_moe_input_quant = input_quant
-
-        if _is_npu:
-            # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
-            for name in self.quant_description.keys():
-                if "norm.bias" in name:
-                    apply_module_patch(
-                        "sglang.srt.layers.layernorm.RMSNorm",
-                        "__init__",
-                        [npu_wrapper_rmsnorm_init],
-                    )
-                    apply_module_patch(
-                        "sglang.srt.layers.layernorm.RMSNorm",
-                        "forward_npu",
-                        [npu_wrapper_rmsnorm_forward],
-                    )
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
-        return (
-            [torch.float16, torch.bfloat16]
-            if not _is_npu
-            else [torch.int8, torch.float16, torch.bfloat16]
-        )
+        return [torch.float16, torch.bfloat16]
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if _is_npu:
-            raise NotImplementedError(
-                'NPU hardware does not support "get_min_capability" feature.'
-            )
-        else:
-            return 75
+        return 75
 
     @classmethod
     def get_name(self) -> str:
@@ -169,15 +75,13 @@ class W8A8Int8Config(QuantizationConfig):
     @classmethod
     def get_config_filenames(cls) -> List[str]:
         filenames = []
-        if _is_npu:
-            filenames.append("quant_model_description.json")
         return filenames
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> W8A8Int8Config:
         return cls(config)
 
-    def _get_quant_method_npu(
+    def get_quant_method(
         self,
         layer: torch.nn.Module,
         prefix: str,
@@ -185,72 +89,15 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
+        if should_ignore_layer(
+            prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase):
-            if should_ignore_layer(
-                prefix,
-                ignore=self.ignore,
-                fused_mapping=self.packed_modules_mapping,
-            ):
-                return UnquantizedLinearMethod()
-            key = "model"
-            if "vision_model" in prefix:
-                key = "vision_model"
-            elif "visual" in prefix:
-                key = "visual"
-            packed_modules_mapping_subset = self.packed_modules_mapping.get(key, {})
-            prefix_in_quant_config = prefix
-            proj_name = prefix.split(".")[-1]
-            if proj_name in packed_modules_mapping_subset:
-                prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
-                )
-            self.is_dynamic = (
-                self.quant_description[prefix_in_quant_config + ".weight"]
-                == "W8A8_DYNAMIC"
-            )
-            if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
-                return UnquantizedLinearMethod()
-            return (
-                NPUW8A8Int8DynamicLinearMethod()
-                if self.is_dynamic
-                else NPUW8A8Int8LinearMethod()
-            )
+            return W8A8Int8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            prefix_in_quant_config = prefix + ".0.down_proj.weight"
-            is_moe_w4a8_dynamic = (
-                self.quant_description.get(prefix_in_quant_config, "STATIC")
-                == "W4A8_DYNAMIC"
-            )
-            if (
-                self.is_moe_w4_dynamic and self.is_moe_input_quant is not None
-            ) or is_moe_w4a8_dynamic:
-                raise ValueError("npu does not support W4A8 currently!")
-            elif self.is_moe_w4_dynamic and self.is_moe_input_quant is None:
-                return NPUW4A16Int4DynamicMoEMethod(self)
-            else:
-                return NPUW8A8Int8DynamicMoEMethod()
+            return W8A8Int8MoEMethod(self)
         return None
-
-    def get_quant_method(
-        self,
-        layer: torch.nn.Module,
-        prefix: str,
-    ) -> Optional[QuantizeMethodBase]:
-        if _is_npu:
-            return self._get_quant_method_npu(layer, prefix)
-        else:
-            from sglang.srt.layers.linear import LinearBase
-            from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
-            if should_ignore_layer(
-                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
-            ):
-                return UnquantizedLinearMethod()
-            if isinstance(layer, LinearBase):
-                return W8A8Int8LinearMethod(self)
-            elif isinstance(layer, FusedMoE):
-                return W8A8Int8MoEMethod(self)
-            return None
 
     def is_layer_skipped(
         self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
@@ -285,27 +132,6 @@ class W8A8Int8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
-
-    def is_dynamic_token_w4(self, weight_quant, input_quant) -> bool:
-        is_w4 = weight_quant.num_bits == 4
-        weight_strategy = (
-            weight_quant.strategy == QuantizationStrategy.TENSOR.value
-            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
-            or weight_quant.strategy == QuantizationStrategy.GROUP.value
-        )
-        if input_quant is not None:
-            is_token = (
-                weight_strategy
-                and input_quant.strategy == QuantizationStrategy.TOKEN.value
-            )
-            is_dynamic = not weight_quant.dynamic and input_quant.dynamic
-        else:
-            is_token = weight_strategy
-            is_dynamic = not weight_quant.dynamic
-
-        # Both symmetric and asymmetric input quantization supported.
-        # Only symmetric weight quantization supported.
-        return is_w4 and weight_quant.symmetric and is_token and is_dynamic
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
