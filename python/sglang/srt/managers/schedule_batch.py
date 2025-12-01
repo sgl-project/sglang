@@ -1537,9 +1537,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 * (server_args.speculative_num_steps or 1)
             )
             return sum(
-                1
-                for req in requests
-                if ((req.seqlen + thresh) % page_size) <= thresh
+                1 for req in requests if ((req.seqlen + thresh) % page_size) <= thresh
             )
 
         # In the decoding phase, the length of a request's KV cache should be
