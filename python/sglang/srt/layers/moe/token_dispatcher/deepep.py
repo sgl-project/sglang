@@ -680,7 +680,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 overlap_args_dict = dict(
                     overlap=overlap_args.overlap,
                     src_signals=overlap_args.signal,
-                    src_signal_expect_value=meta_overlap_args["threshold"],
+                    src_signal_expect_value=overlap_args.threshold,
                 )
             else:
                 overlap_args_dict = dict(
