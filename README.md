@@ -14,8 +14,8 @@
 
 | [**Blog**](https://lmsys.org/blog/)
 | [**Documentation**](https://docs.sglang.io/)
-| [**Join Slack**](https://slack.sglang.io/)
 | [**Roadmap**](https://roadmap.sglang.io/)
+| [**Join Slack**](https://slack.sglang.io/)
 | [**Weekly Dev Meeting**](https://meet.sglang.io/)
 | [**Slides**](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides) |
 
