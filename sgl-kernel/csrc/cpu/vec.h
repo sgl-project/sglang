@@ -131,8 +131,8 @@ inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
 // convert 64 mxfp4 to 2x bf16 vectors, expect input 32-way packing
 inline std::tuple<__m512bh, __m512bh> cvt_mxfp4_e2m1_bf16_intrinsic_lut(__m256i a, __m512i s0, __m512i s1) {
   // LUT
-  static const __m512 values = _mm512_set_ps(MXFP4_VALUES);
-  static const __m512i lut = (__m512i)(_mm512_cvtne2ps_pbh(values, values));
+  const __m512 values = _mm512_set_ps(MXFP4_VALUES);
+  const __m512i lut = (__m512i)(_mm512_cvtne2ps_pbh(values, values));
 
   const __m512i abs_mask = _mm512_set1_epi16(0x7FFF);
   const __m512i zero = _mm512_setzero_si512();
