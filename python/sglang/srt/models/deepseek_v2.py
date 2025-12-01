@@ -1986,9 +1986,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
 
-            if self.llama_4_scaling:
-                q *= self.llama_4_scaling
-
             attn_output = self.attn_mqa(
                 q,
                 k,

@@ -952,8 +952,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     requires_grad=False,
                 )
 
-            # Precompute and register per-expert output scaling factors for FI MoE
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+                # Precompute and register per-expert output scaling factors for FI MoE
                 # Note: w13_input_scale and w2_input_scale are scalar Parameters post-reduction
                 assert (
                     hasattr(layer, "w13_input_scale") and layer.w13_input_scale is not None
