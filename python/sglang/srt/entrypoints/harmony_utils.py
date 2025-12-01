@@ -345,11 +345,7 @@ def parse_remaining_state(parser: StreamableParser):
         return [reasoning_item]
     elif parser.current_channel == "final":
         output_text = ResponseOutputText(
-            content=[
-                ResponseReasoningTextContent(
-                    text=parser.current_content, type="reasoning_text"
-                )
-            ],
+            text=parser.current_content,
             annotations=[],  # TODO
             type="output_text",
             logprobs=None,  # TODO

@@ -3,9 +3,7 @@ import math
 import unittest
 
 # TODO: use interface in cpu.py
-import sgl_kernel
 import torch
-import torch.nn as nn
 from utils import (
     BLOCK_K,
     BLOCK_N,
