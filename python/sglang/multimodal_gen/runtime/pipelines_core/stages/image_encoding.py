@@ -334,7 +334,7 @@ class ImageVAEEncodingStage(PipelineStage):
         """Verify encoding stage inputs."""
         result = VerificationResult()
 
-        assert batch.condition_image is not None and (
+        assert batch.condition_image is None or (
             isinstance(batch.condition_image, PIL.Image.Image)
             or isinstance(batch.condition_image, torch.Tensor)
         )
