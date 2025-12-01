@@ -1915,6 +1915,7 @@ class Scheduler(
 
         return new_batch
 
+    @nvtx_annotated_method("scheduler.update_running_batch")
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()

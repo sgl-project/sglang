@@ -10,6 +10,7 @@ import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.nvtx_utils import nvtx_annotated_method, nvtx_range
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -67,39 +68,46 @@ class SamplingBatchInfo:
     logit_bias: Optional[torch.Tensor] = None
 
     @classmethod
+    @nvtx_annotated_method("sampling_batch_info.from_schedule_batch")
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
         enable_deterministic = global_server_args.enable_deterministic_inference
 
         reqs = batch.reqs
         device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
+        temperatures = (
+            torch.tensor(
+                [r.sampling_params.temperature for r in reqs],
+                dtype=torch.float,
+                pin_memory=True,
+            )
+            .to(device, non_blocking=True)
+            .view(-1, 1)
+        )
         top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
-        )
+            [r.sampling_params.top_p for r in reqs], dtype=torch.float, pin_memory=True
+        ).to(device, non_blocking=True)
         top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
-        )
+            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, pin_memory=True
+        ).to(device, non_blocking=True)
         min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
+            [r.sampling_params.min_p for r in reqs], dtype=torch.float, pin_memory=True
+        ).to(device, non_blocking=True)
         sampling_seed = (
             torch.tensor(
                 [r.sampling_params.sampling_seed for r in reqs],
                 dtype=torch.int32,
-                device=device,
-            )
+                pin_memory=True,
+            ).to(device, non_blocking=True)
             if enable_deterministic
             else None
         )
 
         logit_bias = None
         if any(r.sampling_params.logit_bias is not None for r in reqs):
-            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
+            logit_bias = torch.zeros(len(reqs), vocab_size, pin_memory=True).to(
+                device, non_blocking=True
+            )
             for i, r in enumerate(reqs):
                 if r.sampling_params.logit_bias is not None:
                     for key, value in r.sampling_params.logit_bias.items():

@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
 
+import nvtx
+
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
@@ -69,19 +71,25 @@ class ScheduleBatchDisaggregationDecodeMixin:
         extend_input_logprob_token_ids = None
 
         # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
-        )
+        with nvtx.annotate("prepare_for_prebuilt.tensor_sum", color="blue"):
+            self.input_ids = torch.tensor(
+                sum(input_ids, []), dtype=torch.int32, pin_memory=True
+            ).to(self.device, non_blocking=True)
         self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
+            req_pool_indices, dtype=torch.int64, pin_memory=True
+        ).to(self.device, non_blocking=True)
+        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=True).to(
+            self.device, non_blocking=True
         )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
-        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.seq_lens_cpu = torch.tensor(
+            seq_lens, dtype=torch.int64, pin_memory=True
+        ).to(self.device, non_blocking=True)
         self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
+            seq_lens, dtype=torch.int32, pin_memory=True
+        ).to(self.device, non_blocking=True)
         self.out_cache_loc = out_cache_loc
-        self.seq_lens_sum = sum(seq_lens)
+        with nvtx.annotate("prepare_for_prebuilt.seq_lens_sum", color="blue"):
+            self.seq_lens_sum = sum(seq_lens)
 
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
@@ -95,15 +103,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         # Build sampling info
-        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
-            self,
-            self.model_config.vocab_size,
-        )
+        with nvtx.annotate("prepare_for_prebuilt.build_sampling_info", color="blue"):
+            self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+                self,
+                self.model_config.vocab_size,
+            )
 
     def process_prebuilt(
         self: ScheduleBatch,
         server_args: ServerArgs,
-        future_map: FutureMap,
+        future_map: "FutureMap",
     ):
         """Assign the buffered last input id to schedule batch"""
         self.output_ids = []
@@ -126,7 +135,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
+
+        # Create tensor on CPU first, then transfer non-blocking
+        self.output_ids = torch.tensor(self.output_ids, dtype=torch.int64).to(
+            self.device, non_blocking=True
+        )
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
@@ -181,7 +194,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 )
 
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
-            hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
+            hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device, non_blocking=True)
 
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_info import EagleDraftInput

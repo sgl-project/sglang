@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.nvtx_utils import nvtx_annotated_method
+
 import torch
 import triton
 import triton.language as tl
@@ -194,7 +196,7 @@ def get_last_loc_triton(
     )
     return result
 
-
+@nvtx_annotated_method("scheduler.alloc_token_slots")
 def alloc_token_slots(
     tree_cache: BasePrefixCache,
     num_tokens: int,
