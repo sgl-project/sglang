@@ -168,6 +168,18 @@ class AuxDataCodec:
         return
 
 
+@dataclasses.dataclass
+class TPSliceConfig:
+    page_size: int
+    src_item_len: int
+    dst_item_len: int
+    bytes_per_token_src: int
+    bytes_per_token_dst: int
+    src_head_slice_offset: int
+    dst_head_slice_offset: int
+    heads_bytes_per_token_to_send: int
+
+
 class MoriKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
 
@@ -508,24 +520,120 @@ class MoriKVManager(CommonKVManager):
         if not src_groups:
             return []
 
-        local_mems = [src_desc] * len(src_groups)
-        remote_mems = [dst_desc] * len(src_groups)
-        local_offsets_list = [
-            [int(src_group[0]) * kv_item_len] for src_group in src_groups
-        ]
-        remote_offsets_list = [
-            [int(dst_group[0]) * kv_item_len] for dst_group in dst_groups
-        ]
-        sizes_list = [[len(src_group) * kv_item_len] for src_group in src_groups]
-        transfer_uids = [self.engine.allocate_transfer_uid() for _ in src_groups]
+        local_offsets = [int(src_group[0]) * kv_item_len for src_group in src_groups]
+        remote_offsets = [int(dst_group[0]) * kv_item_len for dst_group in dst_groups]
+        sizes = [len(src_group) * kv_item_len for src_group in src_groups]
+        transfer_uid = self.engine.allocate_transfer_uid()
 
         statuses = self.engine.batch_write(
-            local_mems,
-            local_offsets_list,
-            remote_mems,
-            remote_offsets_list,
-            sizes_list,
-            transfer_uids,
+            [src_desc],
+            [local_offsets],
+            [dst_desc],
+            [remote_offsets],
+            [sizes],
+            [transfer_uid],
+        )
+        return statuses
+
+    def _build_tp_slice_config(self, peer_info: KVArgsRegisterInfo) -> TPSliceConfig:
+        page_size = self.kv_args.page_size
+
+        src_item_len = self.kv_args.kv_item_lens[0]
+        dst_item_len = peer_info.dst_kv_item_len
+
+        bytes_per_token_src = src_item_len // page_size
+        bytes_per_token_dst = dst_item_len // page_size
+
+        prefill_tp_size = self.attn_tp_size
+        decode_tp_size = peer_info.decode_tp_size
+
+        num_kv_heads = self.kv_args.kv_head_num
+        src_heads_per_rank = num_kv_heads
+        dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
+        if dst_heads_per_rank == 0:
+            raise ValueError("Destination heads per rank evaluates to zero")
+
+        bytes_per_head_slice = bytes_per_token_dst // dst_heads_per_rank
+        if bytes_per_head_slice == 0:
+            raise ValueError("Head slice size evaluates to zero")
+
+        local_tp_rank = self.kv_args.engine_rank % prefill_tp_size
+        dst_tp_rank = peer_info.decode_tp_rank % decode_tp_size
+
+        if prefill_tp_size > decode_tp_size:
+            src_head_start = 0
+            num_heads_to_send = src_heads_per_rank
+            dst_head_start = local_tp_rank * src_heads_per_rank
+        else:
+            src_head_start = (dst_tp_rank * dst_heads_per_rank) % src_heads_per_rank
+            num_heads_to_send = dst_heads_per_rank
+            dst_head_start = 0
+
+        src_head_slice_offset = src_head_start * bytes_per_head_slice
+        dst_head_slice_offset = dst_head_start * bytes_per_head_slice
+        heads_bytes_per_token = num_heads_to_send * bytes_per_head_slice
+
+        if heads_bytes_per_token > bytes_per_token_dst:
+            raise ValueError(
+                "Slice size exceeds destination token capacity for TP slice transfer"
+            )
+
+        return TPSliceConfig(
+            page_size=page_size,
+            src_item_len=src_item_len,
+            dst_item_len=dst_item_len,
+            bytes_per_token_src=bytes_per_token_src,
+            bytes_per_token_dst=bytes_per_token_dst,
+            src_head_slice_offset=src_head_slice_offset,
+            dst_head_slice_offset=dst_head_slice_offset,
+            heads_bytes_per_token_to_send=heads_bytes_per_token,
+        )
+
+    def _issue_tp_slice_transfers(
+        self,
+        src_desc: MemoryDesc,
+        dst_desc: MemoryDesc,
+        kv_indices: npt.NDArray[np.int32],
+        dst_indices: npt.NDArray[np.int32],
+        tp_cfg: TPSliceConfig,
+    ) -> List[TransferStatus]:
+        if kv_indices.size == 0 or dst_indices.size == 0:
+            return []
+
+        limit = min(kv_indices.size, dst_indices.size)
+        local_offsets: List[int] = []
+        remote_offsets: List[int] = []
+        sizes: List[int] = []
+
+        for i in range(limit):
+            src_page = int(kv_indices[i])
+            dst_page = int(dst_indices[i])
+            src_page_base = src_page * tp_cfg.src_item_len
+            dst_page_base = dst_page * tp_cfg.dst_item_len
+            for token_slot in range(tp_cfg.page_size):
+                local_offsets.append(
+                    src_page_base
+                    + token_slot * tp_cfg.bytes_per_token_src
+                    + tp_cfg.src_head_slice_offset
+                )
+                remote_offsets.append(
+                    dst_page_base
+                    + token_slot * tp_cfg.bytes_per_token_dst
+                    + tp_cfg.dst_head_slice_offset
+                )
+                sizes.append(tp_cfg.heads_bytes_per_token_to_send)
+
+        if not local_offsets:
+            return []
+
+        transfer_uid = self.engine.allocate_transfer_uid()
+        statuses = self.engine.batch_write(
+            [src_desc],
+            [local_offsets],
+            [dst_desc],
+            [remote_offsets],
+            [sizes],
+            [transfer_uid],
         )
         return statuses
 
@@ -557,6 +665,7 @@ class MoriKVManager(CommonKVManager):
                     )
                 )
         else:
+            tp_mismatch = peer_info.decode_tp_size != self.attn_tp_size
             (
                 src_k_descs,
                 src_v_descs,
@@ -564,25 +673,51 @@ class MoriKVManager(CommonKVManager):
                 dst_v_descs,
                 layers_current_pp_stage,
             ) = self._get_mha_mem_desc_slices(peer_info.dst_kv_mem_descs)
-            for layer_id in range(layers_current_pp_stage):
-                statuses.extend(
-                    self._issue_layer_transfers(
-                        src_k_descs[layer_id],
-                        dst_k_descs[layer_id],
-                        kv_item_len,
-                        src_groups,
-                        dst_groups,
+
+            if tp_mismatch:
+                tp_cfg = self._build_tp_slice_config(peer_info)
+                for layer_id in range(layers_current_pp_stage):
+                    statuses.extend(
+                        self._issue_tp_slice_transfers(
+                            src_k_descs[layer_id],
+                            dst_k_descs[layer_id],
+                            prefill_kv_indices,
+                            dst_kv_indices,
+                            tp_cfg,
+                        )
                     )
-                )
-                statuses.extend(
-                    self._issue_layer_transfers(
-                        src_v_descs[layer_id],
-                        dst_v_descs[layer_id],
-                        kv_item_len,
-                        src_groups,
-                        dst_groups,
+                    statuses.extend(
+                        self._issue_tp_slice_transfers(
+                            src_v_descs[layer_id],
+                            dst_v_descs[layer_id],
+                            prefill_kv_indices,
+                            dst_kv_indices,
+                            tp_cfg,
+                        )
                     )
+            else:
+                src_groups, dst_groups = group_concurrent_contiguous(
+                    prefill_kv_indices, dst_kv_indices
                 )
+                for layer_id in range(layers_current_pp_stage):
+                    statuses.extend(
+                        self._issue_layer_transfers(
+                            src_k_descs[layer_id],
+                            dst_k_descs[layer_id],
+                            kv_item_len,
+                            src_groups,
+                            dst_groups,
+                        )
+                    )
+                    statuses.extend(
+                        self._issue_layer_transfers(
+                            src_v_descs[layer_id],
+                            dst_v_descs[layer_id],
+                            kv_item_len,
+                            src_groups,
+                            dst_groups,
+                        )
+                    )
 
         return statuses
 
