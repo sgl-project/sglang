@@ -229,9 +229,9 @@ class InputValidationStage(PipelineStage):
             condition_image_width, condition_image_height = image.width, image.height
             batch.original_condition_image_size = image.size
 
-        self.preprocess_condition_image(
-            batch, server_args, condition_image_width, condition_image_height
-        )
+            self.preprocess_condition_image(
+                batch, server_args, condition_image_width, condition_image_height
+            )
 
         return batch
 

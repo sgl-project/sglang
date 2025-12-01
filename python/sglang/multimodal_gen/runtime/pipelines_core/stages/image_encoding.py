@@ -262,12 +262,9 @@ class ImageVAEEncodingStage(PipelineStage):
         generator = batch.generator
         if generator is None:
             raise ValueError("Generator must be provided")
-        # TODO: verify
-        sample_mode = (
-            "argmax"
-            if server_args.pipeline_config.task_type.is_image_gen()
-            else "sample"
-        )
+
+        sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+
         latent_condition = self.retrieve_latents(
             encoder_output, generator, sample_mode=sample_mode
         )
