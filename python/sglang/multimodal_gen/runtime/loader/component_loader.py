@@ -20,10 +20,10 @@ from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
+from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
-from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     maybe_load_fsdp_model,
@@ -410,12 +410,10 @@ class TextEncoderLoader(ComponentLoader):
                 encoder_config = server_args.pipeline_config.text_encoder_configs[2]
                 encoder_config.update_model_arch(model_config)
                 encoder_dtype = server_args.pipeline_config.text_encoder_precisions[2]
-            target_device = get_local_torch_device()
             # TODO(will): add support for other dtypes
             return self.load_model(
-                model_path,
+                component_model_path,
                 encoder_config,
-                target_device,
                 server_args,
                 encoder_dtype,
             )
@@ -619,11 +617,13 @@ class VAELoader(ComponentLoader):
             # Priority: fp16 > full precision > any matching file
             if precision == "fp16":
                 fp16_path = os.path.join(
-                    str(model_path), f"{base_name}.fp16.safetensors"
+                    str(component_model_path), f"{base_name}.fp16.safetensors"
                 )
                 target_files = [fp16_path] if os.path.exists(fp16_path) else []
             else:
-                full_path = os.path.join(str(model_path), f"{base_name}.safetensors")
+                full_path = os.path.join(
+                    str(component_model_path), f"{base_name}.safetensors"
+                )
                 target_files = [full_path] if os.path.exists(full_path) else []
             safetensors_list = target_files
 
