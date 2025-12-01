@@ -362,7 +362,7 @@ def apply_rotary_embedding(
 
 
 if _is_npu:
-
+    # TODO: remove this when triton ascend bug is fixed
     def apply_rotary_embedding_native(
         x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
     ) -> torch.Tensor:
