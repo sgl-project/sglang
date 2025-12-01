@@ -466,7 +466,7 @@ class Qwen2ForCausalLM(nn.Module):
             elif self.pp_group.is_last_rank:
                 emb_token_weight = self.pp_group.recv(
                     size=(
-                        config.vocab_size // get_tensor_model_parallel_world_size(),
+                        self.lm_head.num_embeddings_per_partition,
                         config.hidden_size,
                     ),
                     dtype=next(self.model.parameters()).dtype,
