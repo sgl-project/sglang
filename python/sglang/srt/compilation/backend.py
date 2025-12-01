@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 SPLIT_OPS = [
     "sglang.unified_attention_with_output",
-    "sglang.inplace_all_reduce",
     "sglang.gdn_with_output",
 ]
 
