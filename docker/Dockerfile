@@ -36,20 +36,17 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
 fi
 
-# Python setup (combined with apt update to reduce layers)
-RUN --mount=type=cache,target=/var/cache/apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
-    && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py \
-    && rm get-pip.py \
-    # Fix for apt-add-repository
-    && cd /usr/lib/python3/dist-packages/ \
-    && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y && apt install software-properties-common -y \
+ && add-apt-repository ppa:deadsnakes/ppa -y \
+ && apt install python3.12-full python3.12-dev python3.10-venv -y \
+ && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+ && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
+ && update-alternatives --set python3 /usr/bin/python3.12 \
+ && wget https://bootstrap.pypa.io/get-pip.py \
+ && python3 get-pip.py \
+ # Fix for `apt-add-repository`
+ && cd /usr/lib/python3/dist-packages/ \
+ && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt \
