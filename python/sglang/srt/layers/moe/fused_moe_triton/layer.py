@@ -1174,7 +1174,7 @@ class FlashInferFP4MoE(FusedMoE):
             intermediate_size=self.intermediate_size_per_partition,
             local_expert_offset=self.moe_ep_rank * self.num_local_experts,
             local_num_experts=self.num_local_experts,
-            routed_scaling_factor=None,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
             tile_tokens_dim=None,
             routing_method_type=routing_method_type,
             do_finalize=True,
