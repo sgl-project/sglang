@@ -33,7 +33,7 @@ KUBE_CONFIG = "/data/.cache/kb.yaml"
 DATA_PATH = "/data/.cache/GSM8K-in3584-bs8192.jsonl"
 NAMESPACE = "kube-system"
 CONFIGMAP_NAME = "sglang-info"
-LOACL_TIMEOUT = 6000
+LOCAL_TIMEOUT = 6000
 
 config.load_kube_config(KUBE_CONFIG)
 v1 = client.CoreV1Api()
@@ -396,7 +396,7 @@ def launch_node(config):
     return popen_launch_server(
         config["model_path"],
         f"http://{node_ip}:{8000}",
-        timeout=LOACL_TIMEOUT * 10,
+        timeout=LOCAL_TIMEOUT * 10,
         other_args=[
             *common_args,
         ],
@@ -413,7 +413,7 @@ class TestAscend_DISAGGREGATION_DEEPEP(CustomTestCase):
         cls.role = "router" if "router" in hostname else None
         print(f"Init {cls.local_ip} {cls.role=}!")
 
-    def wait_router_ready(self, url, timeout=LOACL_TIMEOUT):
+    def wait_router_ready(self, url, timeout=LOCAL_TIMEOUT):
         start_time = time.perf_counter()
         while True:
             try:
@@ -510,7 +510,7 @@ class TestAscend_DISAGGREGATION_DEEPEP(CustomTestCase):
                 target=launch_node, args=(DEEPSEEK_R1_CONFIG,)
             )
             sglang_thread.start()
-            time.sleep(LOACL_TIMEOUT)
+            time.sleep(LOCAL_TIMEOUT)
 
 
 if __name__ == "__main__":

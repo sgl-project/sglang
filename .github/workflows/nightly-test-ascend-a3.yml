@@ -18,7 +18,7 @@ concurrency:
 jobs:
   multi-node-tests:
     name: multi-node
-    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     strategy:
       fail-fast: false
       max-parallel: 1

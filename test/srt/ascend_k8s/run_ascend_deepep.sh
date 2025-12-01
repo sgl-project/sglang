@@ -8,7 +8,7 @@ pip install kubernetes
 pip3 install xgrammar==0.1.25
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_goveror
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 

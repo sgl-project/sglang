@@ -11,7 +11,7 @@ KUBE_CONFIG = "/data/.cache/kb.yaml"
 
 config.load_kube_config(KUBE_CONFIG)
 v1 = client.CoreV1Api()
-LOACL_TIMEOUT = 10800
+LOCAL_TIMEOUT = 10800
 
 
 def run_command(cmd, shell=True):
@@ -226,9 +226,9 @@ if __name__ == "__main__":
     if result:
         print(result)
 
-    if check_pods_ready(timeout=LOACL_TIMEOUT):
+    if check_pods_ready(timeout=LOCAL_TIMEOUT):
         create_configmap()
     else:
         print("Pod not ready, maybe not enough resource")
 
-    monitor_pod_logs("mindx-dls-test-sglang-router-0", "kube-system", LOACL_TIMEOUT)
+    monitor_pod_logs("mindx-dls-test-sglang-router-0", "kube-system", LOCAL_TIMEOUT)
