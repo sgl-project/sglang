@@ -530,4 +530,66 @@ mod tests {
         let idx = policy.select_worker(&workers, Some("test1")).unwrap();
         assert_eq!(idx, 1);
     }
+    #[test]
+    fn test_prove_cache_aware_overload_flaw() {
+        // 1. Setup the Policy
+        // We set a high balance threshold so standard load balancing doesn't trigger immediately,
+        // isolating the specific behavior of the cache-aware fallback logic.
+        let config = CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 100, // High threshold to force cache logic
+            balance_rel_threshold: 10.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 1_000_000,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        // 2. Setup Workers
+        let worker_overloaded = BasicWorkerBuilder::new("http://overloaded:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker_idle = BasicWorkerBuilder::new("http://idle:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        // 3. Simulate "Workload A": Overloaded worker with Small Cache
+        // We set load to 50 (busy) but only insert a short prompt into the tree
+        for _ in 0..50 {
+            worker_overloaded.increment_load();
+        }
+        policy.add_worker_by_url("http://overloaded:8000", "default");
+        // Insert short prompt -> Small Tree Size (e.g. 5 chars)
+        if let Some(tree) = policy.trees.get("default") {
+            tree.insert("short", "http://overloaded:8000");
+        }
+
+        // 4. Simulate "Workload B": Idle worker with Large Cache
+        // Load is 0 (idle), but we insert a massive prompt into the tree
+        policy.add_worker_by_url("http://idle:8000", "default");
+        if let Some(tree) = policy.trees.get("default") {
+            // Insert massive prompt -> Large Tree Size (e.g. 1000 chars)
+            let massive_prompt = "x".repeat(1000);
+            tree.insert(&massive_prompt, "http://idle:8000");
+        }
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(worker_overloaded),
+            Arc::new(worker_idle)
+        ];
+
+        // 5. The Trigger: A completely new request (Cache Miss)
+        // Since it's a miss, the router falls back to "get_smallest_tenant()"
+        println!("Sending Probe Request (Cache Miss)...");
+        let selected_idx = policy.select_worker(&workers, Some("new_unique_prompt")).unwrap();
+        let selected_url = workers[selected_idx].url();
+
+        println!("Selected Worker: {}", selected_url);
+        println!("Overloaded Load: {}", workers[0].load());
+        println!("Idle Load:       {}", workers[1].load());
+
+        // 6. PROOF: The current implementation picks the OVERLOADED worker
+        // because it has a smaller tree ("short" < "massive_prompt").
+        assert_eq!(selected_url, "http://overloaded:8000",
+            "THEORY CONFIRMED: Router picked the overloaded worker just because its cache tree was smaller!");
+    }
 }
