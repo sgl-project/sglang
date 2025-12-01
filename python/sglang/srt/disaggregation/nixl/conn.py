@@ -731,7 +731,7 @@ class NixlKVSender(CommonKVSender):
         return KVPoll.WaitingForInput  # type: ignore
 
     def failure_exception(self):
-        raise Exception("NIXL KVSender Exception")
+        raise RuntimeError("NIXL KVSender Exception")
 
 
 class NixlKVReceiver(CommonKVReceiver):
