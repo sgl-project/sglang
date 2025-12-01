@@ -87,7 +87,7 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-
+        print(f"Using Deep EP MoE")
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
@@ -170,7 +170,7 @@ class DeepEPMoE(FusedMoE):
     ):
 
         if self.deprecate_flag:
-            return super().forward(
+            return super().forward_impl(
                 hidden_states,
                 topk_output,
             )
