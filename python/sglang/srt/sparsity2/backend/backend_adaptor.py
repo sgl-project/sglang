@@ -236,45 +236,20 @@ class NSABackendAdaptor(BackendAdaptor):
 
         req_pool_indices = forward_batch.req_pool_indices
 
-        transformed_indices = torch.empty_like(selected_indices, dtype=torch.int32)
-        hierarchical_indices = sparse_mask.nonzero(as_tuple=False).squeeze(1)
-        if hierarchical_indices.numel() > 0:
-            hierarchical_device_indices = (
-                self.decode_offload_manager.transfer_sparse_top_k_cache(
-                    req_pool_indices=req_pool_indices[hierarchical_indices],
-                    top_k_result=selected_indices[hierarchical_indices],
-                    out_cache_loc=forward_batch.out_cache_loc[hierarchical_indices],
-                    seq_lens=forward_batch.seq_lens[hierarchical_indices],
-                    layer_id=layer_id,
-                )
-            )
-            transformed_indices[hierarchical_indices] = hierarchical_device_indices.to(
-                torch.int32
-            )
-
-        non_hierarchical_indices = (~sparse_mask).nonzero(as_tuple=False).squeeze(1)
-        if non_hierarchical_indices.numel() > 0:
-            from sglang.srt.layers.attention.nsa.transform_index import (
-                transform_index_page_table_decode,
-            )
-
-            max_seqlen_k = int(forward_batch.seq_lens.max().item())
-            page_table = self.req_to_token_pool.req_to_token[
-                req_pool_indices[non_hierarchical_indices], :max_seqlen_k
-            ]
-            non_hierarchical_device_indices = transform_index_page_table_decode(
+        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        page_table = self.req_to_token_pool.req_to_token[
+            :, :max_seqlen_k
+        ]
+        transformed_indices = (
+            self.decode_offload_manager.transfer_sparse_top_k_cache_v2(
+                req_pool_indices=req_pool_indices,
+                top_k_result=selected_indices,
+                out_cache_loc=forward_batch.out_cache_loc,
+                seq_lens=forward_batch.seq_lens,
+                sparse_mask=sparse_mask,
                 page_table=page_table,
-                topk_indices=selected_indices[non_hierarchical_indices],
+                layer_id=layer_id,
                 page_size=1,
             )
-            transformed_indices[non_hierarchical_indices] = (
-                non_hierarchical_device_indices
-            )
-
-        if layer_id == 0:
-            logger.info(
-                f"NSA transformed: shape={transformed_indices.shape}, "
-                f"head={transformed_indices[:, :20].tolist()}"
-            )
-
+        ).to(torch.int32)
         return transformed_indices

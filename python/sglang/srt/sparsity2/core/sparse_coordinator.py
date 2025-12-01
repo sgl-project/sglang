@@ -77,7 +77,6 @@ class RequestTrackers:
             dtype=torch.int64,
             device=device,
         )
-        #
         self.prev_device_indices = torch.full(
             (max_pool_size, num_layers, self.top_k + 1),
             -1,

@@ -16,6 +16,8 @@ def nsa_sparse_diff_triton_kernel(
     out_cache_loc_ptr,
     seq_lens_ptr,
     req_pool_indices_ptr,
+    sparse_mask_ptr,
+    page_table_ptr,
     prev_top_k_result_stride_0: tl.constexpr,
     prev_top_k_result_stride_1: tl.constexpr,
     curr_top_k_result_stride: tl.constexpr,
@@ -26,7 +28,8 @@ def nsa_sparse_diff_triton_kernel(
     full_host_indices_stride: tl.constexpr,
     should_load_device_indices_stride: tl.constexpr,
     should_load_host_indices_stride: tl.constexpr,
-    layer_id: tl.constexpr,
+    page_table_stride: tl.constexpr,
+    layer_id,
     TOPK: tl.constexpr,
 ):
     """Optimized version with vectorized operations instead of serial loops."""
@@ -57,6 +60,20 @@ def nsa_sparse_diff_triton_kernel(
         should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset,
         -1,
     )
+    
+    sparse_mask_val = tl.load(sparse_mask_ptr + bid)
+    
+    if sparse_mask_val == 0:
+        page_table_ptr = page_table_ptr + page_table_stride * bid
+        topk_indices_ptr = curr_top_k_result_ptr + curr_top_k_result_stride * bid
+        result_ptr = curr_device_indices_ptr + curr_device_indices_stride * bid
+
+        loaded_topk_indices = tl.load(topk_indices_ptr + offset)
+        mask = loaded_topk_indices >= 0
+        loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
+        tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
+        # tl.store(result_ptr + offset, -1, mask=~mask)
+        return
 
     # Load current top-k (save for later update)
     tmp_curr_top_k_result = tl.load(
@@ -277,11 +294,15 @@ def invoke_nsa_sparse_diff_kernel(
     out_cache_loc: torch.Tensor,
     seq_lens: torch.Tensor,
     req_pool_indices: torch.Tensor,
+    sparse_mask: torch.Tensor,
+    page_table: torch.Tensor,
     layer_id: int,
+    page_size: int,
 ):
     bs = curr_top_k_result.shape[0]
     top_k = curr_top_k_result.shape[1]
     grid = (bs,)
+    assert page_size == 1
     nsa_sparse_diff_triton_kernel[grid](
         prev_top_k_result_pool,
         curr_top_k_result,
@@ -294,6 +315,8 @@ def invoke_nsa_sparse_diff_kernel(
         out_cache_loc,
         seq_lens,
         req_pool_indices,
+        sparse_mask,
+        page_table,
         prev_top_k_result_pool.stride(0),
         prev_top_k_result_pool.stride(1),
         curr_top_k_result.stride(0),
@@ -304,16 +327,18 @@ def invoke_nsa_sparse_diff_kernel(
         full_host_indices.stride(0),
         should_load_device_indices.stride(0),
         should_load_host_indices.stride(0),
+        page_table.stride(0),
         layer_id,
         top_k,
     )
 
 
 if __name__ == "__main__":
-    bs = 2
+    bs = 3
     num_layers = 2
     layer_id = 1
     top_k = 8
+    max_seqlen_k = 17
     bitmap = torch.full(
         (8, 64),
         -1,
@@ -325,13 +350,18 @@ if __name__ == "__main__":
         [
             [[-1, -1, -1, -1, -1, -1, -1, -1], [3, 5, 6, 7, 9, 1, 16, 11]],
             [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
+            [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
         ],
         dtype=torch.int64,
         device="cuda",
     )
 
     curr_top_k_result = torch.tensor(
-        [[5, 6, 7, 9, 1, 13, 15, 17], [2, 3, 5, 6, 7, 9, 12, 10]],
+        [
+            [5, 6, 7, 9, 1, 13, 15, 17],
+            [2, 3, 5, 6, 7, 9, 12, 10],
+            [0, 1, 2, 3, -1, -1, -1, -1],
+        ],
         dtype=torch.int64,
         device="cuda",
     )
@@ -345,6 +375,10 @@ if __name__ == "__main__":
             [
                 [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008, -1],
                 [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008, -1],
+            ],
+            [
+                [7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, -1],
+                [7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, -1],
             ],
         ],
         dtype=torch.int64,
@@ -396,14 +430,55 @@ if __name__ == "__main__":
                 -1,
                 -1,
             ],
+            [
+                3000,
+                3001,
+                3002,
+                3003,
+                3004,
+                3005,
+                3006,
+                3007,
+                3008,
+                3009,
+                3010,
+                3011,
+                3012,
+                3013,
+                3014,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+            ],
         ],
         dtype=torch.int64,
         device="cuda",
     )
 
-    seq_lens = torch.tensor([17, 12], dtype=torch.int64, device="cuda")
-    out_cache_loc = torch.tensor([9017, 8012], dtype=torch.int64, device="cuda")
-    req_pool_indices = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+    seq_lens = torch.tensor([17, 12, 15], dtype=torch.int64, device="cuda")
+    out_cache_loc = torch.tensor([9017, 8012, 7015], dtype=torch.int64, device="cuda")
+    req_pool_indices = torch.tensor([0, 1, 2], dtype=torch.int64, device="cuda")
+
+    # Initialize sparse_mask: 0 uses page_table direct lookup, non-zero uses normal flow
+    # First two batches use normal flow (sparse_mask=1), third batch uses page_table path (sparse_mask=0)
+    sparse_mask = torch.tensor([1, 1, 0], dtype=torch.int32, device="cuda")
+
+    # Initialize page_table: shape (bs, max_seqlen_k), maps logical positions to physical KV cache positions
+    # page_table[i][j] represents the physical KV cache position for logical position j in batch i
+    page_table = torch.full(
+        (bs, max_seqlen_k), -1, dtype=torch.int64, device="cuda"
+    )
+    # Set page_table for batch 0: logical position i maps to physical position 9000+i
+    for i in range(max_seqlen_k):
+        page_table[0, i] = 9000 + i
+    # Set page_table for batch 1: logical position i maps to physical position 8000+i
+    for i in range(max_seqlen_k):
+        page_table[1, i] = 8000 + i
+    # Set page_table for batch 2: logical position i maps to physical position 7000+i
+    for i in range(max_seqlen_k):
+        page_table[2, i] = 7000 + i
 
     curr_device_indices = torch.full(
         (bs, top_k + 1), -1, dtype=torch.int64, device="cuda"
@@ -428,7 +503,11 @@ if __name__ == "__main__":
         out_cache_loc,
         seq_lens,
         req_pool_indices,
+        sparse_mask,
+        page_table,
         layer_id,
+        1,  # page_size
+        max_seqlen_k,
     )
 
     # print(bitmap.tolist())
@@ -437,6 +516,7 @@ if __name__ == "__main__":
         [
             [9002, 9003, 9004, 9005, 9006, 9001, 9008, 9017, 9009],
             [8001, 8002, 8003, 8004, 8005, 8006, 8012, 8007, 8008],
+            [7000, 7001, 7002, 7003, -1, -1, -1, -1, -1],
         ],
         device="cuda:0",
     )
@@ -444,6 +524,7 @@ if __name__ == "__main__":
         [
             [9001, 9008, -1, -1, -1, -1, -1, -1],
             [8001, 8002, 8003, 8004, 8005, 8006, 8007, -1],
+            [-1, -1, -1, -1, -1, -1, -1, -1],
         ],
         device="cuda:0",
     )
@@ -451,6 +532,7 @@ if __name__ == "__main__":
         [
             [1013, 1015, -1, -1, -1, -1, -1, -1],
             [2002, 2003, 2005, 2006, 2007, 2009, 2010, -1],
+            [-1, -1, -1, -1, -1, -1, -1, -1],
         ],
         device="cuda:0",
     )
@@ -464,6 +546,10 @@ if __name__ == "__main__":
                 [8001, 8002, 8003, 8004, 8005, 8006, 8007, 8008, -1],
                 [8001, 8002, 8003, 8004, 8005, 8006, 8012, 8007, 8008],
             ],
+            [
+                [7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, -1],
+                [7001, 7002, 7003, 7004, 7005, 7006, 7007, 7008, -1],
+            ],
         ],
         device="cuda:0",
     )
@@ -471,10 +557,11 @@ if __name__ == "__main__":
         [
             [[-1, -1, -1, -1, -1, -1, -1, -1], [5, 6, 7, 9, 1, 13, 15, 17]],
             [[-1, -1, -1, -1, -1, -1, -1, -1], [2, 3, 5, 6, 7, 9, 12, 10]],
+            [[-1, -1, -1, -1, -1, -1, -1, -1], [-1, -1, -1, -1, -1, -1, -1, -1]],
         ],
         device="cuda:0",
     )
-
+    print(curr_device_indices)
     assert torch.all(curr_device_indices == ref_curr_device_indices)
     assert torch.all(should_load_device_indices == ref_should_load_device_indices)
     assert torch.all(should_load_host_indices == ref_should_load_host_indices)
@@ -508,6 +595,8 @@ if __name__ == "__main__":
             should_load_host_bench = torch.full(
                 (bs, top_k), -1, dtype=torch.int64, device="cuda"
             )
+            sparse_mask_bench = sparse_mask.clone()
+            page_table_bench = page_table.clone()
 
             kernel_func(
                 prev_top_k_result_bench,
@@ -521,7 +610,11 @@ if __name__ == "__main__":
                 out_cache_loc,
                 seq_lens,
                 req_pool_indices,
+                sparse_mask_bench,
+                page_table_bench,
                 layer_id,
+                1,  # page_size
+                max_seqlen_k,
             )
 
         torch.cuda.synchronize()
@@ -542,6 +635,8 @@ if __name__ == "__main__":
             should_load_host_bench = torch.full(
                 (bs, top_k), -1, dtype=torch.int64, device="cuda"
             )
+            sparse_mask_bench = sparse_mask.clone()
+            page_table_bench = page_table.clone()
 
             kernel_func(
                 prev_top_k_result_bench,
@@ -555,7 +650,11 @@ if __name__ == "__main__":
                 out_cache_loc,
                 seq_lens,
                 req_pool_indices,
+                sparse_mask_bench,
+                page_table_bench,
                 layer_id,
+                1,  # page_size
+                max_seqlen_k,
             )
 
         torch.cuda.synchronize()
@@ -568,6 +667,7 @@ if __name__ == "__main__":
     bs_large = 4
     top_k_large = 2048
     seq_len_large = 4096
+    max_seqlen_k_large = seq_len_large
 
     bitmap_large = torch.full(
         (bs_large, seq_len_large), -1, dtype=torch.int32, device="cuda"
@@ -609,6 +709,16 @@ if __name__ == "__main__":
     )
     req_pool_indices_large = torch.arange(bs_large, dtype=torch.int64, device="cuda")
 
+    # Initialize sparse_mask and page_table for large-scale testing
+    sparse_mask_large = torch.ones(bs_large, dtype=torch.int32, device="cuda")
+    page_table_large = torch.full(
+        (bs_large, max_seqlen_k_large), -1, dtype=torch.int64, device="cuda"
+    )
+    # Set page_table for each batch: logical position i maps to physical position 10000*batch_id + i
+    for i in range(bs_large):
+        for j in range(max_seqlen_k_large):
+            page_table_large[i, j] = 10000 * i + j
+
     # Test original kernel
     curr_device_indices_large_orig = torch.full(
         (bs_large, top_k_large + 1), -1, dtype=torch.int64, device="cuda"
@@ -633,7 +743,11 @@ if __name__ == "__main__":
             out_cache_loc_large,
             seq_lens_large,
             req_pool_indices_large,
-            1,
+            sparse_mask_large.clone(),
+            page_table_large.clone(),
+            1,  # layer_id
+            1,  # page_size
+            max_seqlen_k_large,
         ),
         "Original (TOPK=2048)",
         num_warmup=5,

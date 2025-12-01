@@ -354,7 +354,7 @@ class NSAReqToTokenPool(ReqToTokenPool):
         )
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_nsa_index_k = torch.zeros(
-                (size, max_context_len), dtype=torch.int32, device=device
+                (size * 4, max_context_len), dtype=torch.int32, device=device
             )
 
     def write_index_token(self, indices, values):
