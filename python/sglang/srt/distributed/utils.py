@@ -65,7 +65,7 @@ def get_pp_indices(
 ) -> Tuple[int, int]:
     """Try to evenly distribute layers across partitions.
     If the number of layers is not divisible by the number of partitions,
-    the first N partitions will have one extra layer, where N = remainder.
+    the last N partitions will have one extra layer, where N = remainder.
     """
     # partition_list_str can be set to None in sglang
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
@@ -85,16 +85,15 @@ def get_pp_indices(
     else:
         base_layers = num_hidden_layers // pp_size
         remainder = num_hidden_layers % pp_size
-        # Distribute the extra layers to the first 'remainder' partitions
-        if pp_rank < remainder:
+        # Distribute the extra layers to the last 'remainder' partitions
+        if pp_rank >= pp_size - remainder:
+            partitions_without_extra_layer = pp_size - remainder
             # This partition gets one extra layer
-            start_layer = pp_rank * (base_layers + 1)
+            start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
             end_layer = start_layer + (base_layers + 1)
         else:
             # This partition gets only base layers
-            start_layer = (
-                remainder * (base_layers + 1) + (pp_rank - remainder) * base_layers
-            )
+            start_layer = pp_rank * base_layers
             end_layer = start_layer + base_layers
 
     return (start_layer, end_layer)
