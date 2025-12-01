@@ -189,16 +189,6 @@ class ComponentLoader(ABC):
         """
         return load_native(transformers_or_diffusers, component_model_path, server_args)
 
-    def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, module_name: str
-    ):
-        """
-        Load the customized version component, implemented and optimized in SGL-diffusion
-        """
-        raise NotImplementedError(
-            f"load_customized not implemented for {self.__class__.__name__}"
-        )
-
     @abstractmethod
     def load_customized(
         self, model_path: str, server_args: ServerArgs, module_name: str
@@ -500,7 +490,6 @@ class ImageEncoderLoader(TextEncoderLoader):
         encoder_config.update_model_arch(model_config)
 
         # Always start with local device; load_model will adjust for offload if needed
-        should_offload = self.should_offload(server_args)
         # TODO(will): add support for other dtypes
         return self.load_model(
             component_model_path,
@@ -572,9 +561,12 @@ class VAELoader(ComponentLoader):
         # Try to load from ModelRegistry first
         try:
             vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-            with set_default_torch_dtype(
-                PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-            ), skip_init_modules():
+            with (
+                set_default_torch_dtype(
+                    PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+                ),
+                skip_init_modules(),
+            ):
                 vae = vae_cls(vae_config).to(target_device)
 
             # Find all safetensors files
@@ -592,20 +584,28 @@ class VAELoader(ComponentLoader):
         except Exception:
             # If ModelRegistry doesn't have the class, try to load from auto_map
             # Get config again to access auto_map (since we popped _class_name earlier)
-            full_config = get_diffusers_component_config(model_path=component_model_path)
+            full_config = get_diffusers_component_config(
+                model_path=component_model_path
+            )
             auto_map = full_config.get("auto_map", {})
             auto_model_map = auto_map.get("AutoModel")
             if auto_model_map:
                 # Load custom class from auto_map
                 module_path, cls_name = auto_model_map.rsplit(".", 1)
-                custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
+                custom_module_file = os.path.join(
+                    component_model_path, f"{module_path}.py"
+                )
                 if os.path.exists(custom_module_file):
-                    spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
+                    spec = importlib.util.spec_from_file_location(
+                        "_custom", custom_module_file
+                    )
                     custom_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(custom_module)
                     vae_cls = getattr(custom_module, cls_name)
                     # Use the custom class's from_pretrained with correct precision
-                    vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+                    vae_dtype = PRECISION_TO_TYPE[
+                        server_args.pipeline_config.vae_precision
+                    ]
                     with set_default_torch_dtype(vae_dtype):
                         vae = vae_cls.from_pretrained(
                             component_model_path,

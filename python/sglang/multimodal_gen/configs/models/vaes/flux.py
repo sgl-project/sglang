@@ -48,10 +48,17 @@ class FluxVAEConfig(VAEConfig):
 
     def post_init(self):
         # Calculate vae_scale_factor: prefer block_out_channels, fallback to dim_mult or scale_factor_spatial
-        if hasattr(self.arch_config, "block_out_channels") and self.arch_config.block_out_channels:
-            self.arch_config.vae_scale_factor = 2 ** (len(self.arch_config.block_out_channels) - 1)
+        if (
+            hasattr(self.arch_config, "block_out_channels")
+            and self.arch_config.block_out_channels
+        ):
+            self.arch_config.vae_scale_factor = 2 ** (
+                len(self.arch_config.block_out_channels) - 1
+            )
         elif self.arch_config.dim_mult:
-            self.arch_config.vae_scale_factor = 2 ** (len(self.arch_config.dim_mult) - 1)
+            self.arch_config.vae_scale_factor = 2 ** (
+                len(self.arch_config.dim_mult) - 1
+            )
         else:
             self.arch_config.vae_scale_factor = self.arch_config.scale_factor_spatial
 

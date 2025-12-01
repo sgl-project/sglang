@@ -454,7 +454,7 @@ class PipelineConfig:
         # 2.5. Auto-detect fine-tuned VAE for Flux2 models
         pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
-        
+
         # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
         if (
             pipeline_config_cls.__name__ == "Flux2PipelineConfig"
@@ -464,6 +464,7 @@ class PipelineConfig:
             from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
                 Flux2FinetunedPipelineConfig,
             )
+
             pipeline_config_cls = Flux2FinetunedPipelineConfig
 
         pipeline_config = pipeline_config_cls()

@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
 """The arguments of sglang-diffusion Inference."""
+
 import argparse
 import dataclasses
 import inspect
@@ -834,17 +835,15 @@ class ServerArgs:
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
             logger.info(
-                f"Ulysses degree not set, " f"using default value {self.ulysses_degree}"
+                f"Ulysses degree not set, using default value {self.ulysses_degree}"
             )
 
         if self.ring_degree is None:
             self.ring_degree = 1
-            logger.info(
-                f"Ring degree not set, " f"using default value {self.ring_degree}"
-            )
+            logger.info(f"Ring degree not set, using default value {self.ring_degree}")
 
         if self.ring_degree > 1:
-            if self.attention_backend != None and self.attention_backend != "fa":
+            if self.attention_backend is not None and self.attention_backend != "fa":
                 raise ValueError(
                     "Ring Attention is only supported for flash attention backend for now"
                 )

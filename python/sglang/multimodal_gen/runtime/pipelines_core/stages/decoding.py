@@ -125,7 +125,11 @@ class DecodingStage(PipelineStage):
                 latents = latents.to(vae_dtype)
             decode_output = self.vae.decode(latents)
             # Handle DecoderOutput object (has .sample attribute) or direct tensor
-            image = decode_output.sample if hasattr(decode_output, 'sample') else decode_output
+            image = (
+                decode_output.sample
+                if hasattr(decode_output, "sample")
+                else decode_output
+            )
 
         # De-normalize image to [0, 1] range
         image = (image / 2 + 0.5).clamp(0, 1)

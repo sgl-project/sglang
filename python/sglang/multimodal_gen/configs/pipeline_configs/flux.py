@@ -210,10 +210,10 @@ def _prepare_latent_ids(
     t = torch.arange(1)  # [0] - time dimension
     h = torch.arange(height)
     w = torch.arange(width)
-    l = torch.arange(1)  # [0] - layer dimension
+    layer = torch.arange(1)  # [0] - layer dimension
 
     # Create position IDs: (H*W, 4)
-    latent_ids = torch.cartesian_prod(t, h, w, l)
+    latent_ids = torch.cartesian_prod(t, h, w, layer)
 
     # Expand to batch: (B, H*W, 4)
     latent_ids = latent_ids.unsqueeze(0).expand(batch_size, -1, -1)
@@ -284,9 +284,9 @@ def _prepare_text_ids(
         t = torch.arange(1) if t_coord is None else t_coord[i]
         h = torch.arange(1)
         w = torch.arange(1)
-        l = torch.arange(L)
+        layer = torch.arange(L)
 
-        coords = torch.cartesian_prod(t, h, w, l)
+        coords = torch.cartesian_prod(t, h, w, layer)
         out_ids.append(coords)
 
     return torch.stack(out_ids)
@@ -465,7 +465,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
-
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
@@ -517,14 +516,14 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     def preprocess_decoding(self, latents, server_args=None):
         """Preprocess latents before decoding.
-        
+
         Dynamically adapts based on VAE type:
         - Standard Flux2 VAE (has bn): needs unpatchify (128 channels -> 32 channels)
         - Distilled VAE (no bn): keeps patchified latents (128 channels)
         """
         # Check if VAE has bn attribute to determine if it's a standard or distilled VAE
-        vae = getattr(server_args, '_current_vae', None) if server_args else None
-        if vae is not None and hasattr(vae, 'bn') and vae.bn is not None:
+        vae = getattr(server_args, "_current_vae", None) if server_args else None
+        if vae is not None and hasattr(vae, "bn") and vae.bn is not None:
             # Standard Flux2 VAE: needs unpatchify
             return _unpatchify_latents(latents)
         else:
@@ -533,18 +532,20 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         """Get scale and shift for decoding.
-        
+
         Dynamically adapts based on VAE type:
         - Standard Flux2 VAE (has bn): uses BatchNorm statistics
         - Distilled VAE (no bn): uses scaling_factor from config
         """
         vae_arch_config = self.vae_config.arch_config
-        
+
         # Check if VAE has bn attribute (standard Flux2 VAE)
-        if hasattr(vae, 'bn') and vae.bn is not None:
+        if hasattr(vae, "bn") and vae.bn is not None:
             # Standard Flux2 VAE: use BatchNorm statistics
             latents_bn_mean = (
-                vae.bn.running_mean.view(1, -1, 1, 1).to(device=device).to(device, dtype)
+                vae.bn.running_mean.view(1, -1, 1, 1)
+                .to(device=device)
+                .to(device, dtype)
             )
             latents_bn_std = torch.sqrt(
                 vae.bn.running_var.view(1, -1, 1, 1) + vae_arch_config.batch_norm_eps
@@ -557,8 +558,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
                 if hasattr(vae, "config")
                 else getattr(vae, "scaling_factor", None)
             ) or getattr(vae_arch_config, "scaling_factor", 0.13025)
-            
-            scale = torch.tensor(scaling_factor, device=device, dtype=dtype).view(1, 1, 1, 1)
+
+            scale = torch.tensor(scaling_factor, device=device, dtype=dtype).view(
+                1, 1, 1, 1
+            )
             return 1 / scale, None
 
     def post_denoising_loop(self, latents, batch):
