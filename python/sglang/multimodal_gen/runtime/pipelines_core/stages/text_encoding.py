@@ -254,16 +254,6 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
-            is_stable_diffusion3 = isinstance(
-                server_args.pipeline_config, StableDiffusion3PipelineConfig
-            )
-            if is_stable_diffusion3:
-                if i in (0, 1):
-                    tok_kwargs["max_length"] = 77
-                    tok_kwargs["padding"] = "max_length"
-                elif i == 2:
-                    tok_kwargs["max_length"] = 256
-
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
             ).to(target_device)
@@ -273,7 +263,9 @@ class TextEncodingStage(PipelineStage):
                 server_args.pipeline_config, FluxPipelineConfig
             ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
             is_flux_t5 = is_flux_v1 and i == 1
-
+            is_stable_diffusion3 = isinstance(
+                server_args.pipeline_config, StableDiffusion3PipelineConfig
+            )
             if is_flux_t5:
                 attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
             else:

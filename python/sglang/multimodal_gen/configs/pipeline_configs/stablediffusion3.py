@@ -10,8 +10,8 @@ from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAECo
 from sglang.multimodal_gen.configs.models.dits import StableDiffusion3TransformerConfig
 from sglang.multimodal_gen.configs.models.encoders import (
     BaseEncoderOutput,
-    CLIPTextConfig,
-    T5Config,
+    CLIPTextConfigForSD3,
+    T5ConfigForSD3,
 )
 from sglang.multimodal_gen.configs.models.vaes.stablediffusion3 import (
     StableDiffusion3VAEConfig,
@@ -47,7 +47,11 @@ class StableDiffusion3PipelineConfig(PipelineConfig):
     vae_config: VAEConfig = field(default_factory=StableDiffusion3VAEConfig)
     # Text encoders
     text_encoder_configs: Tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (CLIPTextConfig(), CLIPTextConfig(), T5Config())
+        default_factory=lambda: (
+            CLIPTextConfigForSD3(),
+            CLIPTextConfigForSD3(),
+            T5ConfigForSD3(),
+        )
     )
 
     # Precision settings
