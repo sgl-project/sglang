@@ -17,7 +17,6 @@ from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_free_port, get_local_ip_auto, get_zmq_socket
-from sglang.srt.utils.common import get_multi_free_port
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -529,7 +528,9 @@ class MMReceiver:
                 (idx + len(image_urls)) // len(self.encode_urls) for idx in encode_idx
             ]
             obj.embedding_ports = (
-                get_multi_free_port(self.world_size) if self.nnodes == 1 else None
+                [get_free_port() for _ in range(self.world_size)]
+                if self.nnodes == 1
+                else None
             )
             encode_thread = threading.Thread(
                 target=self._run_encode_in_thread,

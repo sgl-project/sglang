@@ -713,39 +713,6 @@ def is_port_available(port):
             return False
 
 
-def get_multi_free_port(count, min_port=10000, max_port=65535, max_attempts=1000):
-    ports = set()
-    attempts = 0
-
-    while len(ports) < count and attempts < max_attempts:
-        attempts += 1
-
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(("", 0))
-                port = s.getsockname()[1]
-
-                if min_port <= port <= max_port:
-                    ports.add(port)
-        except OSError:
-            try:
-                with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
-                    s.bind(("", 0))
-                    port = s.getsockname()[1]
-
-                    if min_port <= port <= max_port:
-                        ports.add(port)
-            except OSError:
-                continue
-
-    if len(ports) < count:
-        raise RuntimeError(
-            f"Could not find {count} free ports after {max_attempts} attempts"
-        )
-
-    return list(ports)
-
-
 def get_free_port():
     # try ipv4
     try:
