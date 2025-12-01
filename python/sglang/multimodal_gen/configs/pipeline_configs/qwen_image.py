@@ -278,28 +278,19 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
 
     def postprocess_image_latent(self, latent_condition, batch):
         batch_size = batch.batch_size
-        if (
-            batch_size > latent_condition.shape[0]
-            and batch_size % latent_condition.shape[0] == 0
-        ):
-            # expand init_latents for batch_size
-            additional_image_per_prompt = batch_size // latent_condition.shape[0]
-            image_latents = torch.cat(
-                [latent_condition] * additional_image_per_prompt, dim=0
-            )
-        elif (
-            batch_size > latent_condition.shape[0]
-            and batch_size % latent_condition.shape[0] != 0
-        ):
-            raise ValueError(
-                f"Cannot duplicate `image` of batch size {latent_condition.shape[0]} to {batch_size} text prompts."
-            )
+        if batch_size > latent_condition.shape[0]:
+            if batch_size % latent_condition.shape[0] == 0:
+                # expand init_latents for batch_size
+                additional_image_per_prompt = batch_size // latent_condition.shape[0]
+                image_latents = latent_condition.repeat(additional_image_per_prompt, 1, 1, 1)
+            else:
+                raise ValueError(
+                    f"Cannot duplicate `image` of batch size {latent_condition.shape[0]} to {batch_size} text prompts."
+                )
         else:
-            image_latents = torch.cat([latent_condition], dim=0)
+            image_latents = latent_condition
         image_latent_height, image_latent_width = image_latents.shape[3:]
-        num_channels_latents = (
-            self.dit_config.arch_config.in_channels // 4
-        )
+        num_channels_latents = self.dit_config.arch_config.in_channels // 4
         image_latents = _pack_latents(
             image_latents,
             batch_size,
