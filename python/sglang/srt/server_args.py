@@ -1879,6 +1879,11 @@ class ServerArgs:
         ):
             raise ValueError("zmq_to_scheduler not support pp_size > 1")
 
+        if self.language_only and len(self.encode_urls) == 0:
+            raise ValueError(
+                "--language-only need to specify at least one --encode-urls"
+            )
+
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
             assert (

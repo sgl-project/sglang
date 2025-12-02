@@ -41,9 +41,9 @@ from sglang.srt.utils import get_local_ip_auto, get_zmq_socket, random_uuid
 
 logger = logging.getLogger(__name__)
 
+rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
 rid_to_receive_count: Dict[str, int] = dict()
-rid_to_ready_event: Dict[str, asyncio.Event] = dict()
 
 
 class TensorWrapper:
@@ -70,13 +70,13 @@ class TensorWrapper:
 
 
 def _convert(data):
-    if type(data) == torch.Tensor:
+    if isinstance(data, torch.Tensor):
         return data
-    elif type(data) == np.ndarray:
+    elif isinstance(data, np.ndarray):
         return torch.tensor(data)
-    elif type(data) == list and type(data[0]) == np.ndarray:
+    elif isinstance(data, list) and isinstance(data[0], np.ndarray):
         return torch.tensor(np.array(data))
-    elif type(data) == list and type(data[0]) in [int, float]:
+    elif isinstance(data, list) and isinstance(data[0], (int, float)):
         return torch.tensor(data)
     else:
         return data
@@ -316,8 +316,9 @@ class MMEncoder:
 
         try:
             while True:
-                current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
-                expected_count = rid_to_receive_count.get(req_id)
+                with rid_lock:
+                    current_targets = rid_to_receive_endpoint.get(req_id, set()).copy()
+                    expected_count = rid_to_receive_count.get(req_id)
 
                 new_targets = current_targets - sent_urls
 
@@ -368,8 +369,9 @@ class MMEncoder:
 
         finally:
             logger.info(f"Cleaning up resources for req_id {req_id}")
-            rid_to_receive_endpoint.pop(req_id, None)
-            rid_to_receive_count.pop(req_id, None)
+            with rid_lock:
+                rid_to_receive_endpoint.pop(req_id, None)
+                rid_to_receive_count.pop(req_id, None)
             self.embedding_to_send.pop(req_id, None)
 
     async def get_embedding_port(self, prefill_url):
@@ -506,9 +508,10 @@ async def handle_send_request(request: dict):
 @app.post("/scheduler_receive_url")
 async def handle_scheduler_receive_url_request(request: dict):
     rid = request["req_id"]
-    global rid_to_receive_endpoint
-    if rid not in rid_to_receive_endpoint:
-        rid_to_receive_endpoint[rid] = set()
-        rid_to_receive_count[rid] = request["receive_count"]
-    assert rid_to_receive_count[rid] == request["receive_count"]
-    rid_to_receive_endpoint[rid].add(request["receive_url"])
+    with rid_lock:
+        global rid_to_receive_endpoint
+        if rid not in rid_to_receive_endpoint:
+            rid_to_receive_endpoint[rid] = set()
+            rid_to_receive_count[rid] = request["receive_count"]
+        assert rid_to_receive_count[rid] == request["receive_count"]
+        rid_to_receive_endpoint[rid].add(request["receive_url"])
