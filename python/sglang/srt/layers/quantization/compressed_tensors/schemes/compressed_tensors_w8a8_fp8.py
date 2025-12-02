@@ -1,17 +1,17 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable, List, Optional
+from typing import Callable
 
 import torch
-from compressed_tensors.quantization import QuantizationStrategy, QuantizationArgs
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from torch.nn import Parameter
 
 from sglang.srt.layers.parameter import (
+    BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
-    BlockQuantScaleParameter,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
@@ -20,9 +20,9 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     apply_fp8_ptpc_linear,
+    dispatch_w8a8_block_fp8_linear,
     normalize_e4m3fn_to_e4m3fnuz,
     validate_fp8_block_shape,
-    dispatch_w8a8_block_fp8_linear,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip
@@ -48,6 +48,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         self.strategy = self.weight_quant.strategy
         self.is_static_input_scheme = is_static_input_scheme
         self.weight_block_size = self.weight_quant.block_structure
+        if self.weight_block_size is not None:
+            self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -187,22 +189,20 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
 
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
-            
-            if is_fp8_fnuz():
-                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                    weight=layer.weight, weight_scale=layer.weight_scale
-                )
+            weight = layer.weight
+            weight_scale_inv = layer.weight_scale_inv
 
-            input_scale = None
+            if is_fp8_fnuz():
+                weight, weight_scale_inv, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=weight, weight_scale=weight_scale_inv
+                )
+            layer.weight = Parameter(weight.data, requires_grad=False)
+            layer.weight_scale_inv = Parameter(
+                weight_scale_inv.data, requires_grad=False
+            )
 
         else:
             raise ValueError(f"Unknown quantization strategy {self.strategy}")
-
-        # required by torch.compile to be torch.nn.Parameter
-        layer.weight = Parameter(weight.data, requires_grad=False)
-        layer.weight_scale = Parameter(weight_scale.data, requires_grad=False)
-        if input_scale is not None:
-            layer.input_scale = Parameter(input_scale.data, requires_grad=False)
 
         # INPUT SCALE
         if self.is_static_input_scheme and hasattr(layer, "input_scale"):
@@ -217,11 +217,11 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.weight_block_size is not None:
-            return dispatch_w8a8_block_fp8_linear(
+            return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
                 block_size=self.weight_block_size,
-                weight_scale=layer.weight_scale,
+                weight_scale=layer.weight_scale_inv,
                 input_scale=layer.input_scale,
                 bias=bias,
             )

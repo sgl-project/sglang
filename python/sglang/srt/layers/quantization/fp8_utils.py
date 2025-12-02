@@ -523,7 +523,7 @@ def requant_weight_ue8m0(
     weight_scale_inv: torch.Tensor,
     weight_block_size: List[int],
 ):
-    assert weight_block_size == [128, 128]
+    assert tuple(weight_block_size) == (128, 128)
 
     *_, n, k = weight.shape
 
