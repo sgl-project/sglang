@@ -330,7 +330,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        block_m, threshold = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,
@@ -340,6 +340,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
         meta_overlap_args = running_state.get("meta_overlap_args", None)
         if meta_overlap_args is not None:
+            block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
 
