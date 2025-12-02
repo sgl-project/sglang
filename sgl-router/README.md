@@ -93,20 +93,28 @@ pip install --force-reinstall dist/*.whl
 After installation, verify the installation and check version information:
 
 ```bash
-# Short version info (Rust binary)
-./target/release/sglang-router -v
+# Simple version (Rust binary)
+./target/release/sgl-model-gateway --version
+# or use aliases
+./target/release/smg --version
+./target/release/amg --version
 
-# Full version info with build details (Rust binary)
-./target/release/sglang-router --version
+# Full version info with build details
+./target/release/sgl-model-gateway --version-verbose
+
+# Python CLI
+amg --version
+amg --version-verbose
+python3 -m sglang_router --version
 ```
 
-The `-v` flag displays a concise version string, while `--version` (or `-V`) shows comprehensive build information including Git commit, build time, compiler versions, and platform details.
+The `--version` (or `-V`) flag displays the version string. Use `--version-verbose` for comprehensive build information including Git commit, build time, compiler versions, and platform details.
 
 ## Quick Start
 ### Regular HTTP Routing
 - **Rust binary**
   ```bash
-  ./target/release/sglang-router \
+  ./target/release/sgl-model-gateway \
     --worker-urls http://worker1:8000 http://worker2:8000 \
     --policy cache_aware
   ```
@@ -121,7 +129,7 @@ The `-v` flag displays a concise version string, while `--version` (or `-V`) sho
 ### Prefill/Decode Disaggregation (PD)
 - **Rust binary**
   ```bash
-  ./target/release/sglang-router \
+  ./target/release/sgl-model-gateway \
     --pd-disaggregation \
     --prefill http://prefill1:30001 9001 \
     --prefill http://prefill2:30002 \
@@ -146,7 +154,7 @@ Prefill entries accept an optional bootstrap port. PD mode merges prefill metada
 ### Multi-Model Inference Gateway
 Enable IGW mode to route multiple models through a single router while applying per-model policies:
 ```bash
-./target/release/sglang-router \
+./target/release/sgl-model-gateway \
   --enable-igw \
   --policy cache_aware \
   --max-concurrent-requests 512
@@ -194,7 +202,7 @@ Add more workers with the same API; include optional `labels` (for per-model pol
 ### gRPC Routing
 - **Rust binary**
   ```bash
-  ./target/release/sglang-router \
+  ./target/release/sgl-model-gateway \
     --worker-urls grpc://worker-grpc-0:31001 grpc://worker-grpc-1:31002 \
     --tokenizer-path /path/to/tokenizer.json \
     --reasoning-parser deepseek-r1 \
@@ -229,7 +237,7 @@ python3 -m sglang_router.launch_router \
 **Notes**
 - OpenAI backend mode acts as a proxy to a single remote endpoint; load balancing is not applied.
 - Provide exactly one `--worker-urls` entry per router instance.
-- The Rust binary supports the same flags (`./target/release/sglang-router --backend openai ...`).
+- The Rust binary supports the same flags (`./target/release/sgl-model-gateway --backend openai ...`).
 
 ### MCP Integration
 The SGL Model Gateway provides native Model Context Protocol (MCP) client integration, enabling tool calling across STDIO, SSE, and Streamable transports. MCP servers are configured via a YAML configuration file and registered at startup through the workflow engine.
@@ -237,7 +245,7 @@ The SGL Model Gateway provides native Model Context Protocol (MCP) client integr
 #### Basic Usage
 ```bash
 # Rust binary
-./target/release/sglang-router \
+./target/release/sgl-model-gateway \
   --mcp-config-path /path/to/mcp-config.yaml \
   --worker-urls http://worker1:8000
 
@@ -407,7 +415,7 @@ All administrative routes inherit router API-key protection when `--api-key` is 
 ### Service Discovery
 Enable Kubernetes discovery to reconcile workers automatically:
 ```bash
-./target/release/sglang-router \
+./target/release/sgl-model-gateway \
   --service-discovery \
   --selector app=sglang-worker role=inference \
   --service-discovery-namespace sglang-system \

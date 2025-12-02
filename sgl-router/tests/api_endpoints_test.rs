@@ -10,7 +10,7 @@ use axum::{
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::{
+use sgl_model_gateway::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
     core::Job,
@@ -1028,7 +1028,7 @@ mod responses_endpoint_tests {
         let app = ctx.create_app().await;
 
         // Directly store a response in the storage to test the retrieval endpoint
-        use sglang_router_rs::data_connector::{ResponseId, StoredResponse};
+        use sgl_model_gateway::data_connector::{ResponseId, StoredResponse};
         let mut stored_response = StoredResponse::new(None);
         stored_response.id = ResponseId::from("resp_test_input_items");
         stored_response.input = json!([

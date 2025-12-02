@@ -397,10 +397,10 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Hybrid memory pool
-        self.is_hybrid = self.tp_worker.is_hybrid
+        self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
         self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
 
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
@@ -732,7 +732,7 @@ class Scheduler(
             server_args.chunked_prefill_size is not None
             and server_args.disable_radix_cache
         ):
-            if not self.is_hybrid:
+            if not self.is_hybrid_swa:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
                 self.tree_cache = ChunkCache(params)
@@ -756,7 +756,7 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-            elif self.is_hybrid:
+            elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
                 self.tree_cache = SWARadixCache(
