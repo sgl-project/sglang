@@ -62,7 +62,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         num_local_heads,
         qk_nope_head_dim,
         qk_rope_head_dim,
-        quant_config: Optional[QuantizationConfig] = None,
+        quant_config: Optional["QuantizationConfig"] = None,
     ):
         super().__init__()
         self.qkv_a_proj = fused_qkv_a_proj_with_mqa
