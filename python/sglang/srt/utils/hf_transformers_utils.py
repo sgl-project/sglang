@@ -60,7 +60,12 @@ from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_remote_url,
+    logger,
+    lru_cache_frozenset,
+)
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -194,6 +199,17 @@ def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     )
 
 
+def _resolve_config_path(model: str):
+    use_modelscope = get_bool_env_var("SGLANG_USE_MODELSCOPE")
+    if use_modelscope and (model is not None and model.count("/") == 1):
+        from modelscope.hub.file_download import model_file_download
+
+        print(f"hello from hf_transformers_utils:200 {model}")
+        return model_file_download(model_id=model, file_path="config.json")
+    else:
+        return model  # HuggingFace will handle the path/id
+
+
 @lru_cache_frozenset(maxsize=32)
 def get_config(
     model: str,
@@ -216,8 +232,12 @@ def get_config(
         model = client.get_local_dir()
 
     try:
+        model_name_or_config_path = _resolve_config_path(model)
         config = AutoConfig.from_pretrained(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            model_name_or_config_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
         )
 
     except ValueError as e:
