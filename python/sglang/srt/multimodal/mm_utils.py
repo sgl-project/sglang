@@ -467,6 +467,19 @@ def run_dp_sharded_mrope_vision_model(
     # GPU_1 tp_rank_local = 1
     tp_rank_local = get_tensor_model_parallel_rank()
 
+    # Fast path: if only one image, process directly without DP sharding
+    if len(grid_thw_list) == 1:
+        if rope_type == "rope_2d":
+            image_embeds = vision_model(pixel_values, torch.tensor(grid_thw_list))
+            if isinstance(image_embeds, list):
+                image_embeds = torch.cat(image_embeds, dim=0)
+        else:
+            init_all_vision_forward_metadata(
+                vision_model, torch.tensor(grid_thw_list), pixel_values
+            )
+            image_embeds = vision_model(pixel_values, torch.tensor(grid_thw_list))
+        return (image_embeds,)
+
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
     # patches_per_image = [0, 1000, 1100, 1300, 1350]
