@@ -26,7 +26,7 @@
     a. For each request, find the worker with the highest prefix match
     b. If match rate > cache_threshold:
     Route to the worker with highest match (likely has relevant data cached)
-    c. If match rate <= cache_threshold:
+    c. If match rate ≤ cache_threshold:
     Route to the worker with smallest tree size (most available cache capacity)
     d. Background maintenance:
     Periodically evict least recently used leaf nodes to prevent memory overflow
@@ -618,7 +618,7 @@ mod tests {
         println!("Overloaded Load: {}", workers[0].load());
         println!("Idle Load:       {}", workers[1].load());
 
-        // 6. PROOF: The corrected implementation should pick the IDLE worker
+        // 6. The corrected implementation should pick the IDLE worker
         assert_eq!(selected_url, "http://idle:8000",
             "SUCCESS: Router correctly prioritized the IDLE worker despite its larger cache usage.");
     }
@@ -635,7 +635,7 @@ mod tests {
         };
         let policy = CacheAwarePolicy::with_config(config);
 
-        // --- CLUSTER SETUP (3 Nodes) ---
+
         // Worker 0: The "Trap" - High Load, Small Cache (e.g., stuck decoding)
         let w0 = BasicWorkerBuilder::new("http://w0:8000").worker_type(WorkerType::Regular).build();
         // Worker 1: Normal - Medium Load, Medium Cache
@@ -680,8 +680,7 @@ mod tests {
         println!("Final Loads   -> W0: {}, W1: {}, W2: {}", workers[0].load(), workers[1].load(), workers[2].load());
         println!("Requests Sent -> W0: {}, W1: {}, W2: {}", distribution[0], distribution[1], distribution[2]);
 
-        // Ideally, W2 (Idle) should have received the most new requests.
-        // With the FIX, W2 should get 100 requests. W0 should stay at 20.
+
 
         let w0_traffic = distribution[0];
         let w2_traffic = distribution[2];
