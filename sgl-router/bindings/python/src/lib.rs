@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use sglang_router::*;
+use sgl_model_gateway::*;
 use std::collections::HashMap;
 
 // Define the enums with PyO3 bindings
