@@ -19,7 +19,7 @@ class TestMistral7B(GSM8KAscendMixin, CustomTestCase):
         "ascend",
         "--disable-cuda-graph",
         "--dtype",
-        "bfloat16"
+        "bfloat16",
     ]
 
 
