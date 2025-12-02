@@ -365,6 +365,12 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
+        # Init overlap
+        self.init_overlap()
+
+        # Init mlp sync flag
+        self.require_mlp_sync = require_mlp_sync(server_args)
+
         # Init request dispatcher
         self.init_request_dispatcher()
 
@@ -422,6 +428,17 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+    def init_truncation_align_size_for_dcp(self):
+        if get_dcp_world_size() > 1:
+            if self.truncation_align_size is None:
+                self.truncation_align_size = get_dcp_world_size()
+            else:
+                import math
+
+                self.truncation_align_size = (
+                    self.truncation_align_size * get_dcp_world_size()
+                ) // (math.gcd(self.truncation_align_size, get_dcp_world_size()))
 
     def init_tokenizer(self):
         server_args = self.server_args

@@ -399,6 +399,13 @@ class ForwardBatch:
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
+    
+    # For decode context parallel
+    dcp_kv_indptr: Optional[torch.Tensor] = None
+    dcp_local_prefix_kv_indices: Optional[torch.Tensor] = None
+    dcp_kv_buffer: Optional[torch.Tensor] = None
+    dcp_kv_indices: Optional[torch.Tensor] = None
+    dcp_extend_prefix_lens_sum: Optional[int] = None
 
     @classmethod
     def init_new(

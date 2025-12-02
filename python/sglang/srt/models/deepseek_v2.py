@@ -1836,18 +1836,44 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # TODO(augusto.yjh) 这里要all_gather q_pe 和 q_node_out,以 tp8为例， [1, 8, 64] [1, 8, 512] 经过all gather后为 [1, 64, 64] [1, 64, 512], k_pe 为 [1, 1, 64], k_nope 为 [1, 1, 512], 从 local heads到all heads
         if get_dcp_world_size() > 1:
-            q_pe = q_pe.contiguous()
-            q_nope_out = q_nope_out.contiguous()
-            # gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
-            # gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
-            # q_pe = gathered_q_pe
-            # q_nope_out = gathered_q_nope_out
-            combined = torch.cat([q_pe, q_nope_out], dim=-1)
-            gathered = get_dcp_group().all_gather(combined, dim=-2)
-            d_pe = q_pe.size(-1)
-            d_nope = q_nope_out.size(-1)
-            q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+            if forward_batch.forward_mode.is_decode():
+                # if forward_batch.forward_mode is decode, gather q
+                q_pe = q_pe.contiguous()
+                q_nope_out = q_nope_out.contiguous()
+                # gathered_q_pe = get_dcp_group().all_gather(q_pe, dim=-2)
+                # gathered_q_nope_out = get_dcp_group().all_gather(q_nope_out, dim=-2)
+                # q_pe = gathered_q_pe
+                # q_nope_out = gathered_q_nope_out
+                combined = torch.cat([q_pe, q_nope_out], dim=-1)
+                gathered = get_dcp_group().all_gather(combined, dim=-2)
+                d_pe = q_pe.size(-1)
+                d_nope = q_nope_out.size(-1)
+                q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+            elif forward_batch.forward_mode.is_extend():
+                # for extend, gather kv
+                cache_k_nope, cache_k_rope = (
+                    forward_batch.token_to_kv_pool.get_mla_kv_buffer(
+                        self.attn_mqa, forward_batch.dcp_local_prefix_kv_indices
+                    )
+                )
+                # all gather kv cache into forward_batch.dcp_kv_buffer
+                local_cache_kv = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+                get_dcp_group().all_gather_into_tensor(
+                    forward_batch.dcp_kv_buffer[
+                        : forward_batch.dcp_extend_prefix_lens_sum
+                    ],
+                    local_cache_kv,
+                )
 
+                # copy local kv cache into forward_batch.dcp_kv_buffer
+                forward_batch.dcp_kv_buffer[
+                    forward_batch.dcp_extend_prefix_lens_sum :, ..., : self.kv_lora_rank
+                ] = k_nope
+                forward_batch.dcp_kv_buffer[
+                    forward_batch.dcp_extend_prefix_lens_sum :, ..., self.kv_lora_rank :
+                ] = k_pe
+            else:
+                logger.warn(f"not supported forward_mode {forward_batch.forward_mode}")
         return (
             q_pe,
             k_pe,
