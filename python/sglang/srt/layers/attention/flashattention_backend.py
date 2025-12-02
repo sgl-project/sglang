@@ -352,7 +352,7 @@ class FlashAttentionBackend(AttentionBackend):
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
         self.sliding_window_size = model_runner.sliding_window_size
-        self.is_hybrid_swa = (
+        self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
@@ -579,7 +579,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand = metadata_expand
 
-                if self.is_hybrid_swa:
+                if self.has_swa:
                     self._init_sliding_window_attn_spec_metadata(
                         metadata, metadata_expand
                     )
@@ -1501,7 +1501,7 @@ class FlashAttentionBackend(AttentionBackend):
                 ),
             }
 
-            if self.is_hybrid_swa:
+            if self.has_swa:
                 self.target_verify_metadata_topk_swa = {
                     "cache_seqlens": torch.zeros(
                         max_bs * self.speculative_num_draft_tokens,
@@ -1715,7 +1715,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.target_verify_metadata_topk_normal[bs] = metadata
                 self.target_verify_metadata_topk_expand[bs] = metadata_expand
 
-                if self.is_hybrid_swa:
+                if self.has_swa:
                     metadata_swa = FlashAttentionMetadata()
                     metadata_swa.cache_seqlens_int32 = (
                         self.target_verify_metadata_topk_swa["cache_seqlens"][
@@ -2008,7 +2008,7 @@ class FlashAttentionBackend(AttentionBackend):
                         dtype=torch.int32,
                     )
                 )
-                if self.is_hybrid_swa:
+                if self.has_swa:
                     metadata_swa = self.target_verify_metadata_topk_swa[bs]
                     self._init_sliding_window_attn_spec_metadata(
                         metadata, metadata_expand, metadata_swa

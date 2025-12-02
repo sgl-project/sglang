@@ -86,7 +86,7 @@ class XPUAttentionBackend(AttentionBackend):
         # For each layer, the sliding_window_size can be different. This is only used for preparing SWA metadata.
         # We use `layer.sliding_window_size` to decide whether to use SWA for each layer.
         self.sliding_window_size = model_runner.sliding_window_size
-        self.is_hybrid_swa = (
+        self.has_swa = (
             self.sliding_window_size is not None and self.sliding_window_size > -1
         )
 
@@ -310,7 +310,7 @@ class XPUAttentionBackend(AttentionBackend):
                 )
                 self.forward_metadata_spec_decode_expand = metadata_expand
 
-                if self.is_hybrid_swa:
+                if self.has_swa:
                     self._init_sliding_window_attn_spec_metadata(
                         metadata, metadata_expand
                     )
