@@ -117,6 +117,11 @@ class MhmtpWorker(TpModelWorker):
                 moe_ep_rank=None,
             )
 
+        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+
+        # Share the embedding and lm_head
+        self.draft_model_runner.model.set_embed_and_head(embed, head)
+
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
         )
@@ -332,21 +337,9 @@ class MhmtpWorker(TpModelWorker):
         batch.forward_mode = ForwardMode.DECODE
         batch.spec_info = res.draft_input
 
-        if (
-            hasattr(res.draft_input, "req_pool_indices_for_draft_extend")
-            and res.draft_input.req_pool_indices_for_draft_extend is not None
-        ):
-            batch.req_pool_indices = res.draft_input.req_pool_indices_for_draft_extend
-
-        if batch.spec_info.verified_id is None:
-            return logits_output, res, model_worker_batch, can_run_cuda_graph
-
         accept_length_cpu = res.draft_input.accept_length_cpu
 
         if not accept_length_cpu or len(accept_length_cpu) == 0:
-            batch.forward_mode = ForwardMode.DECODE
-            batch.spec_info = res.draft_input
-
             if (
                 hasattr(res.draft_input, "req_pool_indices_for_draft_extend")
                 and res.draft_input.req_pool_indices_for_draft_extend is not None
@@ -356,6 +349,15 @@ class MhmtpWorker(TpModelWorker):
                 )
 
             return logits_output, res, model_worker_batch, can_run_cuda_graph
+
+        batch.forward_mode = ForwardMode.DECODE
+        batch.spec_info = res.draft_input
+
+        if (
+            hasattr(res.draft_input, "req_pool_indices_for_draft_extend")
+            and res.draft_input.req_pool_indices_for_draft_extend is not None
+        ):
+            batch.req_pool_indices = res.draft_input.req_pool_indices_for_draft_extend
 
         # Similar to the truncation in “forward_draft_extend”, after verification,
         # we also need to replenish the states to facilitate subsequent
