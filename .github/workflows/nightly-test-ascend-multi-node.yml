@@ -84,6 +84,7 @@ jobs:
           echo "{ \"image\": $image,                                        \
                   \"name_space\": \"$NAMESPACE\",                           \
                   \"kube_job_name\": \"$KUBE_JOB_NAME\",                    \
+                  \"kube_config\": \"$KUBECONFIG\",                         \
                   \"kube_config_map\": \"$KUBE_CONFIG_MAP\",                \
                   \"prefill_size\": $prefill_size,                          \
                   \"decode_size\": $decode_size,                            \

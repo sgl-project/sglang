@@ -118,6 +118,12 @@ spec:
                 fieldPath: metadata.annotations['huawei.com/ascend-1980']
           - name: SGLANG_SOURCE_PATH
             value: "{{ sglang_source_path }}"
+          - name: KUBECONFIG
+            value: "{{ kube_config }}"
+          - name: NAMESPACE
+            value: "{{ name_space }}"
+          - name: KUBE_CONFIG_MAP
+            value: "{{ kube_config_map }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -187,6 +193,12 @@ spec:
                 fieldPath: metadata.annotations['huawei.com/ascend-1980']
           - name: SGLANG_SOURCE_PATH
             value: "{{ sglang_source_path }}"
+          - name: KUBECONFIG
+            value: "{{ kube_config }}"
+          - name: NAMESPACE
+            value: "{{ name_space }}"
+          - name: KUBE_CONFIG_MAP
+            value: "{{ kube_config_map }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -256,6 +268,12 @@ spec:
                 fieldPath: metadata.annotations['huawei.com/ascend-1980']
           - name: SGLANG_SOURCE_PATH
             value: "{{ sglang_source_path }}"
+          - name: KUBECONFIG
+            value: "{{ kube_config }}"
+          - name: NAMESPACE
+            value: "{{ name_space }}"
+          - name: KUBE_CONFIG_MAP
+            value: "{{ kube_config_map }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
