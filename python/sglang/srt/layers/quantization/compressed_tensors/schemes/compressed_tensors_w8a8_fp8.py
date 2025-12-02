@@ -103,11 +103,15 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 output_dim=0,
                 weight_loader=weight_loader,
             )
+            weight_scale[:] = torch.finfo(torch.float32).min
+            layer.register_parameter("weight_scale", weight_scale)
         elif self.strategy == QuantizationStrategy.TENSOR:
             weight_scale = PerTensorScaleParameter(
                 data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
                 weight_loader=weight_loader,
-            )   
+            )
+            weight_scale[:] = torch.finfo(torch.float32).min
+            layer.register_parameter("weight_scale", weight_scale)
         elif self.strategy == QuantizationStrategy.BLOCK:
             assert layer.weight_block_size is not None
             block_n, block_k = layer.weight_block_size[0], layer.weight_block_size[1]
@@ -122,12 +126,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 output_dim=0,
                 weight_loader=weight_loader,
             )
-            # The weight_scale_inv name is intentional for deepseekv3
+            weight_scale.format_ue8m0 = False
+            weight_scale[:] = torch.finfo(torch.float32).min
             layer.register_parameter("weight_scale_inv", weight_scale)
-
-        # min requirement for fp8 kernels
-        weight_scale[:] = torch.finfo(torch.float32).min
-        layer.register_parameter("weight_scale", weight_scale)
 
         # INPUT SCALE
         if self.is_static_input_scheme:
