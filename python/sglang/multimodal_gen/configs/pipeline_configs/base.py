@@ -440,34 +440,10 @@ class PipelineConfig:
             raise ValueError("model_path is required in kwargs")
 
         # 1. Get the pipeline config class from the registry
-        model_info = get_model_info(model_path)
-
-        # 2. Instantiate PipelineConfig
-        if model_info is None:
-            # The error is already logged in get_model_info.
-            # We raise an exception here to stop the execution.
-            raise ValueError(
-                f"Failed to get model info for '{model_path}'. "
-                "Please check the model path and ensure it is registered correctly."
-            )
-
-        # 2.5. Auto-detect fine-tuned VAE for Flux2 models
-        pipeline_config_cls = model_info.pipeline_config_cls
         vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+        model_info = get_model_info(model_path, vae_path=vae_path)
 
-        # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
-        if (
-            pipeline_config_cls.__name__ == "Flux2PipelineConfig"
-            and vae_path is not None
-            and "FLUX.2-Tiny-AutoEncoder" in vae_path
-        ):
-            from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
-                Flux2FinetunedPipelineConfig,
-            )
-
-            pipeline_config_cls = Flux2FinetunedPipelineConfig
-
-        pipeline_config = pipeline_config_cls()
+        pipeline_config = model_info.pipeline_config_cls()
 
         # 3. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
