@@ -21,7 +21,7 @@ class WorkerExitReporter:
         if router_url:
             worker_url = f"http://{server_args.host}:{server_args.port}"
             atexit.register(self._report_exit)
-            self.router_url = worker_url
+            self.router_url = router_url
             self.worker_url = worker_url
 
     def set_child_process_exit_signal_handler(self):
@@ -31,7 +31,10 @@ class WorkerExitReporter:
 
     def _signal_handler(self, signum, frame):
         pid = os.getpid()
-        logger.warning(f"Child process {pid} terminated with signum {signum}")
+        logger.warning(
+            f"Parent process {pid} received SIGCHLD ({signum}), indicating a child process terminated. "
+            f"Reporting worker exit and shutting down."
+        )
         self._report_exit()
         kill_process_tree(pid)
 
