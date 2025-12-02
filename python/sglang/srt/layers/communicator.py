@@ -68,7 +68,7 @@ if _use_aiter:
 if _use_aiter and _is_gfx95_supported:
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
 
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 8192
 
 
 class ScatterMode(Enum):
