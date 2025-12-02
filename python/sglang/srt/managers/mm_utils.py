@@ -288,9 +288,8 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
                     continue
 
                 for i, item in enumerate(items):
-                    offset = items[i].offsets
-                    assert len(offset) == 1
-                    input_ids_tensor[offset[0][0] : offset[0][1] + 1] = item.pad_value
+                    for offset in items[i].offsets:
+                        input_ids_tensor[offset[0] : offset[1] + 1] = item.pad_value
         else:
             # Create mapping of token_ids to pad_values for each modality
             token_to_pad_mapping = {}
