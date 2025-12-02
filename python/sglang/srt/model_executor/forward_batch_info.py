@@ -200,14 +200,14 @@ def compute_local_num_token_non_padded(
     num_tokens_per_dp: int,
 ) -> torch.Tensor:
     """Compute local non-padded token count for this attention-TP rank.
-    
+
     Converts a global count (across all TP ranks) to a local count for this rank.
     The "global" scope is within the current DP rank; DP is handled via num_tokens_per_dp.
     """
     attn_tp_rank = get_attention_tp_rank()
     attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
-    
+
     return torch.clamp(
         global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
         min=0,
@@ -514,7 +514,7 @@ class ForwardBatch:
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
-    
+
     def adjust_num_token_non_padded_for_attn_tp(self) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
         dp_rank = get_attention_dp_rank()

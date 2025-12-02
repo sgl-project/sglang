@@ -84,12 +84,11 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_tp_group,
-    get_attention_tp_rank,
     get_attention_tp_size,
     initialize_dp_attention,
     set_dp_buffer_len,
@@ -2600,7 +2599,7 @@ class ModelRunner:
             and not is_nsa_enable_prefill_cp()
         ):
             forward_batch.adjust_num_token_non_padded_for_attn_tp()
-            
+
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
