@@ -368,13 +368,13 @@ impl ResponseStreamEventEmitter {
     pub fn emit_mcp_list_tools_completed(
         &mut self,
         output_index: usize,
-        tools: &[mcp::Tool],
+        tools: &[(String, String, mcp::Tool)],
     ) -> serde_json::Value {
         let tool_items: Vec<_> = tools
             .iter()
-            .map(|t| {
+            .map(|(qualified_name, _server_name, t)| {
                 json!({
-                    "name": &t.name,
+                    "name": qualified_name,
                     "description": &t.description,
                     "input_schema": t.input_schema.clone()
                 })
