@@ -390,7 +390,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # Run forward
             logits_output, _ = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch, skip_attn_backend_init=False
             )
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
@@ -515,7 +515,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         else:
             draft_logits_output, _ = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch, skip_attn_backend_init=False
             )
 
         # Reorganize the spec info for the next batch
@@ -612,12 +612,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
-                model_worker_batch,
-                batch_output.logits_output.hidden_states,
-                batch_output.next_token_ids,
-            )
-            return batch_output
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                batch_output.next_draft_input = (
+                    self.draft_worker._draft_extend_for_prefill(
+                        model_worker_batch,
+                        batch_output.logits_output.hidden_states,
+                        batch_output.next_token_ids,
+                    )
+                )
+                return batch_output
         else:
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
@@ -627,11 +630,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                verify_input: EagleVerifyInput = self.draft_worker.draft(
+                    model_worker_batch
+                )
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                self.draft_worker._draft_extend_for_decode(
+                    model_worker_batch, batch_output
+                )
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
@@ -644,6 +653,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
+        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -688,7 +698,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             model_worker_batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=False,
         )
         logits_output = forward_batch_output.logits_output
 

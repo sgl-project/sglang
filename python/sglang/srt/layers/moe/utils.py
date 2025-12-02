@@ -289,6 +289,7 @@ def speculative_moe_a2a_backend_context():
     finally:
         MOE_A2A_BACKEND = original_backend
 
+
 # The type of method in top-K routing, for use in torch custom op
 # Please keep this in sync with the counterpart defined in https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/trtllm/fused_moe/runner.h
 class RoutingMethodType(IntEnum):

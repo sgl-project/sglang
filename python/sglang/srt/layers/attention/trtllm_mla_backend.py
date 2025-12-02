@@ -594,8 +594,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens = seq_lens + self.num_draft_tokens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
             elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
-                max_seq = forward_batch.seq_lens_cpu.max().item()
-
                 sum_seq_lens_q = sum(forward_batch.extend_seq_lens_cpu)
                 max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 cu_seqlens_q = torch.nn.functional.pad(
@@ -985,27 +983,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             else:
                 max_seq_len = metadata.max_seq_len_k + metadata.max_seq_len_q
-                # Check if we're in CUDA graph mode (buffers are pre-allocated)
-                if self.padded_q_buffer is not None:
-                    # Use pre-allocated buffer for CUDA graph compatibility
-                    padded_q = self.padded_q_buffer[
-                        :bs, : metadata.max_seq_len_q, :, :
-                    ].to(dtype=q.dtype)
-                else:
-                    # Dynamic allocation for non-CUDA graph mode
-                    padded_q = torch.zeros(
-                        bs,
-                        metadata.max_seq_len_q,
-                        layer.tp_q_head_num,
-                        layer.head_dim,
-                        dtype=q.dtype,
-                        device=q.device,
-                    )
-                q = self.pad_draft_extend_query(
-                    q, padded_q, metadata.seq_lens_q, metadata.cu_seqlens_q
-                )
-
-            # TODO may use `mla_rope_quantize_fp8` fusion
             q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
             assert kv_cache.dtype == self.data_type
 
@@ -1022,15 +999,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 bmm1_scale=bmm1_scale,
             )
 
-            # Reshape output directly without slicing
-
-            if forward_batch.forward_mode.is_draft_extend(include_v2=True):
-                raw_out = self.unpad_draft_extend_output(
-                    raw_out,
-                    metadata.cu_seqlens_q,
-                    metadata.seq_lens_q,
-                    metadata.sum_seq_lens_q,
-                )
             output = raw_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             return output
 

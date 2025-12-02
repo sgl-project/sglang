@@ -646,7 +646,7 @@ class EAGLEWorker(TpModelWorker):
 
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch, skip_attn_backend_init=False
             )
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
@@ -668,6 +668,7 @@ class EAGLEWorker(TpModelWorker):
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
+        spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.return_hidden_states = False
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -990,7 +991,7 @@ class EAGLEWorker(TpModelWorker):
                     forward_batch
                 )
             logits_output, _ = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
+                forward_batch, skip_attn_backend_init=False
             )
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
