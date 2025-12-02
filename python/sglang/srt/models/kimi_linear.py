@@ -32,6 +32,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -52,6 +53,7 @@ class KimiMoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         layer_idx: int = 0,
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -63,6 +65,7 @@ class KimiMoE(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
+        self.alt_stream = alt_stream
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -120,11 +123,34 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if self.num_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        shared_output = None
+        DUAL_STREAM_TOKEN_THRESHOLD = 1024
+
+        if (
+            self.alt_stream is not None
+            and self.num_shared_experts is not None
+            and hidden_states.shape[0] > 0
+            and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and get_is_capture_mode()
+        ):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+
+            shared_output = self.shared_experts(hidden_states.clone())
+
+            with torch.cuda.stream(self.alt_stream):
+                router_logits, _ = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
+                final_hidden_states = self.experts(hidden_states, topk_output)
+
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            if self.num_shared_experts is not None and hidden_states.shape[0] > 0:
+                shared_output = self.shared_experts(hidden_states)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -334,9 +360,11 @@ class KimiDecoderLayer(nn.Module):
         layer_idx: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.alt_stream = alt_stream
 
         self.is_moe = config.is_moe
 
@@ -375,6 +403,7 @@ class KimiDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 layer_idx=layer_idx,
                 prefix=f"{prefix}.mlp",
+                alt_stream=self.alt_stream,
             )
             self.mlp = self.block_sparse_moe
         else:
@@ -442,6 +471,8 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        self.alt_stream = torch.cuda.Stream()
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: KimiDecoderLayer(
@@ -449,6 +480,7 @@ class KimiLinearModel(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=prefix,
+                alt_stream=self.alt_stream,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

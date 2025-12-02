@@ -27,6 +27,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.base_layer: nn.Module = base_layer
         self.set_lora: bool = False
         self.lora_backend: BaseLoRABackend = lora_backend
+        if hasattr(self.base_layer, "weight"):
+            self.weight = self.base_layer.weight
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -198,6 +200,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             dtype=torch.int32,
             device=next(self.base_layer.parameters()).device,
         )
+        self.output_offset_cpu = self.output_offset.cpu()
 
         # For computing number of launched blocks
         self.max_qkv_out_dim = max(q_proj_shard_size, kv_proj_shard_size)
@@ -218,6 +221,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             qkv_lora_b=self.B_buffer_qkv,
             base_output=base_output,
             output_offset=self.output_offset,
+            output_offset_cpu=self.output_offset_cpu,
             max_qkv_out_dim=self.max_qkv_out_dim,
         )
         return lora_output

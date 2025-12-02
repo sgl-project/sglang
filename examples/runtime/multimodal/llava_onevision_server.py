@@ -98,7 +98,7 @@ def multi_image_stream_request_test(client):
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/test/lang/example_image.png"
+                            "url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
                         },
                         "modalities": "multi-images",
                     },

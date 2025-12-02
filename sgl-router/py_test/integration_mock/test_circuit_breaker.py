@@ -32,8 +32,21 @@ def test_circuit_breaker_opens_and_recovers(router_manager, mock_workers):
             timeout=3,
         )
 
-    saw_503 = False
+    # should see 500 when worker actually starts, before that should see 503
+    saw_500 = False
     for _ in range(8):
+        r = post_once()
+        if r.status_code == 500:
+            # Worker starts, continue to circuit breaker test
+            saw_500 = True
+            break
+        assert (
+            r.status_code == 503
+        ), "Should only see 503 when waiting for worker to start"
+    assert saw_500, "Worker didn't start after 8 requests"
+
+    saw_503 = False
+    for _ in range(4):
         r = post_once()
         if r.status_code == 503:
             saw_503 = True
@@ -73,6 +86,19 @@ def test_circuit_breaker_half_open_failure_reopens(router_manager, mock_workers)
             timeout=3,
         )
 
+    # should see 500 when worker actually starts, before that should see 503
+    saw_500 = False
+    for _ in range(8):
+        r = post_once()
+        if r.status_code == 500:
+            # Worker starts, continue to circuit breaker test
+            saw_500 = True
+            break
+        assert (
+            r.status_code == 503
+        ), "Should only see 503 when waiting for worker to start"
+    assert saw_500, "Worker didn't start after 8 requests"
+
     opened = False
     for _ in range(8):
         r = post_once()
@@ -99,17 +125,28 @@ def test_circuit_breaker_disable_flag(router_manager, mock_workers):
             "disable_retries": True,
         },
     )
-    r = requests.post(
-        f"{rh.url}/v1/completions",
-        json={
-            "model": "test-model",
-            "prompt": "x",
-            "max_tokens": 1,
-            "stream": False,
-        },
-        timeout=3,
-    )
-    assert r.status_code == 500
+
+    saw_500 = False
+    for _ in range(8):
+        r = requests.post(
+            f"{rh.url}/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "x",
+                "max_tokens": 1,
+                "stream": False,
+            },
+            timeout=3,
+        )
+        if r.status_code == 500:
+            # Worker starts, continue to check
+            saw_500 = True
+            break
+        assert (
+            r.status_code == 503
+        ), "Should only see 503 when waiting for worker to start"
+
+    assert saw_500
 
 
 @pytest.mark.integration

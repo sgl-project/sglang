@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -41,6 +40,12 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
 )
+from sglang.srt.model_loader.weight_validation import (
+    _cleanup_corrupted_files_selective,
+    _cleanup_corrupted_model_cache,
+    _validate_safetensors_file,
+    _validate_sharded_model,
+)
 from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
 from sglang.utils import is_in_ci
 
@@ -70,7 +75,8 @@ enable_hf_transfer()
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, disable=True)
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
 def get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
@@ -303,20 +309,28 @@ def find_local_hf_snapshot_dir(
         except Exception as e:
             logger.warning("Failed to find local snapshot in default HF cache: %s", e)
 
-    # if any incomplete file exists, force re-download by returning None
+    # Check for incomplete files and clean up if found
     if found_local_snapshot_dir:
         repo_folder = os.path.abspath(
             os.path.join(found_local_snapshot_dir, "..", "..")
         )
         blobs_dir = os.path.join(repo_folder, "blobs")
-        if os.path.isdir(blobs_dir) and glob.glob(
-            os.path.join(blobs_dir, "*.incomplete")
-        ):
-            logger.info(
-                "Found .incomplete files in %s for %s. "
-                "Considering local snapshot incomplete.",
-                blobs_dir,
+
+        # Check for incomplete download markers
+        incomplete_files = []
+        if os.path.isdir(blobs_dir):
+            incomplete_files = glob.glob(os.path.join(blobs_dir, "*.incomplete"))
+
+        if incomplete_files:
+            log_info_on_rank0(
+                logger,
+                f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
+                f"{model_name_or_path}. Will clean up and re-download.",
+            )
+            _cleanup_corrupted_model_cache(
                 model_name_or_path,
+                found_local_snapshot_dir,
+                f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
             )
             return None
 
@@ -343,58 +357,66 @@ def find_local_hf_snapshot_dir(
         )
         local_weight_files = []
 
-    # After we have a list of valid files, check for sharded model completeness.
-    # Check if all safetensors with name model-{i}-of-{n}.safetensors exists
-    checked_sharded_model = False
-    for f in local_weight_files:
-        if checked_sharded_model:
-            break
-        base_name = os.path.basename(f)
-        # Regex for files like model-00001-of-00009.safetensors
-        match = re.match(r"(.*?)-([0-9]+)-of-([0-9]+)\.(.*)", base_name)
-        if match:
-            prefix = match.group(1)
-            shard_id_str = match.group(2)
-            total_shards_str = match.group(3)
-            suffix = match.group(4)
-            total_shards = int(total_shards_str)
-
-            # Check if all shards are present
-            missing_shards = []
-            for i in range(1, total_shards + 1):
-                # Reconstruct shard name, preserving padding of original shard id
-                shard_name = (
-                    f"{prefix}-{i:0{len(shard_id_str)}d}-of-{total_shards_str}.{suffix}"
+    # Validate sharded models and check for corruption
+    if local_weight_files:
+        is_valid, error_msg, corrupted_files = _validate_sharded_model(
+            found_local_snapshot_dir, local_weight_files
+        )
+        if not is_valid:
+            if corrupted_files:
+                # Selective cleanup: only remove corrupted files
+                log_info_on_rank0(
+                    logger,
+                    f"Found {len(corrupted_files)} corrupted file(s) for "
+                    f"{model_name_or_path}: {error_msg}. "
+                    "Will selectively clean and re-download only these files.",
                 )
-                expected_path = os.path.join(found_local_snapshot_dir, shard_name)
-                # os.path.exists returns False for broken symlinks, which is desired.
-                if not os.path.exists(expected_path):
-                    missing_shards.append(shard_name)
-
-            if missing_shards:
-                logger.info(
-                    "Found incomplete sharded model %s. Missing shards: %s. "
-                    "Will attempt download.",
-                    model_name_or_path,
-                    missing_shards,
+                _cleanup_corrupted_files_selective(model_name_or_path, corrupted_files)
+                return None
+            else:
+                # Cannot selectively clean (e.g., missing shards) - remove entire cache
+                log_info_on_rank0(
+                    logger,
+                    f"Validation failed for {model_name_or_path}: {error_msg}. "
+                    "Will remove entire cache and re-download.",
+                )
+                _cleanup_corrupted_model_cache(
+                    model_name_or_path, found_local_snapshot_dir, error_msg
                 )
                 return None
 
-            # If we found and verified one set of shards, we are done.
-            checked_sharded_model = True
+        # Also validate single (non-sharded) safetensors files
+        for f in local_weight_files:
+            base_name = os.path.basename(f)
+            # Check if this is a single model file (not sharded)
+            # Include adapter_model.safetensors for LoRA adapters
+            if base_name in [
+                "model.safetensors",
+                "pytorch_model.safetensors",
+                "adapter_model.safetensors",
+            ]:
+                if not _validate_safetensors_file(f):
+                    log_info_on_rank0(
+                        logger,
+                        f"Corrupted model file {base_name} for {model_name_or_path}. "
+                        "Will selectively clean and re-download this file.",
+                    )
+                    # Selective cleanup for single file
+                    _cleanup_corrupted_files_selective(model_name_or_path, [f])
+                    return None
 
     if len(local_weight_files) > 0:
-        logger.info(
-            "Found local HF snapshot for %s at %s; skipping download.",
-            model_name_or_path,
-            found_local_snapshot_dir,
+        log_info_on_rank0(
+            logger,
+            f"Found local HF snapshot for {model_name_or_path} at "
+            f"{found_local_snapshot_dir}; skipping download.",
         )
         return found_local_snapshot_dir
     else:
-        logger.info(
-            "Local HF snapshot at %s has no files matching %s; will attempt download.",
-            found_local_snapshot_dir,
-            allow_patterns,
+        log_info_on_rank0(
+            logger,
+            f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
+            f"{allow_patterns}; will attempt download.",
         )
     return None
 

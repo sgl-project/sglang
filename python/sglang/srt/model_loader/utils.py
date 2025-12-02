@@ -12,6 +12,7 @@ from torch import nn
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
+from sglang.srt.layers import deep_gemm_wrapper
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,9 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
     supported_archs = ModelRegistry.get_supported_archs()
     is_native_supported = any(arch in supported_archs for arch in architectures)
 
-    if not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
+    if model_config.model_impl == ModelImpl.MINDSPORE:
+        architectures = ["MindSporeForCausalLM"]
+    elif not is_native_supported or model_config.model_impl == ModelImpl.TRANSFORMERS:
         architectures = resolve_transformers_arch(model_config, architectures)
     return ModelRegistry.resolve_model_cls(architectures)
 
@@ -117,6 +120,15 @@ def post_load_weights(model: nn.Module, model_config: ModelConfig):
             model.post_load_weights(is_nextn=True)
         else:
             model.post_load_weights()
+
+
+def should_deepgemm_weight_requant_ue8m0(weight_block_size):
+    """Should we requant fp8 weights into UE8M0 format when loading the model"""
+    return (
+        deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and weight_block_size is not None
+    )
 
 
 def should_async_load(weight: torch.Tensor) -> bool:

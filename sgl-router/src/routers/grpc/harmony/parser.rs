@@ -23,6 +23,7 @@ fn get_harmony_encoding() -> &'static HarmonyEncoding {
 pub struct HarmonyParserAdapter {
     parser: StreamableParser,
     prev_recipient: Option<String>,
+    reasoning_token_count: u32,
 }
 
 impl HarmonyParserAdapter {
@@ -35,6 +36,7 @@ impl HarmonyParserAdapter {
         Ok(Self {
             parser,
             prev_recipient: None,
+            reasoning_token_count: 0,
         })
     }
 
@@ -241,11 +243,20 @@ impl HarmonyParserAdapter {
         finish_reason: String,
         matched_stop: Option<serde_json::Value>,
     ) -> Result<HarmonyChannelOutput, String> {
+        let mut reasoning_token_count = 0u32;
+
         // Feed all tokens to the parser
         for &token_id in output_ids {
             self.parser
                 .process(token_id)
                 .map_err(|e| format!("Failed to process token {}: {}", token_id, e))?;
+
+            // Count reasoning tokens (analysis + commentary channels)
+            if let Some(channel) = self.parser.current_channel() {
+                if channel == "analysis" || channel == "commentary" {
+                    reasoning_token_count += 1;
+                }
+            }
         }
 
         // Extract all completed messages from the parser
@@ -270,6 +281,7 @@ impl HarmonyParserAdapter {
             final_text,
             finish_reason: final_finish_reason,
             matched_stop,
+            reasoning_token_count,
         })
     }
 
@@ -358,6 +370,13 @@ impl HarmonyParserAdapter {
             self.parser
                 .process(token_id)
                 .map_err(|e| format!("Failed to process token {}: {}", token_id, e))?;
+
+            // Count reasoning tokens (analysis + commentary channels)
+            if let Some(channel) = self.parser.current_channel() {
+                if channel == "analysis" || channel == "commentary" {
+                    self.reasoning_token_count += 1;
+                }
+            }
 
             // Check for content delta
             if let Ok(Some(delta_text)) = self.parser.last_content_delta() {
@@ -491,6 +510,7 @@ impl HarmonyParserAdapter {
             final_text,
             finish_reason: final_finish_reason,
             matched_stop,
+            reasoning_token_count: self.reasoning_token_count,
         })
     }
 
@@ -503,6 +523,7 @@ impl HarmonyParserAdapter {
         self.parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
             .map_err(|e| format!("Failed to reset parser: {}", e))?;
         self.prev_recipient = None;
+        self.reasoning_token_count = 0;
         Ok(())
     }
 }

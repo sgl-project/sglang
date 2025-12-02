@@ -20,8 +20,19 @@ from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
 from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
 from sglang.srt.compilation.pass_manager import PostGradPassManager
+from sglang.srt.utils.common import rank0_log
 
 logger = logging.getLogger(__name__)
+
+
+SPLIT_OPS = [
+    "sglang.unified_attention_with_output",
+    "sglang.gdn_with_output",
+]
+
+
+def add_split_ops(ops):
+    SPLIT_OPS.extend(ops)
 
 
 def make_compiler(config: CompilationConfig):
@@ -347,6 +358,7 @@ class SGLangBackend:
         config: CompilationConfig,
         graph_pool: Any,
     ):
+        rank0_log(f"Initializing SGLangBackend")
         assert graph_pool is not None
         self.graph_pool = graph_pool
 
@@ -365,6 +377,7 @@ class SGLangBackend:
         self.inductor_config["post_grad_custom_post_pass"] = self.post_grad_pass_manager
 
     def __call__(self, graph: fx.GraphModule, example_inputs) -> Callable:
+        rank0_log(f"SGLangBackend __call__")
         base_cache_dir = os.path.expanduser(
             os.getenv("SGLANG_CACHE_DIR", "~/.cache/sglang/")
         )
@@ -392,9 +405,9 @@ class SGLangBackend:
         self.configure_post_pass()
 
         self.split_gm, self.piecewise_graphs = split_graph(
-            graph, ["sglang.unified_attention_with_output", "sglang.inplace_all_reduce"]
+            graph,
+            SPLIT_OPS,
         )
-
         from torch._dynamo.utils import lazy_format_graph_code
 
         # depyf will hook lazy_format_graph_code and dump the graph
@@ -419,19 +432,24 @@ class SGLangBackend:
             self,
         ).run(*example_inputs)
 
-        graph_path = os.path.join(local_cache_dir, "computation_graph.py")
-        if not os.path.exists(graph_path):
-            # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30 # noqa
-            # use `print_readable` because it can include submodules
-            src = (
-                "from __future__ import annotations\nimport torch\n"
-                + self.split_gm.print_readable(print_output=False)
-            )
-            src = src.replace("<lambda>", "GraphModule")
-            with open(graph_path, "w") as f:
-                f.write(src)
+        rank = torch.distributed.get_rank()
 
-            logger.debug("Computation graph saved to %s", graph_path)
+        if rank == 0:
+            graph_path = os.path.join(
+                local_cache_dir, f"computation_graph_{time.time()}.py"
+            )
+            if not os.path.exists(graph_path):
+                # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30 # noqa
+                # use `print_readable` because it can include submodules
+                src = (
+                    "from __future__ import annotations\nimport torch\n"
+                    + self.split_gm.print_readable(print_output=False)
+                )
+                src = src.replace("<lambda>", "GraphModule")
+                with open(graph_path, "w") as f:
+                    f.write(src)
+
+                rank0_log(f"Computation graph saved to {graph_path}")
 
         self._called = True
         return self.split_gm
