@@ -559,13 +559,11 @@ jobs:
   unit-test-backend-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
+      (inputs.target_stage == 'unit-test-backend-4-gpu') ||
       (
-        (inputs.target_stage == 'unit-test-backend-4-gpu') ||
-        (
-          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
       )
     runs-on: 4-gpu-h100
     env:
