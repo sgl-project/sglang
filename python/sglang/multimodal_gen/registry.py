@@ -164,17 +164,20 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     """
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
-        model_name = _MODEL_HF_PATH_TO_NAME[model_path]
+        model_id = _MODEL_HF_PATH_TO_NAME[model_path]
         logger.debug(f"Resolved model path '{model_path}' from exact path match.")
-        return _CONFIG_REGISTRY.get(model_name)
+        return _CONFIG_REGISTRY.get(model_id)
 
-    # 2. Partial match: find the best (longest) match against all registered model names.
+    # 2. Partial match: find the best (longest) match against all registered model hf paths.
     cleaned_model_path = re.sub(r"--", "/", model_path.lower())
-    all_model_names = sorted(_CONFIG_REGISTRY.keys(), key=len, reverse=True)
-    for model_name in all_model_names:
-        if model_name in cleaned_model_path:
-            logger.debug(f"Resolved model name '{model_name}' from partial path match.")
-            return _CONFIG_REGISTRY.get(model_name)
+    all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
+    for model_hf_path in all_model_hf_paths:
+        if model_hf_path.lower() in cleaned_model_path:
+            logger.debug(
+                f"Resolved model name '{model_hf_path}' from partial path match."
+            )
+            model_id = _MODEL_HF_PATH_TO_NAME[model_hf_path]
+            return _CONFIG_REGISTRY.get(model_id)
 
     # 3. Use detectors
     if os.path.exists(model_path):
@@ -185,23 +188,22 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     pipeline_name = config.get("_class_name", "").lower()
 
     matched_model_names = []
-    for model_name, detector in _MODEL_NAME_DETECTORS:
+    for model_id, detector in _MODEL_NAME_DETECTORS:
         if detector(model_path.lower()) or detector(pipeline_name):
             logger.debug(
-                f"Matched model name '{model_name}' using a registered detector."
+                f"Matched model name '{model_id}' using a registered detector."
             )
-            matched_model_names += [model_name]
+            matched_model_names += [model_id]
 
     if len(matched_model_names) >= 1:
         if len(matched_model_names) > 1:
             logger.warning(
                 f"More than one model name is matched, using the first matched"
             )
-        model_name = matched_model_names[0]
+        model_id = matched_model_names[0]
+        return _CONFIG_REGISTRY.get(model_id)
     else:
-        return None
-
-    return _CONFIG_REGISTRY.get(model_name)
+        raise RuntimeError(f"No model info found for model path: {model_path}")
 
 
 # --- Part 3: Main Resolver ---
