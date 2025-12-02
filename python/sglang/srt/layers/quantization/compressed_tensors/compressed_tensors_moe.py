@@ -368,16 +368,15 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and self.block_quant:
             assert layer.weight_block_size is not None
             # Re-quantise the expert weights so their scales are UE8M0.
-            block_sz = tuple(layer.weight_block_size)
             requant_weight_ue8m0_inplace(
                 layer.w13_weight,
                 layer.w13_weight_scale,
-                block_sz,
+                layer.weight_block_size,
             )
             requant_weight_ue8m0_inplace(
                 layer.w2_weight,
                 layer.w2_weight_scale,
-                block_sz,
+                layer.weight_block_size,
             )
 
             # Ensure column-major TMA alignment expected by DeepGEMM.
