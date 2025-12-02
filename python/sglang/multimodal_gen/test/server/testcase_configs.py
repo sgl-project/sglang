@@ -24,6 +24,7 @@ import statistics
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -497,6 +498,10 @@ TWO_GPU_CASES_B = [
 
 # Load global configuration
 if _is_cuda:
-    BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+    BASELINE_CONFIG = BaselineConfig.load(
+        Path(__file__).with_name("perf_baselines.json")
+    )
 elif _is_hip:
-    BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines_amd.json"))
+    BASELINE_CONFIG = BaselineConfig.load(
+        Path(__file__).with_name("perf_baselines_amd.json")
+    )

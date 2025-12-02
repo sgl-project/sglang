@@ -25,6 +25,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+
 @dataclass
 class EncoderArchConfig(ArchConfig):
     _fsdp_shard_conditions: list = field(default_factory=lambda: [])
