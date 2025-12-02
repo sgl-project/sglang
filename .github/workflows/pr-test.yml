@@ -524,9 +524,12 @@ jobs:
   unit-test-backend-2-gpu:
     needs: [check-changes, call-gate, unit-test-backend-1-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-2-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 2-gpu-runner
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -597,9 +600,12 @@ jobs:
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-8-gpu-h200') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
@@ -632,9 +638,12 @@ jobs:
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-8-gpu-h20') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 8-gpu-h20
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"

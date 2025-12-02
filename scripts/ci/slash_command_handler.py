@@ -142,8 +142,10 @@ def handle_rerun_stage(
 
     # Valid stage names that support target_stage
     valid_stages = [
+        "unit-test-backend-2-gpu",
         "unit-test-backend-4-gpu",
-        # Add more stages here as we update their conditions
+        "unit-test-backend-8-gpu-h200",
+        "unit-test-backend-8-gpu-h20",
     ]
 
     if stage_name not in valid_stages:
