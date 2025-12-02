@@ -532,6 +532,7 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
+    enable_tp_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
@@ -3643,6 +3644,11 @@ class ServerArgs:
             "--enable-deterministic-inference",
             action="store_true",
             help="Enable deterministic inference mode with batch invariant ops.",
+        )
+        parser.add_argument(
+            "--enable-tp-deterministic-inference",
+            action="store_true",
+            help="Enable deterministic inference mode with tp invariant ops.",
         )
         parser.add_argument(
             "--rl-on-policy-target",
