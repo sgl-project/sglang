@@ -353,16 +353,28 @@ class Scheduler(
             draft_worker_kwargs["enable_overlap"] = self.enable_overlap
 
         if self.enable_mtp:
-            from sglang.srt.speculative.mtp_worker import MTPWorker
-            self.draft_worker = MTPWorker(
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                moe_ep_rank=moe_ep_rank,
-                server_args=server_args,
-                nccl_port=port_args.nccl_port,
-                target_worker=self.tp_worker,
-                dp_rank=dp_rank,
-            )
+            if self.enable_overlap:
+                from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
+                self.draft_worker = MTPWorkerV2(
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    moe_ep_rank=moe_ep_rank,
+                    server_args=server_args,
+                    nccl_port=port_args.nccl_port,
+                    target_worker=self.tp_worker,
+                    dp_rank=dp_rank,
+                )
+            else:
+                from sglang.srt.speculative.mtp_worker import MTPWorker
+                self.draft_worker = MTPWorker(
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    moe_ep_rank=moe_ep_rank,
+                    server_args=server_args,
+                    nccl_port=port_args.nccl_port,
+                    target_worker=self.tp_worker,
+                    dp_rank=dp_rank,
+                )
         else:
             self.draft_worker = self.spec_algorithm.create_draft_worker(
                 **draft_worker_kwargs
@@ -869,11 +881,17 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.is_eagle() and self.enable_overlap:
-            draft_token_to_kv_pool = (
-                self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
-            )
+            if self.enable_mtp:
+                draft_token_to_kv_pool = (
+                    self.draft_worker.draft_worker.draft_runner_list[0].token_to_kv_pool
+                )
+            else:
+                draft_token_to_kv_pool = (
+                    self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
+                )
             model_config = self.draft_worker.draft_worker.draft_runner.model_config
         else:
+            # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config
 
