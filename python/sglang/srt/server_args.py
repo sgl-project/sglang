@@ -1503,6 +1503,7 @@ class ServerArgs:
             "EAGLE3",
             "STANDALONE",
             "SIMPLE_EAGLE",
+            "SIMPLE_EAGLE3"
         ):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -1511,7 +1512,7 @@ class ServerArgs:
                 )
             if (
                 self.max_running_requests is None
-                and self.speculative_algorithm != "SIMPLE_EAGLE"
+                and self.speculative_algorithm != "SIMPLE_EAGLE" and self.speculative_algorithm != "SIMPLE_EAGLE3"
             ):
                 self.max_running_requests = 48
                 logger.warning(
@@ -2699,7 +2700,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SIMPLE_EAGLE"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SIMPLE_EAGLE","SIMPLE_EAGLE3"],
             help="Speculative algorithm.",
         )
         parser.add_argument(

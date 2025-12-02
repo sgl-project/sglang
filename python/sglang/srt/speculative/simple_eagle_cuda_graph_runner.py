@@ -132,10 +132,19 @@ class SimpleEAGLECudaGraphRunner:
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
 
-            self.hidden_states = torch.empty(
-                (self.max_num_token, self.model_runner.model_config.hidden_size),
-                dtype=self.model_runner.dtype,
-            )
+            if self.speculative_algorithm == "SIMPLE_EAGLE3":
+                self.model_runner.model.set_eagle3_layers_to_capture()
+                self.hidden_states = torch.zeros(
+                    (
+                        self.max_num_token, self.model_runner.model_config.hidden_size * 3
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
+            else:
+                self.hidden_states = torch.empty(
+                    (self.max_num_token, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.dtype,
+                )
 
             # NOTE:Add for simple eagle
             self.accept_index = torch.full((self.max_bs, 2), -1, dtype=torch.int32)

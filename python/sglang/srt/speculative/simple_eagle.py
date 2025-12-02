@@ -176,8 +176,9 @@ class SimpleEagleWorker(TpModelWorker):
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        
 
-        if self.speculative_algorithm.is_eagle3():
+        if self.speculative_algorithm == "SIMPLE_EAGLE3":
             # EAGLE3 models don't share lm_head
             self.draft_model_runner.model.set_embed(embed)
 
@@ -446,6 +447,9 @@ class SimpleEagleWorker(TpModelWorker):
                 batch.req_to_token_pool.req_to_token.shape[1],
                 next_power_of_2(num_seqs),
             )
+            if self.hot_token_id is not None:
+                # Map to hot token ids
+                draft_input_spec_info.topk_index = self.hot_token_id[draft_input_spec_info.topk_index]
             batch.input_ids = torch.column_stack(
                 (batch.output_ids, draft_input_spec_info.topk_index.squeeze(1))
             ).flatten()

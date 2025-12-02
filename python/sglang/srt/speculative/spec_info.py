@@ -168,7 +168,7 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
         return self._has_flag("EAGLE3")
     
     def is_simple_eagle(self) -> bool:
-        return self._has_flag("SIMPLE_EAGLE")
+        return self._has_flag("SIMPLE_EAGLE","SIMPLE_EAGLE3")
 
     def is_standalone(self) -> bool:
         return self._has_flag("STANDALONE")
@@ -189,6 +189,7 @@ _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
     "EAGLE": lambda algorithm: SpeculativeAlgorithm._add_flag("EAGLE", algorithm),
     "EAGLE3": lambda algorithm: SpeculativeAlgorithm._add_flag("EAGLE3", algorithm),
     "SIMPLE_EAGLE": lambda algorithm: SpeculativeAlgorithm._add_flag("SIMPLE_EAGLE", algorithm),
+    "SIMPLE_EAGLE3": lambda algorithm: SpeculativeAlgorithm._add_flag("SIMPLE_EAGLE3", algorithm),
     "STANDALONE": lambda algorithm: SpeculativeAlgorithm._add_flag(
         "STANDALONE", algorithm
     ),
@@ -310,6 +311,13 @@ register_speculative_algorithm(
     worker_cls=_create_simple_eagle_worker,
     flags=("SIMPLE_EAGLE","EAGLE"),
 )
+
+register_speculative_algorithm(
+    "SIMPLE_EAGLE3",
+    worker_cls=_create_simple_eagle_worker,
+    flags=("SIMPLE_EAGLE3","EAGLE","SIMPLE_EAGLE"),
+)
+
 
 register_speculative_algorithm(
     "EAGLE3",

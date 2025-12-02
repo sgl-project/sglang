@@ -33,13 +33,13 @@ def create_flashinfer_backend(runner):
         # Init streams
         kv_indptr_buf = None
         kv_last_page_len_buf = None
-        if runner.server_args.speculative_algorithm in ["EAGLE", "SIMPLE_EAGLE"]:
+        if runner.server_args.speculative_algorithm in ["EAGLE", "SIMPLE_EAGLE","SIMPLE_EAGLE3"]:
             if (
                 not hasattr(runner, "plan_stream_for_flashinfer")
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-            if runner.server_args.speculative_algorithm == "SIMPLE_EAGLE":
+            if runner.server_args.speculative_algorithm == "SIMPLE_EAGLE" or runner.server_args.speculative_algorithm == "SIMPLE_EAGLE3":
                 kv_indptr_buf = torch.zeros(
                     (runner.req_to_token_pool.size * 2 + 1,),
                     dtype=torch.int32,
