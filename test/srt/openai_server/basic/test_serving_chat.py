@@ -33,6 +33,11 @@ class _MockTokenizerManager:
             tool_call_parser="hermes",
             reasoning_parser=None,
         )
+        # Mock hf_config for _use_dpsk_v32_encoding check
+        mock_hf_config = Mock()
+        mock_hf_config.architectures = ["LlamaForCausalLM"]
+        self.server_args.get_hf_config.return_value = mock_hf_config
+
         self.chat_template_name: Optional[str] = "llama-3"
 
         # tokenizer stub
@@ -177,7 +182,7 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertNotIn("CUSTOM_STOP", result2.stop)
             self.assertEqual(conv_ins.stop_str, initial_stop_str)
 
-    async def test_unstreamed_tool_args_completion(self):
+    def test_unstreamed_tool_args_completion(self):
         """Test that remaining tool call arguments are sent when generation finishes."""
 
         # Mock FunctionCallParser with detector that has partial tool call data
@@ -213,23 +218,27 @@ class ServingChatTestCase(unittest.TestCase):
             parser=mock_parser,
             content=content,
             request=request,
-            finish_reason_type="stop",
             index=0,
         )
 
         # Should return a chunk with remaining arguments
         self.assertIsNotNone(result, "Should return chunk with remaining arguments")
-        self.assertIn('"arguments":', result, "Should contain arguments field")
-        self.assertIn(
-            ', "unit": "celsius"}', result, "Should contain remaining arguments"
-        )
+
+        # Parse the result to verify content
+        self.assertTrue(result.startswith("data: "))
+        chunk = json.loads(result[6:])
+        tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
+        self.assertEqual(len(tool_calls), 1)
+        arguments = tool_calls[0]["function"]["arguments"]
+        self.assertIn(', "unit": "celsius"}', arguments)
+
         self.assertIn(
             '"finish_reason":null',
             result,
             "Should not include finish_reason in completion chunk",
         )
 
-    async def test_unstreamed_tool_args_no_completion_needed(self):
+    def test_unstreamed_tool_args_no_completion_needed(self):
         """Test that no completion chunk is sent when all arguments were already streamed."""
 
         # Mock FunctionCallParser with detector that has complete tool call data
@@ -262,14 +271,13 @@ class ServingChatTestCase(unittest.TestCase):
             parser=mock_parser,
             content=content,
             request=request,
-            finish_reason_type="stop",
             index=0,
         )
 
         # Should return None since no completion is needed
         self.assertIsNone(result, "Should return None when no completion is needed")
 
-    async def test_unstreamed_tool_args_no_parser_data(self):
+    def test_unstreamed_tool_args_no_parser_data(self):
         """Test that no completion chunk is sent when parser has no tool call data."""
 
         # Mock FunctionCallParser with empty detector
@@ -296,7 +304,6 @@ class ServingChatTestCase(unittest.TestCase):
             parser=mock_parser,
             content=content,
             request=request,
-            finish_reason_type="stop",
             index=0,
         )
 
@@ -595,8 +602,6 @@ class ServingChatTestCase(unittest.TestCase):
             # Mock hf_config
             mock_hf_config = Mock()
             mock_hf_config.architectures = ["DeepseekV32ForCausalLM"]
-            # Can also mock model_type if needed, though not strictly required for this test
-            # mock_hf_config.model_type = "deepseek_v3"
 
             tokenizer_manager.server_args.get_hf_config = Mock(
                 return_value=mock_hf_config
