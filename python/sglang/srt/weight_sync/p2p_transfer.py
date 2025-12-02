@@ -474,14 +474,6 @@ class P2PTransferManager:
             context.term()
             raise e
 
-    def get_session_id(self):
-        """
-        Get the session ID from the first transfer engine.
-        Note: In manager mode, each engine has its own session_id.
-        This returns the first one for compatibility.
-        """
-        return self.engine_pool[0].get_session_id()
-
     def get_all_session_ids(self):
         """Get all session IDs from all engines in the pool."""
         return [engine.get_session_id() for engine in self.engine_pool]

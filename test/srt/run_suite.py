@@ -164,6 +164,7 @@ suites = {
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 481),
+        TestFile("test_p2p_transfer.py", 100),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("lora/test_lora_llama4.py", 400),

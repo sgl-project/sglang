@@ -497,16 +497,14 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
 
-    # P2P transfer settings: null by default
-    enable_p2p_transfer: bool = False
-    p2p_transfer_ib_device: Optional[str] = None
-
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
     weight_loader_disable_mmap: bool = False
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+    enable_p2p_transfer: bool = False
+    p2p_transfer_ib_device: Optional[str] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
