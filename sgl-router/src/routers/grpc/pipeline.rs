@@ -219,9 +219,19 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Generate(_)) => {
+                error!(
+                    function = "execute_chat",
+                    "Wrong response type: expected Chat, got Generate"
+                );
                 error::internal_error("Internal error: wrong response type")
             }
-            None => error::internal_error("No response produced"),
+            None => {
+                error!(
+                    function = "execute_chat",
+                    "No response produced by pipeline"
+                );
+                error::internal_error("No response produced")
+            }
         }
     }
 
@@ -260,9 +270,19 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
             Some(FinalResponse::Chat(_)) => {
+                error!(
+                    function = "execute_generate",
+                    "Wrong response type: expected Generate, got Chat"
+                );
                 error::internal_error("Internal error: wrong response type")
             }
-            None => error::internal_error("No response produced"),
+            None => {
+                error!(
+                    function = "execute_generate",
+                    "No response produced by pipeline"
+                );
+                error::internal_error("No response produced")
+            }
         }
     }
 
@@ -285,6 +305,10 @@ impl RequestPipeline {
             match stage.execute(&mut ctx).await {
                 Ok(Some(_response)) => {
                     // Streaming not supported for responses sync mode
+                    error!(
+                        function = "execute_chat_for_responses",
+                        "Streaming attempted in responses context"
+                    );
                     return Err(error::bad_request(
                         "Streaming is not supported in this context".to_string(),
                     ));
@@ -308,9 +332,19 @@ impl RequestPipeline {
         match ctx.state.response.final_response {
             Some(FinalResponse::Chat(response)) => Ok(response),
             Some(FinalResponse::Generate(_)) => {
+                error!(
+                    function = "execute_chat_for_responses",
+                    "Wrong response type: expected Chat, got Generate"
+                );
                 Err(error::internal_error("Internal error: wrong response type"))
             }
-            None => Err(error::internal_error("No response produced")),
+            None => {
+                error!(
+                    function = "execute_chat_for_responses",
+                    "No response produced by pipeline"
+                );
+                Err(error::internal_error("No response produced"))
+            }
         }
     }
 
@@ -376,6 +410,10 @@ impl RequestPipeline {
             .responses_iteration_result
             .take()
             .ok_or_else(|| {
+                error!(
+                    function = "execute_harmony_responses",
+                    "No ResponsesIterationResult produced by pipeline"
+                );
                 error::internal_error("No ResponsesIterationResult produced by pipeline")
             })
     }
@@ -421,10 +459,12 @@ impl RequestPipeline {
         }
 
         // Extract execution_result (the raw stream from workers)
-        ctx.state
-            .response
-            .execution_result
-            .take()
-            .ok_or_else(|| error::internal_error("No ExecutionResult produced by pipeline"))
+        ctx.state.response.execution_result.take().ok_or_else(|| {
+            error!(
+                function = "execute_harmony_responses_streaming",
+                "No ExecutionResult produced by pipeline"
+            );
+            error::internal_error("No ExecutionResult produced by pipeline")
+        })
     }
 }

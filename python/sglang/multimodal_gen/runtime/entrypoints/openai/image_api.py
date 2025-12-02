@@ -8,7 +8,7 @@ from typing import List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.configs.sample.base import (
+from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
@@ -21,10 +21,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     _save_upload_to_path,
-    post_process_sample,
+    process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.pipelines.pipeline_batch_info import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -54,14 +54,15 @@ def _build_sampling_params_from_request(
     background: Optional[str],
     image_path: Optional[str] = None,
 ) -> SamplingParams:
-    width, height = _parse_size(size)
+    if size is None:
+        width, height = None, None
+    else:
+        width, height = _parse_size(size)
     ext = _choose_ext(output_format, background)
-
     server_args = get_global_server_args()
-    sampling_params = SamplingParams.from_pretrained(server_args.model_path)
-
     # Build user params
-    user_params = SamplingParams(
+    sampling_params = SamplingParams.from_user_sampling_params_args(
+        model_path=server_args.model_path,
         request_id=request_id,
         prompt=prompt,
         image_path=image_path,
@@ -70,18 +71,9 @@ def _build_sampling_params_from_request(
         height=height,
         num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
         save_output=True,
+        server_args=server_args,
+        output_file_name=f"{request_id}.{ext}",
     )
-
-    # Let SamplingParams auto-generate a file name, then force desired extension
-    sampling_params = sampling_params.from_user_sampling_params(user_params)
-    if not sampling_params.output_file_name:
-        sampling_params.output_file_name = request_id
-    if not sampling_params.output_file_name.endswith(f".{ext}"):
-        # strip any existing extension and apply desired one
-        base = sampling_params.output_file_name.rsplit(".", 1)[0]
-        sampling_params.output_file_name = f"{base}.{ext}"
-
-    sampling_params.log(server_args)
     return sampling_params
 
 
@@ -107,7 +99,6 @@ def _build_req_from_sampling(s: SamplingParams) -> Req:
 async def generations(
     request: ImageGenerationsRequest,
 ):
-
     request_id = generate_request_id()
     sampling = _build_sampling_params_from_request(
         request_id=request_id,
@@ -118,20 +109,11 @@ async def generations(
         background=request.background,
     )
     batch = prepare_request(
-        prompt=request.prompt,
         server_args=get_global_server_args(),
         sampling_params=sampling,
     )
     # Run synchronously for images and save to disk
-    result = await scheduler_client.forward([batch])
-    save_file_path = os.path.join(batch.output_path, batch.output_file_name)
-    post_process_sample(
-        result.output[0],
-        batch.data_type,
-        1,
-        batch.save_output,
-        save_file_path,
-    )
+    save_file_path = await process_generation_batch(scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -170,12 +152,11 @@ async def edits(
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
-    size: Optional[str] = Form("1024x1024"),
+    size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
     user: Optional[str] = Form(None),
 ):
-
     request_id = generate_request_id()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
@@ -200,15 +181,7 @@ async def edits(
     )
     batch = _build_req_from_sampling(sampling)
 
-    result = await scheduler_client.forward([batch])
-    save_file_path = os.path.join(batch.output_path, batch.output_file_name)
-    post_process_sample(
-        result.output[0],
-        batch.data_type,
-        1,
-        batch.save_output,
-        save_file_path,
-    )
+    save_file_path = await process_generation_batch(scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
         request_id,

@@ -9,30 +9,29 @@ use std::{
 use axum::{body::Body, http::StatusCode, response::Response};
 use bytes::Bytes;
 use http::header::{HeaderValue, CONTENT_TYPE};
-use proto::{
-    generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
-    generate_response::Response::{Chunk, Complete},
-};
 use serde_json::json;
 use tokio::sync::mpsc;
-use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
 use super::{
     processor::ResponsesIterationResult, types::HarmonyChannelDelta, HarmonyParserAdapter,
 };
 use crate::{
-    grpc_client::{proto, sglang_scheduler::AbortOnDropStream},
+    grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     protocols::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
         },
-        common::{FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
-        responses::{ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage},
+        common::{CompletionTokensDetails, FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
+        responses::{
+            OutputTokensDetails, ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage,
+        },
     },
     routers::grpc::{
         common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
         context,
+        proto_wrapper::{ProtoResponseVariant, ProtoStream},
     },
 };
 
@@ -179,7 +178,7 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from a single stream
     async fn process_single_stream(
-        mut grpc_stream: AbortOnDropStream,
+        mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -198,8 +197,9 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = grpc_stream.next().await {
             let response = result.map_err(|e| format!("Stream error: {}", e))?;
 
-            match response.response {
-                Some(Chunk(chunk)) => {
+            match response.into_response() {
+                ProtoResponseVariant::Chunk(chunk_wrapper) => {
+                    let chunk = chunk_wrapper.as_sglang();
                     let index = chunk.index;
 
                     // Initialize parser for this index if needed
@@ -240,7 +240,8 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                 }
-                Some(Complete(complete)) => {
+                ProtoResponseVariant::Complete(complete_wrapper) => {
+                    let complete = complete_wrapper.as_sglang();
                     let index = complete.index;
 
                     // Store final metadata
@@ -249,10 +250,10 @@ impl HarmonyStreamingProcessor {
                         index,
                         complete.matched_stop.as_ref().map(|m| match m {
                             MatchedTokenId(id) => {
-                                serde_json::json!(id)
+                                json!(id)
                             }
                             MatchedStopStr(s) => {
-                                serde_json::json!(s)
+                                json!(s)
                             }
                         }),
                     );
@@ -277,10 +278,10 @@ impl HarmonyStreamingProcessor {
                         )?;
                     }
                 }
-                Some(proto::generate_response::Response::Error(err)) => {
-                    return Err(format!("Server error: {}", err.message));
+                ProtoResponseVariant::Error(error_wrapper) => {
+                    return Err(format!("Server error: {}", error_wrapper.message()));
                 }
-                None => {}
+                ProtoResponseVariant::None => {}
             }
         }
 
@@ -306,8 +307,8 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from dual streams (prefill + decode)
     async fn process_dual_stream(
-        mut prefill_stream: AbortOnDropStream,
-        mut decode_stream: AbortOnDropStream,
+        mut prefill_stream: ProtoStream,
+        mut decode_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -318,7 +319,8 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = prefill_stream.next().await {
             let response = result.map_err(|e| format!("Prefill stream error: {}", e))?;
 
-            if let Some(Complete(complete)) = response.response {
+            if let ProtoResponseVariant::Complete(complete_wrapper) = response.into_response() {
+                let complete = complete_wrapper.as_sglang();
                 prompt_tokens.insert(complete.index, complete.prompt_tokens as u32);
             }
         }
@@ -335,8 +337,9 @@ impl HarmonyStreamingProcessor {
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| format!("Decode stream error: {}", e))?;
 
-            match response.response {
-                Some(Chunk(chunk)) => {
+            match response.into_response() {
+                ProtoResponseVariant::Chunk(chunk_wrapper) => {
+                    let chunk = chunk_wrapper.as_sglang();
                     let index = chunk.index;
 
                     // Initialize parser for this index if needed
@@ -374,7 +377,8 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                 }
-                Some(Complete(complete)) => {
+                ProtoResponseVariant::Complete(complete_wrapper) => {
+                    let complete = complete_wrapper.as_sglang();
                     let index = complete.index;
 
                     finish_reasons.insert(index, Some(complete.finish_reason.clone()));
@@ -408,10 +412,10 @@ impl HarmonyStreamingProcessor {
                         )?;
                     }
                 }
-                Some(proto::generate_response::Response::Error(err)) => {
-                    return Err(format!("Server error: {}", err.message));
+                ProtoResponseVariant::Error(error_wrapper) => {
+                    return Err(format!("Server error: {}", error_wrapper.message()));
                 }
-                None => {}
+                ProtoResponseVariant::None => {}
             }
         }
 
@@ -449,26 +453,14 @@ impl HarmonyStreamingProcessor {
     ) -> Result<(), String> {
         // On first chunk, emit role announcement separately
         if is_first {
-            let role_chunk = ChatCompletionStreamResponse {
-                id: dispatch.request_id.clone(),
-                object: "chat.completion.chunk".to_string(),
-                created: dispatch.created,
-                model: original_request.model.clone(),
-                system_fingerprint: dispatch.weight_version.clone(),
-                choices: vec![ChatStreamChoice {
-                    index,
-                    delta: ChatMessageDelta {
-                        role: Some("assistant".to_string()),
-                        content: Some(String::new()),
-                        tool_calls: None,
-                        reasoning_content: None,
-                    },
-                    logprobs: None,
-                    finish_reason: None,
-                    matched_stop: None,
-                }],
-                usage: None,
-            };
+            let role_chunk = ChatCompletionStreamResponse::builder(
+                &dispatch.request_id,
+                &original_request.model,
+            )
+            .created(dispatch.created)
+            .add_choice_role(index, "assistant")
+            .maybe_system_fingerprint(dispatch.weight_version.clone())
+            .build();
 
             let chunk_json = serde_json::to_string(&role_chunk)
                 .map_err(|e| format!("JSON serialization error: {}", e))?;
@@ -497,21 +489,18 @@ impl HarmonyStreamingProcessor {
         };
 
         // Build and emit chunk
-        let chunk = ChatCompletionStreamResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created: dispatch.created,
-            model: original_request.model.clone(),
-            system_fingerprint: dispatch.weight_version.clone(),
-            choices: vec![ChatStreamChoice {
-                index,
-                delta: chat_delta,
-                logprobs: None,
-                finish_reason: None,
-                matched_stop: None,
-            }],
-            usage: None,
-        };
+        let chunk =
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+                .created(dispatch.created)
+                .add_choice(ChatStreamChoice {
+                    index,
+                    delta: chat_delta,
+                    logprobs: None,
+                    finish_reason: None,
+                    matched_stop: None,
+                })
+                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .build();
 
         let chunk_json = serde_json::to_string(&chunk)
             .map_err(|e| format!("JSON serialization error: {}", e))?;
@@ -532,26 +521,12 @@ impl HarmonyStreamingProcessor {
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
-        let chunk = ChatCompletionStreamResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created: dispatch.created,
-            model: original_request.model.clone(),
-            system_fingerprint: dispatch.weight_version.clone(),
-            choices: vec![ChatStreamChoice {
-                index,
-                delta: ChatMessageDelta {
-                    role: None,
-                    content: None,
-                    tool_calls: None,
-                    reasoning_content: None,
-                },
-                logprobs: None,
-                finish_reason: Some(finish_reason.to_string()),
-                matched_stop: matched_stop.cloned(),
-            }],
-            usage: None,
-        };
+        let chunk =
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+                .created(dispatch.created)
+                .add_choice_finish_reason(index, finish_reason, matched_stop.cloned())
+                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .build();
 
         let chunk_json = serde_json::to_string(&chunk)
             .map_err(|e| format!("JSON serialization error: {}", e))?;
@@ -571,20 +546,17 @@ impl HarmonyStreamingProcessor {
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
-        let usage_chunk = ChatCompletionStreamResponse {
-            id: dispatch.request_id.clone(),
-            object: "chat.completion.chunk".to_string(),
-            created: dispatch.created,
-            model: original_request.model.clone(),
-            system_fingerprint: dispatch.weight_version.clone(),
-            choices: vec![],
-            usage: Some(Usage {
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-                completion_tokens_details: None,
-            }),
-        };
+        let usage_chunk =
+            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
+                .created(dispatch.created)
+                .usage(Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    completion_tokens_details: None,
+                })
+                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .build();
 
         let chunk_json = serde_json::to_string(&usage_chunk)
             .map_err(|e| format!("JSON serialization error: {}", e))?;
@@ -628,7 +600,7 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from a single stream
     async fn process_responses_single_stream_mixed(
-        grpc_stream: AbortOnDropStream,
+        grpc_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp_tool_names: &std::collections::HashSet<String>,
@@ -639,8 +611,8 @@ impl HarmonyStreamingProcessor {
 
     /// Process streaming chunks from dual streams
     async fn process_responses_dual_stream_mixed(
-        mut prefill_stream: AbortOnDropStream,
-        decode_stream: AbortOnDropStream,
+        mut prefill_stream: ProtoStream,
+        decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp_tool_names: &std::collections::HashSet<String>,
@@ -670,7 +642,7 @@ impl HarmonyStreamingProcessor {
     /// If mcp_tool_names is Some, determines mode per-tool by checking tool name.
     /// If mcp_tool_names is None, uses default MCP mode for all tools.
     async fn process_decode_stream_with_tool_lookup(
-        mut decode_stream: AbortOnDropStream,
+        mut decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
         mcp_tool_names: Option<&std::collections::HashSet<String>>,
@@ -699,6 +671,7 @@ impl HarmonyStreamingProcessor {
         let mut matched_stop: Option<serde_json::Value> = None;
         let mut prompt_tokens: u32 = 0;
         let mut completion_tokens: u32 = 0;
+        let mut reasoning_token_count: u32 = 0;
 
         // Process stream
         let mut chunk_count = 0;
@@ -706,8 +679,9 @@ impl HarmonyStreamingProcessor {
             chunk_count += 1;
             let response = result.map_err(|e| format!("Decode stream error: {}", e))?;
 
-            match response.response {
-                Some(Chunk(chunk)) => {
+            match response.into_response() {
+                ProtoResponseVariant::Chunk(chunk_wrapper) => {
+                    let chunk = chunk_wrapper.as_sglang();
                     // Parse chunk via Harmony parser
                     let delta_result = parser
                         .parse_chunk(&chunk.token_ids)
@@ -879,7 +853,8 @@ impl HarmonyStreamingProcessor {
                         }
                     }
                 }
-                Some(Complete(complete)) => {
+                ProtoResponseVariant::Complete(complete_wrapper) => {
+                    let complete = complete_wrapper.as_sglang();
                     // Store final metadata
                     finish_reason = complete.finish_reason.clone();
                     matched_stop = complete.matched_stop.as_ref().map(|m| match m {
@@ -898,8 +873,9 @@ impl HarmonyStreamingProcessor {
                         .finalize(finish_reason.clone(), matched_stop.clone())
                         .map_err(|e| format!("Finalize error: {}", e))?;
 
-                    // Store finalized tool calls
+                    // Store finalized tool calls and reasoning token count
                     accumulated_tool_calls = final_output.commentary.clone();
+                    reasoning_token_count = final_output.reasoning_token_count;
 
                     // Complete all tool calls if we have commentary
                     if let Some(ref tool_calls) = accumulated_tool_calls {
@@ -988,10 +964,10 @@ impl HarmonyStreamingProcessor {
                         emitter.send_event_best_effort(&event, tx);
                     }
                 }
-                Some(proto::generate_response::Response::Error(err)) => {
-                    return Err(format!("Server error: {}", err.message));
+                ProtoResponseVariant::Error(error_wrapper) => {
+                    return Err(format!("Server error: {}", error_wrapper.message()));
                 }
-                None => {}
+                ProtoResponseVariant::None => {}
             }
         }
 
@@ -1100,7 +1076,13 @@ impl HarmonyStreamingProcessor {
                         prompt_tokens,
                         completion_tokens,
                         total_tokens: prompt_tokens + completion_tokens,
-                        completion_tokens_details: None,
+                        completion_tokens_details: if reasoning_token_count > 0 {
+                            Some(CompletionTokensDetails {
+                                reasoning_tokens: Some(reasoning_token_count),
+                            })
+                        } else {
+                            None
+                        },
                     },
                     request_id: emitter.response_id.clone(),
                 });
@@ -1111,43 +1093,35 @@ impl HarmonyStreamingProcessor {
         // The caller will build it from the SSE events
         // Return a placeholder Completed result (caller ignores these fields in streaming mode)
         Ok(ResponsesIterationResult::Completed {
-            response: Box::new(ResponsesResponse {
-                id: emitter.response_id.clone(),
-                object: "response".to_string(),
-                created_at: 0,
-                status: ResponseStatus::Completed,
-                error: None,
-                incomplete_details: None,
-                instructions: None,
-                max_output_tokens: None,
-                model: String::new(),
-                output: vec![],
-                parallel_tool_calls: true,
-                previous_response_id: None,
-                reasoning: None,
-                store: true,
-                temperature: None,
-                text: None,
-                tool_choice: "auto".to_string(),
-                tools: vec![],
-                top_p: None,
-                truncation: None,
-                user: None,
-                safety_identifier: None,
-                metadata: HashMap::new(),
-                usage: Some(ResponsesUsage::Modern(ResponseUsage {
-                    input_tokens: prompt_tokens,
-                    output_tokens: completion_tokens,
-                    total_tokens: prompt_tokens + completion_tokens,
-                    input_tokens_details: None,
-                    output_tokens_details: None,
-                })),
-            }),
+            response: Box::new(
+                ResponsesResponse::builder(&emitter.response_id, "")
+                    .status(ResponseStatus::Completed)
+                    .usage(ResponsesUsage::Modern(ResponseUsage {
+                        input_tokens: prompt_tokens,
+                        output_tokens: completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                        input_tokens_details: None,
+                        output_tokens_details: if reasoning_token_count > 0 {
+                            Some(OutputTokensDetails {
+                                reasoning_tokens: reasoning_token_count,
+                            })
+                        } else {
+                            None
+                        },
+                    }))
+                    .build(),
+            ),
             usage: Usage {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
-                completion_tokens_details: None,
+                completion_tokens_details: if reasoning_token_count > 0 {
+                    Some(CompletionTokensDetails {
+                        reasoning_tokens: Some(reasoning_token_count),
+                    })
+                } else {
+                    None
+                },
             },
         })
     }

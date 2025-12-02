@@ -43,9 +43,8 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
-use validator::Validate;
 
 use super::{
     conversions,
@@ -58,7 +57,7 @@ use crate::{
     },
     protocols::{
         chat::{self, ChatCompletionStreamResponse},
-        common::{self, ToolChoice},
+        common::{self},
         responses::{
             self, ResponseContentPart, ResponseInput, ResponseInputOutputItem, ResponseOutputItem,
             ResponseReasoningContent, ResponseStatus, ResponsesRequest, ResponsesResponse,
@@ -83,48 +82,7 @@ pub async fn route_responses(
     headers: Option<http::HeaderMap>,
     model_id: Option<String>,
 ) -> Response {
-    // 1. Validate request (includes conversation ID format)
-    if let Err(validation_errors) = request.validate() {
-        // Extract the first error message for conversation field
-        let error_message = validation_errors
-            .field_errors()
-            .get("conversation")
-            .and_then(|errors| errors.first())
-            .and_then(|error| error.message.as_ref())
-            .map(|msg| msg.to_string())
-            .unwrap_or_else(|| "Invalid request parameters".to_string());
-
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "error": {
-                    "message": error_message,
-                    "type": "invalid_request_error",
-                    "param": "conversation",
-                    "code": "invalid_value"
-                }
-            })),
-        )
-            .into_response();
-    }
-
-    // 2. Validate mutually exclusive parameters
-    if request.previous_response_id.is_some() && request.conversation.is_some() {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "error": {
-                    "message": "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
-                    "type": "invalid_request_error",
-                    "param": serde_json::Value::Null,
-                    "code": "mutually_exclusive_parameters"
-                }
-            })),
-        )
-            .into_response();
-    }
-
-    // 3. Reject background mode (no longer supported)
+    // 1. Reject background mode (no longer supported)
     let is_background = request.background.unwrap_or(false);
     if is_background {
         return (
@@ -141,13 +99,12 @@ pub async fn route_responses(
             .into_response();
     }
 
-    // 4. Route based on execution mode
+    // 2. Route based on execution mode
     let is_streaming = request.stream.unwrap_or(false);
     if is_streaming {
         route_responses_streaming(ctx, request, headers, model_id).await
     } else {
         // Generate response ID for synchronous execution
-        // TODO: we may remove this when we have builder pattern for responses
         let response_id = Some(format!("resp_{}", Uuid::new_v4()));
         route_responses_sync(ctx, request, headers, model_id, response_id).await
     }
@@ -432,9 +389,8 @@ async fn process_and_transform_sse_stream(
         // Include reasoning_tokens if present
         if let Some(details) = &u.completion_tokens_details {
             if let Some(reasoning_tokens) = details.reasoning_tokens {
-                usage_obj["output_tokens_details"] = json!({
-                    "reasoning_tokens": reasoning_tokens
-                });
+                usage_obj["output_tokens_details"] =
+                    json!({ "reasoning_tokens": reasoning_tokens });
             }
         }
 
@@ -621,32 +577,13 @@ impl StreamingResponseAccumulator {
             ResponsesUsage::Classic(usage_info)
         });
 
-        ResponsesResponse {
-            id: self.response_id,
-            object: "response".to_string(),
-            created_at: self.created_at,
-            status,
-            error: None,
-            incomplete_details: None,
-            instructions: self.original_request.instructions.clone(),
-            max_output_tokens: self.original_request.max_output_tokens,
-            model: self.model,
-            output,
-            parallel_tool_calls: self.original_request.parallel_tool_calls.unwrap_or(true),
-            previous_response_id: self.original_request.previous_response_id.clone(),
-            reasoning: None,
-            store: self.original_request.store.unwrap_or(true),
-            temperature: self.original_request.temperature,
-            text: None,
-            tool_choice: ToolChoice::serialize_to_string(&self.original_request.tool_choice),
-            tools: self.original_request.tools.clone().unwrap_or_default(),
-            top_p: self.original_request.top_p,
-            truncation: None,
-            usage,
-            user: None,
-            safety_identifier: self.original_request.user.clone(),
-            metadata: self.original_request.metadata.clone().unwrap_or_default(),
-        }
+        ResponsesResponse::builder(&self.response_id, &self.model)
+            .copy_from_request(&self.original_request)
+            .created_at(self.created_at)
+            .status(status)
+            .output(output)
+            .maybe_usage(usage)
+            .build()
     }
 }
 
@@ -664,8 +601,14 @@ async fn execute_without_mcp(
     response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
     // Convert ResponsesRequest → ChatCompletionRequest
-    let chat_request = conversions::responses_to_chat(modified_request)
-        .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
+    let chat_request = conversions::responses_to_chat(modified_request).map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ResponsesRequest to ChatCompletionRequest"
+        );
+        error::bad_request(format!("Failed to convert request: {}", e))
+    })?;
 
     // Execute chat pipeline (errors already have proper HTTP status codes)
     let chat_response = ctx
@@ -679,8 +622,14 @@ async fn execute_without_mcp(
         .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
-    conversions::chat_to_responses(&chat_response, original_request, response_id)
-        .map_err(|e| error::internal_error(format!("Failed to convert to responses format: {}", e)))
+    conversions::chat_to_responses(&chat_response, original_request, response_id).map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ChatCompletionResponse to ResponsesResponse"
+        );
+        error::internal_error(format!("Failed to convert to responses format: {}", e))
+    })
 }
 
 /// Load conversation history and response chains, returning modified request
@@ -757,7 +706,15 @@ async fn load_conversation_history(
             .conversation_storage
             .get_conversation(&conv_id)
             .await
-            .map_err(|e| error::internal_error(format!("Failed to check conversation: {}", e)))?;
+            .map_err(|e| {
+                error!(
+                    function = "load_conversation_history",
+                    conversation_id = %conv_id_str,
+                    error = %e,
+                    "Failed to check conversation existence in storage"
+                );
+                error::internal_error(format!("Failed to check conversation: {}", e))
+            })?;
 
         if conversation.is_none() {
             return Err(error::not_found(format!(

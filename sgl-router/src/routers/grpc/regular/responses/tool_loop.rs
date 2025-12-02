@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::conversions;
@@ -250,8 +250,15 @@ pub(super) async fn execute_tool_loop(
 
     loop {
         // Convert to chat request
-        let mut chat_request = conversions::responses_to_chat(&current_request)
-            .map_err(|e| error::bad_request(format!("Failed to convert request: {}", e)))?;
+        let mut chat_request = conversions::responses_to_chat(&current_request).map_err(|e| {
+            error!(
+                function = "tool_loop",
+                iteration = state.iteration,
+                error = %e,
+                "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
+            );
+            error::bad_request(format!("Failed to convert request: {}", e))
+        })?;
 
         // Prepare tools and tool_choice for this iteration
         prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
@@ -301,6 +308,13 @@ pub(super) async fn execute_tool_loop(
                     response_id.clone(),
                 )
                 .map_err(|e| {
+                    error!(
+                        function = "tool_loop",
+                        iteration = state.iteration,
+                        error = %e,
+                        context = "function_tool_calls",
+                        "Failed to convert ChatCompletionResponse to ResponsesResponse"
+                    );
                     error::internal_error(format!("Failed to convert to responses format: {}", e))
                 })?;
 
@@ -331,6 +345,13 @@ pub(super) async fn execute_tool_loop(
                     response_id.clone(),
                 )
                 .map_err(|e| {
+                    error!(
+                        function = "tool_loop",
+                        iteration = state.iteration,
+                        error = %e,
+                        context = "max_tool_calls_limit",
+                        "Failed to convert ChatCompletionResponse to ResponsesResponse"
+                    );
                     error::internal_error(format!("Failed to convert to responses format: {}", e))
                 })?;
 
@@ -453,6 +474,13 @@ pub(super) async fn execute_tool_loop(
                 response_id.clone(),
             )
             .map_err(|e| {
+                error!(
+                    function = "tool_loop",
+                    iteration = state.iteration,
+                    error = %e,
+                    context = "final_response",
+                    "Failed to convert ChatCompletionResponse to ResponsesResponse"
+                );
                 error::internal_error(format!("Failed to convert to responses format: {}", e))
             })?;
 
@@ -1148,12 +1176,8 @@ impl ChatResponseAccumulator {
         tool_calls_vec.sort_by_key(|(index, _)| *index);
         let tool_calls: Vec<_> = tool_calls_vec.into_iter().map(|(_, call)| call).collect();
 
-        ChatCompletionResponse {
-            id: self.id,
-            object: "chat.completion".to_string(),
-            created: chrono::Utc::now().timestamp() as u64,
-            model: self.model,
-            choices: vec![ChatChoice {
+        ChatCompletionResponse::builder(&self.id, &self.model)
+            .choices(vec![ChatChoice {
                 index: 0,
                 message: ChatCompletionMessage {
                     role: "assistant".to_string(),
@@ -1173,9 +1197,7 @@ impl ChatResponseAccumulator {
                 logprobs: None,
                 matched_stop: None,
                 hidden_states: None,
-            }],
-            usage: None,
-            system_fingerprint: None,
-        }
+            }])
+            .build()
     }
 }

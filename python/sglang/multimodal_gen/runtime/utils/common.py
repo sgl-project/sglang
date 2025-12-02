@@ -2,6 +2,7 @@
 
 import importlib
 import ipaddress
+import logging
 import os
 import platform
 import signal
@@ -14,9 +15,8 @@ import psutil
 import torch
 import zmq
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
+# use the native logger to avoid circular import
+logger = logging.getLogger(__name__)
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -126,8 +126,26 @@ def is_port_available(port):
 
 
 def get_zmq_socket(
-    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
-) -> zmq.Socket:
+    context: zmq.Context,
+    socket_type: zmq.SocketType,
+    endpoint: str,
+    bind: bool,
+    max_bind_retries: int = 10,
+) -> tuple[zmq.Socket, str]:
+    """
+    Create and configure a ZMQ socket.
+
+    Args:
+        context: ZMQ context
+        socket_type: Type of ZMQ socket
+        endpoint: Endpoint string (e.g., "tcp://localhost:5555")
+        bind: Whether to bind (True) or connect (False)
+        max_bind_retries: Maximum number of retries if bind fails due to address already in use
+
+    Returns:
+        A tuple of (socket, actual_endpoint). The actual_endpoint may differ from the
+        requested endpoint if bind retry was needed.
+    """
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -165,11 +183,67 @@ def get_zmq_socket(
         raise ValueError(f"Unsupported socket type: {socket_type}")
 
     if bind:
-        socket.bind(endpoint)
+        # Parse port from endpoint for retry logic
+        import re
+
+        port_match = re.search(r":(\d+)$", endpoint)
+
+        if port_match and max_bind_retries > 1:
+            original_port = int(port_match.group(1))
+            last_exception = None
+
+            for attempt in range(max_bind_retries):
+                try:
+                    current_endpoint = endpoint
+                    if attempt > 0:
+                        # Try next port (increment by 42 to match settle_port logic)
+                        current_port = original_port + attempt * 42
+                        current_endpoint = re.sub(
+                            r":(\d+)$", f":{current_port}", endpoint
+                        )
+                        logger.info(
+                            f"ZMQ bind failed for port {original_port + (attempt - 1) * 42}, "
+                            f"retrying with port {current_port} (attempt {attempt + 1}/{max_bind_retries})"
+                        )
+
+                    socket.bind(current_endpoint)
+
+                    if attempt > 0:
+                        logger.warning(
+                            f"Successfully bound ZMQ socket to {current_endpoint} after {attempt + 1} attempts. "
+                            f"Original port {original_port} was unavailable."
+                        )
+
+                    return socket, current_endpoint
+
+                except zmq.ZMQError as e:
+                    last_exception = e
+                    if e.errno == zmq.EADDRINUSE and attempt < max_bind_retries - 1:
+                        # Address already in use, try next port
+                        continue
+                    elif attempt == max_bind_retries - 1:
+                        # Last attempt failed
+                        logger.error(
+                            f"Failed to bind ZMQ socket after {max_bind_retries} attempts. "
+                            f"Original endpoint: {endpoint}, Last tried port: {original_port + attempt * 42}"
+                        )
+                        raise
+                    else:
+                        # Different error, raise immediately
+                        raise
+
+            # Should not reach here, but just in case
+            if last_exception:
+                raise last_exception
+        else:
+            # No retry logic needed (either no port in endpoint or max_bind_retries == 1)
+            socket.bind(endpoint)
+            return socket, endpoint
     else:
         socket.connect(endpoint)
+        return socket, endpoint
 
-    return socket
+    return socket, endpoint
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -234,30 +308,6 @@ def set_cuda_arch():
     os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch}{'+PTX' if arch == '9.0' else ''}"
 
 
-def get_bool_env_var(env_var_name: str, default: str | bool = "false") -> bool:
-    raw_value = os.getenv(env_var_name, None)
-    if raw_value is None:
-        raw_value = str(default)
-
-    value_str = str(raw_value).strip().lower()
-    truthy = {"1", "true", "yes", "y", "t", "on"}
-    falsy = {"0", "false", "no", "n", "f", "off", ""}
-
-    if value_str in truthy:
-        return True
-    if value_str in falsy:
-        return False
-
-    default_bool = str(default).strip().lower() in truthy
-    logger.warning(
-        "Unrecognized boolean for %s=%r; falling back to default=%r",
-        env_var_name,
-        raw_value,
-        default_bool,
-    )
-    return default_bool
-
-
 def is_flashinfer_available():
     """
     Check whether flashinfer is available.
@@ -274,12 +324,11 @@ _warned_bool_env_var_keys = set()
 
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
-    # FIXME: move your environment variable to sglang.srt.environ
     value = os.getenv(name, default)
-    value = value.lower()
+    value = str(value).strip().lower()
 
-    truthy_values = ("true", "1")
-    falsy_values = ("false", "0")
+    truthy_values = {"1", "true", "yes", "y", "t", "on"}
+    falsy_values = {"0", "false", "no", "n", "f", "off", ""}
 
     if (value not in truthy_values) and (value not in falsy_values):
         if value not in _warned_bool_env_var_keys:

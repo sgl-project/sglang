@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 # Copyright 2023-2024 SGLang Team
@@ -66,6 +67,7 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    release_kv_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -441,6 +443,7 @@ class Req:
         sampling_params: SamplingParams,
         return_logprob: bool = False,
         top_logprobs_num: int = 0,
+        dllm_config: Optional[DllmConfig] = None,
         token_ids_logprob: List[int] = None,
         stream: bool = False,
         origin_input_ids_unpadded: Optional[Tuple[int]] = None,
@@ -478,6 +481,12 @@ class Req:
         self.fill_ids = []
         self.session_id = session_id
         self.input_embeds = input_embeds
+
+        # For req-level memory management
+        self.kv_committed_len = 0
+        self.kv_allocated_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
 
         # for corss-endoder model
         self.token_type_ids = token_type_ids
@@ -555,8 +564,8 @@ class Req:
         self.host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
-        # The prefix length of the last prefix matching
-        self.last_matched_prefix_len: int = 0
+        # The prefix length that is inserted into the tree cache
+        self.cache_protected_len: int = 0
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -565,6 +574,8 @@ class Req:
 
         # For retraction
         self.is_retracted = False
+        # Indicates if the req has ever been retracted.
+        self.retracted_stain = False
 
         # Incremental streamining
         self.send_token_offset: int = 0
@@ -674,8 +685,14 @@ class Req:
         # For Matryoshka embeddings
         self.dimensions = dimensions
 
+        # For diffusion LLM
+        self.dllm_ids = []
+        self.dllm_block_offset = 0
+        self.dllm_config = dllm_config
+
     @property
-    def seqlen(self):
+    def seqlen(self) -> int:
+        """Get the current sequence length of the request."""
         return len(self.origin_input_ids) + len(self.output_ids)
 
     @property
@@ -692,6 +709,35 @@ class Req:
         if self.finished_len is not None:
             return self.output_ids[: self.finished_len]
         return self.output_ids
+
+    def pop_committed_kv_cache(self) -> int:
+        """Return the length of committed KV cache and mark them as freed."""
+
+        # NOTE: This function is called exactly once after the request is finished.
+        global_server_args = get_global_server_args()
+        topk = global_server_args.speculative_eagle_topk
+
+        enable_kv_committed_len = topk is None or topk == 1
+        if enable_kv_committed_len:
+            assert (
+                not self.kv_committed_freed
+            ), f"Committed KV cache already freed ({self.kv_committed_len=})"
+            self.kv_committed_freed = True
+            return self.kv_committed_len
+        else:
+            return len(self.origin_input_ids) + max(len(self.output_ids) - 1, 0)
+
+    def pop_overallocated_kv_cache(self) -> Tuple[int, int]:
+        """Return the range of over-allocated KV cache and mark them as freed."""
+
+        # NOTE: This function is called when there is over-allocation of KV cache.
+        # Over-allocation: we allocate more KV cache than the committed length.
+        # e.g., speculative decoding may allocate more KV cache than actually used.
+        assert (
+            not self.kv_overallocated_freed
+        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
+        self.kv_overallocated_freed = True
+        return self.kv_committed_len, self.kv_allocated_len
 
     def add_latency(self, stage: RequestStage):
         if self.metrics_collector is None:
@@ -713,8 +759,28 @@ class Req:
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def is_dllm(self):
+        return self.dllm_config is not None
+
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
-        self.fill_ids = self.origin_input_ids + self.output_ids
+        if self.is_dllm():
+            if not self.fill_ids:
+                self.dllm_ids = (
+                    self.origin_input_ids
+                    + [
+                        self.dllm_config.mask_id,
+                    ]
+                    * self.dllm_config.block_size
+                )
+            else:
+                self.dllm_block_offset += self.dllm_config.block_size
+                self.dllm_ids += [
+                    self.dllm_config.mask_id
+                ] * self.dllm_config.block_size
+            self.fill_ids = self.dllm_ids
+        else:
+            self.fill_ids = self.origin_input_ids + self.output_ids
+
         input_len = len(self.fill_ids)
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
         max_prefix_len = input_len - 1
@@ -724,12 +790,7 @@ class Req:
         token_ids = self.fill_ids[:max_prefix_len]
 
         if tree_cache is not None:
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-            ) = tree_cache.match_prefix(
+            match_result = tree_cache.match_prefix(
                 key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
                 **(
                     {"req": self, "cow_mamba": True}
@@ -737,7 +798,34 @@ class Req:
                     else {}
                 ),
             )
-            self.last_matched_prefix_len = len(self.prefix_indices)
+            (
+                self.prefix_indices,
+                self.last_node,
+                self.last_host_node,
+                self.host_hit_length,
+            ) = (
+                match_result.device_indices,
+                match_result.last_device_node,
+                match_result.last_host_node,
+                match_result.host_hit_length,
+            )
+            self.cache_protected_len = len(self.prefix_indices)
+
+        if (
+            self.is_retracted
+            and self.multimodal_inputs is not None
+            and self.multimodal_inputs.mrope_positions is not None
+        ):
+            from sglang.srt.managers.mm_utils import (
+                extend_mrope_positions_for_retracted_request,
+            )
+
+            self.multimodal_inputs.mrope_positions = (
+                extend_mrope_positions_for_retracted_request(
+                    self.multimodal_inputs.mrope_positions, len(self.output_ids)
+                )
+            )
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -911,6 +999,7 @@ class Req:
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
         self.is_retracted = True
+        self.retracted_stain = True
         self.input_token_logprobs = None
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
@@ -918,6 +1007,10 @@ class Req:
         self.is_chunked = 0
         self.mamba_pool_idx = None
         self.already_computed = 0
+        self.kv_allocated_len = 0
+        self.kv_committed_len = 0
+        self.kv_committed_freed = False
+        self.kv_overallocated_freed = False
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -973,7 +1066,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
-    is_hybrid: bool = False
+    is_hybrid_swa: bool = False
 
     # Batch configs
     model_config: ModelConfig = None
@@ -1010,6 +1103,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
     # For DP attention
+    inner_idle_batch: Optional[ScheduleBatch] = None
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
     is_extend_in_batch: bool = False
@@ -1077,6 +1171,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # hicache pointer for synchronizing data loading from CPU to GPU
     hicache_consumer_index: int = -1
 
+    # Diffusion LLM
+    dllm_config: Optional[DllmConfig] = None
+
     @classmethod
     def init_new(
         cls,
@@ -1088,24 +1185,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
+        dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
-        is_hybrid = False
+        is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert (
                 tree_cache is None
                 or isinstance(tree_cache, SWARadixCache)
                 or isinstance(tree_cache, SWAChunkCache)
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
-            is_hybrid = True
+            is_hybrid_swa = True
 
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
-            is_hybrid=is_hybrid,
+            is_hybrid_swa=is_hybrid_swa,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
@@ -1116,6 +1214,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
+            dllm_config=dllm_config,
         )
 
     def batch_size(self):
@@ -1123,6 +1222,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def is_empty(self):
         return len(self.reqs) == 0
+
+    def is_dllm(self):
+        return self.dllm_config is not None
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         self.encoder_lens_cpu = []
@@ -1261,6 +1363,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.req_pool_idx = req_pool_indices[i]
             assert seq_len - pre_len == req.extend_input_len
 
+            # update req-level memory management fields
+            req.kv_committed_len = seq_len
+            req.kv_allocated_len = seq_len
+
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # If req.input_embeds is already a list, append its content directly
@@ -1268,8 +1374,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             multimodal_inputs.append(req.multimodal_inputs)
 
-            req.cached_tokens += pre_len - req.already_computed
-            req.already_computed = seq_len
+            # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
+            # flag will always True
+            if not req.retracted_stain:
+                req.cached_tokens += pre_len - req.already_computed
+                req.already_computed = seq_len
             req.is_retracted = False
 
             # Compute the relative logprob_start_len in an extend batch
@@ -1435,6 +1544,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         if page_size == 1:
             return len(requests)
+
+        if not self.spec_algorithm.is_none():
+            # A loose bound that err towards safety
+            server_args = get_global_server_args()
+            thresh = server_args.speculative_num_draft_tokens + (
+                (server_args.speculative_eagle_topk or 1)
+                * (server_args.speculative_num_steps or 1)
+            )
+            return sum(
+                1 for req in requests if ((req.seqlen + thresh) % page_size) <= thresh
+            )
+
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
         return (
@@ -1455,8 +1576,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
         return self._is_available_size_sufficient(num_tokens)
 
+    def retract_all(self, server_args: ServerArgs):
+        retracted_reqs = self.reqs
+        for idx in range(len(self.reqs)):
+            self.release_req(idx, len(self.reqs) - idx, server_args)
+
+        self.filter_batch(retracted_reqs)
+        return retracted_reqs
+
     def retract_decode(
-        self, server_args: ServerArgs
+        self,
+        server_args: ServerArgs,
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = list(range(len(self.reqs)))
@@ -1482,7 +1612,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
-                if self.is_hybrid:
+                if self.is_hybrid_swa:
                     full_available_size = (
                         self.token_to_kv_pool_allocator.full_available_size()
                     )
@@ -1535,7 +1665,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
-        self.tree_cache.cache_finished_req(req, is_insert=False)
+        release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
@@ -1612,6 +1742,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+
+        # Update req-level memory management fields
+        for req in self.reqs:
+            req.kv_committed_len += 1
+            req.kv_allocated_len += 1
 
         # Update seq_lens after allocation
         if self.enable_overlap:
@@ -1704,7 +1839,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def merge_batch(self, other: "ScheduleBatch"):
         # NOTE: in v2 eagle mode, we do not need wait verify here because
-        # 1) current batch is always prefill, whose seq_lens and allocate_lens are not a future
+        # 1) current batch is always prefill, whose seq_lens is not a future
         # 2) other batch is always decode, which is finished in previous step
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -1815,6 +1950,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
+            dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
+            dllm_config=self.dllm_config,
+            reqs=self.reqs,
+            has_grammar=self.has_grammar,
         )
 
     def copy(self):
@@ -1839,7 +1978,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             return (
                 self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
                 and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens
@@ -1928,3 +2067,12 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # Diffusion LLM
+    dllm_block_offsets: Optional[List[int]] = None
+    dllm_config: Optional[DllmConfig] = None
+
+    # For constrained decoding
+    # FIXME(lsyin): remove this after fully overlap grammar
+    reqs: Optional[List[Req]] = None
+    has_grammar: bool = False

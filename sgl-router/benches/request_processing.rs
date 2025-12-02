@@ -2,10 +2,10 @@ use std::time::Instant;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::{from_str, to_string, to_value, to_vec};
-use sglang_router_rs::{
+use sgl_model_gateway::{
     core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::StringOrArray,
         completion::CompletionRequest,
         generate::GenerateRequest,
@@ -33,6 +33,7 @@ fn get_bootstrap_info(worker: &BasicWorker) -> (String, Option<u16>) {
 fn default_generate_request() -> GenerateRequest {
     GenerateRequest {
         text: None,
+        model: None,
         input_ids: None,
         input_embeds: None,
         image_data: None,
@@ -148,11 +149,11 @@ fn create_sample_chat_completion_request() -> ChatCompletionRequest {
         model: "gpt-3.5-turbo".to_string(),
         messages: vec![
             ChatMessage::System {
-                content: "You are a helpful assistant".to_string(),
+                content: MessageContent::Text("You are a helpful assistant".to_string()),
                 name: None,
             },
             ChatMessage::User {
-                content: UserMessageContent::Text(
+                content: MessageContent::Text(
                     "Explain quantum computing in simple terms".to_string(),
                 ),
                 name: None,
@@ -188,18 +189,20 @@ fn create_sample_completion_request() -> CompletionRequest {
 #[allow(deprecated)]
 fn create_large_chat_completion_request() -> ChatCompletionRequest {
     let mut messages = vec![ChatMessage::System {
-        content: "You are a helpful assistant with extensive knowledge.".to_string(),
+        content: MessageContent::Text(
+            "You are a helpful assistant with extensive knowledge.".to_string(),
+        ),
         name: None,
     }];
 
     // Add many user/assistant pairs to simulate a long conversation
     for i in 0..50 {
         messages.push(ChatMessage::User {
-            content: UserMessageContent::Text(format!("Question {}: What do you think about topic number {} which involves complex reasoning about multiple interconnected systems and their relationships?", i, i)),
+            content: MessageContent::Text(format!("Question {}: What do you think about topic number {} which involves complex reasoning about multiple interconnected systems and their relationships?", i, i)),
             name: None,
         });
         messages.push(ChatMessage::Assistant {
-            content: Some(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i)),
+            content: Some(MessageContent::Text(format!("Answer {}: This is a detailed response about topic {} that covers multiple aspects and provides comprehensive analysis of the interconnected systems you mentioned.", i, i))),
             name: None,
             tool_calls: None,
             reasoning_content: None,

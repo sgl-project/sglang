@@ -406,6 +406,9 @@ class NDRotaryEmbedding(torch.nn.Module):
         start_frame: int = 0,
         device: torch.device | str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Handles sp internally
+        """
         # Caching wrapper: use grid parameters directly as the key.
         # grid_tuple = _to_tuple(grid_size, dim=self.ndim)
         device_str = str(device) if device is not None else "cpu"

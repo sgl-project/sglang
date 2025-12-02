@@ -17,13 +17,13 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use sglang_router_rs::{
+use sgl_model_gateway::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
     },
     data_connector::{ResponseId, StoredResponse},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::StringOrArray,
         completion::CompletionRequest,
         generate::GenerateRequest,
@@ -577,12 +577,14 @@ async fn test_router_factory_openai_mode() {
         worker_urls: vec!["https://api.openai.com".to_string()],
     };
 
-    let router_config =
-        RouterConfig::new(routing_mode, sglang_router_rs::config::PolicyConfig::Random);
+    let router_config = RouterConfig::new(
+        routing_mode,
+        sgl_model_gateway::config::PolicyConfig::Random,
+    );
 
     let app_context = common::create_test_context(router_config).await;
 
-    let router = sglang_router_rs::routers::RouterFactory::create_router(&app_context).await;
+    let router = sgl_model_gateway::routers::RouterFactory::create_router(&app_context).await;
     assert!(
         router.is_ok(),
         "Router factory should create OpenAI router successfully"
@@ -602,6 +604,7 @@ async fn test_unsupported_endpoints() {
 
     let generate_request = GenerateRequest {
         text: Some("Hello world".to_string()),
+        model: None,
         input_ids: None,
         input_embeds: None,
         image_data: None,
@@ -661,7 +664,7 @@ async fn test_openai_router_chat_completion_with_mock() {
     // Create a minimal chat completion request
     let mut chat_request = create_minimal_chat_request();
     chat_request.messages = vec![ChatMessage::User {
-        content: UserMessageContent::Text("Hello, how are you?".to_string()),
+        content: MessageContent::Text("Hello, how are you?".to_string()),
         name: None,
     }];
     chat_request.temperature = Some(0.7);

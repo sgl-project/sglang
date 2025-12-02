@@ -24,7 +24,6 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
-from sglang.srt.utils.common import cached_triton_kernel
 
 if is_flashinfer_available():
     import flashinfer
@@ -51,7 +50,6 @@ DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK_SIZE"]))
 @triton.jit
 def pad_draft_extend_query_kernel(
     q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
@@ -125,7 +123,6 @@ def pad_draft_extend_query_kernel(
     )
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK_SIZE"]))
 @triton.jit
 def unpad_draft_extend_output_kernel(
     raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)
@@ -207,6 +204,7 @@ class TRTLLMMLAPrefillMetadata:
     max_seq_len: int
     cum_seq_lens: torch.Tensor
     seq_lens: torch.Tensor
+    fallback_to_flashinfer_impl: bool = False
 
 
 @dataclass
@@ -551,13 +549,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and not forward_batch.forward_mode.is_target_verify()
             and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
-            if self.disable_chunked_prefix_cache:
+            # For extend batch with prefix length > 0, fallback to ragged kernel implemented in flashinfer MLA backend
+            # when chunked prefix cache is disabled.
+            has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+            fallback_to_flashinfer_impl = (
+                self.disable_chunked_prefix_cache and has_prefix
+            )
+            if fallback_to_flashinfer_impl:
                 super().init_forward_metadata(forward_batch)
 
             seq_lens = forward_batch.seq_lens - forward_batch.extend_prefix_lens
             cum_seq_lens_q = torch.cat(
                 (
-                    torch.tensor([0], device=forward_batch.seq_lens.device),
+                    torch.zeros(
+                        1, dtype=torch.int32, device=forward_batch.seq_lens.device
+                    ),
                     torch.cumsum(seq_lens, dim=0),
                 )
             ).int()
@@ -566,6 +572,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len,
                 cum_seq_lens_q,
                 seq_lens,
+                fallback_to_flashinfer_impl,
             )
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
@@ -897,6 +904,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
     ) -> torch.Tensor:
+
+        if (
+            self.forward_prefill_metadata is not None
+            and self.forward_prefill_metadata.fallback_to_flashinfer_impl
+        ):
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         if (
@@ -1021,9 +1037,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if k_rope is not None:
             k = torch.cat([k, k_rope], dim=-1)
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
-
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
-
+        # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
         if forward_batch.attn_attend_prefix_cache:
             # MHA for chunked prefix kv cache when running model with MLA
             assert forward_batch.prefix_chunk_idx is not None

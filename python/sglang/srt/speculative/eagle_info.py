@@ -116,6 +116,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 len(batch.input_ids),
             )
             end_offset = batch.seq_lens + self.draft_token_num
+            for req in batch.reqs:
+                req.kv_allocated_len += 1
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
@@ -415,6 +417,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            for i, req in enumerate(batch.reqs):
+                req.kv_committed_len += accept_length_list[i] + 1
+                req.kv_allocated_len = req.kv_committed_len
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
@@ -426,6 +431,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     next_power_of_2(self.draft_token_num),
                 )
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                for i, req in enumerate(batch.reqs):
+                    req.kv_committed_len += accept_length_list[i] + 1
+                    req.kv_allocated_len = req.kv_committed_len
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
@@ -616,7 +624,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
-    allocate_lens: Optional[torch.Tensor] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
 
@@ -657,6 +664,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length_cpu=[],
         )
@@ -728,7 +736,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
-            self.allocate_lens = self.allocate_lens[new_indices]
             return
 
         if has_been_filtered:
@@ -756,9 +763,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 indices=torch.cat(
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
-            )
-            self.allocate_lens = torch.cat(
-                [self.allocate_lens, spec_info.allocate_lens]
             )
             return
 

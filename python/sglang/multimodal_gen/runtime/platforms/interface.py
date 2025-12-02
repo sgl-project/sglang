@@ -23,7 +23,7 @@ logger = init_logger(__name__)
 
 
 class AttentionBackendEnum(enum.Enum):
-    FA3 = enum.auto()
+    FA = enum.auto()
     SLIDING_TILE_ATTN = enum.auto()
     TORCH_SDPA = enum.auto()
     SAGE_ATTN = enum.auto()

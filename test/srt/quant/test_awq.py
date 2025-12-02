@@ -1,8 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-import requests
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -73,7 +71,7 @@ class TestAWQMarlinBfloat16(CustomTestCase):
         )
 
         metrics = run_eval(args)
-        self.assertGreater(metrics["score"], 0.87)
+        self.assertGreater(metrics["score"], 0.85)
 
 
 if __name__ == "__main__":

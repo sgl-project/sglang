@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_fp8_ptpc_linear,
     normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
@@ -61,7 +62,6 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 )
                 if input_scale is not None:
                     layer.input_scale = Parameter(input_scale, requires_grad=False)
-
             layer.weight = Parameter(weight.t(), requires_grad=False)
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
 
@@ -83,6 +83,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 weight_scale = layer.weight_scale.data
 
             if _use_aiter:
+                # keep the weight as (N, K)
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)), requires_grad=False
                 )
@@ -161,12 +162,23 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return apply_fp8_linear(
-            input=x,
-            weight=layer.weight,
-            weight_scale=layer.weight_scale,
-            input_scale=layer.input_scale,
-            bias=bias,
-            use_per_token_if_dynamic=True,
-            compressed_tensor_quant=True,
-        )
+        if _use_aiter and self.strategy == QuantizationStrategy.CHANNEL:
+            return apply_fp8_ptpc_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+            )
+        else:
+            return apply_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+            )
