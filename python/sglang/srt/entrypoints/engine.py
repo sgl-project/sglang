@@ -76,6 +76,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     launch_dummy_health_check_server,
     maybe_reindex_device_id,
+    numa_utils,
     prepare_model_and_tokenizer,
     set_prometheus_multiproc_dir,
     set_ulimit,
@@ -466,6 +467,7 @@ class Engine(EngineBase):
         shapes: list[list[int]],
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
+        load_format: Optional[str] = None,
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -474,6 +476,7 @@ class Engine(EngineBase):
             shapes=shapes,
             group_name=group_name,
             flush_cache=flush_cache,
+            load_format=load_format,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -844,7 +847,9 @@ def _launch_subprocesses(
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess():
+                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                        server_args, gpu_id
+                    ):
                         proc.start()
 
                 scheduler_procs.append(proc)
