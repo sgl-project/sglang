@@ -113,12 +113,35 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     def run_lora_a_embedding(
         self, input_: torch.Tensor, batch_info: LoRABatchInfo
     ) -> torch.Tensor:
+        #############################
+        #########cuda lora###########
+        #############################
+        batch_info = self.lora_backend.batch_info
+        # if batch_info.use_cuda_graph:
+        # cuda
         """
-        Apply LoRA A weights using efficient embedding lookup.
+        Apply LoRA A weights using efficient embedding lookup with CUDA graph support.
         Maps tokens to their corresponding LoRA adapters internally.
         """
-        token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-        lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
+        # Use backend implementation which supports CUDA graph
+        lora_a_output = self.lora_backend.run_lora_a_embedding(
+            input_ids=input_,
+            weights=self.embedding_A_buffer,
+            vocab_size=self.vocab_size,
+            extra_embeddings=self.new_embeddings_buffer if hasattr(self, 'new_embeddings_buffer') and self.new_embeddings_buffer is not None else None,
+        )
+        return lora_a_output
+        # else:
+        #     # non-cuda
+        #     """
+        #     Apply LoRA A weights using efficient embedding lookup.
+        #     Maps tokens to their corresponding LoRA adapters internally.
+        #     """
+        #     token_weight_indices = self._get_token_weight_indices(input_, batch_info)
+        #     lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
+        #############################
+        #############################
+        #############################
 
         return lora_a_output 
         
@@ -179,31 +202,86 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         ###############
         ############### consider both non-extra and extra tokens
         ###############
+
+        ##############################
+        ##########cuda lora###########
+        ##############################
+        # batch_info = self.lora_backend.batch_info
+        # if batch_info.use_cuda_graph:
+        """
+        Forward pass with LoRA support and CUDA graph compatibility.
         
+        Extra tokens (tokens >= vocab_size) are now handled efficiently
+        in the backend's run_lora_a_embedding method.
+        """
         batch_info = self.lora_backend.batch_info
-    
-        # Handle added tokens (tokens beyond base vocabulary)
+        
+        # Get base embedding output
+        # For tokens >= vocab_size, base_layer will clamp or handle them
+        # We mask them to 0 to avoid out-of-bounds access
         added_tokens_mask = input_ > self.vocab_size - 1
-        base_output = self.base_layer.forward(input_.masked_fill(added_tokens_mask, 0))
-
-        # Process extra tokens if they exist
-        if added_tokens_mask.any():
-            token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-            added_weight_indices = token_weight_indices[added_tokens_mask]
-            unique_added_weight_indices = torch.unique(added_weight_indices)
-
-            for idx in unique_added_weight_indices:
-                lora_mask = added_weight_indices == idx
-                added_token_positions = torch.where(added_tokens_mask)[0][lora_mask]
-                x = input_[added_token_positions] - self.vocab_size
-                new_embeddings = F.embedding(x, self.new_embeddings_buffer[idx])
-                base_output[added_token_positions] = new_embeddings
-
-        # Apply LoRA if set
+        base_input = input_.masked_fill(added_tokens_mask, 0)
+        base_output = self.base_layer.forward(base_input)
+        
+        # Apply LoRA if configured
         if self.set_lora:
+            # The backend's run_lora_a_embedding now handles both regular
+            # and extra tokens efficiently with CUDA graph support
             output = self.apply_lora(base_output, input_, batch_info)
         else:
-            output = base_output
+            ## Optimized for CUDA graph compatibility
+
+            # Support extra_token
+            if added_tokens_mask.any() and hasattr(self, 'new_embeddings_buffer') and self.new_embeddings_buffer is not None:
+                # Use backend even without LoRA to handle extra tokens with CUDA graph support
+                # The backend's run_lora_a_embedding can handle extra_embeddings directly
+                extra_output = self.lora_backend.run_lora_a_embedding(
+                    input_ids=input_,
+                    weights=torch.zeros(
+                        (self.new_embeddings_buffer.shape[0], self.new_embeddings_buffer.shape[2], self.vocab_size),
+                        device=input_.device,
+                        dtype=self.new_embeddings_buffer.dtype
+                    ),  # Dummy LoRA weights (all zeros)
+                    vocab_size=self.vocab_size,
+                    extra_embeddings=self.new_embeddings_buffer,
+                )
+                # Only use extra embeddings for tokens >= vocab_size
+                # For regular tokens, keep base_output; for extra tokens, use extra_output
+                output = torch.where(
+                    added_tokens_mask.unsqueeze(-1),
+                    extra_output,
+                    base_output
+                )
+            else:
+                # Do not have extra token
+                output = base_output
+        ##############################
+        ##############################
+        ##############################
+        # else: 
+        #     batch_info = self.lora_backend.batch_info
+        #     # Handle added tokens (tokens beyond base vocabulary)
+        #     added_tokens_mask = input_ > self.vocab_size - 1
+        #     base_output = self.base_layer.forward(input_.masked_fill(added_tokens_mask, 0))
+
+        #     # Process extra tokens if they exist
+        #     if added_tokens_mask.any():
+        #         token_weight_indices = self._get_token_weight_indices(input_, batch_info)
+        #         added_weight_indices = token_weight_indices[added_tokens_mask]
+        #         unique_added_weight_indices = torch.unique(added_weight_indices)
+
+        #         for idx in unique_added_weight_indices:
+        #             lora_mask = added_weight_indices == idx
+        #             added_token_positions = torch.where(added_tokens_mask)[0][lora_mask]
+        #             x = input_[added_token_positions] - self.vocab_size
+        #             new_embeddings = F.embedding(x, self.new_embeddings_buffer[idx])
+        #             base_output[added_token_positions] = new_embeddings
+
+        #     # Apply LoRA if set
+        #     if self.set_lora:
+        #         output = self.apply_lora(base_output, input_, batch_info)
+        #     else:
+        #         output = base_output
 
         return output
         ##############################

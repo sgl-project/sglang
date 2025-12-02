@@ -817,8 +817,14 @@ class LogitsProcessor(nn.Module):
         ##############################
         if hasattr(lm_head, 'set_lora') and hasattr(lm_head, 'apply_lora'):
             # This is a LoRA-wrapped module, use its forward method
-            #[TODO] improve lm_head forward infernce 
             logits = lm_head(hidden_states)
+            # logits = torch.matmul(
+            #         hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+            #     )
+            # print("====")
+            # print(self.use_fp32_lm_head)
+            # print("====")
+            # exit()
 
     
         # if hasattr(lm_head, "weight"):
