@@ -693,11 +693,13 @@ class DenoisingStage(PipelineStage):
         reserved_frames_mask,
     ):
         bsz = batch.raw_latent_shape[0]
-        # expand timestep
-        if (
+        should_preprocess_for_wan_ti2v = (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
             and batch.condition_image is not None
-        ):
+            and isinstance(server_args.pipeline_config, Wan2_2_TI2V_5B_Config)
+        )
+        # expand timestep
+        if should_preprocess_for_wan_ti2v:
             # Explicitly cast t_device to the target float type at the beginning.
             # This ensures any precision-based rounding (e.g., float32(999.0) -> bfloat16(1000.0))
             # is applied consistently *before* it's used by any rank.
@@ -739,10 +741,12 @@ class DenoisingStage(PipelineStage):
         """
         For Wan2.2 ti2v task, global first frame should be replaced with encoded image after each timestep
         """
-        if (
+        should_preprocess_for_wan_ti2v = (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
             and batch.condition_image is not None
-        ):
+            and isinstance(server_args.pipeline_config, Wan2_2_TI2V_5B_Config)
+        )
+        if should_preprocess_for_wan_ti2v:
             # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
             # This ensures the first frame is always the condition image after each step.
             # This is only applied on rank 0, where z is not None.
