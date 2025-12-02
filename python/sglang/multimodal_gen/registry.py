@@ -392,13 +392,13 @@ def _register_configs():
 
     # FLUX
     register_configs(
-        model_name="flux",
+        model_name="flux-1",
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=FluxPipelineConfig,
         model_paths=[
             "black-forest-labs/FLUX.1-dev",
         ],
-        model_detectors=[lambda id: "flux" in id.lower()],
+        model_detectors=[lambda id: "flux.1" in id.lower()],
     )
     register_configs(
         model_name="flux-2",
