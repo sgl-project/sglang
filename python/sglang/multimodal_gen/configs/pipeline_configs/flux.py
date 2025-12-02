@@ -4,6 +4,7 @@ from typing import Callable, List, Optional
 
 import PIL
 import torch
+from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
@@ -465,8 +466,19 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
         return None
 
-    def resize_condition_image(self, image, target_width, target_height):
-        return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+    def preprocess_condition_image(
+        self, image, target_width, target_height, vae_image_processor: VaeImageProcessor
+    ):
+        img = image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+        image_width, image_height = img.size
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        multiple_of = vae_scale_factor * 2
+        image_width = (image_width // multiple_of) * multiple_of
+        image_height = (image_height // multiple_of) * multiple_of
+        img = vae_image_processor.preprocess(
+            img, height=image_height, width=image_width, resize_mode="crop"
+        )
+        return img, (image_width, image_height)
 
     def postprocess_image_latent(self, latent_condition, batch):
         batch_size = batch.batch_size

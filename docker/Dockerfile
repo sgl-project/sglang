@@ -9,7 +9,7 @@ ARG GRACE_BLACKWELL=0
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.18.post1
+ARG SGL_KERNEL_VERSION=0.3.18.post2
 ARG SGL_VERSION=0.5.5.post3
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -18,7 +18,6 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.5.3
-ARG CUDA_VERSION
 ARG NVSHMEM_VERSION=3.4.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -148,6 +147,10 @@ ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
     LC_ALL=en_US.UTF-8
 
+########################################################
+########## Framework Development Image ################
+########################################################
+
 # Copy local source if building from local
 FROM scratch AS local_src
 COPY . /src
@@ -247,8 +250,7 @@ RUN set -eux; \
         cd .. ; \
     fi
 
-# Install DeepEP with proper CUDA architecture handling
-# CRITICAL FIX: CUDA 12.8.1 should NOT include Blackwell (10.3) - only 12.9.1+
+# Install DeepEP 
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
@@ -273,17 +275,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
 # Install nvidia-cutlass-dsl for flashinfer_cutedsl (WideEP configs)
+# Using stable versions: 4.3.0 for CUDA 12, 4.3.1 for CUDA 13
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0" --extra-index-url https://pypi.org/simple/
-
-# For CUDA 13, install triton from source to fix sm103 issues
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$CUDA_VERSION" = "13.0.1" ]; then \
-        curl --retry 3 --retry-delay 2 -fsSL -o ${TRITON_LANG_COMMIT}.zip \
-            https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/${TRITON_LANG_COMMIT}.zip && \
-        unzip -q ${TRITON_LANG_COMMIT}.zip && rm ${TRITON_LANG_COMMIT}.zip && mv triton-${TRITON_LANG_COMMIT} triton && \
-        cd triton && pip install --break-system-packages -r python/requirements.txt && \
-        MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
+    if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+        python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps; \
+    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps; \
     fi
 
 # Install essential Python packages
@@ -316,6 +313,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && cp target/release/sglang-router /usr/local/bin/sglang-router \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
+
 
 # Install development tools
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
@@ -371,7 +369,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     tabulate \
     termplotlib
 
-# Install external development tools with retry logic
 # diff-so-fancy
 RUN curl --retry 3 --retry-delay 2 -LSso /usr/local/bin/diff-so-fancy \
         https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
