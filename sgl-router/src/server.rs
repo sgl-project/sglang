@@ -693,7 +693,7 @@ pub fn build_app(
         .with_state(app_state)
 }
 
-pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn startup(mut config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
@@ -721,6 +721,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     if let Some(prometheus_config) = &config.prometheus_config {
         metrics::start_prometheus(prometheus_config.clone());
+    }
+
+    // Auto-enable IGW mode when service discovery is enabled
+    // This ensures all router types (HTTP/gRPC, Regular/PD) are available to handle
+    // dynamically discovered workers whose protocols and modes are not known in advance
+    if let Some(ref sd_config) = config.service_discovery_config {
+        if sd_config.enabled && !config.router_config.enable_igw {
+            info!(
+                "Automatically enabling IGW mode because service discovery is enabled. \
+                IGW mode spins up all router types (HTTP/gRPC, Regular/PD) to handle any workers \
+                that may be dynamically discovered, since their protocols and modes are not known in advance."
+            );
+            config.router_config.enable_igw = true;
+        }
     }
 
     info!(
