@@ -433,7 +433,7 @@ class SGLangTraceReqContext:
         ts = ts or get_cur_time_ns()
 
         # End all unclosed thread spans.
-        if self.thread_context.thread_span:
+        if self.thread_context and self.thread_context.thread_span:
             self.thread_context.thread_span.end(end_time=ts)
 
         if attrs:
@@ -547,10 +547,10 @@ class SGLangTraceReqContext:
                     self.thread_context.cur_slice = (
                         self.thread_context.cur_slice.parent_slice
                     )
-                self.__release_slice_reference_tree(
-                    self.thread_context.cur_slice.parent_slice
-                )
+                self.__release_slice_reference_tree(self.thread_context.cur_slice)
+                self.thread_context.cur_slice = None
 
+            self.thread_context = None
             return
 
         if auto_next_anon:
@@ -566,6 +566,9 @@ class SGLangTraceReqContext:
         level: int = 1,
     ):
         if not self.tracing_enable:
+            return
+
+        if not self.thread_context:
             return
 
         if not self.thread_context.cur_slice:
