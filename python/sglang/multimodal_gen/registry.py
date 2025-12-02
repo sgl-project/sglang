@@ -276,7 +276,7 @@ def _register_configs():
         hf_model_paths=[
             "hunyuanvideo-community/HunyuanVideo",
         ],
-        model_detectors=[lambda id: "hunyuan" in id.lower()],
+        model_detectors=[lambda hf_id: "hunyuan" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=FastHunyuanSamplingParam,
@@ -293,7 +293,7 @@ def _register_configs():
         hf_model_paths=[
             "FastVideo/stepvideo-t2v-diffusers",
         ],
-        model_detectors=[lambda id: "stepvideo" in id.lower()],
+        model_detectors=[lambda hf_id: "stepvideo" in hf_id.lower()],
     )
 
     # Wan
@@ -303,7 +303,7 @@ def _register_configs():
         hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         ],
-        model_detectors=[lambda id: "wanpipeline" in id.lower()],
+        model_detectors=[lambda hf_id: "wanpipeline" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=WanT2V_14B_SamplingParams,
@@ -318,7 +318,7 @@ def _register_configs():
         hf_model_paths=[
             "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
         ],
-        model_detectors=[lambda id: "wanimagetovideo" in id.lower()],
+        model_detectors=[lambda hf_id: "wanimagetovideo" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=WanI2V_14B_720P_SamplingParam,
@@ -374,7 +374,7 @@ def _register_configs():
         hf_model_paths=[
             "black-forest-labs/FLUX.1-dev",
         ],
-        model_detectors=[lambda id: "flux.1" in id.lower()],
+        model_detectors=[lambda hf_id: "flux.1" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=FluxSamplingParams,
@@ -382,7 +382,7 @@ def _register_configs():
         hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
         ],
-        model_detectors=[lambda id: "flux.2" in id.lower()],
+        model_detectors=[lambda hf_id: "flux.2" in hf_id.lower()],
     )
     register_configs(
         sampling_param_cls=ZImageSamplingParams,
@@ -390,7 +390,7 @@ def _register_configs():
         hf_model_paths=[
             "Tongyi-MAI/Z-Image-Turbo",
         ],
-        model_detectors=[lambda id: "z-image" in id.lower()],
+        model_detectors=[lambda hf_id: "z-image" in hf_id.lower()],
     )
 
     # Qwen-Image
