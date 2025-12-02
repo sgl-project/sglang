@@ -785,6 +785,8 @@ class ForwardBatch:
                     )
                 else:
                     bs = self.batch_size = num_tokens
+        elif self.forward_mode.is_extend():
+            self.extend_num_tokens = num_tokens
 
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
@@ -801,8 +803,6 @@ class ForwardBatch:
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
-        if self.forward_mode.is_extend():
-            self.extend_num_tokens = num_tokens
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
