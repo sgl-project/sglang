@@ -33,7 +33,7 @@ bindings/python/
 pip install maturin
 
 # Build and install in development mode
-cd sgl-router/bindings/python
+cd sgl-model-gateway/bindings/python
 maturin develop --features vendored-openssl
 ```
 
@@ -41,7 +41,7 @@ maturin develop --features vendored-openssl
 
 ```bash
 # Build wheel
-cd sgl-router/bindings/python
+cd sgl-model-gateway/bindings/python
 maturin build --release --out dist --features vendored-openssl
 
 # Install the built wheel
@@ -52,7 +52,7 @@ pip install dist/sglang_router-*.whl
 
 ```bash
 # Run Python tests
-cd sgl-router
+cd sgl-model-gateway
 pytest py_test/
 ```
 
