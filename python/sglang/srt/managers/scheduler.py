@@ -1658,7 +1658,9 @@ class Scheduler(
             # Merge the new batch into the running batch.
             # For prefill-only batch, we can avoid going through decoding step.
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
-                if self.running_batch.is_empty() or all(req.finished() for req in self.running_batch.reqs):
+                if self.running_batch.is_empty() or all(
+                    req.finished() for req in self.running_batch.reqs
+                ):
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch

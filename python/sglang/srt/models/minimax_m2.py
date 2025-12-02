@@ -155,7 +155,7 @@ class MiniMaxM2MoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_local_experts
-                        + get_global_server_args().ep_num_redundant_experts,
+            + get_global_server_args().ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -399,7 +399,7 @@ class MiniMaxM2Attention(nn.Module):
             reduce_results=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
-            )
+        )
 
         # Setup RoPE with partial rotary dimension
         rope_scaling = getattr(config, "rope_scaling", None)

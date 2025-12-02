@@ -1,3 +1,4 @@
+import logging
 import os
 from typing import Iterable, Optional, Tuple
 
@@ -8,19 +9,19 @@ from transformers import PretrainedConfig
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.minimax_m2 import MiniMaxM2DecoderLayer, MiniMaxM2ForCausalLM
-import logging
+
 logger = logging.getLogger(__name__)
 
-DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
 
 
 class MiniMaxM2MultiTokenPredictorLayer(nn.Module):
@@ -84,17 +85,15 @@ class MiniMaxM2ForCausalLMNextN(MiniMaxM2ForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.num_mtp_layers = getattr(
-            config, "num_nextn_predict_layers", None
-        )
+        self.num_mtp_layers = getattr(config, "num_nextn_predict_layers", None)
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
-        ) # mtp layers share the same embed_tokens
+        )  # mtp layers share the same embed_tokens
         self.mtp_layers = nn.ModuleList(
             [
                 MiniMaxM2MultiTokenPredictorLayer(
-                    config=config, quant_config=quant_config, prefix=prefix,layer_id = i
+                    config=config, quant_config=quant_config, prefix=prefix, layer_id=i
                 )
                 for i in range(self.num_mtp_layers)
             ]
@@ -118,12 +117,16 @@ class MiniMaxM2ForCausalLMNextN(MiniMaxM2ForCausalLM):
     ) -> torch.Tensor:
 
         input_embeds = self.embed_tokens(input_ids)
-        if os.getenv('DEBUG_MODE', 'false').lower() == 'true':
-            logger.warning(f"(gaoji:m2_nextn:forward: layer_idx: {layer_idx}\n"
-              f"input_ids: {input_ids.shape}\n"
-              f"input_embeds: {input_embeds.shape}\n")
+        if os.getenv("DEBUG_MODE", "false").lower() == "true":
+            logger.warning(
+                f"(gaoji:m2_nextn:forward: layer_idx: {layer_idx}\n"
+                f"input_ids: {input_ids.shape}\n"
+                f"input_embeds: {input_embeds.shape}\n"
+            )
         input_embeds[positions == 0] = 0
-        hidden_states = self.mtp_layers[layer_idx](positions, forward_batch, input_embeds) #TODO(zhongyu): support multiple MTP layers
+        hidden_states = self.mtp_layers[layer_idx](
+            positions, forward_batch, input_embeds
+        )  # TODO(zhongyu): support multiple MTP layers
         hidden_states = self.final_layernorm(hidden_states)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
@@ -200,15 +203,18 @@ class MiniMaxM2ForCausalLMNextN(MiniMaxM2ForCausalLM):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
 
     def map_model_name_to_mtp_param_name(self, name: str) -> str:
         import re
-        mtp_specific_params = ['e_norm', 'h_norm', 'linear_projection']
+
+        mtp_specific_params = ["e_norm", "h_norm", "linear_projection"]
         shared_params_name_map = {
-            'model.norm': 'final_layernorm',
-            'model.embed_tokens': 'embed_tokens',
+            "model.norm": "final_layernorm",
+            "model.embed_tokens": "embed_tokens",
         }
         for origin_name, mtp_name in shared_params_name_map.items():
             if origin_name in name:
@@ -225,7 +231,12 @@ class MiniMaxM2ForCausalLMNextN(MiniMaxM2ForCausalLM):
             return name.replace(group.group(), f"mtp_layers.{layer_id}.mtp_block.")
 
     def is_mtp_param(self, name: str) -> bool:
-        if 'mtp_layers' in name or 'final_layernorm' in name or 'embed_tokens' in name or 'lm_head' in name:
+        if (
+            "mtp_layers" in name
+            or "final_layernorm" in name
+            or "embed_tokens" in name
+            or "lm_head" in name
+        ):
             return True
         return False
 
@@ -239,4 +250,3 @@ class MiniMaxM2ForCausalLMNextN(MiniMaxM2ForCausalLM):
 
 
 EntryClass = [MiniMaxM2ForCausalLMNextN]
-

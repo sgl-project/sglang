@@ -7,7 +7,7 @@ draft token generation using the MHMTP speculative decoding algorithm.
 from __future__ import annotations
 
 import bisect
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -26,7 +26,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.mhmtp_utils import MhmtpDraftInput
-from sglang.srt.utils.common import fast_topk
 from sglang.srt.speculative.spec_utils import select_top_k_tokens
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -34,6 +33,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.common import fast_topk
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.mhmtp_worker import MhmtpWorker
