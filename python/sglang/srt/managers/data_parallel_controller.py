@@ -182,8 +182,8 @@ class DataParallelController:
                 bootstrap_room=bootstrap_room,
                 module_name="request",
                 server_args=self.server_args,
-                propagation_context=req.trace_metric_ctx,
             )
+            trace_metric_ctx.trace_set_proc_propagate_context(req.trace_metric_ctx)
             trace_metric_ctx.metric_trace_slice_start(RequestStage.DC_DISPATCH)
             req.trace_metric_ctx = trace_metric_ctx.trace_get_proc_propagate_context()
 

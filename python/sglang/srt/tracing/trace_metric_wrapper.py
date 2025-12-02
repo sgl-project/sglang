@@ -147,10 +147,7 @@ class TraceMetricContext(SGLangTraceReqContext):
         module_name,
         server_args,
         metrics_collector=None,
-        propagation_context: Optional[Dict[str, Any]] = None,
         role: Optional[str] = None,
-        ts: Optional[int] = None,
-        external_trace_header: Optional[Dict[str, Any]] = None,
     ):
         self.enable_metrics = getattr(server_args, "enable_metrics", False)
         self.metrics_collector = metrics_collector
@@ -184,11 +181,6 @@ class TraceMetricContext(SGLangTraceReqContext):
             trace_level=trace_level,
             module_name=module_name,
         )
-
-        if isinstance(propagation_context, dict):
-            super().trace_set_proc_propagate_context(propagation_context)
-        else:
-            super().trace_req_start(ts, external_trace_header=external_trace_header)
 
     def metric_trace_slice_start(
         self,

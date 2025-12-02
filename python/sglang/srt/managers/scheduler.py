@@ -2556,6 +2556,7 @@ class Scheduler(
 
         bootstrap_room = req.bootstrap_room if hasattr(req, "bootstrap_room") else None
 
+        propagation_context = req.trace_metric_ctx
         req.trace_metric_ctx = TraceMetricContext(
             req.rid,
             bootstrap_room,
@@ -2564,8 +2565,8 @@ class Scheduler(
             metrics_collector=(
                 self.metrics_collector if self.server_args.enable_metrics else None
             ),
-            propagation_context=req.trace_metric_ctx,
         )
+        req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
         req.trace_metric_ctx.metric_trace_slice_start(RequestStage.ANONYMOUS)
 
 

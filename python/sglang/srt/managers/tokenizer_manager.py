@@ -2452,8 +2452,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 bootstrap_room=bootstrap_room,
                 module_name="request",
                 server_args=self.server_args,
-                ts=int(created_time * 1e9),
-                external_trace_header=external_trace_header,
             )
             if not trace_metric_ctx.tracing_enable:
                 return
@@ -2461,6 +2459,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # store into global table,
             # because trace_metric_ctx can not be passed to _handle_batch_output
             global_set_trace_metric_ctx(trace_metric_ctx)
+            trace_metric_ctx.trace_req_start(
+                ts=int(created_time * 1e9), external_trace_header=external_trace_header
+            )
             trace_metric_ctx.metric_trace_slice_start(
                 RequestStage.ANONYMOUS, ts=int(created_time * 1e9)
             )
@@ -2476,13 +2477,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     bootstrap_room=bootstrap_room,
                     module_name="request",
                     server_args=self.server_args,
-                    ts=int(created_time * 1e9),
-                    external_trace_header=external_trace_header,
                 )
                 if not trace_metric_ctx.tracing_enable:
                     return
 
                 global_set_trace_metric_ctx(trace_metric_ctx)
+                trace_metric_ctx.trace_req_start(
+                    ts=int(created_time * 1e9),
+                    external_trace_header=external_trace_header,
+                )
                 trace_metric_ctx.metric_trace_slice_start(
                     RequestStage.ANONYMOUS,
                     ts=int(created_time * 1e9),
