@@ -323,15 +323,15 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 if let Some(w) = candidate_worker {
                     // Check if candidate is overloaded (load > min_load + 5)
                     // The threshold 5 is arbitrary but prevents jitter
-                    if w.load() > min_load + 5 {
-                        debug!("Cache-Aware Override: Candidate {} is overloaded (load: {} vs min: {}). Fallback to least loaded.",
-                            w.url(), w.load(), min_load);
+                    if w.load() > min_load + self.config.load_aware_fallback_threshold {
+                        debug!("Cache-Aware Override: Candidate {} is overloaded (load: {} vs min: {} + {}). Fallback to least loaded.",
+                            w.url(), w.load(), min_load, self.config.load_aware_fallback_threshold);
 
                         let best_idx = healthy_indices
                             .iter()
                             .min_by_key(|&&idx| workers[idx].load())
                             .copied()
-                            .unwrap_or(0);
+                            .unwrap();
 
                         workers[best_idx].url().to_string()
                     } else {
@@ -501,6 +501,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            load_aware_fallback_threshold: 5,
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -572,6 +573,7 @@ mod tests {
             balance_rel_threshold: 10.0,
             eviction_interval_secs: 0,
             max_tree_size: 1_000_000,
+            load_aware_fallback_threshold: 5,
         };
         let policy = CacheAwarePolicy::with_config(config);
 
@@ -632,6 +634,7 @@ mod tests {
             balance_rel_threshold: 100.0,
             eviction_interval_secs: 0,
             max_tree_size: 1_000_000,
+            load_aware_fallback_threshold: 5,
         };
         let policy = CacheAwarePolicy::with_config(config);
 
