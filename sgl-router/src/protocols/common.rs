@@ -129,6 +129,11 @@ pub struct VideoUrl {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct VideoUrl {
+    pub url: String,
+}
+
 // ============================================================================
 // Response Format (for structured outputs)
 // ============================================================================
