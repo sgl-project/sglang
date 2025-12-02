@@ -131,10 +131,10 @@ class Fp8Config(QuantizationConfig):
                 raise ValueError(
                     f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."
                 )
-            if activation_scheme != "dynamic":
-                raise ValueError(
-                    f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
-                )
+            # if activation_scheme != "dynamic":
+            #     raise ValueError(
+            #         f"The block-wise quantization only supports dynamic activation scheme for now, but got {activation_scheme} activation scheme."
+            #     )
         self.weight_block_size = weight_block_size
 
     @classmethod
@@ -285,9 +285,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALE
             if self.block_quant:
-                if hasattr(self.quant_config, "activation_scheme"):
-                    assert self.quant_config.activation_scheme == "dynamic"
-                elif hasattr(self.quant_config, "linear_activation_scheme"):
+                if hasattr(self.quant_config, "linear_activation_scheme"):
                     assert self.quant_config.linear_activation_scheme == "dynamic"
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(

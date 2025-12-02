@@ -3581,6 +3581,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                 weight_block_size = getattr(
                     selected_quant_config, "weight_block_size", None
                 )
+
+                print("weight_block_size", weight_block_size)
+                print("selected_quant_config", selected_quant_config)
+                print("self.quant_config", self.quant_config)
+
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
                     if _is_fp8_fnuz:

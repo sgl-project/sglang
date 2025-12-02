@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
     is_activation_quantization_format,
@@ -92,6 +93,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
         return CompressedTensorsLinearMethod(self)
@@ -157,6 +159,8 @@ class CompressedTensorsConfig(QuantizationConfig):
         linear_fp8_config = None
         if "linear_fp8_config" in config:
             from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+            print("linear_fp8_config", config["linear_fp8_config"])
 
             fp8_cfg = config["linear_fp8_config"]
             # Check if it's fp8 format based on quant_method field
@@ -610,6 +614,7 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
+        self.quant_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)

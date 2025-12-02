@@ -736,10 +736,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id < len(self.output_sizes)
 
         if isinstance(param, BlockQuantScaleParameter):
-            if type(self.quant_method) == CompressedTensorsLinearMethod:
-                weight_block_size = self.quant_method.quantization_config.config["config_groups"]["FP8_BLOCK"]["weights"]["block_structure"]
-            else:
-                weight_block_size = self.quant_method.quant_config.weight_block_size
+            weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (
