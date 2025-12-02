@@ -13,7 +13,7 @@ v1 = client.CoreV1Api()
 
 LOCAL_TIMEOUT = 10800
 KUBE_NAME_SPACE = os.environ.get('NAMESPACE')
-KUBE_ROUTER_POD_NAME = "{}-router-0".format(os.environ.get('KUBE_JOB_NAME'))
+KUBE_ROUTER_POD_NAME = "{}-sglang-router-0".format(os.environ.get('KUBE_JOB_NAME'))
 
 
 def run_command(cmd, shell=True):
@@ -31,7 +31,7 @@ def check_pods_ready(timeout=300):
     print("Waiting all pods to running...")
     start_time = time.time()
     matching_string = "{}-sglang".format(os.environ.get('KUBE_JOB_NAME'))
-    
+
     while time.time() - start_time < timeout:
         cmd = "kubectl get pods -A -o json"
 
