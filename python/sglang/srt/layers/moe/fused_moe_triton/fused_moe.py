@@ -10,6 +10,7 @@ import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -23,7 +24,11 @@ from sglang.srt.utils import (
 )
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
-from .fused_moe_triton_kernels import invoke_fused_moe_kernel, moe_sum_reduce_triton
+from .fused_moe_triton_kernels import (
+    invoke_fused_moe_kernel,
+    moe_sum_reduce_triton,
+    support_tensor_descriptor,
+)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -36,7 +41,7 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -62,6 +67,7 @@ def inplace_fused_experts(
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
@@ -78,6 +84,7 @@ def inplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -89,6 +96,7 @@ def inplace_fused_experts(
         b2,
         True,
         activation,
+        is_gated,
         apply_router_weight_on_input,
         use_fp8_w8a8,
         use_int8_w8a8,
@@ -106,6 +114,7 @@ def inplace_fused_experts(
         routed_scaling_factor,
         gemm1_alpha,
         gemm1_limit,
+        filter_expert,
     )
 
 
@@ -118,6 +127,7 @@ def inplace_fused_experts_fake(
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
@@ -134,6 +144,7 @@ def inplace_fused_experts_fake(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ) -> None:
     pass
 
@@ -155,6 +166,7 @@ def outplace_fused_experts(
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
@@ -172,6 +184,7 @@ def outplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -183,6 +196,7 @@ def outplace_fused_experts(
         b2,
         False,
         activation,
+        is_gated,
         apply_router_weight_on_input,
         use_fp8_w8a8,
         use_int8_w8a8,
@@ -200,6 +214,7 @@ def outplace_fused_experts(
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        filter_expert=filter_expert,
     )
 
 
@@ -212,6 +227,7 @@ def outplace_fused_experts_fake(
     b1: Optional[torch.Tensor] = None,
     b2: Optional[torch.Tensor] = None,
     activation: str = "silu",
+    is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
@@ -229,6 +245,7 @@ def outplace_fused_experts_fake(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -263,6 +280,10 @@ def fused_experts(
     block_shape: Optional[List[int]] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
+    filter_expert = (
+        moe_runner_config.num_experts is None
+        or moe_runner_config.num_experts != moe_runner_config.num_local_experts
+    )
     if moe_runner_config.inplace:
         assert not moe_runner_config.no_combine, "no combine + inplace makes no sense"
         torch.ops.sglang.inplace_fused_experts(
@@ -274,6 +295,7 @@ def fused_experts(
             b1,
             b2,
             moe_runner_config.activation,
+            moe_runner_config.is_gated,
             moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
@@ -290,6 +312,7 @@ def fused_experts(
             moe_runner_config.routed_scaling_factor,
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
+            filter_expert,
         )
         return hidden_states
     else:
@@ -302,6 +325,7 @@ def fused_experts(
             b1,
             b2,
             moe_runner_config.activation,
+            moe_runner_config.is_gated,
             moe_runner_config.apply_router_weight_on_input,
             use_fp8_w8a8,
             use_int8_w8a8,
@@ -319,6 +343,7 @@ def fused_experts(
             routed_scaling_factor=moe_runner_config.routed_scaling_factor,
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            filter_expert=filter_expert,
         )
 
 
@@ -336,6 +361,11 @@ def swiglu_with_alpha_and_limit(x, gemm1_alpha, gemm1_limit):
     return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
 
 
+@functools.lru_cache()
+def _down_moe_use_tma():
+    return support_tensor_descriptor()
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -346,6 +376,7 @@ def fused_experts_impl(
     b2: Optional[torch.Tensor] = None,
     inplace: bool = False,
     activation: str = "silu",
+    is_gated: bool = True,
     apply_router_weight_on_input: bool = False,
     use_fp8_w8a8: bool = False,
     use_int8_w8a8: bool = False,
@@ -363,6 +394,7 @@ def fused_experts_impl(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    filter_expert: bool = True,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -402,25 +434,28 @@ def fused_experts_impl(
         topk_ids.shape[1],
         config_dtype,
         block_shape=block_shape,
+        per_channel_quant=per_channel_quant,
+        return_down_config=True,
     )
 
-    config = get_config_func(M)
-
+    config, (down_config, max_block_m) = get_config_func(M)
+    down_moe_use_tma = (
+        _down_moe_use_tma()
+        and down_config is not None
+        and down_config.pop("USE_TMA", False)
+    )
+    topk = topk_ids.shape[1]
+    max_padded_tokens = (
+        min(M * topk, E + 1) * (max_block_m - 1) if down_moe_use_tma else 0
+    )
+    total_tokens = M * topk + max_padded_tokens
     cache = torch.empty(
-        M * topk_ids.shape[1] * max(N, w2.shape[1]),
+        total_tokens * max(N, w2.shape[1]),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache1 = cache[: M * topk_ids.shape[1] * N].view(
-        (M, topk_ids.shape[1], N),
-    )
-    intermediate_cache2 = torch.empty(
-        (M * topk_ids.shape[1], N // 2),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    intermediate_cache3 = cache[: M * topk_ids.shape[1] * w2.shape[1]].view(
-        (M, topk_ids.shape[1], w2.shape[1]),
+    intermediate_cache3 = cache[: M * topk * w2.shape[1]].view(
+        (M, topk, w2.shape[1]),
     )
 
     compute_type = tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
@@ -428,7 +463,7 @@ def fused_experts_impl(
     if no_combine:
         assert not inplace
         out_hidden_states = torch.empty(
-            (num_tokens, topk_ids.shape[1], w2.shape[1]),
+            (num_tokens, topk, w2.shape[1]),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -453,12 +488,28 @@ def fused_experts_impl(
             # chunk. Note that in most cases we only have one chunk
             # so the cache size and config are already set correctly and
             # do not need to be adjusted.
-            intermediate_cache1 = intermediate_cache1[:tokens_in_chunk]
-            intermediate_cache2 = intermediate_cache2[
-                : tokens_in_chunk * topk_ids.shape[1]
-            ]
+            config, (down_config, _) = get_config_func(tokens_in_chunk)
+            down_moe_use_tma = (
+                _down_moe_use_tma()
+                and down_config is not None
+                and down_config.pop("USE_TMA", False)
+            )
             intermediate_cache3 = intermediate_cache3[:tokens_in_chunk]
-            config = get_config_func(tokens_in_chunk)
+
+        padded_tokens = (
+            min(tokens_in_chunk * topk, E + 1) * (config["BLOCK_SIZE_M"] - 1)
+            if down_moe_use_tma
+            else 0
+        )
+        total_tokens = tokens_in_chunk * topk + padded_tokens
+        intermediate_cache1 = cache[: total_tokens * N].view(
+            (total_tokens, N),
+        )
+        intermediate_cache2 = torch.empty(
+            (total_tokens, N // 2),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
@@ -490,8 +541,11 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            c_sorted=down_moe_use_tma,
+            filter_expert=filter_expert,
         )
-        if activation == "silu":
+        # Activation function with multiplication
+        if activation == "silu" and is_gated:
             if gemm1_alpha is not None:
                 assert gemm1_limit is not None
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
@@ -505,7 +559,7 @@ def fused_experts_impl(
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
-        elif activation == "gelu":
+        elif activation == "gelu" and is_gated:
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
             if _is_cuda or _is_hip:
@@ -514,8 +568,15 @@ def fused_experts_impl(
                 vllm_ops.gelu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
+        # Activation function without multiplication
+        elif activation == "silu" and not is_gated:
+            intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
+        elif activation == "gelu" and not is_gated:
+            intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
+        elif activation == "relu2" and not is_gated:
+            intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
         else:
-            raise ValueError(f"Unsupported activation: {activation=}")
+            raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
         invoke_fused_moe_kernel(
             intermediate_cache2,
@@ -536,7 +597,7 @@ def fused_experts_impl(
             num_tokens_post_padded,
             not apply_router_weight_on_input,
             1,
-            config,
+            down_config or config,
             compute_type=compute_type,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int8_w8a8=use_int8_w8a8,
@@ -544,6 +605,9 @@ def fused_experts_impl(
             use_int4_w4a16=use_int4_w4a16,
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
+            a_use_tma=down_moe_use_tma,
+            b_use_tma=down_moe_use_tma,
+            filter_expert=filter_expert,
         )
 
         if routed_scaling_factor is None:
@@ -569,11 +633,12 @@ def fused_experts_impl(
                         routed_scaling_factor,
                     )
                 else:
-                    moe_sum_reduce_triton(
+                    moe_sum_reduce(
                         intermediate_cache3.view(*intermediate_cache3.shape),
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
                         routed_scaling_factor,
                     )
+
         elif _is_hip:
             if _use_aiter:
                 moe_sum(

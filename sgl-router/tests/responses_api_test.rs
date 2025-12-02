@@ -1,7 +1,7 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sglang_router_rs::protocols::{
+use sgl_model_gateway::protocols::{
     common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
     responses::{
         ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
@@ -14,13 +14,7 @@ use common::{
     mock_mcp_server::MockMCPServer,
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sglang_router_rs::{
-    config::{
-        CircuitBreakerConfig, ConnectionMode, HealthCheckConfig, PolicyConfig, RetryConfig,
-        RouterConfig, RoutingMode,
-    },
-    routers::RouterFactory,
-};
+use sgl_model_gateway::{config::RouterConfig, routers::RouterFactory};
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -47,48 +41,23 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     let worker_url = worker.start().await.expect("start worker");
 
     // Build router config (HTTP OpenAI mode)
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    // Create router and context
-    let ctx = common::create_test_context(router_cfg);
+    // Create router and context with MCP config from file
+    let ctx =
+        common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
@@ -111,6 +80,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         tool_choice: Some(ToolChoice::default()),
         tools: Some(vec![ResponseTool {
             r#type: ResponseToolType::Mcp,
+            function: None,
             server_url: Some(mcp.url()),
             authorization: None,
             server_label: Some("mock".to_string()),
@@ -121,6 +91,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         top_logprobs: Some(0),
         top_p: None,
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_test_mcp_e2e".to_string()),
         priority: 0,
@@ -248,47 +219,21 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
 #[tokio::test]
 async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["http://localhost".to_string()],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 1,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 8,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
@@ -368,6 +313,7 @@ fn test_responses_request_creation() {
         top_logprobs: Some(5),
         top_p: Some(0.9),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: Some("test-user".to_string()),
         request_id: Some("resp_test123".to_string()),
         priority: 0,
@@ -410,6 +356,7 @@ fn test_responses_request_sglang_extensions() {
         top_logprobs: Some(0),
         top_p: Some(0.95),
         truncation: Some(Truncation::Auto),
+        text: None,
         user: None,
         request_id: Some("resp_test456".to_string()),
         priority: 0,
@@ -446,7 +393,7 @@ fn test_usage_conversion() {
         completion_tokens: 25,
         total_tokens: 40,
         reasoning_tokens: Some(8),
-        prompt_tokens_details: Some(sglang_router_rs::protocols::common::PromptTokenUsageInfo {
+        prompt_tokens_details: Some(sgl_model_gateway::protocols::common::PromptTokenUsageInfo {
             cached_tokens: 3,
         }),
     };
@@ -525,6 +472,7 @@ fn test_json_serialization() {
         top_logprobs: Some(10),
         top_p: Some(0.8),
         truncation: Some(Truncation::Auto),
+        text: None,
         user: Some("test_user".to_string()),
         request_id: Some("resp_comprehensive_test".to_string()),
         priority: 1,
@@ -584,47 +532,21 @@ async fn test_multi_turn_loop_with_mcp() {
     let worker_url = worker.start().await.expect("start worker");
 
     // Build router config
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("info".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("info")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
@@ -656,6 +578,7 @@ async fn test_multi_turn_loop_with_mcp() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_multi_turn_test".to_string()),
         priority: 0,
@@ -761,47 +684,21 @@ async fn test_max_tool_calls_limit() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("info".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("info")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -830,6 +727,7 @@ async fn test_max_tool_calls_limit() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_max_calls_test".to_string()),
         priority: 0,
@@ -883,7 +781,7 @@ async fn test_max_tool_calls_limit() {
 async fn setup_streaming_mcp_test() -> (
     MockMCPServer,
     MockWorker,
-    Box<dyn sglang_router_rs::routers::RouterTrait>,
+    Box<dyn sgl_model_gateway::routers::RouterTrait>,
     tempfile::TempDir,
 ) {
     let mcp = MockMCPServer::start().await.expect("start mcp");
@@ -904,47 +802,22 @@ async fn setup_streaming_mcp_test() -> (
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec![worker_url],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 5,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("info".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 32,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec![worker_url])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(5)
+        .worker_startup_check_interval_secs(1)
+        .log_level("info")
+        .max_concurrent_requests(32)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx =
+        common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
@@ -1026,6 +899,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_streaming_mcp_test".to_string()),
         priority: 0,
@@ -1305,6 +1179,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_streaming_multiturn_test".to_string()),
         priority: 0,
@@ -1346,47 +1221,21 @@ async fn test_streaming_multi_turn_with_mcp() {
 #[tokio::test]
 async fn test_conversation_items_create_and_get() {
     // Test creating items and getting a specific item
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["http://localhost".to_string()],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 1,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 8,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1448,47 +1297,21 @@ async fn test_conversation_items_create_and_get() {
 #[tokio::test]
 async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["http://localhost".to_string()],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 1,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 8,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1556,47 +1379,21 @@ async fn test_conversation_items_delete() {
 #[tokio::test]
 async fn test_conversation_items_max_limit() {
     // Test that creating > 20 items returns error
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["http://localhost".to_string()],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 1,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 8,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1634,47 +1431,21 @@ async fn test_conversation_items_max_limit() {
 #[tokio::test]
 async fn test_conversation_items_unsupported_type() {
     // Test that unsupported item types return error
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["http://localhost".to_string()],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 1,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 8,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
@@ -1711,47 +1482,21 @@ async fn test_conversation_items_unsupported_type() {
 #[tokio::test]
 async fn test_conversation_items_multi_conversation_sharing() {
     // Test that items can be shared across conversations via soft delete
-    let router_cfg = RouterConfig {
-        chat_template: None,
-        mode: RoutingMode::OpenAI {
-            worker_urls: vec!["http://localhost".to_string()],
-        },
-        connection_mode: ConnectionMode::Http,
-        policy: PolicyConfig::Random,
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        max_payload_size: 8 * 1024 * 1024,
-        request_timeout_secs: 60,
-        worker_startup_timeout_secs: 1,
-        worker_startup_check_interval_secs: 1,
-        dp_aware: false,
-        api_key: None,
-        discovery: None,
-        metrics: None,
-        log_dir: None,
-        log_level: Some("warn".to_string()),
-        request_id_headers: None,
-        max_concurrent_requests: 8,
-        queue_size: 0,
-        queue_timeout_secs: 5,
-        rate_limit_tokens_per_second: None,
-        cors_allowed_origins: vec![],
-        retry: RetryConfig::default(),
-        circuit_breaker: CircuitBreakerConfig::default(),
-        disable_retries: false,
-        disable_circuit_breaker: false,
-        health_check: HealthCheckConfig::default(),
-        enable_igw: false,
-        model_path: None,
-        tokenizer_path: None,
-        history_backend: sglang_router_rs::config::HistoryBackend::Memory,
-        oracle: None,
-        reasoning_parser: None,
-        tool_call_parser: None,
-        tokenizer_cache: sglang_router_rs::config::TokenizerCacheConfig::default(),
-    };
+    let router_cfg = RouterConfig::builder()
+        .openai_mode(vec!["http://localhost".to_string()])
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_timeout_secs(1)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .max_concurrent_requests(8)
+        .queue_timeout_secs(5)
+        .build_unchecked();
 
-    let ctx = common::create_test_context(router_cfg);
+    let ctx = common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations

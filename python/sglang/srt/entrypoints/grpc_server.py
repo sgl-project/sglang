@@ -999,7 +999,6 @@ def _wait_and_warmup_grpc(
     # Mark health service as SERVING after warmup completes
     if health_servicer:
         health_servicer.set_serving()
-        logger.info("Health service marked as SERVING")
 
     logger.info("The server is fired up and ready to roll!")
 

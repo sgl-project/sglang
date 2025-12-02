@@ -22,6 +22,11 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
@@ -36,11 +41,13 @@ from sglang.srt.utils import (
     direct_register_custom_op,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_sm100_supported,
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
+    next_power_of_2,
     round_up,
     set_weight_attrs,
 )
@@ -66,18 +73,20 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
+_is_shuffle_moe_mxfp4 = is_gfx95_supported()
 
 if _is_hip:
     # import aiter
     try:
-        from aiter import ActivationType, QuantType, dtypes
+        from aiter import ActivationType, QuantType
         from aiter.fused_moe import fused_moe
+        from aiter.ops.shuffle import shuffle_weight
         from aiter.ops.triton.quant import dynamic_mxfp4_quant
         from aiter.utility.fp4_utils import e8m0_shuffle
     except ImportError as err:
-        ActivationType = QuantType = dtypes = fused_moe = dynamic_mxfp4_quant = (
-            e8m0_shuffle
-        ) = err
+        ActivationType = QuantType = fused_moe = dynamic_mxfp4_quant = e8m0_shuffle = (
+            err
+        )
 
 
 def _swizzle_mxfp4(quant_tensor, scale, num_warps):
@@ -261,25 +270,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
-
-        self.triton_kernel_moe_forward = None
-        self.triton_kernel_moe_with_bias_forward = None
-        if torch.cuda.is_available() and has_triton_kernels:
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_forward as _tk_forward,
-            )
-            from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
-                triton_kernel_moe_with_bias_forward as _tk_with_bias_forward,
-            )
-
-            self.triton_kernel_moe_forward = _tk_forward
-            self.triton_kernel_moe_with_bias_forward = _tk_with_bias_forward
 
     def create_weights(
         self,
@@ -600,7 +596,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = (
+            MoeRunnerBackend.TRITON_KERNELS
+            if self.use_triton_kernels
+            else MoeRunnerBackend.TRITON
+        )
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
@@ -613,8 +614,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-
-        moe_runner_config = self.moe_runner_config
 
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
@@ -636,9 +635,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
                 x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
-                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
             else:
-                raise NotImplementedError
+                raise NotImplementedError()
 
             assert x_quant.shape[-1] == self.hidden_size
             assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -646,6 +645,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             top_k = topk_output.topk_config.top_k
             router_logits = topk_output.router_logits
 
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                num_tokens = x_quant.shape[0]
+                hidden_size = (
+                    x_quant.shape[-1] * 2
+                    if x_quant.dtype == torch.uint8
+                    else x_quant.shape[-1]
+                )
+                symm_output = torch.empty(
+                    num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
+                )
             trtllm_gen_output = trtllm_fp4_block_scale_moe(
                 router_logits.to(torch.bfloat16),
                 None,  # routing_bias
@@ -674,34 +685,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
+                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
+                output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
 
-        if self.use_triton_kernels:
+        backend = self.runner.runner_backend
+        if backend.is_triton_kernels():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
             assert (
                 layer.moe_ep_size == 1
             ), "Expert parallel is not supported when using triton kernels"
-            if self.with_bias:
-                output = self.triton_kernel_moe_with_bias_forward(
-                    hidden_states=x,
-                    w1=self.w13_weight_triton_tensor,
-                    w1_pcg=self.w13_precision_config,
-                    w2=self.w2_weight_triton_tensor,
-                    w2_pcg=self.w2_precision_config,
-                    b1=layer.w13_weight_bias,
-                    b2=layer.w2_weight_bias,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
-            else:
-                output = self.triton_kernel_moe_forward(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    topk_output=topk_output,
-                    moe_runner_config=moe_runner_config,
-                )
-            return StandardCombineInput(hidden_states=output)
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=(
+                    self.w13_weight_triton_tensor
+                    if self.w13_weight_triton_tensor is not None
+                    else layer.w13_weight
+                ),
+                w2_weight=(
+                    self.w2_weight_triton_tensor
+                    if self.w2_weight_triton_tensor is not None
+                    else layer.w2_weight
+                ),
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+                w13_precision_config=getattr(self, "w13_precision_config", None),
+                w2_precision_config=getattr(self, "w2_precision_config", None),
+            )
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -709,7 +722,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
-            return self.runner.run(dispatch_output, quant_info)
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
@@ -792,10 +805,18 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         w13, w13_mx_scales = self.mxfp4_quantize(layer.w13_weight.data)
         w2, w2_mx_scales = self.mxfp4_quantize(layer.w2_weight.data)
 
+        # Pre-shuffle weight
+        is_shuffled = _is_shuffle_moe_mxfp4
+        if is_shuffled:
+            w13 = shuffle_weight(w13.contiguous(), (16, 16))
+            w2 = shuffle_weight(w2.contiguous(), (16, 16))
+
         layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        layer.w13_weight.is_shuffled = is_shuffled
         layer.w13_weight_scale = torch.nn.Parameter(w13_mx_scales, requires_grad=False)
 
         layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+        layer.w2_weight.is_shuffled = is_shuffled
         layer.w2_weight_scale = torch.nn.Parameter(w2_mx_scales, requires_grad=False)
 
     def create_moe_runner(
@@ -825,6 +846,10 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         else:
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
+
+        if hasattr(layer.w13_weight, "is_shuffled"):
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
 
         output = fused_moe(
             x,

@@ -12,7 +12,6 @@ Run with:
     pytest py_test/e2e_grpc/e2e_grpc/validation/test_openai_server_ignore_eos.py -v
 """
 
-# CHANGE: Import router launcher instead of server launcher
 import sys
 from pathlib import Path
 

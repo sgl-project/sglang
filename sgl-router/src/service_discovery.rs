@@ -18,7 +18,7 @@ use rustls;
 use tokio::{task, time};
 use tracing::{debug, error, info, warn};
 
-use crate::{core::Job, protocols::worker_spec::WorkerConfigRequest, server::AppContext};
+use crate::{app_context::AppContext, core::Job, protocols::worker_spec::WorkerConfigRequest};
 
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
@@ -376,6 +376,7 @@ async fn handle_pod_event(
                 worker_type,
                 priority: None,
                 cost: None,
+                runtime: None,
                 labels: HashMap::new(),
                 bootstrap_port,
                 tokenizer_path: None,
@@ -565,10 +566,9 @@ mod tests {
     async fn create_test_app_context() -> Arc<AppContext> {
         use crate::{config::RouterConfig, middleware::TokenBucket};
 
-        let router_config = RouterConfig {
-            worker_startup_timeout_secs: 1,
-            ..Default::default()
-        };
+        let router_config = RouterConfig::builder()
+            .worker_startup_timeout_secs(1)
+            .build_unchecked();
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
@@ -594,6 +594,7 @@ mod tests {
             configured_tool_parser: None,
             worker_job_queue: Arc::new(std::sync::OnceLock::new()),
             workflow_engine: Arc::new(std::sync::OnceLock::new()),
+            mcp_manager: Arc::new(std::sync::OnceLock::new()),
         })
     }
 

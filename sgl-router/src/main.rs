@@ -1,17 +1,18 @@
 use std::collections::HashMap;
 
-use clap::{ArgAction, Parser, ValueEnum};
-use sglang_router_rs::{
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use sgl_model_gateway::{
     config::{
-        CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, RetryConfig,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
+        HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
         RouterConfig, RoutingMode, TokenizerCacheConfig,
     },
+    core::ConnectionMode,
     metrics::PrometheusConfig,
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
+    version,
 };
-
 fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
     let mut prefill_entries = Vec::new();
@@ -71,29 +72,31 @@ impl std::fmt::Display for Backend {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "sglang-router")]
-#[command(about = "SGLang Router - High-performance request distribution across worker nodes")]
+#[command(name = "sglang-router", alias = "smg", alias = "amg")]
+#[command(about = "SGLang Model Gateway - High-performance inference gateway")]
+#[command(args_conflicts_with_subcommands = true)]
 #[command(long_about = r#"
-SGLang Router - High-performance request distribution across worker nodes
+SGLang Model Gateway - Rust-based inference gateway
 
 Usage:
-This launcher enables starting a router with individual worker instances. It is useful for
-multi-node setups or when you want to start workers and router separately.
+  smg launch [OPTIONS]     Launch router (short command)
+  amg launch [OPTIONS]     Launch router (alternative)
+  sglang-router [OPTIONS]  Launch router (full name)
 
 Examples:
   # Regular mode
-  sglang-router --worker-urls http://worker1:8000 http://worker2:8000
+  smg launch --worker-urls http://worker1:8000 http://worker2:8000
 
-  # PD disaggregated mode with same policy for both
-  sglang-router --pd-disaggregation \
+  # PD disaggregated mode
+  smg launch --pd-disaggregation \
     --prefill http://127.0.0.1:30001 9001 \
     --prefill http://127.0.0.2:30002 9002 \
     --decode http://127.0.0.3:30003 \
     --decode http://127.0.0.4:30004 \
     --policy cache_aware
 
-  # PD mode with different policies for prefill and decode
-  sglang-router --pd-disaggregation \
+  # With different policies
+  smg launch --pd-disaggregation \
     --prefill http://127.0.0.1:30001 9001 \
     --prefill http://127.0.0.2:30002 \
     --decode http://127.0.0.3:30003 \
@@ -101,6 +104,25 @@ Examples:
     --prefill-policy cache_aware --decode-policy power_of_two
 
 "#)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    #[command(flatten)]
+    router_args: CliArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Launch the router (same as running without subcommand)
+    #[command(visible_alias = "start")]
+    Launch {
+        #[command(flatten)]
+        args: CliArgs,
+    },
+}
+
+#[derive(Parser, Debug)]
 struct CliArgs {
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
@@ -126,7 +148,7 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
     decode_policy: Option<String>,
 
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 1800)]
     worker_startup_timeout_secs: u64,
 
     #[arg(long, default_value_t = 30)]
@@ -282,7 +304,7 @@ struct CliArgs {
     #[arg(long, default_value_t = 52428800)]
     tokenizer_cache_l1_max_memory: usize,
 
-    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle"])]
+    #[arg(long, default_value = "memory", value_parser = ["memory", "none", "oracle","postgres"])]
     history_backend: String,
 
     #[arg(long, env = "ATP_WALLET_PATH")]
@@ -310,10 +332,19 @@ struct CliArgs {
     oracle_pool_timeout_secs: Option<u64>,
 
     #[arg(long)]
+    postgres_db_url: Option<String>,
+
+    #[arg(long)]
+    postgres_pool_max_size: Option<usize>,
+
+    #[arg(long)]
     reasoning_parser: Option<String>,
 
     #[arg(long)]
     tool_call_parser: Option<String>,
+
+    #[arg(long)]
+    mcp_config_path: Option<String>,
 }
 
 enum OracleConnectSource {
@@ -325,7 +356,7 @@ impl CliArgs {
     fn determine_connection_mode(worker_urls: &[String]) -> ConnectionMode {
         for url in worker_urls {
             if url.starts_with("grpc://") || url.starts_with("grpcs://") {
-                return ConnectionMode::Grpc;
+                return ConnectionMode::Grpc { port: None };
             }
         }
         ConnectionMode::Http
@@ -442,6 +473,18 @@ impl CliArgs {
         })
     }
 
+    fn build_postgres_config(&self) -> ConfigResult<PostgresConfig> {
+        let db_url = self.postgres_db_url.clone().unwrap_or_default();
+        let pool_max = self
+            .postgres_pool_max_size
+            .unwrap_or_else(PostgresConfig::default_pool_max);
+        let pcf = PostgresConfig { db_url, pool_max };
+        pcf.validate().map_err(|e| ConfigError::ValidationFailed {
+            reason: e.to_string(),
+        })?;
+        Ok(pcf)
+    }
+
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
@@ -457,12 +500,7 @@ impl CliArgs {
         } else if self.pd_disaggregation {
             let decode_urls = self.decode.clone();
 
-            if !self.service_discovery && (prefill_urls.is_empty() || decode_urls.is_empty()) {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "PD disaggregation mode requires --prefill and --decode URLs when not using service discovery".to_string(),
-                });
-            }
-
+            // Allow empty URLs to support dynamic worker addition
             RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
@@ -470,12 +508,7 @@ impl CliArgs {
                 decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
             }
         } else {
-            if !self.service_discovery && self.worker_urls.is_empty() {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Regular mode requires --worker-urls when not using service discovery"
-                        .to_string(),
-                });
-            }
+            // Allow empty URLs to support dynamic worker addition
             RoutingMode::Regular {
                 worker_urls: self.worker_urls.clone(),
             }
@@ -528,6 +561,7 @@ impl CliArgs {
         let history_backend = match self.history_backend.as_str() {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
+            "postgres" => HistoryBackend::Postgres,
             _ => HistoryBackend::Memory,
         };
 
@@ -536,70 +570,76 @@ impl CliArgs {
         } else {
             None
         };
+        let postgres = if history_backend == HistoryBackend::Postgres {
+            Some(self.build_postgres_config()?)
+        } else {
+            None
+        };
 
-        Ok(RouterConfig {
-            mode,
-            policy,
-            connection_mode,
-            host: self.host.clone(),
-            port: self.port,
-            max_payload_size: self.max_payload_size,
-            request_timeout_secs: self.request_timeout_secs,
-            worker_startup_timeout_secs: self.worker_startup_timeout_secs,
-            worker_startup_check_interval_secs: self.worker_startup_check_interval,
-            dp_aware: self.dp_aware,
-            api_key: self.api_key.clone(),
-            discovery,
-            metrics,
-            log_dir: self.log_dir.clone(),
-            log_level: Some(self.log_level.clone()),
-            request_id_headers: if self.request_id_headers.is_empty() {
-                None
-            } else {
-                Some(self.request_id_headers.clone())
-            },
-            max_concurrent_requests: self.max_concurrent_requests,
-            queue_size: self.queue_size,
-            queue_timeout_secs: self.queue_timeout_secs,
-            cors_allowed_origins: self.cors_allowed_origins.clone(),
-            retry: RetryConfig {
+        let builder = RouterConfig::builder()
+            .mode(mode)
+            .policy(policy)
+            .connection_mode(connection_mode)
+            .host(&self.host)
+            .port(self.port)
+            .max_payload_size(self.max_payload_size)
+            .request_timeout_secs(self.request_timeout_secs)
+            .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
+            .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .max_concurrent_requests(self.max_concurrent_requests)
+            .queue_size(self.queue_size)
+            .queue_timeout_secs(self.queue_timeout_secs)
+            .cors_allowed_origins(self.cors_allowed_origins.clone())
+            .retry_config(RetryConfig {
                 max_retries: self.retry_max_retries,
                 initial_backoff_ms: self.retry_initial_backoff_ms,
                 max_backoff_ms: self.retry_max_backoff_ms,
                 backoff_multiplier: self.retry_backoff_multiplier,
                 jitter_factor: self.retry_jitter_factor,
-            },
-            circuit_breaker: CircuitBreakerConfig {
+            })
+            .circuit_breaker_config(CircuitBreakerConfig {
                 failure_threshold: self.cb_failure_threshold,
                 success_threshold: self.cb_success_threshold,
                 timeout_duration_secs: self.cb_timeout_duration_secs,
                 window_duration_secs: self.cb_window_duration_secs,
-            },
-            disable_retries: self.disable_retries,
-            disable_circuit_breaker: self.disable_circuit_breaker,
-            health_check: HealthCheckConfig {
+            })
+            .health_check_config(HealthCheckConfig {
                 failure_threshold: self.health_failure_threshold,
                 success_threshold: self.health_success_threshold,
                 timeout_secs: self.health_check_timeout_secs,
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
-            },
-            enable_igw: self.enable_igw,
-            rate_limit_tokens_per_second: self.rate_limit_tokens_per_second,
-            model_path: self.model_path.clone(),
-            tokenizer_path: self.tokenizer_path.clone(),
-            chat_template: self.chat_template.clone(),
-            history_backend,
-            oracle,
-            reasoning_parser: self.reasoning_parser.clone(),
-            tool_call_parser: self.tool_call_parser.clone(),
-            tokenizer_cache: TokenizerCacheConfig {
+            })
+            .tokenizer_cache(TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
                 l0_max_entries: self.tokenizer_cache_l0_max_entries,
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
-            },
-        })
+            })
+            .history_backend(history_backend)
+            .log_level(&self.log_level)
+            .maybe_api_key(self.api_key.as_ref())
+            .maybe_discovery(discovery)
+            .maybe_metrics(metrics)
+            .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_request_id_headers(
+                (!self.request_id_headers.is_empty()).then(|| self.request_id_headers.clone()),
+            )
+            .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .maybe_model_path(self.model_path.as_ref())
+            .maybe_tokenizer_path(self.tokenizer_path.as_ref())
+            .maybe_chat_template(self.chat_template.as_ref())
+            .maybe_oracle(oracle)
+            .maybe_postgres(postgres)
+            .maybe_reasoning_parser(self.reasoning_parser.as_ref())
+            .maybe_tool_call_parser(self.tool_call_parser.as_ref())
+            .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .dp_aware(self.dp_aware)
+            .retries(!self.disable_retries)
+            .circuit_breaker(!self.disable_circuit_breaker)
+            .igw(self.enable_igw);
+
+        builder.build()
     }
 
     fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
@@ -644,6 +684,19 @@ impl CliArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Check for version flags before parsing other args to avoid errors
+    let args: Vec<String> = std::env::args().collect();
+    for arg in &args {
+        if arg == "--version" || arg == "-V" {
+            println!("{}", version::get_version_string());
+            return Ok(());
+        }
+        if arg == "--version-verbose" {
+            println!("{}", version::get_verbose_version_string());
+            return Ok(());
+        }
+    }
+
     let prefill_urls = parse_prefill_args();
 
     let mut filtered_args: Vec<String> = Vec::new();
@@ -665,7 +718,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let cli_args = CliArgs::parse_from(filtered_args);
+    let cli = Cli::parse_from(filtered_args);
+
+    // Handle subcommands or use direct args
+    let cli_args = match cli.command {
+        Some(Commands::Launch { args }) => args,
+        None => cli.router_args,
+    };
 
     println!("SGLang Router starting...");
     println!("Host: {}:{}", cli_args.host, cli_args.port);

@@ -38,7 +38,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
+from sglang.srt.distributed.parallel_state import (
+    get_moe_expert_parallel_world_size,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_rank,
@@ -78,6 +83,10 @@ class ForwardMode(IntEnum):
 
     DRAFT_EXTEND_V2 = auto()
 
+    # Used in disaggregated decode worker
+    # Represent a batch of requests having their KV cache ready to start decoding
+    PREBUILT = auto()
+
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
@@ -89,12 +98,20 @@ class ForwardMode(IntEnum):
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.DRAFT_EXTEND
+            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
+            or self == ForwardMode.TARGET_VERIFY
+            or self == ForwardMode.SPLIT_PREFILL
+        )
+
+    def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
+        return (
+            self == ForwardMode.EXTEND
+            or self == ForwardMode.MIXED
             or (
                 self == ForwardMode.DRAFT_EXTEND_V2
                 if include_draft_extend_v2
                 else False
             )
-            or self == ForwardMode.TARGET_VERIFY
         )
 
     def is_decode(self):
@@ -113,22 +130,21 @@ class ForwardMode(IntEnum):
         return self == ForwardMode.TARGET_VERIFY
 
     def is_draft_extend(self, include_v2: bool = False):
-        if include_v2:
-            return (
-                self == ForwardMode.DRAFT_EXTEND_V2 or self == ForwardMode.DRAFT_EXTEND
-            )
-        return self == ForwardMode.DRAFT_EXTEND
+        return self == ForwardMode.DRAFT_EXTEND or (
+            include_v2 and self == ForwardMode.DRAFT_EXTEND_V2
+        )
 
     def is_draft_extend_v2(self):
         # For fixed shape logits output in v2 eagle worker
         return self == ForwardMode.DRAFT_EXTEND_V2
 
-    def is_extend_or_draft_extend_or_mixed(self):
+    def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.SPLIT_PREFILL
+            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
         )
 
     def is_cuda_graph(self):
@@ -143,6 +159,16 @@ class ForwardMode(IntEnum):
 
     def is_split_prefill(self):
         return self == ForwardMode.SPLIT_PREFILL
+
+    def is_extend_without_speculative(self):
+        return (
+            self.is_extend()
+            and not self.is_target_verify()
+            and not self.is_draft_extend()
+        )
+
+    def is_prebuilt(self):
+        return self == ForwardMode.PREBUILT
 
 
 @total_ordering
@@ -189,6 +215,10 @@ class ForwardBatch:
 
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+
+    # The indices of output tokens in the token_to_kv_pool_swa
+    # TODO(shiyang, biao): integrate out_cache_loc_swa into multiple attention backends
+    out_cache_loc_swa: Optional[torch.Tensor] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -250,6 +280,8 @@ class ForwardBatch:
     # For MLA chunked prefix cache used in chunked prefill
     # Tell attention backend whether lse needs to be returned
     mha_return_lse: Optional[bool] = None
+    mha_one_shot_kv_indices: Optional[torch.Tensor] = None
+    mha_one_shot: Optional[bool] = None
 
     # For multimodal
     mm_inputs: Optional[List[MultimodalInputs]] = None
@@ -316,6 +348,12 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+
+    # Record the split metadata of the sequence number of NSA context parallels.
+    nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
+
     @classmethod
     def init_new(
         cls,
@@ -357,6 +395,7 @@ class ForwardBatch:
             input_embeds=batch.input_embeds,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            dimensions=batch.dimensions,
         )
         device = model_runner.device
 
@@ -402,8 +441,17 @@ class ForwardBatch:
             )
             return ret
 
-        # Override the positions with spec_info
-        if (
+        # Override the positions with diffusion LLM or spec_info
+        if batch.dllm_config is not None:
+            block_size = batch.dllm_config.block_size
+            ret.positions = torch.tensor(
+                [
+                    [i for i in range(block_offset, block_offset + block_size)]
+                    for block_offset in batch.dllm_block_offsets
+                ],
+                dtype=torch.int32,
+            ).to(device, non_blocking=True)
+        elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):
@@ -554,6 +602,25 @@ class ForwardBatch:
 
         self.mrope_positions = next_input_positions
 
+    def _expand_mrope_from_input(
+        self,
+        mm_input: MultimodalInputs,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if mm_input.mrope_position_delta.device.type != device:
+            # transfer mrope_position_delta to device when the first running,
+            # avoiding successvie host-to-device data transfer
+            mm_input.mrope_position_delta = mm_input.mrope_position_delta.to(
+                device, non_blocking=True
+            )
+
+        mrope_position_deltas = mm_input.mrope_position_delta.flatten()
+        mrope_positions = (
+            (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
+        )
+        return mrope_positions
+
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
@@ -572,14 +639,10 @@ class ForwardBatch:
                         device=model_runner.device,
                     )
                 else:
-                    mrope_position_deltas = mm_input.mrope_position_delta.flatten().to(
-                        model_runner.device, non_blocking=True
+                    mrope_positions = self._expand_mrope_from_input(
+                        mm_input, self.seq_lens[batch_idx], model_runner.device
                     )
-                    mrope_positions_list[batch_idx] = (
-                        (mrope_position_deltas + self.seq_lens[batch_idx] - 1)
-                        .unsqueeze(0)
-                        .repeat(3, 1)
-                    )
+                    mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend():
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
@@ -604,6 +667,10 @@ class ForwardBatch:
                         :,
                         extend_prefix_len : extend_prefix_len + extend_seq_len,
                     ]
+                    if mrope_positions.numel() == 0:
+                        mrope_positions = self._expand_mrope_from_input(
+                            mm_input, self.seq_lens[batch_idx], model_runner.device
+                        )
                 mrope_positions_list[batch_idx] = mrope_positions
 
         self.mrope_positions = torch.cat(
@@ -697,7 +764,9 @@ class ForwardBatch:
             num_tokens = global_num_tokens[0]
 
         self.global_dp_buffer_len = buffer_len
-        set_dp_buffer_len(buffer_len, num_tokens, global_num_tokens)
+        set_dp_buffer_len(
+            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+        )
         set_is_extend_in_batch(self.is_extend_in_batch)
 
         bs = self.batch_size
@@ -725,6 +794,13 @@ class ForwardBatch:
                     bs = self.batch_size = num_tokens
 
         # padding
+        self._pad_inputs_to_size(model_runner, num_tokens, bs)
+        self.global_num_tokens_cpu = global_num_tokens
+        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
+        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+
+    def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
+        # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
 
@@ -746,9 +822,6 @@ class ForwardBatch:
         if self.encoder_lens is not None:
             self.encoder_lens = self._pad_tensor_to_size(self.encoder_lens, bs)
         self.positions = self._pad_tensor_to_size(self.positions, num_tokens)
-        self.global_num_tokens_cpu = global_num_tokens
-        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
-        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
         if self.mrope_positions is not None:
             self.mrope_positions = self._pad_tensor_to_size(self.mrope_positions, bs)
@@ -776,6 +849,19 @@ class ForwardBatch:
                 spec_info.hidden_states, num_tokens
             )
 
+    def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
+        from sglang.srt.layers.communicator import get_attn_tp_context
+
+        attn_tp_context = get_attn_tp_context()
+        input_scattered = attn_tp_context.use_input_scattered(self)
+        if not input_scattered:
+            return
+        assert self.forward_mode.is_extend()
+        tokens = self.input_ids.shape[0]
+        rank_size = get_tensor_model_parallel_world_size()
+        tokens_padded = (tokens + rank_size - 1) // rank_size * rank_size
+        self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
+
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
 
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
@@ -802,6 +888,10 @@ class ForwardBatch:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend():  # draft extend
                 self.spec_info.accept_length = self.spec_info.accept_length[:bs]
+                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                logits_output.hidden_states = logits_output.hidden_states[:bs]
+            elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
+                bs = bs * self.spec_info.num_tokens_per_batch
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
@@ -863,6 +953,10 @@ class ForwardBatch:
             self.token_to_kv_pool, MLATokenToKVPool
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
+        if not any(self.extend_prefix_lens_cpu):
+            self.num_prefix_chunks = 0
+            return
+
         if self.prefix_chunk_len is not None:
             # Chunked kv cache info already prepared by prior modules
             return
@@ -916,6 +1010,34 @@ class ForwardBatch:
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None
+
+    def fetch_mha_one_shot_kv_indices(self):
+        if self.mha_one_shot_kv_indices is not None:
+            return self.mha_one_shot_kv_indices
+        batch_size = self.batch_size
+        paged_kernel_lens_sum = sum(self.seq_lens_cpu)
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum,
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        kv_indptr = torch.zeros(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=self.req_pool_indices.device,
+        )
+        kv_indptr[1:] = torch.cumsum(self.seq_lens, dim=0)
+        create_flashinfer_kv_indices_triton[(self.batch_size,)](
+            self.req_to_token_pool.req_to_token,
+            self.req_pool_indices,
+            self.seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token_pool.req_to_token.shape[1],
+        )
+        self.mha_one_shot_kv_indices = kv_indices
+        return kv_indices
 
 
 def enable_num_token_non_padded(server_args):

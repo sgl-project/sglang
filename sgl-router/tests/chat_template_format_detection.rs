@@ -1,5 +1,5 @@
-use sglang_router_rs::{
-    protocols::chat::{ChatMessage, UserMessageContent},
+use sgl_model_gateway::{
+    protocols::chat::{ChatMessage, MessageContent},
     tokenizer::chat_template::{
         detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
         ChatTemplateProcessor,
@@ -176,11 +176,11 @@ assistant:
 
     let messages = [
         ChatMessage::System {
-            content: "You are helpful".to_string(),
+            content: MessageContent::Text("You are helpful".to_string()),
             name: None,
         },
         ChatMessage::User {
-            content: UserMessageContent::Text("Hello".to_string()),
+            content: MessageContent::Text("Hello".to_string()),
             name: None,
         },
     ];
@@ -216,7 +216,7 @@ fn test_chat_template_with_tokens_unit_test() {
     let processor = ChatTemplateProcessor::new(template.to_string());
 
     let messages = [ChatMessage::User {
-        content: UserMessageContent::Text("Test".to_string()),
+        content: MessageContent::Text("Test".to_string()),
         name: None,
     }];
 

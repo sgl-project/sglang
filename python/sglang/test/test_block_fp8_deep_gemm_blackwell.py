@@ -222,7 +222,7 @@ class TestDeepGemmBlackwell(CustomTestCase):
 
         with torch.inference_mode():
             ref_out = native_w8a8_block_fp8_matmul(
-                A_q, B_q, A_s, B_s, block_size, out_dtype
+                A_qu[0], B_qu[0], A_qu[1], B_qu[1], block_size, out_dtype
             )
             out = torch.empty_like(ref_out)
             fp8_gemm_nt(A_qu, B_qu, out)

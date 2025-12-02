@@ -10,7 +10,6 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
 logger = logging.getLogger(__name__)
 
@@ -127,13 +126,4 @@ class MistralDetector(BaseFormatDetector):
             begin='[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
             end="}]",
             trigger="[TOOL_CALLS]",
-        )
-
-    def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            function_format="json",
-            tool_call_separator=self.tool_call_separator,
         )

@@ -2,8 +2,8 @@
 mod tests {
     use std::fs;
 
-    use sglang_router_rs::{
-        protocols::chat::{ChatMessage, UserMessageContent},
+    use sgl_model_gateway::{
+        protocols::chat::{ChatMessage, MessageContent},
         tokenizer::{chat_template::ChatTemplateParams, huggingface::HuggingFaceTokenizer},
     };
     use tempfile::TempDir;
@@ -61,11 +61,11 @@ mod tests {
 
         let messages = [
             ChatMessage::User {
-                content: UserMessageContent::Text("Hello".to_string()),
+                content: MessageContent::Text("Hello".to_string()),
                 name: None,
             },
             ChatMessage::Assistant {
-                content: Some("Hi there".to_string()),
+                content: Some(MessageContent::Text("Hi there".to_string())),
                 name: None,
                 tool_calls: None,
                 reasoning_content: None,
@@ -78,7 +78,7 @@ mod tests {
             .map(|msg| serde_json::to_value(msg).unwrap())
             .collect();
 
-        use sglang_router_rs::tokenizer::chat_template::ChatTemplateParams;
+        use sgl_model_gateway::tokenizer::chat_template::ChatTemplateParams;
         let params = ChatTemplateParams {
             add_generation_prompt: true,
             ..Default::default()
@@ -143,7 +143,7 @@ mod tests {
         .unwrap();
 
         let messages = [ChatMessage::User {
-            content: UserMessageContent::Text("Test".to_string()),
+            content: MessageContent::Text("Test".to_string()),
             name: None,
         }];
 
@@ -202,11 +202,11 @@ mod tests {
 
         let messages = [
             ChatMessage::User {
-                content: UserMessageContent::Text("Hello".to_string()),
+                content: MessageContent::Text("Hello".to_string()),
                 name: None,
             },
             ChatMessage::Assistant {
-                content: Some("World".to_string()),
+                content: Some(MessageContent::Text("World".to_string())),
                 name: None,
                 tool_calls: None,
                 reasoning_content: None,

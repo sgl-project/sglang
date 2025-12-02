@@ -477,9 +477,9 @@ class SGLangPerfAnalyzer:
     def get_job_logs(self, run_id: int, job_name: str) -> Optional[str]:
         """Get logs for specific job with early exit optimization"""
         try:
-            # First get job list
+            # First get job list with pagination to ensure we get all jobs
             jobs_url = f"{self.base_url}/repos/{self.repo}/actions/runs/{run_id}/jobs"
-            response = self.session.get(jobs_url)
+            response = self.session.get(jobs_url, params={"per_page": 100})
             response.raise_for_status()
             jobs_data = response.json()
 
@@ -612,18 +612,23 @@ class SGLangPerfAnalyzer:
 
         total_runs = len(runs)
         for i, run in enumerate(runs, 1):
-            print(f"Processing run {i}/{total_runs}: #{run.get('run_number')}")
+            if not isinstance(run, dict):
+                print(f"  Warning: run #{i} is not a dict, skipping.")
+                continue
 
             run_info = {
                 "run_number": run.get("run_number"),
                 "created_at": run.get("created_at"),
-                "head_sha": run.get("head_sha", "")[:8],
-                "author": run.get("head_commit", {})
-                .get("author", {})
-                .get("name", "Unknown"),
+                "head_sha": (run.get("head_sha") or "")[:8],
+                "author": "Unknown",
                 "pr_number": None,
                 "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
             }
+            head_commit = run.get("head_commit", {})
+            if isinstance(head_commit, dict):
+                run_info["author"] = head_commit.get("author", {}).get(
+                    "name", "Unknown"
+                )
 
             # Extract PR number
             pull_requests = run.get("pull_requests", [])
