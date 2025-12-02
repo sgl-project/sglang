@@ -510,7 +510,7 @@ def get_available_gpu_memory(
     When distributed is True, the available memory is the minimum available memory of all GPUs.
     This function has been deprecated. Please use 'get_available_device_memory' instead.
     """
-    get_available_device_memory(
+    return get_available_device_memory(
         device,
         gpu_id,
         distributed=distributed,
