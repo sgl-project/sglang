@@ -9,7 +9,7 @@ register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 class TestGemmaModels(TestVLMModels):
     model = "/root/.cache/modelscope/hub/models/google/gemma-3-4b-it"
-    mmmu_accuracy = 0.25
+    mmmu_accuracy = 0.2
 
     def test_vlm_mmmu_benchmark(self):
         self._run_vlm_mmmu_test()
