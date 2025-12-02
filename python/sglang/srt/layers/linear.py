@@ -737,7 +737,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         if isinstance(param, BlockQuantScaleParameter):
             if type(self.quant_method) == CompressedTensorsLinearMethod:
-                weight_block_size = self.quant_method.quantization_config.config["config_groups"]["FP8_BLOCK"]["input_activations"]["group_size"]
+                weight_block_size = self.quant_method.quantization_config.config["config_groups"]["FP8_BLOCK"]["weights"]["block_structure"]
             else:
                 weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]

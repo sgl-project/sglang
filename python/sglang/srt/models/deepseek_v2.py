@@ -725,11 +725,11 @@ class DeepseekV2MoE(nn.Module):
                     gate_up_proj_config = self.shared_experts.gate_up_proj.quant_method.quantization_config.config
                     down_proj_config = self.shared_experts.down_proj.quant_method.quantization_config.config
                     
-                    gate_up_proj_group_size = gate_up_proj_config["config_groups"]["FP8_BLOCK"]["input_activations"]["group_size"]
-                    down_proj_group_size = down_proj_config["config_groups"]["FP8_BLOCK"]["input_activations"]["group_size"]
+                    gate_up_proj_block_structure = gate_up_proj_config["config_groups"]["FP8_BLOCK"]["weights"]["block_structure"]
+                    down_proj_block_structure = down_proj_config["config_groups"]["FP8_BLOCK"]["weights"]["block_structure"]
 
-                    assert gate_up_proj_group_size == down_proj_group_size
-                    self.shared_experts_weight_block_size = gate_up_proj_group_size
+                    assert gate_up_proj_block_structure == down_proj_block_structure
+                    self.shared_experts_weight_block_size = gate_up_proj_block_structure
 
                     # config {'config_groups': {'FP8_BLOCK': {'format': 'float-quantized', 'input_activations': {'actorder': None, 'block_structure': None, 'dynamic': True, 'group_size': 128, 'num_bits': 8, 'observer': None, 'observer_kwargs': {}, 'strategy': 'group', 'symmetric': True, 'type': 'float'}, 'output_activations': None, 'targets': ['Linear'], 'weights': {'actorder': None, 'block_structure': [128, 128], 'dynamic': False, 'group_size': None, 'num_bits': 8, 'observer': 'static_minmax', 'observer_kwargs': {}, 'strategy': 'block', 'symmetric': True, 'type': 'float'}}}, 'format': 'float-quantized', 'global_compression_ratio': None, 'ignore': ['model.embed_tokens', 're:patch_merger.*', 're:vision_encoder.*', 're:vision_language_adapter.*', 're:.*kv_a_proj_with_mqa$', 're:.*q_a_proj$', 're:.*gate$', 'lm_head'], 'kv_cache_scheme': None, 'quant_method': 'compressed-tensors', 'quantization_status': 'compressed', 'sparsity_config': {}, 'transform_config': {}, 'version': '0.12.3.dev29+g73c2cf9.d20251119', 'packed_modules_mapping': {}}
                 else:
