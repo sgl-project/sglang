@@ -36,20 +36,23 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
 fi
 
-RUN --mount=type=cache,target=/var/cache/apt apt update && apt install wget -y && apt install software-properties-common -y \
- && add-apt-repository ppa:deadsnakes/ppa -y \
- && apt install python3.12-full python3.12-dev python3.10-venv -y \
- && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
- && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
- && update-alternatives --set python3 /usr/bin/python3.12 \
- && wget https://bootstrap.pypa.io/get-pip.py \
- && python3 get-pip.py \
- # Fix for `apt-add-repository`
- && cd /usr/lib/python3/dist-packages/ \
- && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+# Python setup (combined with apt update to reduce layers)
+RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
+    apt update && apt install -y --no-install-recommends wget software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
+    && update-alternatives --set python3 /usr/bin/python3.12 \
+    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && python3 get-pip.py \
+    && rm get-pip.py \
+    # Fix for apt-add-repository
+    && cd /usr/lib/python3/dist-packages/ \
+    && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
 
 # Install system dependencies (organized by category for better caching)
-RUN --mount=type=cache,target=/var/cache/apt \
+RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     echo 'tzdata tzdata/Areas select America' | debconf-set-selections \
     && echo 'tzdata tzdata/Zones/America select Los_Angeles' | debconf-set-selections \
     && apt-get update && apt-get install -y --no-install-recommends \
@@ -313,7 +316,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
 # Install development tools
-RUN --mount=type=cache,target=/var/cache/apt \
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     apt-get update && apt-get install -y --no-install-recommends \
     gdb \
     ninja-build \
@@ -342,7 +345,7 @@ RUN --mount=type=cache,target=/var/cache/apt \
     && apt-get clean
 
 # Install NVIDIA development tools
-RUN --mount=type=cache,target=/var/cache/apt \
+RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     apt update -y \
     && apt install -y --no-install-recommends gnupg \
     && echo "deb http://developer.download.nvidia.com/devtools/repos/ubuntu2004/$(if [ "$(uname -m)" = "aarch64" ]; then echo "arm64"; else echo "amd64"; fi) /" | tee /etc/apt/sources.list.d/nvidia-devtools.list \
@@ -451,7 +454,7 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 # Install ONLY runtime dependencies (no build tools)
-RUN --mount=type=cache,target=/var/cache/apt \
+RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     apt-get update && apt-get install -y --no-install-recommends \
     # Python runtime
     software-properties-common \
@@ -460,6 +463,9 @@ RUN --mount=type=cache,target=/var/cache/apt \
     python3.12-full \
     python3.12-dev \
     wget \
+    # Minimal C compiler for Triton JIT
+    gcc \
+    libc6-dev \
     # Core system utilities
     tzdata \
     ca-certificates \
@@ -514,6 +520,17 @@ COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/pyt
 
 # Copy SGLang workspace
 COPY --from=framework /sgl-workspace /sgl-workspace
+
+# Copy in CUDA bits
+COPY --from=framework /usr/local/cuda/bin/nvcc /usr/local/cuda/bin/nvcc
+COPY --from=framework /usr/local/cuda/bin/cudafe++ /usr/local/cuda/bin/cudafe++
+COPY --from=framework /usr/local/cuda/bin/ptxas /usr/local/cuda/bin/ptxas
+COPY --from=framework /usr/local/cuda/bin/fatbinary /usr/local/cuda/bin/fatbinary
+COPY --from=framework /usr/local/cuda/include/ /usr/local/cuda/include/
+COPY --from=framework /usr/local/cuda/nvvm /usr/local/cuda/nvvm
+COPY --from=framework /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/
+RUN ln -s /usr/local/cuda/lib64/libcublas.so.12 /usr/local/cuda/lib64/libcublas.so
+RUN ln -s /usr/local/cuda/lib64/libcublasLt.so.12 /usr/local/cuda/lib64/libcublasLt.so
 
 # Copy GDRCopy runtime libraries (but not the build artifacts)
 COPY --from=framework /usr/lib/libgdrapi.so* /usr/lib/
