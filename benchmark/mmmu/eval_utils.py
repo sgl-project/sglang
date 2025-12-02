@@ -257,11 +257,12 @@ def get_sampling_params(eval_args):
 
     if eval_args.max_new_tokens is not None and eval_args.max_new_tokens > 0:
         sampling_params.update({"max_completion_tokens": eval_args.max_new_tokens})
-    
+
     if eval_args.temperature is not None:
         sampling_params.update({"temperature": eval_args.temperature})
-    
+
     return sampling_params
+
 
 # ----------- Process Multi-choice -------------
 def parse_multi_choice_response(response, all_choices, index2ans):
