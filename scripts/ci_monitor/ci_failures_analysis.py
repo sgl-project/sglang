@@ -1166,7 +1166,9 @@ class SGLangFailuresAnalyzer:
 
             if filtered_job_alerts:
                 print("\n" + "=" * 150)
-                print("## ALERTS: Critical Consecutive Job Failures")
+                print(
+                    "## ALERTS: Critical Consecutive Job Failures (PR + Scheduled, streak >= 2)"
+                )
                 print("=" * 150)
                 print(
                     f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First Failure':<16} {'Last Failure':<16} {'Top Errors':<60}"
@@ -1207,7 +1209,9 @@ class SGLangFailuresAnalyzer:
                     )
             else:
                 print("\n" + "=" * 100)
-                print("## ALERTS: Critical Consecutive Job Failures")
+                print(
+                    "## ALERTS: Critical Consecutive Job Failures (PR + Scheduled, streak >= 2)"
+                )
                 print("=" * 100)
                 print(
                     "\nNothing to display (no jobs with consecutive failure streak >= 2)"
@@ -1225,7 +1229,7 @@ class SGLangFailuresAnalyzer:
 
             if instance_alerts:
                 print("\n" + "=" * 170)
-                print("## ALERTS: Runners with Issues")
+                print("## ALERTS: Runners with Issues (streak >= 2)")
                 print("=" * 170)
                 print("\n### Runner Consecutive Failures")
                 print(
@@ -1287,10 +1291,10 @@ class SGLangFailuresAnalyzer:
                     )
             else:
                 print("\n" + "=" * 100)
-                print("## ALERTS: Runners with Issues")
+                print("## ALERTS: Runners with Issues (streak >= 2)")
                 print("=" * 100)
                 print(
-                    "\nNothing to display (no runners with consecutive failure streak > 2)"
+                    "\nNothing to display (no runners with consecutive failure streak >= 2)"
                 )
 
         # Main Branch Health Section: Jobs failing on cron-triggered main branch runs
@@ -1302,23 +1306,23 @@ class SGLangFailuresAnalyzer:
                 reverse=True,
             )
 
-            # Show ALL jobs with ANY active streak on main (even streak=1 is concerning on main)
+            # Show only jobs with streak >= 2
             broken_main_jobs = [
                 (name, data)
                 for name, data in sorted_main_jobs
-                if data["current_streak"] >= 1
+                if data["current_streak"] >= 2
             ]
 
             if broken_main_jobs:
-                print("\n" + "=" * 150)
+                print("\n" + "=" * 140)
                 print(
                     f"## MAIN BRANCH HEALTH: Failing Jobs on Scheduled Main Branch Runs ({len(broken_main_jobs)} jobs)"
                 )
-                print("=" * 150)
+                print("=" * 140)
                 print(
-                    f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Match':<7} {'Top Errors':<50}"
+                    f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Top Errors':<50}"
                 )
-                print("-" * 150)
+                print("-" * 140)
                 for job_name, data in broken_main_jobs[:15]:
                     display_name = (
                         job_name if len(job_name) <= 38 else job_name[:35] + "..."
@@ -1337,12 +1341,6 @@ class SGLangFailuresAnalyzer:
                         f"Run #{last_failure['run_number']}" if last_failure else "N/A"
                     )
 
-                    # Visual indicator for error signature match
-                    # ✓ = same error on main and overall (consistent failure pattern)
-                    # ✗ = different errors (main has different failure than PRs)
-                    matches = data.get("matches_overall_error", False)
-                    match_indicator = "✓" if matches else "✗"
-
                     # Format top errors - don't truncate
                     top_errors = data.get("top_error_signatures", [])
                     if top_errors:
@@ -1353,18 +1351,14 @@ class SGLangFailuresAnalyzer:
                         error_display = "N/A"
 
                     print(
-                        f"{display_name:<40} {data['current_streak']:<8} {data['max_streak']:<6} {first_failure_str:<13} {last_failure_str:<13} {match_indicator:<7} {error_display:<50}"
+                        f"{display_name:<40} {data['current_streak']:<8} {data['max_streak']:<6} {first_failure_str:<13} {last_failure_str:<13} {error_display:<50}"
                     )
-
-                print(
-                    "\n  Legend: Match column - ✓ = same error as overall failures, ✗ = different error signature on main"
-                )
             else:
                 print("\n" + "=" * 100)
                 print("## MAIN BRANCH HEALTH: Scheduled Main Branch Runs")
                 print("=" * 100)
                 print(
-                    f"\n  ✓ All {len(sorted_main_jobs)} jobs passing on main branch scheduled runs!"
+                    "\n  No consecutive failing jobs (streak >= 2) on main branch scheduled runs"
                 )
 
         # Section 1: Currently Broken Jobs (streak >= 2)
@@ -1374,7 +1368,9 @@ class SGLangFailuresAnalyzer:
 
         if broken_jobs:
             print("\n" + "=" * 140)
-            print("## Section 1: Top 15 Consecutively Failing Jobs")
+            print(
+                "## Section 1: Top 15 Consecutively Failing Jobs (PR + Scheduled, streak >= 2)"
+            )
             print("=" * 140)
             print(
                 f"\n{'Job Name':<40} {'Streak':<8} {'Max':<6} {'First':<13} {'Last':<13} {'Top Errors':<50}"
@@ -1449,7 +1445,9 @@ class SGLangFailuresAnalyzer:
 
             if runners_with_issues:
                 print("\n" + "=" * 160)
-                print("## Section 2: Top 15 Workers by Consecutive Failures")
+                print(
+                    "## Section 2: Top 15 Workers by Consecutive Failures (streak >= 2)"
+                )
                 print("=" * 160)
                 print(
                     f"\n{'Machine Name':<30} {'Str':<5} {'Max':<5} {'Fail%':<7} {'AvgQ':<7} {'First':<13} {'Last':<13} {'Top Errors':<45} {'Total Jobs':<11} {'Unique Jobs':<12}"
@@ -1658,7 +1656,9 @@ class SGLangFailuresAnalyzer:
                 ]
 
                 if filtered_job_alerts:
-                    summary_lines.append("## ALERTS: Critical Consecutive Job Failures")
+                    summary_lines.append(
+                        "## Alerts: Critical Consecutive Job Failures (PR + Scheduled, streak >= 2)"
+                    )
                     summary_lines.append("")
                     summary_lines.append(
                         "| Job Name | Streak | Max | First Failure | Last Failure | Top Errors |"
@@ -1704,7 +1704,9 @@ class SGLangFailuresAnalyzer:
 
                     summary_lines.append("")
                 else:
-                    summary_lines.append("## ALERTS: Critical Consecutive Job Failures")
+                    summary_lines.append(
+                        "## Alerts: Critical Consecutive Job Failures (PR + Scheduled, streak >= 2)"
+                    )
                     summary_lines.append("")
                     summary_lines.append(
                         "Nothing to display (no jobs with consecutive failure streak >= 2)"
@@ -1722,7 +1724,7 @@ class SGLangFailuresAnalyzer:
                 ]
 
                 if instance_alerts:
-                    summary_lines.append("## ALERTS: Workers with Issues")
+                    summary_lines.append("## Alerts: Workers with Issues (streak >= 2)")
                     summary_lines.append("")
                     summary_lines.append(
                         "| Runner | Streak | Max | Fail Rate | Avg Queue | First Failure | Last Failure | Top Errors | Jobs Failed |"
@@ -1790,10 +1792,10 @@ class SGLangFailuresAnalyzer:
                     summary_lines.append("")
                     summary_lines.append("")
                 else:
-                    summary_lines.append("## ALERTS: Runners with Issues")
+                    summary_lines.append("## Alerts: Runners with Issues (streak >= 2)")
                     summary_lines.append("")
                     summary_lines.append(
-                        "Nothing to display (no runners with consecutive failure streak > 2)"
+                        "Nothing to display (no runners with consecutive failure streak >= 2)"
                     )
                     summary_lines.append("")
                     summary_lines.append("")
@@ -1807,23 +1809,23 @@ class SGLangFailuresAnalyzer:
                     reverse=True,
                 )
 
-                # Show ALL jobs with ANY active streak on main (even streak=1 is concerning on main)
+                # Show only jobs with streak >= 2
                 broken_main_jobs = [
                     (name, data)
                     for name, data in sorted_main_jobs
-                    if data["current_streak"] >= 1
+                    if data["current_streak"] >= 2
                 ]
 
                 if broken_main_jobs:
                     summary_lines.append(
-                        f"## MAIN BRANCH HEALTH: Failing Jobs on Scheduled Main Branch Runs ({len(broken_main_jobs)} jobs)"
+                        f"## Main Branch Health: Consecutive Failing Jobs on Scheduled Main Branch Runs (streak >= 2)"
                     )
                     summary_lines.append("")
                     summary_lines.append(
-                        "| Job Name | Streak | Max | First Failure | Last Failure | Match | Top Errors |"
+                        "| Job Name | Streak | Max | First Failure | Last Failure | Top Errors |"
                     )
                     summary_lines.append(
-                        "|----------|--------|-----|---------------|--------------|-------|------------|"
+                        "|----------|--------|-----|---------------|--------------|------------|"
                     )
                     for job_name, data in broken_main_jobs[:15]:
                         display_name = (
@@ -1843,10 +1845,6 @@ class SGLangFailuresAnalyzer:
                         else:
                             last_failure_str = "N/A"
 
-                        # Visual indicator for error signature match
-                        matches = data.get("matches_overall_error", False)
-                        match_indicator = "✓" if matches else "✗"
-
                         # Format top errors as bullet list
                         top_errors = data.get("top_error_signatures", [])
                         if top_errors:
@@ -1858,21 +1856,17 @@ class SGLangFailuresAnalyzer:
 
                         summary_lines.append(
                             f"| `{display_name}` | {data['current_streak']} | {data['max_streak']} | "
-                            f"{first_failure_str} | {last_failure_str} | {match_indicator} | {error_str} |"
+                            f"{first_failure_str} | {last_failure_str} | {error_str} |"
                         )
 
                     summary_lines.append("")
-                    summary_lines.append(
-                        "**Legend:** Match column - ✓ = same error as overall failures, ✗ = different error signature on main"
-                    )
-                    summary_lines.append("")
                 else:
                     summary_lines.append(
-                        "## MAIN BRANCH HEALTH: Scheduled Main Branch Runs"
+                        "## Main Branch Health: Scheduled Main Branch Runs"
                     )
                     summary_lines.append("")
                     summary_lines.append(
-                        f"✓ All {len(sorted_main_jobs)} jobs passing on main branch scheduled runs!"
+                        "No consecutive failing jobs (streak >= 2) on main branch scheduled runs"
                     )
                     summary_lines.append("")
 
@@ -1891,7 +1885,9 @@ class SGLangFailuresAnalyzer:
             ]
 
             if broken_jobs:
-                summary_lines.append("## Section 1: Top 15 Consecutively Failing Jobs")
+                summary_lines.append(
+                    "## Section 1: Top 15 Consecutively Failing Jobs (PR + Scheduled, streak >= 2)"
+                )
                 summary_lines.append("")
                 summary_lines.append(
                     "| Job Name | Streak | Max | First Failure | Last Failure | Top Errors |"
@@ -1981,7 +1977,7 @@ class SGLangFailuresAnalyzer:
 
                 if runners_with_issues:
                     summary_lines.append(
-                        "## Section 2: Top 15 Consecutively Failing Workers"
+                        "## Section 2: Top 15 Consecutively Failing Workers (streak >= 2)"
                     )
                     summary_lines.append("")
                     summary_lines.append(
