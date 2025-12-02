@@ -1053,6 +1053,41 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    def _parse_multipart_message(self, parts):
+        # Check message type
+        msg_type = bytes(parts[0])
+
+        if msg_type == b"NORM":
+            # Normal message
+            recv_req = pickle.loads(parts[1])
+
+        elif msg_type == b"FEAT":
+            # Message with optimized feature tensors
+            recv_req = pickle.loads(parts[1])
+            feature_infos = pickle.loads(parts[2])
+
+            # Reconstruct tensors
+            for i, feature_info in enumerate(feature_infos):
+                buffer_idx = 3 + i
+                buffer = (
+                    parts[buffer_idx].buffer
+                    if hasattr(parts[buffer_idx], "buffer")
+                    else parts[buffer_idx]
+                )
+
+                dtype = feature_info["dtype"]
+                shape = feature_info["shape"]
+                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
+
+                idx = feature_info["idx"]
+                if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
+                    mm_items = recv_req.mm_inputs.get("mm_items", [])
+                    if idx < len(mm_items):
+                        mm_items[idx].feature = tensor
+        else:
+            logger.warning(f"Unknown message type: {msg_type}")
+        return recv_req
+
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1076,50 +1111,10 @@ class Scheduler(
                         parts = self.recv_from_tokenizer.recv_multipart(
                             flags=zmq.NOBLOCK, copy=False
                         )
-
                         if not parts:
                             break
-
-                        # Check message type
-                        msg_type = bytes(parts[0])
-
-                        if msg_type == b"NORM":
-                            # Normal message
-                            recv_req = pickle.loads(parts[1])
-                            recv_reqs.append(recv_req)
-
-                        elif msg_type == b"FEAT":
-                            # Message with optimized feature tensors
-                            recv_req = pickle.loads(parts[1])
-                            feature_infos = pickle.loads(parts[2])
-
-                            # Reconstruct tensors
-                            for i, feature_info in enumerate(feature_infos):
-                                buffer_idx = 3 + i
-                                buffer = (
-                                    parts[buffer_idx].buffer
-                                    if hasattr(parts[buffer_idx], "buffer")
-                                    else parts[buffer_idx]
-                                )
-
-                                dtype = feature_info["dtype"]
-                                shape = feature_info["shape"]
-                                tensor = torch.frombuffer(buffer, dtype=dtype).reshape(
-                                    shape
-                                )
-
-                                idx = feature_info["idx"]
-                                if (
-                                    hasattr(recv_req, "mm_inputs")
-                                    and recv_req.mm_inputs
-                                ):
-                                    mm_items = recv_req.mm_inputs.get("mm_items", [])
-                                    if idx < len(mm_items):
-                                        mm_items[idx].feature = tensor
-                            recv_reqs.append(recv_req)
-                        else:
-                            logger.warning(f"Unknown message type: {msg_type}")
-
+                        recv_req = self._parse_multipart_message(parts)
+                        recv_reqs.append(recv_req)
                     except zmq.ZMQError as e:
                         break
 
