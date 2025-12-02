@@ -380,11 +380,7 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.get_model_info(req).await
         } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No routers available",
-            )
-                .into_response()
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
         }
     }
 
