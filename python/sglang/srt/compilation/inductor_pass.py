@@ -1,18 +1,18 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/inductor_pass.py
 
+import functools
 import hashlib
 import inspect
 import json
 import logging
-import time
 import types
 from contextlib import contextmanager
 from typing import Any, Callable, Optional, Union
 
 import torch
 from torch import fx
-from torch._dynamo.utils import lazy_format_graph_code
 from torch._inductor.custom_graph_pass import CustomGraphPass
+from torch._subclasses.fake_tensor import FakeTensorMode, unset_fake_temporarily
 
 logger = logging.getLogger(__name__)
 
@@ -111,30 +111,17 @@ class CallableInductorPass(InductorPass):
         return self._uuid
 
 
-class SGLangInductorPass(InductorPass):
+def enable_fake_mode(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """
+    Applies a FakeTensorMode context. This is useful when you don't want to
+    create or run things with real tensors.
+    """
 
-    def __init__(
-        self,
-    ):
-        self.pass_name = self.__class__.__name__
+    @functools.wraps(fn)
+    def fn_new(*args, **kwargs) -> Any:
+        with torch._guards.tracing(None), unset_fake_temporarily(), FakeTensorMode():
+            result = fn(*args, **kwargs)
 
-    def dump_graph(self, graph: torch.fx.Graph, stage: str):
-        lazy_format_graph_code(stage, graph.owning_module)
+        return result
 
-    def begin(self):
-        self._start_time = time.perf_counter_ns()
-
-    def end_and_log(self):
-        self._end_time = time.perf_counter_ns()
-        duration_ms = float(self._end_time - self._start_time) / 1.0e6
-        logger.debug("%s completed in %.1f ms", self.pass_name, duration_ms)
-
-
-class PrinterInductorPass(SGLangInductorPass):
-
-    def __init__(self, name: str):
-        super().__init__()
-        self.name = name
-
-    def __call__(self, graph: torch.fx.Graph):
-        self.dump_graph(graph, self.name)
+    return fn_new
