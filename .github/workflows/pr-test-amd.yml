@@ -197,6 +197,15 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
 
+      - name: Clean shared memory
+        run: |
+          echo "Host /dev/shm usage:"
+          df -h /dev/shm || echo "/dev/shm not accessible"
+          echo "Cleaning host /dev/shm..."
+          sudo rm -f /dev/shm/nccl-* /dev/shm/rccl-* 2>/dev/null || true
+          echo "After cleanup:"
+          df -h /dev/shm || echo "/dev/shm not accessible"
+
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -204,6 +213,15 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
+
+      - name: Check and clean shared memory
+        run: |
+          echo "Container /dev/shm usage:"
+          docker exec ci_sglang df -h /dev/shm
+          echo "Cleaning container /dev/shm..."
+          docker exec ci_sglang bash -c "rm -f /dev/shm/nccl-* /dev/shm/rccl-* 2>/dev/null || true"
+          echo "After cleanup:"
+          docker exec ci_sglang df -h /dev/shm
 
       - name: Test RCCL multi-GPU communication
         timeout-minutes: 5
