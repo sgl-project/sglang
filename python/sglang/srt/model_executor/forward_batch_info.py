@@ -82,7 +82,10 @@ class ForwardMode(IntEnum):
     DRAFT_EXTEND = auto()
 
     DRAFT_EXTEND_V2 = auto()
-
+    
+    SIMPLE_DRAFT_EXTEND = auto()
+    SIMPLE_TARGET_VERIFY = auto()
+    
     # Used in disaggregated decode worker
     # Represent a batch of requests having their KV cache ready to start decoding
     PREBUILT = auto()
@@ -101,6 +104,7 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+            or self == ForwardMode.SIMPLE_DRAFT_EXTEND
         )
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
@@ -132,7 +136,7 @@ class ForwardMode(IntEnum):
     def is_draft_extend(self, include_v2: bool = False):
         return self == ForwardMode.DRAFT_EXTEND or (
             include_v2 and self == ForwardMode.DRAFT_EXTEND_V2
-        )
+        ) or self == ForwardMode.SIMPLE_DRAFT_EXTEND
 
     def is_draft_extend_v2(self):
         # For fixed shape logits output in v2 eagle worker
@@ -169,7 +173,12 @@ class ForwardMode(IntEnum):
 
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
+    
+    def is_simple_draft(self):
+        return self == ForwardMode.SIMPLE_DRAFT_EXTEND
 
+    def is_simple_verify(self):
+        return self == ForwardMode.SIMPLE_TARGET_VERIFY
 
 @total_ordering
 class CaptureHiddenMode(IntEnum):
@@ -334,6 +343,7 @@ class ForwardBatch:
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    simple_eagle_skip_attn_backend_init: bool = False
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded

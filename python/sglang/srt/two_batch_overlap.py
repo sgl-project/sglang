@@ -734,6 +734,7 @@ class TboForwardBatchPreparer:
                 top_logprobs_nums=None,
                 token_ids_logprobs=None,
                 next_token_logits_buffer=None,
+                simple_eagle_skip_attn_backend_init=False,
             )
         )
 

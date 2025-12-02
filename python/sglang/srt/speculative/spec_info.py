@@ -167,6 +167,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_eagle3(self) -> bool:
         return self._has_flag("EAGLE3")
 
+    def is_simple_eagle(self) -> bool:
+        return self._has_flag("SIMPLE_EAGLE")
+
     def is_standalone(self) -> bool:
         return self._has_flag("STANDALONE")
 
@@ -189,6 +192,7 @@ _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
         "STANDALONE", algorithm
     ),
     "NGRAM": lambda algorithm: SpeculativeAlgorithm._add_flag("NGRAM", algorithm),
+    "SIMPLE_EAGLE": lambda algorithm: SpeculativeAlgorithm._add_flag("SIMPLE_EAGLE", algorithm),
 }
 
 
@@ -284,6 +288,9 @@ def _create_ngram_worker(**kwargs: Any) -> Any:
 
     return NGRAMWorker(**kwargs)
 
+def _create_simple_eagle_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.simple_eagle import SimpleEagleWorker
+    return SimpleEagleWorker(**kwargs)
 
 # Register built-in algorithms.
 # Third-party integrations should import `SpeculativeAlgorithm` and either
@@ -316,6 +323,11 @@ register_speculative_algorithm(
     flags=("NGRAM",),
 )
 
+register_speculative_algorithm(
+    "SIMPLE_EAGLE",
+    worker_cls=_create_simple_eagle_worker,
+    flags=("SIMPLE_EAGLE","EAGLE"),
+)
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
