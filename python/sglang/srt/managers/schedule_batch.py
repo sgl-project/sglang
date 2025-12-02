@@ -1066,7 +1066,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
-    is_hybrid: bool = False
+    is_hybrid_swa: bool = False
 
     # Batch configs
     model_config: ModelConfig = None
@@ -1189,21 +1189,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
-        is_hybrid = False
+        is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert (
                 tree_cache is None
                 or isinstance(tree_cache, SWARadixCache)
                 or isinstance(tree_cache, SWAChunkCache)
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
-            is_hybrid = True
+            is_hybrid_swa = True
 
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
-            is_hybrid=is_hybrid,
+            is_hybrid_swa=is_hybrid_swa,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
@@ -1612,7 +1612,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
-                if self.is_hybrid:
+                if self.is_hybrid_swa:
                     full_available_size = (
                         self.token_to_kv_pool_allocator.full_available_size()
                     )
@@ -1978,7 +1978,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             return (
                 self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
                 and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens

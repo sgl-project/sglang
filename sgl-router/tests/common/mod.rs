@@ -14,7 +14,7 @@ use std::{
 };
 
 use serde_json::json;
-use sglang_router_rs::{
+use sgl_model_gateway::{
     app_context::AppContext,
     config::RouterConfig,
     core::{LoadMonitor, WorkerRegistry},
@@ -90,8 +90,8 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sglang_router_rs::core::JobQueue::new(
-        sglang_router_rs::core::JobQueueConfig::default(),
+    let job_queue = sgl_model_gateway::core::JobQueue::new(
+        sgl_model_gateway::core::JobQueueConfig::default(),
         weak_context,
     );
     app_context
@@ -100,7 +100,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sglang_router_rs::core::workflow::{
+    use sgl_model_gateway::core::workflow::{
         create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
@@ -112,7 +112,7 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         .expect("WorkflowEngine should only be initialized once");
 
     // Initialize MCP manager with empty config
-    use sglang_router_rs::mcp::{McpConfig, McpManager};
+    use sgl_model_gateway::mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -137,7 +137,7 @@ pub async fn create_test_context_with_mcp_config(
     config: RouterConfig,
     mcp_config_path: &str,
 ) -> Arc<AppContext> {
-    use sglang_router_rs::mcp::{McpConfig, McpManager};
+    use sgl_model_gateway::mcp::{McpConfig, McpManager};
 
     let client = reqwest::Client::new();
 
@@ -201,8 +201,8 @@ pub async fn create_test_context_with_mcp_config(
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sglang_router_rs::core::JobQueue::new(
-        sglang_router_rs::core::JobQueueConfig::default(),
+    let job_queue = sgl_model_gateway::core::JobQueue::new(
+        sgl_model_gateway::core::JobQueueConfig::default(),
         weak_context,
     );
     app_context
@@ -211,7 +211,7 @@ pub async fn create_test_context_with_mcp_config(
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sglang_router_rs::core::workflow::{
+    use sgl_model_gateway::core::workflow::{
         create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
