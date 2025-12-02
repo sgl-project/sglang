@@ -194,19 +194,10 @@ def safetensors_weights_iterator(
         )
 
     if use_runai_model_streamer:
-        name2weights = {}
         with SafetensorsStreamer() as streamer:
-            streamer.stream_files(hf_weights_files)
+            streamer.stream_files(hf_weights_files, device=device, is_distributed=True)
             for name, tensor in streamer.get_tensors():
-                if not to_cpu:
-                    tensor = tensor.to(str(get_local_torch_device()), non_blocking=True)
-                else:
-                    tensor = tensor.clone()
-                name2weights[name] = tensor
-
-        torch.cuda.synchronize()
-        for name, tensor in name2weights.items():
-            yield name, tensor
+                yield name, tensor.clone().detach()
     else:
         for st_file in tqdm(
             hf_weights_files,

@@ -131,7 +131,8 @@ def maybe_load_fsdp_model(
             pin_cpu_memory=pin_cpu_memory,
         )
 
-    weight_iterator = safetensors_weights_iterator(weight_dir_list)
+    # even if cpu_offload is True, we still need to load the weights to GPU for pin memory
+    weight_iterator = safetensors_weights_iterator(weight_dir_list, to_cpu=False)
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     load_model_from_full_model_state_dict(
         model,
@@ -269,7 +270,7 @@ def load_model_from_full_model_state_dict(
                 meta_sharded_param.placements,
             )
             if cpu_offload:
-                sharded_tensor = sharded_tensor.cpu()
+                sharded_tensor = sharded_tensor.to("cpu", pin_memory=True)
         sharded_sd[target_param_name] = nn.Parameter(sharded_tensor)
 
     model.reverse_param_names_mapping = reverse_param_names_mapping
