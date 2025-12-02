@@ -6,9 +6,11 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::routers::grpc::{
+    client::GrpcClient,
     common::stages::{helpers, PipelineStage},
     context::{ClientSelection, RequestContext, WorkerSelection},
     error,
+    proto_wrapper::ProtoGenerateRequest,
 };
 
 /// Generate request building stage
@@ -57,17 +59,37 @@ impl PipelineStage for GenerateRequestBuildingStage {
             .clone()
             .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
 
-        let mut proto_request = builder_client
-            .build_plain_generate_request(
-                request_id,
-                &generate_request,
-                prep.original_text.clone(),
-                prep.token_ids.clone(),
-            )
-            .map_err(|e| {
-                error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build generate request");
-                error::bad_request(e)
-            })?;
+        // Dispatch to the appropriate client based on backend type
+        let mut proto_request = match builder_client {
+            GrpcClient::Sglang(sglang_client) => {
+                let req = sglang_client
+                    .build_plain_generate_request(
+                        request_id,
+                        &generate_request,
+                        prep.original_text.clone(),
+                        prep.token_ids.clone(),
+                    )
+                    .map_err(|e| {
+                        error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build SGLang generate request");
+                        error::bad_request(e)
+                    })?;
+                ProtoGenerateRequest::Sglang(Box::new(req))
+            }
+            GrpcClient::Vllm(vllm_client) => {
+                let req = vllm_client
+                    .build_plain_generate_request(
+                        request_id,
+                        &generate_request,
+                        prep.original_text.clone(),
+                        prep.token_ids.clone(),
+                    )
+                    .map_err(|e| {
+                        error!(function = "GenerateRequestBuildingStage::execute", error = %e, "Failed to build vLLM generate request");
+                        error::bad_request(e)
+                    })?;
+                ProtoGenerateRequest::Vllm(Box::new(req))
+            }
+        };
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {

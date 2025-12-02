@@ -9,7 +9,6 @@ from sglang.srt.function_call.core_types import (
     StructureInfo,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +85,4 @@ class Llama32Detector(BaseFormatDetector):
             begin='<|python_tag|>{"name":"' + name + '", "arguments":',
             end="}",
             trigger="<|python_tag|>",
-        )
-
-    def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            function_format="json",
-            tool_call_separator=self.tool_call_separator,
         )

@@ -12,12 +12,14 @@ use serde::{Deserialize, Serialize};
 use serde_json;
 use tokio::{sync::RwLock, time};
 
-use super::{CircuitBreaker, WorkerError, WorkerResult};
+use super::{
+    CircuitBreaker, Endpoint, ModelCard, ModelType, ProviderType, WorkerError, WorkerResult,
+};
 use crate::{
     core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
-    grpc_client::SglangSchedulerClient,
     metrics::RouterMetrics,
     protocols::worker_spec::WorkerInfo,
+    routers::grpc::client::GrpcClient,
 };
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -169,11 +171,17 @@ pub trait Worker: Send + Sync + fmt::Debug {
     }
 
     /// Get the model ID this worker serves
+    /// Checks ModelCards first, then falls back to labels
     fn model_id(&self) -> &str {
+        // Check ModelCards first
         self.metadata()
-            .labels
-            .get("model_id")
-            .map(|s| s.as_str())
+            .models
+            .first()
+            .map(|m| m.id.as_str())
+            .or_else(|| {
+                // Fall back to labels
+                self.metadata().labels.get("model_id").map(|s| s.as_str())
+            })
             .unwrap_or("unknown")
     }
 
@@ -195,41 +203,66 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(1.0)
     }
 
-    /// Get the tokenizer path for this worker (gRPC mode only)
-    fn tokenizer_path(&self) -> Option<&str> {
+    /// Get tokenizer path for a specific model.
+    fn tokenizer_path(&self, model_id: &str) -> Option<&str> {
         self.metadata()
-            .labels
-            .get("tokenizer_path")
-            .map(|s| s.as_str())
+            .find_model(model_id)
+            .and_then(|m| m.tokenizer_path.as_deref())
     }
 
-    /// Get the reasoning parser type for this worker (gRPC mode only)
-    fn reasoning_parser(&self) -> Option<&str> {
+    /// Get reasoning parser for a specific model.
+    fn reasoning_parser(&self, model_id: &str) -> Option<&str> {
         self.metadata()
-            .labels
-            .get("reasoning_parser")
-            .map(|s| s.as_str())
+            .find_model(model_id)
+            .and_then(|m| m.reasoning_parser.as_deref())
     }
 
-    /// Get the tool parser type for this worker (gRPC mode only)
-    fn tool_parser(&self) -> Option<&str> {
+    /// Get tool parser for a specific model.
+    fn tool_parser(&self, model_id: &str) -> Option<&str> {
         self.metadata()
-            .labels
-            .get("tool_parser")
-            .map(|s| s.as_str())
+            .find_model(model_id)
+            .and_then(|m| m.tool_parser.as_deref())
     }
 
-    /// Get the chat template for this worker (gRPC mode only)
-    fn chat_template(&self) -> Option<&str> {
+    /// Get chat template for a specific model.
+    fn chat_template(&self, model_id: &str) -> Option<&str> {
         self.metadata()
-            .labels
-            .get("chat_template")
-            .map(|s| s.as_str())
+            .find_model(model_id)
+            .and_then(|m| m.chat_template.as_deref())
+    }
+
+    /// Get the default provider type for this worker.
+    /// `None` means native/passthrough.
+    fn default_provider(&self) -> Option<&ProviderType> {
+        self.metadata().default_provider.as_ref()
+    }
+
+    /// Get provider for a specific model.
+    /// Priority: ModelCard.provider > worker.default_provider
+    fn provider_for_model(&self, model_id: &str) -> Option<&ProviderType> {
+        self.metadata().provider_for_model(model_id)
+    }
+
+    /// Check if this worker supports a specific model.
+    /// If models list is empty, worker accepts any model.
+    fn supports_model(&self, model_id: &str) -> bool {
+        self.metadata().supports_model(model_id)
+    }
+
+    /// Check if this worker supports an endpoint for a given model.
+    /// Falls back to default_model_type if model not found.
+    fn supports_endpoint(&self, model_id: &str, endpoint: Endpoint) -> bool {
+        self.metadata().supports_endpoint(model_id, endpoint)
+    }
+
+    /// Get all models this worker can serve.
+    fn models(&self) -> &[ModelCard] {
+        &self.metadata().models
     }
 
     /// Get or create a gRPC client for this worker
     /// Returns None for HTTP workers, Some(client) for gRPC workers
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>>;
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>>;
 
     /// Reset the gRPC client connection (for reconnection scenarios)
     /// No-op for HTTP workers
@@ -278,6 +311,43 @@ impl fmt::Display for ConnectionMode {
                 Some(p) => write!(f, "gRPC(port:{})", p),
                 None => write!(f, "gRPC"),
             },
+        }
+    }
+}
+
+/// Runtime implementation type for workers
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeType {
+    /// SGLang runtime (default)
+    #[default]
+    Sglang,
+    /// vLLM runtime
+    Vllm,
+    /// External OpenAI-compatible API (not local inference)
+    /// Used for routing to external providers like OpenAI, Azure OpenAI, xAI, etc.
+    External,
+}
+
+impl fmt::Display for RuntimeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RuntimeType::Sglang => write!(f, "sglang"),
+            RuntimeType::Vllm => write!(f, "vllm"),
+            RuntimeType::External => write!(f, "external"),
+        }
+    }
+}
+
+impl std::str::FromStr for RuntimeType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sglang" => Ok(RuntimeType::Sglang),
+            "vllm" => Ok(RuntimeType::Vllm),
+            "external" => Ok(RuntimeType::External),
+            _ => Err(format!("Unknown runtime type: {}", s)),
         }
     }
 }
@@ -345,6 +415,8 @@ pub struct WorkerMetadata {
     pub worker_type: WorkerType,
     /// Connection mode
     pub connection_mode: ConnectionMode,
+    /// Runtime type (for gRPC workers)
+    pub runtime_type: RuntimeType,
     /// Additional labels/tags
     pub labels: std::collections::HashMap<String, String>,
     /// Health check configuration
@@ -355,6 +427,50 @@ pub struct WorkerMetadata {
     pub bootstrap_host: String,
     /// Cached bootstrap port (from WorkerType::Prefill)
     pub bootstrap_port: Option<u16>,
+    /// Models this worker can serve.
+    /// If empty, worker accepts any model (backward compatible behavior).
+    pub models: Vec<ModelCard>,
+    /// Default provider for this worker (used when model doesn't specify one).
+    /// `None` means native/passthrough.
+    pub default_provider: Option<ProviderType>,
+    /// Default model type for unknown models (defaults to LLM capabilities).
+    pub default_model_type: ModelType,
+}
+
+impl WorkerMetadata {
+    /// Find a model card by ID (including aliases)
+    pub fn find_model(&self, model_id: &str) -> Option<&ModelCard> {
+        self.models.iter().find(|m| m.matches(model_id))
+    }
+
+    /// Check if this worker can serve a given model.
+    /// If models list is empty, worker accepts any model (backward compatible).
+    pub fn supports_model(&self, model_id: &str) -> bool {
+        self.models.is_empty() || self.find_model(model_id).is_some()
+    }
+
+    /// Check if this worker supports an endpoint for a given model.
+    /// Falls back to default_model_type if model not found.
+    pub fn supports_endpoint(&self, model_id: &str, endpoint: Endpoint) -> bool {
+        if let Some(model) = self.find_model(model_id) {
+            model.supports_endpoint(endpoint)
+        } else {
+            self.default_model_type.supports_endpoint(endpoint)
+        }
+    }
+
+    /// Get the provider for a given model.
+    /// Returns the model's provider if found, otherwise the worker's default provider.
+    pub fn provider_for_model(&self, model_id: &str) -> Option<&ProviderType> {
+        self.find_model(model_id)
+            .and_then(|m| m.provider.as_ref())
+            .or(self.default_provider.as_ref())
+    }
+
+    /// Get all model IDs this worker can serve
+    pub fn model_ids(&self) -> impl Iterator<Item = &str> {
+        self.models.iter().map(|m| m.id.as_str())
+    }
 }
 
 /// Basic worker implementation
@@ -368,7 +484,7 @@ pub struct BasicWorker {
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
     /// Lazily initialized gRPC client for gRPC workers
-    pub grpc_client: Arc<RwLock<Option<Arc<SglangSchedulerClient>>>>,
+    pub grpc_client: Arc<RwLock<Option<Arc<GrpcClient>>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -506,7 +622,7 @@ impl Worker for BasicWorker {
         &self.circuit_breaker
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>> {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
@@ -523,16 +639,19 @@ impl Worker for BasicWorker {
                     return Ok(Some(client.clone()));
                 }
 
+                let runtime_str = self.metadata.runtime_type.to_string();
                 tracing::info!(
-                    "Lazily initializing gRPC client for worker: {}",
+                    "Lazily initializing gRPC client ({}) for worker: {}",
+                    runtime_str,
                     self.metadata.url
                 );
-                match SglangSchedulerClient::connect(&self.metadata.url).await {
+                match GrpcClient::connect(&self.metadata.url, &runtime_str).await {
                     Ok(client) => {
                         let client_arc = Arc::new(client);
                         *client_guard = Some(client_arc.clone());
                         tracing::info!(
-                            "Successfully connected gRPC client for worker: {}",
+                            "Successfully connected gRPC client ({}) for worker: {}",
+                            runtime_str,
                             self.metadata.url
                         );
                         Ok(Some(client_arc))
@@ -749,7 +868,7 @@ impl Worker for DPAwareWorker {
         format!("{}{}", self.base_url, route)
     }
 
-    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<SglangSchedulerClient>>> {
+    async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>> {
         self.base_worker.get_grpc_client().await
     }
 
@@ -927,20 +1046,27 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         _ => None,
     };
 
+    let runtime_type = match worker.connection_mode() {
+        ConnectionMode::Grpc { .. } => Some(worker.metadata().runtime_type.to_string()),
+        ConnectionMode::Http => None,
+    };
+
+    let model_id = worker.model_id();
     WorkerInfo {
         id: worker.url().to_string(),
         url: worker.url().to_string(),
-        model_id: worker.model_id().to_string(),
+        model_id: model_id.to_string(),
         priority: worker.priority(),
         cost: worker.cost(),
         worker_type: worker_type_str.to_string(),
         is_healthy: worker.is_healthy(),
         load: worker.load(),
         connection_mode: format!("{:?}", worker.connection_mode()),
-        tokenizer_path: worker.tokenizer_path().map(String::from),
-        reasoning_parser: worker.reasoning_parser().map(String::from),
-        tool_parser: worker.tool_parser().map(String::from),
-        chat_template: worker.chat_template().map(String::from),
+        runtime_type,
+        tokenizer_path: worker.tokenizer_path(model_id).map(String::from),
+        reasoning_parser: worker.reasoning_parser(model_id).map(String::from),
+        tool_parser: worker.tool_parser(model_id).map(String::from),
+        chat_template: worker.chat_template(model_id).map(String::from),
         bootstrap_port,
         metadata: worker.metadata().labels.clone(),
         job_status: None,
@@ -1754,5 +1880,66 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+
+    // === Phase 1.3: WorkerMetadata model methods tests ===
+
+    #[test]
+    fn test_worker_metadata_empty_models_accepts_all() {
+        let metadata = WorkerMetadata {
+            url: "http://test:8080".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
+            labels: std::collections::HashMap::new(),
+            health_config: HealthConfig::default(),
+            api_key: None,
+            bootstrap_host: "test".to_string(),
+            bootstrap_port: None,
+            models: Vec::new(), // Empty = accepts any model
+            default_provider: None,
+            default_model_type: ModelType::LLM,
+        };
+
+        // Empty models list should accept any model
+        assert!(metadata.supports_model("any-model"));
+        assert!(metadata.supports_model("gpt-4"));
+        assert!(metadata.supports_model("llama-3.1"));
+    }
+
+    #[test]
+    fn test_worker_metadata_find_model() {
+        use super::ModelCard;
+
+        let model1 = ModelCard::new("meta-llama/Llama-3.1-8B")
+            .with_alias("llama-3.1-8b")
+            .with_alias("llama3.1");
+        let model2 = ModelCard::new("gpt-4o");
+
+        let metadata = WorkerMetadata {
+            url: "http://test:8080".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
+            labels: std::collections::HashMap::new(),
+            health_config: HealthConfig::default(),
+            api_key: None,
+            bootstrap_host: "test".to_string(),
+            bootstrap_port: None,
+            models: vec![model1, model2],
+            default_provider: None,
+            default_model_type: ModelType::LLM,
+        };
+
+        // Find by primary ID
+        assert!(metadata.find_model("meta-llama/Llama-3.1-8B").is_some());
+        assert!(metadata.find_model("gpt-4o").is_some());
+
+        // Find by alias
+        assert!(metadata.find_model("llama-3.1-8b").is_some());
+        assert!(metadata.find_model("llama3.1").is_some());
+
+        // Not found
+        assert!(metadata.find_model("unknown-model").is_none());
     }
 }

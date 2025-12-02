@@ -1,3 +1,5 @@
+# Production Request Tracing
+
 SGlang exports request trace data based on the OpenTelemetry Collector. You can enable tracing by adding the `--enable-trace` and configure the OpenTelemetry Collector endpoint using `--otlp-traces-endpoint` when launching the server.
 
 You can find example screenshots of the visualization in https://github.com/sgl-project/sglang/issues/8965.
@@ -32,6 +34,12 @@ This section explains how to configure the request tracing and export the trace 
     ```
 
     Replace `0.0.0.0:4317` with the actual endpoint of the opentelemetry collector. If you launched the openTelemetry collector with tracing_compose.yaml, the default receiving port is 4317.
+
+    To use the HTTP/protobuf span exporter, set the following environment variable and point to an HTTP endpoint, for example, `http://0.0.0.0:4318/v1/traces`.
+    ```bash
+    export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
+    ```
+
 
 4. raise some requests
 5. Observe whether trace data is being exported

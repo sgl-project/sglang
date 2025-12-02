@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -184,6 +185,10 @@ class NgramVerifyInput(SpecInput):
                             )
                             raise e
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
+
         if has_finished:
             self.accept_length = (self.accept_index != -1).sum(dim=1) - 1
         self.accept_index = self.accept_index[self.accept_index != -1]
@@ -408,7 +413,9 @@ class NgramVerifyInput(SpecInput):
             )
 
         # Sample tokens. Force greedy sampling on AMD
-        is_all_greedy = sampling_info.is_all_greedy
+        is_all_greedy = (
+            sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
+        )
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
@@ -419,8 +426,7 @@ class NgramVerifyInput(SpecInput):
             self._greedy_verify(batch, logits_output)
         else:
             # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
-            self._greedy_verify(batch, logits_output)
-            # self._sampling_verify(batch, logits_output, sampling_info)
+            self._sampling_verify(batch, logits_output, sampling_info)
 
         self._fill_requests(batch, logits_output)
 
