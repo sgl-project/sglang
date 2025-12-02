@@ -30,10 +30,7 @@ class DmdDenoisingStage(DenoisingStage):
         self.scheduler = FlowMatchEulerDiscreteScheduler(shift=8.0)
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
-        """
-        Override base method to handle DMD-specific latent permutation.
-        """
-        # 1. Use base method to shard latents (B, C, T, H, W) along dim 2
+        # 1. to shard latents (B, C, T, H, W) along dim 2
         super()._preprocess_sp_latents(batch, server_args)
 
         # 2. DMD expects (B, T, C, H, W) for the main latents in the loop
@@ -41,7 +38,6 @@ class DmdDenoisingStage(DenoisingStage):
             batch.latents = batch.latents.permute(0, 2, 1, 3, 4)
 
         # Note: batch.image_latent is kept as (B, C, T, H, W) here
-        # and permuted inside the loop when used.
 
     def _postprocess_sp_latents(
         self,
@@ -49,11 +45,8 @@ class DmdDenoisingStage(DenoisingStage):
         latents: torch.Tensor,
         trajectory_tensor: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Override base method to handle DMD-specific latent permutation.
-        """
         # 1. convert back from DMD's (B, T, C, H, W) to standard (B, C, T, H, W)
-        # This is required because base gather_latents_for_sp expects dim=2 for time
+        # this is because base gather_latents_for_sp expects dim=2 for T
         latents = latents.permute(0, 2, 1, 3, 4)
 
         # 2. use base method to gather
@@ -67,19 +60,14 @@ class DmdDenoisingStage(DenoisingStage):
         """
         Run the denoising loop.
         """
-        # 1. prepare common variables using Base class logic
-        # This handles model loading, basic type casting, SP pre-processing (via override), etc.
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
 
         target_dtype = prepared_vars["target_dtype"]
         autocast_enabled = prepared_vars["autocast_enabled"]
         num_warmup_steps = prepared_vars["num_warmup_steps"]
-
-        # Extract latents (already permuted to B, T, C, H, W by _preprocess_sp_latents)
         latents = prepared_vars["latents"]
         video_raw_latent_shape = latents.shape
 
-        # 2. DMD Specific Setup
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps,
             dtype=torch.long,
@@ -102,7 +90,6 @@ class DmdDenoisingStage(DenoisingStage):
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
         prompt_embeds = prepared_vars["prompt_embeds"]
 
-        # 3. Run Denoising Loop
         denoising_loop_start_time = time.time()
         self.start_profile(batch=batch)
 
@@ -134,7 +121,6 @@ class DmdDenoisingStage(DenoisingStage):
                     # Prepare inputs for transformer
                     t_expand = t.repeat(latent_model_input.shape[0])
 
-                    # DMD Embedded Guidance
                     guidance_expand = self.get_or_build_guidance(
                         latent_model_input.shape[0],
                         target_dtype,
@@ -147,7 +133,6 @@ class DmdDenoisingStage(DenoisingStage):
                         dtype=target_dtype,
                         enabled=autocast_enabled,
                     ):
-                        # Build attention metadata using Base method
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
 
                         batch.is_cfg_negative = False
@@ -157,7 +142,6 @@ class DmdDenoisingStage(DenoisingStage):
                             forward_batch=batch,
                         ):
                             # Run transformer
-                            # Input: (B, T, C, H, W) -> Permute to (B, C, T, H, W) for transformer
                             pred_noise = self.transformer(
                                 latent_model_input.permute(0, 2, 1, 3, 4),
                                 prompt_embeds,
@@ -165,9 +149,7 @@ class DmdDenoisingStage(DenoisingStage):
                                 guidance=guidance_expand,
                                 **image_kwargs,
                                 **pos_cond_kwargs,
-                            ).permute(
-                                0, 2, 1, 3, 4
-                            )  # Output: (B, C, T, H, W) -> Permute back to (B, T, C, H, W)
+                            ).permute(0, 2, 1, 3, 4)
 
                         pred_video = pred_noise_to_pred_video(
                             pred_noise=pred_noise.flatten(0, 1),
@@ -185,11 +167,6 @@ class DmdDenoisingStage(DenoisingStage):
                                 dtype=pred_video.dtype,
                                 generator=batch.generator[0],
                             ).to(self.device)
-
-                            # Note: noise generation needs to match the permuted shape (B, T, C, H, W)
-                            # If we generated noise in (B, C, T, H, W), we would need to permute it.
-                            # Here we assume video_raw_latent_shape is already (B, T, C, H, W).
-
                             latents = self.scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),

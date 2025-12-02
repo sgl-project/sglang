@@ -227,10 +227,11 @@ class InputValidationStage(PipelineStage):
         # result.add_check("height", batch.height, V.positive_int)
         # result.add_check("width", batch.width, V.positive_int)
         # Validate height and width
-        # if batch.height % 8 != 0 or batch.width % 8 != 0:
-        #     raise ValueError(
-        #         f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
-        #     )
+        if batch.height > 0 and batch.width > 0:
+            if batch.height % 8 != 0 or batch.width % 8 != 0:
+                raise ValueError(
+                    f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
+                )
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )
