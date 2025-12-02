@@ -104,28 +104,6 @@ def _remap_mistral_vision_args(config: dict) -> dict:
     }
     if quant_config:
         config["quantization_config"] = quant_config
-
-        if quant_config["config_groups"]["FP8_BLOCK"] is not None:
-            config["quantization_config"]["linear_fp8_config"] = {
-                "quant_method": "fp8",
-                "activation_scheme": "dynamic" if quant_config["config_groups"]["FP8_BLOCK"]["input_activations"]["dynamic"] else "static",
-                "ignored_layers": quant_config["ignore"],
-                "weight_block_size": quant_config["config_groups"]["FP8_BLOCK"]["weights"]["block_structure"],
-            }
-
-        # linear_fp8_config = None
-        # if "linear_fp8_config" in config:
-        #     from sglang.srt.layers.quantization.fp8 import Fp8Config
-
-        #     fp8_cfg = config["linear_fp8_config"]
-        #     # Check if it's fp8 format based on quant_method field
-        #     is_fp8 = fp8_cfg.get("quant_method") == "fp8"
-        #     linear_fp8_config = Fp8Config(
-        #         is_checkpoint_fp8_serialized=is_fp8,
-        #         activation_scheme=fp8_cfg.get("activation_scheme", "dynamic"),
-        #         ignored_layers=fp8_cfg.get("ignored_layers"),
-        #         weight_block_size=fp8_cfg.get("weight_block_size"),
-        #     )
     return config
 
 
