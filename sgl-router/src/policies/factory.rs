@@ -87,6 +87,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 30,
             max_tree_size: 1000,
+            load_aware_fallback_threshold: 5,
         });
         assert_eq!(policy.name(), "cache_aware");
 
