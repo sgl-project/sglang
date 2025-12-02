@@ -711,6 +711,22 @@ impl HarmonyBuilder {
                     };
                     harmony_messages.push(harmony_msg);
                 }
+                ChatMessage::Developer { content, name ,tools} => {
+                    // Developer messages stay as-is
+                    let harmony_msg = HarmonyMessage {
+                        author: Author {
+                            role: Role::Developer,
+                            name: name.clone(),
+                        },
+                        recipient: None,
+                        content: vec![Content::Text(TextContent {
+                            text: content.to_simple_string(),
+                        })],
+                        channel: None,
+                        content_type: None,
+                    };
+                    harmony_messages.push(harmony_msg);
+                }
 
                 ChatMessage::User { content, name } => {
                     // Extract text from user content
@@ -744,6 +760,7 @@ impl HarmonyBuilder {
                     };
                     harmony_messages.push(harmony_msg);
                 }
+
 
                 ChatMessage::Assistant {
                     content,
