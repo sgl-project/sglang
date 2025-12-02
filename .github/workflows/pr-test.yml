@@ -15,6 +15,11 @@ on:
         options:
           - "release"
           - "nightly"
+      target_stage:
+        description: "Specific stage to run (optional, for quick testing)"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: pr-test-${{ github.ref }}
@@ -555,8 +560,13 @@ jobs:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
       always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (
+        (inputs.target_stage == 'unit-test-backend-4-gpu') ||
+        (
+          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     runs-on: 4-gpu-h100
     env:
       RUNNER_LABELS: 4-gpu-h100

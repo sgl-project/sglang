@@ -122,7 +122,7 @@ def handle_rerun_stage(
 ):
     """
     Handles the /rerun-stage <stage-name> command.
-    Reruns a specific job/stage in the PR Test workflow.
+    Triggers a workflow_dispatch to run only the specified stage, skipping dependencies.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_stage", False):
@@ -134,86 +134,70 @@ def handle_rerun_stage(
         comment.create_reaction("confused")
         comment.create_comment(
             f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
-            f"Examples: `/rerun-stage unit-test-backend-1-gpu`, `/rerun-stage accuracy-test-1-gpu`"
+            f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
         )
         return False
 
-    print(f"Permission granted. Looking for stage '{stage_name}' to rerun.")
+    print(f"Permission granted. Triggering workflow_dispatch for stage '{stage_name}'.")
 
-    # Get the SHA of the latest commit in the PR
-    head_sha = pr.head.sha
-    print(f"Checking workflows for commit: {head_sha}")
+    # Valid stage names that support target_stage
+    valid_stages = [
+        "unit-test-backend-4-gpu",
+        # Add more stages here as we update their conditions
+    ]
 
-    # List all workflow runs for this commit
-    runs = gh_repo.get_workflow_runs(head_sha=head_sha)
-
-    rerun_count = 0
-    found_stage = False
-
-    for run in runs:
-        # Only look at PR Test workflow
-        if run.name != "PR Test":
-            continue
-
-        print(
-            f"Examining PR Test workflow (ID: {run.id}, Status: {run.status}, Conclusion: {run.conclusion})"
-        )
-
-        # Get all jobs in this workflow run
-        jobs = run.jobs()
-
-        for job in jobs:
-            # Match the job name with the requested stage
-            if job.name == stage_name or stage_name in job.name:
-                found_stage = True
-                print(
-                    f"Found matching job: {job.name} (ID: {job.id}, Status: {job.status}, Conclusion: {job.conclusion})"
-                )
-
-                # Try to rerun this specific job
-                try:
-                    # Rerun the entire workflow run with failed jobs only won't work for individual jobs
-                    # We need to rerun the whole workflow if the job failed
-                    if job.conclusion in ["failure", "skipped", "cancelled"]:
-                        print(f"Rerunning failed/skipped job: {job.name}")
-                        run.rerun_failed_jobs()
-                        rerun_count += 1
-                        break  # Only rerun once per workflow
-                    elif job.conclusion == "success":
-                        print(f"Job '{job.name}' already succeeded. Not rerunning.")
-                        comment.create_reaction("eyes")
-                        comment.create_comment(
-                            f"ℹ️ Stage `{job.name}` already succeeded in the latest run. "
-                            f"If you want to force rerun, use `/rerun-failed-ci` to rerun all failed stages."
-                        )
-                        return False
-                except Exception as e:
-                    print(f"Failed to rerun job {job.id}: {e}")
-
-    if not found_stage:
-        print(f"Stage '{stage_name}' not found in PR Test workflow")
+    if stage_name not in valid_stages:
         comment.create_reaction("confused")
         comment.create_comment(
-            f"❌ Stage `{stage_name}` not found in PR Test workflow.\n\n"
-            f"Common stage names:\n"
-            f"- `unit-test-backend-1-gpu`\n"
-            f"- `unit-test-backend-2-gpu`\n"
-            f"- `unit-test-backend-4-gpu`\n"
-            f"- `performance-test-1-gpu-part-1`\n"
-            f"- `accuracy-test-1-gpu`\n"
-            f"- `quantization-test`\n"
-            f"- `sgl-kernel-unit-test`\n\n"
-            f"Tip: Check the PR checks tab for exact stage names."
+            f"❌ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
+            f"Currently supported stages:\n"
+            + "\n".join(f"- `{s}`" for s in valid_stages)
+            + "\n\nOther stages will be added soon. For now, use `/rerun-failed-ci` for those stages."
         )
         return False
 
-    if rerun_count > 0:
-        print(f"Triggered rerun for stage '{stage_name}'.")
-        if react_on_success:
-            comment.create_reaction("+1")
-        return True
-    else:
-        print(f"No action taken for stage '{stage_name}'.")
+    try:
+        # Get the PR Test workflow
+        workflows = gh_repo.get_workflows()
+        pr_test_workflow = None
+        for wf in workflows:
+            if wf.name == "PR Test":
+                pr_test_workflow = wf
+                break
+
+        if not pr_test_workflow:
+            print("Error: PR Test workflow not found")
+            return False
+
+        # Trigger workflow_dispatch on the PR's head branch
+        ref = pr.head.ref
+        print(f"Triggering workflow on branch: {ref}")
+
+        success = pr_test_workflow.create_dispatch(
+            ref=ref,
+            inputs={"version": "release", "target_stage": stage_name},
+        )
+
+        if success:
+            print(f"Successfully triggered workflow for stage '{stage_name}'")
+            if react_on_success:
+                comment.create_reaction("+1")
+                comment.create_comment(
+                    f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
+                    f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
+                )
+            return True
+        else:
+            print("Failed to trigger workflow_dispatch")
+            return False
+
+    except Exception as e:
+        print(f"Error triggering workflow_dispatch: {e}")
+        comment.create_reaction("confused")
+        comment.create_comment(
+            f"❌ Failed to trigger workflow: {str(e)}\n\n"
+            f"Please check the logs or contact maintainers."
+        )
         return False
 
 
