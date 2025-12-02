@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
+    is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
@@ -114,8 +115,8 @@ def forward_mla_prepare_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
 ):
-    if m.is_mla_preprocess_enabled:
-        if m.mla_preprocess is None:
+    if is_mla_preprocess_enabled():
+        if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
                 m.fused_qkv_a_proj_with_mqa,
                 m.q_a_layernorm,
@@ -256,8 +257,8 @@ def forward_dsa_prepare_npu(
     forward_batch: "ForwardBatch",
     zero_allocator: "BumpAllocator",
 ):
-    if m.is_mla_preprocess_enabled and forward_batch.forward_mode.is_decode():
-        if m.mla_preprocess is None:
+    if is_mla_preprocess_enabled() and forward_batch.forward_mode.is_decode():
+        if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
                 m.fused_qkv_a_proj_with_mqa,
                 m.q_a_layernorm,

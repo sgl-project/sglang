@@ -46,9 +46,6 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
-    is_mla_preprocess_enabled,
-)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
@@ -1425,12 +1422,6 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.weight_block_size = (
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
-        self.is_mla_preprocess_enabled = is_mla_preprocess_enabled()
-        if self.is_mla_preprocess_enabled:
-            assert (
-                quant_config is None or quant_config.get_name() == "modelslim"
-            ), "MLA Preprocess only works with Unquant or ModelSlim"
-            self.mla_preprocess = None
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
