@@ -287,29 +287,10 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
                 if not items or token_id is None:
                     continue
 
-                indices = (input_ids_tensor == token_id).nonzero(as_tuple=True)[0]
-                num_placeholders = len(indices)
-                num_items = len(items)
-
-                if num_placeholders == 0:
-                    continue
-
-                if num_placeholders % num_items != 0:
-                    raise ValueError(
-                        f"Mismatch for modality {modality.name}: "
-                        f"Found {num_placeholders} placeholder tokens (ID: {token_id}), "
-                        f"which is not divisible by the number of multimodal items ({num_items})."
-                    )
-
-                tokens_per_item = num_placeholders // num_items
-
                 for i, item in enumerate(items):
-                    start_index = i * tokens_per_item
-                    end_index = (i + 1) * tokens_per_item
-
-                    indices_for_this_item = indices[start_index:end_index]
-
-                    input_ids_tensor[indices_for_this_item] = item.pad_value
+                    offset = items[i].offsets
+                    assert len(offset) == 1
+                    input_ids_tensor[offset[0][0] : offset[0][1] + 1] = item.pad_value
         else:
             # Create mapping of token_ids to pad_values for each modality
             token_to_pad_mapping = {}
