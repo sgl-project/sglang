@@ -310,6 +310,7 @@ set(SOURCES
     "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/store.cu"
+    "csrc/multimodal/rotary_embedding.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"

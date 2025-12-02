@@ -395,6 +395,17 @@ void fused_qk_norm_rope(
     double high,
     double attention_factor);
 
+/*
+ * From csrc/multimodal/rotary_embedding.cu
+ */
+void rotary_embedding(
+    at::Tensor& cos,
+    at::Tensor& sin,
+    at::Tensor& query,
+    const std::optional<at::Tensor>& key,
+    int64_t head_size,
+    bool is_neox);
+
 void cutlass_fp4_group_mm(
     torch::Tensor& output,
     const torch::Tensor& a,
