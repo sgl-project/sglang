@@ -165,7 +165,7 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     # 1. Exact match
     if model_path in _MODEL_HF_PATH_TO_NAME:
         model_name = _MODEL_HF_PATH_TO_NAME[model_path]
-        logger.debug(f"Resolved model name '{model_name}' from exact path match.")
+        logger.debug(f"Resolved model path '{model_path}' from exact path match.")
         return _CONFIG_REGISTRY.get(model_name)
 
     # 2. Partial match: find the best (longest) match against all registered model names.
