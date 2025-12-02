@@ -273,8 +273,13 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
         }
 
-    def resize_condition_image(self, image, target_width, target_height):
-        return resize(image, target_height, target_width, resize_mode="default")
+    def preprocess_condition_image(
+        self, image, target_width, target_height, _vae_image_processor
+    ):
+        return resize(image, target_height, target_width, resize_mode="default"), (
+            target_width,
+            target_height,
+        )
 
     def postprocess_image_latent(self, latent_condition, batch):
         batch_size = batch.batch_size

@@ -598,20 +598,20 @@ def embed_mm_inputs(
     # filled with the hash values of the multimodal for the prefix matching in the radix attention.
     # There values are useless because their embeddings will be replaced by vision embeddings anyway.
     input_ids.clamp_(min=0, max=vocab_size - 1)
-    inputs_embeds = input_embedding(input_ids)
+    input_embeds = input_embedding(input_ids)
 
     # deepstack embedding
     if use_deepstack:
         num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
 
-        deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
-            inputs_embeds.shape[-1] * num_deepstack_embeddings,
+        deepstack_embedding_shape = input_embeds.shape[:-1] + (
+            input_embeds.shape[-1] * num_deepstack_embeddings,
         )
-        # a zero-filled embedding, with the same length of inputs_embeds, but different hidden_size
+        # a zero-filled embedding, with the same length of input_embeds, but different hidden_size
         input_deepstack_embeds = torch.zeros(
             deepstack_embedding_shape,
-            device=inputs_embeds.device,
-            dtype=inputs_embeds.dtype,
+            device=input_embeds.device,
+            dtype=input_embeds.dtype,
         )
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
@@ -624,13 +624,13 @@ def embed_mm_inputs(
             continue
         # in-place update
         indices = torch.where(mask.squeeze(dim=-1))[0]
-        inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
+        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
         if use_deepstack.get(modality, None):
             input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                inputs_embeds.device, inputs_embeds.dtype
+                input_embeds.device, input_embeds.dtype
             )
 
-    return inputs_embeds, other_info
+    return input_embeds, other_info
 
 
 def general_mm_embed_routine(
@@ -692,7 +692,7 @@ def general_mm_embed_routine(
                     for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                     if forward_batch.mm_inputs[i] is not None
                 ]
-                inputs_embeds, other_info = embed_mm_inputs(
+                input_embeds, other_info = embed_mm_inputs(
                     mm_inputs_list=mm_inputs_list,
                     extend_prefix_lens=extend_prefix_lens,
                     extend_seq_lens=extend_seq_lens,
@@ -712,18 +712,18 @@ def general_mm_embed_routine(
                 # just being defensive here
                 forward_batch.mm_inputs = None
             else:
-                inputs_embeds = embed_tokens(input_ids)
+                input_embeds = embed_tokens(input_ids)
             # Copy to pre-allocated buffer if available (for CUDA graph address stability)
             if forward_batch.input_embeds is not None:
-                forward_batch.input_embeds.copy_(inputs_embeds)
-                inputs_embeds = forward_batch.input_embeds
+                forward_batch.input_embeds.copy_(input_embeds)
+                input_embeds = forward_batch.input_embeds
         else:
-            inputs_embeds = None
+            input_embeds = None
 
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
-        input_embeds=inputs_embeds,
+        input_embeds=input_embeds,
         **kwargs,
     )
     return hidden_states
@@ -835,3 +835,45 @@ def hash_feature(f):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
         return tensor_hash([reconstruct_t])
     return data_hash(f)
+
+
+def extend_mrope_positions_for_retracted_request(
+    mrope_positions: torch.Tensor, output_ids_len: int
+) -> torch.Tensor:
+    """
+    Extend mrope_positions for retracted requests by appending positions for output_ids.
+
+    When a request is retracted and has multimodal inputs with mrope_positions,
+    we need to extend the positions to cover the output_ids that were already generated.
+    For pure text tokens, all three dimensions use the same incremental sequence.
+
+    Args:
+        mrope_positions: The original mrope positions tensor, shape (3, origin_input_ids_len)
+        output_ids_len: The number of output tokens to generate positions for
+
+    Returns:
+        Extended mrope_positions tensor with shape (3, origin_input_ids_len + output_ids_len)
+    """
+    if output_ids_len <= 0:
+        return mrope_positions
+
+    # Get the last position value corresponding to origin_input_ids
+    # mrope_positions shape: (3, origin_input_ids_len)
+    last_position = mrope_positions[:, -1]  # shape: (3,)
+
+    # Generate pure text mrope positions for output_ids
+    # All three dimensions for pure text are the same incremental sequence
+    start_pos = last_position[0] + 1  # Start from last position + 1
+    output_positions = (
+        torch.arange(
+            start_pos,
+            start_pos + output_ids_len,
+            dtype=torch.int64,
+            device=mrope_positions.device,
+        )
+        .unsqueeze(0)
+        .expand(3, -1)
+    )  # shape: (3, output_ids_len)
+
+    # Concatenate to the original mrope_positions
+    return torch.cat([mrope_positions, output_positions], dim=1)
