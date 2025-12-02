@@ -539,8 +539,6 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 tp_rank=self.tp_rank,
                 pp_rank=self.pp_rank,
-                device=self.device,
-                gpu_id=self.gpu_id,
             )
 
         # Init request dispatcher
