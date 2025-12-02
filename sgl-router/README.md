@@ -93,14 +93,22 @@ pip install --force-reinstall dist/*.whl
 After installation, verify the installation and check version information:
 
 ```bash
-# Short version info (Rust binary)
-./target/release/sglang-router -v
+# Simple version (Rust binary)
+./target/release/sgl-model-gateway --version
+# or use aliases
+./target/release/smg --version
+./target/release/amg --version
 
-# Full version info with build details (Rust binary)
-./target/release/sglang-router --version
+# Full version info with build details
+./target/release/sgl-model-gateway --version-verbose
+
+# Python CLI
+amg --version
+amg --version-verbose
+python3 -m sglang_router --version
 ```
 
-The `-v` flag displays a concise version string, while `--version` (or `-V`) shows comprehensive build information including Git commit, build time, compiler versions, and platform details.
+The `--version` (or `-V`) flag displays the version string. Use `--version-verbose` for comprehensive build information including Git commit, build time, compiler versions, and platform details.
 
 ## Quick Start
 ### Regular HTTP Routing
