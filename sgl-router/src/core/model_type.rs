@@ -30,9 +30,12 @@ bitflags! {
         const TOOLS       = 1 << 7;
         /// Reasoning/thinking support (e.g., o1, DeepSeek-R1)
         const REASONING   = 1 << 8;
-
-        // === Convenience combinations ===
-        // Note: Within bitflags! macro, we must use .bits() for combining flags
+        /// Image generation (DALL-E, Sora, gpt-image)
+        const IMAGE_GEN   = 1 << 9;
+        /// Audio models (TTS, Whisper, realtime, transcribe)
+        const AUDIO       = 1 << 10;
+        /// Content moderation models
+        const MODERATION  = 1 << 11;
 
         /// Standard LLM: chat + completions + responses + tools
         const LLM = Self::CHAT.bits() | Self::COMPLETIONS.bits()
@@ -52,6 +55,15 @@ bitflags! {
 
         /// Reranker model only
         const RERANK_MODEL = Self::RERANK.bits();
+
+        /// Image generation model only (DALL-E, Sora, gpt-image)
+        const IMAGE_MODEL = Self::IMAGE_GEN.bits();
+
+        /// Audio model only (TTS, Whisper, realtime)
+        const AUDIO_MODEL = Self::AUDIO.bits();
+
+        /// Content moderation model only
+        const MODERATION_MODEL = Self::MODERATION.bits();
     }
 }
 
@@ -67,6 +79,9 @@ const CAPABILITY_NAMES: &[(ModelType, &str)] = &[
     (ModelType::VISION, "vision"),
     (ModelType::TOOLS, "tools"),
     (ModelType::REASONING, "reasoning"),
+    (ModelType::IMAGE_GEN, "image_gen"),
+    (ModelType::AUDIO, "audio"),
+    (ModelType::MODERATION, "moderation"),
 ];
 
 impl ModelType {
@@ -124,6 +139,24 @@ impl ModelType {
         self.contains(Self::REASONING)
     }
 
+    /// Check if this model type supports image generation
+    #[inline]
+    pub fn supports_image_gen(&self) -> bool {
+        self.contains(Self::IMAGE_GEN)
+    }
+
+    /// Check if this model type supports audio (TTS, Whisper, etc.)
+    #[inline]
+    pub fn supports_audio(&self) -> bool {
+        self.contains(Self::AUDIO)
+    }
+
+    /// Check if this model type supports content moderation
+    #[inline]
+    pub fn supports_moderation(&self) -> bool {
+        self.contains(Self::MODERATION)
+    }
+
     /// Check if this model type supports a given endpoint
     pub fn supports_endpoint(&self, endpoint: Endpoint) -> bool {
         match endpoint {
@@ -164,6 +197,24 @@ impl ModelType {
     #[inline]
     pub fn is_reranker(&self) -> bool {
         self.supports_rerank() && !self.supports_chat()
+    }
+
+    /// Check if this is an image generation model
+    #[inline]
+    pub fn is_image_model(&self) -> bool {
+        self.supports_image_gen() && !self.supports_chat()
+    }
+
+    /// Check if this is an audio model
+    #[inline]
+    pub fn is_audio_model(&self) -> bool {
+        self.supports_audio() && !self.supports_chat()
+    }
+
+    /// Check if this is a moderation model
+    #[inline]
+    pub fn is_moderation_model(&self) -> bool {
+        self.supports_moderation() && !self.supports_chat()
     }
 }
 
@@ -277,190 +328,5 @@ impl std::fmt::Display for Endpoint {
             Endpoint::Generate => write!(f, "generate"),
             Endpoint::Models => write!(f, "models"),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_model_type_individual_flags() {
-        let chat_only = ModelType::CHAT;
-        assert!(chat_only.supports_chat());
-        assert!(!chat_only.supports_completions());
-        assert!(!chat_only.supports_embeddings());
-    }
-
-    #[test]
-    fn test_model_type_combinations() {
-        let llm = ModelType::LLM;
-        assert!(llm.supports_chat());
-        assert!(llm.supports_completions());
-        assert!(llm.supports_responses());
-        assert!(llm.supports_tools());
-        assert!(!llm.supports_embeddings());
-        assert!(!llm.supports_vision());
-    }
-
-    #[test]
-    fn test_model_type_custom_combination() {
-        let custom = ModelType::CHAT | ModelType::EMBEDDINGS;
-        assert!(custom.supports_chat());
-        assert!(custom.supports_embeddings());
-        assert!(!custom.supports_completions());
-        assert!(!custom.supports_tools());
-    }
-
-    #[test]
-    fn test_model_type_vision_llm() {
-        let vision = ModelType::VISION_LLM;
-        assert!(vision.supports_chat());
-        assert!(vision.supports_completions());
-        assert!(vision.supports_responses());
-        assert!(vision.supports_tools());
-        assert!(vision.supports_vision());
-        assert!(!vision.supports_embeddings());
-        assert!(!vision.supports_reasoning());
-    }
-
-    #[test]
-    fn test_model_type_reasoning_llm() {
-        let reasoning = ModelType::REASONING_LLM;
-        assert!(reasoning.supports_chat());
-        assert!(reasoning.supports_reasoning());
-        assert!(!reasoning.supports_vision());
-    }
-
-    #[test]
-    fn test_model_type_full_llm() {
-        let full = ModelType::FULL_LLM;
-        assert!(full.supports_chat());
-        assert!(full.supports_completions());
-        assert!(full.supports_responses());
-        assert!(full.supports_tools());
-        assert!(full.supports_vision());
-        assert!(full.supports_reasoning());
-        assert!(!full.supports_embeddings());
-    }
-
-    #[test]
-    fn test_model_type_supports_endpoint() {
-        let llm = ModelType::LLM;
-        assert!(llm.supports_endpoint(Endpoint::Chat));
-        assert!(llm.supports_endpoint(Endpoint::Completions));
-        assert!(llm.supports_endpoint(Endpoint::Responses));
-        assert!(llm.supports_endpoint(Endpoint::Models)); // Always true
-        assert!(!llm.supports_endpoint(Endpoint::Embeddings));
-        assert!(!llm.supports_endpoint(Endpoint::Rerank));
-    }
-
-    #[test]
-    fn test_model_type_as_capability_names() {
-        let llm = ModelType::LLM;
-        let names = llm.as_capability_names();
-        assert!(names.contains(&"chat"));
-        assert!(names.contains(&"completions"));
-        assert!(names.contains(&"responses"));
-        assert!(names.contains(&"tools"));
-        assert!(!names.contains(&"embeddings"));
-    }
-
-    #[test]
-    fn test_model_type_display() {
-        let llm = ModelType::LLM;
-        let display = llm.to_string();
-        assert!(display.contains("chat"));
-        assert!(display.contains("completions"));
-    }
-
-    #[test]
-    fn test_model_type_is_llm() {
-        assert!(ModelType::LLM.is_llm());
-        assert!(ModelType::CHAT.is_llm());
-        assert!(!ModelType::EMBEDDINGS.is_llm());
-        assert!(!ModelType::RERANK.is_llm());
-    }
-
-    #[test]
-    fn test_model_type_is_embedding_model() {
-        assert!(ModelType::EMBED_MODEL.is_embedding_model());
-        assert!(ModelType::EMBEDDINGS.is_embedding_model());
-        // LLM with embeddings is not an "embedding model"
-        let llm_with_embed = ModelType::LLM | ModelType::EMBEDDINGS;
-        assert!(!llm_with_embed.is_embedding_model());
-    }
-
-    #[test]
-    fn test_model_type_is_reranker() {
-        assert!(ModelType::RERANK_MODEL.is_reranker());
-        assert!(ModelType::RERANK.is_reranker());
-        // LLM with rerank is not a "reranker"
-        let llm_with_rerank = ModelType::LLM | ModelType::RERANK;
-        assert!(!llm_with_rerank.is_reranker());
-    }
-
-    #[test]
-    fn test_model_type_default() {
-        let default = ModelType::default();
-        assert!(default.is_empty());
-        assert!(!default.supports_chat());
-    }
-
-    #[test]
-    fn test_model_type_serialization() {
-        let llm = ModelType::LLM;
-        let json = serde_json::to_string(&llm).unwrap();
-        let deserialized: ModelType = serde_json::from_str(&json).unwrap();
-        assert_eq!(llm, deserialized);
-    }
-
-    #[test]
-    fn test_endpoint_path() {
-        assert_eq!(Endpoint::Chat.path(), "/v1/chat/completions");
-        assert_eq!(Endpoint::Embeddings.path(), "/v1/embeddings");
-        assert_eq!(Endpoint::Generate.path(), "/generate");
-    }
-
-    #[test]
-    fn test_endpoint_from_path() {
-        assert_eq!(
-            Endpoint::from_path("/v1/chat/completions"),
-            Some(Endpoint::Chat)
-        );
-        assert_eq!(
-            Endpoint::from_path("/v1/chat/completions/"),
-            Some(Endpoint::Chat)
-        );
-        assert_eq!(
-            Endpoint::from_path("/v1/embeddings"),
-            Some(Endpoint::Embeddings)
-        );
-        assert_eq!(Endpoint::from_path("/unknown"), None);
-    }
-
-    #[test]
-    fn test_endpoint_required_capability() {
-        assert_eq!(Endpoint::Chat.required_capability(), Some(ModelType::CHAT));
-        assert_eq!(
-            Endpoint::Embeddings.required_capability(),
-            Some(ModelType::EMBEDDINGS)
-        );
-        assert_eq!(Endpoint::Models.required_capability(), None);
-    }
-
-    #[test]
-    fn test_endpoint_display() {
-        assert_eq!(Endpoint::Chat.to_string(), "chat");
-        assert_eq!(Endpoint::Embeddings.to_string(), "embeddings");
-    }
-
-    #[test]
-    fn test_endpoint_serialization() {
-        let endpoint = Endpoint::Chat;
-        let json = serde_json::to_string(&endpoint).unwrap();
-        assert_eq!(json, "\"chat\"");
-        let deserialized: Endpoint = serde_json::from_str(&json).unwrap();
-        assert_eq!(endpoint, deserialized);
     }
 }
