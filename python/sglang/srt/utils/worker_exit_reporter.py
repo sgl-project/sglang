@@ -15,6 +15,7 @@ class WorkerExitReporter:
         self.router_url = None
         self.worker_url = None
         self.delete_called = False
+        self.api_key = None
 
     def init_worker_exit_reporter(self, server_args):
         router_url = getattr(server_args, "router_url", None)
@@ -23,6 +24,7 @@ class WorkerExitReporter:
             atexit.register(self._report_exit)
             self.router_url = router_url
             self.worker_url = worker_url
+            self.api_key = server_args.api_key
 
     def set_child_process_exit_signal_handler(self):
         if threading.current_thread() is threading.main_thread():
@@ -46,6 +48,9 @@ class WorkerExitReporter:
             # Report that this worker is no longer healthy.
             logger.info(f"Reporting worker exit for {self.worker_url}")
             encoded_url = requests.utils.quote(self.worker_url, safe="")
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
             response = requests.patch(
                 f"{self.router_url}/workers/{encoded_url}/health",
                 json={"healthy": False},
