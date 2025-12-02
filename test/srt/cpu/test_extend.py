@@ -118,6 +118,11 @@ class TestExtendAttention(CustomTestCase):
             v_scale.copy_(v_scale0)
             k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
             v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
+        elif kvcache_dtype == torch.float8_e5m2:
+            k_buffer_fp8 = k_buffer.to(torch.float8_e5m2)
+            v_buffer_fp8 = v_buffer.to(torch.float8_e5m2)
+            k_buffer = k_buffer_fp8.to(dtype)
+            v_buffer = v_buffer_fp8.to(dtype)
 
         k_extend = torch.empty((extend_token_num, H_KV, D), dtype=dtype)
         v_extend = torch.empty((extend_token_num, H_KV, DV), dtype=dtype)
@@ -180,8 +185,16 @@ class TestExtendAttention(CustomTestCase):
             k_extend,
             v_extend,
             o_extend,
-            k_buffer if kvcache_dtype != torch.float8_e4m3fn else k_buffer_fp8,
-            v_buffer if kvcache_dtype != torch.float8_e4m3fn else v_buffer_fp8,
+            (
+                k_buffer
+                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else k_buffer_fp8
+            ),
+            (
+                v_buffer
+                if kvcache_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]
+                else v_buffer_fp8
+            ),
             k_scale,
             v_scale,
             req_to_tokens,
@@ -198,7 +211,11 @@ class TestExtendAttention(CustomTestCase):
 
     def test_extend_attention(self):
         for is_mla in [True, False]:
-            for kvcache_dtype in [torch.bfloat16, torch.float8_e4m3fn]:
+            for kvcache_dtype in [
+                torch.bfloat16,
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            ]:
                 self._test_extend_attention_once(
                     1, 123, 1, 1, 128, 96, is_mla, kvcache_dtype
                 )

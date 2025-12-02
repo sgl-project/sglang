@@ -89,6 +89,11 @@ class TestDecodeAttention(CustomTestCase):
             v_scale.copy_(v_scale0)
             k_buffer = (k_buffer_fp8.float() * k_scale).to(dtype)
             v_buffer = (v_buffer_fp8.float() * v_scale).to(dtype)
+        elif kvcache_dtype == torch.float8_e5m2:
+            k_buffer_fp8 = k_buffer.to(torch.float8_e5m2)
+            v_buffer_fp8 = v_buffer.to(torch.float8_e5m2)
+            k_buffer = k_buffer_fp8.to(dtype)
+            v_buffer = v_buffer_fp8.to(dtype)
 
         key = torch.randn(B, H_KV, D, dtype=dtype)
         value = torch.randn(B, H_KV, D_V, dtype=dtype)
@@ -175,7 +180,11 @@ class TestDecodeAttention(CustomTestCase):
 
         for B, H_Q, H_KV, D, D_V in configs:
             for dtype in [torch.bfloat16, torch.float16]:
-                for kvcache_dtype in [torch.float16, torch.float8_e4m3fn]:
+                for kvcache_dtype in [
+                    torch.float16,
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ]:
                     self._test_grouped_decode_attention_once(
                         B,
                         H_Q,

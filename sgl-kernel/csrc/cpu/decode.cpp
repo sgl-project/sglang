@@ -131,29 +131,29 @@ void pack_vnni(
     int ld_src,
     int ld_dst0,
     int ld_dst1) {
-#if defined(CPU_CAPABILITY_AVX512)
-  const int NB = div_up(N, 16);
-  const int KB = K / 32;    // no remainder
-  const int KBv = Kv / 32;  // no remainder
+  // #if defined(CPU_CAPABILITY_AVX512)
+  //   const int NB = div_up(N, 16);
+  //   const int KB = K / 32;    // no remainder
+  //   const int KBv = Kv / 32;  // no remainder
 
-  for (int nb = 0; nb < NB; ++nb) {
-    for (int kb = 0; kb < KB; ++kb) {
-      // handle 16x512bits each block
-      int nb_size = std::min(N - nb * 16, 16);
-      pack_vnni_Nx32<scalar_t, index_t>(
-          /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
-          /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
-          /*     src */ src + kb * 32,
-          /* src_scale */ src_scale,
-          /*     ind */ ind + nb * 16,
-          /*       N */ nb_size,
-          /*  ld_src */ ld_src,
-          /* ld_dst0 */ ld_dst0,
-          /* ld_dst1 */ ld_dst1,
-          /*   cvt_v */ kb < KBv);
-    }
-  }
-#else
+  //   for (int nb = 0; nb < NB; ++nb) {
+  //     for (int kb = 0; kb < KB; ++kb) {
+  //       // handle 16x512bits each block
+  //       int nb_size = std::min(N - nb * 16, 16);
+  //       pack_vnni_Nx32<scalar_t, index_t>(
+  //           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
+  //           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
+  //           /*     src */ src + kb * 32,
+  //           /* src_scale */ src_scale,
+  //           /*     ind */ ind + nb * 16,
+  //           /*       N */ nb_size,
+  //           /*  ld_src */ ld_src,
+  //           /* ld_dst0 */ ld_dst0,
+  //           /* ld_dst1 */ ld_dst1,
+  //           /*   cvt_v */ kb < KBv);
+  //     }
+  //   }
+  // #else
   for (int n = 0; n < N; ++n) {
     index_t index = ind[n];
     float scale = src_scale != nullptr ? src_scale[index] : 1.0f;
@@ -182,7 +182,7 @@ void pack_vnni(
       dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
     }
   }
-#endif
+  // #endif
 }
 
 template <typename scalar_t>
@@ -1163,6 +1163,55 @@ void decode_set_kv_buffer(
 }
 
 template <typename scalar_t>
+void decode_set_kv_buffer(
+    at::Float8_e5m2* __restrict__ k_buffer,
+    at::Float8_e5m2* __restrict__ v_buffer,
+    const scalar_t* __restrict__ key,
+    const scalar_t* __restrict__ value,
+    const int64_t* __restrict__ loc,
+    int64_t batches,
+    int64_t num_heads_kv,
+    int64_t head_size,
+    int64_t head_size_v,
+    int64_t k_strideN,
+    int64_t k_strideH,
+    int64_t v_strideN,
+    int64_t v_strideH,
+    int64_t nk_strideN,
+    int64_t nk_strideH,
+    int64_t nv_strideN,
+    int64_t nv_strideH,
+    bool is_mla) {
+  at::parallel_for(0, batches * num_heads_kv, 0, [&](int64_t begin, int64_t end) {
+    int64_t bs{0}, head_kv_id{0};
+    data_index_init(begin, bs, batches, head_kv_id, num_heads_kv);
+
+    for (int64_t i = begin; i < end; i++) {
+      int64_t loc_val = loc[bs];
+      at::Float8_e5m2* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
+      const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
+      // copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
+      for (int64_t j = 0; j < head_size; j++) {
+        k_buffer_ptr[j] = static_cast<at::Float8_e5m2>(new_key_ptr[j]);
+      }
+      // cvt_bf16_e5m2_rne_intrinsic(new_key_ptr, k_buffer_ptr, head_size);
+      if (!is_mla) {
+        at::Float8_e5m2* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
+        const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
+        // copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
+        for (int64_t j = 0; j < head_size_v; j++) {
+          v_buffer_ptr[j] = static_cast<at::Float8_e5m2>(new_value_ptr[j]);
+        }
+        // cvt_bf16_e5m2_rne_intrinsic(new_value_ptr, vfloa_buffer_ptr, head_size_v);
+      }
+
+      // move to the next index
+      data_index_step(bs, batches, head_kv_id, num_heads_kv);
+    }
+  });
+}
+
+template <typename scalar_t>
 void decode_accumulate_kv_splits(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
@@ -1932,6 +1981,118 @@ void decode_attention_cpu(
               (const at::Float8_e4m3fn*)v_buffer_data,
               k_scale.data_ptr<float>(),
               v_scale.data_ptr<float>(),
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              num_seqs,
+              num_heads,
+              num_heads_kv,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens);
+        }
+      } else if (kv_dtype == at::ScalarType::Float8_e5m2) {
+        TORCH_CHECK(v_buffer.scalar_type() == kv_dtype, "k_buffer and v_buffer should have the same dtype");
+        decode_set_kv_buffer(
+            (at::Float8_e5m2*)k_buffer_data,
+            (at::Float8_e5m2*)v_buffer_data,
+            key.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            loc.data_ptr<int64_t>(),
+            num_seqs,
+            num_heads_kv,
+            head_size,
+            head_size_v,
+            k_strideN,
+            k_strideH,
+            v_strideN,
+            v_strideH,
+            nk_strideN,
+            nk_strideH,
+            nv_strideN,
+            nv_strideH,
+            is_mla);
+
+        if (num_heads == num_heads_kv) {
+          // MHA
+          decode_attention_kernel_impl<scalar_t, at::Float8_e5m2, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const at::Float8_e5m2*)k_buffer_data,
+              (const at::Float8_e5m2*)v_buffer_data,
+              nullptr,
+              nullptr,
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              num_seqs,
+              num_heads,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens);
+        } else if (is_mla) {
+          decode_attention_mla_kernel_impl<scalar_t, at::Float8_e5m2, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const at::Float8_e5m2*)k_buffer_data,
+              (const at::Float8_e5m2*)v_buffer_data,
+              nullptr,
+              nullptr,
+              req_to_token.data_ptr<index_t>(),
+              req_pool_indices.data_ptr<int64_t>(),
+              seq_lens.data_ptr<int64_t>(),
+              buffer.data_ptr<scalar_t>(),
+              num_seqs,
+              num_heads,
+              head_size,
+              head_size_v,
+              num_kv_splits,
+              q_strideM,
+              q_strideH,
+              k_strideN,
+              k_strideH,
+              v_strideN,
+              v_strideH,
+              sm_scale,
+              logit_cap,
+              max_num_reqs,
+              max_context_len,
+              max_total_num_tokens,
+              size_per_thread);
+        } else {
+          // GQA/MQA
+          decode_attention_grouped_kernel_impl<scalar_t, at::Float8_e5m2, index_t, BLOCK_N>(
+              output.data_ptr<scalar_t>(),
+              attn_logits.data_ptr<float>(),
+              query.data_ptr<scalar_t>(),
+              (const at::Float8_e5m2*)k_buffer_data,
+              (const at::Float8_e5m2*)v_buffer_data,
+              nullptr,
+              nullptr,
               req_to_token.data_ptr<index_t>(),
               req_pool_indices.data_ptr<int64_t>(),
               seq_lens.data_ptr<int64_t>(),
