@@ -82,6 +82,7 @@ from sglang.srt.utils import (
     set_ulimit,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.worker_exit_reporter import worker_exit_reporter
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -790,6 +791,11 @@ def _launch_subprocesses(
     configure_logger(server_args)
     server_args.check_server_args()
     _set_envs_and_config(server_args)
+
+    # config worker exit reporter
+    worker_exit_reporter.init_worker_exit_reporter(server_args)
+    # Main thread set child process signal handler
+    worker_exit_reporter.set_child_process_exit_signal_handler()
 
     # Allocate ports for inter-process communications
     if port_args is None:
