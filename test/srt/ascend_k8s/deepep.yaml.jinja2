@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: rings-config-mindx-dls-test
+  name: rings-config-ascend-sglang-test
   namespace: {{ name_space }}
   labels:
     ring-controller.atlas: ascend-1980
@@ -15,7 +15,7 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: sglang-info
+  name: {{ kube_config_map }}
   namespace: {{ name_space }}
 data: {}
 
@@ -23,19 +23,19 @@ data: {}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: sglang-configmap-access
+  name: ascend-sglang-configmap-access
   namespace: {{ name_space }}
 rules:
 - apiGroups: [""]
   resources: ["configmaps"]
-  resourceNames: ["sglang-info"]
+  resourceNames: ["{{ kube_config_map }}"]
   verbs: ["get", "update", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: sglang-configmap-binding
+  name: ascend-sglang-configmap-binding
   namespace: {{ name_space }}
 subjects:
 - kind: ServiceAccount
@@ -43,14 +43,14 @@ subjects:
   namespace: {{ name_space }}
 roleRef:
   kind: Role
-  name: sglang-configmap-access
+  name: ascend-sglang-configmap-access
   apiGroup: rbac.authorization.k8s.io
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: sglang-pod-access
+  name: ascend-sglang-pod-access
   namespace: {{ name_space }}
 rules:
 - apiGroups: [""]
@@ -61,7 +61,7 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: sglang-pod-binding
+  name: ascend-sglang-pod-binding
   namespace: {{ name_space }}
 subjects:
 - kind: ServiceAccount
@@ -69,7 +69,7 @@ subjects:
   namespace: {{ name_space }}
 roleRef:
   kind: Role
-  name: sglang-pod-access
+  name: ascend-sglang-pod-access
   apiGroup: rbac.authorization.k8s.io
 
 ---
@@ -147,7 +147,7 @@ spec:
             path: /data
         - name: ascend-910-config
           configMap:
-            name: rings-config-mindx-dls-test
+            name: rings-config-ascend-sglang-test
         - name: ascend-driver
           hostPath:
             path: /usr/local/Ascend/driver
@@ -216,7 +216,7 @@ spec:
             path: /data
         - name: ascend-910-config
           configMap:
-            name: rings-config-mindx-dls-test
+            name: rings-config-ascend-sglang-test
         - name: ascend-driver
           hostPath:
             path: /usr/local/Ascend/driver
@@ -285,7 +285,7 @@ spec:
             path: /data
         - name: ascend-910-config
           configMap:
-            name: rings-config-mindx-dls-test
+            name: rings-config-ascend-sglang-test
         - name: ascend-driver
           hostPath:
             path: /usr/local/Ascend/driver

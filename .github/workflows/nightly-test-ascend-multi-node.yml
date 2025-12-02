@@ -57,6 +57,7 @@ jobs:
         NAMESPACE: kube-system
         ASCEND_TEST_CASE_PATH: test/srt/ascend_k8s
         KUBE_JOB_NAME: ascend-sglang-test
+        KUBE_CONFIG_MAP: ascend-sglang-info
     steps:
       - name: Install system denpendencies
         run: |
@@ -83,12 +84,14 @@ jobs:
           echo "{ \"image\": $image,                                        \
                   \"name_space\": \"$NAMESPACE\",                           \
                   \"kube_job_name\": \"$KUBE_JOB_NAME\",                    \
+                  \"kube_config_map\": \"$KUBE_CONFIG_MAP\",                \
                   \"prefill_size\": $prefill_size,                          \
                   \"decode_size\": $decode_size,                            \
                   \"router_size\": $router_size,                            \
                   \"sglang_source_path\": \"$sglang_source_path\",          \
                   \"test_case\": \"$test_case\" }"                         |\
               jinja2 ${ASCEND_TEST_CASE_PATH}/deepep.yaml.jinja2 -o ${ASCEND_TEST_CASE_PATH}/deepep.yaml
+          echo "Kubelete config file is generated: ${ASCEND_TEST_CASE_PATH}/deepep.yaml"
 
       - name: Clear resources
         run: |
