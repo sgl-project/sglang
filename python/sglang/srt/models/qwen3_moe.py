@@ -85,57 +85,6 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 
-def _should_enable_trtllm_fp8_fuse(forward_batch: ForwardBatch) -> bool:
-    """
-    Check if we should enable TRTLLM MHA FP8 fusion.
-
-    Conditions:
-    1. Current backend is TRTLLMHAAttnBackend
-    2. KV cache dtype is FP8 (torch.float8_e4m3fn or torch.float8_e4m3fnuz)
-    3. Not using fused_set_kv_buffer (which handles KV cache write differently)
-
-    Returns:
-        bool: True if all conditions are met
-    """
-    if forward_batch is None or forward_batch.attn_backend is None:
-        return False
-
-    # Check if backend is TRTLLM MHA
-    backend = forward_batch.attn_backend
-    backend_class_name = backend.__class__.__name__
-    from sglang.srt.layers.attention.trtllm_mha_backend import (
-        TRTLLMHAAttnBackend,
-        TRTLLMHAAttnMultiStepDraftBackend,
-    )
-    is_trtllm_mha = isinstance(
-        backend, (TRTLLMHAAttnBackend, TRTLLMHAAttnMultiStepDraftBackend)
-    )
-
-    if not is_trtllm_mha:
-        return False
-
-    # Check if KV cache is FP8
-    # TRTLLMHAAttnBackend has self.data_type attribute
-    kv_cache_dtype = getattr(backend, "data_type", None)
-    is_fp8_kv = kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-
-    if not is_fp8_kv:
-        return False
-
-    # Don't enable if already using fused_set_kv_buffer
-    if enable_fused_set_kv_buffer(forward_batch):
-        return False
-
-    if not hasattr(_should_enable_trtllm_fp8_fuse, "_logged"):
-        logger.debug(
-            "TRTLLM FP8 KV cache fusion enabled (backend=%s, kv_dtype=%s)",
-            backend_class_name, kv_cache_dtype,
-        )
-        _should_enable_trtllm_fp8_fuse._logged = True
-
-    return True
-
-
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -474,10 +423,7 @@ class Qwen3MoeAttention(nn.Module):
             k_bias=getattr(self.k_norm, "bias", None),
         )
 
-        # Prepare extra kwargs for backend (NPU path currently doesn't need them)
-        attn_extra_kwargs = {}
-
-        inner_state = q, k, v, forward_batch, attn_extra_kwargs
+        inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
     def forward_prepare_native(
@@ -505,14 +451,7 @@ class Qwen3MoeAttention(nn.Module):
             ),
         )
 
-        # Prepare extra kwargs for backend (e.g., TRTLLM MHA fusion hints)
-        attn_extra_kwargs = {}
-
-        # Enable TRTLLM FP8 fusion if conditions are met
-        if _should_enable_trtllm_fp8_fuse(forward_batch):
-            attn_extra_kwargs["enable_trtllm_fp8_fuse"] = True
-
-        inner_state = q, k, v, forward_batch, attn_extra_kwargs
+        inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
     def forward_prepare(
@@ -541,23 +480,18 @@ class Qwen3MoeAttention(nn.Module):
         if inner_state is None:
             return hidden_states
 
-        # Support both old (q, k, v, forward_batch) and new (q, k, v, forward_batch, attn_extra_kwargs) formats
-        if len(inner_state) == 4:
-            q, k, v, fb = inner_state
-            attn_extra_kwargs = {}
-        else:
-            q, k, v, fb, attn_extra_kwargs = inner_state
+        q, k, v, fb = inner_state
 
-        # Build base kwargs
-        base_kwargs = {
-            "save_kv_cache": not (
+        attn_output = self.attn(
+            q,
+            k,
+            v,
+            fb,
+            save_kv_cache=not (
                 enable_fused_set_kv_buffer(forward_batch)
                 and self.compatible_with_fused_kv_buffer
             ),
-        }
-        base_kwargs.update(attn_extra_kwargs)
-
-        attn_output = self.attn(q, k, v, fb, **base_kwargs)
+        )
         output, _ = self.o_proj(attn_output)
         return output
 
