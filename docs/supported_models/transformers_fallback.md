@@ -4,23 +4,23 @@
 
 ## Example launch Command
 
-By default, we will use sglang implementation if it is available. Otherwise, we will fall back to transformers one. However, you can switch the implementation by setting `impl` to `transformers`.
+By default, we will use sglang implementation if it is available. Otherwise, we will fall back to transformers one. However, you can switch the implementation by setting `--model-impl` to `transformers`.
 
 ```shell
 python3 -m sglang.launch_server \
   --model-path meta-llama/Llama-3.2-1B-Instruct \
   --host 0.0.0.0 \
   --port 30000 \
-  --impl transformers
+  --model-impl transformers
 ```
 
-#### Supported features
+## Supported features
 
-##### Quantization
+### Quantization
 
-Transformers fall back has supported most of available quantization in SGLang (except GGUF). See [Quantization page](https://docs.sglang.ai/backend/quantization.html) for more information about supported quantization in SGLang.
+Transformers fall back has supported most of available quantization in SGLang (except GGUF). See [Quantization page](../advanced_features/quantization.md) for more information about supported quantization in SGLang.
 
-##### Remote code
+### Remote code
 
 This fallback also means that any model on the hub that can be used in `transformers` with `trust_remote_code=True` that correctly implements attention can be used in production!
 

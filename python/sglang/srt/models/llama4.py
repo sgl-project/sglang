@@ -31,7 +31,7 @@ from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_local_attention_dp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -45,7 +45,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -59,6 +58,7 @@ from sglang.srt.utils import (
     is_cuda,
     make_layers,
 )
+from sglang.srt.utils.common import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
 
@@ -131,20 +131,25 @@ class Llama4MoE(nn.Module):
             reduce_results=False,  # We need to do scatter before reduce
         )
 
-    def forward(self, hidden_states, forward_batch: ForwardBatch):
+    def forward(
+        self,
+        hidden_states,
+        forward_batch: ForwardBatch,
+        use_reduce_scatter: bool = False,
+    ):
         shared_out, routed_out = self._forward_core(
             hidden_states, forward_batch.forward_mode
         )
 
         out_aD = routed_out + shared_out
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not use_reduce_scatter:
             out_aD = tensor_model_parallel_all_reduce(out_aD)
 
         return out_aD
 
     def _forward_core(self, hidden_states, forward_mode: ForwardMode):
-        if hidden_states.shape[0] < 4 and _is_cuda:
+        if _is_cuda:
             return self._forward_core_shared_routed_overlap(hidden_states)
         else:
             return self._forward_core_normal(hidden_states)
@@ -160,7 +165,7 @@ class Llama4MoE(nn.Module):
     def _forward_core_shared_routed_overlap(self, hidden_states):
         alt_stream = _get_or_create_alt_stream(self.device_module)
 
-        alt_stream.wait_stream(self.device_module.current_stream())
+        alt_stream.wait_stream(get_current_device_stream_fast())
 
         shared_out = self.shared_expert(hidden_states)
 
@@ -169,7 +174,7 @@ class Llama4MoE(nn.Module):
             router_logits, _ = self.router(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             routed_out = self.experts(hidden_states, topk_output)
-        self.device_module.current_stream().wait_stream(alt_stream)
+        get_current_device_stream_fast().wait_stream(alt_stream)
 
         return shared_out, routed_out
 
@@ -204,7 +209,7 @@ class Llama4Attention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        self.use_rope = int((layer_id + 1) % 4 != 0)
+        self.use_rope = (layer_id + 1) % 4 != 0
         self.use_qk_norm = config.use_qk_norm and self.use_rope
 
         attn_tp_rank = get_attention_tp_rank()
@@ -241,13 +246,22 @@ class Llama4Attention(nn.Module):
             if self.use_qk_norm
             else None
         )
+
+        qkv_quant_config = quant_config
+        o_quant_config = quant_config
+        if quant_config and hasattr(quant_config, "ignore") and quant_config.ignore:
+            if add_prefix("q_proj", prefix) in quant_config.ignore:
+                qkv_quant_config = None
+            if add_prefix("o_proj", prefix) in quant_config.ignore:
+                o_quant_config = None
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
             head_size=self.head_dim,
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
             bias=bias,
-            quant_config=quant_config,
+            quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -257,7 +271,7 @@ class Llama4Attention(nn.Module):
             input_size=self.total_num_heads * self.head_dim,
             output_size=hidden_size,
             bias=bias_o_proj,
-            quant_config=quant_config,
+            quant_config=o_quant_config,
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -350,7 +364,6 @@ class Llama4DecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
-        self.local_dp_size = get_local_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
@@ -403,10 +416,19 @@ class Llama4DecoderLayer(nn.Module):
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
+        if self.config.interleave_moe_layer_step == 0:
+            return self.config.num_local_experts > 0
         return (layer_id + 1) % self.config.interleave_moe_layer_step == 0
+
+    def get_intermediate_size(self) -> int:
+        if isinstance(self.feed_forward, Llama4MoE):
+            return self.config.intermediate_size
+        else:
+            return self.config.intermediate_size_mlp
 
     def forward(
         self,
@@ -430,8 +452,15 @@ class Llama4DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
         # Fully Connected
-        hidden_states = self.feed_forward(hidden_states, forward_batch)
+        hidden_states = self.feed_forward(
+            hidden_states, forward_batch, use_reduce_scatter
+        )
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -455,7 +484,7 @@ class Llama4Model(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("embed_tokens", prefix),
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
+            enable_tp=not is_dp_attention_enabled(),
         )
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -517,6 +546,9 @@ class Llama4ForCausalLM(LlamaForCausalLM):
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
+
+    def get_layers(self):
+        return self.model.layers
 
     def _init_model(
         self,

@@ -9,6 +9,8 @@ from typing import AbstractSet, Dict, List, Optional, Tuple, Type, Union
 
 import torch.nn as nn
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
 
 
@@ -16,6 +18,18 @@ logger = logging.getLogger(__name__)
 class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
+
+    def register(self, package_name: str, overwrite: bool = False):
+        new_models = import_model_classes(package_name)
+        if overwrite:
+            self.models.update(new_models)
+        else:
+            for arch, cls in new_models.items():
+                if arch in self.models:
+                    raise ValueError(
+                        f"Model architecture {arch} already registered. Set overwrite=True to replace."
+                    )
+                self.models[arch] = cls
 
     def get_supported_archs(self) -> AbstractSet[str]:
         return self.models.keys()
@@ -74,16 +88,19 @@ class _ModelRegistry:
 
 
 @lru_cache()
-def import_model_classes():
+def import_model_classes(package_name: str):
     model_arch_name_to_cls = {}
-    package_name = "sglang.srt.models"
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
+            if name.split(".")[-1] in envs.SGLANG_DISABLED_MODEL_ARCHS.get():
+                logger.debug(f"Skip loading {name} due to SGLANG_DISABLED_MODEL_ARCHS")
+                continue
+
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
@@ -104,4 +121,8 @@ def import_model_classes():
     return model_arch_name_to_cls
 
 
-ModelRegistry = _ModelRegistry(import_model_classes())
+ModelRegistry = _ModelRegistry()
+ModelRegistry.register("sglang.srt.models")
+
+if envs.SGLANG_EXTERNAL_MODEL_PACKAGE.value:
+    ModelRegistry.register(envs.SGLANG_EXTERNAL_MODEL_PACKAGE.value, overwrite=True)

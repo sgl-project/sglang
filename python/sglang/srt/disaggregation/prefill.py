@@ -20,10 +20,10 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
-import threading
+import time
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Type
 
 import torch
 
@@ -42,9 +42,20 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils import require_mlp_sync
+from sglang.srt.managers.schedule_batch import (
+    FINISH_LENGTH,
+    Req,
+    RequestStage,
+    ScheduleBatch,
+)
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    NSATokenToKVPool,
+    SWAKVPool,
+)
+from sglang.srt.tracing.trace import trace_event_batch, trace_slice, trace_slice_end
+from sglang.srt.utils import broadcast_pyobj, point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -103,8 +114,11 @@ class PrefillBootstrapQueue:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
+        kv_args.pp_rank = self.pp_rank
+        kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
         kv_args.prefill_pp_size = self.pp_size
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -132,8 +146,32 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
-        kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
-        kv_manager = kv_manager_class(
+        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
+            state_data_ptrs, state_data_lens, state_item_lens = (
+                self.token_to_kv_pool.get_state_buf_infos()
+            )
+            kv_args.state_data_ptrs = state_data_ptrs
+            kv_args.state_data_lens = state_data_lens
+            kv_args.state_item_lens = state_item_lens
+
+            if isinstance(self.token_to_kv_pool, SWAKVPool):
+                kv_args.state_type = "swa"
+            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                kv_args.state_type = "mamba"
+            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+                kv_args.state_type = "nsa"
+            else:
+                kv_args.state_type = "none"
+        else:
+            kv_args.state_data_ptrs = []
+            kv_args.state_data_lens = []
+            kv_args.state_item_lens = []
+            kv_args.state_type = "none"
+
+        kv_manager_class: Type[BaseKVManager] = get_kv_class(
+            self.transfer_backend, KVClassType.MANAGER
+        )
+        kv_manager: BaseKVManager = kv_manager_class(
             kv_args,
             DisaggregationMode.PREFILL,
             self.scheduler.server_args,
@@ -160,7 +198,9 @@ class PrefillBootstrapQueue:
             pp_rank=self.pp_rank,
         )
         self._process_req(req)
+        req.add_latency(RequestStage.PREFILL_PREPARE)
         self.queue.append(req)
+        trace_slice_end(RequestStage.PREFILL_PREPARE, req.rid, auto_next_anon=True)
 
     def extend(self, reqs: List[Req], num_kv_heads: int) -> None:
         for req in reqs:
@@ -170,7 +210,7 @@ class PrefillBootstrapQueue:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
-            prepare_abort(req, message)
+            prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
             return True
         return False
@@ -206,8 +246,8 @@ class PrefillBootstrapQueue:
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.queue], self.gloo_group
         )
-        for i, (req, poll) in enumerate(zip(self.queue, polls)):
 
+        for i, (req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
@@ -230,6 +270,8 @@ class PrefillBootstrapQueue:
                 self.scheduler.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 continue
 
             # KV.WaitingForInput - init here
@@ -244,8 +286,15 @@ class PrefillBootstrapQueue:
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
+            req.time_stats.wait_queue_entry_time = time.perf_counter()
+            req.add_latency(RequestStage.PREFILL_BOOTSTRAP)
+
+            trace_slice_end(
+                RequestStage.PREFILL_BOOTSTRAP, req.rid, auto_next_anon=True
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -262,6 +311,20 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def get_next_disagg_prefill_batch_to_run(
+        self: Scheduler,
+    ) -> Optional[ScheduleBatch]:
+        self.process_prefill_chunk()
+
+        batch = self.get_new_batch_prefill()
+        if self.require_mlp_sync:
+            batch = self.prepare_mlp_sync_batch(batch)
+
+        if batch:
+            trace_event_batch("schedule", batch.reqs)
+
+        return batch
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -272,22 +335,16 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.process_prefill_chunk()
-            batch = self.get_new_batch_prefill()
-
-            if require_mlp_sync(self.server_args):
-                batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
 
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result_disagg_prefill(batch, result)
-
-            if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
-
-            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+            else:
                 self.self_check_during_idle()
+
+            self.process_disagg_prefill_inflight_queue()
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -304,38 +361,23 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            self.process_prefill_chunk()
-            batch = self.get_new_batch_prefill()
-
-            if require_mlp_sync(self.server_args):
-                batch = self.prepare_mlp_sync_batch(batch)
+            batch = self.get_next_disagg_prefill_batch_to_run()
             self.cur_batch = batch
-            if batch:
-                result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), result))
 
-                if self.last_batch is None:
-                    # Create a dummy first batch to start the pipeline for overlap schedule.
-                    # It is now used for triggering the sampling_info_done event.
-                    tmp_batch = ScheduleBatch(
-                        reqs=None,
-                        forward_mode=ForwardMode.DUMMY_FIRST,
-                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                    )
-                    self.set_next_batch_sampling_info_done(tmp_batch)
+            batch_result = None
+            if batch:
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
-
-            if len(self.disagg_prefill_inflight_queue) > 0:
-                self.process_disagg_prefill_inflight_queue()
-
-            if batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+            elif batch is None:
                 self.self_check_during_idle()
+
+            self.process_disagg_prefill_inflight_queue()
+
+            self.launch_batch_sample_if_needed(batch_result)
 
             self.last_batch = batch
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
@@ -346,7 +388,6 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
-        launch_done: Optional[threading.Event] = None,
     ) -> None:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -357,50 +398,48 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
+            copy_done,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
+            result.copy_done,
         )
+
+        if copy_done is not None:
+            copy_done.synchronize()
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        if self.enable_overlap:
-            # wait
-            logits_output, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(
-                launch_done
-            )
-        else:
-            next_token_ids = result.next_token_ids.tolist()
-            if batch.return_logprob:
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs.tolist()
-                    )
-                if logits_output.input_token_logprobs is not None:
-                    logits_output.input_token_logprobs = tuple(
-                        logits_output.input_token_logprobs.tolist()
-                    )
+        next_token_ids = result.next_token_ids.tolist()
+        if batch.return_logprob:
+            if logits_output.next_token_logprobs is not None:
+                logits_output.next_token_logprobs = (
+                    logits_output.next_token_logprobs.tolist()
+                )
+            if logits_output.input_token_logprobs is not None:
+                logits_output.input_token_logprobs = tuple(
+                    logits_output.input_token_logprobs.tolist()
+                )
 
         hidden_state_offset = 0
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            req: Req
             if req.is_chunked <= 0:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                req.add_latency(RequestStage.PREFILL_FORWARD)
+                trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
                 self.disagg_prefill_inflight_queue.append(req)
-                if logits_output.hidden_states is not None:
-                    last_hidden_index = (
-                        hidden_state_offset + extend_input_len_per_req[i] - 1
-                    )
+                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
+                    req.output_topk_p = batch.spec_info.topk_p[i]
+                    req.output_topk_index = batch.spec_info.topk_index[i]
                     req.hidden_states_tensor = (
-                        logits_output.hidden_states[last_hidden_index].cpu().clone()
+                        batch.spec_info.hidden_states[i].cpu().clone()
                     )
-                    hidden_state_offset += extend_input_len_per_req[i]
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:
@@ -419,6 +458,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
+                req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:
                     # FIXME: this try-except block is for handling unexpected xgrammar issue.
@@ -428,7 +468,7 @@ class SchedulerDisaggregationPrefillMixin:
                         # Grammar accept_token can raise ValueError if the token is not in the grammar.
                         # This can happen if the grammar is not set correctly or the token is invalid.
                         error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                        self.tree_cache.cache_finished_req(req)
+                        release_kv_cache(req, self.tree_cache)
                         prepare_abort(
                             req,
                             error_message,
@@ -457,9 +497,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                trace_slice(
+                    RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
+                )
 
-        # We need to remove the sync in the following function for overlap schedule.
-        self.set_next_batch_sampling_info_done(batch)
+        self.maybe_send_health_check_signal()
 
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
@@ -492,7 +534,7 @@ class SchedulerDisaggregationPrefillMixin:
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
-                self.tree_cache.cache_finished_req(req)  # unlock the tree
+                release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
@@ -505,13 +547,18 @@ class SchedulerDisaggregationPrefillMixin:
                 except Exception as e:
                     error_message += f" with exception {e}"
                 logger.warning(error_message)
-                self.tree_cache.cache_finished_req(req)  # unlock the tree
+                release_kv_cache(req, self.tree_cache)  # unlock the tree
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
+                if self.enable_metrics:
+                    self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 assert False, f"Unexpected polling state {poll=}"
+
+        for req in done_reqs:
+            req.time_stats.completion_time = time.perf_counter()
 
         # Stream requests which have finished transfer
         self.stream_output(
@@ -521,8 +568,12 @@ class SchedulerDisaggregationPrefillMixin:
         )
         for req in done_reqs:
             req: Req
+            req.add_latency(RequestStage.PREFILL_TRANSFER_KV_CACHE)
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
+            trace_slice(
+                RequestStage.PREFILL_TRANSFER_KV_CACHE, req.rid, thread_finish_flag=True
+            )
 
         self.disagg_prefill_inflight_queue = undone_reqs
 
@@ -534,7 +585,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
-            self.tp_worker.get_tp_group().cpu_group,
+            self.tp_worker.get_attention_tp_cpu_group(),
         )
 
         transferred_rids: List[str] = []
@@ -546,22 +597,38 @@ class SchedulerDisaggregationPrefillMixin:
         return transferred_rids
 
     def process_prefill_chunk(self: Scheduler) -> None:
-        if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.chunked_req:
-                # Move the chunked request out of the batch so that we can merge
-                # only finished requests to running_batch.
-                self.last_batch.filter_batch(chunked_req_to_exclude=self.chunked_req)
-                self.tree_cache.cache_unfinished_req(self.chunked_req)
-                if self.enable_overlap:
-                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                    self.chunked_req.tmp_end_idx = min(
-                        len(self.chunked_req.fill_ids),
-                        len(self.chunked_req.origin_input_ids),
-                    )
-                else:
-                    self.send_kv_chunk(self.chunked_req)
-                # chunked request keeps its rid but will get a new req_pool_idx
+        chunked_req_to_exclude = set()
+        if self.chunked_req:
+            chunked_req_to_exclude.add(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+            if self.enable_overlap:
+                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                self.chunked_req.tmp_end_idx = min(
+                    len(self.chunked_req.fill_ids),
+                    len(self.chunked_req.origin_input_ids),
+                )
+            else:
+                self.send_kv_chunk(self.chunked_req)
+            # chunked request keeps its rid but will get a new req_pool_idx
+            if self.tp_worker.model_runner.mambaish_config is not None:
+                self.req_to_token_pool.free(
+                    self.chunked_req.req_pool_idx, free_mamba_cache=False
+                )
+            else:
                 self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+            self.running_batch.batch_is_full = False
+
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.last_batch.chunked_req:
+                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
+                # We need to discard it.
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
     def send_kv_chunk(
@@ -591,12 +658,88 @@ class SchedulerDisaggregationPrefillMixin:
             .numpy()
         )
         req.start_send_idx = end_idx
+        state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
+
+            # Prepare extra pool indices for hybrid models
+            if isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
+            ):
+                # Mamba hybrid model: send single mamba state index
+                state_indices = [
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        req.req_pool_idx
+                    ]
+                    .cpu()
+                    .numpy()
+                ]
+            elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
+                # SWA hybrid model: send last window KV indices
+                seq_len = len(req.fill_ids)
+                window_size = self.sliding_window_size
+                window_start = max(0, seq_len - window_size)
+                window_start = (window_start // page_size) * page_size
+
+                window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, window_start:seq_len
+                ]
+
+                # Translate to SWA pool indices
+                window_kv_indices_swa = (
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        window_kv_indices_full
+                    )
+                )
+                state_indices = window_kv_indices_swa.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+            elif isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
+            ):
+                seq_len = len(req.fill_ids)
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, :seq_len
+                ]
+                state_indices = kv_indices_full.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices)
+        req.disagg_kv_sender.send(page_indices, state_indices)
+
+    def send_pyobj_to_next_stage(self, data):
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            point_to_point_pyobj(
+                data,
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.device_group,
+                self.pp_rank * self.tp_size + dp_offset,
+                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+            )
+
+    def recv_pyobj_from_prev_stage(self):
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            data = point_to_point_pyobj(
+                [],
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.device_group,
+                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
+            )
+        else:
+            data = None
+
+        if self.attn_tp_size != 1:
+            data = broadcast_pyobj(
+                data,
+                self.attn_tp_group.rank,
+                self.attn_tp_cpu_group,
+                src=self.attn_tp_group.ranks[0],
+            )
+        return data

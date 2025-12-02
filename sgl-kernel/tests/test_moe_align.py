@@ -4,7 +4,14 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import moe_align_block_size
+from sgl_kernel import moe_align_block_size, moe_sum
+
+
+def is_hip() -> bool:
+    return torch.version.hip is not None
+
+
+_is_hip = is_hip()
 
 
 def ceil_div(a, b):
@@ -157,7 +164,7 @@ def test_moe_align_block_size_compare_implementations(
         :, :topk
     ]
 
-    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
 
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
@@ -171,13 +178,8 @@ def test_moe_align_block_size_compare_implementations(
     num_tokens_post_pad_cuda = torch.empty(
         (1), dtype=torch.int32, device=topk_ids.device
     )
-    token_cnts_buffer = torch.empty(
-        (num_experts + 1) * num_experts,
-        dtype=torch.int32,
-        device=topk_ids.device,
-    )
     cumsum_buffer = torch.empty(
-        num_experts + 1, dtype=torch.int32, device=topk_ids.device
+        num_experts + 2, dtype=torch.int32, device=topk_ids.device
     )
 
     sorted_ids_triton = torch.empty_like(sorted_ids_cuda)
@@ -187,19 +189,18 @@ def test_moe_align_block_size_compare_implementations(
 
     moe_align_block_size(
         topk_ids,
-        num_experts,
+        num_experts + 1,
         block_size,
         sorted_ids_cuda,
         expert_ids_cuda,
         num_tokens_post_pad_cuda,
-        token_cnts_buffer,
         cumsum_buffer,
         pad_sorted_token_ids,
     )
 
     moe_align_block_size_triton(
         topk_ids,
-        num_experts,
+        num_experts + 1,
         block_size,
         sorted_ids_triton,
         expert_ids_triton,
@@ -250,6 +251,21 @@ def test_moe_align_block_size_compare_implementations(
         f"CUDA sorted_ids: {selected_sorted_ids_cuda}\n"
         f"Triton sorted_ids: {selected_sorted_ids_triton}"
     )
+
+
+@pytest.mark.parametrize("m", [1, 33, 64, 222])
+@pytest.mark.parametrize("topk", [2, 6])
+@pytest.mark.parametrize("k", [128, 511, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.skipif(_is_hip, reason="Skip for AMD GPU")
+def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
+    input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
+    actual = torch.empty((m, k), device="cuda", dtype=dtype)
+
+    expected = input.sum(dim=1)
+    moe_sum(input, actual)
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
 
 
 if __name__ == "__main__":

@@ -12,15 +12,31 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
-
+import os
 import time
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.metrics.utils import exponential_buckets, generate_buckets
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+
+
+def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
+    """
+    Get the histogram configuration from the environment variable.
+    env value should be like "0.1,0.2,0.5,1,2"
+    """
+    if env_var_name not in os.environ:
+        return None
+    # if the env var is not set or empty, return None
+    env_var_value = os.environ[env_var_name]
+    if not env_var_value:
+        return None
+    return [float(x) for x in env_var_value.split(",")]
 
 
 @dataclass
@@ -33,6 +49,7 @@ class TimeStats:
     Decode: prealloc_queue -> transfer_queue -> wait_queue -> forward -> completion
     """
 
+    disagg_mode: DisaggregationMode = DisaggregationMode.NULL
     lb_entry_time: float = 0.0
     wait_queue_entry_time: float = 0.0
     forward_entry_time: float = 0.0
@@ -41,18 +58,27 @@ class TimeStats:
     prefill_transfer_queue_entry_time: float = 0.0
     decode_prealloc_queue_entry_time: float = 0.0
     decode_transfer_queue_entry_time: float = 0.0
+    # TODO: correct set them
+    bootstrap_duration: float = 0.0
+    alloc_waiting_duration: float = 0.0
+    prefill_start_time_host: float = 0.0
+    prefill_end_time_host: float = 0.0
 
-    class RequestType(Enum):
-        UNIFIED = "unified"
-        PREFILL = "prefill"
-        DECODE = "decode"
-        INVALID = "invalid"
+    def get_queueing_time(self) -> float:
+        return self.forward_entry_time - self.wait_queue_entry_time
 
-    def __str__(self) -> str:
-        # if unified
-        _type = self.get_type()
+    def get_prefill_launch_delay(self) -> Optional[float]:
+        if self.prefill_start_time_host > 0.0:
+            return self.prefill_start_time_host - self.forward_entry_time
+        return None
 
-        if _type == self.RequestType.UNIFIED:
+    def get_prefill_launch_latency(self) -> Optional[float]:
+        if self.prefill_start_time_host > 0.0 and self.prefill_end_time_host > 0.0:
+            return self.prefill_end_time_host - self.prefill_start_time_host
+        return None
+
+    def convert_to_duration(self) -> str:
+        if self.disagg_mode == DisaggregationMode.NULL:
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
             forward_duration = self.completion_time - self.forward_entry_time
 
@@ -61,30 +87,41 @@ class TimeStats:
                     queue_duration >= 0 and forward_duration >= 0
                 ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time}"
-        elif _type == self.RequestType.PREFILL:
+            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time:.3f}"
+        elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_duration = (
                 self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
             )
-
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-
             forward_duration = self.completion_time - self.forward_entry_time
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
-                assert (
-                    bootstrap_duration >= 0
-                    and queue_duration >= 0
-                    and forward_duration >= 0
-                ), f"bootstrap_duration={bootstrap_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
-            return f"bootstrap_duration={self.format_duration(bootstrap_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.prefill_bootstrap_queue_entry_time}"
-        # if decode
-        elif _type == self.RequestType.DECODE:
+                if self.wait_queue_entry_time > 0:
+                    assert (
+                        bootstrap_duration >= 0
+                        and queue_duration >= 0
+                        and forward_duration >= 0
+                    ), f"bootstrap_duration={bootstrap_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+
+            other = max(
+                0.0,
+                bootstrap_duration
+                - (self.alloc_waiting_duration + self.bootstrap_duration),
+            )
+            return (
+                f"bootstrap_queue_duration({self.format_duration(bootstrap_duration)}) "
+                f"= alloc_wait({self.format_duration(self.alloc_waiting_duration)}) "
+                f"+ bootstrap({self.format_duration(self.bootstrap_duration)}) "
+                f"+ other({self.format_duration(other)}); "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start={self.prefill_bootstrap_queue_entry_time:.3f}"
+            )
+        elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
                 self.decode_transfer_queue_entry_time
                 - self.decode_prealloc_queue_entry_time
             )
-
             transfer_duration = (
                 self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
             )
@@ -92,67 +129,102 @@ class TimeStats:
             forward_duration = self.completion_time - self.forward_entry_time
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
-                assert (
-                    prealloc_duration >= 0
-                    and transfer_duration >= 0
-                    and queue_duration >= 0
-                    and forward_duration >= 0
-                ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
+                if self.wait_queue_entry_time > 0:
+                    assert (
+                        prealloc_duration >= 0
+                        and transfer_duration >= 0
+                        and queue_duration >= 0
+                        and forward_duration >= 0
+                    ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
 
-            return f"prealloc_duration={self.format_duration(prealloc_duration)}, transfer_duration={self.format_duration(transfer_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.decode_prealloc_queue_entry_time}"
+            other = max(
+                0.0,
+                prealloc_duration
+                - (self.alloc_waiting_duration + self.bootstrap_duration),
+            )
+            return (
+                f"prealloc_queue_duration({self.format_duration(prealloc_duration)}) "
+                f"= alloc_wait({self.format_duration(self.alloc_waiting_duration)}) "
+                f"+ bootstrap({self.format_duration(self.bootstrap_duration)}) "
+                f"+ other({self.format_duration(other)}); "
+                f"transfer_duration={self.format_duration(transfer_duration)}; "
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start={self.decode_prealloc_queue_entry_time:.3f}"
+            )
         else:
-            return "Invalid Time Stats"
+            return "Unknown Time Stats"
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
 
-    def get_type(self) -> RequestType:
-        """Determine the type of request based on timestamp values."""
-        if (
-            self.prefill_bootstrap_queue_entry_time == 0.0
-            and self.prefill_transfer_queue_entry_time == 0.0
-            and self.decode_prealloc_queue_entry_time == 0.0
-            and self.decode_transfer_queue_entry_time == 0.0
-        ):
-            return self.RequestType.UNIFIED
-        elif (
-            self.prefill_bootstrap_queue_entry_time > 0.0
-            and self.prefill_transfer_queue_entry_time > 0.0
-        ):
-            return self.RequestType.PREFILL
-        elif (
-            self.decode_prealloc_queue_entry_time > 0.0
-            and self.decode_transfer_queue_entry_time > 0.0
-            and self.wait_queue_entry_time > 0.0
-        ):
-            return self.RequestType.DECODE
+    def disagg_mode_str(self) -> str:
+        if self.disagg_mode == DisaggregationMode.NULL:
+            return "unified"
+        elif self.disagg_mode == DisaggregationMode.DECODE:
+            return "decode"
+        elif self.disagg_mode == DisaggregationMode.PREFILL:
+            return "prefill"
         else:
-            return self.RequestType.INVALID
+            return "unknown"
 
 
 @dataclass
 class SchedulerStats:
+    # Basics
     num_running_reqs: int = 0
     num_used_tokens: int = 0
     token_usage: float = 0.0
+    pending_prealloc_token_usage: float = 0.0
+    swa_token_usage: float = 0.0
+    mamba_usage: float = 0.0
     gen_throughput: float = 0.0
     num_queue_reqs: int = 0
-    cache_hit_rate: float = 0.0
     num_grammar_queue_reqs: int = 0
+    num_running_reqs_offline_batch: int = 0
+    cache_hit_rate: float = 0.0
+
+    max_total_num_tokens: int = 0
+
+    # Speculative decoding
     spec_accept_length: float = 0.0
-    avg_request_queue_latency: float = 0.0
+    spec_accept_rate: float = 0.0
+
+    # Retract
+    num_retracted_reqs: int = 0
+    num_paused_reqs: int = 0
+
+    # PD disaggregation
     num_prefill_prealloc_queue_reqs: int = 0
-    num_prefill_infight_queue_reqs: int = 0
+    num_prefill_inflight_queue_reqs: int = 0
     num_decode_prealloc_queue_reqs: int = 0
     num_decode_transfer_queue_reqs: int = 0
-    total_retracted_reqs: int = 0
+    kv_transfer_speed_gb_s: float = 0.0
+    kv_transfer_latency_ms: float = 0.0
+    kv_transfer_bootstrap_ms: float = 0.0
+    kv_transfer_alloc_ms: float = 0.0
+
+    # Utilization
+    utilization: float = 0.0
+    max_running_requests_under_SLO: Optional[int] = None
+
+    # Engine startup
+    engine_startup_time: float = 0.0
+    engine_load_weights_time: float = 0.0
+    new_token_ratio: float = 0.0
+
+    # CUDA graph
+    is_cuda_graph: float = 0.0
 
 
 class SchedulerMetricsCollector:
 
-    def __init__(self, labels: Dict[str, str]) -> None:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import Counter, Gauge
+        from prometheus_client import Counter, Gauge, Histogram
 
         self.labels = labels
         self.last_log_time = time.perf_counter()
@@ -163,42 +235,60 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.num_used_tokens = Gauge(
             name="sglang:num_used_tokens",
             documentation="The number of used tokens.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.token_usage = Gauge(
             name="sglang:token_usage",
             documentation="The token usage.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
+        self.pending_prealloc_token_usage = Gauge(
+            name="sglang:pending_prealloc_token_usage",
+            documentation="The token usage for pending preallocated tokens (not preallocated yet).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.swa_token_usage = Gauge(
+            name="sglang:swa_token_usage",
+            documentation="The token usage for SWA layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mamba_usage = Gauge(
+            name="sglang:mamba_usage",
+            documentation="The token usage for Mamba layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.gen_throughput = Gauge(
             name="sglang:gen_throughput",
             documentation="The generation throughput (token/s).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.num_queue_reqs = Gauge(
             name="sglang:num_queue_reqs",
             documentation="The number of requests in the waiting queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.num_grammar_queue_reqs = Gauge(
             name="sglang:num_grammar_queue_reqs",
             documentation="The number of requests in the grammar waiting queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
+        self.num_running_reqs_offline_batch = Gauge(
+            name="sglang:num_running_reqs_offline_batch",
+            documentation="The number of running low-priority offline batch requests(label is 'batch').",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
@@ -206,71 +296,328 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.max_total_num_tokens = Gauge(
+            name="sglang:max_total_num_tokens",
+            documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # Speculative decoding
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
             documentation="The average acceptance length of speculative decoding.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
-        self.avg_request_queue_latency = Gauge(
-            name="sglang:avg_request_queue_latency",
-            documentation="The average request queue latency for the last batch of requests in seconds.",
+        self.spec_accept_rate = Gauge(
+            name="sglang:spec_accept_rate",
+            documentation="The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
 
-        self.total_retracted_reqs = Gauge(
-            name="sglang:total_retracted_reqs",
-            documentation="The total number of retracted requests due to kvcache full.",
+        # Retract
+        self.num_retracted_reqs = Gauge(
+            name="sglang:num_retracted_reqs",
+            documentation="The number of retracted requests.",
             labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
+        )
+        self.num_paused_reqs = Gauge(
+            name="sglang:num_paused_reqs",
+            documentation="The number of paused requests by async weight sync.",
+            labelnames=labels.keys(),
         )
 
-        # Disaggregation queue metrics
+        # PD disaggregation
         self.num_prefill_prealloc_queue_reqs = Gauge(
             name="sglang:num_prefill_prealloc_queue_reqs",
             documentation="The number of requests in the prefill prealloc queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
-        self.num_prefill_infight_queue_reqs = Gauge(
-            name="sglang:num_prefill_infight_queue_reqs",
-            documentation="The number of requests in the prefill infight queue.",
+        self.num_prefill_inflight_queue_reqs = Gauge(
+            name="sglang:num_prefill_inflight_queue_reqs",
+            documentation="The number of requests in the prefill inflight queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.num_decode_prealloc_queue_reqs = Gauge(
             name="sglang:num_decode_prealloc_queue_reqs",
             documentation="The number of requests in the decode prealloc queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.num_decode_transfer_queue_reqs = Gauge(
             name="sglang:num_decode_transfer_queue_reqs",
             documentation="The number of requests in the decode transfer queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.num_bootstrap_failed_reqs = Counter(
-            name="sglang:num_bootstrap_failed_reqs",
+            name="sglang:num_bootstrap_failed_reqs_total",
             documentation="The number of bootstrap failed requests.",
             labelnames=labels.keys(),
         )
-
         self.num_transfer_failed_reqs = Counter(
-            name="sglang:num_transfer_failed_reqs",
+            name="sglang:num_transfer_failed_reqs_total",
             documentation="The number of transfer failed requests.",
             labelnames=labels.keys(),
+        )
+        self.kv_transfer_speed_gb_s = Gauge(
+            name="sglang:kv_transfer_speed_gb_s",
+            documentation="The transfer speed of the KV cache in GB/s.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_transfer_latency_ms = Gauge(
+            name="sglang:kv_transfer_latency_ms",
+            documentation="The transfer latency of the KV cache in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_transfer_bootstrap_ms = Gauge(
+            name="sglang:kv_transfer_bootstrap_ms",
+            documentation="The bootstrap time of the KV transfer in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_transfer_alloc_ms = Gauge(
+            name="sglang:kv_transfer_alloc_ms",
+            documentation="The allocation waiting time of the KV transfer in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # Utilization
+        self.utilization = Gauge(
+            name="sglang:utilization",
+            documentation="The utilization.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.max_running_requests_under_SLO = Gauge(
+            name="sglang:max_running_requests_under_SLO",
+            documentation="The maximum number of running requests under SLO.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # Engine startup
+        self.engine_startup_time = Gauge(
+            name="sglang:engine_startup_time",
+            documentation="The time taken for the engine to start up.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.engine_load_weights_time = Gauge(
+            name="sglang:engine_load_weights_time",
+            documentation="The time taken for the engine to load weights.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        # Additional queueing time histogram
+        self.queue_time = Histogram(
+            name="sglang:queue_time_seconds",
+            documentation="Histogram of queueing time in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.0,
+                0.1,
+                0.2,
+                0.5,
+                1,
+                2,
+                3,
+                4,
+                5,
+                10,
+                15,
+                20,
+                30,
+                40,
+                50,
+                60,
+                70,
+                80,
+                90,
+                100,
+                200,
+                300,
+                400,
+                500,
+                600,
+                700,
+                800,
+                900,
+                1000,
+                1200,
+                1400,
+                1600,
+                1800,
+                2000,
+                2500,
+                3000,
+            ],
+        )
+
+        # Grammar metrics
+        self.grammar_compilation_time = Histogram(
+            name="sglang:grammar_compilation_time_seconds",
+            documentation="Histogram of grammar compilation time in seconds.",
+            labelnames=labels.keys(),
+            buckets=[
+                0.0,
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1,
+                2,
+                5,
+                10,
+                20,
+                30,
+                60,
+                90,
+                120,
+                240,
+            ],
+        )
+        self.num_grammar_cache_hit = Counter(
+            name="sglang:num_grammar_cache_hit_total",
+            documentation="Number of grammar cache hits.",
+            labelnames=labels.keys(),
+        )
+        self.num_grammar_aborted = Counter(
+            name="sglang:num_grammar_aborted_total",
+            documentation="Number of grammar aborted requests.",
+            labelnames=labels.keys(),
+        )
+        self.num_grammar_timeout = Counter(
+            name="sglang:num_grammar_timeout_total",
+            documentation="Number of grammar timeouts.",
+            labelnames=labels.keys(),
+        )
+        self.num_grammar_total = Counter(
+            name="sglang:num_grammar_total",
+            documentation="Number of the total grammar requests.",
+            labelnames=labels.keys(),
+        )
+        self.grammar_schema_count = Histogram(
+            name="sglang:grammar_schema_count",
+            documentation="Histogram of grammar schema count.",
+            labelnames=labels.keys(),
+            buckets=[
+                0,
+                1,
+                2,
+                5,
+                10,
+                20,
+                30,
+                40,
+                60,
+                80,
+                100,
+                120,
+                140,
+                160,
+                180,
+                200,
+                300,
+                400,
+                500,
+                700,
+                1000,
+            ],
+        )
+        self.grammar_ebnf_size = Histogram(
+            name="sglang:grammar_ebnf_size",
+            documentation="Histogram of grammar EBNF size.",
+            labelnames=labels.keys(),
+            buckets=[
+                0,
+                50,
+                100,
+                200,
+                300,
+                500,
+                1000,
+                2000,
+                3000,
+                5000,
+                10000,
+                20000,
+                30000,
+                50000,
+                100000,
+            ],
+        )
+
+        tree_traversal_time_buckets = [
+            0.0,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1,
+            2,
+            5,
+            10,
+            15,
+            30,
+            60,
+            90,
+            120,
+            240,
+        ]
+        self.grammar_tree_traversal_time_avg = Histogram(
+            name="sglang:grammar_tree_traversal_time_avg",
+            documentation="Histogram of average grammar tree traversal time in seconds.",
+            labelnames=labels.keys(),
+            buckets=tree_traversal_time_buckets,
+        )
+        self.grammar_tree_traversal_time_max = Histogram(
+            name="sglang:grammar_tree_traversal_time_max",
+            documentation="Histogram of max grammar tree traversal time in seconds.",
+            labelnames=labels.keys(),
+            buckets=tree_traversal_time_buckets,
+        )
+
+        self.per_stage_req_latency_seconds = Histogram(
+            name="sglang:per_stage_req_latency_seconds",
+            documentation="The latency of each stage of requests.",
+            # captures latency in range [1ms - ~1191s]
+            buckets=exponential_buckets(start=0.001, width=1.62, length=30),
+            labelnames=list(labels.keys()) + ["stage"],
+        )
+
+        self.is_cuda_graph = Gauge(
+            name="sglang:is_cuda_graph",
+            documentation="Whether the batch is using CUDA graph.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.new_token_ratio = Gauge(
+            name="sglang:new_token_ratio",
+            documentation="The new token ratio.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
 
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
+
+    def _log_histogram(self, histogram, data: Union[int, float]) -> None:
+        histogram.labels(**self.labels).observe(data)
 
     def increment_bootstrap_failed_reqs(self) -> None:
         self.num_bootstrap_failed_reqs.labels(**self.labels).inc(1)
@@ -278,23 +625,42 @@ class SchedulerMetricsCollector:
     def increment_transfer_failed_reqs(self) -> None:
         self.num_transfer_failed_reqs.labels(**self.labels).inc(1)
 
+    def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
+        labels_with_stage = {**self.labels, "stage": stage}
+        self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
+
+    def observe_queue_time(self, latency: float) -> None:
+        self._log_histogram(self.queue_time, latency)
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(
+            self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
+        )
+        self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
+        self._log_gauge(self.mamba_usage, stats.mamba_usage)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
         self._log_gauge(self.num_queue_reqs, stats.num_queue_reqs)
         self._log_gauge(self.num_grammar_queue_reqs, stats.num_grammar_queue_reqs)
+        self._log_gauge(
+            self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
+        )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
-        self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
-        self._log_gauge(self.total_retracted_reqs, stats.total_retracted_reqs)
 
-        # Disaggregation metrics
+        self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+
+        # Speculative decoding
+        self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
+        self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+
+        # PD disaggregation
         self._log_gauge(
             self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
         )
         self._log_gauge(
-            self.num_prefill_infight_queue_reqs, stats.num_prefill_infight_queue_reqs
+            self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
         )
         self._log_gauge(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
@@ -302,14 +668,67 @@ class SchedulerMetricsCollector:
         self._log_gauge(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
         )
+        self._log_gauge(self.kv_transfer_speed_gb_s, stats.kv_transfer_speed_gb_s)
+        self._log_gauge(self.kv_transfer_latency_ms, stats.kv_transfer_latency_ms)
+        self._log_gauge(self.kv_transfer_bootstrap_ms, stats.kv_transfer_bootstrap_ms)
+        self._log_gauge(self.kv_transfer_alloc_ms, stats.kv_transfer_alloc_ms)
+
+        # Retract
+        self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
+        self._log_gauge(self.num_paused_reqs, stats.num_paused_reqs)
+
+        # Utilization
+        self._log_gauge(self.utilization, stats.utilization)
+        if stats.max_running_requests_under_SLO is not None:
+            self._log_gauge(
+                self.max_running_requests_under_SLO,
+                stats.max_running_requests_under_SLO,
+            )
+
+        # Engine startup time
+        self._log_gauge(self.engine_startup_time, stats.engine_startup_time)
+        if stats.engine_load_weights_time is not None:
+            self._log_gauge(
+                self.engine_load_weights_time, stats.engine_load_weights_time
+            )
+        self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
+
+        # CUDA graph
+        self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
 
         self.last_log_time = time.perf_counter()
+
+    def log_grammar_stats(self, grammar_stats) -> None:
+        if grammar_stats.compilation_time is not None:
+            self._log_histogram(
+                self.grammar_compilation_time, grammar_stats.compilation_time
+            )
+        if grammar_stats.schema_count is not None:
+            self._log_histogram(self.grammar_schema_count, grammar_stats.schema_count)
+        if grammar_stats.ebnf_size is not None:
+            self._log_histogram(self.grammar_ebnf_size, grammar_stats.ebnf_size)
+        tree_times = grammar_stats.tree_traversal_time
+        if tree_times:
+            max_time = max(tree_times)
+            avg_time = sum(tree_times) / len(tree_times)
+            self._log_histogram(self.grammar_tree_traversal_time_max, max_time)
+            self._log_histogram(self.grammar_tree_traversal_time_avg, avg_time)
+        if grammar_stats.is_cache_hit:
+            self.num_grammar_cache_hit.labels(**self.labels).inc(1)
+        if grammar_stats.is_grammar_aborted:
+            self.num_grammar_aborted.labels(**self.labels).inc(1)
+        if grammar_stats.num_timeout > 0:
+            self.num_grammar_timeout.labels(**self.labels).inc(
+                grammar_stats.num_timeout
+            )
+        self.num_grammar_total.labels(**self.labels).inc(1)
 
 
 class TokenizerMetricsCollector:
     def __init__(
         self,
-        labels: Dict[str, str],
+        server_args: Optional[ServerArgs] = None,
+        labels: Dict[str, str] = None,
         bucket_time_to_first_token: Optional[List[float]] = None,
         bucket_inter_token_latency: Optional[List[float]] = None,
         bucket_e2e_request_latency: Optional[List[float]] = None,
@@ -318,7 +737,7 @@ class TokenizerMetricsCollector:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Histogram
 
-        self.labels = labels
+        self.labels = labels or {}
         self.collect_tokens_histogram = collect_tokens_histogram
 
         self.prompt_tokens_total = Counter(
@@ -334,7 +753,7 @@ class TokenizerMetricsCollector:
         )
 
         if collect_tokens_histogram:
-            bucket_prompt_tokens = [
+            default_bucket_prompt_tokens = [
                 100,
                 300,
                 500,
@@ -358,39 +777,30 @@ class TokenizerMetricsCollector:
                 30000,
                 35000,
                 40000,
+                66000,
+                99000,
+                132000,
+                300000,
+                600000,
+                900000,
+                1100000,
             ]
             self.prompt_tokens_histogram = Histogram(
                 name="sglang:prompt_tokens_histogram",
                 documentation="Histogram of prompt token length.",
                 labelnames=labels.keys(),
-                buckets=bucket_prompt_tokens,
+                buckets=generate_buckets(
+                    server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+                ),
             )
-            bucket_generation_tokens = [
-                100,
-                300,
-                500,
-                1000,
-                1200,
-                1500,
-                1700,
-                2000,
-                2500,
-                3000,
-                3500,
-                4000,
-                4500,
-                5000,
-                6000,
-                7000,
-                8000,
-                9000,
-                10000,
-            ]
             self.generation_tokens_histogram = Histogram(
                 name="sglang:generation_tokens_histogram",
                 documentation="Histogram of generation token length.",
                 labelnames=labels.keys(),
-                buckets=bucket_generation_tokens,
+                buckets=generate_buckets(
+                    server_args.generation_tokens_buckets,
+                    default_bucket_prompt_tokens,
+                ),
             )
 
         self.cached_tokens_total = Counter(
@@ -412,7 +822,7 @@ class TokenizerMetricsCollector:
         )
 
         self.num_aborted_requests_total = Counter(
-            name="sglang:num_aborted_requests",
+            name="sglang:num_aborted_requests_total",
             documentation="Number of requests aborted.",
             labelnames=labels.keys(),
         )
@@ -459,7 +869,10 @@ class TokenizerMetricsCollector:
                 100,
                 200,
                 400,
-                800,
+                600,
+                1200,
+                1800,
+                2400,
             ]
 
         if bucket_inter_token_latency is None:
@@ -496,7 +909,7 @@ class TokenizerMetricsCollector:
             buckets=bucket_time_to_first_token,
         )
 
-        self.histogram_inter_token_latency_seconds = Histogram(
+        self.histogram_inter_token_latency = Histogram(
             name="sglang:inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
             labelnames=labels.keys(),
@@ -510,38 +923,83 @@ class TokenizerMetricsCollector:
             buckets=bucket_e2e_request_latency,
         )
 
-    def _log_histogram(self, histogram, data: Union[int, float]) -> None:
-        histogram.labels(**self.labels).observe(data)
+        # Retraction count histogram
+        self.num_retractions = Histogram(
+            name="sglang:num_retractions",
+            documentation="Histogram of retraction counts per request.",
+            labelnames=labels.keys(),
+            buckets=[
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                15,
+                20,
+                25,
+                30,
+                40,
+                50,
+                75,
+                100,
+            ],
+        )
 
     def observe_one_finished_request(
         self,
+        labels: Dict[str, str],
         prompt_tokens: int,
         generation_tokens: int,
         cached_tokens: int,
         e2e_latency: float,
         has_grammar: bool,
+        retraction_count: int,
     ):
-        self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
-        self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
+        self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
+        self.generation_tokens_total.labels(**labels).inc(generation_tokens)
         if cached_tokens > 0:
-            self.cached_tokens_total.labels(**self.labels).inc(cached_tokens)
-        self.num_requests_total.labels(**self.labels).inc(1)
+            self.cached_tokens_total.labels(**labels).inc(cached_tokens)
+        self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
-            self.num_so_requests_total.labels(**self.labels).inc(1)
-        self._log_histogram(self.histogram_e2e_request_latency, e2e_latency)
+            self.num_so_requests_total.labels(**labels).inc(1)
+        self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
         if self.collect_tokens_histogram:
-            self._log_histogram(self.prompt_tokens_histogram, prompt_tokens)
-            self._log_histogram(self.generation_tokens_histogram, generation_tokens)
+            self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
+            self.generation_tokens_histogram.labels(**labels).observe(
+                float(generation_tokens)
+            )
+        self.num_retractions.labels(**labels).observe(retraction_count)
 
-    def observe_time_to_first_token(self, value: float):
-        self.histogram_time_to_first_token.labels(**self.labels).observe(value)
+    def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
+        self.histogram_time_to_first_token.labels(**labels).observe(value)
 
-    def observe_inter_token_latency(self, internval: float, num_new_tokens: int):
+    def check_time_to_first_token_straggler(self, value: float) -> bool:
+        his = self.histogram_time_to_first_token.labels(**self.labels)
+        total_observations = sum(bucket._value for bucket in his._buckets)
+        if total_observations < 100:
+            return False
+        p99_threshold = total_observations * 0.99
+        cumulative_count = 0
+        for i, bucket in enumerate(his._buckets):
+            cumulative_count += bucket._value
+            if cumulative_count > p99_threshold:
+                return value >= his._upper_bounds[i]
+        return False
+
+    def observe_inter_token_latency(
+        self, labels: Dict[str, str], internval: float, num_new_tokens: int
+    ):
         adjusted_interval = internval / num_new_tokens
 
         # A faster version of the Histogram::observe which observes multiple values at the same time.
         # reference: https://github.com/prometheus/client_python/blob/v0.21.1/prometheus_client/metrics.py#L639
-        his = self.histogram_inter_token_latency_seconds.labels(**self.labels)
+        his = self.histogram_inter_token_latency.labels(**labels)
         his._sum.inc(internval)
 
         for i, bound in enumerate(his._upper_bounds):
@@ -549,5 +1007,217 @@ class TokenizerMetricsCollector:
                 his._buckets[i].inc(num_new_tokens)
                 break
 
-    def observe_one_aborted_request(self):
-        self.num_aborted_requests_total.labels(**self.labels).inc(1)
+    def observe_one_aborted_request(self, labels: Dict[str, str]):
+        self.num_aborted_requests_total.labels(**labels).inc(1)
+
+
+@dataclass
+class StorageMetrics:
+    prefetch_pgs: List[int] = field(default_factory=list)
+    backup_pgs: List[int] = field(default_factory=list)
+    prefetch_bandwidth: List[float] = field(default_factory=list)
+    backup_bandwidth: List[float] = field(default_factory=list)
+
+
+class StorageMetricsCollector:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ):
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels
+
+        self.prefetched_tokens_total = Counter(
+            name="sglang:prefetched_tokens_total",
+            documentation="Number of prefetched prompt tokens.",
+            labelnames=labels.keys(),
+        )
+
+        self.backuped_tokens_total = Counter(
+            name="sglang:backuped_tokens_total",
+            documentation="Number of backuped tokens.",
+            labelnames=labels.keys(),
+        )
+
+        bucket_io = [
+            1,
+            5,
+            10,
+            50,
+            100,
+        ]
+
+        bucket_bandwidth = [
+            0.1,
+            0.5,
+            1,
+            5,
+            10,
+            50,
+            100,
+        ]
+
+        self.histogram_prefetch_pgs = Histogram(
+            name="sglang:prefetch_pgs",
+            documentation="Histogram of prefetch pages of batches.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+        self.histogram_backup_pgs = Histogram(
+            name="sglang:backup_pgs",
+            documentation="Histogram of backup pages of batches.",
+            labelnames=labels.keys(),
+            buckets=bucket_io,
+        )
+
+        self.histogram_prefetch_bandwidth = Histogram(
+            name="sglang:prefetch_bandwidth",
+            documentation="Histogram of prefetch bandwidth in GB/s.",
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth,
+        )
+
+        self.histogram_backup_bandwidth = Histogram(
+            name="sglang:backup_bandwidth",
+            documentation="Histogram of backup bandwidth in GB/s.",
+            labelnames=labels.keys(),
+            buckets=bucket_bandwidth,
+        )
+
+    def log_prefetched_tokens(self, prefetched_tokens: int):
+        if prefetched_tokens > 0:
+            self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
+
+    def log_backuped_tokens(self, backuped_tokens: int):
+        if backuped_tokens > 0:
+            self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def _log_histogram(self, histogram, data: Union[int, float]):
+        histogram.labels(**self.labels).observe(data)
+
+    def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
+        if storage_metrics is None:
+            return
+
+        assert isinstance(storage_metrics, StorageMetrics)
+
+        for v in storage_metrics.prefetch_pgs:
+            self._log_histogram(self.histogram_prefetch_pgs, v)
+        for v in storage_metrics.backup_pgs:
+            self._log_histogram(self.histogram_backup_pgs, v)
+        for v in storage_metrics.prefetch_bandwidth:
+            self._log_histogram(self.histogram_prefetch_bandwidth, v)
+        for v in storage_metrics.backup_bandwidth:
+            self._log_histogram(self.histogram_backup_bandwidth, v)
+
+
+class ExpertDispatchCollector:
+    def __init__(self, ep_size: int) -> None:
+        from prometheus_client import Histogram
+
+        ep_size_buckets = [i for i in range(ep_size)]
+        self.eplb_gpu_physical_count = Histogram(
+            name="sglang:eplb_gpu_physical_count",
+            documentation="The selected count of physical experts on each layer and GPU rank.",
+            labelnames={"layer"},
+            buckets=ep_size_buckets,
+        )
+
+
+class RadixCacheMetricsCollector:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ) -> None:
+        # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels
+
+        bucket_eviction_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_EVICTION_DURATION"
+        )
+        if bucket_eviction_duration is None:
+            bucket_eviction_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        bucket_load_back_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_LOAD_BACK_DURATION"
+        )
+        if bucket_load_back_duration is None:
+            bucket_load_back_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        self.eviction_duration_seconds = Histogram(
+            name="sglang:eviction_duration_seconds",
+            documentation="Time taken to evict memory from GPU to CPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_eviction_duration,
+        )
+
+        self.eviction_num_tokens = Counter(
+            name="sglang:evicted_tokens_total",
+            documentation="The number of tokens evicted from GPU to CPU.",
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_duration_seconds = Histogram(
+            name="sglang:load_back_duration_seconds",
+            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
+
+        self.load_back_num_tokens = Counter(
+            name="sglang:load_back_tokens_total",
+            documentation="The number of tokens loaded from CPU to GPU.",
+            labelnames=labels.keys(),
+        )
+
+    def increment_eviction_num_tokens(self, num_tokens: int) -> None:
+        self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_load_back_num_tokens(self, num_tokens: int) -> None:
+        self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def observe_eviction_duration(self, duration_seconds: float) -> None:
+        self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_load_back_duration(self, duration_seconds: float) -> None:
+        self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)

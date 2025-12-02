@@ -7,6 +7,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.linear import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -18,7 +19,14 @@ from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.ep_moe.layer import EPMoE, TopKOutput
+    from sglang.srt.layers.moe import MoeRunnerConfig
+    from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        DeepEPLLDispatchOutput,
+        DeepEPNormalDispatchOutput,
+        StandardDispatchOutput,
+    )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
 
@@ -87,14 +95,13 @@ class W4AFp8Config(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.moe.ep_moe.layer import EPMoE
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
             if is_layer_skipped(prefix, self.ignored_layers):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
-        elif isinstance(layer, EPMoE):
+        elif isinstance(layer, FusedMoE):
             return W4AFp8MoEMethod(self)
         return None
 
@@ -102,27 +109,45 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
 
-class W4AFp8MoEMethod(FusedMoEMethodBase):
+def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
+    s_shape = scales.shape
+    # Reshape to separate groups of 4
+    alignment = 4 if s_shape[2] % 4 == 0 else 1
+    scales_interleaved = scales.reshape(
+        s_shape[0], s_shape[1], (s_shape[2] // alignment), alignment
+    )
+    # Permute dimensions to interleave
+    scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
+    # Reshape back to original dimensions but with interleaved values
+    scales_interleaved = scales_interleaved.reshape(
+        s_shape[0], s_shape[2] // alignment, s_shape[1] * alignment
+    )
+    return scales_interleaved.contiguous()
 
+
+class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
 
     def create_weights(
         self,
-        layer: EPMoE,
+        layer: Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         assert "weight_loader" in extra_weight_attrs
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                intermediate_size * 2,
+                intermediate_size_per_partition * 2,
                 hidden_size // 2,
                 dtype=torch.int8,
             ),
@@ -136,7 +161,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             torch.empty(
                 num_experts,
                 hidden_size,
-                intermediate_size // 2,
+                intermediate_size_per_partition // 2,
                 dtype=torch.int8,
             ),
             requires_grad=False,
@@ -144,10 +169,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.GROUP.value}
+        )
         w13_weight_scale = torch.nn.Parameter(
             torch.zeros(
                 num_experts,
-                2 * intermediate_size,
+                2 * intermediate_size_per_partition,
                 hidden_size // self.quant_config.group_size,
                 dtype=torch.float32,
             ),
@@ -160,7 +188,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             torch.zeros(
                 num_experts,
                 hidden_size,
-                intermediate_size // self.quant_config.group_size,
+                intermediate_size_per_partition // self.quant_config.group_size,
                 dtype=torch.float32,
             ),
             requires_grad=False,
@@ -194,13 +222,13 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         self.c_strides1 = torch.full(
             (num_experts, 3),
-            2 * intermediate_size,
+            2 * intermediate_size_per_partition,
             device=device,
             dtype=torch.int64,
         )
         self.a_strides2 = torch.full(
             (num_experts, 3),
-            intermediate_size,
+            intermediate_size_per_partition,
             device=device,
             dtype=torch.int64,
         )
@@ -227,82 +255,62 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         return
 
-    def _interleave_scales(self, scales: torch.Tensor) -> torch.Tensor:
-        """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
-        s_shape = scales.shape
-        # Reshape to separate groups of 4
-        scales_interleaved = scales.reshape(
-            s_shape[0], s_shape[1], (s_shape[2] // 4), 4
-        )
-        # Permute dimensions to interleave
-        scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
-        # Reshape back to original dimensions but with interleaved values
-        scales_interleaved = scales_interleaved.reshape(
-            s_shape[0], s_shape[2] // 4, s_shape[1] * 4
-        )
-        return scales_interleaved.contiguous()
-
     def process_weights_after_loading(self, layer: Module) -> None:
         dtype = torch.bfloat16
         device = layer.w2_weight.device
 
         # Interleave w13_weight_scale (gate_up_proj)
         w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
-        w13_weight_scale = self._interleave_scales(w13_weight_scale)
+        w13_weight_scale = interleave_scales(w13_weight_scale)
         layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
 
         # Interleave w2_weight_scale (down_proj)
         w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = self._interleave_scales(w2_weight_scale)
+        w2_weight_scale = interleave_scales(w2_weight_scale)
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
-        w13_input_scale_max = layer.w13_input_scale.max().to(dtype).item()
+        w13_input_scale_max = layer.w13_input_scale.max().to(torch.float32).item()
         new_w13_input_scale = torch.tensor(
             [w13_input_scale_max],
-            dtype=dtype,
+            dtype=torch.float32,
             device=device,
         )
         layer.w13_input_scale = Parameter(new_w13_input_scale, requires_grad=False)
 
-        w2_input_scale_max = layer.w2_input_scale.max().to(dtype).item()
+        w2_input_scale_max = layer.w2_input_scale.max().to(torch.float32).item()
         new_w2_input_scale = torch.tensor(
-            [w2_input_scale_max], dtype=dtype, device=device
+            [w2_input_scale_max], dtype=torch.float32, device=device
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
     def apply(
         self,
-        layer: EPMoE,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ) -> torch.Tensor:
+        layer: Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
 
-        # TODO(ch-wan): move it out of this class
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        topk_ids, topk_weights, _ = topk_output
-        local_topk_ids = topk_ids
-        if layer.expert_map is not None:
-            "Translate info from expert_map to topk_ids"
-            local_topk_ids = torch.where(
-                layer.expert_map[topk_ids] != layer.num_experts,
-                layer.expert_map[topk_ids],
-                layer.num_experts,
-            )
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
 
-        return cutlass_w4a8_moe(
-            layer.start_expert_id,
-            layer.end_expert_id,
-            layer.num_experts,
-            hidden_states,
+        topk_weights, topk_ids, _ = topk_output
+
+        output = cutlass_w4a8_moe(
+            x,
             layer.w13_weight,
             layer.w2_weight,
             layer.w13_weight_scale_inv,
             layer.w2_weight_scale_inv,
             topk_weights,
             topk_ids,
-            local_topk_ids,
             self.a_strides1,
             self.b_strides1,
             self.c_strides1,
@@ -316,4 +324,85 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             self.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
         )
+        return StandardCombineInput(hidden_states=output)
+
+    def apply_deepep_ll(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPLLDispatchOutput,
+    ) -> torch.Tensor:
+
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
+
+        hidden_states, _, topk_ids, _, masked_m, _ = dispatch_output
+
+        output = cutlass_w4a8_moe_deepep_ll(
+            hidden_states,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            topk_ids,
+            masked_m,
+            layer.quant_method.a_strides1,
+            layer.quant_method.b_strides1,
+            layer.quant_method.c_strides1,
+            layer.quant_method.a_strides2,
+            layer.quant_method.b_strides2,
+            layer.quant_method.c_strides2,
+            layer.quant_method.s_strides13,
+            layer.quant_method.s_strides2,
+            layer.quant_method.expert_offsets,
+            layer.quant_method.problem_sizes1,
+            layer.quant_method.problem_sizes2,
+            layer.w13_input_scale,
+            layer.w2_input_scale,
+        )
+
+        return output
+
+    def apply_deepep_normal(
+        self,
+        layer: DeepEPMoE,
+        dispatch_output: DeepEPNormalDispatchOutput,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.moe.cutlass_w4a8_moe import (
+            cutlass_w4a8_moe_deepep_normal,
+        )
+
+        hidden_states, topk_idx, topk_weights = (
+            dispatch_output.hidden_states,
+            dispatch_output.topk_ids,
+            dispatch_output.topk_weights,
+        )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+
+        num_tokens = hidden_states.shape[0]
+        if num_tokens > 0:
+            return cutlass_w4a8_moe_deepep_normal(
+                hidden_states,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight_scale_inv,
+                topk_weights,
+                topk_idx,
+                self.a_strides1,
+                self.b_strides1,
+                self.c_strides1,
+                self.a_strides2,
+                self.b_strides2,
+                self.c_strides2,
+                self.s_strides13,
+                self.s_strides2,
+                self.expert_offsets,
+                self.problem_sizes1,
+                self.problem_sizes2,
+                layer.w13_input_scale,
+                layer.w2_input_scale,
+            )
+        else:
+            return hidden_states

@@ -1,8 +1,12 @@
 //! Round-robin load balancing policy
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::core::Worker;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Round-robin selection policy
 ///
@@ -23,7 +27,7 @@ impl RoundRobinPolicy {
 impl LoadBalancingPolicy for RoundRobinPolicy {
     fn select_worker(
         &self,
-        workers: &[Box<dyn Worker>],
+        workers: &[Arc<dyn Worker>],
         _request_text: Option<&str>,
     ) -> Option<usize> {
         let healthy_indices = get_healthy_worker_indices(workers);
@@ -35,7 +39,10 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
         // Get and increment counter atomically
         let count = self.counter.fetch_add(1, Ordering::Relaxed);
         let selected_idx = count % healthy_indices.len();
+        let worker = workers[healthy_indices[selected_idx]].url();
 
+        RouterMetrics::record_processed_request(worker);
+        RouterMetrics::record_policy_decision(self.name(), worker);
         Some(healthy_indices[selected_idx])
     }
 
@@ -55,24 +62,27 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorker, WorkerType};
+    use crate::core::{BasicWorkerBuilder, WorkerType};
 
     #[test]
     fn test_round_robin_selection() {
         let policy = RoundRobinPolicy::new();
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Box::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Box::new(BasicWorker::new(
-                "http://w3:8000".to_string(),
-                WorkerType::Regular,
-            )),
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w3:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
         ];
 
         // Should select workers in order: 0, 1, 2, 0, 1, 2, ...
@@ -86,19 +96,22 @@ mod tests {
     #[test]
     fn test_round_robin_with_unhealthy_workers() {
         let policy = RoundRobinPolicy::new();
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Box::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Box::new(BasicWorker::new(
-                "http://w3:8000".to_string(),
-                WorkerType::Regular,
-            )),
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w3:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
         ];
 
         // Mark middle worker as unhealthy
@@ -114,15 +127,17 @@ mod tests {
     #[test]
     fn test_round_robin_reset() {
         let policy = RoundRobinPolicy::new();
-        let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(BasicWorker::new(
-                "http://w1:8000".to_string(),
-                WorkerType::Regular,
-            )),
-            Box::new(BasicWorker::new(
-                "http://w2:8000".to_string(),
-                WorkerType::Regular,
-            )),
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
         ];
 
         // Advance the counter

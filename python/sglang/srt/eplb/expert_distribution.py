@@ -11,24 +11,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+
+from __future__ import annotations
+
 import logging
-import os
+import math
 import time
 from abc import ABC
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Type
 
 import einops
 import torch
 import torch.distributed
 
-from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.environ import envs
+from sglang.srt.metrics.collector import ExpertDispatchCollector
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_bool_env_var
+from sglang.srt.utils import Withable, get_int_env_var, is_npu
+
+_is_npu = is_npu()
+
+if TYPE_CHECKING:
+    from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +51,7 @@ class ExpertDistributionRecorder(ABC):
     @staticmethod
     def init_new(
         server_args: ServerArgs,
-        expert_location_metadata: "ExpertLocationMetadata",
+        expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
         if server_args.expert_distribution_recorder_mode is not None:
@@ -118,7 +126,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def __init__(
         self,
         server_args: ServerArgs,
-        expert_location_metadata: "ExpertLocationMetadata",
+        expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
         self._server_args = server_args
@@ -211,7 +219,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
-        if not (self._recording or torch.cuda.is_current_stream_capturing()):
+        if not (
+            self._recording or torch.get_device_module().is_current_stream_capturing()
+        ):
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -279,7 +289,7 @@ class _SinglePassGatherer(ABC):
     @staticmethod
     def init_new(
         server_args: ServerArgs,
-        expert_location_metadata: "ExpertLocationMetadata",
+        expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> "_SinglePassGatherer":
         if server_args.expert_distribution_recorder_mode == "per_token":
@@ -288,12 +298,14 @@ class _SinglePassGatherer(ABC):
             )
 
         if server_args.expert_distribution_recorder_mode == "stat_approx":
-            if server_args.enable_deepep_moe and (server_args.deepep_mode == "normal"):
+            if server_args.moe_a2a_backend != "none" and (
+                server_args.deepep_mode == "normal"
+            ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 
-        if server_args.enable_deepep_moe:
+        if server_args.moe_a2a_backend != "none":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             elif server_args.deepep_mode == "low_latency":
@@ -305,7 +317,7 @@ class _SinglePassGatherer(ABC):
 
         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 
-    def __init__(self, expert_location_metadata: "ExpertLocationMetadata", rank: int):
+    def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
@@ -344,7 +356,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     def __init__(
         self,
         server_args: ServerArgs,
-        expert_location_metadata: "ExpertLocationMetadata",
+        expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
         super().__init__(expert_location_metadata, rank)
@@ -405,10 +417,19 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
     def collect(self) -> Dict:
         num_tokens = len(self._metadata["input_ids"])
+
+        global_physical_count = _convert_per_token_to_global_physical_count(
+            num_tokens,
+            num_layers=self._expert_location_metadata.num_layers,
+            num_physical_experts=self._expert_location_metadata.num_physical_experts,
+            _topk_ids_of_layer=self._topk_ids_of_layer,
+        )
+
         return dict(
             **self._metadata,
             topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone().cpu(),
             misc_objects=self._misc_objects,
+            global_physical_count=global_physical_count,
         )
 
 
@@ -444,6 +465,10 @@ def _list_sum(a: List, b: List) -> List:
 class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
     def __init__(self, *args, enable_global_physical_experts: bool, **kwargs):
         super().__init__(*args, **kwargs)
+        if not _is_npu:
+            device = "cuda"
+        else:
+            device = "npu"
         self._enable_global_physical_experts = enable_global_physical_experts
         self._data = torch.zeros(
             (
@@ -455,7 +480,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 ),
             ),
             dtype=torch.int,
-            device="cuda",
+            device=device,
         )
 
     def reset(self):
@@ -533,6 +558,27 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
         self._data[layer_idx, :] += local_physical_count_of_layer
 
 
+def _convert_per_token_to_global_physical_count(
+    num_tokens: int,
+    num_layers: int,
+    num_physical_experts: int,
+    _topk_ids_of_layer: torch.Tensor,
+) -> torch.Tensor:
+    topk_ids_layer_major = _topk_ids_of_layer[:, :num_tokens, :].reshape(num_layers, -1)
+    mask = topk_ids_layer_major != -1
+
+    index = topk_ids_layer_major.masked_fill(~mask, 0).long()
+    src = mask.int()
+
+    ans = torch.zeros(
+        (num_layers, num_physical_experts),
+        dtype=_topk_ids_of_layer.dtype,
+        device=_topk_ids_of_layer.device,
+    )
+    ans.scatter_add_(dim=1, index=index, src=src)
+    return ans
+
+
 def _convert_local_to_global_physical_count(
     local_physical_count: torch.Tensor,
     rank: int,
@@ -559,7 +605,7 @@ class _Accumulator(ABC):
     @staticmethod
     def init_new(
         server_args: ServerArgs,
-        expert_location_metadata: "ExpertLocationMetadata",
+        expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> "_Accumulator":
         return _Accumulator.get_class(server_args)(
@@ -578,7 +624,7 @@ class _Accumulator(ABC):
     def __init__(
         self,
         server_args: ServerArgs,
-        expert_location_metadata: "ExpertLocationMetadata",
+        expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
         self._server_args = server_args
@@ -613,9 +659,13 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         self._enable = self._server_args.enable_expert_distribution_metrics
 
         if self._enable:
-            window_sizes = [10, 100, 1000]
-            self._history = _DequeCollection(maxlens=window_sizes)
+            self.window_sizes = [10, 100, 1000]
+            self._history = _DequeCollection(maxlens=self.window_sizes)
             self._rank = torch.distributed.get_rank()
+            self._expert_dispatch_collector = ExpertDispatchCollector(
+                self._expert_location_metadata.ep_size
+            )
+            self._collection_counter = 0
 
     def append(
         self,
@@ -647,6 +697,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
 
         if self._rank == 0:
+            self._collect_metrics_if_needed(gpu_physical_count)
+
             utilization_rate_tensor = compute_utilization_rate(gpu_physical_count)
             utilization_rate = torch.mean(utilization_rate_tensor).item()
             self._history.append(utilization_rate)
@@ -661,6 +713,28 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 f"gpu_physical_count_sum={gpu_physical_count_sum}"
                 # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
             )
+
+    def _collect_metrics_if_needed(self, gpu_physical_count: torch.Tensor):
+        # sglang:eplb_gpu_physical_count metric is disabled if SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL <= 0
+        interval = get_int_env_var("SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL", 0)
+        if interval > 0 and self._collection_counter % interval == 0:
+            for layer_idx in range(self._expert_location_metadata.num_layers):
+                count_of_layer = (
+                    self._expert_dispatch_collector.eplb_gpu_physical_count.labels(
+                        layer=str(layer_idx)
+                    )
+                )
+                # Exclude the +Inf bucket.
+                assert (
+                    self._expert_location_metadata.ep_size
+                    == len(count_of_layer._buckets) - 1
+                ), f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                for gpu_rank in range(self._expert_location_metadata.ep_size):
+                    count = gpu_physical_count[layer_idx, gpu_rank]
+                    if count > 0:
+                        count_of_layer._sum.inc(count * gpu_rank)
+                        count_of_layer._buckets[gpu_rank].inc(count)
+        self._collection_counter += 1
 
 
 class _DequeCollection:
@@ -777,7 +851,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
 
         if self._first_dump:
             self._first_dump = False
-            torch.cuda.empty_cache()
+            torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
             logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
@@ -786,6 +860,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         output = dict(
             rank=self._rank,
             logical_count=logical_count_of_buffered_step,
+            average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
         if output_mode == "file":
@@ -796,9 +871,34 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         else:
             raise NotImplementedError
 
+    def _get_global_average_utilization_rate(self):
+        if not self._enable or math.isclose(
+            self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
+        ):
+            return None
+
+        if self._rank == 0:
+            utilization_mean_rates = self._history.mean()
+            window_index = self.window_sizes[-1]
+            average_utilization_rate_over_window = (
+                utilization_mean_rates[window_index]
+                if window_index in utilization_mean_rates
+                else 0
+            )
+
+            avg_rate_tensor = torch.tensor(
+                [average_utilization_rate_over_window],
+                dtype=torch.float32,
+                device="cuda",
+            )
+        else:
+            avg_rate_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        return avg_rate_tensor.item()
+
 
 def _dump_to_file(name, data):
-    save_dir = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", "/tmp"))
+    save_dir = Path(envs.SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR.get())
     path_output = save_dir / name
     logger.info(f"Write expert distribution to {path_output}")
     if not save_dir.exists():

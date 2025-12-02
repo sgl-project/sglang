@@ -1,14 +1,14 @@
 import unittest
 
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import select_experts
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import is_hip
 from sglang.test.test_utils import CustomTestCase
 
@@ -63,6 +63,8 @@ class TestFusedMOE(CustomTestCase):
         a1_scale=None,
         a2_scale=None,
     ):
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
         B, D = a.shape
         a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
         out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -136,19 +138,7 @@ class TestFusedMOE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                top_k=topk,
-            )
-
-            sglang_output = fused_moe(
-                a,
-                w1,
-                w2,
-                topk_output,
-                use_fp8_w8a8=True,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                a1_scale=a1_scale,
-                a2_scale=a2_scale,
+                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
 
             torch_output = self.torch_naive_moe(
@@ -162,6 +152,18 @@ class TestFusedMOE(CustomTestCase):
                 a1_scale,
                 a2_scale,
             )
+
+            sglang_output = fused_moe(
+                a,
+                w1,
+                w2,
+                topk_output,
+                use_fp8_w8a8=True,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+            )
             torch.testing.assert_close(
                 sglang_output, torch_output, rtol=rtol, atol=atol
             )
@@ -174,7 +176,7 @@ class TestFusedMOE(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=a,
                 router_logits=score,
-                top_k=topk,
+                topk_config=TopKConfig(top_k=topk, renormalize=False),
             )
 
             triton_output = fused_moe(a, w1, w2, topk_output)
@@ -189,6 +191,8 @@ class TestFusedMOE(CustomTestCase):
         k_values = [128, 511, 1024]
         dtypes = [torch.float16, torch.bfloat16]
         fp8_modes = [False, True]
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
         # Calculate total number of tests
         total_tests = (

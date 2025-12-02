@@ -35,7 +35,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -46,7 +45,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
@@ -94,8 +92,7 @@ class MixtralMoE(nn.Module):
             renormalize=True,
         )
 
-        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
-        self.experts = MoEImpl(
+        self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
             layer_id=layer_id,
@@ -103,7 +100,6 @@ class MixtralMoE(nn.Module):
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
             quant_config=quant_config,
-            tp_size=tp_size,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -357,6 +353,7 @@ class MixtralForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -398,8 +395,7 @@ class MixtralForCausalLM(nn.Module):
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
-        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
-        expert_params_mapping = MoEImpl.make_expert_params_mapping(
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",

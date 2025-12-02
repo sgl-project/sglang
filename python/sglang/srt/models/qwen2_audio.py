@@ -23,36 +23,27 @@
 # limitations under the License.
 """Inference-only Qwen2-Audio model compatible with HuggingFace weights."""
 import logging
-import math
-from functools import lru_cache, partial
-from typing import Any, Iterable, List, Optional, Tuple, Type, TypedDict
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
-from transformers import AutoTokenizer, Qwen2AudioEncoderConfig, Qwen2Config
-from transformers.activations import ACT2FN
+from transformers import Qwen2AudioEncoderConfig, Qwen2Config
 from transformers.models.qwen2_audio.configuration_qwen2_audio import Qwen2AudioConfig
 from transformers.models.qwen2_audio.modeling_qwen2_audio import (
     Qwen2AudioEncoder,
     Qwen2AudioMultiModalProjector,
 )
 
-from sglang.srt.hf_transformers_utils import get_processor
-from sglang.srt.layers.activation import QuickGELU
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
@@ -106,15 +97,10 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
         self.language_model = Qwen2ForCausalLM(
             config.text_config, quant_config, prefix=add_prefix("model", prefix)
         )
+        self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        # Get all special token IDs for audio
-        audio_token_id: int = getattr(
-            mm_inputs, "audio_token_id", mm_inputs.im_token_id
-        )
-
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens([audio_token_id])
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return self.pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # Extract audio features from input items
@@ -143,7 +129,9 @@ class Qwen2AudioForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             forward_batch=forward_batch,
             language_model=self.language_model,
-            audio_data_embedding_func=self.get_audio_feature,
+            data_embedding_funcs={
+                Modality.AUDIO: self.get_audio_feature,
+            },
             positions=positions,
         )
 

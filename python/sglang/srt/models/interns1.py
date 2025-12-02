@@ -1,11 +1,11 @@
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import parallel_state
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.attention import vision_utils
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -20,6 +20,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.internvl import InternVisionModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 from sglang.utils import logger
 
@@ -34,7 +35,7 @@ class InternS1ForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self._update_hf_config()
+        vision_utils.update_vit_attn_dummy_heads_config(self.config)
         image_size = (
             getattr(config, "force_image_size", None) or config.vision_config.image_size
         )
@@ -49,8 +50,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             (image_size // patch_size) ** 2 * (config.downsample_ratio**2)
         )
         self.downsample_ratio = config.downsample_ratio
-        self.ps_version = getattr(config, "ps_version", "v1")
-        # self.template = getattr(config, 'template', 'internvl2_5')
 
         config.vision_config.use_flash_attn = True if use_flash_attn else False
         config.text_config._attn_implementation = (
@@ -58,7 +57,6 @@ class InternS1ForConditionalGeneration(nn.Module):
         )
 
         logger.info(f"num_image_token: {self.num_image_token}")
-        logger.info(f"ps_version: {self.ps_version}")
 
         self.vision_model = InternVisionModel(config.vision_config)
         if config.text_config.architectures[0] == "Qwen2ForCausalLM":
@@ -67,6 +65,10 @@ class InternS1ForConditionalGeneration(nn.Module):
             )
         elif config.text_config.architectures[0] == "Qwen3MoeForCausalLM":
             self.language_model = Qwen3MoeForCausalLM(
+                config=config.text_config, quant_config=quant_config
+            )
+        elif config.text_config.architectures[0] == "Qwen3ForCausalLM":
+            self.language_model = Qwen3ForCausalLM(
                 config=config.text_config, quant_config=quant_config
             )
         else:
@@ -86,21 +88,6 @@ class InternS1ForConditionalGeneration(nn.Module):
             nn.Linear(llm_hidden_size, llm_hidden_size),
         )
 
-    def _update_hf_config(self):
-        """update hf config to support tp"""
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        num_heads = self.config.vision_config.num_attention_heads
-        head_dim = self.config.vision_config.hidden_size // num_heads
-        num_dummy_heads = 0
-
-        if num_heads % world_size != 0:
-            num_dummy_heads = (
-                (num_heads + world_size) // world_size
-            ) * world_size - num_heads
-
-        setattr(self.config.vision_config, "head_dim", head_dim)
-        setattr(self.config.vision_config, "num_dummy_heads", num_dummy_heads)
-
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
         # N, W, H, C --> N, W, H * scale, C // scale
@@ -114,13 +101,7 @@ class InternS1ForConditionalGeneration(nn.Module):
             int(w * scale_factor),
             int(c / (scale_factor * scale_factor)),
         )
-        if self.ps_version == "v1":
-            logger.warn(
-                "In ps_version 'v1', the height and width have not been swapped back, "
-                "which results in a transposed image."
-            )
-        else:
-            x = x.permute(0, 2, 1, 3).contiguous()
+        x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
     def extract_feature(self, pixel_values):
@@ -183,34 +164,6 @@ class InternS1ForConditionalGeneration(nn.Module):
 
         return helper.pad_input_tokens(input_ids, mm_inputs)
 
-    def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
-        """pad attn qkv weights for dummy heads"""
-        num_dummy_heads = self.config.vision_config.num_dummy_heads
-        if num_dummy_heads == 0:
-            return loaded_weight
-        head_dim = self.config.vision_config.head_dim
-
-        if any([_ in name for _ in ["attn.q_proj", "attn.k_proj", "attn.v_proj"]]):
-            if name.endswith(".weight"):
-                dummy_shape = [num_dummy_heads, head_dim, loaded_weight.shape[-1]]
-            elif name.endswith(".bias"):
-                dummy_shape = [num_dummy_heads, head_dim]
-            else:
-                raise RuntimeError(f"Unsupported weight with name={name}")
-            padded_weight = loaded_weight.new_zeros(dummy_shape)
-            loaded_weight = torch.cat(
-                [loaded_weight.unflatten(0, (-1, head_dim)), padded_weight], dim=0
-            ).flatten(0, 1)
-        if "attn.proj.weight" in name:
-            padded_weight = loaded_weight.new_zeros(
-                loaded_weight.shape[0], head_dim * num_dummy_heads
-            )
-            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=-1)
-        if "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
-            padded_weight = loaded_weight.new_zeros(head_dim * num_dummy_heads)
-            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
-        return loaded_weight
-
     def _mapping_interns1_name(self, name):
         names_map = {
             "lm_head.weight": "language_model.lm_head.weight",
@@ -254,7 +207,7 @@ class InternS1ForConditionalGeneration(nn.Module):
         ]
         expert_params_mapping = []
         if "Qwen3MoeForCausalLM" in self.config.text_config.architectures:
-            expert_params_mapping = get_moe_impl_class().make_expert_params_mapping(
+            expert_params_mapping = FusedMoE.make_expert_params_mapping(
                 ckpt_gate_proj_name="gate_proj",
                 ckpt_down_proj_name="down_proj",
                 ckpt_up_proj_name="up_proj",
@@ -262,14 +215,15 @@ class InternS1ForConditionalGeneration(nn.Module):
             )
 
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             name = self._mapping_interns1_name(name)
             if "vision_model" in name:
-                loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+                loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                    self.config, name, loaded_weight
+                )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -316,13 +270,5 @@ class InternS1ForConditionalGeneration(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-            loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            raise RuntimeError(
-                f"Some weights are not initialized from checkpoints: {unloaded_params}"
-            )
-        return loaded_params
 
-
-EntryClass = [InternS1ForConditionalGeneration]
+EntryClass = InternS1ForConditionalGeneration

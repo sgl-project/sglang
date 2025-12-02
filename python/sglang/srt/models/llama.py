@@ -45,13 +45,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.utils import get_exception_traceback
 
@@ -91,10 +91,18 @@ class LlamaMLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None):
+    def forward(
+        self,
+        x,
+        forward_batch=None,
+        use_reduce_scatter: bool = False,
+    ):
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(
+            x,
+            skip_all_reduce=use_reduce_scatter,
+        )
         return x
 
 
@@ -377,6 +385,10 @@ class LlamaModel(nn.Module):
                     "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        """Get input embeddings from the model."""
+        return self.embed_tokens
+
 
 class LlamaForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -421,7 +433,7 @@ class LlamaForCausalLM(nn.Module):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
@@ -531,31 +543,6 @@ class LlamaForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-
-    def get_hidden_dim(self, module_name):
-        # return input_dim, output_dim
-        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size
-        elif module_name in ["kv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size // (
-                self.config.num_attention_heads // self.config.num_key_value_heads
-            )
-        elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size
-        elif module_name == "down_proj":
-            return self.config.intermediate_size, self.config.hidden_size
-        else:
-            raise NotImplementedError()
-
-    def get_module_name(self, name):
-        params_mapping = {
-            "q_proj": "qkv_proj",
-            "k_proj": "qkv_proj",
-            "v_proj": "qkv_proj",
-            "gate_proj": "gate_up_proj",
-            "up_proj": "gate_up_proj",
-        }
-        return params_mapping.get(name, name)
 
     def get_module_name_from_weight_name(self, name):
         for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:

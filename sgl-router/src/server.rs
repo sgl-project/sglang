@@ -1,285 +1,589 @@
-use crate::config::RouterConfig;
-use crate::logging::{self, LoggingConfig};
-use crate::metrics::{self, PrometheusConfig};
-use crate::middleware::{get_request_id, RequestIdMiddleware};
-use crate::openai_api_types::{ChatCompletionRequest, CompletionRequest, GenerateRequest};
-use crate::routers::{RouterFactory, RouterTrait};
-use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
-use actix_web::{
-    error, get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
-use futures_util::StreamExt;
-use reqwest::Client;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::spawn;
+
+use axum::{
+    extract::{Path, Query, Request, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    serve, Json, Router,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
 
-#[derive(Debug)]
+use crate::{
+    app_context::AppContext,
+    config::{RouterConfig, RoutingMode},
+    core::{
+        worker_to_info,
+        workflow::{
+            create_mcp_registration_workflow, create_worker_registration_workflow,
+            create_worker_removal_workflow, LoggingSubscriber, WorkflowEngine,
+        },
+        Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
+    },
+    logging::{self, LoggingConfig},
+    metrics::{self, PrometheusConfig},
+    middleware::{self, AuthConfig, QueuedRequest},
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::{RerankRequest, V1RerankReqInput},
+        responses::{ResponsesGetParams, ResponsesRequest},
+        validated::ValidatedJson,
+        worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
+    },
+    routers::{router_manager::RouterManager, RouterTrait},
+    service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+};
+
+#[derive(Clone)]
 pub struct AppState {
-    router: Arc<dyn RouterTrait>,
-    client: Client,
+    pub router: Arc<dyn RouterTrait>,
+    pub context: Arc<AppContext>,
+    pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
+    pub router_manager: Option<Arc<RouterManager>>,
 }
 
-impl AppState {
-    pub fn new(router_config: RouterConfig, client: Client) -> Result<Self, String> {
-        // Use RouterFactory to create the appropriate router type
-        let router = RouterFactory::create_router(&router_config)?;
-
-        // Convert Box<dyn RouterTrait> to Arc<dyn RouterTrait>
-        let router = Arc::from(router);
-
-        Ok(Self { router, client })
-    }
+async fn sink_handler() -> Response {
+    StatusCode::NOT_FOUND.into_response()
 }
 
-async fn sink_handler(_req: HttpRequest, mut payload: web::Payload) -> Result<HttpResponse, Error> {
-    // Drain the payload
-    while let Some(chunk) = payload.next().await {
-        if let Err(err) = chunk {
-            println!("Error while draining payload: {:?}", err);
-            break;
-        }
-    }
-    Ok(HttpResponse::NotFound().finish())
+async fn liveness() -> Response {
+    (StatusCode::OK, "OK").into_response()
 }
 
-// Custom error handler for JSON payload errors.
-fn json_error_handler(err: error::JsonPayloadError, req: &HttpRequest) -> Error {
-    let request_id = get_request_id(req);
-    match &err {
-        error::JsonPayloadError::OverflowKnownLength { length, limit } => {
-            error!(
-                request_id = %request_id,
-                "Payload too large length={} limit={}", length, limit
-            );
-            error::ErrorPayloadTooLarge(format!(
-                "Payload too large: {} bytes exceeds limit of {} bytes",
-                length, limit
-            ))
-        }
-        error::JsonPayloadError::Overflow { limit } => {
-            error!(
-                request_id = %request_id,
-                "Payload overflow limit={}", limit
-            );
-            error::ErrorPayloadTooLarge(format!("Payload exceeds limit of {} bytes", limit))
-        }
-        _ => {
-            error!(
-                request_id = %request_id,
-                "Invalid JSON payload error={}", err
-            );
-            error::ErrorBadRequest(format!("Invalid JSON payload: {}", err))
-        }
-    }
-}
+async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+    let workers = state.context.worker_registry.get_all();
+    let healthy_workers: Vec<_> = workers.iter().filter(|w| w.is_healthy()).collect();
 
-#[get("/liveness")]
-async fn liveness(_req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.liveness()
-}
-
-#[get("/readiness")]
-async fn readiness(_req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.readiness()
-}
-
-#[get("/health")]
-async fn health(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.health(&data.client, &req).await
-}
-
-#[get("/health_generate")]
-async fn health_generate(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.health_generate(&data.client, &req).await
-}
-
-#[get("/get_server_info")]
-async fn get_server_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.get_server_info(&data.client, &req).await
-}
-
-#[get("/v1/models")]
-async fn v1_models(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.get_models(&data.client, &req).await
-}
-
-#[get("/get_model_info")]
-async fn get_model_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.get_model_info(&data.client, &req).await
-}
-
-#[post("/generate")]
-async fn generate(
-    req: HttpRequest,
-    body: web::Json<GenerateRequest>,
-    state: web::Data<AppState>,
-) -> Result<HttpResponse, Error> {
-    let request_id = get_request_id(&req);
-    info!(
-        request_id = %request_id,
-        "Received generate request method=\"POST\" path=\"/generate\""
-    );
-
-    let json_body = serde_json::to_value(body.into_inner()).map_err(|e| {
-        error!(
-            request_id = %request_id,
-            "Failed to parse generate request body error={}", e
-        );
-        error::ErrorBadRequest(format!("Invalid JSON: {}", e))
-    })?;
-
-    Ok(state
-        .router
-        .route_generate(&state.client, &req, json_body)
-        .await)
-}
-
-#[post("/v1/chat/completions")]
-async fn v1_chat_completions(
-    req: HttpRequest,
-    body: web::Json<ChatCompletionRequest>,
-    state: web::Data<AppState>,
-) -> Result<HttpResponse, Error> {
-    let request_id = get_request_id(&req);
-    info!(
-        request_id = %request_id,
-        "Received chat completion request method=\"POST\" path=\"/v1/chat/completions\""
-    );
-
-    let json_body = serde_json::to_value(body.into_inner()).map_err(|e| {
-        error!(
-            request_id = %request_id,
-            "Failed to parse chat completion request body error={}", e
-        );
-        error::ErrorBadRequest(format!("Invalid JSON: {}", e))
-    })?;
-
-    Ok(state
-        .router
-        .route_chat(&state.client, &req, json_body)
-        .await)
-}
-
-#[post("/v1/completions")]
-async fn v1_completions(
-    req: HttpRequest,
-    body: web::Json<CompletionRequest>,
-    state: web::Data<AppState>,
-) -> Result<HttpResponse, Error> {
-    let request_id = get_request_id(&req);
-    info!(
-        request_id = %request_id,
-        "Received completion request method=\"POST\" path=\"/v1/completions\""
-    );
-
-    let json_body = serde_json::to_value(body.into_inner()).map_err(|e| {
-        error!(
-            request_id = %request_id,
-            "Failed to parse completion request body error={}", e
-        );
-        error::ErrorBadRequest(format!("Invalid JSON: {}", e))
-    })?;
-
-    Ok(state
-        .router
-        .route_completion(&state.client, &req, json_body)
-        .await)
-}
-
-#[post("/add_worker")]
-async fn add_worker(
-    req: HttpRequest,
-    query: web::Query<HashMap<String, String>>,
-    data: web::Data<AppState>,
-) -> impl Responder {
-    let request_id = get_request_id(&req);
-
-    let worker_url = match query.get("url") {
-        Some(url) => url.to_string(),
-        None => {
-            warn!(
-                request_id = %request_id,
-                "Add worker request missing URL parameter"
-            );
-            return HttpResponse::BadRequest()
-                .body("Worker URL required. Provide 'url' query parameter");
+    let is_ready = if state.context.router_config.enable_igw {
+        !healthy_workers.is_empty()
+    } else {
+        match &state.context.router_config.mode {
+            RoutingMode::PrefillDecode { .. } => {
+                let has_prefill = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));
+                let has_decode = healthy_workers
+                    .iter()
+                    .any(|w| matches!(w.worker_type(), WorkerType::Decode));
+                has_prefill && has_decode
+            }
+            RoutingMode::Regular { .. } => !healthy_workers.is_empty(),
+            RoutingMode::OpenAI { .. } => !healthy_workers.is_empty(),
         }
     };
 
-    info!(
-        request_id = %request_id,
-        worker_url = %worker_url,
-        "Adding worker"
-    );
+    if is_ready {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "ready",
+                "healthy_workers": healthy_workers.len(),
+                "total_workers": workers.len()
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "not ready",
+                "reason": "insufficient healthy workers"
+            })),
+        )
+            .into_response()
+    }
+}
 
-    match data.router.add_worker(&worker_url).await {
-        Ok(message) => {
-            info!(
-                request_id = %request_id,
-                worker_url = %worker_url,
-                "Successfully added worker"
-            );
-            HttpResponse::Ok().body(message)
+async fn health(_state: State<Arc<AppState>>) -> Response {
+    liveness().await
+}
+
+async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.health_generate(req).await
+}
+
+async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
+    WorkerManager::get_engine_metrics(&state.context.worker_registry, &state.context.client).await
+}
+
+async fn get_server_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.get_server_info(req).await
+}
+
+async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.get_models(req).await
+}
+
+async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    state.router.get_model_info(req).await
+}
+
+async fn generate(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<GenerateRequest>,
+) -> Response {
+    let model_id = body.model.as_deref();
+    state
+        .router
+        .route_generate(Some(&headers), &body, model_id)
+        .await
+}
+
+async fn v1_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+) -> Response {
+    state
+        .router
+        .route_chat(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_completions(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<CompletionRequest>,
+) -> Response {
+    state
+        .router
+        .route_completion(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<RerankRequest>,
+) -> Response {
+    state
+        .router
+        .route_rerank(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_rerank(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<V1RerankReqInput>,
+) -> Response {
+    let rerank_body = &body.into();
+    state
+        .router
+        .route_rerank(Some(&headers), rerank_body, Some(&rerank_body.model))
+        .await
+}
+
+async fn v1_responses(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+) -> Response {
+    state
+        .router
+        .route_responses(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_embeddings(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<EmbeddingRequest>,
+) -> Response {
+    state
+        .router
+        .route_embeddings(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_classify(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<ClassifyRequest>,
+) -> Response {
+    state
+        .router
+        .route_classify(Some(&headers), &body, Some(&body.model))
+        .await
+}
+
+async fn v1_responses_get(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+    Query(params): Query<ResponsesGetParams>,
+) -> Response {
+    state
+        .router
+        .get_response(Some(&headers), &response_id, &params)
+        .await
+}
+
+async fn v1_responses_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .cancel_response(Some(&headers), &response_id)
+        .await
+}
+
+async fn v1_responses_delete(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_response(Some(&headers), &response_id)
+        .await
+}
+
+async fn v1_responses_list_input_items(
+    State(state): State<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .list_response_input_items(Some(&headers), &response_id)
+        .await
+}
+
+async fn v1_conversations_create(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .create_conversation(Some(&headers), &body)
+        .await
+}
+
+async fn v1_conversations_get(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_conversation(Some(&headers), &conversation_id)
+        .await
+}
+
+async fn v1_conversations_update(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .update_conversation(Some(&headers), &conversation_id, &body)
+        .await
+}
+
+async fn v1_conversations_delete(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_conversation(Some(&headers), &conversation_id)
+        .await
+}
+
+#[derive(Deserialize, Default)]
+struct ListItemsQuery {
+    limit: Option<usize>,
+    order: Option<String>,
+    after: Option<String>,
+}
+
+async fn v1_conversations_list_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    Query(ListItemsQuery {
+        limit,
+        order,
+        after,
+    }): Query<ListItemsQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .list_conversation_items(Some(&headers), &conversation_id, limit, order, after)
+        .await
+}
+
+#[derive(Deserialize, Default)]
+struct GetItemQuery {
+    /// Additional fields to include in response (not yet implemented)
+    include: Option<Vec<String>>,
+}
+
+async fn v1_conversations_create_items(
+    State(state): State<Arc<AppState>>,
+    Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    state
+        .router
+        .create_conversation_items(Some(&headers), &conversation_id, &body)
+        .await
+}
+
+async fn v1_conversations_get_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    Query(query): Query<GetItemQuery>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .get_conversation_item(Some(&headers), &conversation_id, &item_id, query.include)
+        .await
+}
+
+async fn v1_conversations_delete_item(
+    State(state): State<Arc<AppState>>,
+    Path((conversation_id, item_id)): Path<(String, String)>,
+    headers: http::HeaderMap,
+) -> Response {
+    state
+        .router
+        .delete_conversation_item(Some(&headers), &conversation_id, &item_id)
+        .await
+}
+
+async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
+    match WorkerManager::flush_cache_all(&state.context.worker_registry, &state.context.client)
+        .await
+    {
+        Ok(result) => {
+            if result.failed.is_empty() {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "success",
+                        "message": result.message,
+                        "workers_flushed": result.successful.len(),
+                        "total_http_workers": result.http_workers,
+                        "total_workers": result.total_workers
+                    })),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    Json(json!({
+                        "status": "partial_success",
+                        "message": result.message,
+                        "successful": result.successful,
+                        "failed": result.failed.into_iter().map(|(url, err)| json!({
+                            "worker": url,
+                            "error": err
+                        })).collect::<Vec<_>>(),
+                        "total_http_workers": result.http_workers,
+                        "total_workers": result.total_workers
+                    })),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => {
+            error!("Failed to flush cache: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("Failed to flush cache: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
+    let result =
+        WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
+            .await;
+
+    let loads: Vec<Value> = result
+        .loads
+        .iter()
+        .map(|info| {
+            json!({
+                "worker": &info.worker,
+                "load": info.load
+            })
+        })
+        .collect();
+
+    (StatusCode::OK, Json(json!({ "workers": loads }))).into_response()
+}
+
+async fn create_worker(
+    State(state): State<Arc<AppState>>,
+    Json(config): Json<WorkerConfigRequest>,
+) -> Response {
+    // Warn if router has API key but worker is being added without one
+    if state.context.router_config.api_key.is_some() && config.api_key.is_none() {
+        warn!(
+            "Adding worker {} without API key while router has API key configured. \
+            Worker will be accessible without authentication. \
+            If the worker requires the same API key as the router, please specify it explicitly.",
+            config.url
+        );
+    }
+
+    // Populate dp_aware from router's configuration
+    let config = WorkerConfigRequest {
+        dp_aware: state.context.router_config.dp_aware,
+        ..config
+    };
+
+    // Submit job for async processing
+    let worker_url = config.url.clone();
+    let job = Job::AddWorker {
+        config: Box::new(config),
+    };
+
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+    match job_queue.submit(job).await {
+        Ok(_) => {
+            let response = json!({
+                "status": "accepted",
+                "worker_id": worker_url,
+                "message": "Worker addition queued for background processing"
+            });
+            (StatusCode::ACCEPTED, Json(response)).into_response()
         }
         Err(error) => {
-            error!(
-                request_id = %request_id,
-                worker_url = %worker_url,
-                error = %error,
-                "Failed to add worker"
-            );
-            HttpResponse::BadRequest().body(error)
+            let error_response = WorkerErrorResponse {
+                error,
+                code: "INTERNAL_SERVER_ERROR".to_string(),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
         }
     }
 }
 
-#[get("/list_workers")]
-async fn list_workers(data: web::Data<AppState>) -> impl Responder {
-    let worker_list = data.router.get_worker_urls();
-    HttpResponse::Ok().json(serde_json::json!({ "urls": worker_list }))
-}
+async fn list_workers_rest(State(state): State<Arc<AppState>>) -> Response {
+    let workers = state.context.worker_registry.get_all();
+    let worker_infos: Vec<WorkerInfo> = workers.iter().map(worker_to_info).collect();
 
-#[post("/remove_worker")]
-async fn remove_worker(
-    req: HttpRequest,
-    query: web::Query<HashMap<String, String>>,
-    data: web::Data<AppState>,
-) -> impl Responder {
-    let request_id = get_request_id(&req);
-
-    let worker_url = match query.get("url") {
-        Some(url) => url.to_string(),
-        None => {
-            warn!(
-                request_id = %request_id,
-                "Remove worker request missing URL parameter"
-            );
-            return HttpResponse::BadRequest().finish();
+    let response = json!({
+        "workers": worker_infos,
+        "total": workers.len(),
+        "stats": {
+            "prefill_count": state.context.worker_registry.get_prefill_workers().len(),
+            "decode_count": state.context.worker_registry.get_decode_workers().len(),
+            "regular_count": state.context.worker_registry.get_by_type(&WorkerType::Regular).len(),
         }
+    });
+    Json(response).into_response()
+}
+
+async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+
+    if let Some(worker) = state.context.worker_registry.get_by_url(&url) {
+        // Worker exists in registry, get its full info and attach job status if any
+        let mut worker_info = worker_to_info(&worker);
+        if let Some(status) = job_queue.get_status(&url) {
+            worker_info.job_status = Some(status);
+        }
+        return Json(worker_info).into_response();
+    }
+
+    // Worker not in registry, check job queue for its status
+    if let Some(status) = job_queue.get_status(&url) {
+        // Create a partial WorkerInfo to report the job status
+        let worker_info = WorkerInfo {
+            id: url.clone(),
+            url: url.clone(),
+            model_id: "unknown".to_string(),
+            priority: 0,
+            cost: 1.0,
+            worker_type: "unknown".to_string(),
+            is_healthy: false,
+            load: 0,
+            connection_mode: "unknown".to_string(),
+            runtime_type: None,
+            tokenizer_path: None,
+            reasoning_parser: None,
+            tool_parser: None,
+            chat_template: None,
+            bootstrap_port: None,
+            metadata: std::collections::HashMap::new(),
+            job_status: Some(status),
+        };
+        return Json(worker_info).into_response();
+    }
+
+    // Worker not found in registry or job queue
+    let error = WorkerErrorResponse {
+        error: format!("Worker {url} not found"),
+        code: "WORKER_NOT_FOUND".to_string(),
     };
-
-    info!(
-        request_id = %request_id,
-        worker_url = %worker_url,
-        "Removing worker"
-    );
-
-    data.router.remove_worker(&worker_url);
-    HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
+    (StatusCode::NOT_FOUND, Json(error)).into_response()
 }
 
-#[post("/flush_cache")]
-async fn flush_cache(_req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.flush_cache(&data.client).await
-}
+async fn delete_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>) -> Response {
+    let worker_id = url.clone();
+    let job = Job::RemoveWorker { url };
 
-#[get("/get_loads")]
-async fn get_loads(_req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
-    data.router.get_worker_loads(&data.client).await
+    let job_queue = state
+        .context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue not initialized");
+    match job_queue.submit(job).await {
+        Ok(_) => {
+            let response = json!({
+                "status": "accepted",
+                "worker_id": worker_id,
+                "message": "Worker removal queued for background processing"
+            });
+            (StatusCode::ACCEPTED, Json(response)).into_response()
+        }
+        Err(error) => {
+            let error_response = WorkerErrorResponse {
+                error,
+                code: "INTERNAL_SERVER_ERROR".to_string(),
+            };
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(error_response)).into_response()
+        }
+    }
 }
 
 pub struct ServerConfig {
@@ -295,8 +599,101 @@ pub struct ServerConfig {
     pub request_id_headers: Option<Vec<String>>,
 }
 
-pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
-    // Only initialize logging if not already done (for Python bindings support)
+pub fn build_app(
+    app_state: Arc<AppState>,
+    auth_config: AuthConfig,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+) -> Router {
+    let protected_routes = Router::new()
+        .route("/generate", post(generate))
+        .route("/v1/chat/completions", post(v1_chat_completions))
+        .route("/v1/completions", post(v1_completions))
+        .route("/rerank", post(rerank))
+        .route("/v1/rerank", post(v1_rerank))
+        .route("/v1/responses", post(v1_responses))
+        .route("/v1/embeddings", post(v1_embeddings))
+        .route("/v1/classify", post(v1_classify))
+        .route("/v1/responses/{response_id}", get(v1_responses_get))
+        .route(
+            "/v1/responses/{response_id}/cancel",
+            post(v1_responses_cancel),
+        )
+        .route("/v1/responses/{response_id}", delete(v1_responses_delete))
+        .route(
+            "/v1/responses/{response_id}/input_items",
+            get(v1_responses_list_input_items),
+        )
+        .route("/v1/conversations", post(v1_conversations_create))
+        .route(
+            "/v1/conversations/{conversation_id}",
+            get(v1_conversations_get)
+                .post(v1_conversations_update)
+                .delete(v1_conversations_delete),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items",
+            get(v1_conversations_list_items).post(v1_conversations_create_items),
+        )
+        .route(
+            "/v1/conversations/{conversation_id}/items/{item_id}",
+            get(v1_conversations_get_item).delete(v1_conversations_delete_item),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::concurrency_limit_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
+
+    let public_routes = Router::new()
+        .route("/liveness", get(liveness))
+        .route("/readiness", get(readiness))
+        .route("/health", get(health))
+        .route("/health_generate", get(health_generate))
+        .route("/engine_metrics", get(engine_metrics))
+        .route("/v1/models", get(v1_models))
+        .route("/get_model_info", get(get_model_info))
+        .route("/get_server_info", get(get_server_info));
+
+    let admin_routes = Router::new()
+        .route("/flush_cache", post(flush_cache))
+        .route("/get_loads", get(get_loads))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
+
+    let worker_routes = Router::new()
+        .route("/workers", post(create_worker))
+        .route("/workers", get(list_workers_rest))
+        .route("/workers/{url}", get(get_worker))
+        .route("/workers/{url}", delete(delete_worker))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_config.clone(),
+            middleware::auth_middleware,
+        ));
+
+    Router::new()
+        .merge(protected_routes)
+        .merge(public_routes)
+        .merge(admin_routes)
+        .merge(worker_routes)
+        .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            max_payload_size,
+        ))
+        .layer(middleware::create_logging_layer())
+        .layer(middleware::RequestIdLayer::new(request_id_headers))
+        .layer(create_cors_layer(cors_allowed_origins))
+        .fallback(sink_handler)
+        .with_state(app_state)
+}
+
+pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
@@ -307,7 +704,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
                 .and_then(|s| match s.to_uppercase().parse::<Level>() {
                     Ok(l) => Some(l),
                     Err(_) => {
-                        warn!("Invalid log level string: '{}'. Defaulting to INFO.", s);
+                        warn!("Invalid log level string: '{s}'. Defaulting to INFO.");
                         None
                     }
                 })
@@ -322,9 +719,8 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         None
     };
 
-    // Initialize prometheus metrics exporter
-    if let Some(prometheus_config) = config.prometheus_config {
-        metrics::start_prometheus(prometheus_config);
+    if let Some(prometheus_config) = &config.prometheus_config {
+        metrics::start_prometheus(prometheus_config.clone());
     }
 
     info!(
@@ -336,24 +732,138 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         config.max_payload_size / (1024 * 1024)
     );
 
-    let client = Client::builder()
-        .pool_idle_timeout(Some(Duration::from_secs(50)))
-        .timeout(Duration::from_secs(config.request_timeout_secs)) // Use configurable timeout
-        .build()
-        .expect("Failed to create HTTP client");
+    let app_context = Arc::new(
+        AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
+    );
 
-    let app_state_init = AppState::new(config.router_config.clone(), client.clone())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let router_arc = Arc::clone(&app_state_init.router);
-    let app_state = web::Data::new(app_state_init);
+    let weak_context = Arc::downgrade(&app_context);
+    let worker_job_queue = JobQueue::new(JobQueueConfig::default(), weak_context);
+    app_context
+        .worker_job_queue
+        .set(worker_job_queue)
+        .expect("JobQueue should only be initialized once");
 
-    // Start the service discovery if enabled
+    // Initialize workflow engine and register workflows
+    let engine = Arc::new(WorkflowEngine::new());
+
+    engine
+        .event_bus()
+        .subscribe(Arc::new(LoggingSubscriber))
+        .await;
+
+    engine.register_workflow(create_worker_registration_workflow(&config.router_config));
+    engine.register_workflow(create_worker_removal_workflow());
+    engine.register_workflow(create_mcp_registration_workflow());
+    app_context
+        .workflow_engine
+        .set(engine)
+        .expect("WorkflowEngine should only be initialized once");
+    info!(
+        "Workflow engine initialized with worker and MCP registration workflows (health check timeout: {}s)",
+        config.router_config.health_check.timeout_secs
+    );
+
+    info!(
+        "Initializing workers for routing mode: {:?}",
+        config.router_config.mode
+    );
+
+    // Submit worker initialization job to queue
+    let job_queue = app_context
+        .worker_job_queue
+        .get()
+        .expect("JobQueue should be initialized");
+    let job = Job::InitializeWorkersFromConfig {
+        router_config: Box::new(config.router_config.clone()),
+    };
+    job_queue
+        .submit(job)
+        .await
+        .map_err(|e| format!("Failed to submit worker initialization job: {}", e))?;
+
+    info!("Worker initialization job submitted (will complete in background)");
+
+    if let Some(mcp_config) = &config.router_config.mcp_config {
+        info!("Found {} MCP server(s) in config", mcp_config.servers.len());
+        let mcp_job = Job::InitializeMcpServers {
+            mcp_config: Box::new(mcp_config.clone()),
+        };
+        job_queue
+            .submit(mcp_job)
+            .await
+            .map_err(|e| format!("Failed to submit MCP initialization job: {}", e))?;
+    } else {
+        info!("No MCP config provided, skipping MCP server initialization");
+    }
+
+    // Start background refresh for ALL MCP servers (static + dynamic in LRU cache)
+    if let Some(mcp_manager) = app_context.mcp_manager.get() {
+        let refresh_interval = Duration::from_secs(600); // 10 minutes
+        let _refresh_handle =
+            Arc::clone(mcp_manager).spawn_background_refresh_all(refresh_interval);
+        info!("Started background refresh for all MCP servers (every 10 minutes)");
+    }
+
+    let worker_stats = app_context.worker_registry.stats();
+    info!(
+        "Workers initialized: {} total, {} healthy",
+        worker_stats.total_workers, worker_stats.healthy_workers
+    );
+
+    let router_manager = RouterManager::from_config(&config, &app_context).await?;
+    let router: Arc<dyn RouterTrait> = router_manager.clone();
+
+    let _health_checker = app_context
+        .worker_registry
+        .start_health_checker(config.router_config.health_check.check_interval_secs);
+    info!(
+        "Started health checker for workers with {}s interval",
+        config.router_config.health_check.check_interval_secs
+    );
+
+    if let Some(ref load_monitor) = app_context.load_monitor {
+        load_monitor.start().await;
+        info!("Started LoadMonitor for PowerOfTwo policies");
+    }
+
+    let (limiter, processor) = middleware::ConcurrencyLimiter::new(
+        app_context.rate_limiter.clone(),
+        config.router_config.queue_size,
+        Duration::from_secs(config.router_config.queue_timeout_secs),
+    );
+
+    if app_context.rate_limiter.is_none() {
+        info!("Rate limiting is disabled (max_concurrent_requests = -1)");
+    }
+
+    match processor {
+        Some(proc) => {
+            spawn(proc.run());
+            info!(
+                "Started request queue (size: {}, timeout: {}s)",
+                config.router_config.queue_size, config.router_config.queue_timeout_secs
+            );
+        }
+        None => {
+            info!(
+                "Rate limiting enabled (max_concurrent_requests = {}, queue disabled)",
+                config.router_config.max_concurrent_requests
+            );
+        }
+    }
+
+    let app_state = Arc::new(AppState {
+        router,
+        context: app_context.clone(),
+        concurrency_queue_tx: limiter.queue_tx.clone(),
+        router_manager: Some(router_manager),
+    });
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
-            match start_service_discovery(service_discovery_config, router_arc).await {
+            let app_context_arc = Arc::clone(&app_state.context);
+            match start_service_discovery(service_discovery_config, app_context_arc).await {
                 Ok(handle) => {
                     info!("Service discovery started");
-                    // Spawn a task to handle the service discovery thread
                     spawn(async move {
                         if let Err(e) = handle.await {
                             error!("Service discovery task failed: {:?}", e);
@@ -361,7 +871,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
                     });
                 }
                 Err(e) => {
-                    error!("Failed to start service discovery: {}", e);
+                    error!("Failed to start service discovery: {e}");
                     warn!("Continuing without service discovery");
                 }
             }
@@ -370,10 +880,9 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
 
     info!(
         "Router ready | workers: {:?}",
-        app_state.router.get_worker_urls()
+        WorkerManager::get_worker_urls(&app_state.context.worker_registry)
     );
 
-    // Configure request ID headers
     let request_id_headers = config.request_id_headers.clone().unwrap_or_else(|| {
         vec![
             "x-request-id".to_string(),
@@ -383,36 +892,81 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         ]
     });
 
-    HttpServer::new(move || {
-        let request_id_middleware = RequestIdMiddleware::new(request_id_headers.clone());
+    let auth_config = AuthConfig {
+        api_key: config.router_config.api_key.clone(),
+    };
 
-        App::new()
-            .wrap(request_id_middleware)
-            .app_data(app_state.clone())
-            .app_data(
-                web::JsonConfig::default()
-                    .limit(config.max_payload_size)
-                    .error_handler(json_error_handler),
-            )
-            .app_data(web::PayloadConfig::default().limit(config.max_payload_size))
-            .service(generate)
-            .service(v1_chat_completions)
-            .service(v1_completions)
-            .service(v1_models)
-            .service(get_model_info)
-            .service(liveness)
-            .service(readiness)
-            .service(health)
-            .service(health_generate)
-            .service(get_server_info)
-            .service(add_worker)
-            .service(remove_worker)
-            .service(list_workers)
-            .service(flush_cache)
-            .service(get_loads)
-            .default_service(web::route().to(sink_handler))
-    })
-    .bind_auto_h2c((config.host, config.port))?
-    .run()
-    .await
+    let app = build_app(
+        app_state,
+        auth_config,
+        config.max_payload_size,
+        request_id_headers,
+        config.router_config.cors_allowed_origins.clone(),
+    );
+
+    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
+    let bind_addr = format!("{}:{}", config.host, config.port);
+    info!("Starting server on {}", bind_addr);
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
+    serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C, starting graceful shutdown");
+        },
+        _ = terminate => {
+            info!("Received terminate signal, starting graceful shutdown");
+        },
+    }
+}
+
+fn create_cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
+    use tower_http::cors::Any;
+
+    let cors = if allowed_origins.is_empty() {
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+            .expose_headers(Any)
+    } else {
+        let origins: Vec<http::HeaderValue> = allowed_origins
+            .into_iter()
+            .filter_map(|origin| origin.parse().ok())
+            .collect();
+
+        tower_http::cors::CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([http::Method::GET, http::Method::POST, http::Method::OPTIONS])
+            .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
+            .expose_headers([http::header::HeaderName::from_static("x-request-id")])
+    };
+
+    cors.max_age(Duration::from_secs(3600))
 }

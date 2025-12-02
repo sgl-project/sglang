@@ -1,6 +1,5 @@
 # Adapted from qwen2.py
 import logging
-from functools import partial
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
@@ -24,15 +23,29 @@ from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import (
+    add_prefix,
+    get_cmo_stream,
+    is_cuda,
+    is_npu,
+    wait_cmo_stream,
+)
 
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 
 class Qwen3Attention(nn.Module):
@@ -79,8 +92,16 @@ class Qwen3Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        norm_kwargs = (
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
+            )
+            if get_global_server_args().rl_on_policy_target is not None
+            else {}
+        )
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -143,16 +164,57 @@ class Qwen3Attention(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def forward_prepare_native(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self._apply_qk_norm(q, k)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v
+
+    def forward_prepare_npu(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        if self.attn.layer_id == 0:
+            self.rotary_emb.get_cos_sin_with_position(positions)
+        q, k, v = split_qkv_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            self.q_norm.variance_epsilon,
+            q_bias=getattr(self.q_norm, "bias", None),
+            k_bias=getattr(self.k_norm, "bias", None),
+        )
+        return q, k, v
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        if get_global_server_args().rl_on_policy_target is not None:
+            hidden_states = hidden_states.bfloat16()
+
+        if not _is_npu:
+            q, k, v = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            q, k, v = self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+
+        if get_global_server_args().rl_on_policy_target is not None:
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
@@ -195,9 +257,22 @@ class Qwen3DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        norm_kwargs = (
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
+                override_orig_dtype=torch.float32,
+                fp32_residual=True,
+            )
+            if get_global_server_args().rl_on_policy_target is not None
+            else {}
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(
@@ -232,9 +307,18 @@ class Qwen3DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
+            hidden_states,
+            residual,
+            forward_batch,
+            cache=(
+                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                if _is_npu
+                else None
+            ),
         )
         hidden_states = self.mlp(hidden_states)
+        if _is_npu and get_cmo_stream():
+            wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -313,7 +397,7 @@ class Qwen3ForCausalLM(nn.Module):
                 self.pp_group.send(
                     self.model.embed_tokens.weight, dst=self.pp_group.last_rank
                 )
-            else:
+            elif self.pp_group.is_last_rank:
                 emb_token_weight = self.pp_group.recv(
                     size=(config.vocab_size, config.hidden_size),
                     dtype=next(self.model.parameters()).dtype,
@@ -327,32 +411,8 @@ class Qwen3ForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
-
-    def get_hidden_dim(self, module_name: str) -> Tuple[int]:
-        # return input_dim, output_dim
-        if module_name in ["q_proj", "qkv_proj"]:
-            return (
-                self.config.hidden_size,
-                self.config.head_dim * self.config.num_attention_heads,
-            )
-        elif module_name in ["o_proj"]:
-            return (
-                self.config.head_dim * self.config.num_attention_heads,
-                self.config.hidden_size,
-            )
-        elif module_name in ["kv_proj"]:
-            return (
-                self.config.hidden_size,
-                self.config.head_dim * self.config.num_key_value_heads,
-            )
-        elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size
-        elif module_name == "down_proj":
-            return self.config.intermediate_size, self.config.hidden_size
-        else:
-            raise NotImplementedError()
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.get_input_embeddings()
 
     @torch.no_grad()
     def forward(
@@ -482,7 +542,10 @@ class Qwen3ForCausalLM(nn.Module):
                     continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue

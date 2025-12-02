@@ -1,11 +1,10 @@
 import json
-import time
 import unittest
 
 import openai
 
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -73,11 +72,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         "type": "object",
                         "properties": {
                             "a": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "A number",
                             },
                             "b": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "A number",
                             },
                         },
@@ -128,11 +127,11 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         "type": "object",
                         "properties": {
                             "a": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "A number",
                             },
                             "b": {
-                                "type": "int",
+                                "type": "integer",
                                 "description": "A number",
                             },
                         },
@@ -947,6 +946,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
 
 #     def test_function_calling_multiturn(self):
 #         self._test_function_calling_multiturn()
+
 
 if __name__ == "__main__":
     unittest.main()
