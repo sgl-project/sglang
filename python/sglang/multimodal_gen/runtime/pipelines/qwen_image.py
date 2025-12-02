@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -144,10 +143,6 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
             stage=ImageEncodingStage(
                 image_processor=self.get_module("processor"),
                 text_encoder=self.get_module("text_encoder"),
-                vae_image_processor=VaeImageProcessor(
-                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-                    * 2
-                ),
             ),
         )
 
