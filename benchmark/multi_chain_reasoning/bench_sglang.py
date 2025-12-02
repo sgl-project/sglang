@@ -5,7 +5,9 @@ import re
 import time
 
 import numpy as np
+import requests
 
+from sglang.bench_serving import get_auth_headers, get_bool_env_var
 from sglang.test.test_utils import (
     add_common_sglang_args_and_parse,
     select_sglang_backend,
@@ -37,7 +39,7 @@ prompt_lib = [
 
 
 def main(args):
-    lines = read_jsonl(args.data_path)
+    lines = list(read_jsonl(args.data_path))
 
     # Construct prompts
     # k = args.num_shot
@@ -89,6 +91,38 @@ def main(args):
     # Select backend
     backend = select_sglang_backend(args)
 
+    # Warmup
+    warmup_requests = getattr(args, "warmup_requests", 1)
+    if warmup_requests > 0:
+        print(f"Starting warmup with {warmup_requests} sequences...")
+
+        # Use the first question for warmup
+        warmup_arguments = [{"question": questions[0]}] * warmup_requests
+
+        try:
+            warmup_states = multi_chain_gsm8k.run_batch(
+                warmup_arguments,
+                temperature=0,
+                backend=backend,
+                num_threads=1,  # Use single thread for warmup
+                progress_bar=False,
+            )
+            print(
+                f"Warmup completed with {warmup_requests} sequences. Starting main benchmark run..."
+            )
+        except Exception as e:
+            print(f"Warmup failed: {e}")
+            print("Continuing with main benchmark run...")
+
+        # Small delay after warmup
+        time.sleep(1.0)
+
+    # Flush cache
+    if "sglang" in str(backend) and get_bool_env_var("SGLANG_IS_IN_CI"):
+        base_url = f"http://{args.host}:{args.port}"
+        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+        time.sleep(1.0)
+
     # Run requests
     tic = time.perf_counter()
     states = multi_chain_gsm8k.run_batch(
@@ -136,5 +170,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-chains", type=int, default=5)
     parser.add_argument("--data-path", type=str, default="test.jsonl")
     parser.add_argument("--num-questions", type=int, default=50)
+    parser.add_argument(
+        "--warmup-requests",
+        type=int,
+        default=1,
+        help="Number of warmup requests to run before the main benchmark",
+    )
     args = add_common_sglang_args_and_parse(parser)
     main(args)
