@@ -202,7 +202,7 @@ class SchedulerRuntimeCheckerMixin:
             )
 
     def check_memory(self: Scheduler):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
         elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
             memory_leak, token_msg = self._check_mamba_memory()
@@ -226,7 +226,7 @@ class SchedulerRuntimeCheckerMixin:
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 (
                     full_num_used,
                     swa_num_used,
@@ -277,7 +277,7 @@ class SchedulerRuntimeCheckerMixin:
         self._publish_kv_events()
 
     def check_tree_cache(self: Scheduler):
-        if (self.is_hybrid and isinstance(self.tree_cache, SWARadixCache)) or (
+        if (self.is_hybrid_swa and isinstance(self.tree_cache, SWARadixCache)) or (
             self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache)
         ):
             self.tree_cache.sanity_check()
@@ -320,7 +320,7 @@ class SchedulerRuntimeCheckerMixin:
 
         if not disable_request_logging():
             # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 _, info_msg = self._check_hybrid_memory()
             elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
                 _, info_msg = self._check_mamba_memory()

@@ -386,8 +386,8 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_runner.model.forward(
-                forward_batch.input_ids, forward_batch.positions, forward_batch
+            logits_output, _ = self.draft_runner.forward(
+                forward_batch, skip_attn_backend_init=True
             )
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
