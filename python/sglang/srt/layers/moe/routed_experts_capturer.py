@@ -1,11 +1,13 @@
 import logging
 from abc import ABC
+from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.dp_attention import get_dp_local_info, is_dp_attention_enabled
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
 
@@ -120,6 +122,10 @@ class RoutedExpertsCapturer(ABC):
     def sync_fwd_experts_buffer_DtoH(self, batch: int, loc: torch.Tensor):
         raise NotImplementedError
 
+    @contextmanager
+    def with_forward(self, forward_batch):
+        yield
+
     def get_host_cache(self):
         raise NotImplementedError
 
@@ -137,7 +143,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         max_running_requests: int,
         device: str,
     ):
-
+        self.forward_batch = None
         self.host_cache = _RoutedExpertsHostCache(model_config, num_tokens)
 
         self.device_cache = _RoutedExpertsDeviceCache(
@@ -150,9 +156,16 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     def sync_fwd_experts_buffer_DtoH(
         self, device_loc: torch.Tensor, cpu_loc: torch.Tensor
     ):
-        batch = device_loc.shape[0]
+        if is_dp_attention_enabled():
+            local_start_pos, local_num_tokens = get_dp_local_info(self.forward_batch)
+            local_end_pos = local_start_pos + local_num_tokens
+        else:
+            local_start_pos = 0
+            local_end_pos = device_loc.shape[0]
 
-        self.host_cache.buffer[cpu_loc] = self.device_cache.buffer[:batch].cpu()
+        self.host_cache.buffer[cpu_loc] = self.device_cache.buffer[
+            local_start_pos:local_end_pos
+        ].cpu()
 
     def get_routed_experts(
         self,
@@ -164,6 +177,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
         )
         return self.get_host_cache().buffer[cache_pool_idx]
+
+    @contextmanager
+    def with_forward(self, forward_batch):
+        self.forward_batch = None
+        self.forward_batch = forward_batch
+        yield
 
     def get_host_cache(self):
         return self.host_cache
@@ -191,6 +210,10 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         self, device_loc: torch.Tensor, cpu_loc: torch.Tensor
     ):
         pass
+
+    @contextmanager
+    def with_forward(self, forward_batch):
+        yield
 
     def get_host_cache(self):
         pass
