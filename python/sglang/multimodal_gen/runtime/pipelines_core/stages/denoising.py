@@ -605,7 +605,7 @@ class DenoisingStage(PipelineStage):
                 schedule=torch.profiler.schedule(
                     skip_first=0,
                     wait=0,
-                    warmup=0,
+                    warmup=1,
                     active=batch.num_profiled_timesteps,
                     repeat=5,
                 ),
@@ -911,6 +911,8 @@ class DenoisingStage(PipelineStage):
                         ):
                             progress_bar.update()
 
+                        # Advance profiler schedule for step-based profiling
+                        self.step_profile()
 
         self.stop_profile(batch)
 
