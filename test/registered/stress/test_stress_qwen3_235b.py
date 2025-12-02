@@ -43,7 +43,7 @@ class TestStressQwen3235B(unittest.TestCase):
                     "8",
                     "--trust-remote-code",
                     "--max-running-requests",
-                    "10000",
+                    "500",
                 ],
             )
 

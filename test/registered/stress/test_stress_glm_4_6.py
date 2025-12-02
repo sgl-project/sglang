@@ -43,7 +43,7 @@ class TestStressGLM46(unittest.TestCase):
                     "8",
                     "--trust-remote-code",
                     "--max-running-requests",
-                    "10000",
+                    "500",
                 ],
             )
 

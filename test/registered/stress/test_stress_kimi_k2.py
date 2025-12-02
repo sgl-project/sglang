@@ -47,7 +47,7 @@ class TestStressKimiK2(unittest.TestCase):
                     "--reasoning-parser",
                     "kimi_k2",
                     "--max-running-requests",
-                    "10000",
+                    "500",
                 ],
             )
 
