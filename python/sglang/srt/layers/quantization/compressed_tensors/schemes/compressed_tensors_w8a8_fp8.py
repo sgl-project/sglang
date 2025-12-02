@@ -22,7 +22,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_ptpc_linear,
     normalize_e4m3fn_to_e4m3fnuz,
     validate_fp8_block_shape,
-    apply_fp8_block_linear,
+    dispatch_w8a8_block_fp8_linear,
 )
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
 from sglang.srt.utils import get_bool_env_var, is_hip
@@ -214,12 +214,12 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.weight_block_size is not None:
-            return apply_fp8_block_linear(
+            return dispatch_w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
+                block_size=self.weight_block_size,
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
-                weight_group_shape=self.weight_block_size,
                 bias=bias,
             )
 
