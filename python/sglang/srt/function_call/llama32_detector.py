@@ -156,7 +156,6 @@ class Llama32Detector(BaseFormatDetector):
 
             tags.append(
                 {
-                    "format": "tag",
                     "begin": begin,
                     "content": {
                         "type": "json_schema",

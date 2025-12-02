@@ -199,9 +199,13 @@ class DeepSeekV31Detector(BaseFormatDetector):
         at_least_one: bool = False,
         stop_after_first: bool = False,
     ) -> Dict[str, Any]:
-        """Build structural tag for DeepSeek V3.1 wrapper format."""
-        # Build individual tool call tags
-        tool_tags = []
+        """Build structural tag for DeepSeek V3.1 wrapper format.
+
+        Uses dual triggers to support multiple tool calls:
+        - First trigger: <｜tool▁calls▁begin｜> for the first tool call
+        - Second trigger: <｜tool▁call▁begin｜> for subsequent tool calls
+        """
+        tags = []
         for tool in tools:
             name = tool.function.name
             if not name:
@@ -209,38 +213,37 @@ class DeepSeekV31Detector(BaseFormatDetector):
 
             schema = tool.function.parameters or {}
 
-            tool_tags.append(
+            # Tag for FIRST tool call (includes outer wrapper)
+            tags.append(
                 {
-                    "format": "tag",
-                    "begin": "<｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>{",
+                    "begin": "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>"
+                    + name
+                    + "<｜tool▁sep｜>",
                     "content": {
                         "type": "json_schema",
                         "json_schema": schema,
                     },
-                    "end": "}<｜tool▁call▁end｜>",
+                    "end": "<｜tool▁call▁end｜>",
+                }
+            )
+            # Tag for SUBSEQUENT tool calls (no outer wrapper)
+            tags.append(
+                {
+                    "begin": "<｜tool▁call▁begin｜>" + name + "<｜tool▁sep｜>",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "<｜tool▁call▁end｜>",
                 }
             )
 
-        # Wrap in outer tag with separator
         return {
             "format": {
                 "type": "triggered_tags",
-                "triggers": ["<｜tool▁calls▁begin｜>"],
-                "tags": [
-                    {
-                        "format": "tag",
-                        "begin": "<｜tool▁calls▁begin｜>",
-                        "content": {
-                            "type": "tags_with_separator",
-                            "tags": tool_tags,
-                            "separator": "",
-                            "at_least_one": at_least_one,
-                            "stop_after_first": stop_after_first,
-                        },
-                        "end": "<｜tool▁calls▁end｜>",
-                    }
-                ],
-                "at_least_one": False,  # Outer level
-                "stop_after_first": False,
+                "triggers": ["<｜tool▁calls▁begin｜>", "<｜tool▁call▁begin｜>"],
+                "tags": tags,
+                "at_least_one": at_least_one,
+                "stop_after_first": stop_after_first,
             }
         }
