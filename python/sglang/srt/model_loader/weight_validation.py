@@ -52,9 +52,7 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
     """
     # Find all safetensors index files
     index_files = [
-        f
-        for f in os.listdir(snapshot_dir)
-        if f.endswith(".safetensors.index.json")
+        f for f in os.listdir(snapshot_dir) if f.endswith(".safetensors.index.json")
     ]
 
     if not index_files:
