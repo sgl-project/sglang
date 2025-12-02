@@ -3,18 +3,12 @@ name: 'e2e nightly test single_node (Ascend NPU)'
 on:
   workflow_call:
     inputs:
-      soc_version:
+      runner:
         required: true
         type: string
-        description: use a2 or a3
-      runner:
-        required: false
-        type: string
-        default: linux-aarch64-a3-16
       image:
         required: false
         type: string
-        description: base image for pods
         default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3"
       test_config_name:
         required: true
@@ -26,7 +20,7 @@ on:
         description: path of test case file
 
 concurrency:
-  group: ascend-nightly-singlenode-${{ github.ref }}-${{ inputs.soc_version }}
+  group: ascend-nightly-singlenode-${{ github.workflow_ref }}-${{ github.ref }}--${{ inputs.test_config_name }}
   cancel-in-progress: true
 
 jobs:
@@ -36,8 +30,9 @@ jobs:
     container:
       image: ${{ inputs.image }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Check npu info
+        run: |
+          npu-smi info
 
       - name: Run test
         timeout-minutes: 300

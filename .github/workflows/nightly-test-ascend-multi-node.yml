@@ -54,9 +54,9 @@ jobs:
       env:
         KUBECONFIG: /data/.cache/kb.yaml
         KUBECTL: /data/.cache/kubectl
-        NAMESPACE: kube-system
+        NAMESPACE: ascend-sglang
         ASCEND_TEST_CASE_PATH: test/srt/ascend_k8s
-        KUBE_JOB_NAME: mindx-dls-test
+        KUBE_JOB_NAME: ascend-sglang-test
     steps:
       - name: Install system denpendencies
         run: |
@@ -96,13 +96,14 @@ jobs:
           kubectl delete -f ./deepep.yaml --ignore-not-found=true || true
 
           pod_name_prefix="${KUBE_JOB_NAME}-sglang"
+          echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
           while true; do
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
               echo "Found exist sglang job, sleeping for 30 seconds..."
               sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE
+              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
             else
-              echo "No exist sglang job, start deepep case..."
+              echo "No sglang job exist, start deepep case..."
               break
             fi
           done

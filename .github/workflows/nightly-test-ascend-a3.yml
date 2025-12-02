@@ -52,16 +52,18 @@ jobs:
     needs: multi-node-tests
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         test_config:
           - name: test_ascend_qwen3_8b_in1000_out300_bs8
-            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_qwen3_8b_in1000_out300_bs8.py
           - name: test_ascend_qwen3_8b_in1000_out300_bs16
-            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_qwen3_8b_in1000_out300_bs16.py
     uses: ./.github/workflows/nightly-test-ascend-single-node.yml
     with:
-      soc_version: a3
-      runner: linux-aarch64-a3-0
+      runner:  ${{ matrix.test_config.os }}
       image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3'
       test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}
