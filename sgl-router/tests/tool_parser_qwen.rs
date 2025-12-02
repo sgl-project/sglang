@@ -3,7 +3,7 @@
 //! Tests for the Qwen parser which handles <tool_call>...</tool_call> format
 
 use serde_json::json;
-use sglang_router_rs::tool_parser::{QwenParser, ToolParser};
+use sgl_model_gateway::tool_parser::{QwenParser, ToolParser};
 
 mod common;
 use common::{create_test_tools, streaming_helpers::*};
