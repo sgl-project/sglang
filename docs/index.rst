@@ -47,6 +47,7 @@ Its core features include:
    advanced_features/hicache.rst
    advanced_features/pd_multiplexing.md
    advanced_features/vlm_query.ipynb
+   advanced_features/dp_for_multi_modal_encoder.md
    advanced_features/router.md
    advanced_features/deterministic_inference.md
    advanced_features/observability.md
@@ -97,8 +98,8 @@ Its core features include:
    references/multi_node_deployment/multi_node_index.rst
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
-   references/learn_more.md
    references/post_training_integration.md
+   references/learn_more.md
 
 .. toctree::
    :maxdepth: 1

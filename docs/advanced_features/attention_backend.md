@@ -92,8 +92,6 @@ Constraints when combining hybrid attention with speculative decoding:
 
 - If any attention backend is `trtllm_mha`, speculative decoding supports only `--speculative-eagle-topk 1`.
 - For paged MHA backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only `flashinfer` is supported.
-- `flex_attention` is not supported with speculative decoding.
-- For MLA backends, `trtllm_mla` supports `topk > 1`; `flashmla` and `flashinfer_mla` support only `topk = 1`.
 - CUDA Graph: the decode backend is always captured; the prefill backend is captured only when `--speculative-attention-mode prefill`.
 
 

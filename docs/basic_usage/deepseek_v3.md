@@ -15,16 +15,17 @@ To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
 | | 8 x MI300X |
 | | 2 x 8 x H100/800/20 |
 | | Xeon 6980P CPU |
-| **Full precision BF16** | 2 x 8 x H200 |
+| **Full precision BF16 (upcast from original FP8)** | 2 x 8 x H200 |
 | | 2 x 8 x MI300X |
 | | 4 x 8 x H100/800/20 |
 | | 4 x 8 x A100/A800 |
 | **Quantized weights (AWQ)** | 8 x H100/800/20 |
 | | 8 x A100/A800 |
-| **Quantized weights (int8)** | 16 x A100/800 |
+| **Quantized weights (INT8)** | 16 x A100/800 |
 | | 32 x L40S |
 | | Xeon 6980P CPU |
 | | 2 x Atlas 800I A3 |
+| **Quantized weights (FP4)** | 8 x B200 or 4 x B200 |
 
 <style>
 .md-typeset__table {
@@ -72,7 +73,7 @@ If you encounter errors when starting the server, ensure the weights have finish
 
 ### Launch with one node of 8 x H200
 Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#installation--launch).
-**Note that Deepseek V3 is already in FP8**, so we should not run it with any quantization arguments like `--quantization fp8 --kv-cache-dtype fp8_e5m2`.
+**Note that Deepseek V3 is already in FP8**, so we should not run it with any quantization arguments like `--quantization fp8`.
 
 ### Running examples on Multi-node
 
