@@ -364,16 +364,12 @@ def _register_configs():
     register_configs(
         sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_T2V_A14B_Config,
-        hf_model_paths=[
-            "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-        ]
+        hf_model_paths=["Wan-AI/Wan2.2-T2V-A14B-Diffusers"],
     )
     register_configs(
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_I2V_A14B_Config,
-        hf_model_paths=[
-            "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
-        ]
+        hf_model_paths=["Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
     )
     register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
@@ -413,16 +409,12 @@ def _register_configs():
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
-        hf_model_paths=[
-            "Qwen/Qwen-Image"
-        ]
+        hf_model_paths=["Qwen/Qwen-Image"],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
-        hf_model_paths=[
-            "Qwen/Qwen-Image-Edit"
-        ]
+        hf_model_paths=["Qwen/Qwen-Image-Edit"],
     )
 
 
