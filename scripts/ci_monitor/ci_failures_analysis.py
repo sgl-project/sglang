@@ -179,14 +179,13 @@ class SGLangFailuresAnalyzer:
                     f"Processing run {i}/{total_runs_processed} for runner analysis: #{run.get('run_number')}"
                 )
 
+            head_commit = run.get("head_commit") or {}
             run_info = {
                 "run_number": run.get("run_number"),
                 "run_id": run.get("id"),
                 "created_at": run.get("created_at"),
                 "head_sha": run.get("head_sha", "")[:8],
-                "author": run.get("head_commit", {})
-                .get("author", {})
-                .get("name", "Unknown"),
+                "author": head_commit.get("author", {}).get("name", "Unknown"),
                 "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
             }
 
@@ -750,14 +749,13 @@ class SGLangFailuresAnalyzer:
                     f"Processing run {i}/{total_runs_processed}: #{run.get('run_number')}"
                 )
 
+            head_commit = run.get("head_commit") or {}
             run_info = {
                 "run_number": run.get("run_number"),
                 "run_id": run.get("id"),
                 "created_at": run.get("created_at"),
                 "head_sha": run.get("head_sha", "")[:8],
-                "author": run.get("head_commit", {})
-                .get("author", {})
-                .get("name", "Unknown"),
+                "author": head_commit.get("author", {}).get("name", "Unknown"),
                 "url": f"https://github.com/{self.repo}/actions/runs/{run.get('id')}",
             }
 
