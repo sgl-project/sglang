@@ -429,6 +429,7 @@ class NpuFuseEPMoE(DeepEPMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        **kwargs,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -442,6 +443,7 @@ class NpuFuseEPMoE(DeepEPMoE):
             prefix=prefix,
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
         )
 
         self.quant_method.process_weights_after_loading = (
