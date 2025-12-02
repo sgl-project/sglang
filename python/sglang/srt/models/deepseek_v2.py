@@ -259,15 +259,6 @@ class AttnForwardMethod(IntEnum):
     # Use absorbed multi-latent attention
     MLA = auto()
 
-    # Use multi-head attention for NPU
-    NPU_MHA = auto()
-
-    # Use absorbed multi-latent attention for NPU
-    NPU_MLA = auto()
-
-    # Use Deepseek V3.2 sparse multi-latent attention
-    NPU_DSA = auto()
-
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
@@ -281,6 +272,15 @@ class AttnForwardMethod(IntEnum):
 
     # Use MLA with fused RoPE kernel for CPU
     MLA_FUSED_ROPE_CPU = auto()
+
+    # Use multi-head attention for NPU
+    MHA_NPU = auto()
+
+    # Use absorbed multi-latent attention for NPU
+    MLA_NPU = auto()
+
+    # Use Deepseek V3.2 sparse multi-latent attention for NPU
+    DSA_NPU = auto()
 
 
 def _dispatch_mla_subtype(attn, forward_batch):
@@ -316,14 +316,14 @@ def handle_attention_ascend(attn, forward_batch):
         and not forward_batch.forward_mode.is_draft_extend_v2()
     ):
         if hasattr(attn, "indexer"):
-            return AttnForwardMethod.NPU_DSA
+            return AttnForwardMethod.DSA_NPU
         else:
-            return AttnForwardMethod.NPU_MHA
+            return AttnForwardMethod.MHA_NPU
     else:
         if hasattr(attn, "indexer"):
-            return AttnForwardMethod.NPU_DSA
+            return AttnForwardMethod.DSA_NPU
         else:
-            return AttnForwardMethod.NPU_MLA
+            return AttnForwardMethod.MLA_NPU
 
 
 def _get_sum_extend_prefix_lens(forward_batch):
@@ -1528,17 +1528,17 @@ class DeepseekV2AttentionMLA(nn.Module):
             inner_state = self.forward_absorb_fused_mla_rope_cpu_prepare(
                 positions, hidden_states, forward_batch, zero_allocator
             )
-        elif attn_forward_method == AttnForwardMethod.NPU_MHA:
+        elif attn_forward_method == AttnForwardMethod.MHA_NPU:
             inner_state = forward_mha_prepare_npu(
-                positions, hidden_states, forward_batch, zero_allocator
+                self, positions, hidden_states, forward_batch, zero_allocator
             )
-        elif attn_forward_method == AttnForwardMethod.NPU_MLA:
+        elif attn_forward_method == AttnForwardMethod.MLA_NPU:
             inner_state = forward_mla_prepare_npu(
-                positions, hidden_states, forward_batch, zero_allocator
+                self, positions, hidden_states, forward_batch, zero_allocator
             )
-        elif attn_forward_method == AttnForwardMethod.NPU_DSA:
+        elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             inner_state = forward_dsa_prepare_npu(
-                positions, hidden_states, forward_batch, zero_allocator
+                self, positions, hidden_states, forward_batch, zero_allocator
             )
         else:
             raise NotImplementedError
@@ -1563,12 +1563,12 @@ class DeepseekV2AttentionMLA(nn.Module):
             return self.forward_absorb_fused_mla_rope_core(*inner_state)
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_CPU:
             return self.forward_absorb_fused_mla_rope_cpu_core(*inner_state)
-        elif attn_forward_method == AttnForwardMethod.NPU_MHA:
-            return forward_mha_core_npu(*inner_state)
-        elif attn_forward_method == AttnForwardMethod.NPU_MLA:
-            return forward_mla_core_npu(*inner_state)
-        elif attn_forward_method == AttnForwardMethod.NPU_DSA:
-            return forward_dsa_core_npu(*inner_state)
+        elif attn_forward_method == AttnForwardMethod.MHA_NPU:
+            return forward_mha_core_npu(self, *inner_state)
+        elif attn_forward_method == AttnForwardMethod.MLA_NPU:
+            return forward_mla_core_npu(self, *inner_state)
+        elif attn_forward_method == AttnForwardMethod.DSA_NPU:
+            return forward_dsa_core_npu(self, *inner_state)
         else:
             raise NotImplementedError
 
