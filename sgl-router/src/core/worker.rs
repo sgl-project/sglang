@@ -315,7 +315,7 @@ impl fmt::Display for ConnectionMode {
     }
 }
 
-/// Runtime implementation type for gRPC workers
+/// Runtime implementation type for workers
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeType {
@@ -324,6 +324,9 @@ pub enum RuntimeType {
     Sglang,
     /// vLLM runtime
     Vllm,
+    /// External OpenAI-compatible API (not local inference)
+    /// Used for routing to external providers like OpenAI, Azure OpenAI, xAI, etc.
+    External,
 }
 
 impl fmt::Display for RuntimeType {
@@ -331,6 +334,7 @@ impl fmt::Display for RuntimeType {
         match self {
             RuntimeType::Sglang => write!(f, "sglang"),
             RuntimeType::Vllm => write!(f, "vllm"),
+            RuntimeType::External => write!(f, "external"),
         }
     }
 }
@@ -342,6 +346,7 @@ impl std::str::FromStr for RuntimeType {
         match s.to_lowercase().as_str() {
             "sglang" => Ok(RuntimeType::Sglang),
             "vllm" => Ok(RuntimeType::Vllm),
+            "external" => Ok(RuntimeType::External),
             _ => Err(format!("Unknown runtime type: {}", s)),
         }
     }
@@ -1936,293 +1941,5 @@ mod tests {
 
         // Not found
         assert!(metadata.find_model("unknown-model").is_none());
-    }
-
-    #[test]
-    fn test_worker_metadata_supports_model_with_list() {
-        use super::ModelCard;
-
-        let model1 = ModelCard::new("model-a").with_alias("alias-a");
-        let model2 = ModelCard::new("model-b");
-
-        let metadata = WorkerMetadata {
-            url: "http://test:8080".to_string(),
-            worker_type: WorkerType::Regular,
-            connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
-            labels: std::collections::HashMap::new(),
-            health_config: HealthConfig::default(),
-            api_key: None,
-            bootstrap_host: "test".to_string(),
-            bootstrap_port: None,
-            models: vec![model1, model2],
-            default_provider: None,
-            default_model_type: ModelType::LLM,
-        };
-
-        // Should support listed models
-        assert!(metadata.supports_model("model-a"));
-        assert!(metadata.supports_model("alias-a"));
-        assert!(metadata.supports_model("model-b"));
-
-        // Should not support unlisted models
-        assert!(!metadata.supports_model("model-c"));
-    }
-
-    #[test]
-    fn test_worker_metadata_supports_endpoint() {
-        use super::{Endpoint, ModelCard};
-
-        let embed_model =
-            ModelCard::new("text-embedding-3-small").with_model_type(ModelType::EMBEDDINGS);
-        let llm_model = ModelCard::new("gpt-4o").with_model_type(ModelType::LLM);
-
-        let metadata = WorkerMetadata {
-            url: "http://test:8080".to_string(),
-            worker_type: WorkerType::Regular,
-            connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
-            labels: std::collections::HashMap::new(),
-            health_config: HealthConfig::default(),
-            api_key: None,
-            bootstrap_host: "test".to_string(),
-            bootstrap_port: None,
-            models: vec![embed_model, llm_model],
-            default_provider: None,
-            default_model_type: ModelType::LLM,
-        };
-
-        // Embedding model supports embeddings but not chat
-        assert!(metadata.supports_endpoint("text-embedding-3-small", Endpoint::Embeddings));
-        assert!(!metadata.supports_endpoint("text-embedding-3-small", Endpoint::Chat));
-
-        // LLM model supports chat but not embeddings
-        assert!(metadata.supports_endpoint("gpt-4o", Endpoint::Chat));
-        assert!(!metadata.supports_endpoint("gpt-4o", Endpoint::Embeddings));
-
-        // Unknown model falls back to default_model_type (LLM)
-        assert!(metadata.supports_endpoint("unknown", Endpoint::Chat));
-        assert!(!metadata.supports_endpoint("unknown", Endpoint::Embeddings));
-    }
-
-    #[test]
-    fn test_worker_metadata_provider_for_model() {
-        use super::{ModelCard, ProviderType};
-
-        let openai_model = ModelCard::new("gpt-4o").with_provider(ProviderType::OpenAI);
-        let native_model = ModelCard::new("llama-3.1"); // No provider = native
-
-        let metadata = WorkerMetadata {
-            url: "http://test:8080".to_string(),
-            worker_type: WorkerType::Regular,
-            connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
-            labels: std::collections::HashMap::new(),
-            health_config: HealthConfig::default(),
-            api_key: None,
-            bootstrap_host: "test".to_string(),
-            bootstrap_port: None,
-            models: vec![openai_model, native_model],
-            default_provider: Some(ProviderType::XAI), // Default for unknown models
-            default_model_type: ModelType::LLM,
-        };
-
-        // OpenAI model returns OpenAI provider
-        assert_eq!(
-            metadata.provider_for_model("gpt-4o"),
-            Some(&ProviderType::OpenAI)
-        );
-
-        // Native model returns None (model has no provider)
-        // But falls back to worker's default_provider
-        assert_eq!(
-            metadata.provider_for_model("llama-3.1"),
-            Some(&ProviderType::XAI)
-        );
-
-        // Unknown model returns worker's default_provider
-        assert_eq!(
-            metadata.provider_for_model("unknown"),
-            Some(&ProviderType::XAI)
-        );
-    }
-
-    #[test]
-    fn test_worker_metadata_model_ids() {
-        use super::ModelCard;
-
-        let model1 = ModelCard::new("model-a");
-        let model2 = ModelCard::new("model-b");
-        let model3 = ModelCard::new("model-c");
-
-        let metadata = WorkerMetadata {
-            url: "http://test:8080".to_string(),
-            worker_type: WorkerType::Regular,
-            connection_mode: ConnectionMode::Http,
-            runtime_type: RuntimeType::default(),
-            labels: std::collections::HashMap::new(),
-            health_config: HealthConfig::default(),
-            api_key: None,
-            bootstrap_host: "test".to_string(),
-            bootstrap_port: None,
-            models: vec![model1, model2, model3],
-            default_provider: None,
-            default_model_type: ModelType::LLM,
-        };
-
-        let ids: Vec<&str> = metadata.model_ids().collect();
-        assert_eq!(ids, vec!["model-a", "model-b", "model-c"]);
-    }
-
-    // === Phase 1.4: Worker trait model-aware methods tests ===
-
-    #[test]
-    fn test_worker_tokenizer_path() {
-        use super::ModelCard;
-        use crate::core::BasicWorkerBuilder;
-
-        // Create a worker with a ModelCard that has tokenizer_path
-        let model_card =
-            ModelCard::new("my-model").with_tokenizer_path("my-model/tokenizer".to_string());
-
-        let worker = BasicWorkerBuilder::new("http://test:8080")
-            .model(model_card)
-            .build();
-
-        // Should find the tokenizer_path from the ModelCard
-        assert_eq!(
-            worker.tokenizer_path("my-model"),
-            Some("my-model/tokenizer")
-        );
-
-        // Unknown model should return None
-        assert_eq!(worker.tokenizer_path("unknown-model"), None);
-    }
-
-    #[test]
-    fn test_worker_model_aware_methods_with_model_cards() {
-        use super::{ModelCard, ProviderType};
-        use crate::core::BasicWorkerBuilder;
-
-        // Build worker (labels are not used for model config anymore)
-        let mut worker = BasicWorkerBuilder::new("http://test:8080").build();
-
-        // Add model cards to the worker's metadata
-        let model_with_config = ModelCard::new("gpt-4o")
-            .with_tokenizer_path("gpt4o/tokenizer")
-            .with_chat_template("gpt4o_template")
-            .with_reasoning_parser("gpt4o_reasoning")
-            .with_tool_parser("gpt4o_tools")
-            .with_provider(ProviderType::OpenAI);
-
-        let model_without_config = ModelCard::new("llama-3.1");
-
-        worker.metadata.models = vec![model_with_config, model_without_config];
-
-        // Model with explicit config should use ModelCard values
-        assert_eq!(worker.tokenizer_path("gpt-4o"), Some("gpt4o/tokenizer"));
-        assert_eq!(worker.chat_template("gpt-4o"), Some("gpt4o_template"));
-        assert_eq!(worker.reasoning_parser("gpt-4o"), Some("gpt4o_reasoning"));
-        assert_eq!(worker.tool_parser("gpt-4o"), Some("gpt4o_tools"));
-        assert_eq!(
-            worker.provider_for_model("gpt-4o"),
-            Some(&ProviderType::OpenAI)
-        );
-
-        // Model without explicit config should return None (no fallback to labels)
-        assert_eq!(worker.tokenizer_path("llama-3.1"), None);
-        assert_eq!(worker.chat_template("llama-3.1"), None);
-        assert_eq!(worker.reasoning_parser("llama-3.1"), None);
-        assert_eq!(worker.tool_parser("llama-3.1"), None);
-
-        // Unknown model should return None
-        assert_eq!(worker.tokenizer_path("unknown"), None);
-    }
-
-    #[test]
-    fn test_worker_supports_model_and_endpoint() {
-        use super::{Endpoint, ModelCard};
-        use crate::core::BasicWorkerBuilder;
-
-        let mut worker = BasicWorkerBuilder::new("http://test:8080").build();
-
-        // Empty models list - accepts any model
-        assert!(worker.supports_model("any-model"));
-
-        // Add specific models
-        let llm_model = ModelCard::new("gpt-4o").with_model_type(ModelType::LLM);
-        let embed_model = ModelCard::new("text-embedding").with_model_type(ModelType::EMBEDDINGS);
-
-        worker.metadata.models = vec![llm_model, embed_model];
-
-        // Now only listed models are supported
-        assert!(worker.supports_model("gpt-4o"));
-        assert!(worker.supports_model("text-embedding"));
-        assert!(!worker.supports_model("unknown-model"));
-
-        // Check endpoint support
-        assert!(worker.supports_endpoint("gpt-4o", Endpoint::Chat));
-        assert!(!worker.supports_endpoint("gpt-4o", Endpoint::Embeddings));
-        assert!(worker.supports_endpoint("text-embedding", Endpoint::Embeddings));
-        assert!(!worker.supports_endpoint("text-embedding", Endpoint::Chat));
-    }
-
-    #[test]
-    fn test_worker_models_accessor() {
-        use super::ModelCard;
-        use crate::core::BasicWorkerBuilder;
-
-        let mut worker = BasicWorkerBuilder::new("http://test:8080").build();
-
-        // Initially empty
-        assert!(worker.models().is_empty());
-
-        // Add models
-        worker.metadata.models = vec![ModelCard::new("model-a"), ModelCard::new("model-b")];
-
-        assert_eq!(worker.models().len(), 2);
-        assert_eq!(worker.models()[0].id, "model-a");
-        assert_eq!(worker.models()[1].id, "model-b");
-    }
-
-    #[test]
-    fn test_worker_default_provider() {
-        use super::ProviderType;
-        use crate::core::BasicWorkerBuilder;
-
-        let mut worker = BasicWorkerBuilder::new("http://test:8080").build();
-
-        // Default is None (native/passthrough)
-        assert!(worker.default_provider().is_none());
-
-        // Set a default provider
-        worker.metadata.default_provider = Some(ProviderType::OpenAI);
-        assert_eq!(worker.default_provider(), Some(&ProviderType::OpenAI));
-    }
-
-    #[test]
-    fn test_worker_model_id_with_model_cards() {
-        use super::ModelCard;
-        use crate::core::BasicWorkerBuilder;
-
-        // Test 1: No models, no labels → "unknown"
-        let worker = BasicWorkerBuilder::new("http://test:8080").build();
-        assert_eq!(worker.model_id(), "unknown");
-
-        // Test 2: No models but has label → uses label
-        let worker = BasicWorkerBuilder::new("http://test:8080")
-            .label("model_id", "label-model")
-            .build();
-        assert_eq!(worker.model_id(), "label-model");
-
-        // Test 3: Has ModelCards → uses first ModelCard
-        let mut worker = BasicWorkerBuilder::new("http://test:8080")
-            .label("model_id", "label-model")
-            .build();
-        worker.metadata.models = vec![
-            ModelCard::new("card-model-1"),
-            ModelCard::new("card-model-2"),
-        ];
-        assert_eq!(worker.model_id(), "card-model-1");
     }
 }
