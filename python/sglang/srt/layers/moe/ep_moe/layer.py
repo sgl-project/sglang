@@ -17,7 +17,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
 )
-from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputFormat
+from sglang.srt.layers.moe.topk import TopKOutput, TopKOutputChecker
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -87,7 +87,6 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        print(f"Using Deep EP MoE")
         if _use_aiter or _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
@@ -150,8 +149,8 @@ class DeepEPMoE(FusedMoE):
         topk_output: TopKOutput,
     ):
         if is_in_piecewise_cuda_graph():
-            assert (
-                topk_output.format() == TopKOutputFormat.STANDARD
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
             return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
