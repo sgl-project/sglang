@@ -70,6 +70,7 @@ def run_pytest(files):
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
 
     max_retries = 2
+    # retry if the perf assertion failed, for {max_retries} times
     for i in range(max_retries + 1):
         cmd = list(base_cmd)
         if i > 0:
@@ -83,7 +84,6 @@ def run_pytest(files):
 
         logger.info(f"Running command: {' '.join(cmd)}")
 
-        # Run with output capturing to detect specific errors
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -106,7 +106,7 @@ def run_pytest(files):
         if returncode == 0:
             return 0
 
-        # Check if the failure is due to an assertion in test_server_utils.py
+        # check if the failure is due to an assertion in test_server_utils.py
         full_output = "".join(output_lines)
         is_perf_assertion = (
             "multimodal_gen/test/server/test_server_utils.py" in full_output
