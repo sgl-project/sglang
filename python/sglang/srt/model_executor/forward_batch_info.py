@@ -90,27 +90,6 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
-    def __str__(self):
-        if self == ForwardMode.EXTEND:
-            return "EXTEND"
-        elif self == ForwardMode.DECODE:
-            return "DECODE"
-        elif self == ForwardMode.MIXED:
-            return "MIXED"
-        elif self == ForwardMode.IDLE:
-            return "IDLE"
-        elif self == ForwardMode.TARGET_VERIFY:
-            return "TARGET_VERIFY"
-        elif self == ForwardMode.DRAFT_EXTEND:
-            return "DRAFT_EXTEND"
-        elif self == ForwardMode.DRAFT_EXTEND_V2:
-            return "DRAFT_EXTEND_V2"
-        elif self == ForwardMode.PREBUILT:
-            return "PREBUILT"
-        elif self == ForwardMode.SPLIT_PREFILL:
-            return "SPLIT_PREFILL"
-        return "UNKNOWN"
-
     def is_prefill(self):
         return self.is_extend()
 
@@ -381,8 +360,6 @@ class ForwardBatch:
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
-        from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
-
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -457,13 +434,19 @@ class ForwardBatch:
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
-            TboForwardBatchPreparer.prepare(
-                ret, is_draft_worker=model_runner.is_draft_worker
-            )
             return ret
 
-        # Override the positions with spec_info
-        if (
+        # Override the positions with diffusion LLM or spec_info
+        if batch.dllm_config is not None:
+            block_size = batch.dllm_config.block_size
+            ret.positions = torch.tensor(
+                [
+                    [i for i in range(block_offset, block_offset + block_size)]
+                    for block_offset in batch.dllm_block_offsets
+                ],
+                dtype=torch.int32,
+            ).to(device, non_blocking=True)
+        elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):
@@ -507,10 +490,6 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.enable_lora:
             model_runner.lora_manager.prepare_lora_batch(ret)
-
-        TboForwardBatchPreparer.prepare(
-            ret, is_draft_worker=model_runner.is_draft_worker
-        )
 
         return ret
 
@@ -740,6 +719,8 @@ class ForwardBatch:
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+        from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None
 
@@ -804,6 +785,8 @@ class ForwardBatch:
                     )
                 else:
                     bs = self.batch_size = num_tokens
+        elif self.forward_mode.is_extend():
+            self.extend_num_tokens = num_tokens
 
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
@@ -811,10 +794,15 @@ class ForwardBatch:
         global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
         self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
 
+        TboForwardBatchPreparer.prepare(
+            batch=self, is_draft_worker=model_runner.is_draft_worker
+        )
+
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
+        self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()

@@ -55,7 +55,7 @@ jobs:
 
   run-nightly-tests:
     needs: bump-sglang-version
-    uses: ./.github/workflows/nightly-test.yml
+    uses: ./.github/workflows/nightly-test-nvidia.yml
     with:
       ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
     secrets: inherit

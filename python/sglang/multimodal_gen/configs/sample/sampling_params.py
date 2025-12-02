@@ -195,7 +195,7 @@ class SamplingParams:
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError("prompt_path must be a txt file")
 
-    def adjust(
+    def _adjust(
         self,
         server_args: ServerArgs,
     ):
@@ -225,6 +225,13 @@ class SamplingParams:
             self.num_frames = 1
             self.data_type = DataType.IMAGE
         else:
+            # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
+            # If we apply it after, adjust_num_frames might modify the frame count
+            # and break the divisibility constraint (alignment) required by num_gpus.
+            self.num_frames = server_args.pipeline_config.adjust_num_frames(
+                self.num_frames
+            )
+
             # Adjust number of frames based on number of GPUs for video task
             use_temporal_scaling_frames = (
                 pipeline_config.vae_config.use_temporal_scaling_frames
@@ -275,10 +282,6 @@ class SamplingParams:
                 )
                 self.num_frames = new_num_frames
 
-            self.num_frames = server_args.pipeline_config.adjust_num_frames(
-                self.num_frames
-            )
-
         self._set_output_file_name()
         self.log(server_args=server_args)
 
@@ -296,15 +299,7 @@ class SamplingParams:
         from sglang.multimodal_gen.registry import get_model_info
 
         model_info = get_model_info(model_path)
-        logger.debug(f"Found model info: {model_info}")
-        if model_info is not None:
-            sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
-        else:
-            logger.warning(
-                "Couldn't find an optimal sampling param for %s. Using the default sampling param.",
-                model_path,
-            )
-            sampling_params = cls(**kwargs)
+        sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
@@ -312,9 +307,9 @@ class SamplingParams:
         sampling_params = SamplingParams.from_pretrained(model_path)
 
         user_sampling_params = SamplingParams(*args, **kwargs)
+        # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
-
-        sampling_params.adjust(server_args)
+        sampling_params._adjust(server_args)
 
         return sampling_params
 
@@ -416,6 +411,32 @@ class SamplingParams:
             default=SamplingParams.width,
             help="Width of generated output",
         )
+        # resolution shortcuts
+        parser.add_argument(
+            "--4k",
+            action="store_true",
+            dest="resolution_4k",
+            help="Set resolution to 4K (3840x2160)",
+        )
+        parser.add_argument(
+            "--2k",
+            action="store_true",
+            dest="resolution_2k",
+            help="Set resolution to 2K (2560x1440)",
+        )
+        parser.add_argument(
+            "--1080p",
+            action="store_true",
+            dest="resolution_1080p",
+            help="Set resolution to 1080p (1920x1080)",
+        )
+        parser.add_argument(
+            "--720p",
+            action="store_true",
+            dest="resolution_720p",
+            help="Set resolution to 720p (1280x720)",
+        )
+
         parser.add_argument(
             "--fps",
             type=int,
@@ -491,11 +512,25 @@ class SamplingParams:
         return parser
 
     @classmethod
-    def from_cli_args(cls, args: argparse.Namespace):
+    def get_cli_args(cls, args: argparse.Namespace):
+        # handle resolution shortcuts
+        if hasattr(args, "resolution_4k") and args.resolution_4k:
+            args.width = 3840
+            args.height = 2160
+        elif hasattr(args, "resolution_2k") and args.resolution_2k:
+            args.width = 2560
+            args.height = 1440
+        elif hasattr(args, "resolution_1080p") and args.resolution_1080p:
+            args.width = 1920
+            args.height = 1080
+        elif hasattr(args, "resolution_720p") and args.resolution_720p:
+            args.width = 1280
+            args.height = 720
+
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         args.height_not_provided = False
         args.width_not_provided = False
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        return {attr: getattr(args, attr) for attr in attrs}
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
@@ -536,6 +571,8 @@ class SamplingParams:
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
 
+        self.height_not_provided = user_params.height_not_provided
+        self.width_not_provided = user_params.width_not_provided
         self.__post_init__()
 
     @property
@@ -568,8 +605,8 @@ class SamplingParams:
 
         # Log sampling parameters
         debug_str = f"""Sampling params:
-                      height: {target_height}
                        width: {target_width}
+                      height: {target_height}
                   num_frames: {self.num_frames}
                       prompt: {self.prompt}
                   neg_prompt: {self.negative_prompt}

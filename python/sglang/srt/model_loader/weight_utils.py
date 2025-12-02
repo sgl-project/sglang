@@ -322,12 +322,10 @@ def find_local_hf_snapshot_dir(
             incomplete_files = glob.glob(os.path.join(blobs_dir, "*.incomplete"))
 
         if incomplete_files:
-            logger.info(
-                "Found %d .incomplete files in %s for %s. "
-                "Will clean up and re-download.",
-                len(incomplete_files),
-                blobs_dir,
-                model_name_or_path,
+            log_info_on_rank0(
+                logger,
+                f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
+                f"{model_name_or_path}. Will clean up and re-download.",
             )
             _cleanup_corrupted_model_cache(
                 model_name_or_path,
@@ -367,22 +365,20 @@ def find_local_hf_snapshot_dir(
         if not is_valid:
             if corrupted_files:
                 # Selective cleanup: only remove corrupted files
-                logger.info(
-                    "Found %d corrupted file(s) for %s: %s. "
+                log_info_on_rank0(
+                    logger,
+                    f"Found {len(corrupted_files)} corrupted file(s) for "
+                    f"{model_name_or_path}: {error_msg}. "
                     "Will selectively clean and re-download only these files.",
-                    len(corrupted_files),
-                    model_name_or_path,
-                    error_msg,
                 )
                 _cleanup_corrupted_files_selective(model_name_or_path, corrupted_files)
                 return None
             else:
                 # Cannot selectively clean (e.g., missing shards) - remove entire cache
-                logger.info(
-                    "Validation failed for %s: %s. "
+                log_info_on_rank0(
+                    logger,
+                    f"Validation failed for {model_name_or_path}: {error_msg}. "
                     "Will remove entire cache and re-download.",
-                    model_name_or_path,
-                    error_msg,
                 )
                 _cleanup_corrupted_model_cache(
                     model_name_or_path, found_local_snapshot_dir, error_msg
@@ -393,30 +389,34 @@ def find_local_hf_snapshot_dir(
         for f in local_weight_files:
             base_name = os.path.basename(f)
             # Check if this is a single model file (not sharded)
-            if base_name in ["model.safetensors", "pytorch_model.safetensors"]:
+            # Include adapter_model.safetensors for LoRA adapters
+            if base_name in [
+                "model.safetensors",
+                "pytorch_model.safetensors",
+                "adapter_model.safetensors",
+            ]:
                 if not _validate_safetensors_file(f):
-                    logger.info(
-                        "Corrupted model file %s for %s. "
+                    log_info_on_rank0(
+                        logger,
+                        f"Corrupted model file {base_name} for {model_name_or_path}. "
                         "Will selectively clean and re-download this file.",
-                        base_name,
-                        model_name_or_path,
                     )
                     # Selective cleanup for single file
                     _cleanup_corrupted_files_selective(model_name_or_path, [f])
                     return None
 
     if len(local_weight_files) > 0:
-        logger.info(
-            "Found local HF snapshot for %s at %s; skipping download.",
-            model_name_or_path,
-            found_local_snapshot_dir,
+        log_info_on_rank0(
+            logger,
+            f"Found local HF snapshot for {model_name_or_path} at "
+            f"{found_local_snapshot_dir}; skipping download.",
         )
         return found_local_snapshot_dir
     else:
-        logger.info(
-            "Local HF snapshot at %s has no files matching %s; will attempt download.",
-            found_local_snapshot_dir,
-            allow_patterns,
+        log_info_on_rank0(
+            logger,
+            f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
+            f"{allow_patterns}; will attempt download.",
         )
     return None
 
