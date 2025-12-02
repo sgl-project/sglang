@@ -58,6 +58,7 @@ from sglang.srt.utils.common import (
     kill_itself_when_parent_died,
     maybe_reindex_device_id,
 )
+from sglang.srt.utils.worker_exit_reporter import worker_exit_reporter
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
@@ -530,6 +531,9 @@ def run_data_parallel_controller_process(
 
     try:
         controller = data_parallel_controller_class(server_args, port_args)
+        # Data Parallel Controller process set child process signal handler
+        worker_exit_reporter.set_child_process_exit_signal_handler()
+
         pipe_writer.send(
             {
                 "status": "ready",

@@ -249,6 +249,7 @@ class ServerArgs:
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
+    router_url: Optional[str] = None
 
     # Quantization and data type
     dtype: str = "auto"
@@ -2200,6 +2201,12 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        )
+        parser.add_argument(
+            "--router-url",
+            type=str,
+            default=ServerArgs.router_url,
+            help="Router URL for worker exit reporting (e.g., http://router:8000)",
         )
 
         # Quantization and data type
