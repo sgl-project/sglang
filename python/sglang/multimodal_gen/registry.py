@@ -195,7 +195,7 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     if len(matched_model_names) >= 1:
         if len(matched_model_names) > 1:
             logger.warning(
-                f"More than one model name is matched: {matched_model_names}, using the first matched"
+                f"More than one model name is matched, using the first matched"
             )
         model_name = matched_model_names[0]
     else:
