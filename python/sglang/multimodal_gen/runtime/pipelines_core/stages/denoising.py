@@ -381,7 +381,7 @@ class DenoisingStage(PipelineStage):
         should_preprocess_for_wan_ti2v = (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
             and batch.condition_image is not None
-            and isinstance(server_args.pipeline_config, Wan2_2_TI2V_5B_Config)
+            and type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
         )
 
         # TI2V specific preparations - before SP sharding
@@ -696,8 +696,9 @@ class DenoisingStage(PipelineStage):
         should_preprocess_for_wan_ti2v = (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
             and batch.condition_image is not None
-            and isinstance(server_args.pipeline_config, Wan2_2_TI2V_5B_Config)
+            and type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
         )
+
         # expand timestep
         if should_preprocess_for_wan_ti2v:
             # Explicitly cast t_device to the target float type at the beginning.
@@ -744,7 +745,7 @@ class DenoisingStage(PipelineStage):
         should_preprocess_for_wan_ti2v = (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
             and batch.condition_image is not None
-            and isinstance(server_args.pipeline_config, Wan2_2_TI2V_5B_Config)
+            and type(server_args.pipeline_config) is Wan2_2_TI2V_5B_Config
         )
         if should_preprocess_for_wan_ti2v:
             # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
