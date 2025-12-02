@@ -56,9 +56,9 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_npu,
     is_sm90_supported,
     is_sm100_supported,
-    prepare_weight_cache,
 )
 
 _is_cuda = is_cuda()
@@ -67,11 +67,14 @@ _is_sm90_supported = _is_cuda and is_sm90_supported()
 _is_sm100_supported = _is_cuda and is_sm100_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_npu = is_npu()
 
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import fused_rms_mxfp4_quant
+elif _is_npu:
+    from sglang.srt.hardware_backend.npu.cmo import prepare_weight_cache
 
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
@@ -776,7 +779,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
-                if context.cache is not None:
+                if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
         return hidden_states, residual
