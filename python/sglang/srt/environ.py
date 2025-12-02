@@ -296,6 +296,9 @@ class Envs:
 
     # fmt: on
 
+    # Control default thinking
+    SGLANG_ENABLE_DEFAULT_THINKING = EnvBool(False)
+
 
 envs = Envs()
 

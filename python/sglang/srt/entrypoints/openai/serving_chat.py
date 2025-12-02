@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -1045,11 +1046,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.chat_template_kwargs.get("thinking") is True
             )
         elif self.reasoning_parser in ["qwen3", "qwen3-thinking", "glm45"]:
-            # qwen3 and glm45 are reasoning by default
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking", True) is True
-            )
+            # Check environment variable for default thinking behavior
+            enable_default_thinking = envs.SGLANG_ENABLE_DEFAULT_THINKING.get()
+
+            if enable_default_thinking:
+                # qwen3 and glm45 are reasoning by default (controlled by env var)
+                return (
+                    not request.chat_template_kwargs
+                    or request.chat_template_kwargs.get("enable_thinking", enable_default_thinking) is True
+                )
+            else:
+                return (
+                    request.chat_template_kwargs
+                    and request.chat_template_kwargs.get("enable_thinking", enable_default_thinking) is True
+                )
         elif self.reasoning_parser in [
             "kimi_k2",
             "deepseek-r1",
