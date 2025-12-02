@@ -16,12 +16,13 @@
  */
 
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
 
 #include <cmath>
+
 #include "utils.h"
 
 template <typename scalar_t, bool IS_NEOX>
@@ -35,8 +36,8 @@ inline __device__ void apply_token_rotary_embedding(
 
   if (IS_NEOX) {
     // NeoX-style: interleaved layout [x0, y0, x1, y1, ...].
-    // For NeoX, cos/sin have shape [..., rotary_dim/2]; each index corresponds
-    // to one (x,y) pair.
+    // For NeoX, cos/sin have shape [..., rotary_dim/2]; 
+    // each index corresponds to one (x,y) pair.
     x_index = 2 * rot_offset;
     y_index = x_index + 1;
 
@@ -50,19 +51,14 @@ inline __device__ void apply_token_rotary_embedding(
 
   } else {
     // GPT-J / LLaMA style when cos/sin are [..., rotary_dim], i.e. non-interleaved
-    // [x0, x1, ..., y0, y1, ...]. Here embed_dim is the "half" dimension and
-    // cos/sin have length 2 * embed_dim.
-    x_index = rot_offset; 
+    // [x0, x1, ..., y0, y1, ...]. Here embed_dim is the "half" dimension and cos/sin have length 2 * embed_dim.
+    x_index = rot_offset;
     y_index = rot_offset + embed_dim;
 
-    const float cos_val_x =
-        static_cast<float>(SGLANG_LDG(cos_ptr + rot_offset));
-    const float sin_val_x =
-        static_cast<float>(SGLANG_LDG(sin_ptr + rot_offset));
-    const float cos_val_y =
-        static_cast<float>(SGLANG_LDG(cos_ptr + rot_offset + embed_dim));
-    const float sin_val_y =
-        static_cast<float>(SGLANG_LDG(sin_ptr + rot_offset + embed_dim));
+    const float cos_val_x = static_cast<float>(SGLANG_LDG(cos_ptr + rot_offset));
+    const float sin_val_x = static_cast<float>(SGLANG_LDG(sin_ptr + rot_offset));
+    const float cos_val_y = static_cast<float>(SGLANG_LDG(cos_ptr + rot_offset + embed_dim));
+    const float sin_val_y = static_cast<float>(SGLANG_LDG(sin_ptr + rot_offset + embed_dim));
 
     const float x = static_cast<float>(arr[x_index]);
     const float y = static_cast<float>(arr[y_index]);
@@ -92,7 +88,8 @@ inline __device__ void apply_rotary_embedding(
 
     scalar_t* query_for_token_head = query + head_idx * (int)head_stride_query;
 
-    apply_token_rotary_embedding<scalar_t, IS_NEOX>(query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+    apply_token_rotary_embedding<scalar_t, IS_NEOX>(
+        query_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
   }
 
   if (key != nullptr) {
@@ -103,7 +100,8 @@ inline __device__ void apply_rotary_embedding(
 
       scalar_t* key_for_token_head = key + head_idx * (int)head_stride_key;
 
-      apply_token_rotary_embedding<scalar_t, IS_NEOX>(key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
+      apply_token_rotary_embedding<scalar_t, IS_NEOX>(
+          key_for_token_head, current_token_cos_ptr, current_token_sin_ptr, rot_offset, embed_dim_for_rotation);
     }
   }
 }
@@ -169,15 +167,11 @@ void rotary_embedding(
   TORCH_CHECK(cos.scalar_type() == query.scalar_type(), "cos dtype mismatch");
   TORCH_CHECK(sin.scalar_type() == query.scalar_type(), "sin dtype mismatch");
   TORCH_CHECK(cos.is_cuda() && sin.is_cuda() && query.is_cuda(), "All tensors must be on CUDA");
-  TORCH_CHECK(
-      query.is_contiguous(),
-      "query must be contiguous; got non-contiguous tensor");
+  TORCH_CHECK(query.is_contiguous(), "query must be contiguous; got non-contiguous tensor");
   if (key.has_value()) {
     TORCH_CHECK(key->is_cuda(), "Key tensor must be on CUDA if provided");
     TORCH_CHECK(key->scalar_type() == query.scalar_type(), "Key dtype mismatch");
-    TORCH_CHECK(
-        key->is_contiguous(),
-        "key must be contiguous when provided; got non-contiguous tensor");
+    TORCH_CHECK(key->is_contiguous(), "key must be contiguous when provided; got non-contiguous tensor");
   }
 
   int query_hidden_size_calculated;
@@ -232,7 +226,8 @@ void rotary_embedding(
   //  - NeoX: cos.size(1) = rotary_dim/2  => pairs = rot_dim_from_cache
   //  - GPT-J: cos.size(1) = rotary_dim   => pairs = rot_dim_from_cache / 2
   int embed_dim_for_block_calc = is_neox ? rot_dim_from_cache : (rot_dim_from_cache / 2);
-  int max_pairs_to_rotate_per_token = std::max(num_heads * embed_dim_for_block_calc, num_kv_heads * embed_dim_for_block_calc);
+  int max_pairs_to_rotate_per_token =
+      std::max(num_heads * embed_dim_for_block_calc, num_kv_heads * embed_dim_for_block_calc);
   dim3 block(std::min<int64_t>(max_pairs_to_rotate_per_token, 512L));
 
   if (block.x == 0 && num_tokens > 0) block.x = 1;
@@ -241,43 +236,41 @@ void rotary_embedding(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16,
-      query.scalar_type(), "rotary_embedding", [&] {
-    using cuda_scalar_t = typename std::conditional<
-        std::is_same<scalar_t, at::Half>::value, nv_half,
-        typename std::conditional<
-            std::is_same<scalar_t, at::BFloat16>::value, nv_bfloat16,
-            scalar_t>::type>::type;
-    
-    if (is_neox) {
-      rotary_embedding_kernel<cuda_scalar_t, true><<<grid, block, 0, stream>>>(
-          reinterpret_cast<cuda_scalar_t*>(cos.data_ptr<scalar_t>()),
-          reinterpret_cast<cuda_scalar_t*>(sin.data_ptr<scalar_t>()),
-          reinterpret_cast<cuda_scalar_t*>(query.data_ptr<scalar_t>()),
-          key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<scalar_t>()) : nullptr,
-          rot_dim_from_cache,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          num_heads,
-          num_kv_heads,
-          (int)head_size);
-    } else {
-      rotary_embedding_kernel<cuda_scalar_t, false><<<grid, block, 0, stream>>>(
-          reinterpret_cast<cuda_scalar_t*>(cos.data_ptr<scalar_t>()),
-          reinterpret_cast<cuda_scalar_t*>(sin.data_ptr<scalar_t>()),
-          reinterpret_cast<cuda_scalar_t*>(query.data_ptr<scalar_t>()),
-          key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<scalar_t>()) : nullptr,
-          rot_dim_from_cache,
-          query_token_stride,
-          key_token_stride,
-          head_stride_query,
-          head_stride_key,
-          num_heads,
-          num_kv_heads,
-          (int)head_size);
-    }
-  });
+      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding", [&] {
+        using cuda_scalar_t = typename std::conditional<
+            std::is_same<scalar_t, at::Half>::value,
+            nv_half,
+            typename std::conditional<std::is_same<scalar_t, at::BFloat16>::value, nv_bfloat16, scalar_t>::type>::type;
+
+        if (is_neox) {
+          rotary_embedding_kernel<cuda_scalar_t, true><<<grid, block, 0, stream>>>(
+              reinterpret_cast<cuda_scalar_t*>(cos.data_ptr<scalar_t>()),
+              reinterpret_cast<cuda_scalar_t*>(sin.data_ptr<scalar_t>()),
+              reinterpret_cast<cuda_scalar_t*>(query.data_ptr<scalar_t>()),
+              key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<scalar_t>()) : nullptr,
+              rot_dim_from_cache,
+              query_token_stride,
+              key_token_stride,
+              head_stride_query,
+              head_stride_key,
+              num_heads,
+              num_kv_heads,
+              (int)head_size);
+        } else {
+          rotary_embedding_kernel<cuda_scalar_t, false><<<grid, block, 0, stream>>>(
+              reinterpret_cast<cuda_scalar_t*>(cos.data_ptr<scalar_t>()),
+              reinterpret_cast<cuda_scalar_t*>(sin.data_ptr<scalar_t>()),
+              reinterpret_cast<cuda_scalar_t*>(query.data_ptr<scalar_t>()),
+              key.has_value() ? reinterpret_cast<cuda_scalar_t*>(key->data_ptr<scalar_t>()) : nullptr,
+              rot_dim_from_cache,
+              query_token_stride,
+              key_token_stride,
+              head_stride_query,
+              head_stride_key,
+              num_heads,
+              num_kv_heads,
+              (int)head_size);
+        }
+      });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

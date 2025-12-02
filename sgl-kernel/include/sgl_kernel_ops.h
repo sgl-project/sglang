@@ -396,7 +396,7 @@ void fused_qk_norm_rope(
     double attention_factor);
 
 /*
- * From csrc/multimodal/rotary_embedding.cu
+ * From csrc/multimodal/rotary_embedding
  */
 void rotary_embedding(
     at::Tensor& cos,

@@ -40,13 +40,8 @@ def compute_cos_sin_cache(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute separate cos and sin caches.
-
-    Returns:
-        cos, sin: shape (max_seq_len, rotary_dim / 2)
     """
-    inv_freq = 1.0 / (
-        base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
-    )
+    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
     t = torch.arange(max_seq_len, dtype=torch.float32)
     freqs = torch.einsum("i,j->ij", t, inv_freq)
     cos = freqs.cos().to(dtype)
@@ -62,8 +57,8 @@ def reference_rotary_neox(
     head_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Reference implementation of NeoX-style rotary embedding, using explicit
-    cos/sin caches and Q/K in flattened (num_tokens, heads * dim) layout.
+    Reference implementation of NeoX-style rotary embedding, 
+    using explicit cos/sin caches and Q/K in flattened (num_tokens, heads * dim) layout.
     """
     num_tokens = query.size(0)
     num_heads = query.size(1) // head_size
@@ -127,7 +122,6 @@ def _check_rotary_correctness(
     tol: float = 1e-2,
     device: str = "cuda",
 ) -> RotaryTestResult:
-    """Helper function for rotary correctness checking."""
     if not HAS_ROTARY_EMBEDDING:
         return RotaryTestResult("basic (skipped: rotary_embedding not built)", True, details="rotary_embedding extension not found")
 
