@@ -15,7 +15,10 @@ import os
 import sys
 from typing import List, Optional
 
-from sglang_router.sglang_router_rs import get_verbose_version_string, get_version_string
+from sglang_router.sglang_router_rs import (
+    get_verbose_version_string,
+    get_version_string,
+)
 
 
 def create_parser() -> argparse.ArgumentParser:
