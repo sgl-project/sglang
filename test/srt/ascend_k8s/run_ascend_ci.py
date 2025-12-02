@@ -10,6 +10,7 @@ from kubernetes import client, config
 
 config.load_kube_config(os.environ.get('KUBECONFIG'))
 v1 = client.CoreV1Api()
+
 LOCAL_TIMEOUT = 10800
 KUBE_NAME_SPACE = os.environ.get('NAMESPACE')
 KUBE_ROUTER_POD_NAME = "{}-router-0".format(os.environ.get('KUBE_JOB_NAME'))
@@ -29,7 +30,8 @@ def run_command(cmd, shell=True):
 def check_pods_ready(timeout=300):
     print("Waiting all pods to running...")
     start_time = time.time()
-
+    matching_string = "{}-sglang".format(os.environ.get('KUBE_JOB_NAME'))
+    
     while time.time() - start_time < timeout:
         cmd = "kubectl get pods -A -o json"
 
@@ -46,7 +48,7 @@ def check_pods_ready(timeout=300):
             for item in data.get("items", []):
                 metadata = item.get("metadata", {})
                 pod_name = metadata.get("name", "")
-                if "mindx-dls-test-sglang" not in pod_name:
+                if matching_string not in pod_name:
                     continue
 
                 sglang_pods_found = True
