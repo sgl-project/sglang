@@ -31,8 +31,8 @@ class Ministral3Attention(LlamaAttention):
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_theta: float = 1000000.0,
+        rope_scaling: Optional[Dict[str, Any]] = {},
         rope_is_neox_style: bool = True,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
@@ -107,9 +107,9 @@ class Ministral3DecoderLayer(LlamaDecoderLayer):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
-            rope_theta=getattr(config, "rope_theta", 10000),
-            rope_scaling=getattr(config, "rope_scaling", None),
-            max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
+            rope_theta=getattr(config, "rope_parameters", {}).get("rope_theta", 1000000.0),
+            rope_scaling=getattr(config, "rope_parameters", {}), # rope_scaling is rope_parameters in Ministral3Config
+            max_position_embeddings=getattr(config, "original_max_position_embeddings", 16384),
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             bias=getattr(config, "attention_bias", False)
