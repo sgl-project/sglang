@@ -29,14 +29,35 @@ class ReasonerGrammarObject(BaseGrammarObject):
         super().__init__()
         self.grammar = grammar
         self.think_end_id = think_end_id
-        self.is_in_reasoning = True
+        # -1    means thinking has not ended yet
+        # 0     means just ended thinking in the last token
+        # +     means number of tokens after thinking ended
+        self.tokens_after_think_end = -1
+
+    def transfer_state(self, token: int) -> int:
+        if self.tokens_after_think_end == -1 and token == self.think_end_id:
+            self.tokens_after_think_end = 0
+        elif self.tokens_after_think_end >= 0:
+            self.tokens_after_think_end += 1
+
+    def rollback_state(self):
+        if self.tokens_after_think_end == 0:
+            self.tokens_after_think_end = -1
+        elif self.tokens_after_think_end > 0:
+            self.tokens_after_think_end -= 1
 
     def accept_token(self, token: int):
-        if token == self.think_end_id:
-            self.is_in_reasoning = False
-
-        if not self.is_in_reasoning and token != self.think_end_id:
+        if self.tokens_after_think_end >= 0:
             self.grammar.accept_token(token)
+        self.transfer_state(token)
+
+    def rollback(self, k):
+        steps_after_think = min(k, self.tokens_after_think_end)
+        if steps_after_think > 0:
+            self.grammar.rollback(steps_after_think)
+
+        for _ in range(k):
+            self.rollback_state()
 
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
@@ -44,7 +65,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         return self.grammar.allocate_vocab_mask(vocab_size, batch_size, device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        if not self.is_in_reasoning:
+        if self.tokens_after_think_end >= 0:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
 
     def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:

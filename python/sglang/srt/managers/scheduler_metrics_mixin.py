@@ -172,6 +172,8 @@ class SchedulerMetricsMixin:
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
 
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
+
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
             self.stats.num_paused_reqs = self.num_paused_reqs
@@ -319,6 +321,8 @@ class SchedulerMetricsMixin:
             self.stats.num_queue_reqs = len(self.waiting_queue)
             self.stats.num_grammar_queue_reqs = len(self.grammar_queue)
             self.stats.cache_hit_rate = cache_hit_rate
+
+            self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
