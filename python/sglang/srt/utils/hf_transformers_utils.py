@@ -246,18 +246,21 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    if "mistral-large-3" in model:
+    if "mistral-large-3" in model.lower():
         config = _load_mistral_large_3_for_causal_LM(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-    elif "deepseek_v32" in model:
-        config = _load_deepseek_v32_model(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-        )
     else:
-        config = AutoConfig.from_pretrained(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-        )
+        try:
+            config = AutoConfig.from_pretrained(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
+        except ValueError as e:
+            if not "deepseek_v32" in str(e):
+                raise e
+            config = _load_deepseek_v32_model(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
 
     if (
         config.architectures is not None
