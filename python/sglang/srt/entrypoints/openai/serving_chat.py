@@ -12,6 +12,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -81,6 +82,17 @@ class OpenAIServingChat(OpenAIServingBase):
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
         )
+
+        self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+
+    def _use_dpsk_v32_encoding(self) -> bool:
+        has_chat_template = (
+            self.tokenizer_manager.tokenizer is not None
+            and self.tokenizer_manager.tokenizer.chat_template is not None
+        )
+        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
+        return not has_chat_template and is_dpsk_v32
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -305,78 +317,82 @@ class OpenAIServingChat(OpenAIServingBase):
 
             openai_compatible_messages.append(processed_msg)
 
-        # # Handle assistant prefix for continue_final_message
-        # assistant_prefix = None
-        # if (
-        #     openai_compatible_messages
-        #     and openai_compatible_messages[-1]["role"] == "assistant"
-        # ):
-        #     if request.continue_final_message:
-        #         assistant_prefix = openai_compatible_messages[-1]["content"]
-        #         openai_compatible_messages = openai_compatible_messages[:-1]
-
-        # try:
-        #     prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-        #         openai_compatible_messages,
-        #         tokenize=True,
-        #         add_generation_prompt=True,
-        #         tools=tools,
-        #         reasoning_effort=request.reasoning_effort,
-        #         **(
-        #             request.chat_template_kwargs if request.chat_template_kwargs else {}
-        #         ),
-        #     )
-        # except Exception:
-        #     # This except branch will be triggered when the chosen model
-        #     # has a different tools input format that is not compatible
-        #     # with openAI's apply_chat_template tool_call format, like Mistral.
-        #     tools = (
-        #         [t if "function" in t else {"function": t} for t in tools]
-        #         if tools
-        #         else None
-        #     )
-        #     prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-        #         openai_compatible_messages,
-        #         tokenize=True,
-        #         add_generation_prompt=True,
-        #         tools=tools,
-        #         reasoning_effort=request.reasoning_effort,
-        #         **(
-        #             request.chat_template_kwargs if request.chat_template_kwargs else {}
-        #         ),
-        #     )
-
-        # if assistant_prefix:
-        #     encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-        #     if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
-        #         encoded = encoded[1:]
-        #     prompt_ids += encoded
-
-        # if is_multimodal:
-        #     prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
-
-        from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
-
-        if request.chat_template_kwargs and request.chat_template_kwargs.get(
-            "thinking"
-        ):
-            thinking_mode = "thinking"
-        else:
-            thinking_mode = "chat"
-        encode_config = dict(
-            thinking_mode=thinking_mode, drop_thinking=False, add_default_bos_token=True
-        )
-        messages = request.messages
-        messages = [msg.model_dump() for msg in messages]
-        if messages[0]["role"] != "system":
-            messages.insert(
-                0, {"role": "system", "content": "You are a helpful Assistant."}
+        if self.use_dpsk_v32_encoding:
+            if request.chat_template_kwargs and request.chat_template_kwargs.get(
+                "thinking"
+            ):
+                thinking_mode = "thinking"
+            else:
+                thinking_mode = "chat"
+            messages = request.messages
+            messages = [msg.model_dump() for msg in messages]
+            if messages[0]["role"] != "system":
+                messages.insert(
+                    0, {"role": "system", "content": "You are a helpful Assistant."}
+                )
+            if request.tools:
+                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+            real_input = encode_messages(
+                messages, thinking_mode=thinking_mode, drop_thinking=False
             )
-        if request.tools:
-            messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-        real_input = encode_messages(messages, **encode_config)
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+        else:
+            # Handle assistant prefix for continue_final_message
+            assistant_prefix = None
+            if (
+                openai_compatible_messages
+                and openai_compatible_messages[-1]["role"] == "assistant"
+            ):
+                if request.continue_final_message:
+                    assistant_prefix = openai_compatible_messages[-1]["content"]
+                    openai_compatible_messages = openai_compatible_messages[:-1]
 
-        prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            try:
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    reasoning_effort=request.reasoning_effort,
+                    **(
+                        request.chat_template_kwargs
+                        if request.chat_template_kwargs
+                        else {}
+                    ),
+                )
+            except Exception:
+                # This except branch will be triggered when the chosen model
+                # has a different tools input format that is not compatible
+                # with openAI's apply_chat_template tool_call format, like Mistral.
+                tools = (
+                    [t if "function" in t else {"function": t} for t in tools]
+                    if tools
+                    else None
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    reasoning_effort=request.reasoning_effort,
+                    **(
+                        request.chat_template_kwargs
+                        if request.chat_template_kwargs
+                        else {}
+                    ),
+                )
+
+            if assistant_prefix:
+                encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+                if (
+                    encoded
+                    and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
+                ):
+                    encoded = encoded[1:]
+                prompt_ids += encoded
+
+            if is_multimodal:
+                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -1058,7 +1074,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return False
         return False
 
-    async def _process_tool_call_stream(
+    def _process_tool_call_stream(
         self,
         index: int,
         delta: str,
@@ -1236,170 +1252,3 @@ class OpenAIServingChat(OpenAIServingBase):
             return f"data: {chunk.model_dump_json()}\n\n"
 
         return None
-
-
-if __name__ == "__main__":
-    from sglang.srt.managers.template_manager import TemplateManager
-    from sglang.srt.managers.tokenizer_manager import TokenizerManager
-    from sglang.srt.server_args import PortArgs, ServerArgs
-
-    server_args = ServerArgs(model_path="deepseek-ai/DeepSeek-V3.2")
-    port_args = PortArgs.init_new(server_args)
-    tokenizer_manager = TokenizerManager(server_args, port_args)
-    serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
-
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_datetime",
-                "description": "Get the current date and time",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "timezone": {
-                            "type": "string",
-                            "description": "The timezone, e.g. Asia/Shanghai, UTC",
-                        }
-                    },
-                    "required": ["timezone"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get the weather for a specific date and location",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "location": {
-                            "type": "string",
-                            "description": "The city name, e.g. Beijing, Hangzhou",
-                        },
-                        "date": {
-                            "type": "string",
-                            "description": "The date in YYYY-MM-DD format",
-                        },
-                    },
-                    "required": ["location", "date"],
-                },
-            },
-        },
-    ]
-    msg1 = [
-        {"role": "system", "content": "You are a helpful Assistant."},
-        {"role": "user", "content": "明天杭州和北京的天气怎么样？"},
-        {
-            "role": "assistant",
-            "reasoning_content": "用户询问明天的天气，我需要先获取当前日期来计算明天的日期📅",
-            "tool_calls": [
-                {
-                    "id": "call_xK9mN3pL2qR8vT5wY6hZ1aB4",
-                    "type": "function",
-                    "function": {
-                        "arguments": '{"timezone": "Asia/Shanghai"}',
-                        "name": "get_datetime",
-                    },
-                }
-            ],
-        },
-        {
-            "tool_call_id": "call_xK9mN3pL2qR8vT5wY6hZ1aB4",
-            "role": "tool",
-            "content": '{"current_date": "2024-01-15", "current_time": "14:30:00", "timezone": "Asia/Shanghai"}',
-        },
-        {
-            "role": "assistant",
-            "reasoning_content": "现在知道今天是2024-01-15，明天就是2024-01-16。接下来查询杭州和北京明天的天气🌤️",
-            "tool_calls": [
-                {
-                    "id": "call_bN7kR9mX3pQ2wL5vY8jZ4cD6",
-                    "type": "function",
-                    "function": {
-                        "arguments": '{"location": "Hangzhou", "date": "2024-01-16"}',
-                        "name": "get_weather",
-                    },
-                },
-                {
-                    "id": "call_dP9mL7kX5rT4yN3wZ2hV8eF1",
-                    "type": "function",
-                    "function": {
-                        "arguments": '{"location": "Beijing", "date": "2024-01-16"}',
-                        "name": "get_weather",
-                    },
-                },
-            ],
-        },
-        {
-            "tool_call_id": "call_bN7kR9mX3pQ2wL5vY8jZ4cD6",
-            "role": "tool",
-            "content": '{"location": "Hangzhou", "date": "2024-01-16", "temperature_high": "12", "temperature_low": "5", "weather": "多云", "humidity": "65%"}',
-        },
-        {
-            "tool_call_id": "call_dP9mL7kX5rT4yN3wZ2hV8eF1",
-            "role": "tool",
-            "content": '{"location": "Beijing", "date": "2024-01-16", "temperature_high": "-2", "temperature_low": "-8", "weather": "晴", "humidity": "30%"}',
-        },
-        {
-            "role": "assistant",
-            "reasoning_content": "已获取两个城市明天的天气信息，现在整理给用户✨",
-            "content": "根据查询结果，明天（2024年1月16日）的天气情况如下：\n\n**杭州**：\n- 天气：多云\n- 最高温度：12°C\n- 最低温度：5°C\n- 湿度：65%\n\n**北京**：\n- 天气：晴\n- 最高温度：-2°C\n- 最低温度：-8°C\n- 湿度：30%\n\n杭州明天会比较温暖但有些多云，而北京会很冷但是晴天。建议在北京的朋友要注意保暖！",
-        },
-        {"role": "user", "content": "谢谢！那后天呢？"},
-        {
-            "role": "assistant",
-            "reasoning_content": "用户现在问后天的天气，后天是2024-01-17，我可以直接查询（因为已知今天日期）🗓️",
-            "tool_calls": [
-                {
-                    "id": "call_fR3nK8mV7pL4xT2yW9jB5gH3",
-                    "type": "function",
-                    "function": {
-                        "arguments": '{"location": "Hangzhou", "date": "2024-01-17"}',
-                        "name": "get_weather",
-                    },
-                },
-                {
-                    "id": "call_hT5pN2kY9rV6zL3wX1mD7jK8",
-                    "type": "function",
-                    "function": {
-                        "arguments": '{"location": "Beijing", "date": "2024-01-17"}',
-                        "name": "get_weather",
-                    },
-                },
-            ],
-        },
-        {
-            "tool_call_id": "call_fR3nK8mV7pL4xT2yW9jB5gH3",
-            "role": "tool",
-            "content": '{"location": "Hangzhou", "date": "2024-01-17", "temperature_high": "15", "temperature_low": "8", "weather": "小雨", "humidity": "80%"}',
-        },
-        {
-            "tool_call_id": "call_hT5pN2kY9rV6zL3wX1mD7jK8",
-            "role": "tool",
-            "content": '{"location": "Beijing", "date": "2024-01-17", "temperature_high": "0", "temperature_low": "-6", "weather": "多云", "humidity": "45%"}',
-        },
-        {
-            "role": "assistant",
-            "reasoning_content": "获取到后天的天气数据，整理回复给用户📝",
-            "content": "后天（2024年1月17日）的天气情况：\n\n**杭州**：\n- 天气：小雨\n- 最高温度：15°C\n- 最低温度：8°C\n- 湿度：80%\n\n**北京**：\n- 天气：多云\n- 最高温度：0°C\n- 最低温度：-6°C\n- 湿度：45%\n\n杭州后天会有小雨，温度略有回升，记得带伞。北京会稍微暖和一点，但依然很冷，请继续做好保暖措施。",
-        },
-    ]
-    msg2 = [
-        {"role": "system", "content": "You are a helpful Assistant."},
-        {"role": "user", "content": "明天杭州和北京的天气怎么样？"},
-    ]
-    msg3 = [{"role": "user", "content": "hello"}]
-
-    request = ChatCompletionRequest(
-        model="deepseek-ai/DeepSeek-V3.2",
-        messages=msg3,
-        chat_template_kwargs={"thinking": True},
-        tools=tools,
-    )
-    x = serving_chat._apply_jinja_template(request, tools, False)
-    print(x)
-
-    # cp /data/sglang/python/sglang/srt/entrypoints/openai/serving_chat.py /sgl-workspace/sglang/python/sglang/srt/entrypoints/openai/serving_chat.py
-    # cp /data/sglang/python/sglang/srt/entrypoints/openai/encoding_dsv32.py /sgl-workspace/sglang/python/sglang/srt/entrypoints/openai/encoding_dsv32.py
