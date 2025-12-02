@@ -72,6 +72,7 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    last_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -507,6 +508,7 @@ class LogitsProcessor(nn.Module):
         )
 
         hidden_states_to_store: Optional[torch.Tensor] = None
+        last_hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
@@ -514,6 +516,7 @@ class LogitsProcessor(nn.Module):
                     hidden_states_to_store = aux_hidden_states
                 else:
                     hidden_states_to_store = hidden_states
+                last_hidden_states_to_store = hidden_states
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
@@ -530,6 +533,7 @@ class LogitsProcessor(nn.Module):
                         if sample_indices is not None
                         else pruned_states
                     )
+                last_hidden_states_to_store = hidden_states_to_store
             else:
                 assert False, "Should never reach"
 
@@ -547,6 +551,7 @@ class LogitsProcessor(nn.Module):
                 full_logits=full_logits,
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                last_hidden_states=last_hidden_states_to_store,
             )
 
         # Start to process input logprobs
@@ -604,6 +609,7 @@ class LogitsProcessor(nn.Module):
             full_logits=full_logits,
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            last_hidden_states=last_hidden_states_to_store,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,

@@ -403,6 +403,13 @@ class ServerArgs:
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
 
+    # For eagle hidden states dump
+    speculative_eagle_enable_dump_hidden_states: bool = False
+    speculative_eagle_hidden_states_dump_path: Optional[str] = None
+    speculative_eagle_dump_worker_num: int = 1
+    speculative_eagle_dump_accept_rate_threshold: float = 1.0
+    speculative_eagle_dump_buffer_pool_size: int = 64
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
@@ -3038,6 +3045,36 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
+        )
+        # Speculative Eagle hidden states dumping
+        parser.add_argument(
+            "--speculative-eagle-enable-dump-hidden-states",
+            action="store_true",
+            help="Enable dumping hidden states generated during EAGLE speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-hidden-states-dump-path",
+            type=str,
+            default=ServerArgs.speculative_eagle_hidden_states_dump_path,
+            help="Directory path where EAGLE speculative hidden states will be dumped.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-dump-accept-rate-threshold",
+            type=float,
+            default=ServerArgs.speculative_eagle_dump_accept_rate_threshold,
+            help="Dump hidden states only when EAGLE speculative acceptance rate is below this threshold.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-dump-worker-num",
+            type=int,
+            default=ServerArgs.speculative_eagle_dump_worker_num,
+            help="Number of worker processes used for dumping hidden states.",
+        )
+        parser.add_argument(
+            "--speculative-eagle-dump-buffer-pool-size",
+            type=int,
+            default=ServerArgs.speculative_eagle_dump_buffer_pool_size,
+            help="Size of the reusable buffer pool used for hidden-state dumping.",
         )
 
         # Expert parallelism
