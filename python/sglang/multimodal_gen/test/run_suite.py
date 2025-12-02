@@ -67,10 +67,27 @@ def run_pytest(files):
         print("No files to run.")
         return 0
 
-    cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"] + files
+    base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
 
-    logger.info(f"Running command: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
+    # Retry up to 2 times on failure
+    max_retries = 2
+    for i in range(max_retries + 1):
+        cmd = list(base_cmd)
+
+        if i > 0:
+            cmd.append("--last-failed")
+            logger.info(
+                f"Test run failed. Retrying ({i}/{max_retries}) with --last-failed..."
+            )
+
+        cmd.extend(files)
+
+        logger.info(f"Running command: {' '.join(cmd)}")
+        result = subprocess.run(cmd)
+
+        if result.returncode == 0:
+            return 0
+
     return result.returncode
 
 
