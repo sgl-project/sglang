@@ -126,14 +126,10 @@ class SamplingParams:
     # Profiling
     profile: bool = False
     num_profiled_timesteps: int = 2
-    # New profiling switches (CLI-driven)
-    # --profile --full-stages => profile entire pipeline stages (was global_profile)
-    # --profile --full-denoise => profile full denoising stage (maps to profile_full)
-    full_stages: bool = False
+    # --profile --full-stages => profile entire pipeline stages 
+    # --profile --full-denoise => profile full denoising stage
     full_denoise: bool = False
-    # Hidden compatibility fields for executors (no CLI)
-    global_profile: bool = False
-    global_profile_full: bool = False
+    full_stages: bool = False
 
     # Debugging
     debug: bool = False
@@ -290,21 +286,6 @@ class SamplingParams:
                 )
                 self.num_frames = new_num_frames
 
-        # Normalize profiling flags:
-        # - --profile --full-denoise -> full denoise profiling
-        # - --profile --full-stages  -> profile entire pipeline stages (legacy global_profile)
-        if self.profile:
-            # full denoising takes precedence over step-scheduled profiling
-            # full denoise: executor-controlled via batch.full_denoise (denoising.py reads this)
-            # keep num_profiled_timesteps for scheduled profiling if not full denoise
-            # Map new full-stages flag to legacy globals for compatibility
-            self.global_profile = bool(self.full_stages)
-            self.global_profile_full = False
-        else:
-            # Disable all profiling-related flags if profile is off
-            self.global_profile = False
-            self.global_profile_full = False
-
         self._set_output_file_name()
         self.log(server_args=server_args)
 
@@ -380,7 +361,7 @@ class SamplingParams:
             default=SamplingParams.full_denoise,
             help="With --profile, profile the entire denoising stage (no schedule/step).",
         )
-        # pipeline-wide profiling (replaces legacy global_profile)
+        # pipeline-wide profiling 
         parser.add_argument(
             "--full-stages",
             action="store_true",
@@ -585,14 +566,6 @@ class SamplingParams:
         for attr in attrs:
             if hasattr(args, attr):
                 result[attr] = getattr(args, attr)
-                continue
-            # Map new flags to legacy/internal fields for compatibility
-            # The following legacy globals are no longer exposed via CLI, but keep defaults stable
-            if attr == "global_profile":
-                result[attr] = getattr(args, "full_stages", False)
-                continue
-            if attr == "global_profile_full":
-                result[attr] = False
                 continue
             if attr == "full_denoise":
                 result[attr] = getattr(args, "full_denoise", False)

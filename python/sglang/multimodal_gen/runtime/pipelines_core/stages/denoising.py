@@ -411,7 +411,7 @@ class DenoisingStage(PipelineStage):
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(
-            getattr(self.transformer, "forward", self.transformer),
+            self.transformer.forward,
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
@@ -420,7 +420,7 @@ class DenoisingStage(PipelineStage):
         )
 
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            getattr(self.transformer, "forward", self.transformer),
+            self.transformer.forward,
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
@@ -435,7 +435,7 @@ class DenoisingStage(PipelineStage):
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
-                getattr(self.transformer, "forward", self.transformer),
+                self.transformer.forward,
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
@@ -944,32 +944,12 @@ class DenoisingStage(PipelineStage):
             The prepared kwargs.
         """
         extra_step_kwargs = {}
-        accepted_params: set[str] = set()
-        # Try to inspect the callable directly
-        try:
-            accepted_params |= set(inspect.signature(func).parameters.keys())
-        except Exception:
-            pass
-        # If it's a module-like object, also try its forward
-        try:
-            forward_fn = getattr(func, "forward", None)
-            if callable(forward_fn):
-                accepted_params |= set(inspect.signature(forward_fn).parameters.keys())
-        except Exception:
-            pass
-        # Fallback: if still empty, conservatively pass through known optional keys only
-        if not accepted_params:
-            accepted_params = {
-                "encoder_hidden_states_image",
-                "mask_strategy",
-                "encoder_hidden_states_2",
-                "encoder_attention_mask",
-            }
         for k, v in kwargs.items():
-            if k in accepted_params:
+            accepts = k in set(inspect.signature(func).parameters.keys())
+            if accepts:
                 extra_step_kwargs[k] = v
         return extra_step_kwargs
-
+        
     def progress_bar(
         self, iterable: Iterable | None = None, total: int | None = None
     ) -> tqdm:

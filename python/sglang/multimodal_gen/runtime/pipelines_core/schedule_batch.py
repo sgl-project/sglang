@@ -175,10 +175,6 @@ class Req:
     full_stages: bool = False
     num_profiled_timesteps: int = 8
 
-    # global pipeline profile
-    global_profile: bool = False
-    global_profile_full: bool = False
-
     # debugging
     debug: bool = False
     # dummy for now
