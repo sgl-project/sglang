@@ -200,7 +200,7 @@ class LayerNorm(CustomOp):
         x = x.view(-1, self.hidden_size)
         return self.forward_triton(x).view(shape)
 
-    @torch.compile(backend="inductor")
+    @torch.compile(backend="inductor", disable=_is_npu)
     def forward_native(
         self,
         x: torch.Tensor,
