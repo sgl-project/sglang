@@ -810,6 +810,22 @@ class Req:
                 match_result.host_hit_length,
             )
             self.cache_protected_len = len(self.prefix_indices)
+
+        if (
+            self.is_retracted
+            and self.multimodal_inputs is not None
+            and self.multimodal_inputs.mrope_positions is not None
+        ):
+            from sglang.srt.managers.mm_utils import (
+                extend_mrope_positions_for_retracted_request,
+            )
+
+            self.multimodal_inputs.mrope_positions = (
+                extend_mrope_positions_for_retracted_request(
+                    self.multimodal_inputs.mrope_positions, len(self.output_ids)
+                )
+            )
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -1050,7 +1066,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     req_to_token_pool: ReqToTokenPool = None
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
     tree_cache: BasePrefixCache = None
-    is_hybrid: bool = False
+    is_hybrid_swa: bool = False
 
     # Batch configs
     model_config: ModelConfig = None
@@ -1173,21 +1189,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ):
         return_logprob = any(req.return_logprob for req in reqs)
 
-        is_hybrid = False
+        is_hybrid_swa = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert (
                 tree_cache is None
                 or isinstance(tree_cache, SWARadixCache)
                 or isinstance(tree_cache, SWAChunkCache)
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
-            is_hybrid = True
+            is_hybrid_swa = True
 
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
-            is_hybrid=is_hybrid,
+            is_hybrid_swa=is_hybrid_swa,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
@@ -1528,6 +1544,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         if page_size == 1:
             return len(requests)
+
+        if not self.spec_algorithm.is_none():
+            # A loose bound that err towards safety
+            server_args = get_global_server_args()
+            thresh = server_args.speculative_num_draft_tokens + (
+                (server_args.speculative_eagle_topk or 1)
+                * (server_args.speculative_num_steps or 1)
+            )
+            return sum(
+                1 for req in requests if ((req.seqlen + thresh) % page_size) <= thresh
+            )
+
         # In the decoding phase, the length of a request's KV cache should be
         # the total length of the request minus 1
         return (
@@ -1584,7 +1612,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ):
             if len(sorted_indices) == 1:
                 # Corner case: only one request left
-                if self.is_hybrid:
+                if self.is_hybrid_swa:
                     full_available_size = (
                         self.token_to_kv_pool_allocator.full_available_size()
                     )
@@ -1950,7 +1978,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def _is_available_size_sufficient(self, num_tokens: int) -> bool:
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             return (
                 self.token_to_kv_pool_allocator.full_available_size() >= num_tokens
                 and self.token_to_kv_pool_allocator.swa_available_size() >= num_tokens

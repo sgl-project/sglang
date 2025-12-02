@@ -15,6 +15,11 @@ import os
 import sys
 from typing import List, Optional
 
+from sglang_router.sglang_router_rs import (
+    get_verbose_version_string,
+    get_version_string,
+)
+
 
 def create_parser() -> argparse.ArgumentParser:
     """Create the main CLI parser with subcommands."""
@@ -50,6 +55,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     """Main CLI entry point."""
     if argv is None:
         argv = sys.argv[1:]
+
+    # Handle version flags before parsing
+    if argv and argv[0] in ["--version", "-V", "--version-verbose"]:
+        if argv[0] == "--version-verbose":
+            print(get_verbose_version_string())
+        else:
+            print(get_version_string())
+        sys.exit(0)
 
     # Handle empty command - show help
     if not argv or argv[0] not in ["launch", "server", "-h", "--help"]:
