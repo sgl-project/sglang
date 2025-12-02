@@ -11,7 +11,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
-use super::responses::build_stored_response;
+use super::responses::utils::build_stored_response;
 use crate::{
     data_connector::{
         Conversation, ConversationId, ConversationItemId, ConversationItemStorage,

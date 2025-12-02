@@ -1,17 +1,16 @@
 //! OpenAI-compatible router implementation
 //!
-//! This module provides OpenAI-compatible API routing with support for:
-//! - Streaming and non-streaming responses
-//! - MCP (Model Context Protocol) tool calling
-//! - Response storage and conversation management
-//! - Multi-turn tool execution loops
-//! - SSE (Server-Sent Events) streaming
+//! This module provides two separate pipelines:
+//! - Chat pipeline: Lightweight proxy for /v1/chat/completions (4 stages)
+//! - Responses pipeline: Full-featured for /v1/responses with MCP (8 stages)
 
+// Two pipeline modules
+pub mod chat;
+pub mod responses;
+
+// Shared modules
 pub mod conversations;
-pub mod mcp;
-mod responses;
 mod router;
-mod streaming;
 mod utils;
 
 // Re-export the main router type for external use
