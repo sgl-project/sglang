@@ -1,6 +1,6 @@
 [package]
-name = "sglang-router"
-version = "0.2.2"
+name = "sgl-model-gateway"
+version = "0.2.3"
 edition = "2021"
 
 [features]
@@ -11,12 +11,11 @@ vendored-openssl = ["openssl/vendored"]
 unused_qualifications = "warn"
 
 [lib]
-name = "sglang_router_rs"
-# Pure Rust library (rlib for the binary and other Rust dependents)
+name = "sgl_model_gateway"
 crate-type = ["rlib"]
 
 [[bin]]
-name = "sglang-router"
+name = "sgl-model-gateway"
 path = "src/main.rs"
 
 [[bin]]
