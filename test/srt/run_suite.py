@@ -158,6 +158,7 @@ suites = {
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
         TestFile("test_pp_single_node.py", 481),
+        TestFile("test_piecewise_cuda_graph.py", 1200),
     ],
     "per-commit-8-gpu-h200": [
         TestFile("test_deepseek_v3_basic.py", 275),
@@ -375,7 +376,7 @@ suite_ascend = {
     ],
     "per-commit-16-npu-a3": [
         TestFile("ascend/test_ascend_deepep.py", 400),
-        # TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
+        TestFile("ascend/test_ascend_deepseek_mtp.py", 400),
     ],
 }
 
