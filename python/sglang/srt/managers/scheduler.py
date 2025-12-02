@@ -1806,7 +1806,10 @@ class Scheduler(
             ret = new_batch
         else:
             # Run decode
-            if not self.running_batch.is_empty() and not self.running_batch.is_prefill_only:
+            if (
+                not self.running_batch.is_empty()
+                and not self.running_batch.is_prefill_only
+            ):
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
