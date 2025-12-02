@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import random
+from bisect import bisect_right
 from collections import defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -340,10 +341,9 @@ class PrefillAdder:
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
 
-        self.rem_total_token_offset = mixed_with_decode_tokens
-        self.cur_rem_token_offset = mixed_with_decode_tokens
+        self.reserved_tokens = mixed_with_decode_tokens
 
-        self.req_states = None
+        self.req_token_tracking = None
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
@@ -352,11 +352,8 @@ class PrefillAdder:
         self.log_input_tokens = 0
 
         if running_batch is not None:
-            self.rem_total_token_offset += sum(
-                [
-                    self._get_running_request_total_token_offset(r)
-                    for r in running_batch.reqs
-                ]
+            self.reserved_tokens += sum(
+                [self._decode_token_usage_estimation(r) for r in running_batch.reqs]
             )
 
         self.is_hybrid = isinstance(
@@ -369,13 +366,16 @@ class PrefillAdder:
         )
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
-    def _get_running_request_total_token_offset(self, req: Req) -> int:
+    def _decode_token_usage_estimation(self, req: Req) -> int:
+        new_token_ratio = (
+            1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
+        )
         return (
             min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
                 CLIP_MAX_NEW_TOKENS,
             )
-            * self.new_token_ratio
+            * new_token_ratio
         )
 
     @property
@@ -398,35 +398,13 @@ class PrefillAdder:
                 + self.tree_cache.evictable_size()
             )
 
-        return available_and_evictable - self.rem_total_token_offset
-
-    @property
-    def cur_rem_tokens(self):
-        if self.is_hybrid:
-            available_and_evictable = min(
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
-            )
-        elif self.is_hybrid_gdn_cache:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.full_evictable_size()
-            )
-        else:
-            available_and_evictable = (
-                self.token_to_kv_pool_allocator.available_size()
-                + self.tree_cache.evictable_size()
-            )
-
-        return available_and_evictable - self.cur_rem_token_offset
+        return available_and_evictable - self.reserved_tokens
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
-        if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
+        if self.rem_total_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0 or (
@@ -442,8 +420,7 @@ class PrefillAdder:
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
-        self.rem_total_token_offset += extend_input_len + max_new_tokens
-        self.cur_rem_token_offset += extend_input_len
+        self.reserved_tokens += extend_input_len + max_new_tokens
         self.rem_input_tokens -= extend_input_len
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= extend_input_len
@@ -460,11 +437,7 @@ class PrefillAdder:
         self._update_prefill_budget(
             0,
             req.extend_input_len,
-            (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
-                else 0
-            ),
+            self._decode_token_usage_estimation(req) if not truncated else 0,
         )
 
         # Return if chunked prefill not finished
@@ -473,6 +446,7 @@ class PrefillAdder:
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
         if self.is_hybrid:
+            # todo: unified interface for swa and non-swa
             try:
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
                 yield None
@@ -485,59 +459,52 @@ class PrefillAdder:
             finally:
                 self.tree_cache.dec_lock_ref(last_node)
 
-    def add_one_req_ignore_eos(self, req: Req, has_chunked_req: bool):
-        # Early exit if no enough tokens for the input tokens
-        if self.ceil_paged_tokens(req.extend_input_len) > min(
-            self.cur_rem_tokens, self.rem_total_tokens
-        ):
+    def add_one_req_ignore_eos(self, req: Req):
+        # Early exit if not enough tokens for the input
+        if self.ceil_paged_tokens(req.extend_input_len) > self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        def add_req_state(r, insert_sort=False):
-            new_token_ratio = (
-                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            )
-            tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
-                r.output_ids
-            )
-            tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
-
-            if tokens_left <= 0:
+        def add_req_state(r):
+            tokens_remaining = r.sampling_params.max_new_tokens - len(r.output_ids)
+            if tokens_remaining <= 0:
                 return
 
-            if not insert_sort:
-                self.req_states.append((tokens_left, tokens_occupied))
-            else:
-                i = 0
-                for i in range(len(self.req_states)):
-                    if tokens_left <= self.req_states[i][0]:
-                        break
-                self.req_states.insert(i, (tokens_left, tokens_occupied))
+            tokens_occupied = len(r.origin_input_ids) + len(r.output_ids)
+            idx = bisect_right(
+                self.req_token_tracking[0],
+                (tokens_remaining, tokens_occupied),
+            )
+            self.req_token_tracking[0].insert(idx, (tokens_remaining, tokens_occupied))
+            self.req_token_tracking[1] += tokens_remaining
 
-        if self.req_states is None:
-            self.req_states = []
+        if self.req_token_tracking is None:
+            self.req_token_tracking = [[], 0]
             add_req_state(req)
             if self.running_batch is not None:
                 for r in self.running_batch.reqs:
                     add_req_state(r)
             for r in self.can_run_list:
                 add_req_state(r)
-            self.req_states.sort(key=lambda x: x[0])
         else:
-            add_req_state(req, insert_sort=True)
+            add_req_state(req)
 
+        # A simplified Banker's algorithm to check if we have enough tokens to serve all requests
+        # Skip for swa. The SWA has different memory management as this mechanism underestimates the memory usage.
         if not self.is_hybrid:
-            # Skip this logic for swa. The SWA has different memory management, and
-            # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
-                req.extend_input_len
+            available_tokens = (
+                self.rem_total_tokens
+                - self.req_token_tracking[1]
+                - self.ceil_paged_tokens(req.extend_input_len)
             )
             tokens_freed = 0
-            for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
-                # tokens_left gives a reservative calculation as the last token is not stored
-                bs = len(self.req_states) - i
-                min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            for i, (tokens_remaining, tokens_occupied) in enumerate(self.req_states):
+                # emulate request completion based on given generation length for EOS ignoring requests
+                active_bs = len(self.req_states) - i
+                min_available_tokens = (
+                    available_tokens + tokens_freed - tokens_remaining * active_bs
+                )
                 # reserve tokens for corner cases
-                if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
+                if min_available_tokens <= IGNORE_EOS_RESERVE_TOKENS * active_bs:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
@@ -576,27 +543,27 @@ class PrefillAdder:
         if self.nsa_enable_prefill_cp and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req, has_chunked_req)
+            return self.add_one_req_ignore_eos(req)
 
-        total_tokens = req.extend_input_len + min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        total_token_usage = req.extend_input_len + self._decode_token_usage_estimation(
+            req
         )
 
-        # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
-        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
-        prefix_len = len(req.prefix_indices)
-
-        if total_tokens >= self.rem_total_tokens:
+        if total_token_usage >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
+
+        # adjusting the input_tokens based on host_hit_length and page_size
+        real_input_tokens = self.ceil_paged_tokens(
+            req.extend_input_len - req.host_hit_length
+        )
 
         if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
+        prefix_len = len(req.prefix_indices)
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
+            if total_token_usage >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
@@ -624,10 +591,7 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
-                    ),
+                    self._decode_token_usage_estimation(req),
                 )
             else:
                 # Make sure at least one page is available
@@ -711,9 +675,7 @@ class PrefillAdder:
         release_counter = 0
         for i, running_req in enumerate(self.running_batch.reqs):
             if running_req in preemptible_reqs:
-                self.rem_total_token_offset -= (
-                    self._get_running_request_total_token_offset(running_req)
-                )
+                self.reserved_tokens -= self._decode_token_usage_estimation(running_req)
                 release_counter += 1
                 self.running_batch.release_req(
                     i, len(self.running_batch.reqs) - release_counter, server_args
