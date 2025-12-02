@@ -24,8 +24,10 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     WanI2V720PConfig,
     WanT2V480PConfig,
     WanT2V720PConfig,
+    ZImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
@@ -55,6 +57,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     WanT2V_1_3B_SamplingParams,
     WanT2V_14B_SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -257,12 +260,15 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
         )
         return None
 
-    # 4. Combine and return the complete model info
-    return ModelInfo(
+    # 4. Combine the complete model info
+    model_info = ModelInfo(
         pipeline_cls=pipeline_cls,
         sampling_param_cls=config_info.sampling_param_cls,
         pipeline_config_cls=config_info.pipeline_config_cls,
     )
+    logger.info(f"Found model info: {model_info}")
+
+    return model_info
 
 
 # Registration of model configs
@@ -393,6 +399,24 @@ def _register_configs():
             "black-forest-labs/FLUX.1-dev",
         ],
         model_detectors=[lambda id: "flux" in id.lower()],
+    )
+    register_configs(
+        model_name="flux-2",
+        sampling_param_cls=FluxSamplingParams,
+        pipeline_config_cls=Flux2PipelineConfig,
+        model_paths=[
+            "black-forest-labs/FLUX.2-dev",
+        ],
+        model_detectors=[lambda id: "flux.2" in id.lower()],
+    )
+    register_configs(
+        model_name="Z-image",
+        sampling_param_cls=ZImageSamplingParams,
+        pipeline_config_cls=ZImagePipelineConfig,
+        model_paths=[
+            "Tongyi-MAI/Z-Image-Turbo",
+        ],
+        model_detectors=[lambda id: "z-image" in id.lower()],
     )
 
     # Qwen-Image

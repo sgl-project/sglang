@@ -72,8 +72,8 @@ class BaseTpWorker(ABC):
         return self.model_runner.sliding_window_size
 
     @property
-    def is_hybrid(self) -> bool:
-        return self.model_runner.is_hybrid is not None
+    def is_hybrid_swa(self) -> bool:
+        return self.model_runner.is_hybrid_swa is not None
 
     def get_tokens_per_layer_info(self):
         return (
@@ -153,7 +153,11 @@ class BaseTpWorker(ABC):
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
         success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
         )
         return success, message
 

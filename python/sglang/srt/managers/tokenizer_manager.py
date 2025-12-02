@@ -454,6 +454,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
+            # FIXME: This is a temporary fix to get the text from the input ids.
+            # We should remove this once we have a proper way.
+            if (
+                self.log_requests_level >= 2
+                and obj.text is None
+                and obj.input_ids is not None
+                and self.tokenizer is not None
+            ):
+                decoded = self.tokenizer.decode(
+                    obj.input_ids, skip_special_tokens=False
+                )
+                obj.text = decoded
+
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
@@ -1610,7 +1623,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
-                if state.obj.stream:
+                if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
@@ -1837,17 +1850,18 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         meta_info["spec_accept_length"] = 0
         meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+        # The draft tokens per speculative step (excluding the target-sampled token).
+        num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+
         if (
             recv_obj.spec_verify_ct[i] > 0
-            and self.server_args.speculative_num_steps is not None
+            and num_guess_tokens is not None
             and not isinstance(recv_obj, BatchEmbeddingOutput)
             and hasattr(recv_obj, "spec_accepted_tokens")
             # Checks that `spec_accepted_tokens[i]` will exist.
             and len(recv_obj.spec_accepted_tokens) > i
         ):
-            total_draft_tokens = (
-                recv_obj.spec_verify_ct[i] * self.server_args.speculative_num_steps
-            )
+            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
 
             # Calculate per-request acceptance rate and average acceptance length.

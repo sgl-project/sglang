@@ -27,6 +27,7 @@ import ipaddress
 import itertools
 import json
 import logging
+import math
 import os
 import pickle
 import platform
@@ -96,6 +97,9 @@ from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
 if TYPE_CHECKING:
+    # Apparently importing this here is necessary to avoid a segfault, see comment in load_video below
+    from decord import VideoReader
+
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -276,6 +280,17 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
     try:
         return int(value)
+    except ValueError:
+        return default
+
+
+def get_float_env_var(name: str, default: float = 0.0) -> float:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
     except ValueError:
         return default
 
@@ -994,6 +1009,24 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
             os.unlink(tmp_file.name)
 
 
+def sample_video_frames(
+    video: "VideoReader", *, desired_fps: int, max_frames: int
+) -> list[int]:
+    total_frames = len(video)
+    assert total_frames > 0, "Video must have at least one frame"
+
+    duration = total_frames / video.get_avg_fps()
+    fps = min(desired_fps, video.get_avg_fps())
+
+    num_frames = math.floor(duration * fps)
+    num_frames = min(max_frames, num_frames, total_frames)
+    num_frames = max(1, num_frames)  # At least one frame
+    if num_frames == total_frames:
+        return list(range(total_frames))
+    else:
+        return np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
+
+
 def encode_video(video_path, frame_count_limit=None):
     # Lazy import because decord is not available on some arm platforms.
     from decord import VideoReader, cpu
@@ -1138,9 +1171,12 @@ def set_ulimit(target_soft_limit=65535):
 
 
 def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_rank,
+        model_parallel_is_initialized,
+    )
 
-    if get_tensor_model_parallel_rank() == 0:
+    if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
 
 
@@ -1181,8 +1217,8 @@ def configure_logger(server_args, prefix: str = ""):
             custom_config = orjson.loads(file.read())
         logging.config.dictConfig(custom_config)
         return
-    format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
+    maybe_ms = ".%(msecs)03d" if envs.SGLANG_LOG_MS.get() else ""
+    format = f"[%(asctime)s{maybe_ms}{prefix}] %(message)s"
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format=format,
@@ -1675,6 +1711,15 @@ def get_cpu_memory_capacity():
         return float(numa_mem // (1 << 20))
 
 
+def get_xpu_memory_capacity():
+    try:
+        if torch.xpu.is_available():
+            return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.xpu is not available.")
+
+
 def get_device_memory_capacity(device: str = None):
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
@@ -1686,6 +1731,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_npu_memory_capacity()
     elif device == "cpu":
         gpu_mem = get_cpu_memory_capacity()
+    elif device == "xpu":
+        gpu_mem = get_xpu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -2753,6 +2800,21 @@ def load_json_config(data: str):
 
 
 def dispose_tensor(x: torch.Tensor):
+    """
+    Dispose a tensor by freeing its memory.
+    During piecewise CUDA graph capture/replay, we skip disposal to avoid
+    interfering with torch.compile's memory tracking and graph recording.
+    """
+
+    # Skip disposal during piecewise CUDA graph to avoid torch.compile issues
+    # we do local import to avoid circular import
+    from sglang.srt.compilation.piecewise_context_manager import (
+        is_in_piecewise_cuda_graph,
+    )
+
+    if is_in_piecewise_cuda_graph():
+        return
+
     x.set_(torch.empty((0,), device=x.device, dtype=x.dtype))
 
 
