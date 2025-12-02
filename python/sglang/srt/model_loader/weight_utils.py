@@ -534,6 +534,14 @@ def filter_duplicate_safetensors_files(
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, index_file)
     if not os.path.isfile(index_file_name):
+        # NOTE: this is a trick of handling mistral model
+        # skip the unsupported consolidated.safetensors file
+        if len(hf_weights_files) == 2:
+            hf_weights_files.sort()
+            if hf_weights_files[0].endswith(
+                "consolidated.safetensors"
+            ) and hf_weights_files[1].endswith("model.safetensors"):
+                return [hf_weights_files[1]]
         return hf_weights_files
 
     # Iterate through the weight_map (weight_name: safetensors files)
