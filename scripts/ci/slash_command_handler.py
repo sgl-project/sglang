@@ -142,10 +142,25 @@ def handle_rerun_stage(
 
     # Valid stage names that support target_stage
     valid_stages = [
+        "stage-a-test-1",
+        "multimodal-gen-test-1-gpu",
+        "multimodal-gen-test-2-gpu",
+        "quantization-test",
+        "unit-test-backend-1-gpu",
         "unit-test-backend-2-gpu",
         "unit-test-backend-4-gpu",
         "unit-test-backend-8-gpu-h200",
         "unit-test-backend-8-gpu-h20",
+        "performance-test-1-gpu-part-1",
+        "performance-test-1-gpu-part-2",
+        "performance-test-1-gpu-part-3",
+        "performance-test-2-gpu",
+        "accuracy-test-1-gpu",
+        "accuracy-test-2-gpu",
+        "unit-test-deepep-4-gpu",
+        "unit-test-deepep-8-gpu",
+        "unit-test-backend-4-gpu-b200",
+        "unit-test-backend-4-gpu-gb200",
     ]
 
     if stage_name not in valid_stages:
