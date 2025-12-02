@@ -65,7 +65,7 @@ class TestTrace(CustomTestCase):
         except:
             pass
 
-    def test_trace_enable(self):
+    def __test_trace_enable(self, trace_level, trace_module, expect_export_data):
         self.__clear_trace_file()
         assert self.__launch_otel_jaeger()
         self.addCleanup(self.__stop_otel_jaeger)
@@ -74,7 +74,14 @@ class TestTrace(CustomTestCase):
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--trace-level", "1", "--otlp-traces-endpoint", "0.0.0.0:4317"],
+            other_args=[
+                "--trace-level",
+                trace_level,
+                "--trace-module",
+                trace_module,
+                "--otlp-traces-endpoint",
+                "0.0.0.0:4317",
+            ],
         )
 
         try:
@@ -102,10 +109,32 @@ class TestTrace(CustomTestCase):
 
             # check trace file
             assert os.path.isfile("/tmp/otel_trace.json"), "trace file not exist"
-            assert os.path.getsize("/tmp/otel_trace.json") > 0, "trace file is empty"
+            if expect_export_data:
+                assert (
+                    os.path.getsize("/tmp/otel_trace.json") > 0
+                ), "trace file is empty"
+            else:
+                assert (
+                    os.path.getsize("/tmp/otel_trace.json") == 0
+                ), "trace file is not empty"
 
         finally:
             kill_process_tree(process.pid)
+
+    def test_trace_enable_level_1(self):
+        self.__test_trace_enable("1", "request", True)
+
+    def test_trace_enable_level_2(self):
+        self.__test_trace_enable("2", "request", True)
+
+    def test_trace_enable_level_3(self):
+        self.__test_trace_enable("3", "request", True)
+
+    def test_trace_enable_level_0(self):
+        self.__test_trace_enable("0", "request", False)
+
+    def test_trace_enable_module_invalid(self):
+        self.__test_trace_enable("1", "valid_module", False)
 
     def test_trace_engine_enable(self):
         self.__clear_trace_file()
