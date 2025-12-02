@@ -1,6 +1,9 @@
 name: SGLang Benchmark Workflow
 
 on:
+  pull_request:
+    branches:
+      - dev/perf
   workflow_dispatch:
     inputs:
       model_list:
