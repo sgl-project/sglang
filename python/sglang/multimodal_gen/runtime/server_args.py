@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
-"""The arguments of sgl-diffusion Inference."""
+"""The arguments of sglang-diffusion Inference."""
 import argparse
 import dataclasses
 import inspect
@@ -156,9 +156,6 @@ class ExecutionMode(str, Enum):
     """
 
     INFERENCE = "inference"
-    PREPROCESS = "preprocess"
-    FINETUNING = "finetuning"
-    DISTILLATION = "distillation"
 
     @classmethod
     def from_string(cls, value: str) -> "ExecutionMode":
@@ -393,7 +390,7 @@ class ServerArgs:
             type=str,
             choices=ExecutionMode.choices(),
             default=ServerArgs.mode.value,
-            help="The mode to run sgl-diffusion",
+            help="The mode to run SGLang-diffusion",
         )
 
         # Workload type
@@ -621,6 +618,19 @@ class ServerArgs:
             default=ServerArgs.override_transformer_cls_name,
             help="Override transformer cls name",
         )
+        # LoRA
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=ServerArgs.lora_path,
+            help="The path to the LoRA adapter weights (can be local file path or HF hub id) to launch with",
+        )
+        parser.add_argument(
+            "--lora-nickname",
+            type=str,
+            default=ServerArgs.lora_nickname,
+            help="The nickname for the LoRA adapter to launch with",
+        )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
 
@@ -793,18 +803,6 @@ class ServerArgs:
         return provided_args
 
     def check_server_sp_args(self):
-
-        if self.pipeline_config.task_type.is_image_gen():
-            if (
-                (self.sp_degree and self.sp_degree > 1)
-                or (self.ulysses_degree and self.ulysses_degree > 1)
-                or (self.ring_degree and self.ring_degree > 1)
-            ):
-                raise ValueError(
-                    "SP is not supported for image generation models for now"
-                )
-            self.sp_degree = self.ulysses_degree = self.ring_degree = 1
-
         if self.sp_degree == -1:
             # assume we leave all remaining gpus to sp
             num_gpus_per_group = self.dp_size * self.tp_size
@@ -861,8 +859,11 @@ class ServerArgs:
     def check_server_dp_args(self):
         assert self.num_gpus % self.dp_size == 0, f"{self.num_gpus=}, {self.dp_size=}"
         assert self.dp_size >= 1, "--dp-size must be natural number"
-        self.dp_degree = self.num_gpus // self.dp_size
+        # NOTE: disable temporarily
+        # self.dp_degree = self.num_gpus // self.dp_size
         logger.info(f"Setting dp_degree to: {self.dp_degree}")
+        if self.dp_size > 1:
+            raise ValueError("DP is not yet supported")
 
     def check_server_args(self) -> None:
         """Validate inference arguments for consistency"""
@@ -919,18 +920,6 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
-
-        # Add preprocessing config validation if needed
-        if self.mode == ExecutionMode.PREPROCESS:
-            if self.preprocess_config is None:
-                raise ValueError(
-                    "preprocess_config is not set in ServerArgs when mode is PREPROCESS"
-                )
-            if self.preprocess_config.model_path == "":
-                self.preprocess_config.model_path = self.model_path
-            if not self.pipeline_config.vae_config.load_encoder:
-                self.pipeline_config.vae_config.load_encoder = True
-            self.preprocess_config.check_preprocess_config()
 
         # parallelism
         self.check_server_dp_args()

@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
     MooncakeEPDispatcher,
 )
+from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -39,6 +40,7 @@ from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
+    from sglang.srt.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_hip = is_hip()
@@ -970,8 +972,9 @@ def _model_forward_tbo_merge_outputs(output_a, output_b):
 # -------------------------------- Utilities and wrappers ---------------------------------------
 
 
-class MaybeTboDeepEPDispatcher:
+class MaybeTboDeepEPDispatcher(BaseDispatcher):
     def __init__(self, **kwargs):
+        super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
             self._inners = [
@@ -1004,5 +1007,18 @@ class MaybeTboDeepEPDispatcher:
         return self._execute("combine_b", **kwargs)
 
     def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
         for inner in self._inners:
             inner.set_quant_config(quant_config)
+
+    def set_overlap_args(
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+    ):
+        super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        for inner in self._inners:
+            inner.set_overlap_args(combine_overlap_args, meta_overlap_args)
+
+    def clear_overlap_args(self):
+        super().clear_overlap_args()
+        for inner in self._inners:
+            inner.clear_overlap_args()

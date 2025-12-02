@@ -48,41 +48,23 @@ conda activate sglang_npu
 
 #### MemFabric Adaptor
 
-_TODO: MemFabric is still a working project yet open sourced til August/September, 2025. We will release it as prebuilt wheel package for now._
-
-_Notice: Prebuilt wheel package is based on `aarch64`, please leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) to let us know the requests for `amd64` build._
+_TODO: MemFabric is still a working project yet open sourced til end of year 2025. We will release it as prebuilt wheel package for now._
 
 MemFabric Adaptor is a drop-in replacement of Mooncake Transfer Engine that enables KV cache transfer on Ascend NPU clusters.
 
 ```shell
-MF_WHL_NAME="mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl"
-MEMFABRIC_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${MF_WHL_NAME}"
-wget -O "${MF_WHL_NAME}" "${MEMFABRIC_URL}" && pip install "./${MF_WHL_NAME}"
+pip install mf-adapter==1.0.0
 ```
 
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
-Only `torch==2.6.0` is supported currently due to NPUgraph and Triton-on-Ascend's limitation, however a more generalized version will be release by the end of September, 2025.
-
 ```shell
-PYTORCH_VERSION=2.6.0
-TORCHVISION_VERSION=0.21.0
+PYTORCH_VERSION="2.8.0"
+TORCHVISION_VERSION="0.23.0"
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 
-PTA_VERSION="v7.1.0.1-pytorch2.6.0"
-PTA_NAME="torch_npu-2.6.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
-PTA_URL="https://gitee.com/ascend/pytorch/releases/download/${PTA_VERSION}/${PTA_WHL_NAME}"
-wget -O "${PTA_NAME}" "${PTA_URL}" && pip install "./${PTA_NAME}"
-```
-
-#### vLLM
-
-vLLM is still a major prerequisite on Ascend NPU. Because of `torch==2.6.0` limitation, only vLLM v0.8.5 is supported.
-
-```shell
-VLLM_TAG=v0.8.5
-git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
-(cd vllm && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
+PTA_VERSION="2.8.0"
+pip install torch-npu==$PTA_VERSION
 ```
 
 #### Triton on Ascend
@@ -103,6 +85,7 @@ git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
+rm -vf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]
 ```
 
