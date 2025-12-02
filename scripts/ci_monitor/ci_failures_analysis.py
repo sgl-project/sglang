@@ -762,19 +762,6 @@ class SGLangFailuresAnalyzer:
             f"Found {len(cron_runs)} cron-triggered runs out of {len(runs)} total runs"
         )
 
-        # Debug: Show first 3 filtered cron runs to verify
-        if cron_runs:
-            print("\n=== DEBUG: First 3 cron runs found ===")
-            for i, run in enumerate(cron_runs[:3]):
-                print(f"\nCron Run {i+1}:")
-                print(f"  run_number: {run.get('run_number')}")
-                print(f"  name: {run.get('name')}")
-                print(f"  event: {run.get('event')}")
-                print(f"  head_branch: {run.get('head_branch')}")
-                print(f"  status: {run.get('status')}")
-                print(f"  conclusion: {run.get('conclusion')}")
-            print("=== END DEBUG ===\n")
-
         if not cron_runs:
             print("No cron-triggered runs found")
             return {}, {}
