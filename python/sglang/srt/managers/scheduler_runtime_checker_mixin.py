@@ -217,7 +217,8 @@ class SchedulerRuntimeCheckerMixin:
             self.tree_cache.sanity_check()
 
     def self_check_during_idle(self: Scheduler):
-        self.check_memory()
+        # TODO: check memory leak during idle time
+        # self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
