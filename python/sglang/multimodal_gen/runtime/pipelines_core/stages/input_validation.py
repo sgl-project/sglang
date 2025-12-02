@@ -224,14 +224,7 @@ class InputValidationStage(PipelineStage):
             lambda _: V.string_or_list_strings(batch.prompt)
             or V.list_not_empty(batch.prompt_embeds),
         )
-        # result.add_check("height", batch.height, V.positive_int)
-        # result.add_check("width", batch.width, V.positive_int)
-        # Validate height and width
-        if batch.height > 0 and batch.width > 0:
-            if batch.height % 8 != 0 or batch.width % 8 != 0:
-                raise ValueError(
-                    f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
-                )
+
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )
@@ -245,6 +238,13 @@ class InputValidationStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify input validation stage outputs."""
         result = VerificationResult()
+        result.add_check("height", batch.height, V.positive_int)
+        result.add_check("width", batch.width, V.positive_int)
+        # Validate height and width
+        if batch.height % 8 != 0 or batch.width % 8 != 0:
+            raise ValueError(
+                f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
+            )
         result.add_check("seeds", batch.seeds, V.list_not_empty)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         return result
