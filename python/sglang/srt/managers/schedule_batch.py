@@ -810,6 +810,22 @@ class Req:
                 match_result.host_hit_length,
             )
             self.cache_protected_len = len(self.prefix_indices)
+
+        if (
+            self.is_retracted
+            and self.multimodal_inputs is not None
+            and self.multimodal_inputs.mrope_positions is not None
+        ):
+            from sglang.srt.managers.mm_utils import (
+                extend_mrope_positions_for_retracted_request,
+            )
+
+            self.multimodal_inputs.mrope_positions = (
+                extend_mrope_positions_for_retracted_request(
+                    self.multimodal_inputs.mrope_positions, len(self.output_ids)
+                )
+            )
+
         self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
