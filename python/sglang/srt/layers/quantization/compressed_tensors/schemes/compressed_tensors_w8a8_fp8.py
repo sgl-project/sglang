@@ -122,6 +122,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
                 output_dim=0,
                 weight_loader=weight_loader,
             )
+            # The weight_scale_inv name is intentional for deepseekv3
+            layer.register_parameter("weight_scale_inv", weight_scale)
 
         # min requirement for fp8 kernels
         weight_scale[:] = torch.finfo(torch.float32).min
