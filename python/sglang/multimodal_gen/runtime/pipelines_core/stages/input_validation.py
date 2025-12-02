@@ -93,8 +93,8 @@ class InputValidationStage(PipelineStage):
 
             # adjust output image size
             calculated_width, calculated_height = calculated_size
-            width = calculated_width if batch.width_not_provided else batch.width
-            height = calculated_height if batch.height_not_provided else batch.height
+            width = batch.width or calculated_width
+            height = batch.height or calculated_height
             multiple_of = (
                 server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
             )
