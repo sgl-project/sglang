@@ -69,26 +69,54 @@ def run_pytest(files):
 
     base_cmd = [sys.executable, "-m", "pytest", "-s", "-v", "--log-cli-level=INFO"]
 
-    # Retry up to 2 times on failure
     max_retries = 2
     for i in range(max_retries + 1):
         cmd = list(base_cmd)
-
         if i > 0:
             cmd.append("--last-failed")
-            logger.info(
-                f"Test run failed. Retrying ({i}/{max_retries}) with --last-failed..."
-            )
-
         cmd.extend(files)
 
-        logger.info(f"Running command: {' '.join(cmd)}")
-        result = subprocess.run(cmd)
+        if i > 0:
+            logger.info(
+                f"Performance assertion failed. Retrying ({i}/{max_retries}) with --last-failed..."
+            )
 
-        if result.returncode == 0:
+        logger.info(f"Running command: {' '.join(cmd)}")
+
+        # Run with output capturing to detect specific errors
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        output_lines = []
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            if line:
+                sys.stdout.write(line)
+                output_lines.append(line)
+
+        returncode = process.poll()
+
+        if returncode == 0:
             return 0
 
-    return result.returncode
+        # Check if the failure is due to an assertion in test_server_utils.py
+        full_output = "".join(output_lines)
+        is_perf_assertion = (
+            "multimodal_gen/test/server/test_server_utils.py" in full_output
+            and "AssertionError" in full_output
+        )
+
+        if not is_perf_assertion:
+            return returncode
+
+    return returncode
 
 
 def main():
