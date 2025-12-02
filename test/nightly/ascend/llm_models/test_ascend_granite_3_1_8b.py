@@ -10,7 +10,7 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 class TestMistral7B(GSM8KAscendMixin, CustomTestCase):
     model = "/root/.cache/modelscope/hub/models/ibm-granite/granite-3.1-8b-instruct"
-    accuracy = 0.00
+    accuracy = 0.695
 
 
 if __name__ == "__main__":

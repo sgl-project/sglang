@@ -35,6 +35,8 @@ class TestC4AI(CustomTestCase):
             chat_template_path,
             "--tp-size",
             "2",
+            "--dtype",
+            "bfloat16",
         ]
         env = os.environ.copy()
         env.update(

@@ -36,10 +36,10 @@ NIGHTLY_SUITES = {
     HWBackend.AMD: ["nightly-amd"],
     HWBackend.CPU: [],
     HWBackend.NPU: [
-        "nightly-1-npu",
-        "nightly-2-npu",
-        "nightly-4-npu",
-        "nightly-16-npu",
+        "nightly-1-npu-a3",
+        "nightly-2-npu-a3",
+        "nightly-4-npu-a3",
+        "nightly-16-npu-a3",
     ],
 }
 

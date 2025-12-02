@@ -49,6 +49,7 @@ class TestRewardModels(CustomTestCase):
             model_path,
             torch_dtype=torch_dtype,
             model_type="reward",
+            trust_remote_code=True,
         ) as hf_runner:
             hf_outputs = hf_runner.forward(convs)
 
