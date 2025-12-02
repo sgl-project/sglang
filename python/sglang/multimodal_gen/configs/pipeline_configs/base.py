@@ -487,8 +487,7 @@ class PipelineConfig:
             raise ValueError("model_path is required in kwargs")
 
         # 1. Get the pipeline config class from the registry
-        vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
-        model_info = get_model_info(model_path, vae_path=vae_path)
+        model_info = get_model_info(model_path)
 
         pipeline_config = model_info.pipeline_config_cls()
 
