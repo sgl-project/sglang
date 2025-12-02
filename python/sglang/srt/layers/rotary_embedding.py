@@ -601,6 +601,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
             self.rotary_dim,
             self.base,
             self.max_position_embeddings,
+            self.truncate,
         )
         # Get n-d rotational scaling corrected for extrapolation
         inv_freq_mask = (
