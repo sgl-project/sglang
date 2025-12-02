@@ -329,38 +329,50 @@ class MistralDetector(BaseFormatDetector):
         at_least_one: bool = False,
         stop_after_first: bool = False,
     ) -> Dict[str, Any]:
-        """Build structural tag for Mistral format."""
+        """Build structural tag for Mistral format.
+
+        Uses dual triggers to support multiple tool calls:
+        - First trigger: [TOOL_CALLS] for the first tool call
+        - Second trigger: , {"name":" for subsequent tool calls (after first call ends with })
+        """
         tags = []
-        triggers = set()
 
         for tool in tools:
             name = tool.function.name
             if not name:
                 continue
 
-            begin = '[TOOL_CALLS] [{"name":"' + name + '", "arguments":'
-            end = "}]"
-            trigger = "[TOOL_CALLS]"
-
             # Always include schema
             schema = tool.function.parameters or {}
 
+            # Tag for FIRST tool call (includes outer wrapper)
             tags.append(
                 {
-                    "begin": begin,
+                    "begin": '[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
                     "content": {
                         "type": "json_schema",
                         "json_schema": schema,
                     },
-                    "end": end,
+                    "end": "}",
                 }
             )
-            triggers.add(trigger)
+
+            # Tag for SUBSEQUENT tool calls (triggered after previous call ends with })
+            tags.append(
+                {
+                    "begin": ', {"name":"' + name + '", "arguments":',
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "}",
+                }
+            )
 
         return {
             "format": {
                 "type": "triggered_tags",
-                "triggers": list(triggers),
+                "triggers": ["[TOOL_CALLS]", ', {"name":"'],
                 "tags": tags,
                 "at_least_one": at_least_one,
                 "stop_after_first": stop_after_first,
