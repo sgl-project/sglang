@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -244,7 +245,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.num_position_embeddings = vision_config.num_position_embeddings
         self.num_grid_per_side = int(self.num_position_embeddings**0.5)
         self.num_grid = self.num_grid_per_side * self.num_grid_per_side
-        self.align_corners = get_global_server_args().enable_precise_embedding_interpolation
+        self.align_corners = (
+            get_global_server_args().enable_precise_embedding_interpolation
+        )
         self.patch_size = vision_config.patch_size
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.spatial_merge_unit = self.spatial_merge_size**2
@@ -344,7 +347,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
         )
         for t, h, w in grid_thw:
             pos_embed = torch.nn.functional.interpolate(
-                embeds, size=(h, w), mode="bilinear", align_corners = self.align_corners
+                embeds, size=(h, w), mode="bilinear", align_corners=self.align_corners
             )
             pos_embed = pos_embed.reshape(
                 -1,
