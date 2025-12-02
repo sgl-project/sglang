@@ -54,7 +54,10 @@ def _build_sampling_params_from_request(
     background: Optional[str],
     image_path: Optional[str] = None,
 ) -> SamplingParams:
-    width, height = _parse_size(size)
+    if size is None:
+        width, height = None, None
+    else:
+        width, height = _parse_size(size)
     ext = _choose_ext(output_format, background)
     server_args = get_global_server_args()
     # Build user params
@@ -149,7 +152,7 @@ async def edits(
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
-    size: Optional[str] = Form("1024x1024"),
+    size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
     user: Optional[str] = Form(None),
