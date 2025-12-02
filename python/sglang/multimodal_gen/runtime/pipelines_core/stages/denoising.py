@@ -20,6 +20,7 @@ from einops import rearrange
 from tqdm.auto import tqdm
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -376,11 +377,15 @@ class DenoisingStage(PipelineStage):
         else:
             boundary_timestep = None
 
-        # TI2V specific preparations - before SP sharding
-        if (
+        # specifically for Wan2_2_TI2V_5B_Config, not applicable for FastWan2_2_TI2V_5B_Config
+        should_preprocess_for_wan_ti2v = (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
             and batch.condition_image is not None
-        ):
+            and isinstance(server_args.pipeline_config, Wan2_2_TI2V_5B_Config)
+        )
+
+        # TI2V specific preparations - before SP sharding
+        if should_preprocess_for_wan_ti2v:
             seq_len, z, reserved_frames_masks = self._preprocess_latents_for_ti2v(
                 latents, target_dtype, batch, server_args
             )
@@ -396,10 +401,7 @@ class DenoisingStage(PipelineStage):
         latents = batch.latents
 
         # Shard z and reserved_frames_mask for TI2V if SP is enabled
-        if (
-            server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.condition_image is not None
-        ):
+        if should_preprocess_for_wan_ti2v:
             reserved_frames_mask_sp, z_sp = self._postprocess_latents_for_ti2v(
                 z, reserved_frames_masks, batch
             )
