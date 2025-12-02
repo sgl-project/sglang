@@ -52,7 +52,7 @@ def synchronized(func):
     return wrapper
 
 
-def alloc_default(dims, dtype, device, pin_memory):
+def alloc_manual_pinned(dims, dtype, device, pin_memory):
     buffer = torch.empty(dims, dtype=dtype, device=device)
     if pin_memory:
         torch.cuda.cudart().cudaHostRegister(
@@ -61,15 +61,15 @@ def alloc_default(dims, dtype, device, pin_memory):
     return buffer
 
 
-def alloc_npu(dims, dtype, device, pin_memory):
+def alloc_native_pinned(dims, dtype, device, pin_memory):
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 
 
 ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_default,
+    lambda: alloc_manual_pinned,
     {
-        "npu": alloc_npu,
+        "npu": alloc_native_pinned,
     },
 )
 
