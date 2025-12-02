@@ -12,8 +12,8 @@ RANDOM_INPUT_LEN = 4096
 RANDOM_OUTPUT_LEN = 512
 OUTPUT_FILE = "stress_test_qwen3_235b.jsonl"
 
-# Register for CI - estimated 45 minutes
-register_cuda_ci(est_time=2700, suite="stress")
+# Register for CI - estimated 60 minutes (with increased concurrency)
+register_cuda_ci(est_time=3600, suite="stress")
 
 
 class TestStressQwen3235B(unittest.TestCase):
@@ -22,7 +22,7 @@ class TestStressQwen3235B(unittest.TestCase):
         cls.model = MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_prompts = int(os.environ.get("NUM_PROMPTS", "50000"))
-        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "45"))
+        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "60"))
 
         cls.runner = StressTestRunner(
             test_name="Qwen3-235B Stress Test",
@@ -38,7 +38,13 @@ class TestStressQwen3235B(unittest.TestCase):
                 random_input_len=RANDOM_INPUT_LEN,
                 random_output_len=RANDOM_OUTPUT_LEN,
                 output_file=OUTPUT_FILE,
-                server_args=["--tp", "8", "--trust-remote-code"],
+                server_args=[
+                    "--tp",
+                    "8",
+                    "--trust-remote-code",
+                    "--max-running-requests",
+                    "10000",
+                ],
             )
 
             self.assertTrue(success, f"Stress test failed for {self.model}")

@@ -12,8 +12,8 @@ RANDOM_INPUT_LEN = 4096
 RANDOM_OUTPUT_LEN = 512
 OUTPUT_FILE = "stress_test_kimi_k2.jsonl"
 
-# Register for CI - estimated 45 minutes
-register_cuda_ci(est_time=2700, suite="stress")
+# Register for CI - estimated 60 minutes (with increased concurrency)
+register_cuda_ci(est_time=3600, suite="stress")
 
 
 class TestStressKimiK2(unittest.TestCase):
@@ -22,7 +22,7 @@ class TestStressKimiK2(unittest.TestCase):
         cls.model = MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_prompts = int(os.environ.get("NUM_PROMPTS", "50000"))
-        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "45"))
+        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "60"))
 
         cls.runner = StressTestRunner(
             test_name="Kimi-K2-Thinking Stress Test",
@@ -46,6 +46,8 @@ class TestStressKimiK2(unittest.TestCase):
                     "kimi_k2",
                     "--reasoning-parser",
                     "kimi_k2",
+                    "--max-running-requests",
+                    "10000",
                 ],
             )
 
