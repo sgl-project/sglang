@@ -108,6 +108,58 @@ inline void pack_vnni_Nx32(
     _mm512_mask_storeu_epi32(dst0 + k * ld_dst0 * 2, vmask, vinputs[k]);
   }
 }
+
+template <typename scalar_t, typename index_t>
+inline void pack_vnni_Nx32(
+    scalar_t* __restrict__ dst0,
+    scalar_t* __restrict__ dst1,
+    const at::Float8_e5m2* __restrict__ src,
+    const float* __restrict__ src_scale,
+    const index_t* __restrict__ ind,
+    int N,
+    int ld_src,
+    int ld_dst0,
+    int ld_dst1,
+    bool convert_v) {
+  __m512i vinputs[16];
+  int n = 0;
+  for (; n < N; ++n) {
+    index_t index = ind[n];
+    __m512 scale = _mm512_set1_ps(src_scale[index]);
+    __m512i s8 = _mm512_loadu_si512(src + ind[n] * ld_src);
+    __m256i s8_0 = _mm512_extracti32x8_epi32(s8, 0);
+    __m512i a = _mm512_slli_epi16(_mm512_cvtepi8_epi16(s8_0), 8);
+    __m256i ah = _mm512_extracti64x4_epi64(a, 0);
+    __m256i bh = _mm512_extracti64x4_epi64(a, 1);
+    __m512 a_ = _mm512_cvtph_ps(ah);
+    __m512 b_ = _mm512_cvtph_ps(bh);
+    __m512bh bf16_0 = _mm512_cvtne2ps_pbh(b_, a_);
+    vinputs[n] = (__m512i)bf16_0;
+  }
+  // padding with zero to avoid uninitialized vectors
+  for (; n < 16; ++n) {
+    vinputs[n] = _mm512_set1_epi32(0);
+  }
+
+  // pack value, skip 64 elems for deepseek
+  // handle 2 vectors at a time from [2, 32] to [32, 2]
+  if (convert_v) {
+    for (int n = 0; n < 16; n += 2) {
+      __m512i d0, d1;
+      std::tie(d0, d1) = transpose_2x32_16bit(vinputs[n], vinputs[n + 1]);
+      _mm512_storeu_si512(dst1 + (n >> 1) * ld_dst1 * 2, d0);
+      _mm512_storeu_si512(dst1 + (n >> 1) * ld_dst1 * 2 + 32, d1);
+    }
+  }
+
+  // pack key
+  transpose_16x16_32bit(vinputs);
+
+  const __mmask16 vmask = (1 << N) - 1;
+  for (int k = 0; k < 16; ++k) {
+    _mm512_mask_storeu_epi32(dst0 + k * ld_dst0 * 2, vmask, vinputs[k]);
+  }
+}
 #endif
 
 // [NOTE]: MLA vnni format conversion
@@ -131,29 +183,29 @@ void pack_vnni(
     int ld_src,
     int ld_dst0,
     int ld_dst1) {
-  // #if defined(CPU_CAPABILITY_AVX512)
-  //   const int NB = div_up(N, 16);
-  //   const int KB = K / 32;    // no remainder
-  //   const int KBv = Kv / 32;  // no remainder
+#if defined(CPU_CAPABILITY_AVX512)
+  const int NB = div_up(N, 16);
+  const int KB = K / 32;    // no remainder
+  const int KBv = Kv / 32;  // no remainder
 
-  //   for (int nb = 0; nb < NB; ++nb) {
-  //     for (int kb = 0; kb < KB; ++kb) {
-  //       // handle 16x512bits each block
-  //       int nb_size = std::min(N - nb * 16, 16);
-  //       pack_vnni_Nx32<scalar_t, index_t>(
-  //           /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
-  //           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
-  //           /*     src */ src + kb * 32,
-  //           /* src_scale */ src_scale,
-  //           /*     ind */ ind + nb * 16,
-  //           /*       N */ nb_size,
-  //           /*  ld_src */ ld_src,
-  //           /* ld_dst0 */ ld_dst0,
-  //           /* ld_dst1 */ ld_dst1,
-  //           /*   cvt_v */ kb < KBv);
-  //     }
-  //   }
-  // #else
+  for (int nb = 0; nb < NB; ++nb) {
+    for (int kb = 0; kb < KB; ++kb) {
+      // handle 16x512bits each block
+      int nb_size = std::min(N - nb * 16, 16);
+      pack_vnni_Nx32<scalar_t, index_t>(
+          /*    dst0 */ dst0 + ((kb * 32) >> 1) * ld_dst0 * 2 + nb * 16 * 2,
+          /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
+          /*     src */ src + kb * 32,
+          /* src_scale */ src_scale,
+          /*     ind */ ind + nb * 16,
+          /*       N */ nb_size,
+          /*  ld_src */ ld_src,
+          /* ld_dst0 */ ld_dst0,
+          /* ld_dst1 */ ld_dst1,
+          /*   cvt_v */ kb < KBv);
+    }
+  }
+#else
   for (int n = 0; n < N; ++n) {
     index_t index = ind[n];
     float scale = src_scale != nullptr ? src_scale[index] : 1.0f;
@@ -182,7 +234,7 @@ void pack_vnni(
       dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
     }
   }
-  // #endif
+#endif
 }
 
 template <typename scalar_t>
@@ -232,6 +284,41 @@ copy_stub(at::Float8_e4m3fn* __restrict__ out, const scalar_t* __restrict__ src,
     out[d] = static_cast<at::Float8_e4m3fn>(scaled_src);
   }
 }
+
+template <typename scalar_t>
+inline void copy_stub(at::Float8_e5m2* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
+  for (int64_t d = 0; d < size; ++d) {
+    out[d] = static_cast<at::Float8_e5m2>(src[d]);
+  }
+}
+#if defined(CPU_CAPABILITY_AVX512)
+template <>
+inline void copy_stub(at::Float8_e5m2* __restrict__ out, const at::BFloat16* __restrict__ src, int64_t size) {
+  int64_t i = 0;
+  const __m512i vnaninf = _mm512_set1_epi16(0x7c00);
+  const __m512i vrneadd = _mm512_set1_epi16(0x007f);
+  const __m512i vfixup = _mm512_set1_epi16(0x0001);
+  const __m512i vfixupmask = _mm512_set1_epi16(0x0100);
+  for (; i < size - 31; i += 32) {
+    __m512i x0 = _mm512_loadu_si512(&src[i]);
+    __m512 b = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(x0, 0));
+    __m512 a = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(x0, 1));
+
+    __m256i ah_ = _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    __m256i bh_ = _mm512_cvtps_ph(b, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    const __m512i a_ = _mm512_inserti64x4(_mm512_inserti64x4(_mm512_setzero_si512(), bh_, 0), ah_, 1);
+    const __mmask32 maska1_ = _mm512_cmp_epi16_mask(_mm512_and_si512(a_, vnaninf), vnaninf, _MM_CMPINT_NE);
+    const __mmask32 maska2_ = _mm512_cmp_epi16_mask(_mm512_and_si512(a_, vfixupmask), vfixupmask, _MM_CMPINT_EQ);
+    __m512i a_rne_ = _mm512_mask_add_epi16(a_, maska1_, a_, _mm512_mask_add_epi16(vrneadd, maska2_, vrneadd, vfixup));
+    a_rne_ = _mm512_srli_epi16(a_rne_, 8);
+    _mm256_storeu_epi8(&out[i], _mm512_cvtepi16_epi8(a_rne_));
+  }
+
+  for (; i < size; i++) {
+    out[i] = static_cast<at::Float8_e5m2>(src[i]);
+  }
+}
+#endif
 
 template <typename scalar_t>
 inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ src, int64_t size) {
@@ -1194,19 +1281,11 @@ void decode_set_kv_buffer(
       int64_t loc_val = loc[bs];
       at::Float8_e5m2* k_buffer_ptr = k_buffer + loc_val * k_strideN + head_kv_id * k_strideH;
       const scalar_t* new_key_ptr = key + bs * nk_strideN + head_kv_id * nk_strideH;
-      // copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
-      for (int64_t j = 0; j < head_size; j++) {
-        k_buffer_ptr[j] = static_cast<at::Float8_e5m2>(new_key_ptr[j]);
-      }
-      // cvt_bf16_e5m2_rne_intrinsic(new_key_ptr, k_buffer_ptr, head_size);
+      copy_stub<scalar_t>(k_buffer_ptr, new_key_ptr, head_size);
       if (!is_mla) {
         at::Float8_e5m2* v_buffer_ptr = v_buffer + loc_val * v_strideN + head_kv_id * v_strideH;
         const scalar_t* new_value_ptr = value + bs * nv_strideN + head_kv_id * nv_strideH;
-        // copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
-        for (int64_t j = 0; j < head_size_v; j++) {
-          v_buffer_ptr[j] = static_cast<at::Float8_e5m2>(new_value_ptr[j]);
-        }
-        // cvt_bf16_e5m2_rne_intrinsic(new_value_ptr, vfloa_buffer_ptr, head_size_v);
+        copy_stub<scalar_t>(v_buffer_ptr, new_value_ptr, head_size_v);
       }
 
       // move to the next index
