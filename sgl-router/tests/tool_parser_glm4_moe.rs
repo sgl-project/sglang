@@ -1,6 +1,6 @@
 //! GLM-4 MoE Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{Glm4MoeParser, ToolParser};
+use sgl_model_gateway::tool_parser::{Glm4MoeParser, ToolParser};
 
 mod common;
 use common::create_test_tools;
