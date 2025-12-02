@@ -4,11 +4,7 @@ import time
 
 import torch
 
-from sglang.multimodal_gen.runtime.distributed import (
-    get_local_torch_device,
-    get_sp_parallel_rank,
-    get_sp_world_size,
-)
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -43,7 +39,7 @@ class DmdDenoisingStage(DenoisingStage):
         # 2. DMD expects (B, T, C, H, W) for the main latents in the loop
         if batch.latents is not None:
             batch.latents = batch.latents.permute(0, 2, 1, 3, 4)
-        
+
         # Note: batch.image_latent is kept as (B, C, T, H, W) here
         # and permuted inside the loop when used.
 
@@ -105,7 +101,6 @@ class DmdDenoisingStage(DenoisingStage):
 
         pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
         prompt_embeds = prepared_vars["prompt_embeds"]
-
 
         # 3. Run Denoising Loop
         denoising_loop_start_time = time.time()
@@ -170,7 +165,9 @@ class DmdDenoisingStage(DenoisingStage):
                                 guidance=guidance_expand,
                                 **image_kwargs,
                                 **pos_cond_kwargs,
-                            ).permute(0, 2, 1, 3, 4) # Output: (B, C, T, H, W) -> Permute back to (B, T, C, H, W)
+                            ).permute(
+                                0, 2, 1, 3, 4
+                            )  # Output: (B, C, T, H, W) -> Permute back to (B, T, C, H, W)
 
                         pred_video = pred_noise_to_pred_video(
                             pred_noise=pred_noise.flatten(0, 1),
@@ -188,11 +185,11 @@ class DmdDenoisingStage(DenoisingStage):
                                 dtype=pred_video.dtype,
                                 generator=batch.generator[0],
                             ).to(self.device)
-                            
+
                             # Note: noise generation needs to match the permuted shape (B, T, C, H, W)
                             # If we generated noise in (B, C, T, H, W), we would need to permute it.
                             # Here we assume video_raw_latent_shape is already (B, T, C, H, W).
-                            
+
                             latents = self.scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),
@@ -218,7 +215,6 @@ class DmdDenoisingStage(DenoisingStage):
                 "average time per step: %.4f seconds",
                 (denoising_loop_end_time - denoising_loop_start_time) / len(timesteps),
             )
-
 
         self._post_denoising_loop(
             batch=batch,
