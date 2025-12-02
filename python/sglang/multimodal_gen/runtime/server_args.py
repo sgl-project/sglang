@@ -156,9 +156,6 @@ class ExecutionMode(str, Enum):
     """
 
     INFERENCE = "inference"
-    PREPROCESS = "preprocess"
-    FINETUNING = "finetuning"
-    DISTILLATION = "distillation"
 
     @classmethod
     def from_string(cls, value: str) -> "ExecutionMode":
