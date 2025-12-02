@@ -3,7 +3,7 @@
 //! Tests for the JSON parser which handles OpenAI, Claude, and generic JSON formats
 
 use serde_json::json;
-use sglang_router_rs::tool_parser::{JsonParser, ToolParser};
+use sgl_model_gateway::tool_parser::{JsonParser, ToolParser};
 
 mod common;
 use common::{create_test_tools, streaming_helpers::*};
@@ -166,7 +166,7 @@ async fn test_json_format_detection() {
 // Streaming tests for JSON array format
 #[tokio::test]
 async fn test_json_array_streaming_required_mode() {
-    use sglang_router_rs::protocols::common::Tool;
+    use sgl_model_gateway::protocols::common::Tool;
 
     // Test that simulates the exact streaming pattern from required mode
     let mut parser = JsonParser::new();
@@ -174,7 +174,7 @@ async fn test_json_array_streaming_required_mode() {
     // Define test tools
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sglang_router_rs::protocols::common::Function {
+        function: sgl_model_gateway::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
@@ -240,7 +240,7 @@ async fn test_json_array_streaming_required_mode() {
 
 #[tokio::test]
 async fn test_json_array_multiple_tools_streaming() {
-    use sglang_router_rs::protocols::common::Tool;
+    use sgl_model_gateway::protocols::common::Tool;
 
     // Test with multiple tools in array
     let mut parser = JsonParser::new();
@@ -248,7 +248,7 @@ async fn test_json_array_multiple_tools_streaming() {
     let tools = vec![
         Tool {
             tool_type: "function".to_string(),
-            function: sglang_router_rs::protocols::common::Function {
+            function: sgl_model_gateway::protocols::common::Function {
                 name: "get_weather".to_string(),
                 description: Some("Get weather".to_string()),
                 parameters: serde_json::json!({}),
@@ -257,7 +257,7 @@ async fn test_json_array_multiple_tools_streaming() {
         },
         Tool {
             tool_type: "function".to_string(),
-            function: sglang_router_rs::protocols::common::Function {
+            function: sgl_model_gateway::protocols::common::Function {
                 name: "get_news".to_string(),
                 description: Some("Get news".to_string()),
                 parameters: serde_json::json!({}),
@@ -305,14 +305,14 @@ async fn test_json_array_multiple_tools_streaming() {
 
 #[tokio::test]
 async fn test_json_array_closing_bracket_separate_chunk() {
-    use sglang_router_rs::protocols::common::Tool;
+    use sgl_model_gateway::protocols::common::Tool;
 
     // Test case where the closing ] comes as a separate chunk
     let mut parser = JsonParser::new();
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sglang_router_rs::protocols::common::Function {
+        function: sgl_model_gateway::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: json!({}),
@@ -366,14 +366,14 @@ async fn test_json_array_closing_bracket_separate_chunk() {
 
 #[tokio::test]
 async fn test_json_single_object_with_trailing_text() {
-    use sglang_router_rs::protocols::common::Tool;
+    use sgl_model_gateway::protocols::common::Tool;
 
     // Test single object format (no array) with trailing text
     let mut parser = JsonParser::new();
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sglang_router_rs::protocols::common::Function {
+        function: sgl_model_gateway::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
@@ -420,14 +420,14 @@ async fn test_json_single_object_with_trailing_text() {
 
 #[tokio::test]
 async fn test_json_single_object_with_bracket_in_text() {
-    use sglang_router_rs::protocols::common::Tool;
+    use sgl_model_gateway::protocols::common::Tool;
 
     // Test that ] in normal text is NOT stripped for single object format
     let mut parser = JsonParser::new();
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sglang_router_rs::protocols::common::Function {
+        function: sgl_model_gateway::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
@@ -472,14 +472,14 @@ async fn test_json_single_object_with_bracket_in_text() {
 
 #[tokio::test]
 async fn test_json_array_bracket_in_text_after_tools() {
-    use sglang_router_rs::protocols::common::Tool;
+    use sgl_model_gateway::protocols::common::Tool;
 
     // Test that ] in normal text AFTER array tools is preserved
     let mut parser = JsonParser::new();
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sglang_router_rs::protocols::common::Function {
+        function: sgl_model_gateway::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),

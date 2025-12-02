@@ -114,6 +114,8 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -121,6 +123,11 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct VideoUrl {
+    pub url: String,
 }
 
 // ============================================================================

@@ -76,7 +76,8 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
-        self.disabled = True
+        self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
+        self.original_disabled = True  # To store the original state
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -206,6 +207,7 @@ class CustomAllreduce:
             self.register_buffer(self.buffer)
 
         self.disabled = False
+        self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
     @staticmethod

@@ -97,8 +97,7 @@ class EncodingStage(PipelineStage):
         batch.latents = latents
 
         # Offload models if needed
-        if hasattr(self, "maybe_free_model_hooks"):
-            self.maybe_free_model_hooks()
+        self.maybe_free_model_hooks()
 
         if server_args.vae_cpu_offload:
             self.vae.to("cpu")
