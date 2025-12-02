@@ -574,9 +574,7 @@ class DenoisingStage(PipelineStage):
         return latents, trajectory_tensor
 
     def start_profile(self, batch: Req):
-        # Skip local profiling when:
-        # - profiling is disabled, or
-        # - global stages profiling is enabled (to avoid nested/duplicate profilers)
+        
         if (not batch.profile) or bool(getattr(batch, "full_stages", False)):
             return
 
@@ -586,9 +584,7 @@ class DenoisingStage(PipelineStage):
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-        # Enable a full-coverage mode (no schedule/step) when requested
         self._profile_full = bool(getattr(batch, "full_denoise", False))
-        # Ensure log directory exists for trace files/handlers
         try:
             os.makedirs("./logs", exist_ok=True)
         except Exception:
@@ -911,7 +907,6 @@ class DenoisingStage(PipelineStage):
                         ):
                             progress_bar.update()
 
-                        # Advance profiler schedule for step-based profiling
                         self.step_profile()
 
         self.stop_profile(batch)
