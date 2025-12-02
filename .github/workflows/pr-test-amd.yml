@@ -205,6 +205,12 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
 
+      - name: Test RCCL multi-GPU communication
+        timeout-minutes: 5
+        run: |
+          echo "Testing RCCL multi-GPU communication with debug info..."
+          docker exec ci_sglang bash -c "cd /sglang-checkout && NCCL_DEBUG=INFO RCCL_DEBUG=INFO torchrun --nproc_per_node=8 scripts/ci/test_rccl_multi_gpu.py"
+
       - name: Run test
         timeout-minutes: 60
         run: |
