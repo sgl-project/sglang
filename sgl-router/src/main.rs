@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use sglang_router_rs::{
+use sgl_model_gateway::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
@@ -691,8 +691,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", version::get_version_string());
             return Ok(());
         }
-        if arg == "-v" {
-            println!("{}", version::get_short_version_string());
+        if arg == "--version-verbose" {
+            println!("{}", version::get_verbose_version_string());
             return Ok(());
         }
     }
