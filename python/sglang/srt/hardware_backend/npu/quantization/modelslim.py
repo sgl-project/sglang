@@ -6,12 +6,12 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.hardware_backend.npu.layers.quantization.fused_moe_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     NPUW4A8Int4DynamicMoEMethod,
     NPUW4A16Int4DynamicMoEMethod,
     NPUW8A8Int8DynamicMoEMethod,
 )
-from sglang.srt.hardware_backend.npu.layers.quantization.linear_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     NPUW8A8Int8DynamicLinearMethod,
     NPUW8A8Int8LinearMethod,
 )

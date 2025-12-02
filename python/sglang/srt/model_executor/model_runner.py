@@ -1786,7 +1786,7 @@ class ModelRunner:
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
-                from sglang.srt.hardware_backend.npu.mem_cache.memory_pool_npu import (
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
                 )
 
@@ -1804,7 +1804,7 @@ class ModelRunner:
                     end_layer=self.end_layer,
                 )
             else:
-                from sglang.srt.hardware_backend.npu.mem_cache.memory_pool_npu import (
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
 
@@ -1966,7 +1966,7 @@ class ModelRunner:
                 self.server_args.attention_backend == "ascend"
                 or self.hybrid_gdn_config is not None
             ):
-                from sglang.srt.hardware_backend.npu.mem_cache.allocator_npu import (
+                from sglang.srt.hardware_backend.npu.allocator_npu import (
                     NPUPagedTokenToKVPoolAllocator,
                 )
 

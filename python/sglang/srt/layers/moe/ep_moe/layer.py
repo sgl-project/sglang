@@ -318,7 +318,7 @@ class DeepEPMoE(FusedMoE):
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
 
-        from sglang.srt.hardware_backend.npu.layers.quantization.fused_moe_method_npu import (
+        from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
             npu_fused_moe_without_routing_weights_bf16,
         )
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

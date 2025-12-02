@@ -1003,7 +1003,7 @@ class HybridLinearKVPool(KVCache):
             TokenToKVPoolClass = MHATokenToKVPool
 
             if _is_npu:
-                from sglang.srt.hardware_backend.npu.mem_cache.memory_pool_npu import (
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
 
@@ -1024,7 +1024,7 @@ class HybridLinearKVPool(KVCache):
             TokenToKVPoolClass = MLATokenToKVPool
 
             if _is_npu:
-                from sglang.srt.hardware_backend.npu.mem_cache.memory_pool_npu import (
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
                 )
 

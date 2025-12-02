@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.layers.quantization.fused_moe_method_npu import (
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
     npu_fused_experts,
 )
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs

@@ -2,7 +2,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import NPUFusedMLAPreprocess
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+    NPUFusedMLAPreprocess,
+)
 from sglang.srt.layers.attention.nsa.utils import (
     cp_split_and_rebuild_position,
     enable_prefill_cp,

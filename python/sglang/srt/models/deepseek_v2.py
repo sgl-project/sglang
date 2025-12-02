@@ -46,10 +46,12 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+    is_mla_preprocess_enabled,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
@@ -208,7 +210,7 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
-    from sglang.srt.hardware_backend.npu.layers.modules.deepseek_v2_attention_mla_npu import (
+    from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
         forward_mha_core_npu,

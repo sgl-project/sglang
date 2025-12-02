@@ -333,7 +333,7 @@ class TopK(CustomOp):
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
 
-        from sglang.srt.hardware_backend.npu.layers.moe.topk import fused_topk_npu
+        from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 
         return fused_topk_npu(
             hidden_states=hidden_states,
