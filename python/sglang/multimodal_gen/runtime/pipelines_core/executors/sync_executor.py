@@ -4,8 +4,9 @@
 """
 Synchronous pipeline executor implementation.
 """
-from typing import List
 import os
+from typing import List
+
 import torch
 import torch.profiler
 
@@ -50,7 +51,9 @@ class SyncExecutor(PipelineExecutor):
         logger.info("Running pipeline stages sequentially with SyncExecutor.")
 
         # New profiling flag: profile all stages when both profile and full_stages are set
-        do_full_stages_profile = bool(getattr(batch, "profile", False) and getattr(batch, "full_stages", False))
+        do_full_stages_profile = bool(
+            getattr(batch, "profile", False) and getattr(batch, "full_stages", False)
+        )
 
         if do_full_stages_profile:
             try:

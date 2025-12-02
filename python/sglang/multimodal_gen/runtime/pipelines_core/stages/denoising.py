@@ -574,7 +574,7 @@ class DenoisingStage(PipelineStage):
         return latents, trajectory_tensor
 
     def start_profile(self, batch: Req):
-        
+
         if (not batch.profile) or bool(getattr(batch, "full_stages", False)):
             return
 
@@ -946,7 +946,7 @@ class DenoisingStage(PipelineStage):
             if accepts:
                 extra_step_kwargs[k] = v
         return extra_step_kwargs
-        
+
     def progress_bar(
         self, iterable: Iterable | None = None, total: int | None = None
     ) -> tqdm:

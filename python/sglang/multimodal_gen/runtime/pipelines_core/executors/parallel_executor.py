@@ -1,7 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from typing import List
 import os
+from typing import List
 
 import torch
 import torch.profiler
@@ -100,7 +100,9 @@ class ParallelExecutor(PipelineExecutor):
     ) -> Req:
         rank = get_classifier_free_guidance_rank()
 
-        do_full_stages_profile = bool(getattr(batch, "profile", False) and getattr(batch, "full_stages", False))
+        do_full_stages_profile = bool(
+            getattr(batch, "profile", False) and getattr(batch, "full_stages", False)
+        )
 
         if do_full_stages_profile:
             try:
