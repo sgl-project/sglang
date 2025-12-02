@@ -117,6 +117,100 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         return False
 
 
+def handle_rerun_stage(gh_repo, pr, comment, user_perms, stage_name, react_on_success=True):
+    """
+    Handles the /rerun-stage <stage-name> command.
+    Reruns a specific job/stage in the PR Test workflow.
+    Returns True if action was taken, False otherwise.
+    """
+    if not user_perms.get("can_rerun_stage", False):
+        print("Permission denied: can_rerun_stage is false.")
+        return False
+
+    if not stage_name:
+        print("Error: No stage name provided")
+        comment.create_reaction("confused")
+        comment.create_comment(
+            f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
+            f"Examples: `/rerun-stage unit-test-backend-1-gpu`, `/rerun-stage accuracy-test-1-gpu`"
+        )
+        return False
+
+    print(f"Permission granted. Looking for stage '{stage_name}' to rerun.")
+
+    # Get the SHA of the latest commit in the PR
+    head_sha = pr.head.sha
+    print(f"Checking workflows for commit: {head_sha}")
+
+    # List all workflow runs for this commit
+    runs = gh_repo.get_workflow_runs(head_sha=head_sha)
+
+    rerun_count = 0
+    found_stage = False
+
+    for run in runs:
+        # Only look at PR Test workflow
+        if run.name != "PR Test":
+            continue
+
+        print(f"Examining PR Test workflow (ID: {run.id}, Status: {run.status}, Conclusion: {run.conclusion})")
+
+        # Get all jobs in this workflow run
+        jobs = run.jobs()
+
+        for job in jobs:
+            # Match the job name with the requested stage
+            if job.name == stage_name or stage_name in job.name:
+                found_stage = True
+                print(f"Found matching job: {job.name} (ID: {job.id}, Status: {job.status}, Conclusion: {job.conclusion})")
+
+                # Try to rerun this specific job
+                try:
+                    # Rerun the entire workflow run with failed jobs only won't work for individual jobs
+                    # We need to rerun the whole workflow if the job failed
+                    if job.conclusion in ["failure", "skipped", "cancelled"]:
+                        print(f"Rerunning failed/skipped job: {job.name}")
+                        run.rerun_failed_jobs()
+                        rerun_count += 1
+                        break  # Only rerun once per workflow
+                    elif job.conclusion == "success":
+                        print(f"Job '{job.name}' already succeeded. Not rerunning.")
+                        comment.create_reaction("eyes")
+                        comment.create_comment(
+                            f"ℹ️ Stage `{job.name}` already succeeded in the latest run. "
+                            f"If you want to force rerun, use `/rerun-failed-ci` to rerun all failed stages."
+                        )
+                        return False
+                except Exception as e:
+                    print(f"Failed to rerun job {job.id}: {e}")
+
+    if not found_stage:
+        print(f"Stage '{stage_name}' not found in PR Test workflow")
+        comment.create_reaction("confused")
+        comment.create_comment(
+            f"❌ Stage `{stage_name}` not found in PR Test workflow.\n\n"
+            f"Common stage names:\n"
+            f"- `unit-test-backend-1-gpu`\n"
+            f"- `unit-test-backend-2-gpu`\n"
+            f"- `unit-test-backend-4-gpu`\n"
+            f"- `performance-test-1-gpu-part-1`\n"
+            f"- `accuracy-test-1-gpu`\n"
+            f"- `quantization-test`\n"
+            f"- `sgl-kernel-unit-test`\n\n"
+            f"Tip: Check the PR checks tab for exact stage names."
+        )
+        return False
+
+    if rerun_count > 0:
+        print(f"Triggered rerun for stage '{stage_name}'.")
+        if react_on_success:
+            comment.create_reaction("+1")
+        return True
+    else:
+        print(f"No action taken for stage '{stage_name}'.")
+        return False
+
+
 def main():
     # 1. Load Environment Variables
     token = get_env_var("GITHUB_TOKEN")
@@ -167,6 +261,12 @@ def main():
             print("Combined command processed successfully; reaction added.")
         else:
             print("Combined command finished, but no actions were taken.")
+
+    elif first_line.startswith("/rerun-stage"):
+        # Extract stage name from command
+        parts = first_line.split(maxsplit=1)
+        stage_name = parts[1].strip() if len(parts) > 1 else None
+        handle_rerun_stage(repo, pr, comment, user_perms, stage_name)
 
     else:
         print(f"Unknown or ignored command: {first_line}")
