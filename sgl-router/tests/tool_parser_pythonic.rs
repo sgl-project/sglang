@@ -3,7 +3,7 @@
 //! Tests for the Pythonic parser which handles Python function call syntax
 
 use serde_json::json;
-use sglang_router_rs::tool_parser::{PythonicParser, ToolParser};
+use sgl_model_gateway::tool_parser::{PythonicParser, ToolParser};
 
 mod common;
 use common::create_test_tools;
