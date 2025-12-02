@@ -81,8 +81,8 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
     set_ulimit,
 )
-from sglang.srt.utils.worker_exit_reporter import worker_exit_reporter
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.worker_exit_reporter import worker_exit_reporter
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)

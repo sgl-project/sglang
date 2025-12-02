@@ -5,6 +5,7 @@ import signal
 import threading
 
 import requests
+
 from sglang.srt.utils import kill_process_tree
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,9 @@ class WorkerExitReporter:
 
     def set_child_process_exit_signal_handler(self):
         if threading.current_thread() is threading.main_thread():
-            logger.info("Registered SIGCHLD handler,while child process exits will patch worker status to router")
+            logger.info(
+                "Registered SIGCHLD handler,while child process exits will patch worker status to router"
+            )
             signal.signal(signal.SIGCHLD, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
