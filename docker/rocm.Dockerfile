@@ -170,6 +170,11 @@ RUN pip install IPython \
     && pip install torchao==0.9.0 \
     && pip install pybind11
 
+RUN git clone https://github.com/feifeibear/long-context-attention.git long-context-attention \
+    && cd long-context-attention \
+    && git checkout 7a52abd669efb35e550680a239e1745b620b2bae \
+    && pip install -e .
+
 RUN pip uninstall -y sgl_kernel sglang
 RUN git clone ${SGL_REPO} \
     && cd sglang \
@@ -187,9 +192,9 @@ RUN git clone ${SGL_REPO} \
     && cd .. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         python -m pip --no-cache-dir install -e "python[srt_hip]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[srt_hip,diffusion]" ${NO_DEPS_FLAG}; \
        else \
-         python -m pip --no-cache-dir install -e "python[all_hip]" ${NO_DEPS_FLAG}; \
+         python -m pip --no-cache-dir install -e "python[all_hip,diffusion]" ${NO_DEPS_FLAG}; \
        fi
 
 RUN python -m pip cache purge
