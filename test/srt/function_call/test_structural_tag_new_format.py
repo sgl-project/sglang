@@ -330,14 +330,17 @@ class TestMistralDetector(StructuralTagFormatTestCase):
         tag = self.detector.build_structural_tag(
             tools=tools, at_least_one=False, stop_after_first=False
         )
-        self.assert_structural_tag_structure(tag, expected_tools_count=2)
+        # Mistral uses dual triggers - 2 tags per tool (first call + subsequent calls)
+        # 2 tools * 2 variants = 4 tags
+        self.assertEqual(len(tag["format"]["tags"]), 4)
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
         tag = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=False
         )
-        self.assert_structural_tag_structure(tag, expected_tools_count=1)
+        # Mistral uses dual triggers - 2 tags per tool (first call + subsequent calls)
+        self.assertEqual(len(tag["format"]["tags"]), 2)
         schema = tag["format"]["tags"][0]["content"]["json_schema"]
         self.assertEqual(schema, {})
 
@@ -348,9 +351,11 @@ class TestMistralDetector(StructuralTagFormatTestCase):
             tools=[tool], at_least_one=False, stop_after_first=False
         )
 
-        # Create realistic output: [TOOL_CALLS] [{"name":"get_weather", "arguments":{"city":"Dallas"}}]
-        realistic_output = (
-            '[TOOL_CALLS] [{"name":"get_weather", "arguments":{"city":"Dallas"}}]'
+        # Create realistic output for single tool call
+        # Note: The end pattern is now "}" (not "}]") to allow multiple tool calls
+        # The array closing "]" is handled separately after all tool calls
+        realistic_single = (
+            '[TOOL_CALLS] [{"name":"get_weather", "arguments":{"city":"Dallas"}}'
         )
 
         # Verify the structural tag's begin pattern matches the output
@@ -359,12 +364,12 @@ class TestMistralDetector(StructuralTagFormatTestCase):
         end = tag_item["end"]
 
         self.assertTrue(
-            realistic_output.startswith(begin),
-            f"Realistic output should start with begin pattern. Begin: {begin}, Output: {realistic_output}",
+            realistic_single.startswith(begin),
+            f"Realistic output should start with begin pattern. Begin: {begin}, Output: {realistic_single}",
         )
         self.assertTrue(
-            realistic_output.endswith(end),
-            f"Realistic output should end with end pattern. End: {end}, Output: {realistic_output}",
+            realistic_single.endswith(end),
+            f"Realistic output should end with end pattern. End: {end}, Output: {realistic_single}",
         )
 
         # Verify tool name appears in the begin pattern
@@ -377,20 +382,73 @@ class TestMistralDetector(StructuralTagFormatTestCase):
         # Verify trigger appears in the realistic output
         triggers = tag["format"]["triggers"]
         self.assertTrue(
-            any(trigger in realistic_output for trigger in triggers),
-            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_output}",
+            any(trigger in realistic_single for trigger in triggers),
+            f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_single}",
         )
 
         # Verify that begin + JSON arguments + end forms a complete output
         json_start = len(begin)
-        json_end = len(realistic_output) - len(end)
-        json_part = realistic_output[json_start:json_end]
+        json_end = len(realistic_single) - len(end)
+        json_part = realistic_single[json_start:json_end]
         reconstructed = begin + json_part + end
         self.assertEqual(
             reconstructed,
-            realistic_output,
+            realistic_single,
             f"Begin + JSON + End should reconstruct the realistic output",
         )
+
+    def test_dual_trigger_structure(self):
+        """Test that dual triggers are set up correctly for multiple tool calls."""
+        tool = self.get_simple_tool()
+        tag = self.detector.build_structural_tag(
+            tools=[tool], at_least_one=False, stop_after_first=False
+        )
+
+        # Should have 2 tags: one for first call, one for subsequent calls
+        self.assertEqual(len(tag["format"]["tags"]), 2)
+
+        first_tag = tag["format"]["tags"][0]
+        subsequent_tag = tag["format"]["tags"][1]
+
+        # First tag should include outer wrapper [TOOL_CALLS] [
+        self.assertTrue(first_tag["begin"].startswith("[TOOL_CALLS]"))
+        # Subsequent tag should start with separator pattern
+        self.assertTrue(subsequent_tag["begin"].startswith(', {"name":"'))
+        self.assertFalse(subsequent_tag["begin"].startswith("[TOOL_CALLS]"))
+
+        # Verify both triggers
+        triggers = tag["format"]["triggers"]
+        self.assertEqual(len(triggers), 2)
+        self.assertIn("[TOOL_CALLS]", triggers)
+        self.assertIn(', {"name":"', triggers)
+
+    def test_multiple_tool_calls_structural_tag(self):
+        """Test that structural tag supports multiple tool calls in sequence."""
+        tools = [self.get_simple_tool(), self.get_complex_tool()]
+        tag = self.detector.build_structural_tag(
+            tools=tools, at_least_one=False, stop_after_first=False
+        )
+
+        # Realistic output with multiple tool calls
+        realistic_multi = (
+            '[TOOL_CALLS] [{"name":"get_weather", "arguments":{"city":"Dallas"}}'
+            ', {"name":"analyze_data", "arguments":{"data":{"metrics":["cpu","mem"]}}}'
+            "]"
+        )
+
+        # Verify we have tags for first call and subsequent calls
+        tags = tag["format"]["tags"]
+        first_call_tags = [t for t in tags if t["begin"].startswith("[TOOL_CALLS]")]
+        subsequent_call_tags = [t for t in tags if t["begin"].startswith(', {"name":"')]
+
+        self.assertEqual(len(first_call_tags), 2)  # One per tool
+        self.assertEqual(len(subsequent_call_tags), 2)  # One per tool
+
+        # Verify first call tag for get_weather works
+        first_begin = first_call_tags[0]["begin"]
+        first_end = first_call_tags[0]["end"]
+        self.assertTrue(realistic_multi.startswith(first_begin))
+        self.assertEqual(first_end, "}")
 
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
