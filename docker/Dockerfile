@@ -238,15 +238,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
-# Manually install cutlass-dsl for flashinfer_cutedsl (WideEP configs)
-# Eventually will move this into pyproject.toml
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-        python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps; \
-    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps; \
-    fi
-
 # Download NVSHMEM and DeepEP sources
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 RUN set -eux; \
@@ -302,16 +293,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
         python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps; \
-    fi
-
-# For CUDA 13, install triton from source to fix sm103 issues
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$CUDA_VERSION" = "13.0.1" ]; then \
-        curl --retry 3 --retry-delay 2 -fsSL -o ${TRITON_LANG_COMMIT}.zip \
-            https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/${TRITON_LANG_COMMIT}.zip && \
-        unzip -q ${TRITON_LANG_COMMIT}.zip && rm ${TRITON_LANG_COMMIT}.zip && mv triton-${TRITON_LANG_COMMIT} triton && \
-        cd triton && pip install --break-system-packages -r python/requirements.txt && \
-        MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --break-system-packages -e .; \
     fi
 
 # Install essential Python packages
