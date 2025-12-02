@@ -124,7 +124,7 @@ class ConfigInfo:
 _CONFIG_REGISTRY: Dict[str, ConfigInfo] = {}
 
 # Mappings from Hugging Face model paths to our internal model names
-_MODEL_PATH_TO_NAME: Dict[str, str] = {}
+_MODEL_HF_PATH_TO_NAME: Dict[str, str] = {}
 
 # Detectors to identify model families from paths or class names
 _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
@@ -147,11 +147,11 @@ def register_configs(
     )
     if hf_model_paths:
         for path in hf_model_paths:
-            if path in _MODEL_PATH_TO_NAME:
+            if path in _MODEL_HF_PATH_TO_NAME:
                 logger.warning(
-                    f"Model path '{path}' is already mapped to '{_MODEL_PATH_TO_NAME[path]}' and will be overwritten by '{model_id}'."
+                    f"Model path '{path}' is already mapped to '{_MODEL_HF_PATH_TO_NAME[path]}' and will be overwritten by '{model_id}'."
                 )
-            _MODEL_PATH_TO_NAME[path] = model_id
+            _MODEL_HF_PATH_TO_NAME[path] = model_id
 
     if model_detectors:
         for detector in model_detectors:
@@ -163,8 +163,8 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     Gets the ConfigInfo for a given model path using mappings and detectors.
     """
     # 1. Exact match
-    if model_path in _MODEL_PATH_TO_NAME:
-        model_name = _MODEL_PATH_TO_NAME[model_path]
+    if model_path in _MODEL_HF_PATH_TO_NAME:
+        model_name = _MODEL_HF_PATH_TO_NAME[model_path]
         logger.debug(f"Resolved model name '{model_name}' from exact path match.")
         return _CONFIG_REGISTRY.get(model_name)
 
@@ -262,7 +262,7 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
         logger.error(
             f"Could not resolve configuration for model '{model_path}'. "
             "It is not a registered model path or detected by any registered model family detectors. "
-            f"Known model paths: {list(_MODEL_PATH_TO_NAME.keys())}"
+            f"Known model paths: {list(_MODEL_HF_PATH_TO_NAME.keys())}"
         )
         return None
 
@@ -364,10 +364,16 @@ def _register_configs():
     register_configs(
         sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_T2V_A14B_Config,
+        hf_model_paths=[
+            "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+        ]
     )
     register_configs(
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_I2V_A14B_Config,
+        hf_model_paths=[
+            "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
+        ]
     )
     register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
@@ -407,10 +413,16 @@ def _register_configs():
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
+        hf_model_paths=[
+            "Qwen/Qwen-Image"
+        ]
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
+        hf_model_paths=[
+            "Qwen/Qwen-Image-Edit"
+        ]
     )
 
 
