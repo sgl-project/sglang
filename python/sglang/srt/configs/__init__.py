@@ -1,3 +1,4 @@
+from sglang.srt.configs.bailing_moe_linear import BailingMoeLinearConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
@@ -44,4 +45,5 @@ __all__ = [
     "NemotronH_Nano_VL_V2_Config",
     "JetNemotronConfig",
     "JetVLMConfig",
+    "BailingMoeLinearConfig",
 ]
