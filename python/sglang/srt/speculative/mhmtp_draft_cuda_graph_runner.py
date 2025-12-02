@@ -25,7 +25,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.speculative.mhmtp_utils import MhmtpDraftInput, fast_topk
+from sglang.srt.speculative.mhmtp_utils import MhmtpDraftInput
+from sglang.srt.utils.common import fast_topk
 from sglang.srt.speculative.spec_utils import select_top_k_tokens
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -114,6 +115,7 @@ class MHMTPDraftCudaGraphRunner:
         self.require_gathered_buffer = require_gathered_buffer(
             self.model_runner.server_args
         )
+        self.enable_pdmux = False
         self.require_mlp_tp_gather = require_mlp_tp_gather(
             self.model_runner.server_args
         )
@@ -266,7 +268,7 @@ class MHMTPDraftCudaGraphRunner:
         CudaGraphRunner.capture(self)
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable
+        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
     ) -> tuple[torch.cuda.CUDAGraph, MultiLayerForwardOutput]:
         """Capture CUDA graph for one batch size.
 
