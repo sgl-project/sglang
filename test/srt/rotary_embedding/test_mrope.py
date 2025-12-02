@@ -74,7 +74,6 @@ def create_yarn_rope_scaling(original_config, scaling_factor=2.0):
         "factor": scaling_factor,
         "original_max_position_embeddings": original_config.max_position_embeddings,
     }
-    print(original_config)
     if hasattr(original_config, "rope_scaling") and original_config.rope_scaling:
         if "mrope_section" in original_config.rope_scaling:
             yarn_config["mrope_section"] = original_config.rope_scaling["mrope_section"]
