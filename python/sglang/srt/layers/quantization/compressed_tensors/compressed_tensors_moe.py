@@ -26,7 +26,8 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-from sglang.srt.layers.quantization.w8a8_int8 import NPU_W8A8MoEMethod
+#TODO this import is a hotfix to avoid circular import error. revert after quantization refactor
+import sglang.srt.layers.quantization.w8a8_int8 as w8a8_int8_quant
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -459,7 +460,7 @@ class CompressedTensorsW8A8Int8MoEMethod(CompressedTensorsMoEMethod):
         layer.w13_input_scale = None
         layer.w2_input_scale = None
 
-        self.kernel = NPU_W8A8MoEMethod(None)
+        self.kernel = w8a8_int8_quant.NPU_W8A8MoEMethod(None)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)

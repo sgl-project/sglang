@@ -17,7 +17,8 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-from sglang.srt.layers.quantization.w8a8_int8 import NPU_W8A8DynamicLinearMethod
+#TODO this import is a hotfix to avoid circular import error. revert after quantization refactor
+import sglang.srt.layers.quantization.w8a8_int8 as w8a8_int8_quant
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -174,7 +175,7 @@ class CompressedTensorsW8A8Int8(CompressedTensorsScheme):
                 )
                 layer.register_parameter("input_zero_point", input_zero_point)
         if _is_npu:
-            self.kernel = NPU_W8A8DynamicLinearMethod(None)
+            self.kernel = w8a8_int8_quant.NPU_W8A8DynamicLinearMethod(None)
 
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
