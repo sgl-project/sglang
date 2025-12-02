@@ -972,6 +972,7 @@ def apply_fp8_ptpc_linear(
         output = output + bias
     return output.view(*output_shape)
 
+
 def validate_fp8_block_shape(
     layer: torch.nn.Module,
     input_size: int,
@@ -1013,3 +1014,9 @@ def validate_fp8_block_shape(
                     f"{output_partition_size} is not divisible by "
                     f"weight quantization block_n = {block_n}."
                 )
+
+
+def expert_weight_is_col_major(x: torch.Tensor) -> bool:
+    assert x.dim() == 3
+    b, m, n = x.shape
+    return x.stride(0) == m * n and x.stride(1) == 1 and x.stride(2) == m
