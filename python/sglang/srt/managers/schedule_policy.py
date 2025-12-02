@@ -392,7 +392,7 @@ class PrefillAdder:
                 ]
             )
 
-        self.is_hybrid = isinstance(
+        self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
         self.is_hybrid_gdn_cache = isinstance(self.tree_cache, MambaRadixCache)
@@ -413,7 +413,7 @@ class PrefillAdder:
 
     @property
     def rem_total_tokens(self):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size(),
@@ -435,7 +435,7 @@ class PrefillAdder:
 
     @property
     def cur_rem_tokens(self):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             available_and_evictable = min(
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size(),
@@ -505,7 +505,7 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             try:
                 swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
                 yield None
@@ -558,7 +558,7 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid:
+        if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
             cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
@@ -649,7 +649,7 @@ class PrefillAdder:
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
-                if self.is_hybrid:
+                if self.is_hybrid_swa:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
@@ -685,7 +685,7 @@ class PrefillAdder:
 
                 self.can_run_list.append(req)
                 self.new_chunked_req = req
-                if self.is_hybrid:
+                if self.is_hybrid_swa:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
