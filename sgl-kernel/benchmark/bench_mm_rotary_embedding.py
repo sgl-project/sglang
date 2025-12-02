@@ -183,14 +183,20 @@ def benchmark_mm_rotary_embedding() -> None:
         ours_vals = [r["ours"] for r in results if r["ours"] is not None]
         if ours_vals:
             print(f"  SGLang: {np.mean(ours_vals):.4f} ms")
+        else:
+            print("  SGLang: N/A")
         if HAS_VLLM:
             vllm_vals = [r["vllm"] for r in results if r["vllm"] is not None]
             if vllm_vals:
                 print(f"  vLLM: {np.mean(vllm_vals):.4f} ms")
+            else:
+                print("  vLLM: N/A")
         if HAS_FLASH_ATTN:
             fa_vals = [r["flash_attn"] for r in results if r["flash_attn"] is not None]
             if fa_vals:
                 print(f"  flash_attn: {np.mean(fa_vals):.4f} ms")
+            else:
+                print("  flash_attn: N/A")
    
 
 if __name__ == "__main__":
