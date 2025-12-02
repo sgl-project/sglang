@@ -131,35 +131,31 @@ _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
 
 
 def register_configs(
-    model_name: str,
     sampling_param_cls: Any,
     pipeline_config_cls: Type[PipelineConfig],
-    model_paths: Optional[List[str]] = None,
+    hf_model_paths: Optional[List[str]] = None,
     model_detectors: Optional[List[Callable[[str], bool]]] = None,
 ):
     """
     Registers configuration classes for a new model family.
     """
-    if model_name in _CONFIG_REGISTRY:
-        logger.warning(
-            f"Config for model '{model_name}' is already registered and will be overwritten."
-        )
+    model_id = str(len(_CONFIG_REGISTRY))
 
-    _CONFIG_REGISTRY[model_name] = ConfigInfo(
+    _CONFIG_REGISTRY[model_id] = ConfigInfo(
         sampling_param_cls=sampling_param_cls,
         pipeline_config_cls=pipeline_config_cls,
     )
-    if model_paths:
-        for path in model_paths:
+    if hf_model_paths:
+        for path in hf_model_paths:
             if path in _MODEL_PATH_TO_NAME:
                 logger.warning(
-                    f"Model path '{path}' is already mapped to '{_MODEL_PATH_TO_NAME[path]}' and will be overwritten by '{model_name}'."
+                    f"Model path '{path}' is already mapped to '{_MODEL_PATH_TO_NAME[path]}' and will be overwritten by '{model_id}'."
                 )
-            _MODEL_PATH_TO_NAME[path] = model_name
+            _MODEL_PATH_TO_NAME[path] = model_id
 
     if model_detectors:
         for detector in model_detectors:
-            _MODEL_NAME_DETECTORS.append((model_name, detector))
+            _MODEL_NAME_DETECTORS.append((model_id, detector))
 
 
 def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
@@ -275,29 +271,26 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
 def _register_configs():
     # Hunyuan
     register_configs(
-        model_name="hunyuan",
         sampling_param_cls=HunyuanSamplingParams,
         pipeline_config_cls=HunyuanConfig,
-        model_paths=[
+        hf_model_paths=[
             "hunyuanvideo-community/HunyuanVideo",
         ],
         model_detectors=[lambda id: "hunyuan" in id.lower()],
     )
     register_configs(
-        model_name="fasthunyuan",
         sampling_param_cls=FastHunyuanSamplingParam,
         pipeline_config_cls=FastHunyuanConfig,
-        model_paths=[
+        hf_model_paths=[
             "FastVideo/FastHunyuan-diffusers",
         ],
     )
 
     # StepVideo
     register_configs(
-        model_name="stepvideo",
         sampling_param_cls=StepVideoT2VSamplingParams,
         pipeline_config_cls=StepVideoT2VConfig,
-        model_paths=[
+        hf_model_paths=[
             "FastVideo/stepvideo-t2v-diffusers",
         ],
         model_detectors=[lambda id: "stepvideo" in id.lower()],
@@ -305,115 +298,96 @@ def _register_configs():
 
     # Wan
     register_configs(
-        model_name="wan-t2v-1.3b",
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
         pipeline_config_cls=WanT2V480PConfig,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         ],
         model_detectors=[lambda id: "wanpipeline" in id.lower()],
     )
     register_configs(
-        model_name="wan-t2v-14b",
         sampling_param_cls=WanT2V_14B_SamplingParams,
         pipeline_config_cls=WanT2V720PConfig,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.1-T2V-14B-Diffusers",
         ],
     )
     register_configs(
-        model_name="wan-i2v-14b-480p",
         sampling_param_cls=WanI2V_14B_480P_SamplingParam,
         pipeline_config_cls=WanI2V480PConfig,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.1-I2V-14B-480P-Diffusers",
         ],
         model_detectors=[lambda id: "wanimagetovideo" in id.lower()],
     )
     register_configs(
-        model_name="wan-i2v-14b-720p",
         sampling_param_cls=WanI2V_14B_720P_SamplingParam,
         pipeline_config_cls=WanI2V720PConfig,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
         ],
     )
     register_configs(
-        model_name="wan-fun-1.3b-inp",
         sampling_param_cls=Wan2_1_Fun_1_3B_InP_SamplingParams,
         pipeline_config_cls=WanI2V480PConfig,
-        model_paths=[
+        hf_model_paths=[
             "weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers",
         ],
     )
     register_configs(
-        model_name="wan-ti2v-5b",
         sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
         pipeline_config_cls=Wan2_2_TI2V_5B_Config,
-        model_paths=[
+        hf_model_paths=[
             "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
         ],
     )
 
     register_configs(
-        model_name="fastwan-ti2v-5b",
         sampling_param_cls=Wan2_2_TI2V_5B_SamplingParam,
         pipeline_config_cls=FastWan2_2_TI2V_5B_Config,
-        model_paths=[
+        hf_model_paths=[
             "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
             "FastVideo/FastWan2.2-TI2V-5B-Diffusers",
         ],
     )
 
     register_configs(
-        model_name="wan-t2v-a14b",
         sampling_param_cls=Wan2_2_T2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_T2V_A14B_Config,
-        model_paths=[
-            "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-        ],
     )
     register_configs(
-        model_name="wan-i2v-a14b",
         sampling_param_cls=Wan2_2_I2V_A14B_SamplingParam,
         pipeline_config_cls=Wan2_2_I2V_A14B_Config,
-        model_paths=[
-            "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-        ],
     )
     register_configs(
-        model_name="fast-wan-t2v-1.3b",
         sampling_param_cls=FastWanT2V480PConfig,
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
-        model_paths=[
+        hf_model_paths=[
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
     )
 
     # FLUX
     register_configs(
-        model_name="flux-1",
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=FluxPipelineConfig,
-        model_paths=[
+        hf_model_paths=[
             "black-forest-labs/FLUX.1-dev",
         ],
         model_detectors=[lambda id: "flux.1" in id.lower()],
     )
     register_configs(
-        model_name="flux-2",
         sampling_param_cls=FluxSamplingParams,
         pipeline_config_cls=Flux2PipelineConfig,
-        model_paths=[
+        hf_model_paths=[
             "black-forest-labs/FLUX.2-dev",
         ],
         model_detectors=[lambda id: "flux.2" in id.lower()],
     )
     register_configs(
-        model_name="Z-image",
         sampling_param_cls=ZImageSamplingParams,
         pipeline_config_cls=ZImagePipelineConfig,
-        model_paths=[
+        hf_model_paths=[
             "Tongyi-MAI/Z-Image-Turbo",
         ],
         model_detectors=[lambda id: "z-image" in id.lower()],
@@ -421,12 +395,10 @@ def _register_configs():
 
     # Qwen-Image
     register_configs(
-        model_name="qwen-image",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
     )
     register_configs(
-        model_name="qwen-image-edit",
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
     )
