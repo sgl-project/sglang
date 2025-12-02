@@ -30,15 +30,20 @@ class GptOssDetector(BaseFormatDetector):
         self.bot_token = "<|start|>assistant<|channel|>commentary"
         self.eot_token = "<|call|>"
 
+        self.tool_start_pattern = re.compile(
+            r"<|start|>assistant<|channel|>(analysis|commentary)",
+            re.DOTALL,
+        )
+
         # Pattern to extract function name and JSON from tool_call event content
         self.tool_extract_pattern = re.compile(
-            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*<\|constrain\|>json<\|message\|>(.*?)(?:<\|call\|>|$)",
+            r"to=([a-zA-Z_][a-zA-Z0-9_.-]*)\s*(?:<\|constrain\|>json)?<\|message\|>(.*?)(?:<\|call\|>|<\|return\|>|$)",
             re.DOTALL,
         )
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains TypeScript-style function call markers."""
-        return self.bot_token in text
+        return bool(self.tool_start_pattern.search(text))
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """Parse TypeScript-style function calls from complete text."""
