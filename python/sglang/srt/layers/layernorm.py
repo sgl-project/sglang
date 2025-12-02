@@ -256,8 +256,15 @@ class RMSNorm(CustomOp):
             from sglang.srt.distributed import get_tensor_model_parallel_world_size
 
             if _use_aiter:
+                from sglang.srt.layers.aiter_comm_fusion import (
+                    aiter_allreduce_residual_rmsnorm,
+                )
 
-                fused_op = torch.ops.sglang.aiter_allreduce_residual_rmsnorm
+                fused_op = (
+                    torch.ops.sglang.aiter_allreduce_residual_rmsnorm
+                    if supports_custom_op()
+                    else aiter_allreduce_residual_rmsnorm
+                )
 
                 if get_tensor_model_parallel_world_size() > 1:
                     fused_result = fused_op(
