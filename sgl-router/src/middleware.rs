@@ -222,7 +222,7 @@ impl<B> OnRequest<B> for RequestLogger {
 
         // Log the request start
         info!(
-            target: "sglang_router_rs::request",
+            target: "sgl_model_gateway::request",
             "started processing request"
         );
     }
@@ -254,17 +254,17 @@ impl<B> OnResponse<B> for ResponseLogger {
         let _enter = span.enter();
         if status.is_server_error() {
             error!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "request failed with server error"
             );
         } else if status.is_client_error() {
             warn!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "request failed with client error"
             );
         } else {
             info!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "finished processing request"
             );
         }
@@ -303,7 +303,7 @@ pub struct RequestLogEntry {
 pub fn log_request(entry: RequestLogEntry) {
     if entry.status >= 500 {
         tracing::error!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,
@@ -316,7 +316,7 @@ pub fn log_request(entry: RequestLogEntry) {
         );
     } else if entry.status >= 400 {
         tracing::warn!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,
@@ -328,7 +328,7 @@ pub fn log_request(entry: RequestLogEntry) {
         );
     } else {
         tracing::info!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,
