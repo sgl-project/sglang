@@ -183,11 +183,11 @@ jobs:
     if: always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     env:
-      RUNNER_LABELS: linux-mi325-gpu-8
+      RUNNER_LABELS: linux-mi300-gpu-8
     strategy:
       fail-fast: false
       matrix:
-        runner: [linux-mi325-gpu-8]
+        runner: [linux-mi300-gpu-8]
         part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
