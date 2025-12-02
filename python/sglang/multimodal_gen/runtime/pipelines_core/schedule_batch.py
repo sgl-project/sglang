@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
@@ -39,19 +39,30 @@ class Req:
     This dataclass contains all information needed during the diffusion pipeline
     execution, allowing methods to update specific components without needing
     to manage numerous individual parameters.
+
+    # Attribute Delegation Helpers
+    # -------------------------------------------------------------------------
+    # To enhance usability and streamline the interface, the following methods
+    # implement a delegation mechanism for `sampling_params`.
+    #
+    # Behavior:
+    # 1. Read Access (__getattr__):
+    #    If an attribute is not found directly on the `Req` instance, we
+    #    gracefully attempt to retrieve it from `self.sampling_params` if it
+    #    exists there. This allows for convenient access (e.g., using
+    #    `req.seed` instead of `req.sampling_params.seed`).
+    #
+    # 2. Write Access (__setattr__):
+    #    When setting an attribute, we prioritize fields explicitly defined in
+    #    this dataclass. However, if the attribute is not a `Req` field but
+    #    does exist within `sampling_params`, we update it there. This ensures
+    #    consistency between the wrapper and the underlying parameters.
     """
 
-    # TODO(will): double check that args are separate from server_args
-    # properly. Also maybe think about providing an abstraction for pipeline
-    # specific arguments.
-    data_type: DataType
-
-    request_id: str | None = None
+    sampling_params: SamplingParams = field(default_factory=SamplingParams)
 
     generator: torch.Generator | list[torch.Generator] | None = None
 
-    # Image inputs
-    image_path: str | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
@@ -60,13 +71,7 @@ class Req:
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
-    # Text inputs
-    prompt: str | list[str] | None = None
-    negative_prompt: str | list[str] | None = None
-    prompt_path: str | None = None
-    output_path: str = "outputs/"
     # without extension
-    output_file_name: str | None = None
     output_file_ext: str | None = None
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
@@ -84,9 +89,6 @@ class Req:
     prompt_template: dict[str, Any] | None = None
     do_classifier_free_guidance: bool = False
 
-    # Batch info
-    num_outputs_per_prompt: int = 1
-    seed: int | None = None
     seeds: list[int] | None = None
 
     # Tracking if embeddings are already processed
@@ -106,29 +108,14 @@ class Req:
     # Latent dimensions
     height_latents: list[int] | int | None = None
     width_latents: list[int] | int | None = None
-    num_frames: list[int] | int = 1  # Default for image models
-    num_frames_round_down: bool = (
-        False  # Whether to round down num_frames if it's not divisible by num_gpus
-    )
-
-    # Original dimensions (before VAE scaling)
-    height: list[int] | int | None = None
-    width: list[int] | int | None = None
-    fps: list[int] | int | None = None
-    height_not_provided: bool = False
-    width_not_provided: bool = False
 
     # Timesteps
     timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
-    boundary_ratio: float | None = None
 
     # Scheduler parameters
-    num_inference_steps: int = 50
-    guidance_scale: float = 1.0
     guidance_scale_2: float | None = None
-    guidance_rescale: float = 0.0
     eta: float = 0.0
     sigmas: list[float] | None = None
 
@@ -140,20 +127,13 @@ class Req:
     # Component modules (populated by the pipeline)
     modules: dict[str, Any] = field(default_factory=dict)
 
-    return_trajectory_latents: bool = False
-    return_trajectory_decoded: bool = False
     trajectory_timesteps: list[torch.Tensor] | None = None
     trajectory_latents: torch.Tensor | None = None
 
     # Extra parameters that might be needed by specific pipeline implementations
     extra: dict[str, Any] = field(default_factory=dict)
 
-    # Misc
-    save_output: bool = True
-    return_frames: bool = False
-
     # TeaCache parameters
-    enable_teacache: bool = False
     teacache_params: TeaCacheParams | WanTeaCacheParams | None = None
 
     # STA parameters
@@ -168,17 +148,40 @@ class Req:
     # stage logging
     timings: Optional["RequestTimings"] = None
 
-    # profile
-    profile: bool = False
-    num_profiled_timesteps: int = 8
-
-    # debugging
-    debug: bool = False
-    # dummy for now
-    perf_dump_path: str | None = None
-
     # results
     output: torch.Tensor | None = None
+
+    def __getattr__(self, name):
+        # Get the sampling_params object; it may still be None if initialization is incomplete
+        # Use object.__getattribute__ to avoid potential recursive call risks
+        try:
+            sp = object.__getattribute__(self, "sampling_params")
+        except AttributeError:
+            sp = None
+
+        if sp is not None and hasattr(sp, name):
+            return getattr(sp, name)
+
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def __setattr__(self, name, value):
+        # 1. If the attribute is 'sampling_params' itself, or is defined in Req's type annotations (meaning it's a direct field of Req),
+        #    it must be handled first using super() to write to self, avoiding infinite recursion or overwriting.
+        if name == "sampling_params" or name in self.__class__.__annotations__:
+            super().__setattr__(name, value)
+            return
+
+        try:
+            sp = object.__getattribute__(self, "sampling_params")
+        except AttributeError:
+            sp = None
+
+        if sp is not None and hasattr(sp, name):
+            setattr(sp, name, value)
+        else:
+            super().__setattr__(name, value)
 
     @property
     def batch_size(self):
