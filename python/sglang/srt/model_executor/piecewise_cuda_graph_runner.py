@@ -56,7 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import get_available_device_memory, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -362,7 +362,7 @@ class PiecewiseCudaGraphRunner:
         with freeze_gc(
             self.model_runner.server_args.enable_cudagraph_gc
         ), disable_ca_comm(self.model_runner.tp_group):
-            avail_mem = get_available_gpu_memory(
+            avail_mem = get_available_device_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
                 empty_cache=False,
@@ -375,7 +375,7 @@ class PiecewiseCudaGraphRunner:
             )
             for i, num_tokens in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:
-                    avail_mem = get_available_gpu_memory(
+                    avail_mem = get_available_device_memory(
                         self.model_runner.device,
                         self.model_runner.gpu_id,
                         empty_cache=False,
