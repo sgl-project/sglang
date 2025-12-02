@@ -39,12 +39,7 @@ from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
 )
-from sglang.srt.layers.moe.topk import (
-    StandardTopKOutput,
-    TopKOutput,
-    TopKOutputChecker,
-    TopKOutputFormat,
-)
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -1049,8 +1044,8 @@ class FlashInferFusedMoE(FusedMoE):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            assert (
-                topk_output.format() == TopKOutputFormat.STANDARD
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
             return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
@@ -1138,8 +1133,8 @@ class FlashInferFP4MoE(FusedMoE):
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
-            assert (
-                topk_output.format() == TopKOutputFormat.STANDARD
+            assert TopKOutputChecker.format_is_standard(
+                topk_output
             ), "Only standard topk output is supported for piecewise cuda graph"
             return torch.ops.sglang.moe_forward_piecewise_cuda_graph_impl(
                 hidden_states,
