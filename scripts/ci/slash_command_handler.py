@@ -117,7 +117,9 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         return False
 
 
-def handle_rerun_stage(gh_repo, pr, comment, user_perms, stage_name, react_on_success=True):
+def handle_rerun_stage(
+    gh_repo, pr, comment, user_perms, stage_name, react_on_success=True
+):
     """
     Handles the /rerun-stage <stage-name> command.
     Reruns a specific job/stage in the PR Test workflow.
@@ -153,7 +155,9 @@ def handle_rerun_stage(gh_repo, pr, comment, user_perms, stage_name, react_on_su
         if run.name != "PR Test":
             continue
 
-        print(f"Examining PR Test workflow (ID: {run.id}, Status: {run.status}, Conclusion: {run.conclusion})")
+        print(
+            f"Examining PR Test workflow (ID: {run.id}, Status: {run.status}, Conclusion: {run.conclusion})"
+        )
 
         # Get all jobs in this workflow run
         jobs = run.jobs()
@@ -162,7 +166,9 @@ def handle_rerun_stage(gh_repo, pr, comment, user_perms, stage_name, react_on_su
             # Match the job name with the requested stage
             if job.name == stage_name or stage_name in job.name:
                 found_stage = True
-                print(f"Found matching job: {job.name} (ID: {job.id}, Status: {job.status}, Conclusion: {job.conclusion})")
+                print(
+                    f"Found matching job: {job.name} (ID: {job.id}, Status: {job.status}, Conclusion: {job.conclusion})"
+                )
 
                 # Try to rerun this specific job
                 try:
