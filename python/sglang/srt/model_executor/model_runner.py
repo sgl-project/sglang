@@ -28,6 +28,7 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch import nn
 
 from sglang.srt.configs import (
     FalconH1Config,
@@ -245,6 +246,13 @@ if _is_npu:
 
     torch.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
+
+
+def resolve_language_model(model: nn.Module) -> nn.Module:
+    model_cls_name = model.__class__.__name__
+    if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
+        return model.thinker.model
+    return model.model
 
 
 class RankZeroFilter(logging.Filter):
@@ -2434,6 +2442,7 @@ class ModelRunner:
 
         # Collect attention layers from the model
         self.attention_layers = []
+        self.model.model = resolve_language_model(self.model)
         for layer in self.model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
