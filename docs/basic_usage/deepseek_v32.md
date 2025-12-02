@@ -183,7 +183,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
 
 The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in official tech report.
 ```bash
-Repeat: 8, mean: 0.797
+Repeat: 8, mean: **0**.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
 
@@ -231,7 +231,7 @@ ns prepare_data aime25
 
 PORT=30000
 BACKEND=sglang
-MODEL="deepseek-ai/DeepSeek-V3.2-Exp"
+MODEL="deepseek-ai/DeepSeek-V3.2-Exp" # Should be changed to the model name
 MODEL_NAME="dsv32-fp8"
 
 echo "Starting AIME25 evaluation with model $MODEL on port $PORT using backend $BACKEND..."
@@ -243,7 +243,7 @@ ns eval \
   --output_dir=nemo_skills_aime25_${MODEL_NAME}_output_${BACKEND}_$(date +%Y%m%d_%H%M%S) \
   ++max_concurrent_requests=512 \
   ++server.api_key=dummy \
-  ++inference.tokens_to_generate=64000
+  ++inference.tokens_to_generate=120000
 ```
 
 Test results:
@@ -272,7 +272,7 @@ DeepSeek-V3.2-Speciale:
 | majority@4         | 30          | 14410      | 1758        | 90.00%                | 0.00%     |
 | pass@4             | 30          | 14410      | 1758        | 93.33%                | 0.00%     |
 
-Note that the result of problem#3 with id `aime25-2` is marked as false by nemo-skills  but is actually correct because nemo-skills fails to match predicted_answer `016` with expected_answer `16`. If we add 1/30 = 3.33% to the results, the pass@1[avg-of-4] results match with official reference. (89.3 for DeepSeek-V3.2-Exp, for DeepSeek-V3.2, and for DeepSeek-V3.2-Speciale)
+Note that the result of problem#3 with id `aime25-2` is marked as false by nemo-skills  but is actually correct because nemo-skills fails to match predicted_answer `016` with expected_answer `16`. If we add 1/30 = 3.33% to the results, the pass@1[avg-of-4] results match with official reference. (`89.3` for DeepSeek-V3.2-Exp, for DeepSeek-V3.2, and for DeepSeek-V3.2-Speciale)
 
 
 ## DSA long sequence context parallel optimization(experimental)
