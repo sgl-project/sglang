@@ -266,12 +266,15 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
         )
         return None
 
-    # 4. Combine and return the complete model info
-    return ModelInfo(
+    # 4. Combine the complete model info
+    model_info = ModelInfo(
         pipeline_cls=pipeline_cls,
         sampling_param_cls=config_info.sampling_param_cls,
         pipeline_config_cls=config_info.pipeline_config_cls,
     )
+    logger.info(f"Found model info: {model_info}")
+
+    return model_info
 
 
 # Registration of model configs
