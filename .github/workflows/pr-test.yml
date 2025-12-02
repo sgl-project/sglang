@@ -2,7 +2,7 @@ name: PR Test
 
 on:
   schedule:
-    - cron: '0 */3 * * *'  # Run every 3 hours
+    - cron: '0 */6 * * *'  # Run every 6 hours
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -563,7 +563,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -584,7 +584,7 @@ jobs:
         timeout-minutes: 20
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 2
+          python3 run_suite.py --suite per-commit-4-gpu --auto-partition-id ${{ matrix.part }} --auto-partition-size 3
 
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]

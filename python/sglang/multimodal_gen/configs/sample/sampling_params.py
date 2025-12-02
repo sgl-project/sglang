@@ -299,15 +299,7 @@ class SamplingParams:
         from sglang.multimodal_gen.registry import get_model_info
 
         model_info = get_model_info(model_path)
-        logger.debug(f"Found model info: {model_info}")
-        if model_info is not None:
-            sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
-        else:
-            logger.warning(
-                "Couldn't find an optimal sampling param for %s. Using the default sampling param.",
-                model_path,
-            )
-            sampling_params = cls(**kwargs)
+        sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
@@ -317,8 +309,6 @@ class SamplingParams:
         user_sampling_params = SamplingParams(*args, **kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(user_sampling_params)
-        sampling_params.width_not_provided = user_sampling_params.width is None
-        sampling_params.height_not_provided = user_sampling_params.height is None
         sampling_params._adjust(server_args)
 
         return sampling_params

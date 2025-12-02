@@ -284,6 +284,17 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
 
 
+def get_float_env_var(name: str, default: float = 0.0) -> float:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def support_triton(backend: str) -> bool:
     return backend not in ["torch_native", "intel_amx"]
 
@@ -1160,9 +1171,12 @@ def set_ulimit(target_soft_limit=65535):
 
 
 def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_rank,
+        model_parallel_is_initialized,
+    )
 
-    if get_tensor_model_parallel_rank() == 0:
+    if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
 
 
