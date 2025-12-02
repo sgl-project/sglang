@@ -182,16 +182,6 @@ class InputValidationStage(PipelineStage):
                 "`negative_prompt_embeds` must be provided"
             )
 
-        # Validate height and width
-        if batch.height is None or batch.width is None:
-            raise ValueError(
-                "Height and width must be provided. Please set `height` and `width`."
-            )
-        if batch.height % 8 != 0 or batch.width % 8 != 0:
-            raise ValueError(
-                f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
-            )
-
         # Validate number of inference steps
         if batch.num_inference_steps <= 0:
             raise ValueError(
@@ -236,6 +226,11 @@ class InputValidationStage(PipelineStage):
         )
         # result.add_check("height", batch.height, V.positive_int)
         # result.add_check("width", batch.width, V.positive_int)
+        # Validate height and width
+        # if batch.height % 8 != 0 or batch.width % 8 != 0:
+        #     raise ValueError(
+        #         f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
+        #     )
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )
