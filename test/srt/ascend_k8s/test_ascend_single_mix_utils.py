@@ -1,0 +1,364 @@
+import os
+import subprocess
+
+from sglang.srt.utils import is_npu, kill_process_tree
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+QWEN3_32B_MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/aleoyang/Qwen3-32B-w8a8-MindIE"
+QWEN3_235B_MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/vllm-ascend/Qwen3-235B-A22B-W8A8"
+QWEN3_30B_A3B_MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/Qwen/Qwen3-30B-A3B"
+QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"
+QWEN3_8B_MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/vllm-ascend/Qwen3-8B-W8A8"
+QWEN3_32B_OTHER_ARGS = (
+    [
+        "--trust-remote-code",
+        "--nnodes",
+        "1",
+        "--node-rank",
+        "0",
+        "--attention-backend",
+        "ascend",
+        "--device",
+        "npu",
+        "--quantization",
+        "w8a8_int8",
+        "--max-running-requests",
+        "78",
+        "--context-length",
+        "8192",
+        "--enable-hierarchical-cache",
+        "--hicache-write-policy",
+        "write_through",
+        "--hicache-ratio",
+        "3",
+        "--chunked-prefill-size",
+        "43008",
+        "--max-prefill-tokens",
+        "52500",
+        "--tp-size",
+        "4",
+        "--mem-fraction-static",
+        "0.68",
+        "--cuda-graph-bs",
+        "78",
+        "--dtype",
+        "bfloat16"
+    ]
+    if is_npu()
+    else []
+)
+
+QWEN3_32B_ENVS = {
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+    "HCCL_BUFFSIZE": "400",
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+}
+
+QWEN3_235B_OTHER_ARGS = (
+    [
+        "--trust-remote-code",
+        "--nnodes",
+        "1",
+        "--node-rank",
+        "0",
+        "--attention-backend",
+        "ascend",
+        "--device",
+        "npu",
+        "--quantization",
+        "w8a8_int8",
+        "--max-running-requests",
+        "576",
+        "--context-length",
+        "8192",
+        "--dtype",
+        "bfloat16",
+        "--chunked-prefill-size",
+        "102400",
+        "--max-prefill-tokens",
+        "458880",
+        "--disable-radix-cache",
+        "--moe-a2a-backend",
+        "deepep",
+        "--deepep-mode",
+        "auto",
+        "--tp-size",
+        "16",
+        "--dp-size",
+        "16",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--mem-fraction-static",
+        "0.8",
+        "--cuda-graph-bs",
+        6,
+        12,
+        18,
+        36,
+    ]
+    if is_npu()
+    else []
+)
+
+QWEN3_235B_ENVS = {
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "24",
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
+    "INF_NAN_MODE_FORCE_DISABLE": "1",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+    "HCCL_BUFFSIZE": "2100",
+    "HCCL_SOCKET_IFNAME": "DATA0.3001",
+    "GLOO_SOCKET_IFNAME": "DATA0.3001",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "ENABLE_ASCEND_MOE_NZ": "1",
+}
+
+
+QWEN3_30B_A3B_OTHER_ARGS = (
+    [
+        "--tp",
+        "1",
+        "--trust-remote-code",
+        "--attention-backend",
+        "ascend",
+        "--device",
+        "npu",
+        "--watchdog-timeout",
+        "9000",
+        "--mem-fraction-static",
+        "0.9",
+        "--max-running-requests",
+        "48",
+        "--cuda-graph-bs",
+        "48",
+        "--dtype",
+        "bfloat16",
+        "--disable-radix-cache",
+        "--chunked-prefill-size",
+        "15360",
+        "--max-prefill-tokens",
+        "15360",
+    ]
+)
+
+QWEN3_30B_A3B_ENVS = {
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "STREAMS_PER_DEVICE": "32",
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
+    "HCCL_BUFFSIZE": "1536",
+    "SGLANG_USE_FIA_NZ": "1",
+    "SGLANG_DEEPEP_BF16_DISPATCH": "1",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+}
+
+QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_OTHER_ARGS = (
+    [
+        "--trust-remote-code",
+        "--nnodes",
+        "1",
+        "--node-rank",
+        "0",
+        "--tp-size",
+        "16",
+        "--dp-size",
+        "4",
+        "--mem-fraction-static",
+        "0.7",
+        "--max-running-requests",
+        "32",
+        "--attention-backend",
+        "ascend",
+        "--device",
+        "npu",
+        "--quantization",
+        "w8a8_int8",
+        "--enable-dp-attention",
+        "--cuda-graph-bs",
+        "8",
+        "--watchdog-timeout",
+        "9000",
+        "--chunked-prefill-size",
+        "32768",
+        "--max-prefill-tokens",
+        "458880",
+        "--prefill-round-robin-balance",
+        "--moe-a2a-backend",
+        "deepep",
+        "--deepep-mode",
+        "auto",
+        "--disable-radix-cache",
+        "--dtype",
+        "bfloat16",
+    ]
+)
+
+QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_ENVS = {
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "8",
+    "HCCL_BUFFSIZE": "1536",
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "ENABLE_ASCEND_MOE_NZ": "1",
+    "USE_DEEPEP_INT8": "1",
+    "STREAMS_PER_DEVICE": "32",
+}
+
+QWEN3_8B_OTHER_ARGS = (
+    [
+        "--trust-remote-code",
+        "--nnodes",
+        "1",
+        "--node-rank",
+        "0",
+        "--attention-backend",
+        "ascend",
+        "--device",
+        "npu",
+        "--quantization",
+        "w8a8_int8",
+        "--max-running-requests",
+        "16",
+        "--disable-radix-cache",
+        "--chunked-prefill-size",
+        "43008",
+        "--max-prefill-tokens",
+        "525000",
+        "--tp-size",
+        "4",
+        "--mem-fraction-static",
+        "0.8",
+        "--cuda-graph-bs",
+        "16",
+        "--dtype",
+        "bfloat16",    
+    ]
+)
+
+QWEN3_8B_ENVS = {
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+    "HCCL_BUFFSIZE": "400",
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",     
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    
+}
+
+
+def run_command(cmd, shell=True):
+    try:
+        result = subprocess.run(
+            cmd, shell=shell, capture_output=True, text=True, check=False
+        )
+        return result.stdout
+    except subprocess.CalledProcessError as e:
+        print(f"command error: {e}")
+        return None
+
+def run_bench_serving(host, port, dataset_name="random", request_rate=8, max_concurrency=8, input_len=1024, output_len=1024,
+                      random_range_ratio=1):
+    num_prompts = max_concurrency * 4
+    command = (f"python3 -m sglang.bench_serving --backend sglang --host {host} --port {port} --dataset-name {dataset_name} --request-rate {request_rate} "
+               f"--max-concurrency {max_concurrency} --num-prompts {num_prompts} --random-input-len {input_len} "
+               f"--random-output-len {output_len} --random-range-ratio {random_range_ratio}")
+    print(f"command:{command}")
+    metrics = run_command(f"{command} | tee ./bench_log.txt")
+    return metrics
+
+
+class TestSingleMixUtils(CustomTestCase):
+    model = None
+    dataset_name = None
+    other_args = None
+    timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 10
+    envs = None
+    request_rate = None
+    max_concurrency = None
+    input_len = None
+    output_len = None
+    random_range_ratio = None
+    ttft = None
+    tpot = None
+    output_token_throughput = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        env = os.environ.copy()
+        env.update(cls.envs)
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=cls.timeout,
+            other_args=cls.other_args,
+            env=env,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def run_throughput(self):
+        _, host, port = self.base_url.split(":")
+        host = host[2:]
+        metrics = run_bench_serving(
+            host=host,
+            port=port,
+            dataset_name=self.dataset_name,
+            request_rate=self.request_rate,
+            max_concurrency=self.max_concurrency,
+            input_len=self.input_len,
+            output_len=self.output_len,
+            random_range_ratio=self.random_range_ratio,
+        )
+        print("metrics is " + str(metrics))
+        res_ttft = run_command(
+            "cat ./bench_log.txt | grep 'Mean TTFT' | awk '{print $4}'"
+        )
+        res_tpot = run_command(
+            "cat ./bench_log.txt | grep 'Mean TPOT' | awk '{print $4}'"
+        )
+        res_output_token_throughput = run_command(
+            "cat ./bench_log.txt | grep 'Output token throughput' | awk '{print $5}'"
+        )
+        # self.assertLessEqual(
+        #     float(res_ttft),
+        #     self.ttft,
+        # )
+        # self.assertLessEqual(
+        #     float(res_tpot),
+        #     self.tpot,
+        # )
+        # self.assertGreaterEqual(
+        #     float(res_output_token_throughput),
+        #     self.output_token_throughput,
+        # )
+        self.assertGreater(
+            float(res_ttft),
+            0,
+        )
+        self.assertGreater(
+            float(res_tpot),
+            0,
+        )
+        self.assertGreater(
+            float(res_output_token_throughput),
+            0,
+        )

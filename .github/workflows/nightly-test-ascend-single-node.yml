@@ -30,16 +30,18 @@ jobs:
     container:
       image: ${{ inputs.image }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Check npu info
         run: |
           npu-smi info
-
+          
       - name: Run test
         timeout-minutes: 300
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
-        working-directory: /data/.cache/tests/sglang
         run: |
           python3 -u ${{ inputs.test_case }}
