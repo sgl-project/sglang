@@ -707,13 +707,21 @@ class DeepseekV2MoE(nn.Module):
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
-                assert (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
-                )
-                self.shared_experts_weight_block_size = (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                )
+                if (
+                    _use_aiter
+                    and config.quantization_config.get("quant_method")
+                    == "compressed-tensors"
+                ):
+                    # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    pass
+                else:
+                    assert (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    )
 
         self.top_k = config.num_experts_per_tok
 

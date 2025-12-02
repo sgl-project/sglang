@@ -17,7 +17,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::json;
-use sglang_router_rs::{
+use sgl_model_gateway::{
     config::{
         ConfigError, ConfigValidator, HistoryBackend, OracleConfig, RouterConfig, RoutingMode,
     },
@@ -577,12 +577,14 @@ async fn test_router_factory_openai_mode() {
         worker_urls: vec!["https://api.openai.com".to_string()],
     };
 
-    let router_config =
-        RouterConfig::new(routing_mode, sglang_router_rs::config::PolicyConfig::Random);
+    let router_config = RouterConfig::new(
+        routing_mode,
+        sgl_model_gateway::config::PolicyConfig::Random,
+    );
 
     let app_context = common::create_test_context(router_config).await;
 
-    let router = sglang_router_rs::routers::RouterFactory::create_router(&app_context).await;
+    let router = sgl_model_gateway::routers::RouterFactory::create_router(&app_context).await;
     assert!(
         router.is_ok(),
         "Router factory should create OpenAI router successfully"

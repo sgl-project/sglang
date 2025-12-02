@@ -41,6 +41,7 @@ Its core features include:
    advanced_features/tool_parser.ipynb
    advanced_features/separate_reasoning.ipynb
    advanced_features/quantization.md
+   advanced_features/expert_parallelism.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md
    advanced_features/hicache.rst
@@ -96,6 +97,7 @@ Its core features include:
    references/custom_chat_template.md
    references/frontend/frontend_index.rst
    references/learn_more.md
+   references/post_training_integration.md
 
 .. toctree::
    :maxdepth: 1

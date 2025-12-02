@@ -562,7 +562,6 @@ class VAELoader(ComponentLoader):
 
         server_args.model_paths["vae"] = component_model_path
 
-        # TODO: abstract these logics
         logger.info("HF model config: %s", config)
         vae_config = server_args.pipeline_config.vae_config
         vae_config.update_model_arch(config)

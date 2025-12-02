@@ -197,6 +197,63 @@ class TestDeepseekV32NasBackend_fp8kvcache(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.935)
 
 
+class TestDeepseekV32NasBackend_pure_tp(CustomTestCase):
+    """Test DeepSeek V3.2 with pure TP mode (no DP attention)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEEPSEEK_V32_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        # Pure TP configuration without --dp and --enable-dp-attention
+        other_args = [
+            "--trust-remote-code",
+            "--attention-backend",
+            "nsa",
+            "--nsa-prefill-backend",
+            "flashmla_sparse",
+            "--nsa-decode-backend",
+            "flashmla_kv",
+            "--tp",
+            "8",
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(self):
+        """Test GSM8K accuracy with pure TP mode."""
+        args = SimpleNamespace(
+            num_shots=20,
+            data_path=None,
+            num_questions=1400,
+            parallel=1400,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+
+        if is_in_ci():
+            TEST_RESULTS.append(
+                {
+                    "variant": "pure_tp",
+                    "prefill_backend": "flashmla_sparse",
+                    "decode_backend": "flashmla_kv",
+                    "kv_cache": "fp16",
+                    "accuracy": metrics["accuracy"],
+                }
+            )
+        self.assertGreater(metrics["accuracy"], 0.935)
+
+
 def _write_summary_table():
     """Write a markdown table with all test results."""
     if not TEST_RESULTS:
