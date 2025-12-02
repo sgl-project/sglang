@@ -139,6 +139,10 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         )
         self.logits_processor = LogitsProcessor(config)
 
+        self.num_fused_shared_experts = (
+            0 if get_global_server_args().disable_shared_experts_fusion else 1
+        )
+
     @torch.no_grad()
     def forward(
         self,

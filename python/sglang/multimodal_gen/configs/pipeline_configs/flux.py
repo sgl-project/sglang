@@ -2,8 +2,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 
-import PIL.Image
+import PIL
 import torch
+from diffusers.image_processor import VaeImageProcessor
 
 from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_preprocess_text,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import _pack_latents
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 
 
 def t5_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
@@ -80,6 +82,9 @@ class FluxPipelineConfig(ImagePipelineConfig):
             None,
         ]
     )
+
+    def prepare_sigmas(self, sigmas, num_inference_steps):
+        return self._prepare_sigmas(sigmas, num_inference_steps)
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
         height = 2 * (
@@ -321,7 +326,7 @@ def _prepare_image_ids(
     return image_latent_ids
 
 
-def flux_2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def flux2_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
     hidden_states_layers: list[int] = [10, 20, 30]
 
     out = torch.stack([outputs.hidden_states[k] for k in hidden_states_layers], dim=1)
@@ -412,7 +417,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     )
 
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
-        default_factory=lambda: (flux_2_postprocess_text,)
+        default_factory=lambda: (flux2_postprocess_text,)
     )
     vae_config: VAEConfig = field(default_factory=Flux2VAEConfig)
 
@@ -448,18 +453,51 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds[0]
 
-    def maybe_resize_condition_image(self, width, height, image):
+    def calculate_condition_image_size(
+        self, image, width, height
+    ) -> Optional[tuple[int, int]]:
         target_area: int = 1024 * 1024
-
         if width is not None and height is not None:
             if width * height > target_area:
                 scale = math.sqrt(target_area / (width * height))
                 width = int(width * scale)
                 height = int(height * scale)
-                image = image.resize((width, height), PIL.Image.Resampling.LANCZOS)
-                width, height = image.size
+                return width, height
 
-        return image, width, height
+        return None
+
+    def preprocess_condition_image(
+        self, image, target_width, target_height, vae_image_processor: VaeImageProcessor
+    ):
+        img = image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+        image_width, image_height = img.size
+        vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
+        multiple_of = vae_scale_factor * 2
+        image_width = (image_width // multiple_of) * multiple_of
+        image_height = (image_height // multiple_of) * multiple_of
+        img = vae_image_processor.preprocess(
+            img, height=image_height, width=image_width, resize_mode="crop"
+        )
+        return img, (image_width, image_height)
+
+    def postprocess_image_latent(self, latent_condition, batch):
+        batch_size = batch.batch_size
+        # get image_latent_ids right after scale & shift
+        image_latent_ids = _prepare_image_ids([latent_condition])
+        image_latent_ids = image_latent_ids.repeat(batch_size, 1, 1)
+        image_latent_ids = image_latent_ids.to(get_local_torch_device())
+        batch.condition_image_latent_ids = image_latent_ids
+
+        # latent: (1, 128, 32, 32)
+        packed = self.maybe_pack_latents(
+            latent_condition, None, batch
+        )  # (1, 1024, 128)
+        packed = packed.squeeze(0)  # (1024, 128) - remove batch dim
+
+        # Concatenate all reference tokens along sequence dimension
+        image_latents = packed.unsqueeze(0)  # (1, N*1024, 128)
+        image_latents = image_latents.repeat(batch_size, 1, 1)
+        return image_latents
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
 
@@ -507,7 +545,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def maybe_prepare_latent_ids(self, latents):
         return _prepare_latent_ids(latents)
 
-    def post_process_vae_encode(self, image_latents, vae):
+    def postprocess_vae_encode(self, image_latents, vae):
         # patchify
         image_latents = _patchify_latents(image_latents)
         return image_latents
