@@ -2711,15 +2711,22 @@ class ModelRunner:
         """
         # For duplex models with multiple output streams.
         if isinstance(logits_output, tuple):
-            return torch.stack(
-                [self.sample(values, forward_batch) for values in logits_output],
-                axis=-1,
-            )
+            next_token_ids_list = []
+            callbacks = []
+            for single_logits_output in logits_output:
+                x, y = self.sample(single_logits_output, forward_batch)
+                next_token_ids_list.append(x)
+                callbacks.append(y)
+
+            return torch.stack(next_token_ids_list, axis=-1), lambda: [
+                cb() for cb in callbacks if cb is not None
+            ]
 
         # Calculate logits bias and apply it to next_token_logits.
         callback, mask_ready = forward_batch.sampling_info.init_regex_vocab_mask()
-        callback()
+        print(f"{callback=}, {mask_ready=}")
         if mask_ready is not None:
+            print(f"{mask_ready=}")
             mask_ready.wait()
         forward_batch.sampling_info.apply_logits_bias(logits_output.next_token_logits)
 
@@ -2737,7 +2744,7 @@ class ModelRunner:
                 else forward_batch.seq_lens - 1
             ),
         )
-        return next_token_ids
+        return next_token_ids, callback
 
     def compute_logprobs_only(
         self,

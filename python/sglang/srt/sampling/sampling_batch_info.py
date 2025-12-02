@@ -196,22 +196,30 @@ class SamplingBatchInfo:
             batch_size=len(self.temperatures),
             device=self.device,
         )
+        # Move the mask to the device if needed
+        self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
 
         # force to use static method
         self.apply_mask_func = first_grammar.apply_vocab_mask
-        mask_ready = torch.cuda.Event()
+        from sglang.jit_kernel.cuda_wait_value import Event
+
+        mask_ready = Event()
 
         def update_regex_vocab_callback():
             # Apply the mask
+            mask_buf = first_grammar.allocate_vocab_mask(
+                vocab_size=self.vocab_size,
+                batch_size=len(self.temperatures),
+                device=self.device,
+            )
             for i, grammar in enumerate(self.grammars):
                 if grammar and not grammar.finished and not grammar.is_terminated():
-                    grammar.fill_vocab_mask(self.vocab_mask, i)
+                    grammar.fill_vocab_mask(mask_buf, i)
 
-            # Move the mask to the device if needed
-            self.vocab_mask = first_grammar.move_vocab_mask(
-                self.vocab_mask, self.device
-            )
+            mask_buf = grammar.move_vocab_mask(mask_buf, self.device)
+            self.vocab_mask.copy_(mask_buf)
             mask_ready.record()
+            print("Regex vocab mask is ready.")
 
         if use_callback:
             return update_regex_vocab_callback, mask_ready
@@ -241,6 +249,7 @@ class SamplingBatchInfo:
 
         if self.vocab_mask is not None:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
+            print(f"{logits=}")
 
         if self.logit_bias is not None:
             logits.add_(self.logit_bias)
