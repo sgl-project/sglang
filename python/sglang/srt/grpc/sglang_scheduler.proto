@@ -455,5 +455,5 @@ message GetServerInfoResponse {
   // Note: internal_states not provided in gRPC mode
   // Scheduler-side metrics (memory usage, throughput) require
   // bidirectional communicator infrastructure not available in gRPC.
-  // Use HTTP /get_server_info if scheduler internal state is needed.
+  // Use HTTP /server_info if scheduler internal state is needed.
 }

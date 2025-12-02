@@ -339,7 +339,7 @@ def run_one_case(
     output_throughput = batch_size * output_len / (latency - last_ttft)
     overall_throughput = batch_size * (input_len + output_len) / latency
 
-    server_info = requests.get(url + "/get_server_info").json()
+    server_info = requests.get(url + "/server_info").json()
     internal_state = server_info.get("internal_states", [{}])
     last_gen_throughput = internal_state[0].get("last_gen_throughput", None) or -1
     acc_length = internal_state[0].get("avg_spec_accept_length", None) or -1
@@ -451,7 +451,7 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
         proc, base_url = launch_server_process(server_args)
 
     # Get tokenizer
-    server_info = requests.get(base_url + "/get_server_info").json()
+    server_info = requests.get(base_url + "/server_info").json()
     if "tokenizer_path" in server_info:
         tokenizer_path = server_info["tokenizer_path"]
     elif "prefill" in server_info:
