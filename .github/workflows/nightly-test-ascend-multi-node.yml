@@ -54,7 +54,7 @@ jobs:
       env:
         KUBECONFIG: /data/.cache/kb.yaml
         KUBECTL: /data/.cache/kubectl
-        NAMESPACE: kube-system
+        NAMESPACE: ascend-sglang
         ASCEND_TEST_CASE_PATH: test/srt/ascend_k8s
         KUBE_JOB_NAME: ascend-sglang-test
         KUBE_CONFIG_MAP: ascend-sglang-info
