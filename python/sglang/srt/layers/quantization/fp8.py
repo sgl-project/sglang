@@ -764,8 +764,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     w2_weight_scale, requires_grad=False
                 )
                 layer.w2_input_scale = None
-
-            if _use_aiter:
+            elif _use_aiter:
                 # Pre-shuffle weights
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
@@ -773,13 +772,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
-
-            if _is_cpu:
+            elif _is_cpu:
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            else:
+                # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
+                from sglang.srt.layers.moe import get_moe_runner_backend
+                from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+                from sglang.srt.model_loader.utils import (
+                    should_deepgemm_weight_requant_ue8m0,
+                )
 
+                if (
+                    should_deepgemm_weight_requant_ue8m0(
+                        weight_block_size=getattr(
+                            self.quant_config, "weight_block_size", None
+                        ),
+                    )
+                    and get_moe_runner_backend().is_deep_gemm()
+                ):
+                    assert isinstance(
+                        layer, DeepEPMoE
+                    ), "DeepGemm MoE is only supported with DeepEPMoE"
+                    weight_block_size = self.quant_config.weight_block_size
+                    requant_weight_ue8m0_inplace(
+                        layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
+                    )
+                    requant_weight_ue8m0_inplace(
+                        layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
+                    )
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.

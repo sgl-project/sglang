@@ -74,6 +74,11 @@ def main():
     nightly_dir = Path(__file__).parent / "nightly"
     os.chdir(nightly_dir)
 
+    # Add test/ to PYTHONPATH so tests can import shared utils
+    test_dir = str(Path(__file__).parent)
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = f"{test_dir}:{pythonpath}" if pythonpath else test_dir
+
     print(f"Running {len(files)} tests from suite: {args.suite}")
     print(f"Test files: {[f.name for f in files]}")
 

@@ -553,6 +553,94 @@ class TestRadixCache(unittest.TestCase):
                 result_branch = cache.match_prefix(RadixKey(seq2))
                 torch.testing.assert_close(result_branch.device_indices, val2)
 
+    def test_hash_value_storage(self):
+        """Test that hash_value is stored correctly after insert operations."""
+        cache = RadixCache.create_simulated(
+            page_size=4,
+            enable_kv_cache_events=True,
+        )
+
+        # Insert a sequence
+        cache.insert(RadixKey([1, 2, 3, 4, 5, 6, 7, 8]), None)
+
+        # Trigger event emission to compute hash_value lazily
+        cache.take_events()
+
+        # Find the inserted node (traverse from root)
+        node = cache.root_node
+        for i in range(0, 8, 4):  # page_size=4, so 2 pages
+            child_key = tuple([1, 2, 3, 4][:4]) if i == 0 else tuple([5, 6, 7, 8][:4])
+            if child_key in node.children:
+                node = node.children[child_key]
+                break
+
+        # Verify hash_value is set (computed lazily during event emission)
+        self.assertIsNotNone(node.hash_value)
+        # Should have 2 pages (8 tokens / 4 page_size)
+        self.assertEqual(len(node.hash_value), 2)
+
+    def test_hash_value_repeating_tokens(self):
+        """Test that repeating token patterns get different hash values."""
+        cache = RadixCache.create_simulated(
+            page_size=4,
+            enable_kv_cache_events=True,
+        )
+
+        # Insert a sequence with repeating token pattern: [1,2,3,4, 1,2,3,4]
+        cache.insert(RadixKey([1, 2, 3, 4, 1, 2, 3, 4]), None)
+
+        events = cache.take_events()
+        block_stored_events = [e for e in events if isinstance(e, BlockStored)]
+
+        # Should have 2 blocks (2 pages of size 4)
+        self.assertEqual(len(block_stored_events), 2)
+
+        # Extract block hashes
+        block_hash_1 = block_stored_events[0].block_hashes[0]
+        block_hash_2 = block_stored_events[1].block_hashes[0]
+
+        # The two blocks should have DIFFERENT hashes despite same content
+        # because they are at different positions (sequence-aware hashing)
+        self.assertNotEqual(
+            block_hash_1,
+            block_hash_2,
+            "Repeating token patterns should get different sequence-aware hashes",
+        )
+
+        # First block should have no parent
+        self.assertIsNone(block_stored_events[0].parent_block_hash)
+
+        # Second block's parent should be the first block's hash
+        self.assertEqual(block_stored_events[1].parent_block_hash, block_hash_1)
+
+    def test_hash_value_split(self):
+        """Test that hash_value is split correctly when nodes are split."""
+        cache = RadixCache.create_simulated(
+            page_size=2,
+            enable_kv_cache_events=True,
+        )
+
+        # Insert a sequence that will cause a split
+        cache.insert(RadixKey([1, 2, 3, 4]), None)
+        cache.take_events()  # Clear events and compute hash_value for first node
+
+        # Insert a diverging sequence that will cause a split at page boundary
+        cache.insert(RadixKey([1, 2, 5, 6]), None)
+        cache.take_events()  # Trigger event emission to compute hash_value
+
+        # Find the split node
+        node = cache.root_node
+        child_key = tuple([1, 2])
+        if child_key in node.children:
+            node = node.children[child_key]
+            # After split and event emission, hash_value should be computed
+            # Note: If hash_value wasn't set before split, it will be computed lazily
+            # during event emission. If it was set, it will be split.
+            # Either way, after events are emitted, it should be set.
+            self.assertIsNotNone(node.hash_value)
+            # Should have 1 page (split at page_size=2)
+            self.assertEqual(len(node.hash_value), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

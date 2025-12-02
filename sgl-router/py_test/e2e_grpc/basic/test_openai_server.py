@@ -277,8 +277,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 
     def test_model_list(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        # TODO: Update the logic here when router /v1/models response format matching the openai api standard
-        models = list(client.models.list().models)
+        models = list(client.models.list().data)
         assert len(models) == 1
         # assert isinstance(getattr(models[0], "max_model_len", None), int)
 

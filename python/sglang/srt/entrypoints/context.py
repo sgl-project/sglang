@@ -84,14 +84,6 @@ class HarmonyContext(ConversationContext):
         if isinstance(output, dict) and "output_ids" in output:
             output_token_ids = output["output_ids"]
 
-            # TODO: REMOVE here:
-            # Very hacky, find the first occurrence of token 200006 and cut from there
-            try:
-                start_index = output_token_ids.index(200006)
-                output_token_ids = output_token_ids[start_index:]
-            except ValueError:
-                pass
-
             for token_id in output_token_ids:
                 self.parser.process(token_id)
             output_msgs = self.parser.messages
@@ -189,6 +181,7 @@ class StreamingHarmonyContext(HarmonyContext):
         self.parser = get_streamable_parser_for_assistant()
         self.encoding = get_encoding()
         self.last_tok = None
+        self.num_processed_tokens = 0
 
     @property
     def messages(self) -> list:
@@ -199,16 +192,25 @@ class StreamingHarmonyContext(HarmonyContext):
             # RequestOutput from SGLang with outputs
             output_token_ids = output["output_ids"]
 
-            # TODO: REMOVE here:
-            # Very hacky, find the first occurrence of token 200006 and cut from there
-            # Find the first occurrence of token 200006 and cut from there
-            try:
-                start_index = output_token_ids.index(200006)
-                output_token_ids = output_token_ids[start_index:]
-            except ValueError:
-                pass
+            # Check if we need to handle cumulative tokens
+            meta_info = output.get("meta_info", {})
+            completion_tokens = meta_info.get("completion_tokens")
+            if (
+                completion_tokens is not None
+                and len(output_token_ids) == completion_tokens
+            ):
+                # Case 1: When --stream-output is not set.
+                # The output_ids contains all tokens generated so far.
+                # We only need to process the new tokens.
+                new_token_ids = output_token_ids[self.num_processed_tokens :]
+                self.num_processed_tokens = len(output_token_ids)
+            else:
+                # Case 2: When --stream-output is set.
+                # The output_ids contains only the new tokens.
+                new_token_ids = output_token_ids
+                self.num_processed_tokens += len(output_token_ids)
 
-            for token_id in output_token_ids:
+            for token_id in new_token_ids:
                 self.parser.process(token_id)
 
         else:

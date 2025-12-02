@@ -100,7 +100,7 @@ The steps below show how to build and use an image.
        --port 30000
    ```
 
-4. To verify the utility, you can run a benchmark in another terminal or refer to [other docs](https://docs.sglang.ai/basic_usage/openai_api_completions.html) to send requests to the engine.
+4. To verify the utility, you can run a benchmark in another terminal or refer to [other docs](https://docs.sglang.io/basic_usage/openai_api_completions.html) to send requests to the engine.
 
    ```bash
    drun sglang_image \

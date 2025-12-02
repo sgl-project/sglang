@@ -152,7 +152,7 @@ class FunctionCallParser:
             tool_structures.append(
                 StructuresResponseFormat(
                     begin=info.begin,
-                    schema=schema,  # type: ignore
+                    schema=schema or {},  # type: ignore
                     end=info.end,
                 )
             )

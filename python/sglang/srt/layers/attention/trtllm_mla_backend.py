@@ -24,7 +24,6 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
-from sglang.srt.utils.common import cached_triton_kernel
 
 if is_flashinfer_available():
     import flashinfer
@@ -51,7 +50,6 @@ DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK_SIZE"]))
 @triton.jit
 def pad_draft_extend_query_kernel(
     q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
@@ -125,7 +123,6 @@ def pad_draft_extend_query_kernel(
     )
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK_SIZE"]))
 @triton.jit
 def unpad_draft_extend_output_kernel(
     raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)

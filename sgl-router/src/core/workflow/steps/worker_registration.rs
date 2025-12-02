@@ -24,7 +24,7 @@ use crate::{
     app_context::AppContext,
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        DPAwareWorkerBuilder, HealthConfig, RuntimeType, Worker, WorkerType,
+        DPAwareWorkerBuilder, HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
     },
     protocols::worker_spec::WorkerConfigRequest,
     routers::grpc::client::GrpcClient,
@@ -474,28 +474,13 @@ impl StepExecutor for CreateWorkerStep {
             });
         }
 
-        // Build labels from config
+        // Build labels from config (non-model-specific labels only)
         let mut config_labels = config.labels.clone();
-        if let Some(model_id) = &config.model_id {
-            config_labels.insert("model_id".to_string(), model_id.clone());
-        }
         if let Some(priority) = config.priority {
             config_labels.insert("priority".to_string(), priority.to_string());
         }
         if let Some(cost) = config.cost {
             config_labels.insert("cost".to_string(), cost.to_string());
-        }
-        if let Some(ref tokenizer_path) = config.tokenizer_path {
-            config_labels.insert("tokenizer_path".to_string(), tokenizer_path.clone());
-        }
-        if let Some(ref reasoning_parser) = config.reasoning_parser {
-            config_labels.insert("reasoning_parser".to_string(), reasoning_parser.clone());
-        }
-        if let Some(ref tool_parser) = config.tool_parser {
-            config_labels.insert("tool_parser".to_string(), tool_parser.clone());
-        }
-        if let Some(ref chat_template) = config.chat_template {
-            config_labels.insert("chat_template".to_string(), chat_template.clone());
         }
 
         // Merge: discovered labels first, then config labels (config takes precedence)
@@ -504,18 +489,35 @@ impl StepExecutor for CreateWorkerStep {
             final_labels.insert(key.clone(), value.clone());
         }
 
-        // Derive model_id if not already set
-        if !final_labels.contains_key("model_id") {
-            let derived_model_id = final_labels
-                .get("served_model_name")
-                .or_else(|| final_labels.get("model_path"))
-                .cloned();
+        // Determine model_id: config > served_model_name > model_path > "unknown"
+        let model_id = config
+            .model_id
+            .clone()
+            .or_else(|| final_labels.get("served_model_name").cloned())
+            .or_else(|| final_labels.get("model_path").cloned())
+            .unwrap_or_else(|| "unknown".to_string());
 
-            if let Some(model_id) = derived_model_id {
-                debug!("Derived model_id from metadata: {}", model_id);
-                final_labels.insert("model_id".to_string(), model_id);
-            }
+        if model_id != "unknown" {
+            debug!("Using model_id: {}", model_id);
         }
+
+        // Create ModelCard with model-specific configuration
+        let model_card = {
+            let mut card = ModelCard::new(&model_id);
+            if let Some(ref tokenizer_path) = config.tokenizer_path {
+                card = card.with_tokenizer_path(tokenizer_path.clone());
+            }
+            if let Some(ref reasoning_parser) = config.reasoning_parser {
+                card = card.with_reasoning_parser(reasoning_parser.clone());
+            }
+            if let Some(ref tool_parser) = config.tool_parser {
+                card = card.with_tool_parser(tool_parser.clone());
+            }
+            if let Some(ref chat_template) = config.chat_template {
+                card = card.with_chat_template(chat_template.clone());
+            }
+            card
+        };
 
         debug!(
             "Creating worker {} with {} discovered + {} config = {} final labels",
@@ -621,6 +623,7 @@ impl StepExecutor for CreateWorkerStep {
             for rank in 0..dp_info.dp_size {
                 let mut builder =
                     DPAwareWorkerBuilder::new(normalized_url.clone(), rank, dp_info.dp_size)
+                        .model(model_card.clone())
                         .worker_type(worker_type.clone())
                         .connection_mode(connection_mode.as_ref().clone())
                         .runtime_type(runtime_type.clone())
@@ -656,6 +659,7 @@ impl StepExecutor for CreateWorkerStep {
         } else {
             // Non-DP-aware path: Create single worker
             let mut builder = BasicWorkerBuilder::new(normalized_url.clone())
+                .model(model_card)
                 .worker_type(worker_type)
                 .connection_mode(connection_mode.as_ref().clone())
                 .runtime_type(runtime_type)

@@ -578,6 +578,8 @@ def run_benchmark(server_args: ServerArgs, bench_args: BenchArgs):
 
     if is_in_ci() and bench_args.append_to_github_summary:
         write_github_step_summary(summary)
+    else:
+        print(summary)
 
     # Save results as pydantic models in the JSON format
     if bench_args.pydantic_result_filename:

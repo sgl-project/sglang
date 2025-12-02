@@ -92,6 +92,9 @@ class PipelineStage(ABC):
         # Default implementation - no verification
         return VerificationResult()
 
+    def maybe_free_model_hooks(self):
+        pass
+
     # execute on all ranks by default
     @property
     def parallelism_type(self) -> StageParallelismType:

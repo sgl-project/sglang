@@ -71,7 +71,8 @@ def is_symmetric_memory_enabled():
 
 def set_graph_pool_id(graph_pool_id):
     global _graph_pool_id
-    _graph_pool_id = graph_pool_id
+    if _graph_pool_id is not None:
+        _graph_pool_id = graph_pool_id
 
 
 def disable_symmetric_memory_context():
