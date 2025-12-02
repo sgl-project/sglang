@@ -79,7 +79,7 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 - `/rerun-failed-ci`: Reruns the failed or flaky tests from the most recent commit.
 - `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
 
-If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash_command_handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/13498#issuecomment-3547552157).
+If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
 To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
 
@@ -89,13 +89,13 @@ If you don’t have permission, please ask maintainers to trigger CI for you.
 
 We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
 
-Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default rate limit window is 2 hours, and each workflow can override it via the `rate-limit-hours` input parameter:
+Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default cooldown period is 120 minutes, and each workflow can override it via the `cool-down-minutes` input parameter:
 
 ```yaml
-rate-limit-hours:
-  description: "Rate limit window size in hours; 0 disables rate limiting"
+cool-down-minutes:
+  description: "Default cooldown period in minutes; 0 disables rate limiting"
   type: number
-  default: 2
+  default: 120
 ```
 
 Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.

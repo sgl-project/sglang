@@ -115,7 +115,7 @@ class TestFusedMOE(CustomTestCase):
         quant_info = TritonKernelsQuantInfo(w13_weight=w1_tri, w2_weight=w2_tri)
 
         dispatch_output = StandardDispatchOutput(
-            hidden_states=a, topk_output=triton_topk_output
+            hidden_states=a, hidden_states_scale=None, topk_output=triton_topk_output
         )
 
         torch_per_expert = self.torch_naive_moe(
