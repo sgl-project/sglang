@@ -1,10 +1,14 @@
 from functools import lru_cache
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.utils import get_bool_env_var
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
 @lru_cache(maxsize=1)
@@ -58,6 +62,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         num_local_heads,
         qk_nope_head_dim,
         qk_rope_head_dim,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.qkv_a_proj = fused_qkv_a_proj_with_mqa
@@ -67,6 +72,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.w_kc = w_kc.contiguous()
         self.rotary_emb = rotary_emb
         self.layer_id = layer_id
+        self.quant_config = quant_config
         self.has_preprocess_weights = False
         self.dtype = None
 
@@ -366,14 +372,8 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
-        assert (
-            self.qkv_a_proj.quant_method.quantization_config.get_name() == "modelslim"
-        )
-        _is_w8a8 = (
-            hasattr(self.qkv_a_proj.quant_method, "quantization_config")
-            and self.qkv_a_proj.quant_method.quantization_config.get_name()
-            == "modelslim"
-        )
+        assert self.quant_config and self.quant_config.get_name() == "modelslim"
+        _is_w8a8 = self.quant_config and self.quant_config.get_name() == "modelslim"
         if _is_w8a8:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator

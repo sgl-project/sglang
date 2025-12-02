@@ -128,6 +128,7 @@ def forward_mla_prepare_npu(
                 m.num_local_heads,
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
+                m.quant_config,
             )
         (
             q_pe,
@@ -270,6 +271,7 @@ def forward_dsa_prepare_npu(
                 m.num_local_heads,
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
+                m.quant_config,
             )
         (
             q_pe,
