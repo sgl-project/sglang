@@ -1854,8 +1854,9 @@ if _is_cuda:
         ):
             return
 
-    # Gate the fake registration with an environment variable for diffusion models
-    if not get_bool_env_var("DISABLE_FOR_SGL_KERNEL_FAKE_REGISTER"):
+    # FIXME: for some models, this fake registration will cause NaN outputs.
+    # So we gate the fake registration with an environment variable for them.
+    if not get_bool_env_var("SGLANG_DISABLE_SGL_KERNEL_FAKE_REGISTER"):
 
         @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
         def _(input, output_q, output_s):
