@@ -184,14 +184,24 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
 
     pipeline_name = config.get("_class_name", "").lower()
 
+    matched_model_names = []
     for model_name, detector in _MODEL_NAME_DETECTORS:
         if detector(model_path.lower()) or detector(pipeline_name):
             logger.debug(
-                f"Resolved model name '{model_name}' using a registered detector."
+                f"Matched model name '{model_name}' using a registered detector."
             )
-            return _CONFIG_REGISTRY.get(model_name)
+            matched_model_names += [model_name]
 
-    return None
+    if len(matched_model_names) >= 1:
+        if len(matched_model_names) > 1:
+            logger.warning(
+                f"More than one model name is matched: {matched_model_names}, using the first matched"
+            )
+        model_name = matched_model_names[0]
+    else:
+        return None
+
+    return _CONFIG_REGISTRY.get(model_name)
 
 
 # --- Part 3: Main Resolver ---
