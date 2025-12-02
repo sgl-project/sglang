@@ -1,5 +1,5 @@
-ARG BASE_IMAGE=z.z.z/llm-infra/sglang:v0.5.5-cu129-amd64
-ARG UBUNTU_MIRROR=https://x.x.x/artifactory/deb-remote/ubuntu/
+ARG BASE_IMAGE=
+ARG UBUNTU_MIRROR=http://mirrors.aliyun.com
 
 FROM ${BASE_IMAGE}
 
@@ -15,15 +15,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation \
-    -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple \
     py-spy \
     vllm \
-    transformer_engine[pytorch] \
-    -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple
-
-# ARG SGL_KERNEL_FORCE=0
-# RUN python3 -m pip install https://y.y.y/aie-shared-objects/sgl_kernel-0.3.16.post2-cp310-abi3-manylinux2014_x86_64.whl \
-#    --no-cache-dir --force-reinstall --no-deps && echo "force=${SGL_KERNEL_FORCE}"
+    sglang-router \
+    -i https://mirrors.aliyun.com/pypi/simple
 
 COPY . .
 

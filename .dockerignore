@@ -44,6 +44,3 @@ cmake-build-*/
 *.log
 tmp/
 temp/
-
-# Git
-.git/
