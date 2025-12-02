@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -274,14 +275,14 @@ class DenoisingStage(PipelineStage):
         # FIXME: should probably move to latent preparation stage, to handle with offload
         if (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.pil_image is not None
+            and batch.condition_image is not None
         ):
             # Wan2.2 TI2V directly replaces the first frame of the latent with
             # the image latent instead of appending along the channel dim
             assert batch.image_latent is None, "TI2V task should not have image latents"
             assert self.vae is not None, "VAE is not provided for TI2V task"
-            self.vae = self.vae.to(batch.pil_image.device)
-            z = self.vae.encode(batch.pil_image).mean.float()
+            self.vae = self.vae.to(batch.condition_image.device)
+            z = self.vae.encode(batch.condition_image).mean.float()
             if self.vae.device != "cpu" and server_args.vae_cpu_offload:
                 self.vae = self.vae.to("cpu")
             if hasattr(self.vae, "shift_factor") and self.vae.shift_factor is not None:
@@ -341,7 +342,7 @@ class DenoisingStage(PipelineStage):
         # Shard z and reserved_frames_mask for TI2V if SP is enabled
         if (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.pil_image is not None
+            and batch.condition_image is not None
             and get_sp_world_size() > 1
         ):
             sp_world_size = get_sp_world_size()
@@ -582,12 +583,12 @@ class DenoisingStage(PipelineStage):
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-        prof = torch.profiler.profile(
+        self.profiler = torch.profiler.profile(
             activities=activities,
             schedule=torch.profiler.schedule(
                 skip_first=0,
                 wait=0,
-                warmup=5,
+                warmup=1,
                 active=batch.num_profiled_timesteps,
                 repeat=5,
             ),
@@ -597,8 +598,7 @@ class DenoisingStage(PipelineStage):
             record_shapes=True,
             with_stack=True,
         )
-        prof.start()
-        self.profiler = prof
+        self.profiler.start()
 
     def step_profile(self):
         if self.profiler:
@@ -617,11 +617,13 @@ class DenoisingStage(PipelineStage):
                 log_dir = f"./logs"
                 os.makedirs(log_dir, exist_ok=True)
 
+                rank = get_world_rank()
                 trace_path = os.path.abspath(
-                    os.path.join(log_dir, f"{request_id}.trace.json.gz")
+                    os.path.join(log_dir, f"{request_id}-rank{rank}.trace.json.gz")
                 )
                 logger.info(f"Saving profiler traces to: {trace_path}")
                 self.profiler.export_chrome_trace(trace_path)
+                torch.distributed.barrier()
         except Exception as e:
             logger.error(f"{e}")
 
@@ -687,7 +689,7 @@ class DenoisingStage(PipelineStage):
         # expand timestep
         if (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.pil_image is not None
+            and batch.condition_image is not None
         ):
             # Explicitly cast t_device to the target float type at the beginning.
             # This ensures any precision-based rounding (e.g., float32(999.0) -> bfloat16(1000.0))
@@ -732,7 +734,7 @@ class DenoisingStage(PipelineStage):
         """
         if (
             server_args.pipeline_config.task_type == ModelTaskType.TI2V
-            and batch.pil_image is not None
+            and batch.condition_image is not None
         ):
             # Apply TI2V mask blending with SP-aware z and reserved_frames_mask.
             # This ensures the first frame is always the condition image after each step.
@@ -848,18 +850,18 @@ class DenoisingStage(PipelineStage):
                         # Predict noise residual
                         attn_metadata = self._build_attn_metadata(i, batch, server_args)
                         noise_pred = self._predict_noise_with_cfg(
-                            current_model,
-                            latent_model_input,
-                            timestep,
-                            batch,
-                            i,
-                            attn_metadata,
-                            target_dtype,
-                            current_guidance_scale,
-                            image_kwargs,
-                            pos_cond_kwargs,
-                            neg_cond_kwargs,
-                            server_args,
+                            current_model=current_model,
+                            latent_model_input=latent_model_input,
+                            timestep=timestep,
+                            batch=batch,
+                            timestep_index=i,
+                            attn_metadata=attn_metadata,
+                            target_dtype=target_dtype,
+                            current_guidance_scale=current_guidance_scale,
+                            image_kwargs=image_kwargs,
+                            pos_cond_kwargs=pos_cond_kwargs,
+                            neg_cond_kwargs=neg_cond_kwargs,
+                            server_args=server_args,
                             guidance=guidance,
                             latents=latents,
                         )
@@ -1051,7 +1053,7 @@ class DenoisingStage(PipelineStage):
         current_model: torch.nn.Module,
         latent_model_input: torch.Tensor,
         timestep,
-        batch,
+        batch: Req,
         timestep_index: int,
         attn_metadata,
         target_dtype,
@@ -1351,7 +1353,7 @@ class DenoisingStage(PipelineStage):
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )
-        result.add_check("guidance_scale", batch.guidance_scale, V.positive_float)
+        result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
         result.add_check("eta", batch.eta, V.non_negative_float)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         result.add_check(

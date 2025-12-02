@@ -39,7 +39,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Prometheus metrics and structured tracing for every stage of routing.
 
 ## Documentation
-- **User Guide**: [docs.sglang.ai/advanced_features/router.html](https://docs.sglang.ai/advanced_features/router.html)
+- **User Guide**: [docs.sglang.io/advanced_features/router.html](https://docs.sglang.io/advanced_features/router.html)
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
 ## Installation
@@ -88,11 +88,33 @@ pip install --force-reinstall dist/*.whl
 ```
 > **Note:** Python bindings are located in `bindings/python/` with their own Cargo.toml. Use `maturin develop` for fast iteration during development (builds in debug mode and installs directly). Use `maturin build --release --features vendored-openssl` for production wheels with full optimizations (opt-level="z", lto="fat") and cross-platform compatibility. The package uses abi3 support for Python 3.8+ compatibility.
 
+## Checking Version
+
+After installation, verify the installation and check version information:
+
+```bash
+# Simple version (Rust binary)
+./target/release/sgl-model-gateway --version
+# or use aliases
+./target/release/smg --version
+./target/release/amg --version
+
+# Full version info with build details
+./target/release/sgl-model-gateway --version-verbose
+
+# Python CLI
+amg --version
+amg --version-verbose
+python3 -m sglang_router --version
+```
+
+The `--version` (or `-V`) flag displays the version string. Use `--version-verbose` for comprehensive build information including Git commit, build time, compiler versions, and platform details.
+
 ## Quick Start
 ### Regular HTTP Routing
 - **Rust binary**
   ```bash
-  ./target/release/sglang-router \
+  ./target/release/sgl-model-gateway \
     --worker-urls http://worker1:8000 http://worker2:8000 \
     --policy cache_aware
   ```
@@ -107,7 +129,7 @@ pip install --force-reinstall dist/*.whl
 ### Prefill/Decode Disaggregation (PD)
 - **Rust binary**
   ```bash
-  ./target/release/sglang-router \
+  ./target/release/sgl-model-gateway \
     --pd-disaggregation \
     --prefill http://prefill1:30001 9001 \
     --prefill http://prefill2:30002 \
@@ -132,7 +154,7 @@ Prefill entries accept an optional bootstrap port. PD mode merges prefill metada
 ### Multi-Model Inference Gateway
 Enable IGW mode to route multiple models through a single router while applying per-model policies:
 ```bash
-./target/release/sglang-router \
+./target/release/sgl-model-gateway \
   --enable-igw \
   --policy cache_aware \
   --max-concurrent-requests 512
@@ -180,7 +202,7 @@ Add more workers with the same API; include optional `labels` (for per-model pol
 ### gRPC Routing
 - **Rust binary**
   ```bash
-  ./target/release/sglang-router \
+  ./target/release/sgl-model-gateway \
     --worker-urls grpc://worker-grpc-0:31001 grpc://worker-grpc-1:31002 \
     --tokenizer-path /path/to/tokenizer.json \
     --reasoning-parser deepseek-r1 \
@@ -215,7 +237,7 @@ python3 -m sglang_router.launch_router \
 **Notes**
 - OpenAI backend mode acts as a proxy to a single remote endpoint; load balancing is not applied.
 - Provide exactly one `--worker-urls` entry per router instance.
-- The Rust binary supports the same flags (`./target/release/sglang-router --backend openai ...`).
+- The Rust binary supports the same flags (`./target/release/sgl-model-gateway --backend openai ...`).
 
 ### MCP Integration
 The SGL Model Gateway provides native Model Context Protocol (MCP) client integration, enabling tool calling across STDIO, SSE, and Streamable transports. MCP servers are configured via a YAML configuration file and registered at startup through the workflow engine.
@@ -223,7 +245,7 @@ The SGL Model Gateway provides native Model Context Protocol (MCP) client integr
 #### Basic Usage
 ```bash
 # Rust binary
-./target/release/sglang-router \
+./target/release/sgl-model-gateway \
   --mcp-config-path /path/to/mcp-config.yaml \
   --worker-urls http://worker1:8000
 
@@ -246,12 +268,12 @@ servers:
   - name: "github"
     url: "https://api.github.com/mcp"
     token: "ghp_xxxxx"
-    transport: "sse"
+    protocol: "sse"
     required: false
 
   - name: "custom-tools"
     url: "https://tools.example.com/mcp"
-    transport: "streamable"
+    protocol: "streamable"
     required: true
 
 pool:
@@ -276,7 +298,7 @@ inventory:
 - `command` + `args`: For STDIO transport (local process execution)
 - `url`: For SSE or Streamable transports (HTTP/HTTPS endpoints)
 - `token`: Optional authentication token for HTTP-based transports
-- `transport`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
+- `protocol`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
 - `required`: If `true`, router fails to start if server is unreachable (default: `false`)
 - `envs`: Environment variables for STDIO processes (optional)
 - `proxy`: Per-server proxy override (set to `null` to bypass global proxy)
@@ -312,14 +334,14 @@ envs:
 name: "remote-sse"
 url: "https://mcp.example.com/events"
 token: "bearer-token"
-transport: "sse"
+protocol: "sse"
 ```
 
 **Streamable** (Bidirectional Streaming):
 ```yaml
 name: "streaming-tools"
 url: "https://mcp.example.com/stream"
-transport: "streamable"
+protocol: "streamable"
 required: true
 ```
 
@@ -393,7 +415,7 @@ All administrative routes inherit router API-key protection when `--api-key` is 
 ### Service Discovery
 Enable Kubernetes discovery to reconcile workers automatically:
 ```bash
-./target/release/sglang-router \
+./target/release/sgl-model-gateway \
   --service-discovery \
   --selector app=sglang-worker role=inference \
   --service-discovery-namespace sglang-system \
@@ -454,6 +476,7 @@ Public health endpoints (`/liveness`, `/readiness`, `/health`, `/health_generate
 - `--history-backend memory` (default) stores responses and conversations in-process.
 - `--history-backend none` disables persistence while keeping APIs.
 - `--history-backend oracle` uses Oracle Autonomous Database; provide credentials via flags or environment variables.
+- `--history-backend postgres` uses PostgreSQL Database.
 - Conversation item storage mirrors the history backend (Oracle or memory). The same storage powers OpenAI `/responses` and conversation APIs.
 
 ### History Backend (OpenAI Router Mode)
@@ -465,6 +488,7 @@ Store conversation and response data for tracking, debugging, or analytics.
 - **Memory** (default): In-memory storage, fast but ephemeral.
 - **None**: No storage, minimal overhead.
 - **Oracle**: Persistent storage backed by Oracle Autonomous Database.
+- **Postgres**: Persistent storage backed by PostgreSQL Database.
 
 ```bash
 # Memory backend (default)
@@ -484,6 +508,12 @@ python3 -m sglang_router.launch_router \
   --backend openai \
   --worker-urls https://api.openai.com \
   --history-backend oracle
+
+# PostgreSQL backend
+python3 -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend postgres
 ```
 
 #### Oracle configuration

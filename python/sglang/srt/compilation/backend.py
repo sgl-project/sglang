@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 SPLIT_OPS = [
     "sglang.unified_attention_with_output",
-    "sglang.inplace_all_reduce",
+    "sglang.gdn_with_output",
 ]
 
 
@@ -432,19 +432,24 @@ class SGLangBackend:
             self,
         ).run(*example_inputs)
 
-        graph_path = os.path.join(local_cache_dir, "computation_graph.py")
-        if not os.path.exists(graph_path):
-            # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30 # noqa
-            # use `print_readable` because it can include submodules
-            src = (
-                "from __future__ import annotations\nimport torch\n"
-                + self.split_gm.print_readable(print_output=False)
-            )
-            src = src.replace("<lambda>", "GraphModule")
-            with open(graph_path, "w") as f:
-                f.write(src)
+        rank = torch.distributed.get_rank()
 
-            rank0_log(f"Computation graph saved to {graph_path}")
+        if rank == 0:
+            graph_path = os.path.join(
+                local_cache_dir, f"computation_graph_{time.time()}.py"
+            )
+            if not os.path.exists(graph_path):
+                # code adapted from https://github.com/thuml/depyf/blob/dab831108a752d1facc00acdd6d4243891845c37/depyf/explain/patched_lazy_format_graph_code.py#L30 # noqa
+                # use `print_readable` because it can include submodules
+                src = (
+                    "from __future__ import annotations\nimport torch\n"
+                    + self.split_gm.print_readable(print_output=False)
+                )
+                src = src.replace("<lambda>", "GraphModule")
+                with open(graph_path, "w") as f:
+                    f.write(src)
+
+                rank0_log(f"Computation graph saved to {graph_path}")
 
         self._called = True
         return self.split_gm

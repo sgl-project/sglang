@@ -7,12 +7,11 @@ If the actual run is significantly better than the baseline, the improved cases 
 
 from __future__ import annotations
 
-import base64
 import os
-import time
 from pathlib import Path
 from typing import Any, Callable
 
+import openai
 import pytest
 from openai import OpenAI
 
@@ -26,6 +25,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
     WarmupRunner,
     download_image_from_url,
+    get_generate_fn,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
@@ -33,12 +33,10 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     PerformanceSummary,
     ScenarioConfig,
 )
-from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
+    is_image_url,
     read_perf_logs,
-    validate_image,
-    validate_openai_video,
     wait_for_req_perf_record,
 )
 
@@ -50,13 +48,16 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
-
+    server_args = case.server_args
+    sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-    extra_args += f" --num-gpus {case.num_gpus} --ulysses-degree {case.num_gpus}"
+    extra_args += (
+        f" --num-gpus {server_args.num_gpus} --ulysses-degree {server_args.num_gpus}"
+    )
 
     # start server
     manager = ServerManager(
-        model=case.model_path,
+        model=server_args.model_path,
         port=port,
         wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
         extra_args=extra_args,
@@ -64,25 +65,30 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     ctx = manager.start()
 
     try:
+        # Reconstruct output size for OpenAI API
+        output_size = sampling_params.output_size
         warmup = WarmupRunner(
             port=ctx.port,
-            model=case.model_path,
-            prompt=case.prompt or "A colorful raccoon icon",
-            output_size=case.output_size,
+            model=server_args.model_path,
+            prompt=sampling_params.prompt or "A colorful raccoon icon",
+            output_size=output_size,
         )
-        warmup.run_text_warmups(case.warmup_text)
+        warmup.run_text_warmups(server_args.warmup_text)
 
-        if case.warmup_edit > 0 and case.edit_prompt and case.image_path:
+        if (
+            case.server_args.warmup_edit > 0
+            and case.sampling_params.prompt
+            and sampling_params.image_path
+        ):
             # Handle URL or local path
-            image_path = case.image_path
-            if case.is_image_url():
-                image_path = download_image_from_url(str(case.image_path))
+            if is_image_url(sampling_params.image_path):
+                image_path = download_image_from_url(str(sampling_params.image_path))
             else:
-                image_path = Path(case.image_path)
+                image_path = Path(sampling_params.image_path)
 
             warmup.run_edit_warmups(
-                count=case.warmup_edit,
-                edit_prompt=case.edit_prompt,
+                count=server_args.warmup_edit,
+                edit_prompt=sampling_params.prompt,
                 image_path=image_path,
             )
     except Exception as exc:
@@ -141,14 +147,16 @@ Consider updating perf_baselines.json with the snippets below:
     def run_and_collect(
         self,
         ctx: ServerContext,
-        generate_fn: Callable[[], str],
+        case_id: str,
+        generate_fn: Callable[[str, openai.Client], str],
     ) -> RequestPerfRecord:
         """Run generation and collect performance records."""
         log_path = ctx.perf_log_path
         prev_len = len(read_perf_logs(log_path))
         log_wait_timeout = 30
 
-        rid = generate_fn()
+        client = self._client(ctx)
+        rid = generate_fn(case_id, client)
 
         req_perf_record, _ = wait_for_req_perf_record(
             rid,
@@ -158,241 +166,6 @@ Consider updating perf_baselines.json with the snippets below:
         )
 
         return req_perf_record
-
-    def get_generate_fn(
-        self,
-        ctx: ServerContext,
-        case: DiffusionTestCase,
-    ) -> Callable[[], str]:
-        """Return appropriate generation function for the case."""
-        client = self._client(ctx)
-
-        def _create_and_download_video(
-            *,
-            model: str,
-            size: str,
-            prompt: str | None = None,
-            seconds: int | None = None,
-            input_reference: Any | None = None,
-        ) -> str:
-            """
-            Create a video job via /v1/videos, poll until completion,
-            then download the binary content and validate it.
-            """
-            create_kwargs: dict[str, Any] = {
-                "model": model,
-                "size": size,
-            }
-            if prompt is not None:
-                create_kwargs["prompt"] = prompt
-            if seconds is not None:
-                create_kwargs["seconds"] = seconds
-            if input_reference is not None:
-                create_kwargs["input_reference"] = input_reference  # triggers multipart
-
-            # create video job
-            job = client.videos.create(**create_kwargs)  # type: ignore[attr-defined]
-            video_id = job.id
-
-            job_completed = False
-            is_baseline_generation_mode = (
-                os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
-            )
-            timeout = 3600.0 if is_baseline_generation_mode else 1200.0
-            deadline = time.time() + timeout
-            while True:
-                page = client.videos.list()  # type: ignore[attr-defined]
-                item = next((v for v in page.data if v.id == video_id), None)
-
-                if item and getattr(item, "status", None) == "completed":
-                    job_completed = True
-                    break
-
-                if time.time() > deadline:
-                    break
-
-                time.sleep(1)
-
-            if not job_completed:
-                if is_baseline_generation_mode:
-                    logger.warning(
-                        f"{case.id}: video job {video_id} timed out during baseline generation. "
-                        "Attempting to collect performance data anyway."
-                    )
-                    return video_id
-
-                pytest.fail(f"{case.id}: video job {video_id} did not complete in time")
-
-            # download video
-            resp = client.videos.download_content(video_id=video_id)  # type: ignore[attr-defined]
-            content = resp.read()
-            validate_openai_video(content)
-
-            tmp_path = f"{video_id}.mp4"
-            with open(tmp_path, "wb") as f:
-                f.write(content)
-            upload_file_to_slack(
-                case_id=case.id,
-                model=case.model_path,
-                prompt=case.prompt,
-                file_path=tmp_path,
-                origin_file_path=case.image_path,
-            )
-            os.remove(tmp_path)
-
-            return video_id
-
-        # for all tests, seconds = case.seconds or fallback 4 seconds
-        video_seconds = case.seconds or 4
-
-        # -------------------------
-        # IMAGE MODE
-        # -------------------------
-
-        def generate_image() -> str:
-            """T2I: Text to Image generation."""
-            if not case.prompt:
-                pytest.skip(f"{case.id}: no text prompt configured")
-
-            response = client.images.with_raw_response.generate(
-                model=case.model_path,
-                prompt=case.prompt,
-                n=1,
-                size=case.output_size,
-                response_format="b64_json",
-            )
-            result = response.parse()
-            validate_image(result.data[0].b64_json)
-
-            img_data = base64.b64decode(result.data[0].b64_json)
-            tmp_path = f"{result.created}.png"
-            with open(tmp_path, "wb") as f:
-                f.write(img_data)
-            upload_file_to_slack(
-                case_id=case.id,
-                model=case.model_path,
-                prompt=case.prompt,
-                file_path=tmp_path,
-            )
-            os.remove(tmp_path)
-
-            return str(result.created)
-
-        def generate_image_edit() -> str:
-            """TI2I: Text + Image ? Image edit."""
-            if not case.edit_prompt or not case.image_path:
-                pytest.skip(f"{case.id}: no edit config")
-
-            # Handle URL or local path
-            if case.is_image_url():
-                image_path = download_image_from_url(str(case.image_path))
-            else:
-                image_path = Path(case.image_path)
-                if not image_path.exists():
-                    pytest.skip(f"{case.id}: file missing: {image_path}")
-
-            with image_path.open("rb") as fh:
-                response = client.images.with_raw_response.edit(
-                    model=case.model_path,
-                    image=fh,
-                    prompt=case.edit_prompt,
-                    n=1,
-                    size=case.output_size,
-                    response_format="b64_json",
-                )
-            rid = response.headers.get("x-request-id", "")
-
-            result = response.parse()
-            validate_image(result.data[0].b64_json)
-
-            img_data = base64.b64decode(result.data[0].b64_json)
-            tmp_path = f"{rid}.png"
-            with open(tmp_path, "wb") as f:
-                f.write(img_data)
-            upload_file_to_slack(
-                case_id=case.id,
-                model=case.model_path,
-                prompt=case.edit_prompt,
-                file_path=tmp_path,
-                origin_file_path=case.image_path,
-            )
-            os.remove(tmp_path)
-
-            return rid
-
-        # -------------------------
-        # VIDEO MODE
-        # -------------------------
-
-        def generate_video() -> str:
-            """T2V: Text ? Video."""
-            if not case.prompt:
-                pytest.skip(f"{case.id}: no text prompt configured")
-
-            return _create_and_download_video(
-                model=case.model_path,
-                prompt=case.prompt,
-                size=case.output_size,
-                seconds=video_seconds,
-            )
-
-        def generate_image_to_video() -> str:
-            """I2V: Image ? Video (optional prompt)."""
-            if not case.image_path:
-                pytest.skip(f"{case.id}: no input image configured")
-
-            # Handle URL or local path
-            if case.is_image_url():
-                image_path = download_image_from_url(str(case.image_path))
-            else:
-                image_path = Path(case.image_path)
-                if not image_path.exists():
-                    pytest.skip(f"{case.id}: file missing: {image_path}")
-
-            with image_path.open("rb") as fh:
-                return _create_and_download_video(
-                    model=case.model_path,
-                    prompt=case.edit_prompt,
-                    size=case.output_size,
-                    seconds=video_seconds,
-                    input_reference=fh,
-                )
-
-        def generate_text_image_to_video() -> str:
-            """TI2V: Text + Image ? Video."""
-            if not case.edit_prompt or not case.image_path:
-                pytest.skip(f"{case.id}: no edit config")
-
-            # Handle URL or local path
-            if case.is_image_url():
-                image_path = download_image_from_url(str(case.image_path))
-            else:
-                image_path = Path(case.image_path)
-                if not image_path.exists():
-                    pytest.skip(f"{case.id}: file missing: {image_path}")
-
-            with image_path.open("rb") as fh:
-                return _create_and_download_video(
-                    model=case.model_path,
-                    prompt=case.edit_prompt,
-                    size=case.output_size,
-                    seconds=video_seconds,
-                    input_reference=fh,
-                )
-
-        if case.modality == "video":
-            if case.image_path and case.edit_prompt:
-                return generate_text_image_to_video
-            elif case.image_path:
-                return generate_image_to_video
-            else:
-                return generate_video
-
-        # Image modality
-        if case.edit_prompt and case.image_path:
-            return generate_image_edit
-
-        return generate_image
 
     def _validate_and_record(
         self,
@@ -420,7 +193,7 @@ Consider updating perf_baselines.json with the snippets below:
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
-        validator_name = case.custom_validator or "default"
+        validator_name = case.server_args.custom_validator or "default"
         validator_class = VALIDATOR_REGISTRY.get(validator_name, PerformanceValidator)
 
         validator = validator_class(
@@ -440,7 +213,7 @@ Consider updating perf_baselines.json with the snippets below:
         self._check_for_improvement(case, summary, scenario)
 
         try:
-            validator.validate(perf_record, case.num_frames)
+            validator.validate(perf_record, case.sampling_params.num_frames)
         except AssertionError as e:
             logger.error(f"Performance validation failed for {case.id}:\n{e}")
             self._dump_baseline_for_testcase(case, summary, missing_scenario)
@@ -448,7 +221,7 @@ Consider updating perf_baselines.json with the snippets below:
 
         result = {
             "test_name": case.id,
-            "modality": case.modality,
+            "modality": case.server_args.modality,
             "e2e_ms": summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
@@ -569,7 +342,7 @@ Consider updating perf_baselines.json with the snippets below:
         }
 
         # Video-specific metrics
-        if case.modality == "video":
+        if case.server_args.modality == "video":
             if "per_frame_generation" not in baseline["stages_ms"]:
                 baseline["stages_ms"]["per_frame_generation"] = (
                     round(summary.avg_frame_time_ms, 2)
@@ -598,9 +371,14 @@ Consider updating perf_baselines.json with the snippets below:
         - test_diffusion_perf[qwen_image_edit]
         - etc.
         """
-        generate_fn = self.get_generate_fn(diffusion_server, case)
+        generate_fn = get_generate_fn(
+            model_path=case.server_args.model_path,
+            modality=case.server_args.modality,
+            sampling_params=case.sampling_params,
+        )
         perf_record = self.run_and_collect(
             diffusion_server,
+            case.id,
             generate_fn,
         )
         self._validate_and_record(case, perf_record)

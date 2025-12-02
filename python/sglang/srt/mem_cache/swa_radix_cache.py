@@ -108,9 +108,9 @@ def get_last_access_time() -> float64:
 
 
 class LRUList:
-    def __init__(self, swa: bool = False):
-        self.swa = swa
-        if self.swa:
+    def __init__(self, is_swa_list: bool = False):
+        self.is_swa_list = is_swa_list
+        if self.is_swa_list:
             self.prv = "swa_prev"
             self.nxt = "swa_next"
             self.lock_ref = "swa_lock_ref"
@@ -163,7 +163,7 @@ class LRUList:
         """
         assert node.id in self.cache, f"Resetting node {node.id=} not in lru list"
         assert (
-            not self.swa or not node.swa_tombstone
+            not self.is_swa_list or not node.swa_tombstone
         ), f"Resetting swa tombstone node in swa lru list: {node.id=}"
         self._remove_node(node)
         self._add_node(node)
@@ -176,7 +176,7 @@ class LRUList:
         prev_node = self.head
         while node != root_node:
             # for swa lru list, only reset non-tombstone nodes
-            if not self.swa or not node.swa_tombstone:
+            if not self.is_swa_list or not node.swa_tombstone:
                 assert (
                     node.id in self.cache
                 ), f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
@@ -190,7 +190,7 @@ class LRUList:
         Insert a (new) node as most recently used
         """
         assert (
-            not self.swa or not node.swa_tombstone
+            not self.is_swa_list or not node.swa_tombstone
         ), f"Inserting swa tombstone node in swa lru list: {node.id=}"
         assert (
             node.id not in self.cache
@@ -204,7 +204,7 @@ class LRUList:
         """
         assert node.id in self.cache, f"Removing node {node.id=} not in lru list"
         assert (
-            not self.swa or not node.swa_tombstone
+            not self.is_swa_list or not node.swa_tombstone
         ), f"Removing swa tombstone node from swa lru list: {node.id=}"
         del self.cache[node.id]
         self._remove_node(node)
@@ -282,7 +282,7 @@ class LRUList:
         checking if the lru list is valid.
         """
         try:
-            if self.swa:
+            if self.is_swa_list:
                 nodes = tree_cache._collect_nontombstone_nodes()
             else:
                 nodes = tree_cache._collect_all_nodes()
@@ -303,7 +303,7 @@ class LRUList:
                     continue
                 assert (
                     x == x_lru
-                ), f"Incorrect LRU list, {self.swa=}, x: {x.id=} != x_lru: {x_lru.id=}"
+                ), f"Incorrect LRU list, {self.is_swa_list=}, x: {x.id=} != x_lru: {x_lru.id=}"
                 assert (
                     x_lru.full_lock_ref == 0
                 ), f"x_lru should not be locked when idle, {x_lru.full_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
@@ -312,7 +312,7 @@ class LRUList:
                 ), f"x_lru should not be locked when idle, {x_lru.swa_lock_ref=}, {x_lru.swa_uuid=}, {x_lru.id=}"
                 x_lru = getattr(x, self.prv)
 
-            if self.swa:
+            if self.is_swa_list:
                 evictable_size = tree_cache.swa_evictable_size()
                 lru_list_evictable_size = tree_cache.swa_lru_list_evictable_size()
             else:
@@ -321,7 +321,7 @@ class LRUList:
 
             assert (
                 evictable_size == lru_list_evictable_size
-            ), f"{self.swa=}, total nodes: {total_nodes}, total lru plus 1: {total_lru_plus_1}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
+            ), f"{self.is_swa_list=}, total nodes: {total_nodes}, total lru plus 1: {total_lru_plus_1}, evictable size: {evictable_size} != lru list evictable size: {lru_list_evictable_size}"
         except Exception as e:
             msg = f"SWA Radix tree sanity check failed, ping @hanming-lu: {e}"
             logger.error(msg)
@@ -373,8 +373,8 @@ class SWARadixCache(BasePrefixCache):
         self.full_protected_size_ = 0
         self.swa_protected_size_ = 0
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
-        self.full_lru_list = LRUList(swa=False)
-        self.swa_lru_list = LRUList(swa=True)
+        self.full_lru_list = LRUList(is_swa_list=False)
+        self.swa_lru_list = LRUList(is_swa_list=True)
 
     def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -541,9 +541,14 @@ class SWARadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(
+        match_result = self.match_prefix(
             RadixKey(page_aligned_token_ids, req.extra_key)
         )
+        (new_indices, new_last_node) = (
+            match_result.device_indices,
+            match_result.last_device_node,
+        )
+
         assert old_prefix_len <= len(
             new_indices
         ), f"{req.prefix_indices=}, {new_indices=}"

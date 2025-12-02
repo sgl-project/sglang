@@ -96,7 +96,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 if forward_batch.spec_info.topk > 1:
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
-                    retrieve_parent_token = torch.empty_like(retrieve_next_token)
+                    # retrieve_next_token is None during dummy run so skip tensor creation
+                    if retrieve_next_token is not None:
+                        retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
                 query_start_loc = torch.empty(
                     (bs + 1,), dtype=torch.int32, device=self.device
