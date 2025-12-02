@@ -971,3 +971,110 @@ def apply_fp8_ptpc_linear(
     if bias is not None:
         output = output + bias
     return output.view(*output_shape)
+
+def validate_fp8_block_shape(
+    layer: torch.nn.Module,
+    input_size: int,
+    output_size: int,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    block_size: list[int],
+) -> None:
+    """Validate block quantization shapes for tensor parallelism."""
+    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+    tp_size = getattr(layer, "tp_size", get_tensor_model_parallel_world_size())
+    block_n, block_k = block_size[0], block_size[1]
+
+    # Required by row parallel
+    if (
+        tp_size > 1
+        and input_size // input_size_per_partition == tp_size
+        and input_size_per_partition % block_k != 0
+    ):
+        raise ValueError(
+            f"Weight input_size_per_partition = {input_size_per_partition} "
+            f"is not divisible by weight quantization block_k = {block_k}."
+        )
+
+    # Required by column parallel or enabling merged weights
+    is_tp_split = tp_size > 1 and output_size // sum(output_partition_sizes) == tp_size
+    is_merged_gemm = len(output_partition_sizes) > 1
+    if is_tp_split or is_merged_gemm:
+        sizes_to_check = output_partition_sizes
+        if not is_tp_split and is_merged_gemm:
+            # In case of merged matrices, we allow the last
+            # matrix to not be a multiple of block size
+            sizes_to_check = output_partition_sizes[:-1]
+        for output_partition_size in sizes_to_check:
+            if output_partition_size % block_n != 0:
+                raise ValueError(
+                    f"Weight output_partition_size = "
+                    f"{output_partition_size} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )
+
+def apply_fp8_block_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: torch.Tensor | None = None,
+    weight_group_shape: list[int] | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    assert input_scale is None
+    # View input as 2D matrix for fp8 methods
+    input_2d = input.view(-1, input.shape[-1])
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    if VLLM_AVAILABLE and use_vllm_cutlass_w8a8_fp8_kernel:
+        # input: torch.Tensor,
+        # scale: Optional[torch.Tensor] = None,
+        # num_token_padding: Optional[int] = None,
+        # use_per_token_if_dynamic: bool = False,
+        assert input_scale is None
+
+        # GroupShape(1, self.weight_block_size[0])
+        q_input, input_scale = scaled_fp8_quant(
+            input_2d,
+            input_scale=None,
+            num_token_padding=None,
+            use_per_token_if_dynamic=False,
+        )
+        
+        # Fall back to vllm cutlass w8a8 fp8 kernel
+        output = ops.cutlass_scaled_mm(
+            q_input,
+            weight,
+            input_scale,
+            weight_scale,
+            weight_group_shape,
+            input_2d.dtype,
+        )
+    else:
+        # Run triton w8a8 fp8 kernel
+        
+        assert input_scale is None
+        # assert self.input_quant_op is not None
+        # q_input, input_scale = self.input_quant_op(input_2d)
+        # return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+        #     q_input,
+        #     weight,
+        #     input_scale,
+        #     weight_scale,
+        #     weight_group_shape,
+        #     input_2d.dtype,
+        # )
+
+        output = triton_w8a8_block_fp8_linear(
+            input_2d,
+            weight,
+            weight_group_shape,
+            weight_scale,
+            input_scale,
+            bias,
+        )
+
+    if bias is not None:
+        output = output + bias
+    return output.to(dtype=input.dtype).view(*output_shape)

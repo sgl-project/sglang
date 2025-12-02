@@ -306,7 +306,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Only symmetric weight quantization supported.
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
-    def _is_fp8_w8a8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+    def _is_fp8_w8a8(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
         # Confirm weights and activations quantized.
         if weight_quant is None or input_quant is None:
             return False
@@ -318,15 +320,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         is_symmetric_weight = weight_quant.symmetric
         is_static_weight = not weight_quant.dynamic
-        is_per_tensor_or_channel_weight = weight_quant.strategy in [
+        is_tensor_or_channel_or_block_weight = weight_quant.strategy in [
             QuantizationStrategy.TENSOR,
             QuantizationStrategy.CHANNEL,
+            QuantizationStrategy.BLOCK,
         ]
         if not (
             is_floating_point
             and is_symmetric_weight
             and is_static_weight
-            and is_per_tensor_or_channel_weight
+            and is_tensor_or_channel_or_block_weight
         ):
             return False
 
@@ -406,7 +409,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
-                        strategy=weight_quant.strategy,
+                        weight_quant=weight_quant,
                         is_static_input_scheme=(
                             input_quant and not input_quant.dynamic
                         ),
