@@ -612,6 +612,16 @@ def popen_launch_server(
     if api_key:
         command += ["--api-key", api_key]
 
+    # A significant speedup can be observed in the CI time when we set the default
+    # server argument to always include multithreaded model load, where
+    # --model-loader-extra-config "{\"enable_multithread_load\": true, \"num_threads\": 8}"
+    # as an equivalent is set by the default.
+    if "--model-loader-extra-config" not in command:
+        command += [
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true, "num_threads": 8}',
+        ]
+
     print(f"command={' '.join(command)}")
 
     if return_stdout_stderr:
