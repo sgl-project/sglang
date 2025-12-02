@@ -11,7 +11,7 @@ on:
       duration_minutes:
         description: 'Timeout per model in minutes'
         required: true
-        default: '45'
+        default: '60'
         type: string
 
 jobs:
