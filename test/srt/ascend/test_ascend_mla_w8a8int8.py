@@ -35,7 +35,7 @@ class TestAscendMlaW8A8Int8(CustomTestCase):
             "--mem-fraction-static",
             0.8,
             "--attention-backend",
-            "ascend",
+            "modelslim",
             "--quantization",
             "w8a8_int8",
             "--tp-size",
