@@ -131,8 +131,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
-from sglang.srt.model_executor.npu_compile_model_runner import NPUCompileModelRunner
 from sglang.srt.model_executor.input_buffers import GraphInputBuffers
+from sglang.srt.model_executor.npu_compile_model_runner import NPUCompileModelRunner
 from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
