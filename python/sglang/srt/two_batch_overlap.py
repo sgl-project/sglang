@@ -832,7 +832,7 @@ def _model_forward_tbo(
     input_data_scatter_mode: ScatterMode,
     layer_input_scatter_mode: ScatterMode,
 ):
-    inputs_arr = _model_forward_tbo_split_inputs(
+    inputs_arr, tbo_context = _model_forward_tbo_split_inputs(
         **inputs,
         input_data_scatter_mode=input_data_scatter_mode,
         layer_input_scatter_mode=layer_input_scatter_mode,
@@ -854,7 +854,11 @@ def _model_forward_tbo(
             delta_stages=[0, operations_strategy.tbo_delta_stages],
         )
 
-    return _model_forward_tbo_merge_outputs(*outputs_arr)
+    ret = _model_forward_tbo_merge_outputs(*outputs_arr)
+    if ret[0] is not None:
+        ret[0]._tbo_inputs = inputs_arr
+        ret[0]._tbo_context = tbo_context
+    return ret
 
 
 def _model_forward_non_tbo(inputs, operations_strategy: OperationsStrategy):
@@ -909,7 +913,7 @@ def _model_forward_tbo_split_inputs(
             **kwargs,
         )
 
-    return [_post_transform(**inputs) for inputs in inputs_arr]
+    return [_post_transform(**inputs) for inputs in inputs_arr], context
 
 
 def _model_forward_tbo_split_inputs_raw(
