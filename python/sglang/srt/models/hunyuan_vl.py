@@ -32,7 +32,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens,general_mm_embed_routine
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -490,19 +490,18 @@ class HunYuanVLForConditionalGeneration(
         forward_batch: ForwardBatch,
         input_embeds=None,
         get_embedding: bool = False,
-        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         if self.xdrope_enabled:
             positions = forward_batch.xdrope_positions
 
-        input_embeds = forward_batch.input_embeds
-        hidden_states = self.model(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
+            language_model=self.model,
+            multimodal_model=self,
             positions=positions,
-            # pp_proxy_tensors=pp_proxy_tensors,
         )
+
         if self.pp_group.is_last_rank:
             if not get_embedding:
                 return self.logits_processor(
