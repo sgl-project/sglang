@@ -13,6 +13,7 @@ v1 = client.CoreV1Api()
 
 LOCAL_TIMEOUT = 10800
 KUBE_NAME_SPACE = os.environ.get('NAMESPACE')
+KUBE_CONFIG_MAP = os.environ.get('KUBE_CONFIG_MAP')
 KUBE_ROUTER_POD_NAME = "{}-sglang-router-0".format(os.environ.get('KUBE_JOB_NAME'))
 
 
@@ -103,10 +104,10 @@ def create_configmap():
     configmap_yaml = """apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: sglang-info
+  name: {}
   namespace: {}
 data:
-""".format(KUBE_NAME_SPACE)
+""".format(KUBE_CONFIG_MAP, KUBE_NAME_SPACE)
     configmap_yaml += "\n".join(matching_pods)
 
     # apply ConfigMap
@@ -216,7 +217,7 @@ def monitor_pod_logs(pod_name, namespace=None, timeout=None):
 
 
 if __name__ == "__main__":
-    print("apply deepep.yaml...")
+    print("apply deepep.yaml... KUBE_NAME_SPACE:{}, KUBE_CONFIG_MAP:{}".format(KUBE_NAME_SPACE, KUBE_CONFIG_MAP))
     result = run_command("kubectl apply -f deepep.yaml")
     if result:
         print(result)
