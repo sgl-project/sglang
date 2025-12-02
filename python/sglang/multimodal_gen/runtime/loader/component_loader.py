@@ -8,7 +8,7 @@ import importlib.util
 import json
 import os
 import time
-from abc import ABC, abstractmethod
+from abc import ABC
 from collections.abc import Generator, Iterable
 from copy import deepcopy
 from typing import Any, cast
@@ -198,13 +198,6 @@ class ComponentLoader(ABC):
         raise NotImplementedError(
             f"load_customized not implemented for {self.__class__.__name__}"
         )
-
-    @abstractmethod
-    def load_customized(
-        self, model_path: str, server_args: ServerArgs, module_name: str
-    ) -> Any:
-        """Implement the minimal core load logic in subclasses."""
-        raise NotImplementedError
 
     @classmethod
     def for_module_type(
