@@ -9,9 +9,9 @@ from .compressed_tensors_wNa16 import WNA16_SUPPORTED_BITS, CompressedTensorsWNA
 
 __all__ = [
     "CompressedTensorsScheme",
-    "CompressedTensorsW8A8Fp8",
-    "CompressedTensorsW8A16Fp8",
     "CompressedTensorsW4A16Fp4",
+    "CompressedTensorsW8A16Fp8",
+    "CompressedTensorsW8A8Fp8",
     "CompressedTensorsW8A8Int8",
     "CompressedTensorsWNA16",
     "WNA16_SUPPORTED_BITS",
