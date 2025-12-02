@@ -233,12 +233,11 @@ def forward_mla_core_npu(
         dtype=attn_output.dtype,
         device=attn_output.device,
     )
-    torch.ops.npu.batch_matmul_transpose(
-        attn_output,
+    torch.bmm(
+        attn_output.transpose(0, 1),
         m.w_vc,
-        attn_bmm_output.view(attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+        out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(0, 1),
     )
-
     output, _ = m.o_proj(attn_bmm_output)
 
     return output
