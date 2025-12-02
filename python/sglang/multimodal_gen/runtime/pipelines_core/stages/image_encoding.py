@@ -11,7 +11,6 @@ import PIL
 import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
@@ -51,7 +50,6 @@ class ImageEncodingStage(PipelineStage):
         image_processor,
         image_encoder=None,
         text_encoder=None,
-        vae_image_processor=None,
     ) -> None:
         """
         Initialize the prompt encoding stage.
@@ -61,7 +59,6 @@ class ImageEncodingStage(PipelineStage):
         """
         super().__init__()
         self.image_processor = image_processor
-        self.vae_image_processor = vae_image_processor
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
@@ -210,13 +207,6 @@ class ImageVAEEncodingStage(PipelineStage):
         if batch.condition_image is None:
             return batch
 
-        assert batch.condition_image is not None and isinstance(
-            batch.condition_image, PIL.Image.Image
-        )
-        assert batch.height is not None and isinstance(batch.height, int)
-        assert batch.width is not None and isinstance(batch.width, int)
-        assert batch.num_frames is not None and isinstance(batch.num_frames, int)
-
         num_frames = batch.num_frames
 
         self.vae = self.vae.to(get_local_torch_device())
@@ -272,16 +262,12 @@ class ImageVAEEncodingStage(PipelineStage):
         generator = batch.generator
         if generator is None:
             raise ValueError("Generator must be provided")
-        # TODO: verify
-        sample_mode = (
-            "argmax"
-            if server_args.pipeline_config.task_type == ModelTaskType.I2I
-            else "sample"
-        )
+
+        sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
+
         latent_condition = self.retrieve_latents(
             encoder_output, generator, sample_mode=sample_mode
         )
-
         latent_condition = server_args.pipeline_config.postprocess_vae_encode(
             latent_condition, self.vae
         )
@@ -347,6 +333,15 @@ class ImageVAEEncodingStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify encoding stage inputs."""
         result = VerificationResult()
+
+        assert batch.condition_image is None or (
+            isinstance(batch.condition_image, PIL.Image.Image)
+            or isinstance(batch.condition_image, torch.Tensor)
+        )
+        assert batch.height is not None and isinstance(batch.height, int)
+        assert batch.width is not None and isinstance(batch.width, int)
+        assert batch.num_frames is not None and isinstance(batch.num_frames, int)
+
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         result.add_check("height", batch.height, V.positive_int)
         result.add_check("width", batch.width, V.positive_int)
