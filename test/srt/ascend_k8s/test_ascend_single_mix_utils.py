@@ -13,7 +13,7 @@ QWEN3_32B_MODEL_PATH = "/root/.cache/modelscope/hub/models/aleoyang/Qwen3-32B-w8
 QWEN3_235B_MODEL_PATH = "/root/.cache/modelscope/hub/models/vllm-ascend/Qwen3-235B-A22B-W8A8"
 QWEN3_30B_A3B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B"
 QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"
-QWEN3_8B_MODEL_PATH = "/root/.cache/modelscope/hub/models/vllm-ascend/Qwen3-8B-W8A8"
+QWEN3_8B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen3-8B-W8A8"
 QWEN3_32B_OTHER_ARGS = (
     [
         "--trust-remote-code",
@@ -123,6 +123,101 @@ QWEN3_235B_ENVS = {
     "ENABLE_ASCEND_MOE_NZ": "1",
 }
 
+QWQ_32B_MODEL_PATH = "/root/.cache/modelscope/hub/models/vllm-ascend/QWQ-32B-W8A8"
+QWQ_32B_OTHER_ARGS = [
+    "--trust-remote-code",
+    "--nnodes",
+    "1",
+    "--node-rank",
+    "0",
+    "--attention-backend",
+    "ascend",
+    "--device",
+    "npu",
+    "--quantization",
+    "w8a8_int8",
+    "--max-running-requests",
+    "16",
+    "--context-length",
+    "8192",
+    "--dtype",
+    "bfloat16",
+    "--chunked-prefill-size",
+    "32768",
+    "--max-prefill-tokens",
+    "458880",
+    "--disable-radix-cache",
+    "--tp-size",
+    "4",
+    "--enable-dp-lm-head",
+    "--mem-fraction-static",
+    "0.68",
+    "--cuda-graph-bs",
+    2,
+    4,
+    6,
+    8,
+    10,
+    12,
+    16,
+]
+
+QWQ_32B_ENVS = {
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "INF_NAN_MODE_FORCE_DISABLE": "1",
+    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
+    "HCCL_BUFFSIZE": "2048",
+    "HCCL_SOCKET_IFNAME": "enp23s0f3",
+    "GLOO_SOCKET_IFNAME": "enp23s0f3",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+}
+
+Qwen3_Next_80B_A3B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-Next-80B-A3B-Instruct"
+Qwen3_Next_80B_A3B_OTHER_ARGS = [
+    "--trust-remote-code",
+    "--attention-backend",
+    "ascend",
+    "--device",
+    "npu",
+    "--max-running-requests",
+    "8",
+    "--context-length",
+    "8000",
+    "--chunked-prefill-size",
+    "6400",
+    "--max-prefill-tokens",
+    "8000",
+    "--max-total-tokens",
+    "16000",
+    "--disable-radix-cache",
+    "--tp-size",
+    "4",
+    "--dp-size",
+    "1",
+    "--mem-fraction-static",
+    "0.78",
+    "--cuda-graph-bs",
+    1,
+    2,
+    6,
+    8,
+    16,
+    32,
+]
+
+Qwen3_Next_80B_A3B_ENVS = {
+    "ASCEND_RT_VISIBLE_DEVICES": "12,13,14,15",
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "STREAMS_PER_DEVICE": "32",
+    "HCCL_SOCKET_IFNAME": "enp23s0f3",
+    "GLOO_SOCKET_IFNAME": "enp23s0f3",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
+    "HCCL_BUFFSIZE": "2000",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "HCCL_ALGO": "level0:NA;level1:ring"
+}
 
 QWEN3_30B_A3B_OTHER_ARGS = (
     [
