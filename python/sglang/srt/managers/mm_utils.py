@@ -474,7 +474,6 @@ def _adjust_embedding_length(
 ) -> torch.Tensor:
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
-    assert num_mm_tokens_in_input_ids == expected_token_count, f"num_mm_tokens_in_input_ids != expected_token_count: {num_mm_tokens_in_input_ids} != {expected_token_count}"
     if expected_token_count != num_mm_tokens_in_embedding:
         logger.warning(
             f"Number of tokens in multimodal embedding does not match those in the input text. "
