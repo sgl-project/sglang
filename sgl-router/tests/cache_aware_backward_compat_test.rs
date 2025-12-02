@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use sglang_router_rs::{
+use sgl_model_gateway::{
     core::{BasicWorkerBuilder, Worker, WorkerType},
     policies::{CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy},
 };
