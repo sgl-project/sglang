@@ -61,6 +61,7 @@ Its core features include:
    supported_models/embedding_models.md
    supported_models/reward_models.md
    supported_models/rerank_models.md
+   supported_models/classify_models.md
    supported_models/support_new_models.md
    supported_models/transformers_fallback.md
    supported_models/modelscope.md
