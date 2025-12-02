@@ -234,8 +234,8 @@ class InputValidationStage(PipelineStage):
             lambda _: V.string_or_list_strings(batch.prompt)
             or V.list_not_empty(batch.prompt_embeds),
         )
-        result.add_check("height", batch.height, V.positive_int)
-        result.add_check("width", batch.width, V.positive_int)
+        # result.add_check("height", batch.height, V.positive_int)
+        # result.add_check("width", batch.width, V.positive_int)
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )
