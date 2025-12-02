@@ -1006,6 +1006,15 @@ class SchedulerDisaggregationDecodeMixin:
 
         curr_batch_size = self.running_batch.batch_size()
 
+        # Account for pending merge - count only non-finished requests
+        # This prevents over-scheduling while maintaining performance (no GPU sync)
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            # req.finished() is a CPU-side check (no synchronization needed)
+            pending_active_count = sum(
+                1 for req in self.last_batch.reqs if not req.finished()
+            )
+            curr_batch_size += pending_active_count
+
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
 
         num_not_used_batch = batch_size - curr_batch_size
