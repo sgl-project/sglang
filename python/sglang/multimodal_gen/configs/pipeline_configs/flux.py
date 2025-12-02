@@ -452,21 +452,26 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def get_neg_prompt_embeds(self, batch):
         return batch.negative_prompt_embeds[0]
 
-    def calculate_condition_image_size(
-        self, image, width, height
-    ) -> Optional[tuple[int, int]]:
+    def calculate_condition_image_size(self, images) -> Optional[tuple[int, int]]:
+        width, height = [], []
         target_area: int = 1024 * 1024
-        if width is not None and height is not None:
-            if width * height > target_area:
-                scale = math.sqrt(target_area / (width * height))
-                width = int(width * scale)
-                height = int(height * scale)
-                return width, height
+        for image in images:
+            w, h = image.size
+            if w * h > target_area:
+                scale = math.sqrt(target_area / (w * h))
+                w = int(w * scale)
+                h = int(h * scale)
+                width.append(w)
+                height.append(h)
+        return width, height
 
-        return None
-
-    def resize_condition_image(self, image, target_width, target_height):
-        return image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+    def resize_condition_image(self, images, target_width, target_height):
+        new_images = []
+        for image, width, height in zip(images, target_width, target_height):
+            new_images.append(
+                image.resize((width, height), PIL.Image.Resampling.LANCZOS)
+            )
+        return new_images
 
     def postprocess_image_latent(self, latent_condition, batch):
         batch_size = batch.batch_size

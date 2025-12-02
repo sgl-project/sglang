@@ -189,4 +189,8 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         )
 
 
-EntryClass = [QwenImagePipeline, QwenImageEditPipeline]
+class QwenImageEditPlusPipeline(QwenImageEditPipeline):
+    pipeline_name = "QwenImageEditPlusPipeline"
+
+
+EntryClass = [QwenImagePipeline, QwenImageEditPipeline, QwenImageEditPlusPipeline]

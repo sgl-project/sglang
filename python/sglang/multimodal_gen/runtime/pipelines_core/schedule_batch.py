@@ -57,7 +57,9 @@ class Req:
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
     original_condition_image_size: tuple[int, int] = None
-    condition_image: torch.Tensor | PIL.Image.Image | None = None
+    condition_image: torch.Tensor | PIL.Image.Image | list[PIL.Image.Image] | None = (
+        None
+    )
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
