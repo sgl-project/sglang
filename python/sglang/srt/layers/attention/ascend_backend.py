@@ -43,11 +43,11 @@ class ForwardMetadata:
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
-    flatten_block_tables: Optional[torch.Tensor] = None
+    flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
-    def __init__(self, model_runner: ModelRunner, device, use_fia):
+    def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
         """
         Initialize the AscendAttnMaskBuilder class.
 
@@ -73,16 +73,17 @@ class AscendAttnMaskBuilder:
         mtp_mask_len = 2048
         self.mtp_mask = self.generate_mask_flag(mtp_mask_len).to(self.device)
 
-        # Initialize RingMla mask
-        ringmla_mask_len = 512
-        self.ringmla_mask = self.generate_attn_mask(
-            ringmla_mask_len, "norm", torch.bfloat16
-        ).to(self.device)
-
         # Initialize mixed chunk mask cache
         mixed_chunk_cache_len = 8192
         self.mix_mask_cache = self.generate_attn_mask(mixed_chunk_cache_len, "mix")
         self.mix_seq_len_cached = self.mix_mask_cache.shape[0]
+
+        if use_mla:
+            # Initialize RingMla mask
+            ringmla_mask_len = 512
+            self.ringmla_mask = self.generate_attn_mask(
+                ringmla_mask_len, "norm", torch.bfloat16
+            ).to(self.device)
 
     @staticmethod
     def generate_mask_flag(max_seq_len):
@@ -236,15 +237,16 @@ class AscendAttnBackend(AttentionBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(
-            model_runner, self.device, self.use_fia
+            model_runner, self.device, self.use_fia, self.use_mla
         )
-        self.mask, self.fia_mask, self.mtp_mask, self.mix_mask, self.ringmla_mask = (
+        self.mask, self.fia_mask, self.mtp_mask, self.mix_mask = (
             self.ascend_attn_mask_builder.mask,
             self.ascend_attn_mask_builder.fia_mask,
             self.ascend_attn_mask_builder.mtp_mask,
             self.ascend_attn_mask_builder.mix_mask_cache,
-            self.ascend_attn_mask_builder.ringmla_mask,
         )
+        if self.use_mla:
+            self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -289,21 +291,30 @@ class AscendAttnBackend(AttentionBackend):
             self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
 
         if (
-            forward_batch.forward_mode.is_extend()
+            self.use_mla
+            and forward_batch.forward_mode.is_extend()
             and sum(forward_batch.extend_prefix_lens_cpu) > 0
         ):
-            self.forward_metadata.prefix_lens = (
-                forward_batch.extend_prefix_lens.int().to("cpu")
+            self.forward_metadata.prefix_lens = forward_batch.extend_prefix_lens.to(
+                "cpu"
             )
             seq_prefix_lens = self.forward_metadata.prefix_lens.tolist()
-            flatten_tlbs = torch.empty(0, dtype=torch.int32)
+            self.forward_metadata.flatten_prefix_block_tables = torch.empty(
+                0, dtype=torch.int32
+            ).to(self.device)
             for req_idx, seq_len in zip(
                 forward_batch.req_pool_indices.tolist(), seq_prefix_lens
             ):
-                indices = forward_batch.req_to_token_pool.req_to_token[req_idx]
-                tlbs = indices[:seq_len][:: self.page_size] // self.page_size
-                flatten_tlbs = torch.cat((flatten_tlbs, torch.flatten(tlbs).to("cpu")))
-            self.forward_metadata.flatten_block_tables = flatten_tlbs.npu()
+                req_indices = forward_batch.req_to_token_pool.req_to_token[req_idx]
+                req_prefix_block_tables = (
+                    req_indices[:seq_len][:: self.page_size] // self.page_size
+                )
+                self.forward_metadata.flatten_prefix_block_tables = torch.cat(
+                    (
+                        self.forward_metadata.flatten_prefix_block_tables,
+                        torch.flatten(req_prefix_block_tables),
+                    )
+                )
 
         if forward_batch.forward_mode.is_mixed():
             self.mix_mask = self.ascend_attn_mask_builder.update_mask(
@@ -662,10 +673,10 @@ class AscendAttnBackend(AttentionBackend):
             k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
             kv_cached = torch.index_select(
-                k_buffer, 0, self.forward_metadata.flatten_block_tables
+                k_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
             )
             k_rope_cached = torch.index_select(
-                v_buffer, 0, self.forward_metadata.flatten_block_tables
+                v_buffer, 0, self.forward_metadata.flatten_prefix_block_tables
             ).flatten(0, 1)
 
             assert layer.kv_b_proj is not None

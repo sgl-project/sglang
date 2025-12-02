@@ -1,6 +1,7 @@
 import abc
 import logging
 import threading
+from collections import defaultdict
 from functools import wraps
 from typing import Optional
 
@@ -41,8 +42,6 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
-NEED_HOST_REGISTER = not _is_npu
-
 
 def synchronized(func):
     @wraps(func)
@@ -51,6 +50,28 @@ def synchronized(func):
             return func(self, *args, **kwargs)
 
     return wrapper
+
+
+def alloc_default(dims, dtype, device, pin_memory):
+    buffer = torch.empty(dims, dtype=dtype, device=device)
+    if pin_memory:
+        torch.cuda.cudart().cudaHostRegister(
+            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+        )
+    return buffer
+
+
+def alloc_npu(dims, dtype, device, pin_memory):
+    buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    return buffer
+
+
+ALLOC_MEMORY_FUNCS = defaultdict(
+    lambda: alloc_default,
+    {
+        "npu": alloc_npu,
+    },
+)
 
 
 class HostKVCache(abc.ABC):
@@ -69,8 +90,6 @@ class HostKVCache(abc.ABC):
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
-        self.host_register = self.pin_memory and NEED_HOST_REGISTER
-
         self.device = device
 
         self.dtype = device_pool.store_dtype
@@ -268,22 +287,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
-        if self.host_register:
-            buffer = torch.empty(
-                dims,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            torch.cuda.cudart().cudaHostRegister(
-                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-            )
-        else:
-            buffer = torch.empty(
-                dims,
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-            )
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        buffer = alloc_func(
+            dims, dtype=self.dtype, device=self.device, pin_memory=self.pin_memory
+        )
         return buffer
 
     @property
@@ -684,13 +692,14 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.page_size,
                 1,
             )
-            self.k_buffer = torch.empty(
+            alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+            self.k_buffer = alloc_func(
                 (*base_dims, self.kv_lora_rank),
                 dtype=self.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
             )
-            self.v_buffer = torch.empty(
+            self.v_buffer = alloc_func(
                 (*base_dims, self.qk_rope_head_dim),
                 dtype=self.dtype,
                 device=self.device,
@@ -706,22 +715,10 @@ class MLATokenToKVPoolHost(HostKVCache):
         ) * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
-        if self.host_register:
-            buffer = torch.empty(
-                dims,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            torch.cuda.cudart().cudaHostRegister(
-                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-            )
-        else:
-            buffer = torch.empty(
-                dims,
-                dtype=self.dtype,
-                device=self.device,
-                pin_memory=self.pin_memory,
-            )
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        buffer = alloc_func(
+            dims, dtype=self.dtype, device=self.device, pin_memory=self.pin_memory
+        )
         return buffer
 
     def load_to_device_per_layer(
