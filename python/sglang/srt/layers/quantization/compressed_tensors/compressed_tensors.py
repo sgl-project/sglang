@@ -91,7 +91,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
-        # FP8 config for linear layers, compressed tensor currently does not support block fp8, this is used for ktransformers
         self.linear_fp8_config = linear_fp8_config
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:

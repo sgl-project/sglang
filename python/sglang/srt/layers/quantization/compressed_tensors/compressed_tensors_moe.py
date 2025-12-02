@@ -12,7 +12,7 @@ from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 
-from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -148,7 +148,7 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
         if self.block_quant:
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
-            tp_size = get_tp_world_size()
+            tp_size = get_tensor_model_parallel_world_size()
             block_n, block_k = (
                 self.weight_block_size[0],
                 self.weight_block_size[1],
