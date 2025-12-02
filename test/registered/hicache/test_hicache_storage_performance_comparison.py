@@ -47,6 +47,8 @@ class MockHostKVCache:
         else:
             # MHA: Store as flat contiguous buffer for zero-copy access
             # In real implementation, page_first layout stores K+V contiguously
+            # For MHA, we need to simulate K and V separately for get_page_buffer_meta
+            # Each page has K (first half) and V (second half)
             self.kv_buffer = torch.randn(
                 self.num_pages, self.numel_per_page, dtype=self.dtype
             )
@@ -76,6 +78,50 @@ class MockHostKVCache:
             self.kv_buffer[index] = data_page.reshape(self.kv_buffer[index].shape)
         else:
             self.kv_buffer[index].copy_(data_page)
+
+    def get_page_buffer_meta(self, indices):
+        """Get buffer metadata (pointers and sizes) for zero-copy operations.
+
+        Returns:
+            ptr_list: List of memory pointers
+            element_size_list: List of sizes for each pointer
+        """
+        assert len(indices) % self.page_size == 0
+        ptr_list = []
+        indices = indices.tolist()
+
+        if self.is_mla:
+            # MLA: one pointer per page
+            for index in range(0, len(indices), self.page_size):
+                page_idx = indices[index]
+                # Get the specific page tensor and its data pointer
+                page_tensor = self.kv_buffer[page_idx]
+                ptr = page_tensor.data_ptr()
+                ptr_list.append(ptr)
+            element_size = self.numel_per_page * self.dtype.itemsize
+            element_size_list = [element_size] * len(ptr_list)
+        else:
+            # MHA: K and V pointer pairs per page
+            # For page_first layout, K and V are stored contiguously in the page
+            # K is first half, V is second half of each page
+            k_size = self.numel_per_page // 2  # Half page for K
+            v_size = self.numel_per_page // 2  # Half page for V
+
+            for index in range(0, len(indices), self.page_size):
+                page_idx = indices[index]
+                # Get the page tensor
+                page_tensor = self.kv_buffer[page_idx]
+                k_ptr = page_tensor.data_ptr()
+                # V pointer is offset by half page
+                v_ptr = k_ptr + k_size * self.dtype.itemsize
+                ptr_list.append(k_ptr)
+                ptr_list.append(v_ptr)
+
+            # Each K or V is half page size
+            element_size = k_size * self.dtype.itemsize
+            element_size_list = [element_size] * len(ptr_list)
+
+        return ptr_list, element_size_list
 
 
 class TestHiCacheFilePerformanceComparison(unittest.TestCase):
@@ -254,6 +300,144 @@ class TestHiCacheFilePerformanceComparison(unittest.TestCase):
         end_time = time.perf_counter()
 
         return end_time - start_time
+
+    def test_get_page_buffer_meta_mha(self):
+        """Test get_page_buffer_meta for MHA model."""
+        print("\n" + "=" * 80)
+        print("Testing get_page_buffer_meta for MHA model")
+        print("=" * 80)
+
+        # Create MHA memory pool
+        mem_pool = MockHostKVCache(page_size=self.page_size, is_mla=False)
+
+        # Create test indices: 2 pages
+        num_pages = 2
+        host_indices = torch.cat(
+            [
+                torch.full((self.page_size,), 0, dtype=torch.int64),
+                torch.full((self.page_size,), 1, dtype=torch.int64),
+            ]
+        )
+
+        # Get buffer metadata
+        ptr_list, element_size_list = mem_pool.get_page_buffer_meta(host_indices)
+
+        # Verify results
+        # For MHA: should have K and V pairs (2 pages * 2 = 4 pointers)
+        expected_ptr_count = num_pages * 2  # K and V for each page
+        self.assertEqual(len(ptr_list), expected_ptr_count)
+        self.assertEqual(len(element_size_list), expected_ptr_count)
+
+        # Verify all sizes are the same (half page for K or V)
+        expected_size = (mem_pool.numel_per_page // 2) * mem_pool.dtype.itemsize
+        for size in element_size_list:
+            self.assertEqual(size, expected_size)
+
+        # Verify pointers are valid (non-zero)
+        for ptr in ptr_list:
+            self.assertGreater(ptr, 0)
+
+        # Verify K and V pointers for each page are different
+        for i in range(num_pages):
+            k_idx = i * 2
+            v_idx = i * 2 + 1
+            k_ptr = ptr_list[k_idx]
+            v_ptr = ptr_list[v_idx]
+            self.assertNotEqual(k_ptr, v_ptr)
+            # V should be after K
+            self.assertGreater(v_ptr, k_ptr)
+
+        print(
+            f"✓ MHA test passed: {len(ptr_list)} pointers, size={expected_size} bytes each"
+        )
+        print(f"  Page 0: K_ptr={ptr_list[0]}, V_ptr={ptr_list[1]}")
+        print(f"  Page 1: K_ptr={ptr_list[2]}, V_ptr={ptr_list[3]}")
+
+    def test_get_page_buffer_meta_mla(self):
+        """Test get_page_buffer_meta for MLA model."""
+        print("\n" + "=" * 80)
+        print("Testing get_page_buffer_meta for MLA model")
+        print("=" * 80)
+
+        # Create MLA memory pool
+        mem_pool = MockHostKVCache(page_size=self.page_size, is_mla=True)
+
+        # Create test indices: 2 pages
+        num_pages = 2
+        host_indices = torch.cat(
+            [
+                torch.full((self.page_size,), 0, dtype=torch.int64),
+                torch.full((self.page_size,), 1, dtype=torch.int64),
+            ]
+        )
+
+        # Get buffer metadata
+        ptr_list, element_size_list = mem_pool.get_page_buffer_meta(host_indices)
+
+        # Verify results
+        # For MLA: should have one pointer per page
+        expected_ptr_count = num_pages
+        self.assertEqual(len(ptr_list), expected_ptr_count)
+        self.assertEqual(len(element_size_list), expected_ptr_count)
+
+        # Verify all sizes are the same (full page)
+        expected_size = mem_pool.numel_per_page * mem_pool.dtype.itemsize
+        for size in element_size_list:
+            self.assertEqual(size, expected_size)
+
+        # Verify pointers are valid (non-zero)
+        for ptr in ptr_list:
+            self.assertGreater(ptr, 0)
+
+        # Verify pointers are different for different pages
+        self.assertNotEqual(ptr_list[0], ptr_list[1])
+
+        print(
+            f"✓ MLA test passed: {len(ptr_list)} pointers, size={expected_size} bytes each"
+        )
+        print(f"  Page 0: ptr={ptr_list[0]}")
+        print(f"  Page 1: ptr={ptr_list[1]}")
+
+    def test_get_page_buffer_meta_integration(self):
+        """Test get_page_buffer_meta integration with batch_set_v1."""
+        print("\n" + "=" * 80)
+        print("Testing get_page_buffer_meta integration with batch_set_v1")
+        print("=" * 80)
+
+        num_keys = 5
+        keys, host_indices = self._create_test_data(num_keys)
+        storage = self._create_storage()
+
+        # Verify that batch_set_v1 uses get_page_buffer_meta internally
+        # by checking that it works correctly
+        results = storage.batch_set_v1(keys=keys, host_indices=host_indices)
+
+        # All writes should succeed
+        self.assertEqual(len(results), num_keys)
+        self.assertTrue(all(results), "All batch_set_v1 operations should succeed")
+
+        # Verify files were created
+        for key in keys:
+            batch_file_path = os.path.join(
+                self.test_dir, f"{storage._get_suffixed_key(key)}.batch.bin"
+            )
+            self.assertTrue(
+                os.path.exists(batch_file_path), f"File should exist: {batch_file_path}"
+            )
+
+            # Verify file size is correct (K + V for MHA)
+            expected_size = (
+                self.mem_pool_host.numel_per_page * self.mem_pool_host.dtype.itemsize
+            )
+            actual_size = os.path.getsize(batch_file_path)
+            self.assertEqual(
+                actual_size,
+                expected_size,
+                f"File size mismatch for {key}: expected {expected_size}, got {actual_size}",
+            )
+
+        print(f"✓ Integration test passed: {num_keys} keys written successfully")
+        print(f"  All files created with correct sizes")
 
     def test_performance_comparison_small_batch(self):
         """Compare performance with small batch (10 keys)."""

@@ -220,7 +220,7 @@ class HiCacheFile(HiCacheStorage):
         """Preprocess keys and host_indices to get buffer metadata for zero-copy operations.
         Uses get_page_buffer_meta() to get memory pointers and sizes directly.
         Similar to mooncake_store's _batch_preprocess but adapted for file backend.
-        
+
         Returns:
             ptr_list: List of memory pointers (for MHA: K and V pairs, for MLA: single pointer per page)
             element_size_list: List of sizes for each pointer
@@ -228,7 +228,9 @@ class HiCacheFile(HiCacheStorage):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         # Get buffer metadata (pointers and sizes) for zero-copy access
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(host_indices)
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(
+            host_indices
+        )
         return ptr_list, element_size_list
 
     def _batch_exist(self, keys: List[str]) -> List[bool]:
@@ -467,19 +469,19 @@ class HiCacheFile(HiCacheStorage):
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
 
         page_num = len(keys)
-        
+
         # Stage 1: Get buffer metadata (pointers and sizes) using get_page_buffer_meta
         # This is the key difference - we use the built-in method instead of manual address calculation
         ptr_list, element_size_list = self._batch_preprocess(keys, host_indices)
-        
+
         # Stage 2: Check which files already exist (similar to mooncake_store's _batch_exist)
         exist_results = self._batch_exist(keys)
-        
+
         # Stage 3: Prepare write operations only for non-existing keys
         write_keys = []
         write_indices = []
         write_results = [False] * page_num
-        
+
         for i in range(page_num):
             if exist_results[i]:
                 # File already exists, mark as success
@@ -488,7 +490,7 @@ class HiCacheFile(HiCacheStorage):
                 # File doesn't exist, need to write
                 write_keys.append(keys[i])
                 write_indices.append(i)
-        
+
         # Stage 4: Write only non-existing files using pointers directly
         if self.is_mla_backend:
             # MLA: one pointer per page
@@ -527,5 +529,5 @@ class HiCacheFile(HiCacheStorage):
                 except Exception as e:
                     logger.error(f"Failed to write batch for key {key}: {e}")
                     write_results[idx] = False
-        
+
         return write_results
