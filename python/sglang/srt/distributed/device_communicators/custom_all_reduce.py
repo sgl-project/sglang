@@ -141,12 +141,12 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         if _is_cuda or _is_hip:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
-
         if world_size > 2 and not full_nvlink:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+                "specify disable_custom_all_reduce=True explicitly. To bypass"
+                "check set env variable SGLANG_SKIP_NVLINK_CHECK=1."
             )
             return
         # test P2P capability, this checks software/cudaruntime support

@@ -168,7 +168,8 @@ class QuickAllReduce:
         if self.world_size > 2 and not self.fully_connected:
             logger.debug(
                 "Custom quick allreduce is disabled because it's not supported "
-                "on more than two PCIe-only GPUs. "
+                "on more than two PCIe-only GPUs. To bypass"
+                "check set env variable SGLANG_SKIP_NVLINK_CHECK=1."
             )
             return
 
