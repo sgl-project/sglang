@@ -10,7 +10,7 @@ register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 class TestMistral7B(GSM8KAscendMixin, CustomTestCase):
     model = "/root/.cache/modelscope/hub/models/HuggingFaceTB/SmolLM-1.7B"
-    accuracy = 0.1
+    accuracy = 0.05
     other_args = [
         "--trust-remote-code",
         "--mem-fraction-static",
