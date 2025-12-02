@@ -21,7 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
+from transformers import PretrainedConfig, PreTrainedModel
 
 from sglang.multimodal_gen.runtime.models.dits.stepvideo import StepVideoRMSNorm
 
