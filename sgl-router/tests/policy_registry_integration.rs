@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use sglang_router_rs::{
+use sgl_model_gateway::{
     config::PolicyConfig, core::WorkerRegistry, policies::PolicyRegistry,
     protocols::worker_spec::WorkerConfigRequest, routers::router_manager::RouterManager,
 };
@@ -36,6 +36,7 @@ async fn test_policy_registry_with_router_manager() {
         reasoning_parser: None,
         tool_parser: None,
         chat_template: None,
+        runtime: None,
         health_check_timeout_secs: 30,
         health_check_interval_secs: 60,
         health_success_threshold: 2,
@@ -67,6 +68,7 @@ async fn test_policy_registry_with_router_manager() {
         reasoning_parser: None,
         tool_parser: None,
         chat_template: None,
+        runtime: None,
         health_check_timeout_secs: 30,
         health_check_interval_secs: 60,
         health_success_threshold: 2,
@@ -93,6 +95,7 @@ async fn test_policy_registry_with_router_manager() {
         tokenizer_path: None,
         reasoning_parser: None,
         tool_parser: None,
+        runtime: None,
         chat_template: None,
         health_check_timeout_secs: 30,
         health_check_interval_secs: 60,
@@ -112,7 +115,7 @@ async fn test_policy_registry_with_router_manager() {
 
 #[test]
 fn test_policy_registry_cleanup() {
-    use sglang_router_rs::{config::PolicyConfig, policies::PolicyRegistry};
+    use sgl_model_gateway::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
@@ -139,7 +142,7 @@ fn test_policy_registry_cleanup() {
 
 #[test]
 fn test_policy_registry_multiple_models() {
-    use sglang_router_rs::{config::PolicyConfig, policies::PolicyRegistry};
+    use sgl_model_gateway::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 

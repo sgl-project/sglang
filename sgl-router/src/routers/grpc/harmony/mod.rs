@@ -18,7 +18,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use sglang_router_rs::routers::grpc::harmony::{HarmonyDetector, HarmonyBuilder};
+//! use sgl_model_gateway::routers::grpc::harmony::{HarmonyDetector, HarmonyBuilder};
 //!
 //! // Detect if model supports Harmony
 //! if HarmonyDetector::is_harmony_model("gpt-4o") {
@@ -43,7 +43,9 @@ pub use builder::HarmonyBuilder;
 pub use detector::HarmonyDetector;
 pub use parser::HarmonyParserAdapter;
 pub use processor::{HarmonyResponseProcessor, ResponsesIterationResult};
-pub use responses::{serve_harmony_responses, HarmonyResponsesContext};
+pub use responses::{
+    serve_harmony_responses, serve_harmony_responses_stream, HarmonyResponsesContext,
+};
 pub use stages::{
     HarmonyPreparationStage, HarmonyRequestBuildingStage, HarmonyResponseProcessingStage,
 };

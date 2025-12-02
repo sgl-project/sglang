@@ -377,6 +377,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             page_indices //= self.page_size
             metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+            metadata.max_seq_len_q = self.speculative_num_draft_tokens
         elif forward_mode.is_draft_extend():
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
@@ -488,10 +489,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-            ):
+            if any(
+                forward_batch.extend_prefix_lens_cpu
+            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -529,6 +529,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 layer, cache_loc, k, v, layer.k_scale, layer.v_scale
             )
 
+        if self.data_type == torch.float8_e4m3fn:
+            q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
@@ -567,6 +569,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             window_left=layer.sliding_window_size,
             # TODO: add attention_sink operation or nvfp4 scale factor if needed
             sinks=attention_sink,
+            out_dtype=self.q_data_type,  # model_runner.dtype
         )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -586,6 +589,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, cache_loc, k, v, layer.k_scale, layer.v_scale
             )
+
+        if self.data_type == torch.float8_e4m3fn:
+            q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -609,23 +615,42 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
 
-        o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
-            query=q,
-            kv_cache=kv_cache,
-            workspace_buffer=self.workspace_buffer,
-            block_tables=self.forward_metadata.page_table,
-            seq_lens=self.forward_metadata.cache_seqlens_int32,
-            max_q_len=self.forward_metadata.max_seq_len_q,
-            max_kv_len=self.max_context_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
-            batch_size=forward_batch.batch_size,
-            cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
-            cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
-            window_left=layer.sliding_window_size,
-            # TODO: add attention_sink operation or nvfp4 scale factor if needed
-            sinks=attention_sink,
-        )
+        if forward_batch.forward_mode.is_target_verify():
+            o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=self.forward_metadata.page_table,
+                seq_lens=self.forward_metadata.cache_seqlens_int32,
+                max_seq_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=layer.sliding_window_size,
+                # TODO: add attention_sink operation or nvfp4 scale factor if needed
+                sinks=attention_sink,
+                out_dtype=self.q_data_type,  # model_runner.dtype
+                q_len_per_req=self.forward_metadata.max_seq_len_q,
+            )
+        else:
+
+            o = flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=self.forward_metadata.page_table,
+                seq_lens=self.forward_metadata.cache_seqlens_int32,
+                max_q_len=self.forward_metadata.max_seq_len_q,
+                max_kv_len=self.max_context_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                batch_size=forward_batch.batch_size,
+                cum_seq_lens_q=self.forward_metadata.cu_seqlens_q,
+                cum_seq_lens_kv=self.forward_metadata.cu_seqlens_k,
+                window_left=layer.sliding_window_size,
+                # TODO: add attention_sink operation or nvfp4 scale factor if needed
+                sinks=attention_sink,
+                out_dtype=self.q_data_type,  # model_runner.dtype
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

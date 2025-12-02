@@ -9,10 +9,10 @@
 
 </div>
 
-SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernels for operations.
+SGL Kernel provides optimized compute primitives for the SGLang framework, enabling efficient inference for large language models and vision-language models through custom kernel operations.
 
 ## Installation
-Requires torch == 2.8.0
+Requires torch == 2.9.1
 
 ```bash
 # Latest version
@@ -52,8 +52,8 @@ make build
    ```cpp
    // We need def with schema here for torch.compile
    m.def(
-    "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
-    "cublas_handle, int cuda_stream) -> ()");
+    "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, "
+    "int cublas_handle) -> ()");
    m.impl("bmm_fp8", torch::kCUDA, &bmm_fp8);
    ```
 

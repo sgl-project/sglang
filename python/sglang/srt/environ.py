@@ -2,6 +2,7 @@ import os
 import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
+from enum import IntEnum
 from typing import Any
 
 
@@ -73,6 +74,21 @@ class EnvField:
     def value(self):
         return self.get()
 
+    def __bool__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
+    def __len__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
+
+class EnvTuple(EnvField):
+    def parse(self, value: str) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip())
+
 
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
@@ -105,15 +121,31 @@ class EnvFloat(EnvField):
             raise ValueError(f'"{value}" is not a valid float value')
 
 
+class ToolStrictLevel(IntEnum):
+    """
+    Defines the strictness levels for tool call parsing and validation.
+
+    OFF: No strict validation
+    FUNCTION: Enables structural tag constraints for all tools
+    PARAMETER: Enforces strict parameter validation for all tools
+    """
+
+    OFF = 0
+    FUNCTION = 1
+    PARAMETER = 2
+
+
 class Envs:
     # fmt: off
 
     # Model & File Download
     SGLANG_USE_MODELSCOPE = EnvBool(False)
+    SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
+    SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
 
     # Test & Debug
@@ -121,6 +153,8 @@ class Envs:
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
+    SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
+    SGLANG_PROFILE_V2 = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
@@ -136,16 +170,29 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2 ** 31)
-    SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK = EnvBool(False)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
+    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
 
     # Scheduler: new token ratio hyperparameters
     SGLANG_INIT_NEW_TOKEN_RATIO = EnvFloat(0.7)
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+    SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+
+    # Scheduler: recv interval
+    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
+    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE = EnvInt(1)
+    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY = EnvInt(1)
+    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
+
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
+    SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
+    SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
     SGLANG_TEST_PD_DISAGG_DEVICES = EnvStr(None)
@@ -158,12 +205,26 @@ class Envs:
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(True)
     SGLANG_GRAMMAR_TIMEOUT = EnvFloat(300)
 
+    # Tool Calling
+    SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
 
     # Mooncake KV Transfer
-    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvBool(False)
+    SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+
+    # Mooncake Store
+    SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
+    MOONCAKE_MASTER = EnvStr(None)
+    MOONCAKE_LOCAL_HOSTNAME = EnvStr("localhost")
+    MOONCAKE_TE_META_DATA_SERVER = EnvStr("P2PHANDSHAKE")
+    MOONCAKE_GLOBAL_SEGMENT_SIZE = EnvStr("4gb")
+    MOONCAKE_PROTOCOL = EnvStr("tcp")
+    MOONCAKE_DEVICE = EnvStr("")
+    MOONCAKE_MASTER_METRICS_PORT = EnvInt(9003)
+    MOONCAKE_CHECK_SERVER = EnvBool(False)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
@@ -175,10 +236,13 @@ class Envs:
     SGLANG_CPU_QUANTIZATION = EnvBool(False)
     SGLANG_USE_DYNAMIC_MXFP4_LINEAR = EnvBool(False)
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
+    SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
-    SGLANG_ENABLE_FLASHINFER_GEMM = EnvBool(False)
+    SGLANG_ENABLE_FLASHINFER_FP8_GEMM = EnvBool(False)
+    # Default to the pick from flashinfer
+    SGLANG_FLASHINFER_FP4_GEMM_BACKEND = EnvStr("")
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
 
     # Triton
@@ -194,6 +258,7 @@ class Envs:
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_METRICS = EnvBool(False)
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
+    SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
 
     # TBO
     SGLANG_TBO_DEBUG = EnvBool(False)
@@ -211,7 +276,6 @@ class Envs:
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
     # vLLM dependencies (TODO: they have been deprecated, we can remove them safely)
-    USE_VLLM_CUSTOM_ALLREDUCE = EnvBool(False)
     USE_VLLM_CUTLASS_W8A8_FP8_KERNEL = EnvBool(False)
 
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
@@ -234,27 +298,49 @@ class Envs:
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
+    # RoPE cache configuration
+    SGLANG_SPEC_EXPANSION_SAFETY_FACTOR = EnvInt(2)
+    SGLANG_ROPE_CACHE_SAFETY_MARGIN = EnvInt(256)
+    SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
+
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # VLM
+    SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
 
-    # Ktransformers
-    SGLANG_KT_MOE_NUM_GPU_EXPERTS = EnvInt(None)
-    SGLANG_KT_MOE_CPUINFER = EnvInt(None)
-    SGLANG_KT_THREADPOOL_COUNT = EnvInt(None)
-    SGLANG_KT_MOE_AMX_WEIGHT_PATH = EnvStr(None)
-    SGLANG_KT_AMX_METHOD = EnvStr(None)
-    SGLANG_KT_MOE_CHUNKED_PREFILL_SIZE = EnvInt(None)
-
     # Sparse Embeddings
     SGLANG_EMBEDDINGS_SPARSE_HEAD = EnvStr(None)
+
+    # Logits processor
+    SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
+    SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
+
+    # Tool-Call behavior
+    SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+
+    # Ngram
+    SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
+
+    # Warmup
+    SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
+
+    # Health Check
+    SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
+
+    # External models
+    SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
+    SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
+    SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
+
+    # Numa
+    SGLANG_NUMA_BIND_V2 = EnvBool(True)
 
     # fmt: on
 
@@ -272,6 +358,9 @@ def _print_deprecated_env(new_name: str, old_name: str):
 
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
+    _print_deprecated_env(
+        "SGLANG_ENABLE_FLASHINFER_FP8_GEMM", "SGLANG_ENABLE_FLASHINFER_GEMM"
+    )
 
     for key, value in os.environ.items():
         if key.startswith("SGL_"):
@@ -309,6 +398,30 @@ def example_with_subprocess():
     assert output == "None"
 
 
+def example_with_implicit_bool_avoidance():
+    @contextmanager
+    def assert_throws(message_matcher: str):
+        try:
+            yield
+        except Exception as e:
+            assert message_matcher in str(e), f"{e=}"
+            print(f"assert_throws find expected error: {e}")
+            return
+        raise AssertionError(f"assert_throws do not see exceptions")
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.SGLANG_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if (1 != 1) or envs.SGLANG_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.SGLANG_TEST_RETRACT or (1 == 1):
+            pass
+
+
 def examples():
     # Example usage for envs
     envs.SGLANG_TEST_RETRACT.clear()
@@ -338,6 +451,7 @@ def examples():
 
     example_with_exit_stack()
     example_with_subprocess()
+    example_with_implicit_bool_avoidance()
 
 
 if __name__ == "__main__":

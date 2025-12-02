@@ -695,23 +695,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         let url = format!("{}/v1/responses", base_url);
 
-        // Validate mutually exclusive params: previous_response_id and conversation
-        // TODO: this validation logic should move the right place, also we need a proper error message module
-        if body.previous_response_id.is_some() && body.conversation.is_some() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
-                        "type": "invalid_request_error",
-                        "param": Value::Null,
-                        "code": "mutually_exclusive_parameters"
-                    }
-                })),
-            )
-                .into_response();
-        }
-
         // Clone the body for validation and logic, but we'll build payload differently
         let mut request_body = body.clone();
         if let Some(model) = model_id {
@@ -810,20 +793,76 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 Ok(stored_items) => {
                     let mut items: Vec<ResponseInputOutputItem> = Vec::new();
                     for item in stored_items.into_iter() {
-                        // Only use message items for conversation context
-                        // Skip non-message items (reasoning, function calls, etc.)
-                        if item.item_type == "message" {
-                            if let Ok(content_parts) =
-                                serde_json::from_value::<Vec<ResponseContentPart>>(
+                        // Include messages, function calls, and function call outputs
+                        // Skip reasoning items as they're internal processing details
+                        match item.item_type.as_str() {
+                            "message" => {
+                                match serde_json::from_value::<Vec<ResponseContentPart>>(
                                     item.content.clone(),
-                                )
-                            {
-                                items.push(ResponseInputOutputItem::Message {
-                                    id: item.id.0.clone(),
-                                    role: item.role.clone().unwrap_or_else(|| "user".to_string()),
-                                    content: content_parts,
-                                    status: item.status.clone(),
-                                });
+                                ) {
+                                    Ok(content_parts) => {
+                                        items.push(ResponseInputOutputItem::Message {
+                                            id: item.id.0.clone(),
+                                            role: item
+                                                .role
+                                                .clone()
+                                                .unwrap_or_else(|| "user".to_string()),
+                                            content: content_parts,
+                                            status: item.status.clone(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to deserialize message content: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            "function_call" => {
+                                // The entire function_call item is stored in content field
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.content.clone(),
+                                ) {
+                                    Ok(func_call) => items.push(func_call),
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to deserialize function_call: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            "function_call_output" => {
+                                // The entire function_call_output item is stored in content field
+                                tracing::debug!(
+                                    "Loading function_call_output from DB - content: {}",
+                                    serde_json::to_string_pretty(&item.content)
+                                        .unwrap_or_else(|_| "failed to serialize".to_string())
+                                );
+                                match serde_json::from_value::<ResponseInputOutputItem>(
+                                    item.content.clone(),
+                                ) {
+                                    Ok(func_output) => {
+                                        tracing::debug!(
+                                            "Successfully deserialized function_call_output"
+                                        );
+                                        items.push(func_output);
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Failed to deserialize function_call_output: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            "reasoning" => {
+                                // Skip reasoning items - they're internal processing details
+                            }
+                            _ => {
+                                // Skip unknown item types
+                                warn!("Unknown item type in conversation: {}", item.item_type);
                             }
                         }
                     }
@@ -889,6 +928,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         // Always set store=false for upstream (we store internally)
         request_body.store = Some(false);
+        // Filter out reasoning items from input - they're internal processing details
+        if let ResponseInput::Items(ref mut items) = request_body.input {
+            items.retain(|item| !matches!(item, ResponseInputOutputItem::Reasoning { .. }));
+        }
 
         // Convert to JSON and strip SGLang-specific fields
         let mut payload = match to_value(&request_body) {
@@ -1090,15 +1133,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         (StatusCode::NOT_IMPLEMENTED, "Embeddings not supported").into_response()
     }
 
-    async fn route_rerank(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &RerankRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
-    }
-
     async fn route_classify(
         &self,
         _headers: Option<&HeaderMap>,
@@ -1106,6 +1140,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Classify not supported").into_response()
+    }
+
+    async fn route_rerank(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &RerankRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
     }
 
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {
@@ -1135,10 +1178,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         conversation_id: &str,
     ) -> Response {
         delete_conversation(&self.conversation_storage, conversation_id).await
-    }
-
-    fn router_type(&self) -> &'static str {
-        "openai"
     }
 
     async fn list_conversation_items(
@@ -1214,5 +1253,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             item_id,
         )
         .await
+    }
+
+    fn router_type(&self) -> &'static str {
+        "openai"
     }
 }

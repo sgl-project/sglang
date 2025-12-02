@@ -6,9 +6,7 @@ pub struct ConfigValidator;
 
 impl ConfigValidator {
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
-        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
-
-        Self::validate_mode(&config.mode, has_service_discovery)?;
+        Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
 
@@ -89,7 +87,7 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_mode(mode: &RoutingMode, has_service_discovery: bool) -> ConfigResult<()> {
+    fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
         match mode {
             RoutingMode::Regular { worker_urls } => {
                 if !worker_urls.is_empty() {
@@ -103,19 +101,8 @@ impl ConfigValidator {
                 prefill_policy,
                 decode_policy,
             } => {
-                if !has_service_discovery {
-                    if prefill_urls.is_empty() {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: "PD mode requires at least one prefill worker URL".to_string(),
-                        });
-                    }
-                    if decode_urls.is_empty() {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: "PD mode requires at least one decode worker URL".to_string(),
-                        });
-                    }
-                }
-
+                // Allow empty URLs even without service discovery to support dynamic worker addition
+                // URLs will be validated if provided
                 if !prefill_urls.is_empty() {
                     let prefill_url_strings: Vec<String> =
                         prefill_urls.iter().map(|(url, _)| url.clone()).collect();
@@ -145,12 +132,11 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
-                if worker_urls.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires at least one --worker-urls entry".to_string(),
-                    });
+                // Allow empty URLs to support dynamic worker addition
+                // URLs will be validated if provided
+                if !worker_urls.is_empty() {
+                    Self::validate_urls(worker_urls)?;
                 }
-                Self::validate_urls(worker_urls)?;
             }
         }
         Ok(())
@@ -209,6 +195,34 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::Bucket {
+                balance_abs_threshold: _,
+                balance_rel_threshold,
+                bucket_adjust_interval_secs,
+            } => {
+                if *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_rel_threshold".to_string(),
+                        value: balance_rel_threshold.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
+                    });
+                }
+
+                if *bucket_adjust_interval_secs < 1 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "bucket_adjust_interval_secs".to_string(),
+                        value: bucket_adjust_interval_secs.to_string(),
+                        reason: "Must be >= 1s".to_string(),
+                    });
+                }
+                if *bucket_adjust_interval_secs >= 4294967296 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "bucket_adjust_interval_secs".to_string(),
+                        value: bucket_adjust_interval_secs.to_string(),
+                        reason: "Must be < 4294967296s".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -247,11 +261,12 @@ impl ConfigValidator {
         }
 
         if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
-            if tokens_per_second <= 0 {
+            // Allow 0 for pure concurrency limiting (semaphore behavior)
+            if tokens_per_second < 0 {
                 return Err(ConfigError::InvalidValue {
                     field: "rate_limit_tokens_per_second".to_string(),
                     value: tokens_per_second.to_string(),
-                    reason: "Must be > 0 when specified".to_string(),
+                    reason: "Must be >= 0 when specified".to_string(),
                 });
             }
         }
@@ -504,6 +519,13 @@ impl ConfigValidator {
                                     .to_string(),
                         });
                     }
+                }
+
+                // Check bucket for decode
+                if let Some(PolicyConfig::Bucket { .. }) = decode_policy {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "Decode policy should not be allowed to be bucket".to_string(),
+                    });
                 }
             }
         }
@@ -790,6 +812,106 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+    }
+
+    #[test]
+    fn test_validate_pd_mode_bucket_policy_restrictions() {
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), None),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+                decode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 60,
+                }),
+            },
+            PolicyConfig::Random, // Main policy as fallback
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(
+            result.is_ok(),
+            "Prefill policy should be allowed to be bucket"
+        );
+
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), None),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+                decode_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+            },
+            PolicyConfig::Random, // Main policy as fallback
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(
+            result.is_err(),
+            "Decode policy should not be allowed to be bucket"
+        );
+    }
+
+    #[test]
+    fn test_validate_empty_urls_allowed_without_service_discovery() {
+        // Test that empty URLs are now allowed in PD mode
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        // Test that empty URLs are allowed in Regular mode
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        // Test that empty URLs are allowed in OpenAI mode
+        let config = RouterConfig::new(
+            RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

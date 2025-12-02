@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import KVCache
+
 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 
 def alloc_extend_kernel_ascend(
@@ -61,6 +66,17 @@ def alloc_extend_kernel_ascend(
 
 
 class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+    ):
+        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        self.roundup = page_size - 1
 
     def alloc_extend(
         self,
@@ -77,8 +93,8 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             )
 
         num_new_pages = (
-            (seq_lens + self.page_size - 1) // self.page_size
-            - (prefix_lens + self.page_size - 1) // self.page_size
+            (seq_lens + self.roundup) // self.page_size
+            - (prefix_lens + self.roundup) // self.page_size
         ).sum()
         num_new_pages_item = num_new_pages.item()
         if self.need_sort and num_new_pages_item > len(self.free_pages):
@@ -87,24 +103,33 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages_item > len(self.free_pages):
             return None
 
-        out_indices = torch.empty(
-            (extend_num_tokens,), dtype=torch.int64, device=self.device
-        )
-
         if num_new_pages_item < 200:
-            import sgl_kernel_npu  # noqa: F401
+            from sgl_kernel_npu.mem_cache.allocator import alloc_extend_kernel
 
-            torch.ops.npu.alloc_extend(
+            out_indices = torch.empty(
+                (extend_num_tokens,),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            max_num_extend_tokens = next_power_of_2(extend_num_tokens)
+            bs = prefix_lens.shape[0]
+            alloc_extend_kernel[(bs,)](
                 prefix_lens,
                 seq_lens,
                 last_loc,
                 self.free_pages,
-                self.page_size,
                 out_indices,
-                num_new_pages,
+                next_power_of_2(bs),
+                self.page_size,
+                max_num_extend_tokens,
             )
 
         else:
+            out_indices = torch.empty(
+                (extend_num_tokens,),
+                dtype=torch.int32,
+                device=self.device,
+            )
             alloc_extend_kernel_ascend(
                 prefix_lens,
                 seq_lens,

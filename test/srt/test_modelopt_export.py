@@ -7,7 +7,6 @@ and quantization workflow.
 
 import json
 import os
-import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -23,7 +22,7 @@ from sglang.srt.model_loader.loader import ModelOptModelLoader
 
 # Check if modelopt is available
 try:
-    import modelopt
+    import modelopt  # noqa: F401
 
     MODELOPT_AVAILABLE = True
 except ImportError:
