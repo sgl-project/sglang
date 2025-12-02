@@ -470,7 +470,7 @@ def _adjust_embedding_length(
     embedding: torch.Tensor,
     mask: torch.Tensor,
     logger,
-    expected_token_count: Optional[int] = None,
+    expected_token_count: int,
 ) -> torch.Tensor:
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
