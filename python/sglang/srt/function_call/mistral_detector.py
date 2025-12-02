@@ -141,7 +141,6 @@ class MistralDetector(BaseFormatDetector):
 
             tags.append(
                 {
-                    "format": "tag",
                     "begin": begin,
                     "content": {
                         "type": "json_schema",

@@ -263,7 +263,6 @@ class GptOssDetector(BaseFormatDetector):
 
             tags.append(
                 {
-                    "format": "tag",
                     "begin": begin1,
                     "content": {
                         "type": "json_schema",
@@ -285,7 +284,6 @@ class GptOssDetector(BaseFormatDetector):
 
             tags.append(
                 {
-                    "format": "tag",
                     "begin": begin2,
                     "content": {
                         "type": "json_schema",

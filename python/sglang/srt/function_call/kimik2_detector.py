@@ -73,20 +73,22 @@ class KimiK2Detector(BaseFormatDetector):
             logger.debug("function_call_tuples: %s", function_call_tuples)
 
             tool_calls = []
-            for match in function_call_tuples:
+            for local_idx, match in enumerate(function_call_tuples):
                 function_id, function_args = match
                 m = self.tool_call_id_regex.match(function_id)
                 if not m:
                     logger.warning("Unexpected tool_call_id format: %s", function_id)
                     continue
                 function_name = m.group("name")
-                function_idx = int(m.group("index"))
+                # Use sequential counter instead of model's parsed index
+                # This ensures consistency with streaming mode and produces
+                # sequential response IDs (0, 1, 2...) as expected by Kimi K2
 
                 logger.info(f"function_name {function_name}")
 
                 tool_calls.append(
                     ToolCallItem(
-                        tool_index=function_idx,
+                        tool_index=local_idx,
                         name=function_name,
                         parameters=function_args,
                     )
@@ -227,39 +229,49 @@ class KimiK2Detector(BaseFormatDetector):
         at_least_one: bool = False,
         stop_after_first: bool = False,
     ) -> Dict[str, Any]:
-        """Build structural tag for Kimi K2 format."""
+        """Build structural tag for Kimi K2 format.
+
+        Uses dual triggers:
+        - First trigger: <|tool_calls_section_begin|> for the first tool call
+        - Second trigger: <|tool_call_begin|> for subsequent tool calls
+        """
         tags = []
-        triggers = set()
 
         for index, tool in enumerate(tools):
             name = tool.function.name
             if not name:
                 continue
 
-            begin = f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>"
-            end = "<|tool_call_end|><|tool_calls_section_end|>"
-            trigger = "<|tool_calls_section_begin|>"
-
-            # Always include schema
             schema = tool.function.parameters or {}
 
+            # Tag for FIRST tool call (includes outer section wrapper)
             tags.append(
                 {
-                    "format": "tag",
-                    "begin": begin,
+                    "begin": f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>",
                     "content": {
                         "type": "json_schema",
                         "json_schema": schema,
                     },
-                    "end": end,
+                    "end": "<|tool_call_end|>",
                 }
             )
-            triggers.add(trigger)
+
+            # Tag for SUBSEQUENT tool calls (no outer section wrapper)
+            tags.append(
+                {
+                    "begin": f"<|tool_call_begin|>functions.{name}:{index}<|tool_call_argument_begin|>",
+                    "content": {
+                        "type": "json_schema",
+                        "json_schema": schema,
+                    },
+                    "end": "<|tool_call_end|>",
+                }
+            )
 
         return {
             "format": {
                 "type": "triggered_tags",
-                "triggers": list(triggers),
+                "triggers": ["<|tool_calls_section_begin|>", "<|tool_call_begin|>"],
                 "tags": tags,
                 "at_least_one": at_least_one,
                 "stop_after_first": stop_after_first,
