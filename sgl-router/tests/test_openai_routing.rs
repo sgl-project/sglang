@@ -577,8 +577,10 @@ async fn test_router_factory_openai_mode() {
         worker_urls: vec!["https://api.openai.com".to_string()],
     };
 
-    let router_config =
-        RouterConfig::new(routing_mode, sgl_model_gateway::config::PolicyConfig::Random);
+    let router_config = RouterConfig::new(
+        routing_mode,
+        sgl_model_gateway::config::PolicyConfig::Random,
+    );
 
     let app_context = common::create_test_context(router_config).await;
 
