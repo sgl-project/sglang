@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use serde_json;
 use tracing::{debug, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
@@ -15,7 +16,7 @@ use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
     PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
-use crate::{config::types::PolicyConfig, core::Worker};
+use crate::{config::types::PolicyConfig, core::Worker, mesh::OptionalMeshSyncManager};
 
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
@@ -34,20 +35,50 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode
     decode_policy: Arc<RwLock<Option<Arc<dyn LoadBalancingPolicy>>>>,
+
+    /// Optional mesh sync manager for state synchronization
+    /// When None, the registry works independently without mesh synchronization
+    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
+    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
 }
 
 impl PolicyRegistry {
     /// Create a new PolicyRegistry with a default policy
     pub fn new(default_policy_config: PolicyConfig) -> Self {
-        let default_policy = Self::create_policy_from_config(&default_policy_config);
-
-        Self {
+        let mut registry = Self {
             model_policies: Arc::new(RwLock::new(HashMap::new())),
             model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
-            default_policy,
+            default_policy: Arc::new(RoundRobinPolicy::new()), // Temporary, will be set below
             prefill_policy: Arc::new(RwLock::new(None)),
             decode_policy: Arc::new(RwLock::new(None)),
-        }
+            mesh_sync: Arc::new(RwLock::new(None)),
+        };
+        let default_policy = registry.create_policy_from_config(&default_policy_config);
+        registry.default_policy = default_policy;
+        registry
+    }
+
+    /// Create a new PolicyRegistry with mesh sync manager
+    pub fn with_mesh_sync(
+        default_policy_config: PolicyConfig,
+        mesh_sync: OptionalMeshSyncManager,
+    ) -> Self {
+        let mut registry = Self {
+            model_policies: Arc::new(RwLock::new(HashMap::new())),
+            model_worker_counts: Arc::new(RwLock::new(HashMap::new())),
+            default_policy: Arc::new(RoundRobinPolicy::new()), // Temporary, will be set below
+            prefill_policy: Arc::new(RwLock::new(None)),
+            decode_policy: Arc::new(RwLock::new(None)),
+            mesh_sync: Arc::new(RwLock::new(mesh_sync.clone())),
+        };
+        let default_policy = registry.create_policy_from_config(&default_policy_config);
+        registry.default_policy = default_policy;
+        registry
+    }
+
+    /// Set mesh sync manager (thread-safe, can be called after initialization)
+    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
+        *self.mesh_sync.write().unwrap() = mesh_sync;
     }
 
     /// Called when a worker is added
@@ -96,6 +127,13 @@ impl PolicyRegistry {
             policies.insert(model_id.to_string(), Arc::clone(&policy));
         }
 
+        // Sync to mesh if enabled (no-op if mesh is not enabled)
+        if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+            // Serialize policy config (simplified - just store policy name for now)
+            let config = serde_json::to_vec(&policy.name()).unwrap_or_default();
+            mesh_sync.sync_policy_state(model_id.to_string(), policy.name().to_string(), config);
+        }
+
         policy
     }
 
@@ -132,6 +170,11 @@ impl PolicyRegistry {
                 );
                 // Policy will be dropped here, cleaning up any resources
                 drop(policy);
+            }
+
+            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
+            if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+                mesh_sync.remove_policy_state(model_id);
             }
         }
     }
@@ -174,7 +217,17 @@ impl PolicyRegistry {
         match policy_type {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
-            "cache_aware" => Arc::new(CacheAwarePolicy::new()),
+            "cache_aware" => {
+                // Create CacheAwarePolicy with mesh sync if available
+                if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+                    Arc::new(CacheAwarePolicy::with_config_and_mesh_sync(
+                        CacheAwareConfig::default(),
+                        Some(mesh_sync.clone()),
+                    ))
+                } else {
+                    Arc::new(CacheAwarePolicy::new())
+                }
+            }
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
             "bucket" => Arc::new(BucketPolicy::new()),
             _ => {
@@ -185,7 +238,7 @@ impl PolicyRegistry {
     }
 
     /// Create a policy from a PolicyConfig
-    fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+    fn create_policy_from_config(&self, config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
@@ -203,7 +256,15 @@ impl PolicyRegistry {
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
                 };
-                Arc::new(CacheAwarePolicy::with_config(cache_config))
+                // Create CacheAwarePolicy with mesh sync if available
+                if let Some(ref mesh_sync) = *self.mesh_sync.read().unwrap() {
+                    Arc::new(CacheAwarePolicy::with_config_and_mesh_sync(
+                        cache_config,
+                        Some(mesh_sync.clone()),
+                    ))
+                } else {
+                    Arc::new(CacheAwarePolicy::with_config(cache_config))
+                }
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::Bucket {
@@ -401,6 +462,54 @@ impl PolicyRegistry {
                         );
                         bucket.init_prefill_worker_urls(prefill_workers);
                     }
+                }
+            }
+        }
+    }
+
+    /// Apply remote tree operation to cache-aware policy for a model
+    /// This is called when receiving tree state updates from mesh
+    pub fn apply_remote_tree_operation(
+        &self,
+        model_id: &str,
+        operation: &crate::mesh::tree_ops::TreeOperation,
+    ) {
+        // Try to find the policy for this model
+        if let Some(policy) = self.get_policy(model_id) {
+            if policy.name() == "cache_aware" {
+                if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+
+        // Also check default policy if it's cache-aware
+        if self.default_policy.name() == "cache_aware" {
+            if let Some(cache_aware) = self
+                .default_policy
+                .as_any()
+                .downcast_ref::<CacheAwarePolicy>()
+            {
+                cache_aware.apply_remote_tree_operation(model_id, operation);
+            }
+        }
+
+        // Check prefill and decode policies for PD mode
+        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
+            if prefill_policy.name() == "cache_aware" {
+                if let Some(cache_aware) =
+                    prefill_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
+                }
+            }
+        }
+
+        if let Some(decode_policy) = self.decode_policy.read().unwrap().as_ref() {
+            if decode_policy.name() == "cache_aware" {
+                if let Some(cache_aware) = decode_policy.as_any().downcast_ref::<CacheAwarePolicy>()
+                {
+                    cache_aware.apply_remote_tree_operation(model_id, operation);
                 }
             }
         }

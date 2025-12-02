@@ -30,6 +30,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:info=Protobuf compilation completed successfully");
 
+    // Only regenerate if proto files change
+    println!("cargo:rerun-if-changed=src/mesh/proto/gossip.proto");
+
+    tonic_prost_build::configure()
+        // Generate both client and server code
+        .build_server(true)
+        .build_client(true)
+        .compile_protos(&["src/mesh/proto/gossip.proto"], &["src/mesh/proto"])?;
+
+    println!("cargo:info=Protobuf compilation completed successfully");
+
     // Read version and project name from pyproject.toml with fallback
     let version =
         read_field_from_pyproject("version").unwrap_or_else(|_| DEFAULT_VERSION.to_string());
