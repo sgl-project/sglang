@@ -96,7 +96,6 @@ class GPUWorker:
         Execute a forward pass.
         """
         assert self.pipeline is not None
-        # TODO: dealing with first req for now
         req = batch[0]
         output_batch = None
         try:
@@ -104,19 +103,25 @@ class GPUWorker:
             timings = RequestTimings(request_id=req.request_id)
             req.timings = timings
 
-            output_batch = self.pipeline.forward(req, self.server_args)
+            result = self.pipeline.forward(req, self.server_args)
+
+            if isinstance(result, Req):
+                output_batch = OutputBatch(
+                    output=result.output,
+                    trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
+                    trajectory_latents=getattr(result, "trajectory_latents", None),
+                    trajectory_decoded=getattr(result, "trajectory_decoded", None),
+                )
+            else:
+                output_batch = result
+
             duration_ms = (time.monotonic() - start_time) * 1000
 
             if output_batch.timings:
                 output_batch.timings.total_duration_ms = duration_ms
                 PerformanceLogger.log_request_summary(timings=output_batch.timings)
         except Exception as e:
-            if output_batch is None:
-                from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-                    OutputBatch,
-                )
-
-                output_batch = OutputBatch()
+            output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
         finally:
             return output_batch

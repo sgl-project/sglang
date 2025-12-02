@@ -27,6 +27,11 @@ class ImageGenerationsRequest(BaseModel):
     background: Optional[str] = "auto"  # transparent | opaque | auto
     output_format: Optional[str] = None  # png | jpeg | webp
     user: Optional[str] = None
+    # SGLang extensions
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    seed: Optional[int] = None
+    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
 # Video API protocol models
@@ -54,6 +59,11 @@ class VideoGenerationsRequest(BaseModel):
     size: Optional[str] = "720x1280"
     fps: Optional[int] = None
     num_frames: Optional[int] = None
+    # SGLang extensions
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    seed: Optional[int] = None
+    diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
 
 
 class VideoListResponse(BaseModel):

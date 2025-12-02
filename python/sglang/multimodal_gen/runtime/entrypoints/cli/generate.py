@@ -5,6 +5,7 @@
 
 import argparse
 import dataclasses
+import json
 import os
 from typing import cast
 
@@ -98,14 +99,33 @@ def generate_cmd(args: argparse.Namespace):
         envs.SGLANG_DIFFUSION_STAGE_LOGGING = True
 
     server_args = ServerArgs.from_cli_args(args)
+
     sampling_params_kwargs = SamplingParams.get_cli_args(args)
+    sampling_params_kwargs["request_id"] = generate_request_id()
+
+    # Handle diffusers-specific kwargs passed via CLI
+    if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:
+        try:
+            sampling_params_kwargs["diffusers_kwargs"] = json.loads(
+                args.diffusers_kwargs
+            )
+            logger.info(
+                "Parsed diffusers_kwargs: %s",
+                sampling_params_kwargs["diffusers_kwargs"],
+            )
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse --diffusers-kwargs as JSON: %s", e)
+            raise ValueError(
+                f"--diffusers-kwargs must be valid JSON. Got: {args.diffusers_kwargs}"
+            ) from e
+
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args
     )
 
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
-    prompt = sampling_params_kwargs.get("prompt", None)
+    prompt = sampling_params_kwargs.get("prompt")
     maybe_dump_performance(args, server_args, prompt, results)
 
 
