@@ -18,7 +18,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use sglang_router_rs::routers::grpc::harmony::{HarmonyDetector, HarmonyBuilder};
+//! use sgl_model_gateway::routers::grpc::harmony::{HarmonyDetector, HarmonyBuilder};
 //!
 //! // Detect if model supports Harmony
 //! if HarmonyDetector::is_harmony_model("gpt-4o") {
