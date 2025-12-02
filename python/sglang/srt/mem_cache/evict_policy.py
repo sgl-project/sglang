@@ -45,13 +45,13 @@ class FILOStrategy(EvictionStrategy):
 
 class AdapterMixStrategy(EvictionStrategy):
 
-    def __init__(self, time_threshold):
+    def __init__(self):
         self.cold_count = 0
         self.hot_count = 0
         self.last_update_time = 0
-        self.time_threshold = time_threshold
-        self.min_time_threshold = max(30, self.time_threshold >> 4)
-        self.max_time_threshold = min(self.time_threshold << 4, 600)
+        self.time_threshold = 180
+        self.min_time_threshold = 30
+        self.max_time_threshold = 600
 
     def get_priority(
         self, node: "TreeNode", now_time: Optional[float] = None
