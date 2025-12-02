@@ -165,8 +165,8 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.value:
-            npu_phy_id = envs.ASCEND_NPU_PHY_ID.value
+        if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
+            npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             if npu_phy_id == -1:
                 hostname += f":{get_free_port()}:npu_{self.gpu_id}"
             else:
