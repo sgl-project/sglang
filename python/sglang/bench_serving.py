@@ -12,12 +12,14 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import importlib.util
 import io
 import json
 import os
 import pickle
 import random
 import resource
+import shutil
 import sys
 import time
 import traceback
@@ -46,6 +48,10 @@ from transformers import (
 )
 
 ASSISTANT_SUFFIX = "Assistant:"
+
+TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
+    shutil.which("gnuplot") is not None
+)
 
 global args
 
@@ -93,6 +99,7 @@ class RequestFuncOutput:
     prompt_len: int = 0
     error: str = ""
     output_len: int = 0
+    start_time: float = 0.0
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -230,6 +237,7 @@ async def async_request_openai_completions(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -354,6 +362,7 @@ async def async_request_openai_chat_completions(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(
@@ -401,6 +410,7 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
+                                        output.text_chunks.append(content)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
@@ -542,6 +552,7 @@ async def async_request_sglang_generate(
         output_len = request_func_input.output_len
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
         try:
@@ -617,7 +628,11 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
         try:
             body = {
                 "activities": getattr(args, "profile_activities", []),
+                "num_steps": getattr(args, "profile_num_steps", None),
+                "profile_by_stage": getattr(args, "profile_by_stage", None),
+                "profile_stages": getattr(args, "profile_stages", None),
             }
+            print(f"async_request_profile {api_url=} {body=}")
             async with session.post(url=api_url, json=body) as response:
                 if response.status == 200:
                     output.success = True
@@ -864,6 +879,8 @@ class BenchmarkMetrics:
     std_e2e_latency_ms: float
     p99_e2e_latency_ms: float
     concurrency: float
+    max_output_tokens_per_s: float = 0.0
+    max_concurrent_requests: int = 0
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -994,7 +1011,10 @@ async def get_mooncake_request_over_time(
             # Form the full prompt from history
             try:
                 full_prompt_text = tokenizer.apply_chat_template(
-                    chat_history, tokenize=False, add_generation_prompt=True
+                    chat_history,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    return_dict=False,
                 )
             except Exception:
                 full_prompt_text = "\n".join(
@@ -1160,6 +1180,7 @@ def sample_sharegpt_requests(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True,
                 tokenize=False,
+                return_dict=False,
             )
             if tokenizer.bos_token:
                 prompt = prompt.replace(tokenizer.bos_token, "")
@@ -1382,6 +1403,7 @@ def create_mm_data_row(
     vision_prompt_len = prompt_len - text_prompt_len
 
     use_raw_prompt = backend in [
+        "sglang",
         "sglang-oai",
         "sglang-oai-chat",
         "vllm",
@@ -1461,7 +1483,11 @@ def sample_image_requests(
     total_image_bytes = 0
     for i in range(num_requests):
         # Generate text prompt
-        text_prompt = gen_prompt(processor.tokenizer, int(input_lens[i]))
+        text_prompt = gen_mm_prompt(
+            processor.tokenizer,
+            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            int(input_lens[i]),
+        )
 
         # Generate image list
         images, images_base64, images_bytes = zip(
@@ -1497,6 +1523,15 @@ def get_available_tokens(tokenizer):
 def gen_prompt(tokenizer, token_num):
     """Generate a random prompt of specified token length using tokenizer vocabulary."""
     all_available_tokens = get_available_tokens(tokenizer)
+    selected_tokens = random.choices(all_available_tokens, k=token_num)
+    return tokenizer.decode(selected_tokens)
+
+
+def gen_mm_prompt(tokenizer, image_pad_id, token_num):
+    """Generate a random prompt of specified token length using tokenizer vocabulary."""
+    all_available_tokens = list(tokenizer.get_vocab().values())
+    if image_pad_id:
+        all_available_tokens.remove(image_pad_id)
     selected_tokens = random.choices(all_available_tokens, k=token_num)
     return tokenizer.decode(selected_tokens)
 
@@ -1643,6 +1678,7 @@ def calculate_metrics(
     tokenizer: PreTrainedTokenizerBase,
     backend: str,
     accept_length: Optional[float] = None,
+    plot_throughput: bool = False,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
     retokenized_output_lens: List[int] = []
@@ -1702,6 +1738,70 @@ def calculate_metrics(
             stacklevel=2,
         )
 
+    max_output_tokens_per_s = 0.0
+    max_concurrent_requests = 0
+
+    successful_outputs = [output for output in outputs if output.success]
+    if successful_outputs:
+        min_start_time = min(output.start_time for output in successful_outputs)
+        max_end_time = max(
+            output.start_time + output.latency for output in successful_outputs
+        )
+
+        duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
+        tokens_per_second = np.zeros(duration_seconds)
+        concurrent_requests_per_second = np.zeros(duration_seconds)
+
+        for output in outputs:
+            if not output.success:
+                continue
+
+            token_times = [output.start_time + output.ttft]
+            current_time = token_times[0]
+            for itl_value in output.itl:
+                current_time += itl_value
+                token_times.append(current_time)
+
+            for token_time in token_times:
+                second_bucket = int(token_time - min_start_time)
+                if 0 <= second_bucket < duration_seconds:
+                    tokens_per_second[second_bucket] += 1
+
+            request_start_second = int(output.start_time - min_start_time)
+            request_end_second = int(
+                (output.start_time + output.latency) - min_start_time
+            )
+
+            for second in range(
+                request_start_second, min(request_end_second + 1, duration_seconds)
+            ):
+                concurrent_requests_per_second[second] += 1
+
+        if len(tokens_per_second) > 0:
+            max_output_tokens_per_s = float(np.max(tokens_per_second))
+            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
+
+        if plot_throughput:
+            if TERM_PLOTLIB_AVAILABLE:
+                import termplotlib as tpl
+
+                fig = tpl.figure()
+                fig.plot(
+                    np.arange(len(tokens_per_second)),
+                    tokens_per_second,
+                    title="Output tokens per second",
+                    xlabel="Time (s)",
+                )
+                fig.plot(
+                    np.arange(len(concurrent_requests_per_second)),
+                    concurrent_requests_per_second,
+                    title="Concurrent requests per second",
+                    xlabel="Time (s)",
+                )
+                fig.show()
+            else:
+                print("tip: install termplotlib and gnuplot to plot the metrics")
+
     itls = retokenized_itls if use_retokenized_itl else itls
     metrics = BenchmarkMetrics(
         completed=completed,
@@ -1737,6 +1837,8 @@ def calculate_metrics(
         std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
         p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
         concurrency=np.sum(e2e_latencies) / dur_s,
+        max_output_tokens_per_s=max_output_tokens_per_s,
+        max_concurrent_requests=max_concurrent_requests,
     )
 
     return metrics, output_lens
@@ -1947,12 +2049,13 @@ async def benchmark(
             if pd_profile_urls:
                 await _call_profile_pd(pd_profile_urls, "stop")
         else:
-            print("Stopping profiler...")
-            profile_output = await async_request_profile(
-                api_url=base_url + "/stop_profile"
-            )
-            if profile_output.success:
-                print("Profiler stopped")
+            if getattr(args, "profile_num_steps", None) is None:
+                print("Stopping profiler...")
+                profile_output = await async_request_profile(
+                    api_url=base_url + "/stop_profile"
+                )
+                if profile_output.success:
+                    print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -1988,6 +2091,7 @@ async def benchmark(
         tokenizer=tokenizer,
         backend=backend,
         accept_length=accept_length,
+        plot_throughput=args.plot_throughput,
     )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -2033,6 +2137,16 @@ async def benchmark(
     )
     print(
         "{:<40} {:<10.2f}".format(
+            "Peak output token throughput (tok/s):", metrics.max_output_tokens_per_s
+        )
+    )
+    print(
+        "{:<40} {:<10}".format(
+            "Peak concurrent requests:", metrics.max_concurrent_requests
+        )
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
             "Total token throughput (tok/s):", metrics.total_throughput
         )
     )
@@ -2052,6 +2166,12 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
     print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
     print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+    print(
+        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
+    )
+    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
+    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
     print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
     print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
     print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
@@ -2092,6 +2212,7 @@ async def benchmark(
             "request_throughput": metrics.request_throughput,
             "input_throughput": metrics.input_throughput,
             "output_throughput": metrics.output_throughput,
+            "total_throughput": metrics.total_throughput,
             "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
             "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
             "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
@@ -2111,6 +2232,8 @@ async def benchmark(
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
+            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
+            "max_concurrent_requests": metrics.max_concurrent_requests,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
@@ -2186,6 +2309,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "tokenize_prompt"):
         args.tokenize_prompt = False
+
+    if not hasattr(args, "plot_throughput"):
+        args.plot_throughput = False
 
     if not hasattr(args, "use_trace_timestamps"):
         args.use_trace_timestamps = False
@@ -2578,6 +2704,11 @@ if __name__ == "__main__":
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
     )
+    parser.add_argument(
+        "--plot-throughput",
+        action="store_true",
+        help="Plot throughput and concurrent requests over time. Requires termplotlib and gnuplot.",
+    )
     # TODO unify all these
     parser.add_argument(
         "--profile-activities",
@@ -2586,6 +2717,9 @@ if __name__ == "__main__":
         default=["CPU", "GPU"],
         choices=["CPU", "GPU", "CUDA_PROFILER"],
     )
+    parser.add_argument("--profile-num-steps", type=int, default=None)
+    parser.add_argument("--profile-by-stage", action="store_true", default=False)
+    parser.add_argument("--profile-stages", nargs="+", default=None)
     parser.add_argument(
         "--lora-name",
         type=str,

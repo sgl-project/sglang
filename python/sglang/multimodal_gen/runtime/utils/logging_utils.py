@@ -5,36 +5,32 @@
 """Logging configuration for sglang.multimodal_gen."""
 import argparse
 import datetime
-import json
 import logging
 import os
 import sys
+import time
 import warnings
+from contextlib import contextmanager
 from functools import lru_cache, partial
 from logging import Logger
-from logging.config import dictConfig
-from os import path
 from types import MethodType
 from typing import Any, cast
 
 import sglang.multimodal_gen.envs as envs
 
-SGL_DIFFUSION_CONFIGURE_LOGGING = envs.SGL_DIFFUSION_CONFIGURE_LOGGING
-SGL_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGL_DIFFUSION_LOGGING_CONFIG_PATH
-SGL_DIFFUSION_LOGGING_LEVEL = envs.SGL_DIFFUSION_LOGGING_LEVEL
-SGL_DIFFUSION_LOGGING_PREFIX = envs.SGL_DIFFUSION_LOGGING_PREFIX
+SGLANG_DIFFUSION_CONFIGURE_LOGGING = envs.SGLANG_DIFFUSION_CONFIGURE_LOGGING
+SGLANG_DIFFUSION_LOGGING_CONFIG_PATH = envs.SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
+SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
+SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
 
 RED = "\033[91m"
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 RESET = "\033[0;0m"
 
-_warned_local_main_process = False
-_warned_main_process = False
-
 _FORMAT = (
-    f"{SGL_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
-    "[%(filename)s:%(lineno)d] %(message)s"
+    f"{SGLANG_DIFFUSION_LOGGING_PREFIX}%(levelname)s %(asctime)s "
+    "[%(filename)s: %(lineno)d] %(message)s"
 )
 
 # _FORMAT = "[%(asctime)s] %(message)s"
@@ -52,7 +48,7 @@ DEFAULT_LOGGING_CONFIG = {
         "sgl_diffusion": {
             "class": "logging.StreamHandler",
             "formatter": "sgl_diffusion",
-            "level": SGL_DIFFUSION_LOGGING_LEVEL,
+            "level": SGLANG_DIFFUSION_LOGGING_LEVEL,
             "stream": "ext://sys.stdout",
         },
     },
@@ -129,69 +125,46 @@ def _print_warning_once(logger: Logger, msg: str) -> None:
     logger.warning(msg, stacklevel=2)
 
 
-# TODO(will): add env variable to control this process-aware logging behavior
-def _info(
-    logger: Logger,
+def get_is_main_process():
+    try:
+        rank = int(os.environ["RANK"])
+    except (KeyError, ValueError):
+        rank = 0
+    return rank == 0
+
+
+def get_is_local_main_process():
+    try:
+        rank = int(os.environ["LOCAL_RANK"])
+    except (KeyError, ValueError):
+        rank = 0
+    return rank == 0
+
+
+def _log_process_aware(
+    level: int,
+    logger_self: Logger,
     msg: object,
     *args: Any,
-    main_process_only: bool = True,
-    local_main_process_only: bool = True,
+    main_process_only: bool,
+    local_main_process_only: bool,
     **kwargs: Any,
 ) -> None:
-    """Process-aware INFO level logging function.
+    """Helper function to log a message if the process rank matches the criteria."""
+    is_main_process = get_is_main_process()
+    is_local_main_process = get_is_local_main_process()
 
-    This function controls logging behavior based on the process rank, allowing for
-    selective logging from specific processes in a distributed environment.
+    should_log = (
+        not main_process_only
+        and not local_main_process_only
+        or (main_process_only and is_main_process)
+        or (local_main_process_only and is_local_main_process)
+    )
 
-    Args:
-        logger: The logger instance to use for logging
-        msg: The message format string to log
-        *args: Format string arguments
-        main_process_only: If True, only log if this is the global main process (RANK=0)
-        local_main_process_only: If True, only log if this is the local main process (LOCAL_RANK=0)
-        **kwargs: Additional keyword arguments to pass to the logger.log method
-            - stacklevel: Defaults to 2 to show the original caller's location
-
-    Note:
-        - When both main_process_only and local_main_process_only are True,
-          the message will be logged only if both conditions are met
-        - When both are False, the message will be logged from all processes
-        - By default, only logs from processes with LOCAL_RANK=0
-    """
-    try:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = int(os.environ["RANK"])
-    except Exception:
-        local_rank = 0
-        rank = 0
-
-    is_main_process = rank == 0
-    is_local_main_process = local_rank == 0
-
-    if (main_process_only and is_main_process) or (
-        local_main_process_only and is_local_main_process
-    ):
-        logger.log(logging.INFO, msg, *args, stacklevel=2, **kwargs)
-
-    global _warned_local_main_process, _warned_main_process
-
-    if not _warned_local_main_process and local_main_process_only:
-        # logger.warning(
-        #     "%sBy default, logger.info(..) will only log from the local main process. Set logger.info(..., is_local_main_process=False) to log from all processes.%s",
-        #     GREEN,
-        #     RESET,
-        # )
-        _warned_local_main_process = True
-    if not _warned_main_process and main_process_only and is_main_process:
-        # logger.warning(
-        #     "%sis_main_process_only is set to True, logging only from the main (RANK==0) process.%s",
-        #     GREEN,
-        #     RESET,
-        # )
-        _warned_main_process = True
-
-    if not main_process_only and not local_main_process_only:
-        logger.log(logging.INFO, msg, *args, stacklevel=2, **kwargs)
+    if should_log:
+        # stacklevel=3 to show the original caller's location,
+        # as this function is called by the patched methods.
+        logger_self.log(level, msg, *args, stacklevel=3, **kwargs)
 
 
 class _SGLDiffusionLogger(Logger):
@@ -224,54 +197,34 @@ class _SGLDiffusionLogger(Logger):
         main_process_only: bool = True,
         local_main_process_only: bool = True,
         **kwargs: Any,
-    ) -> None:
-        _info(
-            self,
-            msg,
-            *args,
-            main_process_only=main_process_only,
-            local_main_process_only=local_main_process_only,
-            **kwargs,
-        )
+    ) -> None: ...
 
+    def debug(  # type: ignore[override]
+        self,
+        msg: object,
+        *args: Any,
+        main_process_only: bool = True,
+        local_main_process_only: bool = True,
+        **kwargs: Any,
+    ) -> None: ...
 
-def _configure_sgl_diffusion_root_logger() -> None:
-    logging_config = dict[str, Any]()
+    def warning(  # type: ignore[override]
+        self,
+        msg: object,
+        *args: Any,
+        main_process_only: bool = False,
+        local_main_process_only: bool = True,
+        **kwargs: Any,
+    ) -> None: ...
 
-    if not SGL_DIFFUSION_CONFIGURE_LOGGING and SGL_DIFFUSION_LOGGING_CONFIG_PATH:
-        raise RuntimeError(
-            "SGL_DIFFUSION_CONFIGURE_LOGGING evaluated to false, but "
-            "SGL_DIFFUSION_LOGGING_CONFIG_PATH was given. SGL_DIFFUSION_LOGGING_CONFIG_PATH "
-            "implies SGL_DIFFUSION_CONFIGURE_LOGGING. Please enable "
-            "SGL_DIFFUSION_CONFIGURE_LOGGING or unset SGL_DIFFUSION_LOGGING_CONFIG_PATH."
-        )
-
-    if SGL_DIFFUSION_CONFIGURE_LOGGING:
-        logging_config = DEFAULT_LOGGING_CONFIG
-
-    if SGL_DIFFUSION_LOGGING_CONFIG_PATH:
-        if not path.exists(SGL_DIFFUSION_LOGGING_CONFIG_PATH):
-            raise RuntimeError(
-                "Could not load logging config. File does not exist: %s",
-                SGL_DIFFUSION_LOGGING_CONFIG_PATH,
-            )
-        with open(SGL_DIFFUSION_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
-            custom_config = json.loads(file.read())
-
-        if not isinstance(custom_config, dict):
-            raise ValueError(
-                "Invalid logging config. Expected Dict, got %s.",
-                type(custom_config).__name__,
-            )
-        logging_config = custom_config
-
-    for formatter in logging_config.get("formatters", {}).values():
-        # This provides backwards compatibility after #10134.
-        if formatter.get("class") == "sglang.multimodal_gen.logging.NewLineFormatter":
-            formatter["class"] = "sglang.multimodal_gen.logging_utils.NewLineFormatter"
-
-    if logging_config:
-        dictConfig(logging_config)
+    def error(  # type: ignore[override]
+        self,
+        msg: object,
+        *args: Any,
+        main_process_only: bool = False,
+        local_main_process_only: bool = True,
+        **kwargs: Any,
+    ) -> None: ...
 
 
 def init_logger(name: str) -> _SGLDiffusionLogger:
@@ -281,24 +234,58 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
-    methods_to_patch = {
-        "info_once": _print_info_once,
-        "warning_once": _print_warning_once,
-        "info": _info,
-    }
+    # Patch instance methods
+    setattr(logger, "info_once", MethodType(_print_info_once, logger))
+    setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
 
-    for method_name, method in methods_to_patch.items():
-        setattr(
-            logger, method_name, MethodType(method, logger)
-        )  # type: ignore[arg-type]
+    def _create_patched_method(
+        level: int,
+        main_process_only_default: bool,
+        local_main_process_only_default: bool,
+    ):
+        def _method(
+            self: Logger,
+            msg: object,
+            *args: Any,
+            main_process_only: bool = main_process_only_default,
+            local_main_process_only: bool = local_main_process_only_default,
+            **kwargs: Any,
+        ) -> None:
+            _log_process_aware(
+                level,
+                self,
+                msg,
+                *args,
+                main_process_only=main_process_only,
+                local_main_process_only=local_main_process_only,
+                **kwargs,
+            )
+
+        return _method
+
+    setattr(
+        logger,
+        "info",
+        MethodType(_create_patched_method(logging.INFO, True, True), logger),
+    )
+    setattr(
+        logger,
+        "debug",
+        MethodType(_create_patched_method(logging.DEBUG, True, True), logger),
+    )
+    setattr(
+        logger,
+        "warning",
+        MethodType(_create_patched_method(logging.WARNING, False, True), logger),
+    )
+    setattr(
+        logger,
+        "error",
+        MethodType(_create_patched_method(logging.ERROR, False, True), logger),
+    )
 
     return cast(_SGLDiffusionLogger, logger)
 
-
-# The root logger is initialized when the module is imported.
-# This is thread-safe as the module is only imported once,
-# guaranteed by the Python GIL.
-# _configure_sgl_diffusion_root_logger()
 
 logger = init_logger(__name__)
 
@@ -358,7 +345,7 @@ def enable_trace_function_call(log_file_path: str, root_dir: str | None = None):
     will have the trace enabled. Other threads will not be affected.
     """
     logger.warning(
-        "SGL_DIFFUSION_TRACE_FUNCTION is enabled. It will record every"
+        "SGLANG_DIFFUSION_TRACE_FUNCTION is enabled. It will record every"
         " function executed by Python. This will slow down the code. It "
         "is suggested to be used for debugging hang or crashes only."
     )
@@ -395,7 +382,101 @@ def configure_logger(server_args, prefix: str = ""):
     set_uvicorn_logging_configs()
 
 
-def suppress_other_loggers():
+def suppress_loggers(loggers_to_suppress: list[str]):
+    original_levels = {}
+
+    for logger_name in loggers_to_suppress:
+        logger = logging.getLogger(logger_name)
+        original_levels[logger_name] = logger.level
+        logger.setLevel(logging.WARNING)
+
+    return original_levels
+
+
+@contextmanager
+def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
+    """
+    A context manager to temporarily suppress specified loggers.
+
+    Args:
+        not_suppress_on_main_rank (bool): If True, loggers will not be
+            suppressed on the main process (rank 0).
+    """
+    # This is a global setting that we want to apply to all ranks
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
+    )
+
+    should_suppress = True
+    if not_suppress_on_main_rank:
+        if get_is_main_process() == 0:
+            should_suppress = False
+
+    loggers_to_suppress = ["urllib3", "imageio", "imageio_ffmpeg", "PIL", "PIL_Image"]
+    original_levels = suppress_loggers(loggers_to_suppress)
+
+    try:
+        yield
+    finally:
+        if should_suppress:
+            for logger_name, level in original_levels.items():
+                logging.getLogger(logger_name).setLevel(level)
+
+
+class GenerationTimer:
+    def __init__(self):
+        self.start_time = 0.0
+        self.end_time = 0.0
+        self.duration = 0.0
+
+
+@contextmanager
+def log_generation_timer(
+    logger: logging.Logger,
+    prompt: str,
+    request_idx: int | None = None,
+    total_requests: int | None = None,
+):
+    if request_idx is not None and total_requests is not None:
+        logger.info(
+            "Processing prompt %d/%d: %s",
+            request_idx,
+            total_requests,
+            prompt[:100],
+        )
+    else:
+        max_len = 100
+        suffix = "..." if len(prompt) > max_len else ""
+        logger.info(f"Processing prompt: {prompt[:100]}{suffix}")
+
+    timer = GenerationTimer()
+    timer.start_time = time.perf_counter()
+    try:
+        yield timer
+        timer.end_time = time.perf_counter()
+        timer.duration = timer.end_time - timer.start_time
+        logger.info("Pixel data generated successfully in %.2f seconds", timer.duration)
+    except Exception as e:
+        if request_idx is not None:
+            logger.error(
+                "Failed to generate output for prompt %d: %s",
+                request_idx,
+                e,
+                exc_info=True,
+            )
+        else:
+            logger.error(
+                f"Failed to generate output for prompt: {e}",
+                exc_info=True,
+            )
+        raise
+
+
+def log_batch_completion(
+    logger: logging.Logger, num_outputs: int, total_time: float
+) -> None:
+    logger.info(
+        "Completed batch processing. Generated %d outputs in %.2f seconds.",
+        num_outputs,
+        total_time,
     )

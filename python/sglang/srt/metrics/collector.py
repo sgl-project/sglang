@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Utilities for Prometheus Metrics Collection."""
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
@@ -22,6 +23,20 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
+
+
+def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
+    """
+    Get the histogram configuration from the environment variable.
+    env value should be like "0.1,0.2,0.5,1,2"
+    """
+    if env_var_name not in os.environ:
+        return None
+    # if the env var is not set or empty, return None
+    env_var_value = os.environ[env_var_name]
+    if not env_var_value:
+        return None
+    return [float(x) for x in env_var_value.split(",")]
 
 
 @dataclass
@@ -46,11 +61,21 @@ class TimeStats:
     # TODO: correct set them
     bootstrap_duration: float = 0.0
     alloc_waiting_duration: float = 0.0
-    prefill_start_time: float = 0.0
-    prefill_end_time: float = 0.0
+    prefill_start_time_host: float = 0.0
+    prefill_end_time_host: float = 0.0
 
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
+
+    def get_prefill_launch_delay(self) -> Optional[float]:
+        if self.prefill_start_time_host > 0.0:
+            return self.prefill_start_time_host - self.forward_entry_time
+        return None
+
+    def get_prefill_launch_latency(self) -> Optional[float]:
+        if self.prefill_start_time_host > 0.0 and self.prefill_end_time_host > 0.0:
+            return self.prefill_end_time_host - self.prefill_start_time_host
+        return None
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
@@ -159,6 +184,8 @@ class SchedulerStats:
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
 
+    max_total_num_tokens: int = 0
+
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
@@ -184,6 +211,7 @@ class SchedulerStats:
     # Engine startup
     engine_startup_time: float = 0.0
     engine_load_weights_time: float = 0.0
+    new_token_ratio: float = 0.0
 
     # CUDA graph
     is_cuda_graph: float = 0.0
@@ -191,7 +219,10 @@ class SchedulerStats:
 
 class SchedulerMetricsCollector:
 
-    def __init__(self, labels: Dict[str, str]) -> None:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Gauge, Histogram
 
@@ -261,6 +292,13 @@ class SchedulerMetricsCollector:
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.max_total_num_tokens = Gauge(
+            name="sglang:max_total_num_tokens",
+            documentation="Maximum total number of tokens in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -459,6 +497,11 @@ class SchedulerMetricsCollector:
             documentation="Number of grammar aborted requests.",
             labelnames=labels.keys(),
         )
+        self.num_grammar_timeout = Counter(
+            name="sglang:num_grammar_timeout_total",
+            documentation="Number of grammar timeouts.",
+            labelnames=labels.keys(),
+        )
         self.num_grammar_total = Counter(
             name="sglang:num_grammar_total",
             documentation="Number of the total grammar requests.",
@@ -562,6 +605,13 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.new_token_ratio = Gauge(
+            name="sglang:new_token_ratio",
+            documentation="The new token ratio.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def _log_gauge(self, gauge, data: Union[int, float]) -> None:
         # Convenience function for logging to gauge.
         gauge.labels(**self.labels).set(data)
@@ -598,6 +648,8 @@ class SchedulerMetricsCollector:
             self.num_running_reqs_offline_batch, stats.num_running_reqs_offline_batch
         )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
+
+        self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
@@ -639,6 +691,7 @@ class SchedulerMetricsCollector:
             self._log_gauge(
                 self.engine_load_weights_time, stats.engine_load_weights_time
             )
+        self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
 
         # CUDA graph
         self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
@@ -646,25 +699,28 @@ class SchedulerMetricsCollector:
         self.last_log_time = time.perf_counter()
 
     def log_grammar_stats(self, grammar_stats) -> None:
-        # Duck-typed GrammarStats to avoid cross-package dependency
-        if getattr(grammar_stats, "compilation_time", None) is not None:
+        if grammar_stats.compilation_time is not None:
             self._log_histogram(
                 self.grammar_compilation_time, grammar_stats.compilation_time
             )
-        if getattr(grammar_stats, "schema_count", None) is not None:
+        if grammar_stats.schema_count is not None:
             self._log_histogram(self.grammar_schema_count, grammar_stats.schema_count)
-        if getattr(grammar_stats, "ebnf_size", None) is not None:
+        if grammar_stats.ebnf_size is not None:
             self._log_histogram(self.grammar_ebnf_size, grammar_stats.ebnf_size)
-        tree_times = getattr(grammar_stats, "tree_traversal_time", None)
+        tree_times = grammar_stats.tree_traversal_time
         if tree_times:
             max_time = max(tree_times)
             avg_time = sum(tree_times) / len(tree_times)
             self._log_histogram(self.grammar_tree_traversal_time_max, max_time)
             self._log_histogram(self.grammar_tree_traversal_time_avg, avg_time)
-        if getattr(grammar_stats, "is_cache_hit", False):
+        if grammar_stats.is_cache_hit:
             self.num_grammar_cache_hit.labels(**self.labels).inc(1)
-        if getattr(grammar_stats, "is_grammar_aborted", False):
+        if grammar_stats.is_grammar_aborted:
             self.num_grammar_aborted.labels(**self.labels).inc(1)
+        if grammar_stats.num_timeout > 0:
+            self.num_grammar_timeout.labels(**self.labels).inc(
+                grammar_stats.num_timeout
+            )
         self.num_grammar_total.labels(**self.labels).inc(1)
 
 
@@ -1068,3 +1124,100 @@ class ExpertDispatchCollector:
             labelnames={"layer"},
             buckets=ep_size_buckets,
         )
+
+
+class RadixCacheMetricsCollector:
+    def __init__(
+        self,
+        labels: Dict[str, str],
+    ) -> None:
+        # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels
+
+        bucket_eviction_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_EVICTION_DURATION"
+        )
+        if bucket_eviction_duration is None:
+            bucket_eviction_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        bucket_load_back_duration = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_LOAD_BACK_DURATION"
+        )
+        if bucket_load_back_duration is None:
+            bucket_load_back_duration = [
+                0.001,
+                0.002,
+                0.003,
+                0.004,
+                0.005,
+                0.006,
+                0.007,
+                0.008,
+                0.009,
+                0.01,
+                0.02,
+                0.03,
+                0.04,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+        self.eviction_duration_seconds = Histogram(
+            name="sglang:eviction_duration_seconds",
+            documentation="Time taken to evict memory from GPU to CPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_eviction_duration,
+        )
+
+        self.eviction_num_tokens = Counter(
+            name="sglang:evicted_tokens_total",
+            documentation="The number of tokens evicted from GPU to CPU.",
+            labelnames=labels.keys(),
+        )
+
+        self.load_back_duration_seconds = Histogram(
+            name="sglang:load_back_duration_seconds",
+            documentation="Time taken to load memory from CPU to GPU in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_load_back_duration,
+        )
+
+        self.load_back_num_tokens = Counter(
+            name="sglang:load_back_tokens_total",
+            documentation="The number of tokens loaded from CPU to GPU.",
+            labelnames=labels.keys(),
+        )
+
+    def increment_eviction_num_tokens(self, num_tokens: int) -> None:
+        self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_load_back_num_tokens(self, num_tokens: int) -> None:
+        self.load_back_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def observe_eviction_duration(self, duration_seconds: float) -> None:
+        self.eviction_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def observe_load_back_duration(self, duration_seconds: float) -> None:
+        self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)

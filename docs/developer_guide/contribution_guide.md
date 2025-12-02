@@ -63,19 +63,45 @@ You can find additional accuracy eval examples in:
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](../developer_guide/benchmark_and_profiling.md).
 
-## Request a review
-You can identify potential reviewers for your code by checking the [code owners](https://github.com/sgl-project/sglang/blob/main/.github/CODEOWNERS) and [reviewers](https://github.com/sgl-project/sglang/blob/main/.github/REVIEWERS.md) files.
-Another effective strategy is to review the file modification history and contact individuals who have frequently edited the files.
-If you modify files protected by code owners, their approval is required to merge the code.
+## Requesting a review for merge
+You can follow the pull request merge process described in [MAINTAINER.md](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md).
+You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals.
+Then your PR can be merged.
 
-## How to trigger CI
-To trigger CI, the pull request must have the "run-ci" label.
+## How to Trigger CI Tests
 
-- If you have write access to sgl-project/sglang, your pull request will be automatically tagged by @sglang-bot.
-- If you have triage access to sgl-project/sglang, you can manually add the label by clicking "Labels" on the right side of your pull request page.
-- If you do not have the above access, please request a review and ask other maintainers to add the label for you.
+We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
+Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
-## General code style
+For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
+
+- `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI.
+- `/rerun-failed-ci`: Reruns the failed or flaky tests from the most recent commit.
+- `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
+
+If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
+
+To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
+
+If you don’t have permission, please ask maintainers to trigger CI for you.
+
+### CI rate limits
+
+We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
+
+Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default cooldown period is 120 minutes, and each workflow can override it via the `cool-down-minutes` input parameter:
+
+```yaml
+cool-down-minutes:
+  description: "Default cooldown period in minutes; 0 disables rate limiting"
+  type: number
+  default: 120
+```
+
+Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
+
+
+## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.

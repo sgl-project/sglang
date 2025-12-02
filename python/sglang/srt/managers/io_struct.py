@@ -21,7 +21,7 @@ import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -80,18 +80,18 @@ class RequestTimingMetricsMixin:
     #   - Prefill instance (P): timestamp when prefill forward pass begins
     #   - Decode instance (D): timestamp when decode forward pass begins
     # Note: This is NOT the same as prefill_start_time. There may be a delay between
-    # forward_entry_time and prefill_start_time (see prefill_delay).
+    # forward_entry_time and prefill_start_time (see prefill_launch_delay).
     forward_entry_time: Optional[List[Optional[float]]]
 
-    # Prefill delay: time spent waiting between forward entry and prefill start.
+    # Prefill launch delay: time spent waiting between forward entry and prefill start.
     # Calculated as: prefill_start_time - forward_entry_time
     # This represents the delay between when the request enters the forward stage
     # and when prefill computation actually begins.
-    prefill_delay: Optional[List[Optional[float]]]
+    prefill_launch_delay: Optional[List[Optional[float]]]
 
-    # Prefill latency: time spent during prefill computation.
-    # Calculated as: prefill_end_time - prefill_start_time
-    prefill_latency: Optional[List[Optional[float]]]
+    # Prefill launch latency: time spent during prefill kernel launch.
+    # Calculated as: prefill_end_time_host - prefill_start_time_host
+    prefill_launch_latency: Optional[List[Optional[float]]]
 
 
 @dataclass
@@ -924,7 +924,7 @@ class BatchTokenIDOutput(
 
 
 @dataclass
-class BatchMultimodalDecodeReq(BaseBatchReq, RequestTimingMetricsMixin):
+class BatchMultimodalDecodeReq(BaseBatchReq):
     decoded_ids: List[int]
     input_token_logprobs_val: List[float]
     input_token_logprobs_idx: List[int]
@@ -1003,7 +1003,7 @@ class BatchStrOutput(
 
 
 @dataclass
-class BatchMultimodalOutput(BaseBatchReq, RequestTimingMetricsMixin):
+class BatchMultimodalOutput(BaseBatchReq):
     # The finish reason
     finished_reasons: List[dict]
     decoded_ids: List[List[int]]
@@ -1065,6 +1065,41 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
+class PauseGenerationReqInput(BaseReq):
+    """
+    Note that the PauseGenerationRequests is only supported in SGLang Server.
+    abort: Abort and return all requests currently being processed.
+
+    in_place: Pause the scheduler's event_loop from performing inference;
+            only non-inference requests (e.g., control commands) will be handled.
+            The requests in the engine will be paused and stay in the event_loop,
+            then continue generation after continue_generation with the old kv cache.
+            Note: In 'inplace' mode, flush_cache will fail if there are any requests
+            in the running_batch.
+
+    retract: Pause the scheduler's event loop from performing inference;
+            only non-inference requests will be handled, and all currently running
+            requests will be retracted back to the waiting_queue.
+            Note: The KV cache can be flushed in this mode and will be automatically
+            recomputed after continue_generation.
+    """
+
+    mode: Literal["abort", "retract", "in_place"] = "abort"
+
+    def __post_init__(self):
+        allowed = ["abort", "retract", "in_place"]
+        if self.mode not in allowed:
+            raise ValueError(
+                f"Invalid mode: {self.mode!r}. " f"Expected one of {allowed}."
+            )
+
+
+@dataclass
+class ContinueGenerationReqInput(BaseReq):
+    pass
+
+
+@dataclass
 class UpdateWeightFromDiskReqInput(BaseReq):
     # The model path with the new weights
     model_path: str
@@ -1084,6 +1119,8 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     recapture_cuda_graph: bool = False
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_step: int = 0
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
 
 
 @dataclass
@@ -1107,6 +1144,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional format specification for loading
+    load_format: Optional[str] = None
 
 
 @dataclass
@@ -1273,6 +1312,17 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 
 @dataclass
+class CheckWeightsReqInput(BaseReq):
+    action: str
+
+
+@dataclass
+class CheckWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class SlowDownReqInput(BaseReq):
     forward_sleep_time: Optional[float]
 
@@ -1321,17 +1371,26 @@ class SetInternalStateReqOutput(BaseReq):
 class ProfileReqInput(BaseReq):
     # The output directory
     output_dir: Optional[str] = None
+    # Specify the steps to start the profiling
+    start_step: Optional[int] = None
     # If set, it profile as many as this number of steps.
     # If it is set, profiling is automatically stopped after this step, and
     # the caller doesn't need to run stop_profile.
-    start_step: Optional[int] = None
     num_steps: Optional[int] = None
+    # The activities to record. The choices are ["CPU", "GPU", "MEM", "RPD"]
     activities: Optional[List[str]] = None
+    # Whether profile by stages (e.g., prefill and decode) separately
     profile_by_stage: bool = False
+    # Whether to record source information (file and line number) for the ops.
     with_stack: Optional[bool] = None
+    # Whether to save information about operator’s input shapes.
     record_shapes: Optional[bool] = None
     # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    # The prefix of the profile filenames
+    profile_prefix: Optional[str] = None
+    # Only profile these stages and ignore others
+    profile_stages: Optional[List[str]] = None
 
 
 class ProfileReqType(Enum):
@@ -1350,8 +1409,9 @@ class ProfileReq(BaseReq):
     with_stack: Optional[bool] = None
     record_shapes: Optional[bool] = None
     profile_id: Optional[str] = None
-    # Merge profiles from all ranks into a single trace
     merge_profiles: bool = False
+    profile_prefix: Optional[str] = None
+    profile_stages: Optional[List[str]] = None
 
 
 @dataclass
