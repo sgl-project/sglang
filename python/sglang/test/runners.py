@@ -121,7 +121,8 @@ def _get_sentence_transformer_embedding_model(
             modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
         )
 
-    return model.cuda()
+    device = "npu" if is_npu() else "cuda"
+    return model.to(device)
 
 
 @dataclass
