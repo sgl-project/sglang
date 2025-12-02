@@ -282,41 +282,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        for message in request.messages:
-            if message.content is None:
-                message.content = ""
-            msg_dict = message.model_dump()
-
-            # Process content based on detected template format
-            processed_msg = process_content_for_template_format(
-                msg_dict,
-                template_content_format,
-                image_data,
-                video_data,
-                audio_data,
-                modalities,
-            )
-
-            # per the Transformers docs & maintainers, tool call arguments in
-            # assistant-role messages with tool_calls need to be dicts not JSON str -
-            # this is how tool-use chat templates will expect them moving forwards
-            # so, for messages that have tool_calls, parse the string (which we get
-            # from openAI format) to dict
-            if (
-                processed_msg["role"] == "assistant"
-                and "tool_calls" in processed_msg
-                and isinstance(processed_msg["tool_calls"], list)
-            ):
-                for item in processed_msg["tool_calls"]:
-                    if "arguments" in item["function"] and isinstance(
-                        item["function"]["arguments"], str
-                    ):
-                        item["function"]["arguments"] = orjson.loads(
-                            item["function"]["arguments"]
-                        )
-
-            openai_compatible_messages.append(processed_msg)
-
         if self.use_dpsk_v32_encoding:
             if request.chat_template_kwargs and request.chat_template_kwargs.get(
                 "thinking"
@@ -337,6 +302,41 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
         else:
+            for message in request.messages:
+                if message.content is None:
+                    message.content = ""
+                msg_dict = message.model_dump()
+
+                # Process content based on detected template format
+                processed_msg = process_content_for_template_format(
+                    msg_dict,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                )
+
+                # per the Transformers docs & maintainers, tool call arguments in
+                # assistant-role messages with tool_calls need to be dicts not JSON str -
+                # this is how tool-use chat templates will expect them moving forwards
+                # so, for messages that have tool_calls, parse the string (which we get
+                # from openAI format) to dict
+                if (
+                    processed_msg["role"] == "assistant"
+                    and "tool_calls" in processed_msg
+                    and isinstance(processed_msg["tool_calls"], list)
+                ):
+                    for item in processed_msg["tool_calls"]:
+                        if "arguments" in item["function"] and isinstance(
+                            item["function"]["arguments"], str
+                        ):
+                            item["function"]["arguments"] = orjson.loads(
+                                item["function"]["arguments"]
+                            )
+
+                openai_compatible_messages.append(processed_msg)
+
             # Handle assistant prefix for continue_final_message
             assistant_prefix = None
             if (
