@@ -61,6 +61,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -1863,7 +1864,10 @@ class ModelOptModelLoader(DefaultModelLoader):
             # Apply quantization
             mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
 
-            if get_tensor_model_parallel_rank() == 0:
+            if (
+                not model_parallel_is_initialized()
+                or get_tensor_model_parallel_rank() == 0
+            ):
                 mtq.print_quant_summary(model)
 
             # Save checkpoint if path provided

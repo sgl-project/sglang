@@ -70,8 +70,7 @@ class TestToolChoiceLlama32(CustomTestCase):
 
     def setUp(self):
         self.client = openai.Client(base_url=self.base_url, api_key=self.api_key)
-        # TODO: Update the logic here when router /v1/models response format matching the openai api standard
-        self.model_name = self.client.models.list().models[0]
+        self.model_name = self.client.models.list().data[0].id
 
     def _is_flaky_test(self):
         """Check if the current test is marked as flaky for this class"""
@@ -274,9 +273,6 @@ class TestToolChoiceLlama32(CustomTestCase):
         self.assertIsNotNone(tool_calls)
         self.assertGreater(len(tool_calls), 0)
 
-    @unittest.skip(
-        "Skipping required streaming test as it is not supported by the router"
-    )
     def test_tool_choice_required_streaming(self):
         """Test tool_choice='required' in streaming mode"""
         tools = self.get_test_tools()
@@ -325,9 +321,6 @@ class TestToolChoiceLlama32(CustomTestCase):
         for tool_call in tool_calls:
             self.assertEqual(tool_call.function.name, "get_weather")
 
-    @unittest.skip(
-        "Skipping required streaming test as it is not supported by the router"
-    )
     def test_tool_choice_specific_function_streaming(self):
         """Test tool_choice with specific function in streaming mode"""
         tools = self.get_test_tools()
@@ -363,9 +356,6 @@ class TestToolChoiceLlama32(CustomTestCase):
 
         self.assertEqual(found_name, "get_weather")
 
-    @unittest.skip(
-        "Skipping required streaming arguments chunks json test as it is not supported by the router"
-    )
     def test_required_streaming_arguments_chunks_json(self):
         """In streaming required mode, complete tool call arguments should be valid JSON when all chunks are combined"""
         tools = self.get_test_tools()

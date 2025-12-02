@@ -19,7 +19,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_hip, log_info_on_rank0
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, log_info_on_rank0
 
 try:
     # Use custom allreduce from sgl kernel (ROCM and TRT-LLM)
@@ -76,7 +76,8 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
-        self.disabled = True
+        self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
+        self.original_disabled = True  # To store the original state
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -206,6 +207,7 @@ class CustomAllreduce:
             self.register_buffer(self.buffer)
 
         self.disabled = False
+        self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
 
     @staticmethod
@@ -416,3 +418,23 @@ class CustomAllreduce:
 
     def __del__(self):
         self.close()
+
+
+def dispatch_custom_allreduce():
+    """Return the CustomAllreduce class to use (aiter on ROCm if enabled)."""
+    if is_hip() and get_bool_env_var("SGLANG_USE_AITER_AR", default="true"):
+        try:
+            from aiter.dist.device_communicators.custom_all_reduce import (
+                CustomAllreduce as AiterCustomAllreduce,
+            )
+
+            logger.info("Using AiterCustomAllreduce for ROCm.")
+            return AiterCustomAllreduce
+        except ImportError as e:
+            logger.warning(
+                "Aiter custom all-reduce not available (optional dependency missing); "
+                "falling back to sglang CustomAllreduce. Details: %s",
+                e,
+            )
+            return CustomAllreduce
+    return CustomAllreduce

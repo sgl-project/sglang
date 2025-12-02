@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use super::utils::{event_types, web_search_constants};
+use super::utils::event_types;
 use crate::{
     data_connector::{ResponseId, StoredResponse},
     protocols::responses::{ResponseToolType, ResponsesRequest},
@@ -276,67 +276,41 @@ pub(super) fn rewrite_streaming_block(
 
 /// Mask function tools as MCP tools in response for client
 pub(super) fn mask_tools_as_mcp(resp: &mut Value, original_body: &ResponsesRequest) {
-    // Check for MCP tool
     let mcp_tool = original_body.tools.as_ref().and_then(|tools| {
         tools
             .iter()
             .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())
     });
-
-    // Check for web_search_preview tool
-    let has_web_search = original_body
-        .tools
-        .as_ref()
-        .map(|tools| crate::routers::openai::mcp::has_web_search_preview_tool(tools))
-        .unwrap_or(false);
-
-    // If neither MCP nor web_search_preview, return early
-    if mcp_tool.is_none() && !has_web_search {
+    let Some(t) = mcp_tool else {
         return;
+    };
+
+    let mut m = serde_json::Map::new();
+    m.insert("type".to_string(), Value::String("mcp".to_string()));
+    if let Some(label) = &t.server_label {
+        m.insert("server_label".to_string(), Value::String(label.clone()));
     }
-
-    let mut response_tools = Vec::new();
-
-    // Add MCP tool if present
-    if let Some(t) = mcp_tool {
-        let mut m = serde_json::Map::new();
-        m.insert("type".to_string(), Value::String("mcp".to_string()));
-        if let Some(label) = &t.server_label {
-            m.insert("server_label".to_string(), Value::String(label.clone()));
-        }
-        if let Some(url) = &t.server_url {
-            m.insert("server_url".to_string(), Value::String(url.clone()));
-        }
-        if let Some(desc) = &t.server_description {
-            m.insert(
-                "server_description".to_string(),
-                Value::String(desc.clone()),
-            );
-        }
-        if let Some(req) = &t.require_approval {
-            m.insert("require_approval".to_string(), Value::String(req.clone()));
-        }
-        if let Some(allowed) = &t.allowed_tools {
-            m.insert(
-                "allowed_tools".to_string(),
-                Value::Array(allowed.iter().map(|s| Value::String(s.clone())).collect()),
-            );
-        }
-        response_tools.push(Value::Object(m));
+    if let Some(url) = &t.server_url {
+        m.insert("server_url".to_string(), Value::String(url.clone()));
     }
-
-    // Add web_search_preview tool if present
-    if has_web_search {
-        let mut ws = serde_json::Map::new();
-        ws.insert(
-            "type".to_string(),
-            Value::String(web_search_constants::WEB_SEARCH_PREVIEW_SERVER_NAME.to_string()),
+    if let Some(desc) = &t.server_description {
+        m.insert(
+            "server_description".to_string(),
+            Value::String(desc.clone()),
         );
-        response_tools.push(Value::Object(ws));
+    }
+    if let Some(req) = &t.require_approval {
+        m.insert("require_approval".to_string(), Value::String(req.clone()));
+    }
+    if let Some(allowed) = &t.allowed_tools {
+        m.insert(
+            "allowed_tools".to_string(),
+            Value::Array(allowed.iter().map(|s| Value::String(s.clone())).collect()),
+        );
     }
 
     if let Some(obj) = resp.as_object_mut() {
-        obj.insert("tools".to_string(), Value::Array(response_tools));
+        obj.insert("tools".to_string(), Value::Array(vec![Value::Object(m)]));
         obj.entry("tool_choice")
             .or_insert(Value::String("auto".to_string()));
     }

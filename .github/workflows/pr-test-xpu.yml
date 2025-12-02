@@ -3,21 +3,8 @@ name: PR Test (XPU)
 on:
   push:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-xpu.yml"
   pull_request:
     branches: [ main ]
-    paths:
-      - "python/**"
-      - "scripts/ci/**"
-      - "test/**"
-      - "sgl-kernel/**"
-      - ".github/workflows/pr-test-xpu.yml"
-    types: [synchronize, labeled]
   workflow_dispatch:
 
 concurrency:
@@ -25,8 +12,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ==================== Check Changes ==================== #
+  check-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      main_package: ${{ steps.filter.outputs.main_package }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            main_package:
+              - "python/sglang/!(multimodal_gen)/**"
+              - "python/*.toml"
+              - "scripts/ci/**"
+              - "test/**"
+              - "sgl-kernel/**"
+              - ".github/workflows/pr-test-xpu.yml"
+              - "docker/xpu.Dockerfile"
+
+  # ==================== PR Gate ==================== #
+  pr-gate:
+    needs: check-changes
+    if: needs.check-changes.outputs.main_package == 'true'
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
   build-and-test:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    needs: [check-changes, pr-gate]
+    if: needs.check-changes.outputs.main_package == 'true'
     runs-on: intel-bmg
     env:
       HF_HOME: /home/sdp/.cache/huggingface
@@ -86,14 +104,15 @@ jobs:
 
   finish:
     if: always()
-    needs: [build-and-test]
+    needs: [build-and-test, pr-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Check job status
         run: |
-          if [ "${{ needs.build-and-test.result }}" != "success" ]; then
-            echo "Job failed with result: ${{ needs.build-and-test.result }}"
+          result="${{ needs.build-and-test.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "Job failed with result: $result"
             exit 1
           fi
-          echo "All jobs completed successfully"
+          echo "All jobs completed successfully (result: $result)"
           exit 0

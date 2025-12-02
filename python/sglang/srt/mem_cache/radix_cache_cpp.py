@@ -1,28 +1,73 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, List, Set
 
 import torch
 
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     IOHandle,
     RadixTreeCpp,
     TreeNodeCpp,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.server_args import ServerArgs
 
 
 logger = logging.getLogger(__name__)
 
 
 class RadixCacheCpp(BasePrefixCache):
+    def __init__(
+        self,
+        params: CacheInitParams,
+        server_args: ServerArgs,
+        enable_write_cancel: bool = False,
+    ):
+        self.disable = params.disable
+        self.enable_write_cancel = enable_write_cancel
+
+        assert (
+            params.enable_kv_cache_events is False
+        ), "HiRadixCache does not support kv cache events yet"
+
+        # record the nodes with ongoing write through
+        self.ongoing_write_through: Set[IOHandle] = set()
+        # record the node segments with ongoing load back
+        self.ongoing_load_back: Set[IOHandle] = set()
+        # todo: dynamically adjust the threshold
+        self.write_through_threshold = (
+            1 if server_args.hicache_write_policy == "write_through" else 2
+        )
+        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.device = self.token_to_kv_pool_allocator.device
+        self.req_to_token_pool = params.req_to_token_pool
+        self.page_size = params.page_size
+        self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+
+        self.tp_group = params.tp_cache_group
+
+        if params.enable_metrics:
+            self.init_metrics_collector()
+
+        if not server_args.enable_hierarchical_cache:
+            self.tree = RadixTreeCpp(
+                disabled=self.disable,
+                page_size=self.page_size,
+                host_size=None,  # no host cache, this should be removed in the future
+                write_through_threshold=self.write_through_threshold,
+            )
+            self.cache_controller = None
+            return  # early return if hicache is not used
+
+        raise NotImplementedError("Host cache is not supported yet")
+
     def _merge_tensor(self, l: List[torch.Tensor]) -> torch.Tensor:
         """
         Merge a list of tensors into a single tensor.
@@ -37,56 +82,6 @@ class RadixCacheCpp(BasePrefixCache):
             return l[0]
         else:
             return torch.cat(l)
-
-    def __init__(
-        self,
-        disable: bool,
-        use_hicache: bool,
-        req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool: BaseTokenToKVPoolAllocator,
-        tp_cache_group: torch.distributed.ProcessGroup,
-        page_size: int,
-        hicache_ratio: float,
-        hicache_size: int,
-        hicache_write_policy: str,
-        enable_kv_cache_events: bool = False,
-        hicache_oracle: bool = False,
-        enable_write_cancel: bool = False,
-    ):
-        self.disable = disable
-        self.enable_write_cancel = enable_write_cancel
-
-        assert (
-            enable_kv_cache_events is False
-        ), "HiRadixCache does not support kv cache events yet"
-        self.kv_cache = token_to_kv_pool.get_kvcache()
-
-        # record the nodes with ongoing write through
-        self.ongoing_write_through: Set[IOHandle] = set()
-        # record the node segments with ongoing load back
-        self.ongoing_load_back: Set[IOHandle] = set()
-        # todo: dynamically adjust the threshold
-        self.write_through_threshold = (
-            1 if hicache_write_policy == "write_through" else 2
-        )
-        self.device = token_to_kv_pool.device
-        self.token_to_kv_pool = token_to_kv_pool
-        self.req_to_token_pool = req_to_token_pool
-        self.page_size = page_size
-
-        self.tp_group = tp_cache_group
-
-        if not use_hicache:
-            self.tree = RadixTreeCpp(
-                disabled=self.disable,
-                page_size=page_size,
-                host_size=None,  # no host cache, this should be removed in the future
-                write_through_threshold=self.write_through_threshold,
-            )
-            self.cache_controller = None
-            return  # early return if hicache is not used
-
-        raise NotImplementedError("Host cache is not supported yet")
 
     def reset(self):
         if self.cache_controller is not None:
@@ -138,9 +133,13 @@ class RadixCacheCpp(BasePrefixCache):
         self.tree.lock_ref(node, True)
 
     def evict(self, num_tokens: int):
+        start_time = time.perf_counter()
         evicted_device_indices = self.tree.evict(num_tokens)
         for indice in evicted_device_indices:
-            self.token_to_kv_pool.free(indice)
+            self.token_to_kv_pool_allocator.free(indice)
+
+        # FIXME: not sure about the real evict length here
+        self.update_eviction_metrics(num_tokens, start_time)
 
     def evictable_size(self):
         return self.tree.evictable_size()
@@ -154,15 +153,16 @@ class RadixCacheCpp(BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         assert req.req_pool_idx is not None
-        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-        token_ids = (req.origin_input_ids + req.output_ids)[:all_token_len]
-        overall_len = len(token_ids)  # prefill + decode
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :overall_len]
+        kv_committed_len = req.pop_committed_kv_cache()
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
         old_prefix_len = len(req.prefix_indices) // self.page_size * self.page_size
-        page_aligned_overall_len = overall_len // self.page_size * self.page_size
+        page_aligned_overall_len = kv_committed_len // self.page_size * self.page_size
 
         if is_insert:
             new_prefix_len = self._insert(
@@ -172,16 +172,18 @@ class RadixCacheCpp(BasePrefixCache):
             assert old_prefix_len <= new_prefix_len, "Wrong prefix indices"
             # Free duplicates that were already in the pool
             if old_prefix_len < new_prefix_len:
-                self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
+                self.token_to_kv_pool_allocator.free(
+                    kv_indices[old_prefix_len:new_prefix_len]
+                )
         else:
-            self.token_to_kv_pool.free(
+            self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_overall_len]
             )
 
         # need to free the unaligned part, since it cannot be inserted into the radix tree
-        if page_aligned_overall_len < overall_len:
+        if page_aligned_overall_len < kv_committed_len:
             # NOTE: sglang PagedAllocator support unaligned free (which will automatically align it)
-            self.token_to_kv_pool.free(kv_indices[page_aligned_overall_len:])
+            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_overall_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -192,7 +194,9 @@ class RadixCacheCpp(BasePrefixCache):
         assert req.req_pool_idx is not None
         token_ids = req.fill_ids
         prefill_len = len(token_ids)  # prefill only (maybe chunked)
-        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :prefill_len]
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :prefill_len
+        ].to(dtype=torch.int64, copy=True)
 
         # NOTE: our C++ implementation don't need `token_ids` and `kv_indices` to be page-aligned
         # it will automatically align them, but length of them should be equal
@@ -213,7 +217,9 @@ class RadixCacheCpp(BasePrefixCache):
         # KVCache between old & new is newly generated, but already exists in the pool
         # we need to free this newly generated kv indices and reuse the indices in the pool
         if old_prefix_len < new_prefix_len:
-            self.token_to_kv_pool.free(kv_indices[old_prefix_len:new_prefix_len])
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[old_prefix_len:new_prefix_len]
+            )
             reused_indices = new_indices[old_prefix_len:new_prefix_len]
             self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, old_prefix_len:new_prefix_len

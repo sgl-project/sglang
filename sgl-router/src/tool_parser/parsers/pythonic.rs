@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 ///
 /// This format is used by Llama models and uses Python literals
 /// rather than JSON for arguments.
+/// Reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct?chat_template=default
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
 use regex::Regex;

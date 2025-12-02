@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test_pd_routing {
     use serde_json::json;
-    use sglang_router_rs::{
+    use sgl_model_gateway::{
         app_context::AppContext,
         config::{PolicyConfig, RouterConfig, RoutingMode},
         core::{BasicWorkerBuilder, Worker, WorkerType},
@@ -38,7 +38,7 @@ mod test_pd_routing {
 
     #[test]
     fn test_worker_types() {
-        use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
+        use sgl_model_gateway::core::{BasicWorkerBuilder, Worker, WorkerType};
 
         let prefill_worker: Box<dyn Worker> = Box::new(
             BasicWorkerBuilder::new("http://prefill:8080")
@@ -92,6 +92,11 @@ mod test_pd_routing {
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
             },
+            PDSelectionPolicy::Bucket {
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                bucket_adjust_interval_secs: 5,
+            },
         ];
 
         for policy in policies {
@@ -106,6 +111,12 @@ mod test_pd_routing {
                     cache_threshold, ..
                 } => {
                     assert!(*cache_threshold >= 0.0 && *cache_threshold <= 1.0);
+                }
+                PDSelectionPolicy::Bucket {
+                    balance_rel_threshold,
+                    ..
+                } => {
+                    assert!(*balance_rel_threshold >= 1.0);
                 }
             }
         }
@@ -160,6 +171,23 @@ mod test_pd_routing {
                     max_tree_size: 1000000,
                 },
             ),
+            (
+                RoutingMode::PrefillDecode {
+                    prefill_urls: vec![
+                        ("http://p1:8080".to_string(), Some(9000)),
+                        ("http://p2:8080".to_string(), Some(9001)),
+                        ("http://p3:8080".to_string(), Some(9002)),
+                    ],
+                    decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::Bucket {
+                    balance_abs_threshold: 20,
+                    balance_rel_threshold: 1.2,
+                    bucket_adjust_interval_secs: 5,
+                },
+            ),
         ];
 
         for (mode, policy) in test_cases {
@@ -186,7 +214,7 @@ mod test_pd_routing {
             let app_context = {
                 use std::sync::{Arc, OnceLock};
 
-                use sglang_router_rs::{
+                use sgl_model_gateway::{
                     core::{LoadMonitor, WorkerRegistry},
                     data_connector::{
                         MemoryConversationItemStorage, MemoryConversationStorage,
@@ -645,7 +673,7 @@ mod test_pd_routing {
 
     #[test]
     fn test_bootstrap_injection_with_benchmark_requests() {
-        use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
+        use sgl_model_gateway::core::{BasicWorkerBuilder, Worker, WorkerType};
 
         let mut benchmark_request = json!({
             "input_ids": vec![vec![1, 2, 3, 4]; 16], // Batch size 16

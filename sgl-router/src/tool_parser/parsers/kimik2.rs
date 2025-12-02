@@ -21,6 +21,8 @@ use crate::{
 /// - Token-based delimiters
 /// - Function calls with explicit indexing
 /// - JSON arguments
+///
+/// Reference: https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/docs/tool_call_guidance.md
 pub struct KimiK2Parser {
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,
