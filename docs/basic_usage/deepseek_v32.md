@@ -259,12 +259,7 @@ DeepSeek-V3.2-Exp：
 Note that the result of problem#3 with id `aime25-2` is marked as false by nemo-skills  but is actually correct because nemo-skills fails to match predicted_answer `016` with expected_answer `16`. If we add 1/30 = 3.33% to the results, the pass@1[avg-of-4] results match with official reference. (89.3%)
 
 DeepSeek-V3.2:
-| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct     | no_answer |
-|--------------------|-------------|------------|-------------|-----------------------|-----------|
-| pass@1[avg-of-4]   | 30          | 14006      | 1757        | 87.50% ± 1.67%        | 0.00%     |
-| majority@4         | 30          | 14006      | 1757        | 87.50%                | 0.00%     |
-| pass@4             | 30          | 14006      | 1757        | 93.33%                | 0.00%     |
-
+To be added
 
 DeepSeek-V3.2-Speciale:
 | evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
