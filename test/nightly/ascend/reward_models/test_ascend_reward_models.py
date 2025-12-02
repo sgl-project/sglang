@@ -56,6 +56,7 @@ class TestRewardModels(CustomTestCase):
             model_path,
             torch_dtype=torch_dtype,
             model_type="reward",
+            trust_remote_code=True,
         ) as srt_runner:
             prompts = srt_runner.tokenizer.apply_chat_template(
                 convs, tokenize=False, return_dict=False
