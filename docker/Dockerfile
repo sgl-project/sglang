@@ -148,20 +148,6 @@ ENV LANG=en_US.UTF-8 \
 ########################################################
 ########## Framework Development Image ################
 ########################################################
-#
-# PURPOSE: Framework development and SGLang compilation
-#
-# This stage builds and compiles framework dependencies including:
-# - SGLang inference engine with CUDA support
-# - DeepEP for distributed inference
-# - All necessary build tools and compilation dependencies
-# - Framework-level Python packages and extensions
-#
-# Use this stage when you need to:
-# - Build SGLang from source with custom modifications
-# - Develop or debug framework-level components
-# - Create custom builds with specific optimization flags
-#
 
 # Copy local source if building from local
 FROM scratch AS local_src
@@ -436,20 +422,7 @@ WORKDIR /sgl-workspace/sglang
 ########################################################
 ########## Runtime Image ##############################
 ########################################################
-#
-# PURPOSE: Lightweight production runtime environment
-#
-# This stage creates a production-ready image containing:
-# - Pre-compiled SGLang and DeepEP components
-# - Essential runtime dependencies only (no build tools)
-# - Optimized for inference workloads and deployment
-# - Significantly smaller than the framework image
-#
-# Use this stage when you need:
-# - Production deployment of SGLang
-# - Minimal runtime footprint without build tools
-# - Ready-to-run inference server environment
-#
+
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04 AS runtime
 
 ARG CUDA_VERSION
