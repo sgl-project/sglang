@@ -724,7 +724,7 @@ class DeepseekV2MoE(nn.Module):
                 ):
                     gate_up_proj_config = self.shared_experts.gate_up_proj.quant_method.quantization_config.config
                     down_proj_config = self.shared_experts.down_proj.quant_method.quantization_config.config
-                    
+
                     gate_up_proj_block_structure = gate_up_proj_config["config_groups"]["FP8_BLOCK"]["weights"]["block_structure"]
                     down_proj_block_structure = down_proj_config["config_groups"]["FP8_BLOCK"]["weights"]["block_structure"]
 
@@ -3576,8 +3576,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 # For mixed quantization (experts int4, linear fp8), use linear_fp8_config
                 selected_quant_config = getattr(
-                    self.quant_config, "linear_fp8_config", self.quant_config
+                    self.quant_config, "linear_fp8_config", None
                 )
+                if selected_quant_config is None:
+                    selected_quant_config = self.quant_config
                 weight_block_size = getattr(
                     selected_quant_config, "weight_block_size", None
                 )

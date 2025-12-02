@@ -31,7 +31,6 @@ from sglang.srt.layers.parameter import (
     RowvLLMParameter,
     _ColumnvLLMParameter,
 )
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import CompressedTensorsLinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
@@ -736,10 +735,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         assert loaded_shard_id < len(self.output_sizes)
 
         if isinstance(param, BlockQuantScaleParameter):
-            if type(self.quant_method) == CompressedTensorsLinearMethod:
-                weight_block_size = self.quant_method.quantization_config.config["config_groups"]["FP8_BLOCK"]["weights"]["block_structure"]
-            else:
-                weight_block_size = self.quant_method.quant_config.weight_block_size
+            weight_block_size = self.quant_method.quant_config.weight_block_size
             raw_block_n, _ = weight_block_size[0], weight_block_size[1]
             block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (

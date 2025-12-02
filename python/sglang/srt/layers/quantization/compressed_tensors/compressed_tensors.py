@@ -141,6 +141,15 @@ class CompressedTensorsConfig(QuantizationConfig):
             return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
         return None
 
+    @property
+    def weight_block_size(self) -> Optional[List[int]]:
+        """Get the weight block size from the quantization config."""
+        if "Linear" in self.target_scheme_map:
+            weights_config = self.target_scheme_map["Linear"].get("weights")
+            if weights_config and hasattr(weights_config, "block_structure"):
+                return weights_config.block_structure
+        return None
+
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
         ignore: List[str] = cast(List[str], config.get("ignore", []))
@@ -610,6 +619,7 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
+        self.quant_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
