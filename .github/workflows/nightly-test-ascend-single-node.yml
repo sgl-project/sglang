@@ -42,4 +42,4 @@ jobs:
           HF_ENDPOINT: https://hf-mirror.com
         working-directory: /data/.cache/tests/sglang
         run: |
-          python3 -u ${test_case}
+          python3 -u ${{ inputs.test_case }}
