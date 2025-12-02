@@ -309,8 +309,8 @@ python -m sglang.launch_server                     \
     --tp 2
 ```
 
-Note: The --torch-compile-max-bs and --tp settings are examples that should be adjusted for your setup.
-For instance, use --tp 3 to utilize 1 socket with 3 sub-NUMA clusters on an Intel® Xeon® 6980P server.
+Note: The `--torch-compile-max-bs` and `--tp` settings are examples that should be adjusted for your setup.
+For instance, use `--tp 3` to utilize 1 socket with 3 sub-NUMA clusters on an Intel® Xeon® 6980P server.
 
 Once the server have been launched, you can test it using the `bench_serving` command or create
 your own commands or scripts following [the benchmarking example](#benchmarking-with-requests).
