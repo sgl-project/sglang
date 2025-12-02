@@ -15,7 +15,7 @@ on:
         required: false
         type: string
         description: base image for pods
-        default: "swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main"
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3"
       test_config_name:
         required: true
         type: string
@@ -26,7 +26,7 @@ on:
         description: path of test case file
 
 concurrency:
-  group: ascend-nightly-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.soc_version }}
+  group: ascend-nightly-singlenode-${{ github.ref }}-${{ inputs.soc_version }}
   cancel-in-progress: true
 
 jobs:
@@ -45,5 +45,6 @@ jobs:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
+        working-directory: /data/.cache/tests/sglang
         run: |
           python3 -u ${test_case}

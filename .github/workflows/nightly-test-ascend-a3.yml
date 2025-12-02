@@ -24,11 +24,16 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          - name: deepep_deepseek_r1_2p1d_1
+          - name: test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/srt/ascend_k8s/test_ascend_disaggregation_deepep_k8s_2p1d.py
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500.py
+          - name: test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500.py
     uses: ./.github/workflows/nightly-test-ascend-multi-node.yml
     with:
       soc_version: a3
@@ -39,4 +44,24 @@ jobs:
       decode_size: ${{ matrix.test_config.decode_size }}
       router_size: ${{ matrix.test_config.router_size }}
       sglang_source_path: '/data/.cache/tests/sglang'
+      test_case: ${{ matrix.test_config.test_case }}
+
+  single-node-tests:
+    name: single-node
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    needs: multi-node-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        test_config:
+          - name: test_ascend_qwen3_8b_in1000_out300_bs8
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
+          - name: test_ascend_qwen3_8b_in1000_out300_bs16
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
+    uses: ./.github/workflows/nightly-test-ascend-single-node.yml
+    with:
+      soc_version: a3
+      runner: linux-aarch64-a3-0
+      image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3'
+      test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}

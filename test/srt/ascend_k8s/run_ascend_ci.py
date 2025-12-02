@@ -4,14 +4,15 @@ import signal
 import subprocess
 import sys
 import time
+import os
 
 from kubernetes import client, config
 
-KUBE_CONFIG = "/data/.cache/kb.yaml"
-
-config.load_kube_config(KUBE_CONFIG)
+config.load_kube_config(os.environ.get('KUBECONFIG'))
 v1 = client.CoreV1Api()
 LOCAL_TIMEOUT = 10800
+KUBE_NAME_SPACE = os.environ.get('NAMESPACE')
+KUBE_ROUTER_POD_NAME = "{}-router-0".format(os.environ.get('KUBE_JOB_NAME'))
 
 
 def run_command(cmd, shell=True):
@@ -82,43 +83,35 @@ def check_pods_ready(timeout=300):
 
 
 def create_configmap():
-    cmd = "kubectl get po -A -o wide | grep mindx-dls-test-sglang"
-    output = run_command(cmd)
+    pods = v1.list_namespaced_pod(namespace=KUBE_NAME_SPACE)
+    matching_pods = []
+    matching_string = "{}-sglang".format(os.environ.get('KUBE_JOB_NAME'))
 
-    if not output:
-        print("No exist sglang pod")
-        return
+    for pod in pods.items:
+        pod_name = pod.metadata.name
+        if matching_string in pod_name:
+            pod_ip = pod.status.pod_ip
+            matching_pods.append(f" {pod_name}: {pod_ip}")
 
-    data_lines = []
-    for line in output.strip().split("\n"):
-        parts = line.split()
-        pod_name = parts[1]
-        ipv4_pattern = r"^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$"
-        for part in parts:
-            if bool(re.match(ipv4_pattern, part)):
-                pod_ip = part
-        data_lines.append(f" {pod_name}: {pod_ip}")
-
-    if not data_lines:
+    if not matching_pods:
         print("no sglang pod info")
         return
-
+    
     # generate ConfigMap YAML
     configmap_yaml = """apiVersion: v1
 kind: ConfigMap
 metadata:
   name: sglang-info
-  namespace: kube-system
+  namespace: {}
 data:
-"""
-    configmap_yaml += "\n".join(data_lines)
+""".format(KUBE_NAME_SPACE)
+    configmap_yaml += "\n".join(matching_pods)
 
     # apply ConfigMap
     result = run_command(f"echo '{configmap_yaml}' | kubectl apply -f -")
     if result:
         print("Create ConfigMap successfully!")
         print(result)
-
 
 def monitor_pod_logs(pod_name, namespace=None, timeout=None):
     class TimeoutException(Exception):
@@ -231,4 +224,4 @@ if __name__ == "__main__":
     else:
         print("Pod not ready, maybe not enough resource")
 
-    monitor_pod_logs("mindx-dls-test-sglang-router-0", "kube-system", LOCAL_TIMEOUT)
+    monitor_pod_logs(KUBE_ROUTER_POD_NAME, KUBE_NAME_SPACE, LOCAL_TIMEOUT)

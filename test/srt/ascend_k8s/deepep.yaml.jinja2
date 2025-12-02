@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: rings-config-mindx-dls-test
-  namespace: kube-system
+  namespace: {{ name_space }}
   labels:
     ring-controller.atlas: ascend-1980
 data:
@@ -16,7 +16,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: sglang-info
-  namespace: kube-system
+  namespace: {{ name_space }}
 data: {}
 
 ---
@@ -24,7 +24,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: sglang-configmap-access
-  namespace: kube-system
+  namespace: {{ name_space }}
 rules:
 - apiGroups: [""]
   resources: ["configmaps"]
@@ -36,11 +36,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: sglang-configmap-binding
-  namespace: kube-system
+  namespace: {{ name_space }}
 subjects:
 - kind: ServiceAccount
   name: default
-  namespace: kube-system
+  namespace: {{ name_space }}
 roleRef:
   kind: Role
   name: sglang-configmap-access
@@ -51,7 +51,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: sglang-pod-access
-  namespace: kube-system
+  namespace: {{ name_space }}
 rules:
 - apiGroups: [""]
   resources: ["pods"]
@@ -62,11 +62,11 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: sglang-pod-binding
-  namespace: kube-system
+  namespace: {{ name_space }}
 subjects:
 - kind: ServiceAccount
   name: default
-  namespace: kube-system
+  namespace: {{ name_space }}
 roleRef:
   kind: Role
   name: sglang-pod-access
@@ -76,33 +76,33 @@ roleRef:
 apiVersion: batch.volcano.sh/v1alpha1
 kind: Job
 metadata:
-  name: mindx-dls-test
-  namespace: kube-system
+  name: {{ kube_job_name }}
+  namespace: {{ name_space }}
   labels:
     ring-controller.atlas: ascend-1980
     fault-scheduling: "force"
 spec:
-  minAvailable: {{ prefill_size + decode_size + router_size | default(3) }}
+  minAvailable: {{ prefill_size + decode_size + router_size }}
   schedulerName: volcano
   policies:
     - event: PodEvicted
       action: RestartJob
   tasks:
   - name: "sglang-prefill"
-    replicas: {{ prefill_size | default(1) }}
+    replicas: {{ prefill_size }}
     template:
       metadata:
         labels:
-          app: mindspore
+          app: sgl-ascend
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
         containers:
-        - image: {{ image | default("swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main") }}
+        - image: {{ image }}
           imagePullPolicy: Always
           securityContext:
             privileged: true
-          name: mindspore
+          name: sgl-ascend
           env:
           - name: HOSTNAME
             valueFrom:
@@ -158,20 +158,20 @@ spec:
           accelerator/huawei-npu: ascend-snt9c
         restartPolicy: OnFailure
   - name: "sglang-decode"
-    replicas: {{ decode_size | default(1) }}
+    replicas: {{ decode_size }}
     template:
       metadata:
         labels:
-          app: mindspore
+          app: sgl-ascend
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
         containers:
-        - image: {{ image | default("swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main") }}
+        - image: {{ image }}
           imagePullPolicy: Always
           securityContext:
             privileged: true
-          name: mindspore
+          name: sgl-ascend
           env:
           - name: HOSTNAME
             valueFrom:
@@ -227,20 +227,20 @@ spec:
           accelerator/huawei-npu: ascend-snt9c
         restartPolicy: OnFailure
   - name: "sglang-router"
-    replicas: {{ router_size | default(1) }}
+    replicas: {{ router_size }}
     template:
       metadata:
         labels:
-          app: mindspore
+          app: sgl-ascend
           ring-controller.atlas: ascend-1980
       spec:
         hostNetwork: True
         containers:
-        - image: {{ image | default("swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main") }}
+        - image: {{ image }}
           imagePullPolicy: Always
           securityContext:
             privileged: true
-          name: mindspore
+          name: sgl-ascend
           env:
           - name: HOSTNAME
             valueFrom:
