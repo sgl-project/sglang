@@ -22,9 +22,6 @@ python3 -m sglang.launch_server \
     --tp 2 \
     --mm-enable-dp-encoder
 ```
-!!! important
-    Batch-level multi-modal DP is not to be confused with API request-level DP
-    (which is instead controlled by `data_parallel_size`).
 
 ## Known supported models
 - Qwen2.5-VL (<https://github.com/sgl-project/sglang/pull/13126>)
