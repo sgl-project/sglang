@@ -11,6 +11,8 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
+# TODO this import is a hotfix to avoid circular import error. revert after quantization refactor
+import sglang.srt.layers.quantization.w8a8_int8 as w8a8_int8_quant
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -26,8 +28,6 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     replace_parameter,
 )
-#TODO this import is a hotfix to avoid circular import error. revert after quantization refactor
-import sglang.srt.layers.quantization.w8a8_int8 as w8a8_int8_quant
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:

@@ -7,6 +7,8 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn import Parameter
 
+# TODO this import is a hotfix to avoid circular import error. revert after quantization refactor
+import sglang.srt.layers.quantization.w8a8_int8 as w8a8_int8_quant
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -17,8 +19,6 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 )
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.utils import requantize_with_max_scale
-#TODO this import is a hotfix to avoid circular import error. revert after quantization refactor
-import sglang.srt.layers.quantization.w8a8_int8 as w8a8_int8_quant
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
