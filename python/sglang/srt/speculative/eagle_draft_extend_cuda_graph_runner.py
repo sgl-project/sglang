@@ -125,7 +125,9 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
-            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
+            self.extend_seq_lens = torch.full(
+                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
+            )
             self.accept_length = torch.full(
                 (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
             )
@@ -384,14 +386,16 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
             self.positions.zero_()
-            self.accept_length.fill_(1)
-            self.extend_seq_lens.fill_(1)
+            self.accept_length.fill_(self.num_tokens_per_bs)
+            self.extend_seq_lens.fill_(self.num_tokens_per_bs)
 
         # Common inputs
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         if forward_batch.extend_seq_lens is not None:
             self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
+        else:
+            self.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         if (
@@ -415,6 +419,15 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
+        else:
+            self.extend_seq_lens_cpu[:raw_bs] = [self.num_tokens_per_bs] * raw_bs
+        if bs > raw_bs:
+            self.extend_seq_lens_cpu[raw_bs:bs] = [self.num_tokens_per_bs] * (
+                bs - raw_bs
+            )
+        forward_batch.spec_info.extend_seq_lens_cpu = list(
+            self.extend_seq_lens_cpu[:bs]
+        )
 
         if bs != raw_bs:
             forward_batch.spec_info.positions = self.positions[:num_tokens]

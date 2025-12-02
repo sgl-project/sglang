@@ -251,16 +251,22 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # FIXME cuda not support draft_extend capture
-        if self.draft_extend_attn_backend and _is_npu:
+        if self.draft_extend_attn_backend:
+            extend_runner_cls = Device2ExtendCudaGraphRunner.get(
+                self.target_worker.device
+            )
+            if extend_runner_cls is None:
+                logger.warning(
+                    "Draft extend cuda graph runner is not available for device %s",
+                    self.target_worker.device,
+                )
+                return
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
             )
-            self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
-                self.target_worker.device
-            ](self)
+            self.cuda_graph_runner_for_draft_extend = extend_runner_cls(self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."

@@ -23,6 +23,14 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+from sglang.srt.utils import get_bool_env_var
+
+_use_update_local_attn_cuda = get_bool_env_var(
+    "SGLANG_USE_UPDATE_LOCAL_ATTN_METADATA_CUDA"
+)
+if _use_update_local_attn_cuda:
+    import local_attention_cuda
+
 
 @dataclass
 class FlashAttentionMetadata:
@@ -711,9 +719,22 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
+                        layer.layer_id
+                    ]
+                    if is_swa:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            forward_batch.swa_out_cache_loc,
+                            k,
+                            v,
+                            layer.k_scale,
+                            layer.v_scale,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
@@ -797,10 +818,14 @@ class FlashAttentionBackend(AttentionBackend):
                 _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
                     layer.layer_id
                 ]
-                if is_swa:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        page_table
+                if layer.layer_id == 0:
+                    metadata.swa_page_table = (
+                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            page_table
+                        ).to(torch.int32)
                     )
+                if is_swa:
+                    page_table = metadata.swa_page_table
                     window_size = (self.attention_chunk_size, 0)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
@@ -1042,9 +1067,22 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
+                        layer.layer_id
+                    ]
+                    if is_swa:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            forward_batch.swa_out_cache_loc,
+                            k,
+                            v,
+                            layer.k_scale,
+                            layer.v_scale,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
@@ -1157,12 +1195,14 @@ class FlashAttentionBackend(AttentionBackend):
                     _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
                         layer.layer_id
                     ]
-                    if is_swa:
-                        page_table = (
+                    if layer.layer_id == 0:
+                        metadata.swa_page_table = (
                             self.token_to_kv_pool.translate_loc_from_full_to_swa(
                                 page_table
-                            )
+                            ).to(torch.int32)
                         )
+                    if is_swa:
+                        page_table = metadata.swa_page_table
                         window_size = (self.attention_chunk_size, 0)
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
@@ -1764,7 +1804,7 @@ class FlashAttentionBackend(AttentionBackend):
                     self.target_verify_metadata_topk_swa[bs] = metadata_swa
                     metadata.swa_spec_metadata = metadata_swa
 
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -2058,6 +2098,51 @@ class FlashAttentionBackend(AttentionBackend):
 
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+            )
+
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
+            page_indices = self.req_to_token[
+                req_pool_indices[:, None],
+                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+            ]
+            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+
+        elif forward_mode.is_draft_extend_v2():
+            metadata = self.draft_extend_metadata[bs]
+            metadata.cache_seqlens_int32.copy_(seq_lens)
+
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
+
+            extend_seq_lens_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
+            if extend_seq_lens_cpu is not None:
+                extend_seq_lens = torch.as_tensor(
+                    extend_seq_lens_cpu,
+                    dtype=torch.int32,
+                    device=device,
+                )
+            else:
+                default_extend = getattr(
+                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                )
+                extend_seq_lens = torch.full(
+                    (bs,), default_extend, dtype=torch.int32, device=device
+                )
+                extend_seq_lens_cpu = [default_extend] * bs
+
+            if extend_seq_lens.numel() > 0:
+                metadata.max_seq_len_q = int(extend_seq_lens.max().item())
+            else:
+                metadata.max_seq_len_q = getattr(
+                    spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
+                )
+
+            metadata.cu_seqlens_q[1:].copy_(
+                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
             )
 
             max_seq_pages = (
