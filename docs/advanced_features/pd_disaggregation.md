@@ -276,6 +276,10 @@ Use mooncake backend, more details can be found in mooncake section.
 ```bash
 export ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=true
 ```
+ASCEND_NPU_PHY_ID need to be set in container env
+```bash
+export ASCEND_NPU_PHY_ID=xxx
+```
 
 
 ### Llama Single Node

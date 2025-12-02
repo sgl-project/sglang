@@ -3,7 +3,12 @@ import logging
 import os
 from typing import List, Optional
 
-from sglang.srt.utils import get_bool_env_var, get_free_port, maybe_wrap_ipv6_address
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_free_port,
+    get_int_env_var,
+    maybe_wrap_ipv6_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +170,11 @@ class MooncakeTransferEngine:
     ) -> None:
         """Initialize the mooncake instance."""
         if get_bool_env_var("ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE", "false"):
-            hostname += f":{get_free_port()}:npu_{self.gpu_id}"
+            npu_phy_id = get_int_env_var("ASCEND_NPU_PHY_ID", -1)
+            if npu_phy_id == -1:
+                hostname += f":{get_free_port()}:npu_{self.gpu_id}"
+            else:
+                hostname += f":{get_free_port()}:npu_{npu_phy_id}"
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
