@@ -97,7 +97,7 @@ srt_hip = [
   "wave-lang==3.8.2",
 ]
 
-# https://docs.sglang.ai/platforms/ascend_npu.html
+# https://docs.sglang.io/platforms/ascend_npu.html
 srt_npu = ["sglang[runtime_common]"]
 
 # For Intel Gaudi(device : hpu) follow the installation guide

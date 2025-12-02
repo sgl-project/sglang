@@ -1,4 +1,4 @@
-# https://docs.sglang.ai/platforms/cpu_server.html
+# https://docs.sglang.io/platforms/cpu_server.html
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"

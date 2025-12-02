@@ -28,6 +28,7 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from torch import nn
 
 from sglang.srt.configs import (
     FalconH1Config,
@@ -247,6 +248,13 @@ if _is_npu:
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
+def resolve_language_model(model: nn.Module) -> nn.Module:
+    model_cls_name = model.__class__.__name__
+    if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
+        return model.thinker.model
+    return model.model
+
+
 class RankZeroFilter(logging.Filter):
     """Filter that only allows INFO level logs from rank 0, but allows all other levels from any rank."""
 
@@ -307,8 +315,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.is_hybrid = model_config.is_hybrid
-        self.is_hybrid_swa = self.is_hybrid
+        self.is_hybrid_swa = model_config.is_hybrid_swa
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
@@ -436,7 +443,7 @@ class ModelRunner:
         ):
             architectures = self.model_config.hf_config.architectures
             if architectures and not any("Llama4" in arch for arch in architectures):
-                self.is_hybrid = self.model_config.is_hybrid = True
+                self.is_hybrid_swa = self.model_config.is_hybrid_swa = True
 
         if config := self.mamba2_config:
             class_name = config.__class__.__name__
@@ -1522,8 +1529,8 @@ class ModelRunner:
             in self.model_config.hf_config.architectures
         ):
             temp_ratio = (
-                (1 - self.is_hybrid)
-                + self.is_hybrid
+                (1 - self.is_hybrid_swa)
+                + self.is_hybrid_swa
                 * self.attention_chunk_size
                 / self.model_config.context_len
             )
@@ -1559,7 +1566,7 @@ class ModelRunner:
                     try:
                         layers = self.model.language_model.layers
                     except:
-                        self.is_hybrid = False
+                        self.is_hybrid_swa = False
                         return
 
             for layer in layers:
@@ -1735,7 +1742,7 @@ class ModelRunner:
             self.max_total_num_tokens = tensor.item()
 
         # create token size for hybrid cache
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             self.set_num_token_hybrid()
 
         if self.max_total_num_tokens <= 0:
@@ -1892,7 +1899,7 @@ class ModelRunner:
                 end_layer=self.end_layer,
             )
         else:
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -1989,7 +1996,7 @@ class ModelRunner:
                 )
             else:
                 if self.page_size == 1:
-                    if self.is_hybrid:
+                    if self.is_hybrid_swa:
                         self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
@@ -2007,7 +2014,7 @@ class ModelRunner:
                             need_sort=need_sort,
                         )
                 else:
-                    assert not self.is_hybrid
+                    assert not self.is_hybrid_swa
                     self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -2451,6 +2458,7 @@ class ModelRunner:
 
         # Collect attention layers from the model
         self.attention_layers = []
+        self.model.model = resolve_language_model(self.model)
         for layer in self.model.model.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):

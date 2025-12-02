@@ -167,9 +167,6 @@ class MiniMaxM2MoE(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=True,
             scoring_func=config.scoring_func,
-            use_grouped_topk=True,  # TODO: Use "grouped top-k" flag only for hardcoded sigmoid scoring
-            num_expert_group=1,
-            topk_group=1,
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=1.0,
         )
