@@ -9,7 +9,7 @@ SGLang supports Qwen3-VL Family of models with Image and Video input support.
 Below are suggested launch commands tailored for different hardware / precision modes
 
 ### FP8 (quantised) mode
-For high memory-efficiency and latency optimized deployments on supported hardware:
+For high memory-efficiency and latency optimized deployments (e.g., on H100, H200) where FP8 checkpoint is supported:
 ```bash
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 \
@@ -21,7 +21,7 @@ python3 -m sglang.launch_server \
 ```
 
 ### Non-FP8 (BF16 / full precision) mode
-For deployments on A100 where BF16 is used (or FP8 snapshot not used):
+For deployments on A100/H100 where BF16 is used (or FP8 snapshot not used):
 ```bash
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3-VL-235B-A22B-Instruct \
