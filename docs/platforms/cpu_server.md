@@ -98,7 +98,8 @@ url = "https://download.pytorch.org/whl/cpu"
 
 ```
 
-Save the file (':x+Enter' for `vim`), then set it as the default `uv` config.
+Save the file (in `vim`, press 'esc' to exit insert mode, then ':x+Enter'),
+and set it as the default `uv` config.
 
 ```bash
 export UV_CONFIG_FILE=/opt/.venv/uv.toml
@@ -232,10 +233,10 @@ python -m sglang.bench_serving -h
 ```
 
 Additionally, requests can be formatted using
-[the OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
+[the OpenAI Completions API](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g., using `curl`) or through your own scripts.
 
-## Example Usage Commands for Different Models
+## Example Usage Commands
 
 Large Language Models can range from fewer than 1 billion to several hundred billion parameters.
 Dense models larger than 20B are expected to run on flagship 6th Gen Intel® Xeon® processors

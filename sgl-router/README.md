@@ -39,7 +39,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Prometheus metrics and structured tracing for every stage of routing.
 
 ## Documentation
-- **User Guide**: [docs.sglang.ai/advanced_features/router.html](https://docs.sglang.ai/advanced_features/router.html)
+- **User Guide**: [docs.sglang.io/advanced_features/router.html](https://docs.sglang.io/advanced_features/router.html)
 - Additional guides, API references, and deployment patterns are continuously updated alongside SGLang releases.
 
 ## Installation
