@@ -1074,7 +1074,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return False
         return False
 
-    def _process_tool_call_stream(
+    async def _process_tool_call_stream(
         self,
         index: int,
         delta: str,
