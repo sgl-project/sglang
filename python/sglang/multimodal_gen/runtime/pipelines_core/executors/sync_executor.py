@@ -24,6 +24,20 @@ class SyncExecutor(PipelineExecutor):
     A simple synchronous executor that runs stages sequentially.
     """
 
+    def run_all_stages(
+        self,
+        stages: List[PipelineStage],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Execute all pipeline stages sequentially.
+        """
+        for stage in stages:
+            with Timer(stage.__class__.__name__):
+                batch = stage(batch, server_args)
+        return batch
+
     def execute(
         self,
         stages: List[PipelineStage],
@@ -38,13 +52,6 @@ class SyncExecutor(PipelineExecutor):
         # New profiling flag: profile all stages when both profile and full_stages are set
         do_full_stages_profile = bool(getattr(batch, "profile", False) and getattr(batch, "full_stages", False))
 
-        def _run_all():
-            nonlocal batch
-            for stage in stages:
-                with Timer(stage.__class__.__name__):
-                    batch = stage(batch, server_args)
-            return batch
-
         if do_full_stages_profile:
             try:
                 os.makedirs("./logs", exist_ok=True)
@@ -57,7 +64,7 @@ class SyncExecutor(PipelineExecutor):
             with torch.profiler.profile(
                 activities=activities, record_shapes=True, with_stack=True
             ) as prof:
-                batch = _run_all()
+                batch = self.run_all_stages(stages, batch, server_args)
             request_id = getattr(batch, "request_id", "full_stages")
             rank = 0
             try:
@@ -70,6 +77,6 @@ class SyncExecutor(PipelineExecutor):
             logger.info("Saving stages profiler trace to: %s", trace_path)
             prof.export_chrome_trace(trace_path)
         else:
-            batch = _run_all()
+            batch = self.run_all_stages(stages, batch, server_args)
 
         return batch

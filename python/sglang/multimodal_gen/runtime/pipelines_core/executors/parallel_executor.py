@@ -54,6 +54,44 @@ class ParallelExecutor(PipelineExecutor):
                 src=self.worker.cfg_group.ranks[0],
             )
 
+    def run_all_stages(
+        self,
+        stages: List[PipelineStage],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Execute all pipeline stages respecting their declared parallelism type.
+        """
+        rank = get_classifier_free_guidance_rank()
+        cfg_group = get_cfg_group()
+
+        # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
+        for stage in stages:
+            with Timer(stage.__class__.__name__):
+                paradigm = stage.parallelism_type
+
+                if paradigm == StageParallelismType.MAIN_RANK_ONLY:
+                    if rank == 0:
+                        # Only main rank executes, others just wait
+                        batch = stage(batch, server_args)
+                    torch.distributed.barrier()
+
+                elif paradigm == StageParallelismType.CFG_PARALLEL:
+                    obj_list = [batch] if rank == 0 else []
+                    broadcasted_list = broadcast_pyobj(
+                        obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
+                    )
+                    if rank != 0:
+                        batch = broadcasted_list[0]
+                    batch = stage(batch, server_args)
+
+                    torch.distributed.barrier()
+
+                elif paradigm == StageParallelismType.REPLICATED:
+                    batch = stage(batch, server_args)
+        return batch
+
     def execute(
         self,
         stages: List[PipelineStage],
@@ -61,39 +99,8 @@ class ParallelExecutor(PipelineExecutor):
         server_args: ServerArgs,
     ) -> Req:
         rank = get_classifier_free_guidance_rank()
-        cfg_rank = get_classifier_free_guidance_rank()
-        cfg_group = get_cfg_group()
 
-        # New profiling flag: profile all stages when both profile and full_stages are set
         do_full_stages_profile = bool(getattr(batch, "profile", False) and getattr(batch, "full_stages", False))
-
-        def _run_all_stages():
-            nonlocal batch
-            # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
-            for stage in stages:
-                with Timer(stage.__class__.__name__):
-                    paradigm = stage.parallelism_type
-
-                    if paradigm == StageParallelismType.MAIN_RANK_ONLY:
-                        if rank == 0:
-                            # Only main rank executes, others just wait
-                            batch = stage(batch, server_args)
-                        torch.distributed.barrier()
-
-                    elif paradigm == StageParallelismType.CFG_PARALLEL:
-                        obj_list = [batch] if rank == 0 else []
-                        broadcasted_list = broadcast_pyobj(
-                            obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
-                        )
-                        if rank != 0:
-                            batch = broadcasted_list[0]
-                        batch = stage(batch, server_args)
-
-                        torch.distributed.barrier()
-
-                    elif paradigm == StageParallelismType.REPLICATED:
-                        batch = stage(batch, server_args)
-            return batch
 
         if do_full_stages_profile:
             try:
@@ -104,13 +111,12 @@ class ParallelExecutor(PipelineExecutor):
             if torch.cuda.is_available():
                 activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-            # Directly profile the entire pipeline execution (no per-stage stepping)
             with torch.profiler.profile(
                 activities=activities,
                 record_shapes=True,
                 with_stack=True,
             ) as prof:
-                batch = _run_all_stages()
+                batch = self.run_all_stages(stages, batch, server_args)
             if rank == 0:
                 try:
                     os.makedirs("./logs", exist_ok=True)
@@ -124,6 +130,6 @@ class ParallelExecutor(PipelineExecutor):
                 logger.info("Saving stages profiler trace to: %s", trace_path)
                 prof.export_chrome_trace(trace_path)
         else:
-            batch = _run_all_stages()
+            batch = self.run_all_stages(stages, batch, server_args)
 
         return batch
