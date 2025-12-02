@@ -135,6 +135,16 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
+// Device LayerNorm and fused LayerNorm+ScaleShift (CUTLASS-based)
+torch::Tensor device_layernorm(torch::Tensor x,
+                               const c10::optional<torch::Tensor>& gamma,
+                               const c10::optional<torch::Tensor>& beta);
+torch::Tensor device_layernorm_fuse_scale_shift(torch::Tensor x,
+                                                torch::Tensor gamma,
+                                                torch::Tensor beta,
+                                                torch::Tensor scale,
+                                                torch::Tensor shift);
+
 void apply_rope_pos_ids_cos_sin_cache(
     at::Tensor q,
     at::Tensor k,
