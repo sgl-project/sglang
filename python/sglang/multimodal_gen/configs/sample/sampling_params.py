@@ -560,25 +560,7 @@ class SamplingParams:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         args.height_not_provided = False
         args.width_not_provided = False
-        # Build result dict robustly against removed/renamed CLI flags (profile_full removed)
-        result: dict[str, Any] = {}
-        field_map = {f.name: f for f in dataclasses.fields(cls)}
-        for attr in attrs:
-            if hasattr(args, attr):
-                result[attr] = getattr(args, attr)
-                continue
-            if attr == "full_denoise":
-                result[attr] = getattr(args, "full_denoise", False)
-                continue
-            # Fallback to dataclass default if present
-            f = field_map[attr]
-            if f.default is not dataclasses.MISSING:
-                result[attr] = f.default
-            elif f.default_factory is not dataclasses.MISSING:  # type: ignore[attr-defined]
-                result[attr] = f.default_factory()  # type: ignore[misc]
-            else:
-                result[attr] = None
-        return result
+        return {attr: getattr(args, attr) for attr in attrs}
 
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
