@@ -1448,7 +1448,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.need_prefetch_storage:
+        if self.enable_hicache_storage and self.need_prefetch_storage:
             req.init_next_round_input(self.tree_cache)
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped

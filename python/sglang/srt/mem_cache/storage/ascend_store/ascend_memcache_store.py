@@ -84,7 +84,7 @@ class AscendMemCacheStore(HiCacheStorage):
             with open(config_path, "r") as f:
                 lines = f.readlines()
         except FileNotFoundError:
-            print(f"FileNotFoundError: {config_path}")
+            logger.error(f"FileNotFoundError: {config_path}")
             return False
 
         protocol_value = None

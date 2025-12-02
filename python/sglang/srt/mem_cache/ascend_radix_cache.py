@@ -144,7 +144,7 @@ class AscendHiRadixCache(RadixCache):
             return None, last_hit_node
 
         cached_token_len = len(cached_device_indices)
-        new_node = self._insert(
+        inserted_len, new_node = self._insert(
             RadixKey(new_input_tokens[:cached_token_len], extra_key),
             cached_device_indices,
             last_hit_node,
@@ -155,6 +155,11 @@ class AscendHiRadixCache(RadixCache):
             logger.error(f"====> failed to _insert: {len(cached_device_indices)=}")
             self.mem_pool_device_allocator.free(cached_device_indices)
             return None, last_hit_node
+
+        if inserted_len != cached_token_len:
+            self.mem_pool_device_allocator.free(cached_device_indices[inserted_len :])
+            cached_device_indices = cached_device_indices[: inserted_len]
+            cached_token_len = inserted_len
 
         self.ongoing_load_back[new_node.id] = new_node
         self.inc_lock_ref(new_node)
@@ -243,10 +248,14 @@ class AscendHiRadixCache(RadixCache):
         parent,
         chunked=False,
         priority: int = 0,
-    ) -> TreeNode | None:
-        # key, value = self.maybe_bigram_convert(key, value)
+    ):
+        key, value = self.maybe_bigram_convert(key, value)
         if len(key) == 0:
-            return None
+            return len(value), None
+
+        if self.is_eagle and value is not None:
+            # Make sure the value len equal to the EAGLE bigram key len
+            value = value[: len(key)]
 
         child_key = self.get_child_key_fn(key)
 
@@ -267,7 +276,7 @@ class AscendHiRadixCache(RadixCache):
             )
 
         self._inc_hit_count(new_node, chunked)
-        return new_node
+        return len(value), new_node
 
     def insert(
         self,
