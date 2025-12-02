@@ -91,18 +91,7 @@ class ForwardMode(IntEnum):
     def is_prefill(self):
         return self.is_extend()
 
-    # def is_extend(self):
     def is_extend(self, include_draft_extend_v2: bool = False):
-        # return (
-        #     self == ForwardMode.EXTEND
-        #     or self == ForwardMode.MIXED
-        #     or self == ForwardMode.DRAFT_EXTEND
-        #     or (include_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
-        #     or self == ForwardMode.TARGET_VERIFY
-        #     or self == ForwardMode.SPLIT_PREFILL
-        #     or self == ForwardMode.SIMPLE_DRAFT_EXTEND
-        # )
-        
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
@@ -110,7 +99,6 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
-            or self == ForwardMode.SIMPLE_DRAFT_EXTEND
             or self == ForwardMode.SIMPLE_DRAFT_EXTEND
         )
 
@@ -125,13 +113,6 @@ class ForwardMode(IntEnum):
 
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
-    
-    def is_simple_draft(self):
-        return self == ForwardMode.SIMPLE_DRAFT_EXTEND
-
-    def is_simple_verify(self):
-        return self == ForwardMode.SIMPLE_TARGET_VERIFY
-
 
     def is_simple_draft(self):
         return self == ForwardMode.SIMPLE_DRAFT_EXTEND
@@ -151,14 +132,14 @@ class ForwardMode(IntEnum):
         # For fixed shape logits output in v2 eagle worker
         return self == ForwardMode.DRAFT_EXTEND_V2
 
-    def is_extend_or_draft_extend_or_mixed(self, include_v2: bool = False):
+    def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.SPLIT_PREFILL
             or self == ForwardMode.SIMPLE_DRAFT_EXTEND
-            or (include_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
+            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
         )
 
     def is_cuda_graph(self):
