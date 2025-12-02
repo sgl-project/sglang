@@ -25,7 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import get_bool_env_var, is_hip, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -521,9 +521,14 @@ class ModelConfig:
                 import huggingface_hub
 
                 try:
-                    from huggingface_hub import HfApi, hf_hub_download
 
+                    # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+                    if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+                        from modelscope import hf_hub_download
+                    else:
+                        from huggingface_hub import HfApi, hf_hub_download
                     hf_api = HfApi()
+
                     # Retry HF API call up to 3 times
                     file_exists = retry(
                         lambda: hf_api.file_exists(

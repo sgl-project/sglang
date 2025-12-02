@@ -70,7 +70,7 @@ jobs:
         env:
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
-          HF_ENDPOINT: https://hf-mirror.com
+          HF_ENDPOINT: https://127.0.0.1 # Set to an inaccessible Huggingface endpoint
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
