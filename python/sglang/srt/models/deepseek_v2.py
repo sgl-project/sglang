@@ -30,7 +30,10 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
-from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    MaybeTboDeepEPDispatcher,
+    model_forward_maybe_tbo,
+)
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
@@ -962,6 +965,13 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_overlap_dispatch_flag = (
+            sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
+        )
+        sbo_overlap_combine_flag = (
+            sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
+        )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
@@ -978,8 +988,52 @@ class DeepseekV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        # SBO is not yet implemented for NextN
-        if sbo_enabled_flag:
+        if sbo_overlap_dispatch_flag:
+            shared_output = None
+
+            def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+                for handle in deepep_dispatch_hook_handle:
+                    handle.remove()
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                post_dispatch_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            deepep_dispatch_hook_handle = (
+                self.experts.dispatcher.register_deepep_dispatch_hook(
+                    _deepep_dispatch_hook
+                )
+            )
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
+
+        elif sbo_overlap_combine_flag:
             shared_output = None
 
             def _post_dispatch_hook(
