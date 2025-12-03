@@ -42,6 +42,8 @@ class TestStressQwen3235B(unittest.TestCase):
                     "--tp",
                     "8",
                     "--trust-remote-code",
+                    "--mem-fraction-static",
+                    "0.95",
                 ],
             )
 
