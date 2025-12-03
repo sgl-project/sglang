@@ -4,12 +4,9 @@ python3 -m unittest test_ascend_double_memory_consumption.TestMemoryConsumptionA
 """
 
 import os
-import re
-import threading
-import time
 import unittest
+
 import torch
-from typing import List
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -26,9 +23,6 @@ DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
 )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
-STDERR_FILENAME = "/tmp/stderr.txt"
-STDOUT_FILENAME = "/tmp/stdout.txt"
-
 
 class TestMemoryConsumptionAscend(CustomTestCase):
 
@@ -39,7 +33,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
 
         ### Calculate initial used memory
         free_npu_memory, total_npu_memory = torch.npu.mem_get_info()
-        initial_used_memory = (total_npu_memory - free_npu_memory)
+        initial_used_memory = total_npu_memory - free_npu_memory
 
         process = popen_launch_server(
             model,
@@ -59,17 +53,18 @@ class TestMemoryConsumptionAscend(CustomTestCase):
                 "0.8",
                 "--cuda-graph-bs",
                 "1",
-                "--disable-radix-cache",
                 "--max-total-tokens",
                 "1024",
-                "--disable-cuda-graph"
+                "--disable-radix-cache",
+                "--disable-cuda-graph",
             ],
         )
-        
-        
+
         ### Calculate initial used memory
         free_npu_memory, total_npu_memory = torch.npu.mem_get_info()
-        used_memory_after_server_starting = (total_npu_memory - free_npu_memory - initial_used_memory) / (1 << 30)
+        used_memory_after_server_starting = (
+            total_npu_memory - free_npu_memory - initial_used_memory
+        ) / (1 << 30)
         self.assertLessEqual(float(used_memory_after_server_starting), 17.00)
 
         # Clean up everything
