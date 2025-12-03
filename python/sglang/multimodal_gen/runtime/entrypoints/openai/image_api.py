@@ -8,7 +8,7 @@ from typing import List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.responses import FileResponse
 
-from sglang.multimodal_gen.configs.sample.base import (
+from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     generate_request_id,
 )
@@ -21,7 +21,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     _save_upload_to_path,
-    post_process_sample,
+    process_generation_batch,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -54,7 +54,10 @@ def _build_sampling_params_from_request(
     background: Optional[str],
     image_path: Optional[str] = None,
 ) -> SamplingParams:
-    width, height = _parse_size(size)
+    if size is None:
+        width, height = None, None
+    else:
+        width, height = _parse_size(size)
     ext = _choose_ext(output_format, background)
     server_args = get_global_server_args()
     # Build user params
@@ -110,15 +113,7 @@ async def generations(
         sampling_params=sampling,
     )
     # Run synchronously for images and save to disk
-    result = await scheduler_client.forward([batch])
-    save_file_path = os.path.join(batch.output_path, batch.output_file_name)
-    post_process_sample(
-        result.output[0],
-        batch.data_type,
-        1,
-        batch.save_output,
-        save_file_path,
-    )
+    save_file_path = await process_generation_batch(scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
         request_id,
@@ -157,7 +152,7 @@ async def edits(
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
-    size: Optional[str] = Form("1024x1024"),
+    size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
     user: Optional[str] = Form(None),
@@ -186,15 +181,7 @@ async def edits(
     )
     batch = _build_req_from_sampling(sampling)
 
-    result = await scheduler_client.forward([batch])
-    save_file_path = os.path.join(batch.output_path, batch.output_file_name)
-    post_process_sample(
-        result.output[0],
-        batch.data_type,
-        1,
-        batch.save_output,
-        save_file_path,
-    )
+    save_file_path = await process_generation_batch(scheduler_client, batch)
 
     await IMAGE_STORE.upsert(
         request_id,

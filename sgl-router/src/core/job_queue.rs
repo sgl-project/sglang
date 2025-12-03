@@ -371,9 +371,71 @@ impl JobQueue {
 
                         prefill_workers.chain(decode_workers).collect()
                     }
-                    RoutingMode::OpenAI { .. } => {
-                        info!("OpenAI mode: no workers to initialize");
-                        return Ok("OpenAI mode: no workers to initialize".to_string());
+                    RoutingMode::OpenAI { worker_urls } => {
+                        // OpenAI mode: submit AddWorker jobs with runtime: "external"
+                        // The external_worker_registration workflow handles model discovery
+                        let api_key = router_config.api_key.clone();
+                        let mut submitted_count = 0;
+
+                        for url in worker_urls {
+                            let url_for_error = url.clone();
+                            let config = WorkerConfigRequest {
+                                url: url.clone(),
+                                api_key: api_key.clone(),
+                                worker_type: Some("regular".to_string()),
+                                labels: HashMap::new(),
+                                model_id: None,
+                                priority: None,
+                                cost: None,
+                                runtime: Some("external".to_string()),
+                                tokenizer_path: None,
+                                reasoning_parser: None,
+                                tool_parser: None,
+                                chat_template: None,
+                                bootstrap_port: None,
+                                health_check_timeout_secs: router_config.health_check.timeout_secs,
+                                health_check_interval_secs: router_config
+                                    .health_check
+                                    .check_interval_secs,
+                                health_success_threshold: router_config
+                                    .health_check
+                                    .success_threshold,
+                                health_failure_threshold: router_config
+                                    .health_check
+                                    .failure_threshold,
+                                max_connection_attempts: router_config
+                                    .health_check
+                                    .success_threshold
+                                    * 10,
+                                dp_aware: false,
+                            };
+
+                            let job = Job::AddWorker {
+                                config: Box::new(config),
+                            };
+
+                            if let Some(queue) = context.worker_job_queue.get() {
+                                queue.submit(job).await.map_err(|e| {
+                                    format!(
+                                        "Failed to submit AddWorker job for external endpoint {}: {}",
+                                        url_for_error, e
+                                    )
+                                })?;
+                                submitted_count += 1;
+                            } else {
+                                return Err("JobQueue not available".to_string());
+                            }
+                        }
+
+                        if submitted_count == 0 {
+                            info!("OpenAI mode: no worker URLs provided");
+                            return Ok("OpenAI mode: no worker URLs to initialize".to_string());
+                        }
+
+                        return Ok(format!(
+                            "Submitted {} AddWorker jobs for external endpoints",
+                            submitted_count
+                        ));
                     }
                 };
 
@@ -497,8 +559,14 @@ impl JobQueue {
         workflow_context.set("worker_config", config.clone());
         workflow_context.set_arc("app_context", Arc::clone(context));
 
+        // Select workflow based on runtime field
+        let workflow_id = match config.runtime.as_deref() {
+            Some("external") => WorkflowId::new("external_worker_registration"),
+            _ => WorkflowId::new("worker_registration"),
+        };
+
         engine
-            .start_workflow(WorkflowId::new("worker_registration"), workflow_context)
+            .start_workflow(workflow_id, workflow_context)
             .await
             .map_err(|e| format!("Failed to start worker registration workflow: {:?}", e))
     }

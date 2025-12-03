@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 class TestSchedulePolicy(CustomTestCase):
 
     def setUp(self):
-        self.tree_cache = RadixCache(None, None, False)
+        self.tree_cache = RadixCache.create_simulated()
 
     def test_init_with_cache_aware_policy(self):
         policy = SchedulePolicy(
@@ -47,10 +47,10 @@ class TestSchedulePolicy(CustomTestCase):
             )
 
     def test_init_with_disabled_cache(self):
-        disabled_tree_cache = RadixCache(None, None, disable=True, page_size=1)
+        tree_cache = RadixCache.create_simulated(disable=True)
         policy = SchedulePolicy(
             policy="lpm",
-            tree_cache=disabled_tree_cache,
+            tree_cache=tree_cache,
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
@@ -58,7 +58,7 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(policy.policy, CacheAgnosticPolicy.FCFS)
 
     def test_calc_priority_fcfs(self):
-        tree_cache = RadixCache(None, None, False)
+        tree_cache = RadixCache.create_simulated()
         waiting_queue = [
             Req(1, "a b", [1, 2], SamplingParams()),
             Req(3, "a b c", [1, 2, 3], SamplingParams()),
@@ -79,16 +79,15 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[2].rid, 2)
 
     def test_calc_priority_priority_enabled_fcfs_scheduling(self):
-        tree_cache = RadixCache(None, None, False)
+        tree_cache = RadixCache.create_simulated()
+        r1 = Req(1, "a b", [1, 2], SamplingParams())
+        r2 = Req(3, "a b c", [1, 2, 3], SamplingParams())
+        r3 = Req(2, "a", [1], SamplingParams())
+        r1.priority, r1.time_stats.wait_queue_entry_time = 1, 1
+        r2.priority, r2.time_stats.wait_queue_entry_time = 0, 1
+        r3.priority, r3.time_stats.wait_queue_entry_time = 0, 0
 
-        waiting_queue = [
-            Req(1, "a b", [1, 2], SamplingParams()),
-            Req(3, "a b c", [1, 2, 3], SamplingParams()),
-            Req(2, "a", [1], SamplingParams()),
-        ]
-        waiting_queue[0].priority, waiting_queue[0].queue_time_start = 1, 1
-        waiting_queue[1].priority, waiting_queue[1].queue_time_start = 0, 1
-        waiting_queue[2].priority, waiting_queue[2].queue_time_start = 0, 0
+        waiting_queue = [r1, r2, r3]
 
         policy = SchedulePolicy(
             policy="fcfs",
@@ -98,6 +97,7 @@ class TestSchedulePolicy(CustomTestCase):
             schedule_low_priority_values_first=False,
         )
         policy.calc_priority(waiting_queue)
+
         # Check if priority enabled fcfs ordering is applied.
         self.assertEqual(waiting_queue[0].rid, 1)
         self.assertEqual(waiting_queue[1].rid, 2)
@@ -106,16 +106,15 @@ class TestSchedulePolicy(CustomTestCase):
     def test_calc_priority_priority_enabled_fcfs_scheduling_with_low_priority_values_first(
         self,
     ):
-        tree_cache = RadixCache(None, None, False)
+        tree_cache = RadixCache.create_simulated()
+        r1 = Req(1, "a b", [1, 2], SamplingParams())
+        r2 = Req(3, "a b c", [1, 2, 3], SamplingParams())
+        r3 = Req(2, "a", [1], SamplingParams())
+        r1.priority, r1.time_stats.wait_queue_entry_time = -1, 1
+        r2.priority, r2.time_stats.wait_queue_entry_time = 0, 1
+        r3.priority, r3.time_stats.wait_queue_entry_time = 0, 0
 
-        waiting_queue = [
-            Req(1, "a b", [1, 2], SamplingParams()),
-            Req(3, "a b c", [1, 2, 3], SamplingParams()),
-            Req(2, "a", [1], SamplingParams()),
-        ]
-        waiting_queue[0].priority, waiting_queue[0].queue_time_start = -1, 0
-        waiting_queue[1].priority, waiting_queue[1].queue_time_start = 0, 1
-        waiting_queue[2].priority, waiting_queue[2].queue_time_start = 0, 0
+        waiting_queue = [r1, r2, r3]
 
         policy = SchedulePolicy(
             policy="fcfs",
@@ -131,7 +130,7 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[2].rid, 3)
 
     def test_calc_priority_longest_output_first_scheduling(self):
-        tree_cache = RadixCache(None, None, False)
+        tree_cache = RadixCache.create_simulated()
 
         waiting_queue = [
             Req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1000)),
@@ -153,7 +152,7 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[2].rid, 3)
 
     def test_calc_priority_priority_enabled_longest_output_first_scheduling(self):
-        tree_cache = RadixCache(None, None, False)
+        tree_cache = RadixCache.create_simulated()
 
         waiting_queue = [
             Req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1), priority=1),
@@ -177,7 +176,7 @@ class TestSchedulePolicy(CustomTestCase):
     def test_calc_priority_priority_enabled_longest_output_first_scheduling_with_low_priority_values_first(
         self,
     ):
-        tree_cache = RadixCache(None, None, False)
+        tree_cache = RadixCache.create_simulated()
 
         waiting_queue = [
             Req(1, "a b", [1, 2], SamplingParams(max_new_tokens=1), priority=0),

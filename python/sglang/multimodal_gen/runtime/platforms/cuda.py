@@ -276,7 +276,7 @@ class CudaPlatformBase(Platform):
 
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
-        logger.info("Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend.")
+        logger.info("Using FlashAttention (FA3 for hopper, FA4 for blackwell) backend")
 
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
 
