@@ -58,11 +58,9 @@ class InputValidationStage(PipelineStage):
         # Note: This will overwrite any existing batch.generator
         generator_device = batch.generator_device
 
-        # Determine the device for generator
         if generator_device == "cpu":
             device_str = "cpu"
         else:
-            # Use cuda if available, otherwise fallback to cpu
             device_str = "cuda" if torch.cuda.is_available() else "cpu"
 
         batch.generator = [
