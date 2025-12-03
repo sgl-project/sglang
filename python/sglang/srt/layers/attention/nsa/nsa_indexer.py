@@ -370,6 +370,8 @@ class Indexer(CustomOp):
         k_scale_list = []
         ks_list = []
         ke_list = []
+        # Token-to-batch mapping for PAGED chunk alignment
+        token_to_batch_idx: List[int] = []
 
         q_offset = 0
         k_offset = 0
@@ -405,6 +407,7 @@ class Indexer(CustomOp):
             ks_list.append(ks)
             ke_list.append(ke)
 
+            token_to_batch_idx.extend([i] * extend_seq_len)
             q_offset += extend_seq_len
             k_offset += seq_len
 
@@ -430,6 +433,10 @@ class Indexer(CustomOp):
 
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
+
+        token_to_batch_idx_tensor = torch.tensor(
+            token_to_batch_idx, dtype=torch.long, device=device
+        )
 
         # Check if we need to chunk to avoid OOM
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
@@ -492,17 +499,28 @@ class Indexer(CustomOp):
 
             lengths_chunk = seq_lens_expanded[start:end]
 
-            topk_offset_chunk = (
-                global_topk_offset[start:end]
-                if global_topk_offset is not None
-                else None
-            )
+            # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
+            if global_topk_offset is not None:
+                # RAGGED path
+                topk_offset_chunk = global_topk_offset[start:end]
+                cu_seqlens_q_chunk = None
+                batch_idx_chunk = None
+            else:
+                # PAGED path: treat each token as a length-1 sequence
+                topk_offset_chunk = None
+                B_chunk = logits_chunk.shape[0]
+                cu_seqlens_q_chunk = torch.ones(
+                    B_chunk, dtype=torch.int32, device=device
+                )
+                batch_idx_chunk = token_to_batch_idx_tensor[start:end]
 
             raw_topk_chunk = metadata.topk_transform(
                 logits_chunk,
                 self.index_topk,
                 ks=ks[start:end],
+                cu_seqlens_q=cu_seqlens_q_chunk,
                 ke_offset=lengths_chunk,
+                batch_idx_list=batch_idx_chunk,
                 topk_indices_offset_override=topk_offset_chunk,
             )
             topk_result[start:end] = raw_topk_chunk
