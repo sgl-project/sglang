@@ -331,7 +331,6 @@ class ModelRunner:
 
         # Model-specific adjustment
         self.model_specific_adjustment()
-        self.check_quantized_moe_compatibility()
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
@@ -363,6 +362,7 @@ class ModelRunner:
 
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
+        self.check_quantized_moe_compatibility()
 
         # Temporary cached values
         self.support_pp = (
