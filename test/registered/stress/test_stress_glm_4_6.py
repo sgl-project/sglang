@@ -43,7 +43,7 @@ class TestStressGLM46(unittest.TestCase):
                     "8",
                     "--trust-remote-code",
                     "--mem-fraction-static",
-                    "0.95",
+                    "0.90",
                 ],
             )
 
