@@ -8,8 +8,8 @@ from sglang.test.ci.ci_stress_utils import StressTestRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 MODEL_PATH = "moonshotai/Kimi-K2-Thinking"
-RANDOM_INPUT_LEN = 4096
-RANDOM_OUTPUT_LEN = 512
+RANDOM_INPUT_LEN = 16384
+RANDOM_OUTPUT_LEN = 1024
 OUTPUT_FILE = "stress_test_kimi_k2.jsonl"
 
 # Register for CI - estimated 180 minutes (memory-constrained by KV cache)
