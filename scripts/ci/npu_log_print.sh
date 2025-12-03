@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Print log information(sglang version, commit sha, sgl-kernel-npu version, sgl-kernel-npu commit sha, npu-smi info and pip list)
+# Print log information(sglang version, commit sha, sgl-kernel-npu version, sgl-kernel-npu commit sha, npu-smi info and pip list.)
 npu-smi info
 pip list
 get_version() {
