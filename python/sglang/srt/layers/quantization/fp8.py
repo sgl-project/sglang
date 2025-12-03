@@ -88,13 +88,11 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
 _is_fp8_fnuz = is_fp8_fnuz()
-
-_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
+_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_hip and (_use_aiter or _use_hip_int4):
+if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
