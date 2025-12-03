@@ -186,7 +186,7 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner):
+def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
@@ -203,7 +203,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     if require_gathered_buffer(server_args):
         mul_base *= get_attention_tp_size()
 
-    capture_bs = [bs for bs in capture_bs if bs % mul_base == 0]
+    capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
 
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
@@ -264,11 +264,6 @@ class CudaGraphRunner:
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
-        if KTRANSFORMERS_AVAILABLE:
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
@@ -284,6 +279,14 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+        # Batch sizes to capture
+        num_tokens_per_bs = self.num_tokens_per_bs if is_nsa_enable_prefill_cp() else 1
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, num_tokens_per_bs
+        )
+        log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
+        if KTRANSFORMERS_AVAILABLE:
+            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
