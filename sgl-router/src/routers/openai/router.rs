@@ -154,16 +154,14 @@ impl OpenAIRouter {
         })
     }
 
-    /// Attempt lazy model discovery from a worker using the user's auth header.
+    /// Discover models from a single worker using the provided auth header.
     ///
-    /// This is used for passthrough mode where the router doesn't have an API key,
-    /// but the user provides one in their request. Returns the discovered models
-    /// if successful, or None if discovery fails.
-    async fn try_lazy_discovery(
+    /// Returns true if discovery succeeded and models were cached on the worker.
+    async fn discover_models_for_worker(
         &self,
         worker: &Arc<dyn Worker>,
         auth_header: Option<&HeaderValue>,
-    ) -> Option<Vec<ModelCard>> {
+    ) -> bool {
         let url = format!("{}/v1/models", worker.url());
 
         // Build request to backend
@@ -185,34 +183,65 @@ impl OpenAIRouter {
 
                             if !model_cards.is_empty() {
                                 tracing::info!(
-                                    "Lazy discovery: found {} models from {}",
+                                    "Model discovery: found {} models from {}",
                                     model_cards.len(),
                                     url
                                 );
-                                // Cache models for this worker
-                                worker.set_models(model_cards.clone());
-                                return Some(model_cards);
+                                // Cache models on the worker
+                                worker.set_models(model_cards);
+                                return true;
                             }
                         }
-                        None
+                        false
                     }
                     Err(e) => {
                         tracing::warn!("Failed to parse models response: {}", e);
-                        None
+                        false
                     }
                 }
             }
             Ok(response) => {
                 tracing::debug!(
-                    "Lazy discovery returned non-success status {} from {}",
+                    "Model discovery returned non-success status {} from {}",
                     response.status(),
                     url
                 );
-                None
+                false
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch models from backend: {}", e);
-                None
+                false
+            }
+        }
+    }
+
+    /// Discover models for ALL wildcard workers in the registry.
+    ///
+    /// This loops through all workers that are:
+    /// - External runtime type (OpenAI-compatible API)
+    /// - Have empty model list (wildcard workers)
+    ///
+    /// For each such worker, it queries /v1/models using the provided auth header
+    /// and caches the discovered models on the worker. After this call,
+    /// `select_worker_for_model` and `get_models` work without special handling.
+    async fn discover_models_for_all_wildcard_workers(&self, auth_header: Option<&HeaderValue>) {
+        let workers = self.worker_registry.get_all();
+
+        for worker in workers {
+            // Only process External workers with empty model list
+            if worker.metadata().runtime_type == RuntimeType::External
+                && !worker.has_models_discovered()
+            {
+                // Use worker's stored API key as fallback if no auth header provided
+                let effective_auth = auth_header.cloned().or_else(|| {
+                    worker
+                        .api_key()
+                        .as_ref()
+                        .and_then(|k| HeaderValue::from_str(&format!("Bearer {}", k)).ok())
+                });
+
+                self.discover_models_for_worker(&worker, effective_auth.as_ref())
+                    .await;
             }
         }
     }
@@ -225,15 +254,11 @@ impl OpenAIRouter {
     /// 2. Worker health status
     /// 3. Circuit breaker state
     ///
-    /// For wildcard workers (no models discovered), it attempts lazy discovery using
-    /// the user's auth header before returning "model not found".
+    /// NOTE: Call `discover_models_for_all_wildcard_workers` before this method
+    /// if you have wildcard workers that need model discovery.
     ///
     /// Returns an error response if no suitable worker is found.
-    async fn select_worker_for_model(
-        &self,
-        model_id: &str,
-        auth_header: Option<&HeaderValue>,
-    ) -> Result<Arc<dyn Worker>, Box<Response>> {
+    fn select_worker_for_model(&self, model_id: &str) -> Result<Arc<dyn Worker>, Box<Response>> {
         // Get all workers from registry and filter for:
         // 1. External runtime type (OpenAI-compatible API endpoints)
         // 2. Supports the requested model (checks ModelCard including aliases)
@@ -262,28 +287,6 @@ impl OpenAIRouter {
                 .into_iter()
                 .min_by_key(|w| w.load())
                 .expect("candidates is not empty"));
-        }
-
-        // No candidates found - check if any wildcard workers need lazy discovery
-        let wildcard_workers: Vec<_> = workers
-            .iter()
-            .filter(|w| {
-                w.metadata().runtime_type == RuntimeType::External
-                    && !w.has_models_discovered()
-                    && w.is_healthy()
-                    && w.circuit_breaker().can_execute()
-            })
-            .cloned()
-            .collect();
-
-        // Try lazy discovery on wildcard workers
-        for worker in &wildcard_workers {
-            if self.try_lazy_discovery(worker, auth_header).await.is_some() {
-                // After discovery, check if this worker now supports the model
-                if worker.supports_model(model_id) {
-                    return Ok(worker.clone());
-                }
-            }
         }
 
         Err(Box::new(
@@ -529,30 +532,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .into_response();
         }
 
-        // Check if any workers need model discovery (wildcard mode with no discovered models)
-        let wildcard_workers: Vec<_> = external_workers
-            .iter()
-            .filter(|w| !w.has_models_discovered())
-            .collect();
-
-        // If workers need discovery, use lazy discovery with user's auth
-        if !wildcard_workers.is_empty() {
-            // Get auth header from request (passthrough mode)
-            let headers = req.headers();
-            let worker = wildcard_workers[0];
-            let auth_header = extract_auth_header(Some(headers), worker.api_key());
-
-            // Use shared lazy discovery helper
-            if self
-                .try_lazy_discovery(worker, auth_header.as_ref())
-                .await
-                .is_some()
-            {
-                // Discovery succeeded - fall through to return aggregated models
-                // (The helper already cached the models on the worker)
-            }
-            // If discovery failed, fall through to return any cached models
-        }
+        // Discover models for any wildcard workers using user's auth header
+        let auth_header = extract_auth_header(Some(req.headers()), &None);
+        self.discover_models_for_all_wildcard_workers(auth_header.as_ref())
+            .await;
 
         // Collect models from all workers (either cached or pre-discovered)
         let mut all_models = Vec::new();
@@ -635,14 +618,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        // Extract auth header for lazy discovery (passthrough mode)
+        // Extract auth header for passthrough mode
         let auth_header = extract_auth_header(headers, &None);
 
+        // Discover models for any wildcard workers before selecting
+        self.discover_models_for_all_wildcard_workers(auth_header.as_ref())
+            .await;
+
         // Select worker for model
-        let worker = match self
-            .select_worker_for_model(body.model.as_str(), auth_header.as_ref())
-            .await
-        {
+        let worker = match self.select_worker_for_model(body.model.as_str()) {
             Ok(w) => w,
             Err(response) => return *response,
         };
@@ -766,15 +750,16 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Extract auth header for lazy discovery (passthrough mode)
+        // Extract auth header for passthrough mode
         let auth_header = extract_auth_header(headers, &None);
+
+        // Discover models for any wildcard workers before selecting
+        self.discover_models_for_all_wildcard_workers(auth_header.as_ref())
+            .await;
 
         // Select worker for model (use model_id if provided, otherwise use body.model)
         let model = model_id.unwrap_or(body.model.as_str());
-        let worker = match self
-            .select_worker_for_model(model, auth_header.as_ref())
-            .await
-        {
+        let worker = match self.select_worker_for_model(model) {
             Ok(w) => w,
             Err(response) => return *response,
         };
