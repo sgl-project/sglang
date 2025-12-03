@@ -2,7 +2,7 @@
 //!
 //! Tests for the partial JSON parser with allow_partial_strings flag behavior
 
-use sglang_router_rs::tool_parser::partial_json::PartialJson;
+use sgl_model_gateway::tool_parser::partial_json::PartialJson;
 
 #[test]
 fn test_partial_string_flag_disallows_incomplete_strings() {

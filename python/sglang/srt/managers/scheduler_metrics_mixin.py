@@ -95,7 +95,7 @@ class SchedulerMetricsMixin:
         self.last_prefill_tokens = adder.log_input_tokens
 
         # TODO: generalize this for various memory pools
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             (
                 full_num_used,
                 swa_num_used,
@@ -164,7 +164,7 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_gdn:
                 self.stats.mamba_usage = mamba_usage
@@ -219,7 +219,7 @@ class SchedulerMetricsMixin:
         num_running_reqs_offline_batch = 0
 
         # TODO: generalize this for various memory pools
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             (
                 full_num_used,
                 swa_num_used,
@@ -313,7 +313,7 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
             if self.is_hybrid_gdn:
                 self.stats.mamba_usage = mamba_usage
@@ -398,7 +398,7 @@ class SchedulerMetricsMixin:
                 )
 
     def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             full_num_used, swa_num_used, *_ = self._get_swa_token_info()
             num_tokens = max(full_num_used, swa_num_used)
         elif self.is_hybrid_gdn:

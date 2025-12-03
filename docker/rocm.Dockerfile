@@ -1,8 +1,8 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx942 -t v0.5.5.post3-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.5.post3-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx950 -t v0.5.5.post3-rocm700-mi35x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx1201 -t v0.5.5.post3-rocm702-navi48 -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx942 -t v0.5.6-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx950 -t v0.5.6-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx1201 -t v0.5.6-rocm702-navi48 -f rocm.Dockerfile .
 
 
 # Default base images
