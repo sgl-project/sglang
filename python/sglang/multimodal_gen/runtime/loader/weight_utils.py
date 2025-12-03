@@ -195,9 +195,12 @@ def safetensors_weights_iterator(
 
     if use_runai_model_streamer:
         with SafetensorsStreamer() as streamer:
-            streamer.stream_files(hf_weights_files, device=device, is_distributed=True)
+            streamer.stream_files(hf_weights_files)
             for name, tensor in streamer.get_tensors():
-                yield name, tensor.clone().detach()
+                if to_cpu:
+                    yield name, tensor.clone().detach().cpu()
+                else:
+                    yield name, tensor.to(device)
     else:
         for st_file in tqdm(
             hf_weights_files,

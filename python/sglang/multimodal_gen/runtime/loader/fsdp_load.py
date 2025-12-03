@@ -131,8 +131,7 @@ def maybe_load_fsdp_model(
             pin_cpu_memory=pin_cpu_memory,
         )
 
-    # even if cpu_offload is True, we still need to load the weights to GPU for pin memory
-    weight_iterator = safetensors_weights_iterator(weight_dir_list, to_cpu=False)
+    weight_iterator = safetensors_weights_iterator(weight_dir_list)
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     load_model_from_full_model_state_dict(
         model,
