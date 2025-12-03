@@ -2301,7 +2301,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_rope=q_pe.contiguous(),
             k_rope=k_pe.contiguous(),
             topk_indices=topk_indices,
-            kv_b_proj=self.kv_b_proj,
         )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
