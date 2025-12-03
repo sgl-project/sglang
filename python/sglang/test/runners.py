@@ -170,8 +170,6 @@ class HFRunner:
     def needs_trust_remote_code(self, model_path):
         models_needs_trust_remote = [
             "LxzGordon/URM-LLaMa-3.1-8B",
-            "/root/.cache/modelscope/hub/models/Shanghai_AI_Laboratory/internlm2-7b-reward",
-            "/root/.cache/modelscope/hub/models/Howeee/Qwen2.5-1.5B-apeach",
         ]
         if model_path in models_needs_trust_remote:
             return True
