@@ -114,15 +114,15 @@ class TestMemoryConsumptionAscend(CustomTestCase):
         
         # Launch a thread to stream the output
         for line in output_lines:
-            if "mem usage" in line:
-                mem_usage = re.search(r"mem usage=[+-]?[0-9]+\.[0-9]+ GB")[9:-3]
-                self.assertLessEqual(mem_usage, 17.00)
-            if "K size" in line:
-                k_size = re.search(r"K size=[+-]?[0-9]+\.[0-9]+ GB")[7:-3]
-                self.assertLessEqual(k_size, 17.00)
-            if "V size" in line:
-                v_size = re.search(r"V size=[+-]?[0-9]+\.[0-9]+ GB")[7:-3]
-                self.assertLessEqual(v_size, 17.00)
+            if "Load weight end" in line and "mem usage" in line:
+                match = re.search(r"mem usage=[+-]?[0-9]+\.[0-9]+ GB", line)
+                self.assertLessEqual(float(match.group(0)[10:-3]), 17.00)
+            if "KV Cache is allocated" in line and "K size" in line:
+                match = re.search(r"K size: [+-]?[0-9]+\.[0-9]+ GB", line)
+                self.assertLessEqual(float(match.group(0)[8:-3]), 17.00)
+            if "KV Cache is allocated" in line and "V size" in line:
+                match = re.search(r"V size: [+-]?[0-9]+\.[0-9]+ GB", line)
+                self.assertLessEqual(float(match.group(0)[8:-3]), 17.00)
         
         # Clean up everything
         kill_process_tree(process.pid)
