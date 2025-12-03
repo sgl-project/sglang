@@ -718,11 +718,14 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
-            if envs.SGLANG_MM_PRECOMPUTE_HASH.get():
-                if mm_inputs and "mm_items" in mm_inputs:
-                    for item in mm_inputs["mm_items"]:
-                        if isinstance(item, MultimodalDataItem):
-                            item.set_pad_value()
+            if (
+                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
+                and mm_inputs
+                and "mm_items" in mm_inputs
+            ):
+                for item in mm_inputs["mm_items"]:
+                    if isinstance(item, MultimodalDataItem):
+                        item.set_pad_value()
         else:
             mm_inputs = None
 
