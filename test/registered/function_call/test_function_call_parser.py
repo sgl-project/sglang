@@ -1277,6 +1277,154 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(params_str)
         self.assertEqual(params["city"], "San Francisco")
 
+    def test_detect_and_parse_xml_format_without_dsml(self):
+        """Test parsing simplified XML format without DSML tags"""
+        text = """I'll help you with information about San Francisco.
+
+        <function_calls>
+            <invoke name="get_favorite_tourist_spot">
+                <parameter name="city" string="true">San Francisco</parameter>
+            </invoke>
+            <invoke name="search">
+                <parameter name="query" string="true">WebNav benchmark</parameter>
+                <parameter name="topn" string="false">10</parameter>
+                <parameter name="source" string="true">web</parameter>
+            </invoke>
+        </function_calls>
+        """
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertIn("I'll help you with information", result.normal_text)
+        self.assertEqual(len(result.calls), 2)
+
+        # Check first call
+        call1 = result.calls[0]
+        self.assertEqual(call1.name, "get_favorite_tourist_spot")
+        params1 = json.loads(call1.parameters)
+        self.assertEqual(params1["city"], "San Francisco")
+
+        # Check second call
+        call2 = result.calls[1]
+        self.assertEqual(call2.name, "search")
+        params2 = json.loads(call2.parameters)
+        self.assertEqual(params2["query"], "WebNav benchmark")
+        self.assertEqual(params2["topn"], 10)
+        self.assertEqual(params2["source"], "web")
+
+    def test_detect_and_parse_json_format_without_dsml(self):
+        """Test parsing simplified JSON format without DSML tags"""
+        text = """I'll help you with information about San Francisco.
+
+        <function_calls>
+            <invoke name="get_favorite_tourist_spot">
+            {
+                "city": "San Francisco"
+            }
+            </invoke>
+            <invoke name="search">
+            {
+                "query": "WebNav benchmark",
+                "topn": 10,
+                "source": "web"
+            }
+            </invoke>
+        </function_calls>
+        """
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertIn("I'll help you with information", result.normal_text)
+        self.assertEqual(len(result.calls), 2)
+
+        # Check first call
+        call1 = result.calls[0]
+        self.assertEqual(call1.name, "get_favorite_tourist_spot")
+        params1 = json.loads(call1.parameters)
+        self.assertEqual(params1["city"], "San Francisco")
+
+        # Check second call
+        call2 = result.calls[1]
+        self.assertEqual(call2.name, "search")
+        params2 = json.loads(call2.parameters)
+        self.assertEqual(params2["query"], "WebNav benchmark")
+        self.assertEqual(params2["topn"], 10)
+        self.assertEqual(params2["source"], "web")
+
+    def test_streaming_xml_format_without_dsml(self):
+        """Test streaming parsing of simplified XML format without DSML tags"""
+        text = """<function_calls>
+            <invoke name="get_favorite_tourist_spot">
+                <parameter name="city" string="true">San Francisco</parameter>
+            </invoke>
+        </function_calls>"""
+
+        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
+
+        # Parse parameters
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+        self.assertEqual(params["city"], "San Francisco")
+
+    def test_streaming_json_format_without_dsml(self):
+        """Test streaming parsing of simplified JSON format without DSML tags"""
+        text = """<function_calls>
+            <invoke name="get_favorite_tourist_spot">
+            {
+                "city": "San Francisco"
+            }
+            </invoke>
+        </function_calls>"""
+
+        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
+
+        # Clean up parameters string if needed (trim whitespace)
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+        self.assertEqual(params["city"], "San Francisco")
+
 
 class TestQwen3CoderDetector(unittest.TestCase):
     def setUp(self):
