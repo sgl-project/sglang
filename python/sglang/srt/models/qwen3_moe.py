@@ -419,9 +419,13 @@ class Qwen3MoeAttention(nn.Module):
             aiter_fused_set_kv_buffer_arg = AiterFusedSetKVBufferArg(
                 kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id),
                 cache_loc = forward_batch.out_cache_loc,
-                k_cache = self.attn.k_scale if forward_batch.forward_mode.is_extend() else 1.0,
-                v_cache = self.attn.v_scale if forward_batch.forward_mode.is_extend() else 1.0,
+                k_scale = self.attn.k_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
+                v_scale = self.attn.v_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
             )
+            if aiter_fused_set_kv_buffer_arg.k_scale is None:
+                aiter_fused_set_kv_buffer_arg.k_scale = 1.0
+            if aiter_fused_set_kv_buffer_arg.v_scale is None:
+                aiter_fused_set_kv_buffer_arg.v_scale = 1.0
             q, k, v = self.rotary_emb(
                 qkv,
                 self.q_norm.weight,
