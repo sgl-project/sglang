@@ -63,14 +63,11 @@ def is_nsa_prefill_cp_mode1():
 
 
 def can_nsa_prefill_cp_mode1(forward_batch: "ForwardBatch"):
+    if not forward_batch.forward_mode.is_context_parallel_extend():
+        return False
     cp_size = get_attention_tp_size()
     seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return (
-        is_nsa_prefill_cp_mode1()
-        and seq_len > 0
-        and cp_size > 1
-        and forward_batch.forward_mode.is_context_parallel_extend()
-    )
+    return is_nsa_prefill_cp_mode1() and seq_len > 0 and cp_size > 1
 
 
 def nsa_cp_mode1_split_data(input_: Union[torch.Tensor, List]):
