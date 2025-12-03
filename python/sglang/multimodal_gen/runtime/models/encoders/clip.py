@@ -25,7 +25,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 # TODO: support quantization
 # from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -34,6 +33,7 @@ from sglang.multimodal_gen.runtime.models.encoders.base import ImageEncoder, Tex
 from sglang.multimodal_gen.runtime.models.encoders.vision import (
     resolve_visual_encoder_outputs,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -177,7 +177,6 @@ class CLIPAttention(nn.Module):
         self.tp_size = get_tp_world_size()
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
 
-
         self.attn = LocalAttention(
             self.num_heads_per_partition,
             self.head_dim,
@@ -222,14 +221,14 @@ class CLIPAttention(nn.Module):
             self.num_heads_per_partition,
             self.head_dim,
         )
-        
+
         # Check if using TORCH_SDPA backend, if so use PyTorch SDPA directly to support attention_mask
         if self.attn.backend == AttentionBackendEnum.TORCH_SDPA:
             # Convert to [batch, num_heads, seq_len, head_dim] format (required by SDPA)
             query_states = query_states.transpose(1, 2)  # [B, H, S, D]
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
-            
+
             # Process attention_mask: convert from [B, S] to format suitable for SDPA
             if attention_mask is not None:
                 # SDPA requires [B, 1, 1, S] or [B, S, S] format mask
@@ -237,14 +236,16 @@ class CLIPAttention(nn.Module):
                 if attention_mask.dim() == 2:
                     # Expand to [B, 1, 1, S] for broadcasting
                     # In mask: 1 means valid position, 0 means position to mask
-                    attn_mask = attention_mask[:, None, None, :].to(dtype=query_states.dtype)
+                    attn_mask = attention_mask[:, None, None, :].to(
+                        dtype=query_states.dtype
+                    )
                     # Convert 0 to -inf, keep 1 as 0
                     attn_mask = (1.0 - attn_mask) * torch.finfo(query_states.dtype).min
                 else:
                     attn_mask = attention_mask
             else:
                 attn_mask = None
-            
+
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 query_states,
                 key_states,
@@ -253,7 +254,7 @@ class CLIPAttention(nn.Module):
                 is_causal=True,  # Use causal mask
                 scale=self.scale,
             )
-            
+
             # Convert back to [B, S, H, D] format
             attn_output = attn_output.transpose(1, 2)  # [B, S, H, D]
         else:
@@ -323,7 +324,7 @@ class CLIPEncoderLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(
-        self, 
+        self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -380,8 +381,8 @@ class CLIPEncoder(nn.Module):
         )
 
     def forward(
-        self, 
-        inputs_embeds: torch.Tensor, 
+        self,
+        inputs_embeds: torch.Tensor,
         return_all_hidden_states: bool,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
