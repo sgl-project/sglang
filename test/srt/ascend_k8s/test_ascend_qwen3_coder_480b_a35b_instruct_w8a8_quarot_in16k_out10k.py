@@ -65,6 +65,7 @@ class TestQwen3_Coder_480B_A35b_Instruct_W8a8_Quarot(TestSingleMixUtils):
     dataset_name = "random"
     request_rate = 5.5
     max_concurrency = 32
+    num_prompts = 20
     input_len = 16000
     output_len = 10000
     random_range_ratio = 1
