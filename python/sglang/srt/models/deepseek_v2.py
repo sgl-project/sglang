@@ -29,6 +29,8 @@ import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
@@ -134,9 +136,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -707,13 +707,21 @@ class DeepseekV2MoE(nn.Module):
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
-                assert (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
-                )
-                self.shared_experts_weight_block_size = (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                )
+                if (
+                    _use_aiter
+                    and config.quantization_config.get("quant_method")
+                    == "compressed-tensors"
+                ):
+                    # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    pass
+                else:
+                    assert (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    )
 
         self.top_k = config.num_experts_per_tok
 
