@@ -50,6 +50,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_npu,
 )
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
@@ -67,6 +68,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
@@ -477,7 +479,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -573,7 +575,7 @@ def grouped_topk_cpu(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def kimi_k2_biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -615,7 +617,7 @@ def kimi_k2_biased_topk_impl(
     return topk_weights, topk_ids
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
