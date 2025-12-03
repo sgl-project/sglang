@@ -82,8 +82,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.device, non_blocking=True
         )
         self.seq_lens_cpu = torch.tensor(
-            seq_lens, dtype=torch.int64, pin_memory=True
-        ).to(self.device, non_blocking=True)
+            seq_lens, dtype=torch.int64
+        )
         self.orig_seq_lens = torch.tensor(
             seq_lens, dtype=torch.int32, pin_memory=True
         ).to(self.device, non_blocking=True)
