@@ -20,6 +20,7 @@ from typing import Callable, Iterable, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
@@ -32,6 +33,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -46,10 +48,6 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
@@ -57,10 +55,9 @@ from sglang.srt.multimodal.mm_utils import (
     init_all_vision_forward_metadata,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip
 from sglang.srt.utils.hf_transformers_utils import get_processor
-
-from sglang.srt.server_args import get_global_server_args
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -159,10 +156,14 @@ class Qwen3_VisionBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        residual: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
-            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            if _use_aiter:
+                norm_layer = partial(LayerNorm, eps=1e-6)
+            else:
+                norm_layer = partial(nn.LayerNorm, eps=1e-6)
         self.norm1 = norm_layer(dim)
         self.norm2 = norm_layer(dim)
 
@@ -212,8 +213,15 @@ class Qwen3_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.norm1(x)
+        # First norm
+        if residual is None:
+            hidden_states = self.norm1(x)
+            residual = x
+        else:
+            hidden_states, residual = self.norm1(x, residual=residual)
+
         hidden_states = rearrange(hidden_states, "s b ... -> b s ...")
         attn = self.attn(
             hidden_states,
@@ -221,11 +229,17 @@ class Qwen3_VisionBlock(nn.Module):
             position_embeddings=position_embeddings,
         )
         attn = rearrange(attn, "b s ... -> s b ...")
-        x += attn
-        norm2 = self.norm2(x)
+
+        # Fused add + norm2
+        if isinstance(self.norm2, LayerNorm):
+            norm2, x = self.norm2(attn, residual=residual)
+        else:
+            x = x + attn
+            norm2 = self.norm2(x)
+
+        # MLP and final residual
         mlp = self.mlp(norm2)
-        x += mlp
-        return x
+        return mlp, x
 
 
 class Qwen3VLMoeVisionPatchMerger(nn.Module):
@@ -274,11 +288,23 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
             tp_rank=tp_rank,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, residual: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         if self.use_postshuffle_norm:
-            x = self.norm(x.view(-1, self.hidden_size))
+            if residual is not None:
+                x, _ = self.norm(
+                    x.view(-1, self.hidden_size),
+                    residual=residual.view(-1, self.hidden_size),
+                )
+            else:
+                x = self.norm(x.view(-1, self.hidden_size))
         else:
-            x = self.norm(x).view(-1, self.hidden_size)
+            if residual is not None:
+                x, _ = self.norm(x, residual=residual)
+                x = x.view(-1, self.hidden_size)
+            else:
+                x = self.norm(x).view(-1, self.hidden_size)
 
         x_parallel, _ = self.linear_fc1(x)
         x_parallel = self.act_fn(x_parallel)
@@ -313,7 +339,10 @@ class Qwen3VLMoeVisionModel(nn.Module):
             1 + len(self.deepstack_visual_indexes)
         )
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        if _use_aiter:
+            norm_layer = partial(LayerNorm, eps=norm_eps)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
@@ -325,7 +354,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_2" if _is_hip else "flash_attention_3",
+                    attn_implementation=(
+                        "flash_attention_2" if _is_hip else "flash_attention_3"
+                    ),
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     use_data_parallel=use_data_parallel,
@@ -516,15 +547,22 @@ class Qwen3VLMoeVisionModel(nn.Module):
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
+        residual = None
         for layer_num, blk in enumerate(self.blocks):
-            x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
+            x, residual = blk(
+                x,
+                cu_seqlens=cu_seqlens,
+                position_embeddings=position_embeddings,
+                residual=residual,
+            )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[num_deepstack_captured](
-                    x
+                    x, residual=residual
                 )
                 deepstack_feature_lists.append(deepstack_feature)
                 num_deepstack_captured += 1
-        x = self.merger(x)
+
+        x = self.merger(x, residual=residual)
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
@@ -659,7 +697,6 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         super().__init__()
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
-
         self.visual = Qwen3VLMoeVisionModel(
             config.vision_config,
             # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -667,7 +704,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel
+            use_data_parallel=self.use_data_parallel,
         )
 
         # TODO: make it more elegant
