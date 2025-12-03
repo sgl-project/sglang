@@ -3,6 +3,7 @@
 import logging
 import os
 from enum import Enum
+from functools import cache
 from typing import Union
 
 import torch
@@ -23,14 +24,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 
-try:
-    ops.qr_max_size()
-    quick_ar = True
-except Exception:
-    # For CPUs and CUDA
-    quick_ar = False
-
-
+@cache
 def qr_rocm_arch_available():
     if not _is_hip:
         return False
@@ -99,7 +93,7 @@ class QuickAllReduce:
             )
             return
 
-        if not quick_ar:
+        if not ops.IS_QUICK_AR_AVAILABLE:
             # disable because of missing quick reduce library
             # e.g. in a cuda environment
             logger.info(

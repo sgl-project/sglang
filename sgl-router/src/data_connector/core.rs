@@ -268,7 +268,7 @@ pub fn make_item_id(item_type: &str) -> ConversationItemId {
         "reasoning" => "rs".to_string(),
         "mcp_call" => "mcp".to_string(),
         "mcp_list_tools" => "mcpl".to_string(),
-        "function_tool_call" => "ftc".to_string(),
+        "function_call" => "fc".to_string(),
         other => {
             // Fallback: first 3 letters of type or "itm"
             let mut p = other.chars().take(3).collect::<String>();
@@ -340,8 +340,8 @@ pub struct StoredResponse {
     /// When this response was created
     pub created_at: DateTime<Utc>,
 
-    /// User identifier (optional)
-    pub user: Option<String>,
+    /// Safety identifier for content moderation
+    pub safety_identifier: Option<String>,
 
     /// Model used for generation
     pub model: Option<String>,
@@ -366,7 +366,7 @@ impl StoredResponse {
             tool_calls: Vec::new(),
             metadata: HashMap::new(),
             created_at: Utc::now(),
-            user: None,
+            safety_identifier: None,
             model: None,
             conversation_id: None,
             raw_response: Value::Null,
@@ -465,15 +465,15 @@ pub trait ResponseStorage: Send + Sync {
         max_depth: Option<usize>,
     ) -> ResponseResult<ResponseChain>;
 
-    /// List recent responses for a user
-    async fn list_user_responses(
+    /// List recent responses for a safety identifier
+    async fn list_identifier_responses(
         &self,
-        user: &str,
+        identifier: &str,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>>;
 
-    /// Delete all responses for a user
-    async fn delete_user_responses(&self, user: &str) -> ResponseResult<usize>;
+    /// Delete all responses for a safety identifier
+    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize>;
 }
 
 impl Default for StoredResponse {

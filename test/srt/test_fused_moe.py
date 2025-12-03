@@ -1,7 +1,6 @@
 import unittest
 
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -192,6 +191,8 @@ class TestFusedMOE(CustomTestCase):
         k_values = [128, 511, 1024]
         dtypes = [torch.float16, torch.bfloat16]
         fp8_modes = [False, True]
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
         # Calculate total number of tests
         total_tests = (

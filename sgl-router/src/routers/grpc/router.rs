@@ -1,5 +1,3 @@
-// gRPC Router Implementation
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,12 +9,22 @@ use axum::{
 };
 use tracing::debug;
 
-use super::{context::SharedComponents, pipeline::RequestPipeline, responses};
+use super::{
+    common::responses::{
+        handlers::{cancel_response_impl, get_response_impl},
+        utils::validate_worker_availability,
+    },
+    context::SharedComponents,
+    harmony::{
+        serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector,
+        HarmonyResponsesContext,
+    },
+    pipeline::RequestPipeline,
+    regular::responses,
+};
 use crate::{
     app_context::AppContext,
-    config::types::RetryConfig,
     core::WorkerRegistry,
-    policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
@@ -26,10 +34,7 @@ use crate::{
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    reasoning_parser::ParserFactory as ReasoningParserFactory,
     routers::RouterTrait,
-    tokenizer::traits::Tokenizer,
-    tool_parser::ParserFactory as ToolParserFactory,
 };
 
 /// gRPC router implementation for SGLang
@@ -37,19 +42,11 @@ use crate::{
 #[allow(dead_code)]
 pub struct GrpcRouter {
     worker_registry: Arc<WorkerRegistry>,
-    policy_registry: Arc<PolicyRegistry>,
-    tokenizer: Arc<dyn Tokenizer>,
-    reasoning_parser_factory: ReasoningParserFactory,
-    tool_parser_factory: ToolParserFactory,
-    dp_aware: bool,
-    api_key: Option<String>,
-    retry_config: RetryConfig,
-    configured_reasoning_parser: Option<String>,
-    configured_tool_parser: Option<String>,
     pipeline: RequestPipeline,
+    harmony_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
-    // Responses context (bundles all /v1/responses dependencies: storage, MCP, background_tasks)
     responses_context: responses::ResponsesContext,
+    harmony_responses_context: responses::ResponsesContext,
 }
 
 impl GrpcRouter {
@@ -73,7 +70,7 @@ impl GrpcRouter {
             .clone();
 
         let worker_registry = ctx.worker_registry.clone();
-        let policy_registry = ctx.policy_registry.clone();
+        let _policy_registry = ctx.policy_registry.clone();
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -82,10 +79,10 @@ impl GrpcRouter {
             reasoning_parser_factory: reasoning_parser_factory.clone(),
         });
 
-        // Create pipeline
+        // Create regular pipeline
         let pipeline = RequestPipeline::new_regular(
             worker_registry.clone(),
-            policy_registry.clone(),
+            _policy_registry.clone(),
             tokenizer.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
@@ -93,34 +90,48 @@ impl GrpcRouter {
             ctx.configured_reasoning_parser.clone(),
         );
 
-        // Create responses context with all dependencies
-        let responses_context = responses::ResponsesContext::new(
-            Arc::new(pipeline.clone()),
-            shared_components.clone(),
+        // Create Harmony pipelines
+        let harmony_pipeline = RequestPipeline::new_harmony(
             worker_registry.clone(),
-            ctx.response_storage.clone(),
-            ctx.conversation_storage.clone(),
-            ctx.conversation_item_storage.clone(),
-            ctx.mcp_manager
-                .get()
-                .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
-                .clone(),
+            _policy_registry.clone(),
+            tokenizer.clone(),
+            tool_parser_factory.clone(),
+            reasoning_parser_factory.clone(),
+            ctx.configured_tool_parser.clone(),
+            ctx.configured_reasoning_parser.clone(),
         );
+
+        // Extract shared dependencies for responses contexts
+        let mcp_manager = ctx
+            .mcp_manager
+            .get()
+            .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
+            .clone();
+
+        // Helper closure to create responses context with a given pipeline
+        let create_responses_context = |pipeline: &RequestPipeline| {
+            responses::ResponsesContext::new(
+                Arc::new(pipeline.clone()),
+                shared_components.clone(),
+                worker_registry.clone(),
+                ctx.response_storage.clone(),
+                ctx.conversation_storage.clone(),
+                ctx.conversation_item_storage.clone(),
+                mcp_manager.clone(),
+            )
+        };
+
+        // Create responses contexts for both pipelines
+        let responses_context = create_responses_context(&pipeline);
+        let harmony_responses_context = create_responses_context(&harmony_pipeline);
 
         Ok(GrpcRouter {
             worker_registry,
-            policy_registry,
-            tokenizer,
-            reasoning_parser_factory,
-            tool_parser_factory,
-            dp_aware: ctx.router_config.dp_aware,
-            api_key: ctx.router_config.api_key.clone(),
-            retry_config: ctx.router_config.effective_retry_config(),
-            configured_reasoning_parser: ctx.configured_reasoning_parser.clone(),
-            configured_tool_parser: ctx.configured_tool_parser.clone(),
             pipeline,
+            harmony_pipeline,
             shared_components,
             responses_context,
+            harmony_responses_context,
         })
     }
 
@@ -131,13 +142,21 @@ impl GrpcRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // Choose Harmony pipeline if model indicates Harmony
+        let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
+
         debug!(
-            "Processing chat completion request for model: {:?}",
-            model_id
+            "Processing chat completion request for model: {:?}, using_harmony={}",
+            model_id, is_harmony
         );
 
-        // Use pipeline for ALL requests (streaming and non-streaming)
-        self.pipeline
+        let pipeline = if is_harmony {
+            &self.harmony_pipeline
+        } else {
+            &self.pipeline
+        };
+
+        pipeline
             .execute_chat(
                 Arc::new(body.clone()),
                 headers.cloned(),
@@ -156,7 +175,6 @@ impl GrpcRouter {
     ) -> Response {
         debug!("Processing generate request for model: {:?}", model_id);
 
-        // Use pipeline for ALL requests (streaming and non-streaming)
         self.pipeline
             .execute_generate(
                 Arc::new(body.clone()),
@@ -166,6 +184,62 @@ impl GrpcRouter {
             )
             .await
     }
+
+    /// Main route_responses implementation
+    ///
+    /// Routes to either Harmony or regular responses implementation based on model detection
+    async fn route_responses_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ResponsesRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        // 0. Fast worker validation (fail-fast before expensive operations)
+        let requested_model: Option<&str> = model_id.or(Some(body.model.as_str()));
+
+        if let Some(error_response) = requested_model
+            .and_then(|model| validate_worker_availability(&self.worker_registry, model))
+        {
+            return error_response;
+        }
+
+        // Choose implementation based on Harmony model detection
+        let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
+
+        if is_harmony {
+            debug!(
+                "Processing Harmony responses request for model: {:?}, streaming: {:?}",
+                model_id, body.stream
+            );
+            let harmony_ctx = HarmonyResponsesContext::new(
+                Arc::new(self.harmony_pipeline.clone()),
+                self.shared_components.clone(),
+                self.harmony_responses_context.mcp_manager.clone(),
+                self.harmony_responses_context.response_storage.clone(),
+                self.harmony_responses_context.conversation_storage.clone(),
+                self.harmony_responses_context
+                    .conversation_item_storage
+                    .clone(),
+            );
+
+            if body.stream.unwrap_or(false) {
+                serve_harmony_responses_stream(&harmony_ctx, body.clone()).await
+            } else {
+                match serve_harmony_responses(&harmony_ctx, body.clone()).await {
+                    Ok(response) => axum::Json(response).into_response(),
+                    Err(error_response) => error_response,
+                }
+            }
+        } else {
+            responses::route_responses(
+                &self.responses_context,
+                Arc::new(body.clone()),
+                headers.cloned(),
+                model_id.map(|s| s.to_string()),
+            )
+            .await
+        }
+    }
 }
 
 impl std::fmt::Debug for GrpcRouter {
@@ -173,7 +247,6 @@ impl std::fmt::Debug for GrpcRouter {
         let stats = self.worker_registry.stats();
         f.debug_struct("GrpcRouter")
             .field("workers_count", &stats.total_workers)
-            .field("dp_aware", &self.dp_aware)
             .finish()
     }
 }
@@ -185,7 +258,6 @@ impl RouterTrait for GrpcRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // TODO: Implement actual generation test for gRPC
         (
             StatusCode::NOT_IMPLEMENTED,
             "Health generate not yet implemented for gRPC",
@@ -238,13 +310,7 @@ impl RouterTrait for GrpcRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        responses::route_responses(
-            &self.responses_context,
-            Arc::new(body.clone()),
-            headers.cloned(),
-            model_id.map(|s| s.to_string()),
-        )
-        .await
+        self.route_responses_impl(headers, body, model_id).await
     }
 
     async fn get_response(
@@ -253,26 +319,26 @@ impl RouterTrait for GrpcRouter {
         response_id: &str,
         _params: &ResponsesGetParams,
     ) -> Response {
-        responses::get_response_impl(&self.responses_context, response_id).await
+        get_response_impl(&self.responses_context, response_id).await
     }
 
     async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
-        responses::cancel_response_impl(&self.responses_context, response_id).await
-    }
-
-    async fn route_classify(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &ClassifyRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED).into_response()
+        cancel_response_impl(&self.responses_context, response_id).await
     }
 
     async fn route_embeddings(
         &self,
         _headers: Option<&HeaderMap>,
         _body: &EmbeddingRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED).into_response()
+    }
+
+    async fn route_classify(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &ClassifyRequest,
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()

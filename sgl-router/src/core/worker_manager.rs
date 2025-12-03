@@ -5,7 +5,9 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use axum::response::{IntoResponse, Response};
 use futures::future;
+use http::{Method, StatusCode};
 use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
@@ -14,7 +16,7 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    core::{ConnectionMode, WorkerRegistry, WorkerType},
+    core::{metrics_aggregator::MetricPack, ConnectionMode, WorkerRegistry, WorkerType},
     policies::PolicyRegistry,
     protocols::worker_spec::{FlushCacheResult, WorkerLoadInfo, WorkerLoadsResult},
 };
@@ -233,6 +235,90 @@ impl WorkerManager {
             successful,
             failed,
         }
+    }
+
+    pub async fn get_engine_metrics(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+    ) -> Response {
+        let engine_responses =
+            match Self::fan_out_simple_request(worker_registry, client, "metrics", Method::GET)
+                .await
+            {
+                Ok(x) => x,
+                Err(e) => return e,
+            };
+        let engine_responses = engine_responses
+            .into_iter()
+            .map(|(worker_base_url, metrics_text)| MetricPack {
+                labels: vec![("worker_addr".into(), worker_base_url)],
+                metrics_text,
+            })
+            .collect();
+        let text = match crate::core::metrics_aggregator::aggregate_metrics(engine_responses) {
+            Ok(x) => x,
+            Err(e) => {
+                let error_msg = format!("Failed to aggregate metrics: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response();
+            }
+        };
+        (StatusCode::OK, text).into_response()
+    }
+
+    async fn fan_out_simple_request(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+        endpoint: &str,
+        method: Method,
+    ) -> Result<Vec<(String, String)>, Response> {
+        let workers = worker_registry.get_all();
+        if workers.is_empty() {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "No available workers").into_response());
+        }
+
+        let mut responses = vec![];
+        // May do parallel requests later
+        for worker in workers {
+            let worker_url = worker.url().to_string();
+
+            let url = format!("{}/{}", worker_url, endpoint);
+            let mut request_builder = match method {
+                Method::GET => client.get(url),
+                Method::POST => client.post(url),
+                _ => {
+                    return Err((
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "Unsupported method for simple routing",
+                    )
+                        .into_response())
+                }
+            };
+
+            if let Some(api_key) = worker.api_key() {
+                request_builder =
+                    request_builder.header("Authorization", format!("Bearer {}", api_key));
+            }
+
+            match request_builder.send().await {
+                Ok(res) => {
+                    let status = StatusCode::from_u16(res.status().as_u16())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    match res.text().await {
+                        Ok(body_text) => {
+                            if status.is_success() {
+                                responses.push((worker_url, body_text));
+                            }
+                        }
+                        Err(e) => {
+                            warn!("fan_out_simple_request failed when reading text: {}", e)
+                        }
+                    }
+                }
+                Err(e) => warn!("fan_out_simple_request failed when sending: {}", e),
+            }
+        }
+
+        Ok(responses)
     }
 }
 

@@ -1,8 +1,6 @@
-// MCP Proxy Configuration and Resolution
-//
-// This module provides proxy configuration resolution and HTTP client creation
-// for MCP server connections. Proxy settings are MCP-specific and do NOT affect
-// LLM API traffic.
+//! HTTP proxy configuration for MCP connections.
+//!
+//! Resolves proxy settings and creates HTTP clients for MCP server connections.
 
 use std::time::Duration;
 

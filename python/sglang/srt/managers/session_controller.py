@@ -15,11 +15,11 @@ import uuid
 from typing import Dict, Optional
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 
 
 class SessionReqNode:
-    def __init__(self, req, parent=None, childs=None):
+    def __init__(self, req: Req, parent=None, childs=None):
         self.req = req
         self.parent = parent
         if parent is not None:
@@ -36,12 +36,12 @@ class SessionReqNode:
             req_node.clear(req_dict)
 
         if self.req.finished_reason is None:
-            self.req.to_abort = True
+            self.req.to_finish = FINISH_ABORT()
         del req_dict[self.req.rid]
 
     def abort(self):
         if self.req.finished_reason is None:
-            self.req.to_abort = True
+            self.req.to_finish = FINISH_ABORT()
 
     def __str__(self):
         return self._str_helper(self.req.rid)
@@ -137,13 +137,14 @@ class Session:
             origin_input_ids=input_ids,
             origin_input_ids_unpadded=input_ids_unpadded,
             sampling_params=req.sampling_params,
-            lora_path=req.lora_path,
+            lora_id=req.lora_id,
             session_id=self.session_id,
             custom_logit_processor=req.custom_logit_processor,
             stream=req.stream,
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            vocab_size=tokenizer.vocab_size,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

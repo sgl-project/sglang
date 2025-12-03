@@ -1,42 +1,11 @@
-use std::collections::HashMap;
+//! MCP configuration types and utilities.
+//!
+//! Defines configuration structures for MCP servers, transports, proxies, and inventory.
 
+use std::{collections::HashMap, fmt};
+
+pub use rmcp::model::{Prompt, RawResource, Tool};
 use serde::{Deserialize, Serialize};
-
-// ============================================================================
-// MCP Data Structures
-// ============================================================================
-
-/// Information about an available tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolInfo {
-    pub name: String,
-    pub description: String,
-    pub server: String,
-    pub parameters: Option<serde_json::Value>,
-}
-
-/// Information about an available prompt
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PromptInfo {
-    pub name: String,
-    pub description: Option<String>,
-    pub server: String,
-    pub arguments: Option<Vec<serde_json::Value>>,
-}
-
-/// Information about an available resource
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceInfo {
-    pub uri: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub mime_type: Option<String>,
-    pub server: String,
-}
-
-// ============================================================================
-// Configuration Structures
-// ============================================================================
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
@@ -79,7 +48,7 @@ pub struct McpServerConfig {
     pub required: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "protocol", rename_all = "lowercase")]
 pub enum McpTransport {
     Stdio {
@@ -99,6 +68,33 @@ pub enum McpTransport {
         #[serde(skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
+}
+
+impl fmt::Debug for McpTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            McpTransport::Stdio {
+                command,
+                args,
+                envs,
+            } => f
+                .debug_struct("Stdio")
+                .field("command", command)
+                .field("args", args)
+                .field("envs", envs)
+                .finish(),
+            McpTransport::Sse { url, token } => f
+                .debug_struct("Sse")
+                .field("url", url)
+                .field("token", &token.as_ref().map(|_| "****"))
+                .finish(),
+            McpTransport::Streamable { url, token } => f
+                .debug_struct("Streamable")
+                .field("url", url)
+                .field("token", &token.as_ref().map(|_| "****"))
+                .finish(),
+        }
+    }
 }
 
 /// MCP-specific proxy configuration (does NOT affect LLM API traffic)

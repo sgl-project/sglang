@@ -49,6 +49,7 @@ class DraftBackendFactory:
             "trtllm_mha": self._create_trtllm_mha_decode_backend,
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
             "nsa": self._create_nsa_decode_backend,
+            "ascend": self._create_ascend_decode_backend,
         }
 
         return self._create_backend(
@@ -72,6 +73,7 @@ class DraftBackendFactory:
             "trtllm_mha": self._create_trtllm_mha_prefill_backend,
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             "nsa": self._create_nsa_prefill_backend,
+            "ascend": self._create_ascend_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -173,6 +175,15 @@ class DraftBackendFactory:
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
+    def _create_ascend_decode_backend(self):
+        from sglang.srt.layers.attention.ascend_backend import (
+            AscendAttnMultiStepDraftBackend,
+        )
+
+        return AscendAttnMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
     def _create_flashinfer_prefill_backend(self):
         if not get_global_server_args().use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
@@ -218,6 +229,11 @@ class DraftBackendFactory:
         from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
         return TRTLLMMLABackend(self.draft_model_runner, skip_prefill=False)
+
+    def _create_ascend_prefill_backend(self):
+        from sglang.srt.layers.attention.ascend_backend import AscendAttnBackend
+
+        return AscendAttnBackend(self.draft_model_runner)
 
     def _create_flashmla_prefill_backend(self):
         logger.warning(

@@ -19,13 +19,13 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ✅              | ✅              | ✅                 | ✅             |
 | **FA4 (FlashAttention 4)**      | 128                         | ❌               | ❌              | ❌              | ❌                 | ❌             |
 | **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅                 | ✅             |
-| **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ✅             |
 | **FlexAttention (PyTorch)**     | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **TRTLLM MHA**                  | 16, 32 or 64                | ❌               | ✅              | ❌              | ❌                 | ❌             |
+| **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ❌              | ✅                 | ❌             |
 | **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ❌             |
+| **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ✅             |
 | **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
+| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌                 | ✅             |
 | **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ✅                 | ❌             |
 
 ### MLA Backends
@@ -33,16 +33,16 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 | **Backend**                | **Native Page Sizes**     | **FP8 KV Cache** | **Chunked Prefix Cache** | **Spec topk=1** | **Spec topk>1** |
 |----------------------------|---------------------------|------------------|--------------------------|-----------------|-----------------|
 | **FlashInfer MLA**         | 1                         | ❌               | ✅                       | ✅              | ❌              |
-| **FlashMLA**               | 64                        | ❌               | ✅                       | ✅              | ❌              |
+| **FlashMLA**               | 64                        | ✅               | ✅                       | ✅              | ❌              |
 | **Cutlass MLA**            | 128                       | ✅               | ✅                       | ✅              | ❌              |
 | **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅                       | ✅              | ❌              |
 | **FA3 (FlashAttention 3)** | n/a                       | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
 | **Triton**                 | n/a                       | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
-| **FA4**                    | 128                       | ❌               | ❌                       | ❌              | ❌              |
+| **FA4**                    | 1                         | ❌               | ❌                       | ❌              | ❌              |
 | **Ascend MLA (NPU)**       | 128                       | ❌               | ❌                       | ❌              | ❌              |
 
-```{warning}
-FlashMLA FP8 KV cache is currently not working. See upstream issue [#8856](https://github.com/sgl-project/sglang/pull/8856). Use non-FP8 KV or another backend when FP8 KV cache is required.
+```{note}
+Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" column indicates whether a corresponding multimodal implementation exists for that backend family.
 ```
 
 ```{note}
@@ -54,14 +54,13 @@ FlashMLA FP8 KV cache is currently not working. See upstream issue [#8856](https
 Speculative decoding topk: `topk` is the number of draft tokens sampled per step from the draft model. `topk = 1` follows classic EAGLE; `topk > 1` explores multiple branches and requires backend support in both draft and verification paths.
 ```
 
-Note: Many backends that do not natively operate on pages can emulate `page_size > 1` at the wrapper layer by expanding page tables to per-token indices. The "Page Size > 1 (native)" column indicates true in-kernel paging. Some backends require fixed native page sizes and cannot be reduced/emulated differently: TRTLLM MHA (16/32/64), TRTLLM MLA (32/64), FlashMLA (64), Cutlass MLA (128), FA4 (128), Ascend (128).
+Note: Many backends that do not natively operate on pages can emulate `page_size > 1` at the wrapper layer by expanding page tables to per-token indices. The "Page Size > 1 (native)" column indicates true in-kernel paging. Some backends require fixed native page sizes and cannot be reduced/emulated differently: TRTLLM MHA (16/32/64), TRTLLM MLA (32/64), FlashMLA (64), Cutlass MLA (128), Ascend (128).
 
 MLA page-size constraints:
 - FlashInfer MLA: page_size = 1.
 - FlashMLA: page_size = 64.
 - Cutlass MLA: page_size = 128.
 - TRTLLM MLA: page_size ∈ {32, 64}.
-- FA4: page_size = 128.
 
 ### Hybrid attention (different backends for prefill vs decode) (Experimental)
 
@@ -93,8 +92,6 @@ Constraints when combining hybrid attention with speculative decoding:
 
 - If any attention backend is `trtllm_mha`, speculative decoding supports only `--speculative-eagle-topk 1`.
 - For paged MHA backends with `--page-size > 1` and `--speculative-eagle-topk > 1`, only `flashinfer` is supported.
-- `flex_attention` is not supported with speculative decoding.
-- For MLA backends, `trtllm_mla` supports `topk > 1`; `flashmla` and `flashinfer_mla` support only `topk = 1`.
 - CUDA Graph: the decode backend is always captured; the prefill backend is captured only when `--speculative-attention-mode prefill`.
 
 
@@ -103,9 +100,9 @@ If you set only one of `--prefill-attention-backend` or `--decode-attention-back
 If both are specified and differ, SGLang automatically enables a hybrid wrapper to dispatch to the chosen backend per phase.
 ```
 
-## User guide
+## User Guide
 
-### Launch command for different attention backends.
+### Launch Command for Different Attention Backends
 
 - FlashInfer (Default for Non-Hopper Machines, e.g., A100, A40)
 ```bash
@@ -212,7 +209,7 @@ python3 -m sglang.launch_server \
   --attention-backend flex_attention
 ```
 
-- Dual Chunk FlashAttention (MHA-only)
+- Dual Chunk FlashAttention
 ```bash
 python3 -m sglang.launch_server \
   --model Qwen/Qwen2.5-14B-Instruct-1M \

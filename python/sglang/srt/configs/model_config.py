@@ -47,6 +47,7 @@ class ModelImpl(str, Enum):
     AUTO = "auto"
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
+    MINDSPORE = "mindspore"
 
 
 def is_deepseek_nsa(config: PretrainedConfig) -> bool:
@@ -153,13 +154,13 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-        self.is_hybrid = is_hybrid_model(
+        self.is_hybrid_swa = is_hybrid_model(
             self.hf_config.architectures,
             hybrid_kvcache_ratio=hybrid_kvcache_ratio,
             context_length=context_length,
             attention_chunk_size=self.attention_chunk_size,
         )
-        if self.is_hybrid is not None:
+        if self.is_hybrid_swa is not None:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures, self.hf_text_config.num_hidden_layers
@@ -180,6 +181,14 @@ class ModelConfig:
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
+        # TODO: requires further polishing
+        self.is_image_understandable_model = enable_multimodal and hasattr(
+            self.hf_config, "vision_config"
+        )
+        self.is_audio_understandable_model = enable_multimodal and hasattr(
+            self.hf_config, "audio_config"
+        )
+
         self.is_multimodal_chunked_prefill_supported = (
             enable_multimodal
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
@@ -234,6 +243,7 @@ class ModelConfig:
             model_impl=server_args.model_impl,
             sampling_defaults=server_args.sampling_defaults,
             quantize_and_serve=server_args.quantize_and_serve,
+            override_config_file=server_args.decrypted_config_file,
             **kwargs,
         )
 
@@ -366,6 +376,13 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
+        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
+            self.head_dim = 72
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = self.hf_config.kv_lora_rank
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.v_head_dim = self.hf_config.v_head_dim
+            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -590,14 +607,20 @@ class ModelConfig:
             return
 
         # Check if ModelOpt quantization is specified
-        modelopt_quantization_specified = self.quantization in [
+        _MODELOPT_QUANTIZATION_METHODS = [
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
         ]
+        modelopt_quantization_specified = (
+            self.quantization in _MODELOPT_QUANTIZATION_METHODS
+        )
 
         if not modelopt_quantization_specified:
-            raise ValueError("quantize_and_serve requires ModelOpt quantization")
+            raise ValueError(
+                "quantize_and_serve requires ModelOpt quantization (set with --quantization "
+                f"{{{', '.join(sorted(_MODELOPT_QUANTIZATION_METHODS))}}})"
+            )
 
         # quantize_and_serve is disabled due to compatibility issues
         raise NotImplementedError(
@@ -641,8 +664,10 @@ class ModelConfig:
             "qoq",
             "w4afp8",
             "petit_nvfp4",
+            "quark",
         ]
         compatible_quantization_methods = {
+            "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
@@ -913,6 +938,7 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "NemotronH_Nano_VL_V2",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
@@ -931,7 +957,11 @@ multimodal_model_archs = [
     "NVILAForConditionalGeneration",
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
+    "JetVLMForConditionalGeneration",
 ]
+
+if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
+    multimodal_model_archs.append(envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value)
 
 
 def is_multimodal_model(model_architectures: List[str]):

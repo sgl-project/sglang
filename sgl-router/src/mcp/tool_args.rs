@@ -1,7 +1,6 @@
-//! Tool arguments handling and type coercion
+//! MCP tool argument handling.
 //!
-//! This module provides utilities for handling MCP tool arguments,
-//! supporting both JSON strings and parsed Maps with automatic type coercion.
+//! Supports both JSON strings and parsed Maps with automatic type coercion.
 
 use serde_json::Map;
 

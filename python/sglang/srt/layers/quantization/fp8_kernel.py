@@ -25,7 +25,7 @@ import triton.language as tl
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import (
-    align,
+    ceil_align,
     direct_register_custom_op,
     get_bool_env_var,
     get_device_core_count,
@@ -442,8 +442,8 @@ def create_per_token_group_quant_fp8_output_scale(
         assert column_major_scales and scale_tma_aligned
         *x_batch, x_q_mn, x_q_k = x_shape
         x_s_mn, x_s_k = x_q_mn, x_q_k // 128
-        aligned_mn = align(x_s_mn, 4)
-        aligned_k = align(x_s_k, 4)
+        aligned_mn = ceil_align(x_s_mn, 4)
+        aligned_k = ceil_align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
         return torch.empty(
             (*x_batch, aligned_k // 4, aligned_mn),
@@ -459,7 +459,7 @@ def create_per_token_group_quant_fp8_output_scale(
                 x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
                 device=device,
                 dtype=torch.float32,
-            ).permute(-1, -2)[: x_shape[-2], :]
+            ).transpose(-1, -2)[: x_shape[-2], :]
         else:
             return torch.empty(
                 (x_shape[-1] // group_size,) + x_shape[:-1],
@@ -1849,3 +1849,15 @@ if _is_cuda:
             input, output_q, output_s, group_size, eps, fp8_min, fp8_max, scale_ue8m0
         ):
             return
+
+    # FIXME: for some models, this fake registration will cause NaN outputs.
+    # So we gate the fake registration with an environment variable for them.
+    if not get_bool_env_var("SGLANG_DISABLE_SGL_KERNEL_FAKE_REGISTER"):
+
+        @torch.library.register_fake("sgl_kernel::sgl_per_token_quant_fp8")
+        def _(input, output_q, output_s):
+            return
+
+    @torch.library.register_fake("sgl_kernel::sgl_per_tensor_quant_fp8")
+    def _sgl_per_tensor_quant_fp8(input, output_q, output_s, is_static):
+        return
