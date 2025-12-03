@@ -204,11 +204,11 @@ class DeepSeekV3Detector(BaseFormatDetector):
     ) -> Dict[str, Any]:
         """Build structural tag for DeepSeek V3 wrapper format.
 
-        Uses dual triggers to support multiple tool calls:
-        - First trigger: <｜tool▁calls▁begin｜> for the first tool call
-        - Second trigger: <｜tool▁call▁begin｜> for subsequent tool calls
+        Uses nested tags_with_separator structure to properly handle:
+        - Outer wrapper: <｜tool▁calls▁begin｜>...<｜tool▁calls▁end｜>
+        - Inner tool calls with newline separator
         """
-        tags = []
+        inner_tags = []
         for tool in tools:
             name = tool.function.name
             if not name:
@@ -216,21 +216,7 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
             schema = tool.function.parameters or {}
 
-            # Tag for FIRST tool call (includes outer wrapper)
-            tags.append(
-                {
-                    "begin": "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
-                    + name
-                    + "\n```json\n",
-                    "content": {
-                        "type": "json_schema",
-                        "json_schema": schema,
-                    },
-                    "end": "\n```<｜tool▁call▁end｜>",
-                }
-            )
-            # Tag for SUBSEQUENT tool calls (no outer wrapper)
-            tags.append(
+            inner_tags.append(
                 {
                     "begin": "<｜tool▁call▁begin｜>function<｜tool▁sep｜>"
                     + name
@@ -246,9 +232,20 @@ class DeepSeekV3Detector(BaseFormatDetector):
         return {
             "format": {
                 "type": "triggered_tags",
-                "triggers": ["<｜tool▁calls▁begin｜>", "<｜tool▁call▁begin｜>"],
-                "tags": tags,
+                "triggers": ["<｜tool▁calls▁begin｜>"],
+                "tags": [
+                    {
+                        "begin": "<｜tool▁calls▁begin｜>",
+                        "end": "<｜tool▁calls▁end｜>",
+                        "content": {
+                            "type": "tags_with_separator",
+                            "separator": "\n",
+                            "tags": inner_tags,
+                            "stop_after_first": stop_after_first,
+                        },
+                    }
+                ],
                 "at_least_one": at_least_one,
-                "stop_after_first": stop_after_first,
+                "stop_after_first": True,
             }
         }

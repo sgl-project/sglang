@@ -315,6 +315,7 @@ class TestMistralDetector(StructuralTagFormatTestCase):
         self.assertTrue(tag_true["format"]["at_least_one"])
 
     def test_stop_after_first_parameter(self):
+        """Test that stop_after_first parameter affects nested content structure."""
         tool = self.get_simple_tool()
         tag_false = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=False
@@ -322,26 +323,35 @@ class TestMistralDetector(StructuralTagFormatTestCase):
         tag_true = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=True
         )
-        self.assertFalse(tag_false["format"]["stop_after_first"])
+        # Mistral uses nested tags_with_separator - stop_after_first is in nested content
+        # Format level stop_after_first is always True (outer wrapper only appears once)
+        self.assertTrue(tag_false["format"]["stop_after_first"])
         self.assertTrue(tag_true["format"]["stop_after_first"])
+        # Check nested content's stop_after_first
+        self.assertFalse(tag_false["format"]["tags"][0]["content"]["stop_after_first"])
+        self.assertTrue(tag_true["format"]["tags"][0]["content"]["stop_after_first"])
 
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
         tag = self.detector.build_structural_tag(
             tools=tools, at_least_one=False, stop_after_first=False
         )
-        # Mistral uses dual triggers - 2 tags per tool (first call + subsequent calls)
-        # 2 tools * 2 variants = 4 tags
-        self.assertEqual(len(tag["format"]["tags"]), 4)
+        # Mistral uses nested tags_with_separator - 1 outer tag with inner tags for each tool
+        self.assertEqual(len(tag["format"]["tags"]), 1)
+        # Inner tags should have one entry per tool
+        inner_tags = tag["format"]["tags"][0]["content"]["tags"]
+        self.assertEqual(len(inner_tags), 2)
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
         tag = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=False
         )
-        # Mistral uses dual triggers - 2 tags per tool (first call + subsequent calls)
-        self.assertEqual(len(tag["format"]["tags"]), 2)
-        schema = tag["format"]["tags"][0]["content"]["json_schema"]
+        # Mistral uses nested tags_with_separator - 1 outer tag with 1 inner tag
+        self.assertEqual(len(tag["format"]["tags"]), 1)
+        # Schema is in the inner tag's content
+        inner_tag = tag["format"]["tags"][0]["content"]["tags"][0]
+        schema = inner_tag["content"]["json_schema"]
         self.assertEqual(schema, {})
 
     def test_structural_tag_matches_realistic_output(self):
@@ -352,31 +362,31 @@ class TestMistralDetector(StructuralTagFormatTestCase):
         )
 
         # Create realistic output for single tool call
-        # Note: The end pattern is now "}" (not "}]") to allow multiple tool calls
-        # The array closing "]" is handled separately after all tool calls
         realistic_single = (
-            '[TOOL_CALLS] [{"name":"get_weather", "arguments":{"city":"Dallas"}}'
+            '[TOOL_CALLS] [{"name":"get_weather", "arguments":{"city":"Dallas"}}]'
         )
 
-        # Verify the structural tag's begin pattern matches the output
-        tag_item = tag["format"]["tags"][0]
-        begin = tag_item["begin"]
-        end = tag_item["end"]
+        # Mistral uses nested tags_with_separator structure
+        # Outer tag wraps the entire tool call array
+        outer_tag = tag["format"]["tags"][0]
+        outer_begin = outer_tag["begin"]
+        outer_end = outer_tag["end"]
 
         self.assertTrue(
-            realistic_single.startswith(begin),
-            f"Realistic output should start with begin pattern. Begin: {begin}, Output: {realistic_single}",
+            realistic_single.startswith(outer_begin),
+            f"Realistic output should start with outer begin pattern. Begin: {outer_begin}, Output: {realistic_single}",
         )
         self.assertTrue(
-            realistic_single.endswith(end),
-            f"Realistic output should end with end pattern. End: {end}, Output: {realistic_single}",
+            realistic_single.endswith(outer_end),
+            f"Realistic output should end with outer end pattern. End: {outer_end}, Output: {realistic_single}",
         )
 
-        # Verify tool name appears in the begin pattern
-        self.assertIn(
-            tool.function.name,
-            begin,
-            f"Tool name '{tool.function.name}' should appear in begin pattern: {begin}",
+        # Verify tool name appears in the inner tag's begin pattern
+        inner_tags = outer_tag["content"]["tags"]
+        tool_name_found = any(tool.function.name in t["begin"] for t in inner_tags)
+        self.assertTrue(
+            tool_name_found,
+            f"Tool name '{tool.function.name}' should appear in an inner tag's begin pattern",
         )
 
         # Verify trigger appears in the realistic output
@@ -386,44 +396,36 @@ class TestMistralDetector(StructuralTagFormatTestCase):
             f"At least one trigger should appear in realistic output. Triggers: {triggers}, Output: {realistic_single}",
         )
 
-        # Verify that begin + JSON arguments + end forms a complete output
-        json_start = len(begin)
-        json_end = len(realistic_single) - len(end)
-        json_part = realistic_single[json_start:json_end]
-        reconstructed = begin + json_part + end
-        self.assertEqual(
-            reconstructed,
-            realistic_single,
-            f"Begin + JSON + End should reconstruct the realistic output",
-        )
-
-    def test_dual_trigger_structure(self):
-        """Test that dual triggers are set up correctly for multiple tool calls."""
+    def test_nested_tags_with_separator_structure(self):
+        """Test that nested tags_with_separator is set up correctly for multiple tool calls."""
         tool = self.get_simple_tool()
         tag = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=False
         )
 
-        # Should have 2 tags: one for first call, one for subsequent calls
-        self.assertEqual(len(tag["format"]["tags"]), 2)
+        # Should have 1 outer tag with nested tags_with_separator content
+        self.assertEqual(len(tag["format"]["tags"]), 1)
 
-        first_tag = tag["format"]["tags"][0]
-        subsequent_tag = tag["format"]["tags"][1]
+        outer_tag = tag["format"]["tags"][0]
 
-        # First tag should include outer wrapper [TOOL_CALLS] [
-        self.assertTrue(first_tag["begin"].startswith("[TOOL_CALLS]"))
-        # Subsequent tag should start with separator pattern
-        self.assertTrue(subsequent_tag["begin"].startswith(', {"name":"'))
-        self.assertFalse(subsequent_tag["begin"].startswith("[TOOL_CALLS]"))
+        # Outer tag should include wrapper [TOOL_CALLS] [
+        self.assertTrue(outer_tag["begin"].startswith("[TOOL_CALLS]"))
+        self.assertEqual(outer_tag["end"], "]")
 
-        # Verify both triggers
+        # Verify nested content structure
+        content = outer_tag["content"]
+        self.assertEqual(content["type"], "tags_with_separator")
+        self.assertEqual(content["separator"], ", ")
+        self.assertIn("tags", content)
+        self.assertEqual(len(content["tags"]), 1)  # One inner tag for one tool
+
+        # Verify single trigger
         triggers = tag["format"]["triggers"]
-        self.assertEqual(len(triggers), 2)
+        self.assertEqual(len(triggers), 1)
         self.assertIn("[TOOL_CALLS]", triggers)
-        self.assertIn(', {"name":"', triggers)
 
     def test_multiple_tool_calls_structural_tag(self):
-        """Test that structural tag supports multiple tool calls in sequence."""
+        """Test that structural tag supports multiple tool calls via nested structure."""
         tools = [self.get_simple_tool(), self.get_complex_tool()]
         tag = self.detector.build_structural_tag(
             tools=tools, at_least_one=False, stop_after_first=False
@@ -436,19 +438,27 @@ class TestMistralDetector(StructuralTagFormatTestCase):
             "]"
         )
 
-        # Verify we have tags for first call and subsequent calls
-        tags = tag["format"]["tags"]
-        first_call_tags = [t for t in tags if t["begin"].startswith("[TOOL_CALLS]")]
-        subsequent_call_tags = [t for t in tags if t["begin"].startswith(', {"name":"')]
+        # Verify we have 1 outer tag with multiple inner tags
+        self.assertEqual(len(tag["format"]["tags"]), 1)
+        outer_tag = tag["format"]["tags"][0]
 
-        self.assertEqual(len(first_call_tags), 2)  # One per tool
-        self.assertEqual(len(subsequent_call_tags), 2)  # One per tool
+        # Verify outer tag matches start and end
+        self.assertTrue(realistic_multi.startswith(outer_tag["begin"]))
+        self.assertTrue(realistic_multi.endswith(outer_tag["end"]))
 
-        # Verify first call tag for get_weather works
-        first_begin = first_call_tags[0]["begin"]
-        first_end = first_call_tags[0]["end"]
-        self.assertTrue(realistic_multi.startswith(first_begin))
-        self.assertEqual(first_end, "}")
+        # Verify inner tags exist for each tool
+        inner_tags = outer_tag["content"]["tags"]
+        self.assertEqual(len(inner_tags), 2)  # One per tool
+
+        # Verify tool names appear in inner tags
+        tool_names = {tool.function.name for tool in tools}
+        for inner_tag in inner_tags:
+            # Each inner tag's begin should contain a tool name
+            found_name = any(name in inner_tag["begin"] for name in tool_names)
+            self.assertTrue(
+                found_name,
+                f"Inner tag begin should contain a tool name: {inner_tag['begin']}",
+            )
 
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""
@@ -670,6 +680,7 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
         self.assertTrue(tag_true["format"]["at_least_one"])
 
     def test_stop_after_first_parameter(self):
+        """Test that stop_after_first parameter affects nested content structure."""
         tool = self.get_simple_tool()
         tag_false = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=False
@@ -677,18 +688,25 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
         tag_true = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=True
         )
-        self.assertFalse(tag_false["format"]["stop_after_first"])
+        # DeepSeekV3 uses nested tags_with_separator - stop_after_first is in nested content
+        # Format level stop_after_first is always True (outer wrapper only appears once)
+        self.assertTrue(tag_false["format"]["stop_after_first"])
         self.assertTrue(tag_true["format"]["stop_after_first"])
+        # Check nested content's stop_after_first
+        self.assertFalse(tag_false["format"]["tags"][0]["content"]["stop_after_first"])
+        self.assertTrue(tag_true["format"]["tags"][0]["content"]["stop_after_first"])
 
     def test_multiple_tools(self):
         tools = [self.get_simple_tool(), self.get_complex_tool()]
         tag = self.detector.build_structural_tag(
             tools=tools, at_least_one=False, stop_after_first=False
         )
-        # DeepSeekV3 uses dual triggers - 2 tags per tool (first call + subsequent calls)
+        # DeepSeekV3 uses nested tags_with_separator - 1 outer tag with inner tags for each tool
         self.assertIn("format", tag)
-        # 2 tools * 2 variants = 4 tags
-        self.assertEqual(len(tag["format"]["tags"]), 4)
+        self.assertEqual(len(tag["format"]["tags"]), 1)
+        # Inner tags should have one entry per tool
+        inner_tags = tag["format"]["tags"][0]["content"]["tags"]
+        self.assertEqual(len(inner_tags), 2)
 
     def test_empty_parameters_handling(self):
         tool = self.get_empty_params_tool()
@@ -696,9 +714,11 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
             tools=[tool], at_least_one=False, stop_after_first=False
         )
         self.assertIn("format", tag)
-        # DeepSeekV3 uses flat structure - check first tag's schema
-        first_tag = tag["format"]["tags"][0]
-        schema = first_tag["content"]["json_schema"]
+        # DeepSeekV3 uses nested tags_with_separator - 1 outer tag with 1 inner tag
+        self.assertEqual(len(tag["format"]["tags"]), 1)
+        # Schema is in the inner tag's content
+        inner_tag = tag["format"]["tags"][0]["content"]["tags"][0]
+        schema = inner_tag["content"]["json_schema"]
         self.assertEqual(schema, {})
 
     def test_structural_tag_matches_realistic_output(self):
@@ -714,48 +734,63 @@ class TestDeepSeekV3Detector(StructuralTagFormatTestCase):
             '```json\n{"city":"Dallas"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
         )
 
-        # First tag is for first tool call (includes outer wrapper)
-        first_tag = tag["format"]["tags"][0]
-        first_begin = first_tag["begin"]
-        first_end = first_tag["end"]
+        # DeepSeekV3 uses nested tags_with_separator structure
+        # Outer tag wraps the entire tool calls section
+        outer_tag = tag["format"]["tags"][0]
+        outer_begin = outer_tag["begin"]
+        outer_end = outer_tag["end"]
 
-        # Verify the first tag's begin pattern matches the output
+        # Verify outer tag matches start
         self.assertTrue(
-            realistic_output.startswith(first_begin),
-            f"Realistic output should start with first tag begin. Begin: {first_begin}, Output: {realistic_output}",
+            realistic_output.startswith(outer_begin),
+            f"Realistic output should start with outer begin pattern. Begin: {outer_begin}, Output: {realistic_output}",
+        )
+        # Verify outer tag matches end
+        self.assertTrue(
+            realistic_output.endswith(outer_end),
+            f"Realistic output should end with outer end pattern. End: {outer_end}, Output: {realistic_output}",
         )
 
-        # Verify tool name appears in the begin pattern
-        self.assertIn(
-            tool.function.name,
-            first_begin,
-            f"Tool name '{tool.function.name}' should appear in begin pattern: {first_begin}",
+        # Verify tool name appears in inner tag's begin pattern
+        inner_tags = outer_tag["content"]["tags"]
+        tool_name_found = any(tool.function.name in t["begin"] for t in inner_tags)
+        self.assertTrue(
+            tool_name_found,
+            f"Tool name '{tool.function.name}' should appear in an inner tag's begin pattern",
         )
 
-        # Verify both triggers appear in the triggers list
+        # Verify single trigger (outer wrapper trigger)
         triggers = tag["format"]["triggers"]
-        self.assertEqual(len(triggers), 2)
+        self.assertEqual(len(triggers), 1)
         self.assertIn("<｜tool▁calls▁begin｜>", triggers)
-        self.assertIn("<｜tool▁call▁begin｜>", triggers)
 
-    def test_dual_trigger_structure(self):
-        """Test that dual triggers are set up correctly for multiple tool calls."""
+    def test_nested_tags_with_separator_structure(self):
+        """Test that nested tags_with_separator is set up correctly for multiple tool calls."""
         tool = self.get_simple_tool()
         tag = self.detector.build_structural_tag(
             tools=[tool], at_least_one=False, stop_after_first=False
         )
 
-        # Should have 2 tags: one for first call, one for subsequent calls
-        self.assertEqual(len(tag["format"]["tags"]), 2)
+        # Should have 1 outer tag with nested tags_with_separator content
+        self.assertEqual(len(tag["format"]["tags"]), 1)
 
-        first_tag = tag["format"]["tags"][0]
-        subsequent_tag = tag["format"]["tags"][1]
+        outer_tag = tag["format"]["tags"][0]
 
-        # First tag should include outer wrapper
-        self.assertTrue(first_tag["begin"].startswith("<｜tool▁calls▁begin｜>"))
-        # Subsequent tag should not include outer wrapper
-        self.assertFalse(subsequent_tag["begin"].startswith("<｜tool▁calls▁begin｜>"))
-        self.assertTrue(subsequent_tag["begin"].startswith("<｜tool▁call▁begin｜>"))
+        # Outer tag should include wrapper
+        self.assertTrue(outer_tag["begin"].startswith("<｜tool▁calls▁begin｜>"))
+        self.assertEqual(outer_tag["end"], "<｜tool▁calls▁end｜>")
+
+        # Verify nested content structure
+        content = outer_tag["content"]
+        self.assertEqual(content["type"], "tags_with_separator")
+        self.assertIn("separator", content)
+        self.assertIn("tags", content)
+        self.assertEqual(len(content["tags"]), 1)  # One inner tag for one tool
+
+        # Verify single trigger
+        triggers = tag["format"]["triggers"]
+        self.assertEqual(len(triggers), 1)
+        self.assertIn("<｜tool▁calls▁begin｜>", triggers)
 
     def test_no_format_tag_key(self):
         """Test that tag items do not have 'format': 'tag' key for xgrammar compatibility."""

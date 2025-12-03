@@ -331,11 +331,11 @@ class MistralDetector(BaseFormatDetector):
     ) -> Dict[str, Any]:
         """Build structural tag for Mistral format.
 
-        Uses dual triggers to support multiple tool calls:
-        - First trigger: [TOOL_CALLS] for the first tool call
-        - Second trigger: , {"name":" for subsequent tool calls (after first call ends with })
+        Uses nested tags_with_separator structure to properly handle:
+        - Outer wrapper: [TOOL_CALLS] [...]
+        - Inner tool calls with ", " separator
         """
-        tags = []
+        inner_tags = []
 
         for tool in tools:
             name = tool.function.name
@@ -345,22 +345,9 @@ class MistralDetector(BaseFormatDetector):
             # Always include schema
             schema = tool.function.parameters or {}
 
-            # Tag for FIRST tool call (includes outer wrapper)
-            tags.append(
+            inner_tags.append(
                 {
-                    "begin": '[TOOL_CALLS] [{"name":"' + name + '", "arguments":',
-                    "content": {
-                        "type": "json_schema",
-                        "json_schema": schema,
-                    },
-                    "end": "}",
-                }
-            )
-
-            # Tag for SUBSEQUENT tool calls (triggered after previous call ends with })
-            tags.append(
-                {
-                    "begin": ', {"name":"' + name + '", "arguments":',
+                    "begin": '{"name":"' + name + '", "arguments":',
                     "content": {
                         "type": "json_schema",
                         "json_schema": schema,
@@ -372,9 +359,20 @@ class MistralDetector(BaseFormatDetector):
         return {
             "format": {
                 "type": "triggered_tags",
-                "triggers": ["[TOOL_CALLS]", ', {"name":"'],
-                "tags": tags,
+                "triggers": ["[TOOL_CALLS]"],
+                "tags": [
+                    {
+                        "begin": "[TOOL_CALLS] [",
+                        "end": "]",
+                        "content": {
+                            "type": "tags_with_separator",
+                            "separator": ", ",
+                            "tags": inner_tags,
+                            "stop_after_first": stop_after_first,
+                        },
+                    }
+                ],
                 "at_least_one": at_least_one,
-                "stop_after_first": stop_after_first,
+                "stop_after_first": True,
             }
         }
