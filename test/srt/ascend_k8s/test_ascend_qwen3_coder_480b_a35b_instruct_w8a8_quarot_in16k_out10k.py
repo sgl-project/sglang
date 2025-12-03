@@ -2,10 +2,21 @@ import unittest
 
 from test_ascend_single_mix_utils import (
     TestSingleMixUtils,
-    QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_MODEL_PATH,
-    QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_OTHER_ARGS,
-    QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_ENVS,
 )
+
+QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"
+QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_ENVS = {
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "8",
+    "HCCL_BUFFSIZE": "1536",
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "ENABLE_ASCEND_MOE_NZ": "1",
+    "USE_DEEPEP_INT8": "1",
+    "STREAMS_PER_DEVICE": "32",
+}
 QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_OTHER_ARGS = (
     [
         "--trust-remote-code",
@@ -47,19 +58,6 @@ QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_OTHER_ARGS = (
     ]
 )
 
-QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "8",
-    "HCCL_BUFFSIZE": "1536",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",
-    "HCCL_OP_EXPANSION_MODE": "AIV",
-    "ENABLE_ASCEND_MOE_NZ": "1",
-    "USE_DEEPEP_INT8": "1",
-    "STREAMS_PER_DEVICE": "32",
-}
-
 class TestQwen3_Coder_480B_A35b_Instruct_W8a8_Quarot(TestSingleMixUtils):
     model = QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_MODEL_PATH
     other_args = QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_OTHER_ARGS
@@ -69,7 +67,7 @@ class TestQwen3_Coder_480B_A35b_Instruct_W8a8_Quarot(TestSingleMixUtils):
     max_concurrency = 32
     input_len = 16000
     output_len = 10000
-    random_range_ratio = 0.5
+    random_range_ratio = 1
     ttft = 1206.81
     tpot = 36.45
     output_token_throughput = 252
