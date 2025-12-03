@@ -36,7 +36,7 @@ class TestDeepseekV3FP4(CustomTestCase):
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": "true","num_threads": 64}',
+            '{"enable_multithread_load": true,"num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -111,7 +111,7 @@ class TestDeepseekV3FP4MTP(CustomTestCase):
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": "true","num_threads": 64}',
+            '{"enable_multithread_load": true,"num_threads": 64}',
         ]
         cls.process = popen_launch_server(
             cls.model,
