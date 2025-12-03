@@ -258,6 +258,32 @@ impl Default for ImageProcessorRegistry {
     }
 }
 
+impl ImageProcessorRegistry {
+    /// Create a registry with all built-in processors registered.
+    ///
+    /// Currently registers:
+    /// - `llava-next` -> LlavaNextProcessor
+    /// - `llava` -> LlavaProcessor (also matches llava-1.5, etc.)
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+
+        // Register LLaVA-NeXT first (more specific pattern)
+        registry.register(
+            "llava-next",
+            Box::new(super::processors::LlavaNextProcessor::new()),
+        );
+        registry.register(
+            "llava-v1.6",
+            Box::new(super::processors::LlavaNextProcessor::new()),
+        );
+
+        // Register standard LLaVA (matches llava-1.5, llava-v1.5, etc.)
+        registry.register("llava", Box::new(super::processors::LlavaProcessor::new()));
+
+        registry
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ndarray::Array4;
@@ -324,5 +350,37 @@ mod tests {
         let flat = images.pixel_values_flat();
 
         assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_registry_with_defaults() {
+        let registry = ImageProcessorRegistry::with_defaults();
+
+        // Should find LLaVA processor
+        assert!(registry.has_processor("llava-hf/llava-1.5-7b-hf"));
+        assert!(registry.has_processor("liuhaotian/llava-v1.5-7b"));
+
+        // Should find LLaVA-NeXT processor
+        assert!(registry.has_processor("llava-hf/llava-v1.6-mistral-7b-hf"));
+        assert!(registry.has_processor("lmms-lab/llava-next-interleave-qwen-7b"));
+
+        // Get the processor and check model name
+        let processor = registry.find("llava-hf/llava-1.5-7b-hf").unwrap();
+        assert_eq!(processor.model_name(), "llava");
+    }
+
+    #[test]
+    fn test_registry_find() {
+        let mut registry = ImageProcessorRegistry::new();
+
+        // Create a mock processor using LlavaProcessor
+        registry.register(
+            "test-model",
+            Box::new(crate::multimodal::vision::processors::LlavaProcessor::new()),
+        );
+
+        assert!(registry.has_processor("test-model-7b"));
+        assert!(registry.has_processor("TEST-MODEL"));
+        assert!(!registry.has_processor("other-model"));
     }
 }
