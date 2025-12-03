@@ -285,8 +285,8 @@ class TestSingleMixUtils(CustomTestCase):
     timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 10
     envs = None
     request_rate = None
-    max_concurrency = None
-    num_prompts = None
+    max_concurrency = 8
+    num_prompts = int(max_concurrency) * 4
     input_len = None
     output_len = None
     random_range_ratio = None
