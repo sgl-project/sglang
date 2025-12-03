@@ -428,6 +428,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]
         )
+        forward_batch.spec_info.extend_seq_lens_tensor = self.extend_seq_lens[:bs]
 
         if bs != raw_bs:
             forward_batch.spec_info.positions = self.positions[:num_tokens]
