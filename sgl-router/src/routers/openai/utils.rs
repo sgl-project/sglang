@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::HeaderValue;
 
 // ============================================================================
 // SSE Event Type Constants
@@ -99,16 +99,6 @@ impl OutputIndexMapper {
 // Provider Detection and Header Handling
 // ============================================================================
 
-/// Extract authorization header from request headers
-/// Checks both "authorization" and "Authorization" (case variations)
-pub fn extract_auth_header(headers: Option<&HeaderMap>) -> Option<&str> {
-    headers.and_then(|h| {
-        h.get("authorization")
-            .or_else(|| h.get("Authorization"))
-            .and_then(|v| v.to_str().ok())
-    })
-}
-
 /// API provider types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiProvider {
@@ -168,56 +158,35 @@ pub fn apply_provider_headers(
     req
 }
 
-/// Probe a single endpoint to check if it has the model
-/// Returns Ok(url) if model found, Err(()) otherwise
-pub async fn probe_endpoint_for_model(
-    client: reqwest::Client,
-    url: String,
-    model: String,
-    auth: Option<String>,
-) -> Result<String, ()> {
-    use tracing::debug;
+// ============================================================================
+// Auth Header Resolution
+// ============================================================================
 
-    let probe_url = format!("{}/v1/models/{}", url, model);
-    let req = client
-        .get(&probe_url)
-        .timeout(std::time::Duration::from_secs(5));
+/// Extract auth header with passthrough semantics.
+///
+/// Passthrough mode: User's Authorization header takes priority.
+/// Fallback: Worker's API key is used only if user didn't provide auth.
+///
+/// This enables use cases where:
+/// 1. Users send their own API keys (multi-tenant, BYOK)
+/// 2. Router has a default key for users who don't provide one
+pub fn extract_auth_header(
+    headers: Option<&http::HeaderMap>,
+    worker_api_key: &Option<String>,
+) -> Option<HeaderValue> {
+    // Passthrough: Try user's auth header first
+    let user_auth = headers.and_then(|h| {
+        h.get("authorization")
+            .or_else(|| h.get("Authorization"))
+            .cloned()
+    });
 
-    // Apply provider-specific headers (handles Anthropic, xAI, OpenAI, etc.)
-    let auth_header_value = auth.as_ref().and_then(|a| HeaderValue::from_str(a).ok());
-    let req = apply_provider_headers(req, &url, auth_header_value.as_ref());
-
-    match req.send().await {
-        Ok(resp) => {
-            let status = resp.status();
-            if status.is_success() {
-                debug!(
-                    url = %url,
-                    model = %model,
-                    status = %status,
-                    "Model found on endpoint"
-                );
-                Ok(url)
-            } else {
-                debug!(
-                    url = %url,
-                    model = %model,
-                    status = %status,
-                    "Model not found on endpoint (unsuccessful status)"
-                );
-                Err(())
-            }
-        }
-        Err(e) => {
-            debug!(
-                url = %url,
-                model = %model,
-                error = %e,
-                "Probe request to endpoint failed"
-            );
-            Err(())
-        }
-    }
+    // Return user's auth if provided, otherwise use worker's API key
+    user_auth.or_else(|| {
+        worker_api_key
+            .as_ref()
+            .and_then(|k| HeaderValue::from_str(&format!("Bearer {}", k)).ok())
+    })
 }
 
 // ============================================================================
