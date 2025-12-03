@@ -58,6 +58,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _supports_custom_op = supports_custom_op()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER")
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
