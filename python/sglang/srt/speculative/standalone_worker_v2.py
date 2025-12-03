@@ -5,21 +5,21 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
-from sglang.srt.speculative.eagle_worker import EAGLEWorker
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2, EagleDraftWorker
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
-from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils import empty_context, get_bool_env_var, is_cuda
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
 
 logger = logging.getLogger(__name__)
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+
 
 def _get_plan_stream(
     device: str,
@@ -30,6 +30,7 @@ def _get_plan_stream(
         return plan_stream, plan_stream_ctx
     else:
         return None, contextlib.nullcontext()
+
 
 class StandaloneDraftWorker(EagleDraftWorker):
     """Custom EagleDraftWorker that doesn't share embeddings/lm_head with target model."""
@@ -64,6 +65,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
         # Set constant
         from sglang.srt.speculative.eagle_info import EagleDraftInput
+
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
@@ -165,4 +167,3 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
-

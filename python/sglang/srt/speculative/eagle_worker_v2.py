@@ -52,8 +52,8 @@ from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
     get_available_gpu_memory,
-    is_npu,
     is_cuda,
+    is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -256,7 +256,13 @@ class EagleDraftWorker(BaseDraftWorker):
         }
         # Capture extend
         # FIXME cuda graph for draft_extend capture only support triton now
-        if self.draft_extend_attn_backend and (_is_npu or (_is_cuda and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend))):
+        if self.draft_extend_attn_backend and (
+            _is_npu
+            or (
+                _is_cuda
+                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
+            )
+        ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(

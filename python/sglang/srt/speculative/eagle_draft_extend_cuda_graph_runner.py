@@ -35,6 +35,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
+
 class EAGLEDraftExtendCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
         # Parse args
@@ -187,7 +188,8 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle() or self.model_runner.spec_algorithm.is_standalone()
+                if self.model_runner.spec_algorithm.is_eagle()
+                or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
