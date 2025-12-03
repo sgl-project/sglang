@@ -11,8 +11,6 @@ import triton
 import triton.language as tl
 from packaging import version
 
-from sglang.srt import _custom_ops as ops
-
 PAD_SLOT_ID = -1
 
 TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
