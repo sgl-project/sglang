@@ -33,11 +33,11 @@ use super::{
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
-    utils::apply_provider_headers,
+    utils::{apply_provider_headers, extract_auth_header},
 };
 use crate::{
     app_context::AppContext,
-    core::{RuntimeType, Worker, WorkerRegistry},
+    core::{ModelCard, RuntimeType, Worker, WorkerRegistry},
     data_connector::{
         ConversationId, ConversationItemStorage, ConversationStorage, ListParams, ResponseId,
         ResponseStorage, SortOrder,
@@ -154,6 +154,69 @@ impl OpenAIRouter {
         })
     }
 
+    /// Attempt lazy model discovery from a worker using the user's auth header.
+    ///
+    /// This is used for passthrough mode where the router doesn't have an API key,
+    /// but the user provides one in their request. Returns the discovered models
+    /// if successful, or None if discovery fails.
+    async fn try_lazy_discovery(
+        &self,
+        worker: &Arc<dyn Worker>,
+        auth_header: Option<&HeaderValue>,
+    ) -> Option<Vec<ModelCard>> {
+        let url = format!("{}/v1/models", worker.url());
+
+        // Build request to backend
+        let mut backend_req = self.client.get(&url);
+        if let Some(auth) = auth_header {
+            backend_req = apply_provider_headers(backend_req, &url, Some(auth));
+        }
+
+        match backend_req.send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Value>().await {
+                    Ok(json_response) => {
+                        if let Some(data) = json_response.get("data").and_then(|d| d.as_array()) {
+                            let model_cards: Vec<ModelCard> = data
+                                .iter()
+                                .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
+                                .map(ModelCard::new)
+                                .collect();
+
+                            if !model_cards.is_empty() {
+                                tracing::info!(
+                                    "Lazy discovery: found {} models from {}",
+                                    model_cards.len(),
+                                    url
+                                );
+                                // Cache models for this worker
+                                worker.set_models(model_cards.clone());
+                                return Some(model_cards);
+                            }
+                        }
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse models response: {}", e);
+                        None
+                    }
+                }
+            }
+            Ok(response) => {
+                tracing::debug!(
+                    "Lazy discovery returned non-success status {} from {}",
+                    response.status(),
+                    url
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch models from backend: {}", e);
+                None
+            }
+        }
+    }
+
     /// Select a worker for the given model using the WorkerRegistry.
     ///
     /// This method queries the registry for external workers (RuntimeType::External)
@@ -162,8 +225,15 @@ impl OpenAIRouter {
     /// 2. Worker health status
     /// 3. Circuit breaker state
     ///
+    /// For wildcard workers (no models discovered), it attempts lazy discovery using
+    /// the user's auth header before returning "model not found".
+    ///
     /// Returns an error response if no suitable worker is found.
-    fn select_worker_for_model(&self, model_id: &str) -> Result<Arc<dyn Worker>, Box<Response>> {
+    async fn select_worker_for_model(
+        &self,
+        model_id: &str,
+        auth_header: Option<&HeaderValue>,
+    ) -> Result<Arc<dyn Worker>, Box<Response>> {
         // Get all workers from registry and filter for:
         // 1. External runtime type (OpenAI-compatible API endpoints)
         // 2. Supports the requested model (checks ModelCard including aliases)
@@ -172,7 +242,7 @@ impl OpenAIRouter {
         let workers = self.worker_registry.get_all();
 
         let candidates: Vec<_> = workers
-            .into_iter()
+            .iter()
             .filter(|w| {
                 // Must be external (OpenAI-compatible API)
                 w.metadata().runtime_type == RuntimeType::External
@@ -183,28 +253,51 @@ impl OpenAIRouter {
                     // Circuit breaker must allow execution
                     && w.circuit_breaker().can_execute()
             })
+            .cloned()
             .collect();
 
-        if candidates.is_empty() {
-            return Err(Box::new(
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(json!({
-                        "error": {
-                            "message": format!("No worker available for model '{}'", model_id),
-                            "type": "model_not_found",
-                        }
-                    })),
-                )
-                    .into_response(),
-            ));
+        if !candidates.is_empty() {
+            // Simple load balancing: pick worker with lowest load
+            return Ok(candidates
+                .into_iter()
+                .min_by_key(|w| w.load())
+                .expect("candidates is not empty"));
         }
 
-        // Simple load balancing: pick worker with lowest load
-        Ok(candidates
-            .into_iter()
-            .min_by_key(|w| w.load())
-            .expect("candidates is not empty"))
+        // No candidates found - check if any wildcard workers need lazy discovery
+        let wildcard_workers: Vec<_> = workers
+            .iter()
+            .filter(|w| {
+                w.metadata().runtime_type == RuntimeType::External
+                    && !w.has_models_discovered()
+                    && w.is_healthy()
+                    && w.circuit_breaker().can_execute()
+            })
+            .cloned()
+            .collect();
+
+        // Try lazy discovery on wildcard workers
+        for worker in &wildcard_workers {
+            if self.try_lazy_discovery(worker, auth_header).await.is_some() {
+                // After discovery, check if this worker now supports the model
+                if worker.supports_model(model_id) {
+                    return Ok(worker.clone());
+                }
+            }
+        }
+
+        Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("No worker available for model '{}'", model_id),
+                        "type": "model_not_found",
+                    }
+                })),
+            )
+                .into_response(),
+        ))
     }
 
     /// Handle non-streaming response with optional MCP tool loop
@@ -267,15 +360,8 @@ impl OpenAIRouter {
             let mut request_builder = self.client.post(&url).json(&payload);
 
             // Apply provider-specific headers (handles Anthropic x-api-key, etc.)
-            let auth_header = if let Some(api_key) = worker.api_key() {
-                Some(HeaderValue::from_str(&format!("Bearer {}", api_key)).unwrap())
-            } else if let Some(h) = headers {
-                h.get("authorization")
-                    .or_else(|| h.get("Authorization"))
-                    .cloned()
-            } else {
-                None
-            };
+            // Passthrough mode: user's auth header takes priority, worker's key is fallback
+            let auth_header = extract_auth_header(headers, worker.api_key());
             request_builder = apply_provider_headers(request_builder, &url, auth_header.as_ref());
 
             let response = match request_builder.send().await {
@@ -426,7 +512,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         (StatusCode::OK, info.to_string()).into_response()
     }
 
-    async fn get_models(&self, _req: Request<Body>) -> Response {
+    async fn get_models(&self, req: Request<Body>) -> Response {
         // Return models from all registered external workers
         let external_workers: Vec<_> = self
             .worker_registry
@@ -443,7 +529,32 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .into_response();
         }
 
-        // Collect models from all workers
+        // Check if any workers need model discovery (wildcard mode with no discovered models)
+        let wildcard_workers: Vec<_> = external_workers
+            .iter()
+            .filter(|w| !w.has_models_discovered())
+            .collect();
+
+        // If workers need discovery, use lazy discovery with user's auth
+        if !wildcard_workers.is_empty() {
+            // Get auth header from request (passthrough mode)
+            let headers = req.headers();
+            let worker = wildcard_workers[0];
+            let auth_header = extract_auth_header(Some(headers), worker.api_key());
+
+            // Use shared lazy discovery helper
+            if self
+                .try_lazy_discovery(worker, auth_header.as_ref())
+                .await
+                .is_some()
+            {
+                // Discovery succeeded - fall through to return aggregated models
+                // (The helper already cached the models on the worker)
+            }
+            // If discovery failed, fall through to return any cached models
+        }
+
+        // Collect models from all workers (either cached or pre-discovered)
         let mut all_models = Vec::new();
         let mut seen_models = HashSet::new();
 
@@ -524,8 +635,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
+        // Extract auth header for lazy discovery (passthrough mode)
+        let auth_header = extract_auth_header(headers, &None);
+
         // Select worker for model
-        let worker = match self.select_worker_for_model(body.model.as_str()) {
+        let worker = match self
+            .select_worker_for_model(body.model.as_str(), auth_header.as_ref())
+            .await
+        {
             Ok(w) => w,
             Err(response) => return *response,
         };
@@ -554,15 +671,8 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let mut req = self.client.post(&url).json(&payload);
 
         // Apply provider-specific headers (handles Anthropic x-api-key, etc.)
-        let auth_header = if let Some(api_key) = worker.api_key() {
-            Some(HeaderValue::from_str(&format!("Bearer {}", api_key)).unwrap())
-        } else if let Some(h) = headers {
-            h.get("authorization")
-                .or_else(|| h.get("Authorization"))
-                .cloned()
-        } else {
-            None
-        };
+        // Passthrough mode: user's auth header takes priority, worker's key is fallback
+        let auth_header = extract_auth_header(headers, worker.api_key());
         req = apply_provider_headers(req, &url, auth_header.as_ref());
 
         // Accept SSE when stream=true
@@ -656,9 +766,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
+        // Extract auth header for lazy discovery (passthrough mode)
+        let auth_header = extract_auth_header(headers, &None);
+
         // Select worker for model (use model_id if provided, otherwise use body.model)
         let model = model_id.unwrap_or(body.model.as_str());
-        let worker = match self.select_worker_for_model(model) {
+        let worker = match self
+            .select_worker_for_model(model, auth_header.as_ref())
+            .await
+        {
             Ok(w) => w,
             Err(response) => return *response,
         };
