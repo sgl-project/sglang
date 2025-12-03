@@ -30,6 +30,11 @@ from typing import (
 
 import torch
 
+try:
+    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
+except ImportError:
+    pass
+
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -57,13 +62,8 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
 
-try:
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
-except ImportError:
-    pass
+
 logger = logging.getLogger(__name__)
-
-
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
@@ -80,7 +80,12 @@ if _is_cuda:
         pass
 
 if _is_cuda or _is_hip:
-    from sgl_kernel import topk_sigmoid, topk_softmax
+    from sgl_kernel import topk_softmax
+
+    try:
+        from sgl_kernel import topk_sigmoid
+    except ImportError:
+        pass
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk

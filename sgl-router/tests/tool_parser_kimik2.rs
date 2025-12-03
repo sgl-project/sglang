@@ -1,6 +1,6 @@
 //! Kimi K2 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{KimiK2Parser, ToolParser};
+use sgl_model_gateway::tool_parser::{KimiK2Parser, ToolParser};
 
 mod common;
 use common::create_test_tools;
