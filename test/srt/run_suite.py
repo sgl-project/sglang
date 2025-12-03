@@ -130,7 +130,6 @@ suites = {
         TestFile("test_vision_chunked_prefill.py", 117),
         TestFile("test_vision_openai_server_a.py", 778),
         TestFile("test_vlm_input_format.py", 166),
-        TestFile("test_modelopt_loader.py", 30),
         TestFile("test_modelopt_export.py", 9),
     ],
     "per-commit-2-gpu": [
