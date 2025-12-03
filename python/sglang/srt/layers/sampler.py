@@ -14,7 +14,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu
+from sglang.srt.utils.common import detect_nan
 
 if is_cuda():
     from sgl_kernel import (
@@ -51,13 +52,10 @@ class Sampler(nn.Module):
             apply_custom_logit_processor(logits, sampling_info)
 
         # Detect and handle NaN values in logits
-        if self.use_nan_detection and torch.any(torch.isnan(logits)):
-            logger.warning("Detected errors during sampling! NaN in the logits.")
+        if self.use_nan_detection and detect_nan(logits):
             logits = torch.where(
                 torch.isnan(logits), torch.full_like(logits, -1e5), logits
             )
-            if crash_on_warnings():
-                raise ValueError("Detected errors during sampling! NaN in the logits.")
 
         return logits
 

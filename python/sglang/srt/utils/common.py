@@ -1821,6 +1821,7 @@ def init_custom_process_group(
     return pg
 
 
+@functools.lru_cache(1)
 def crash_on_warnings():
     # Crash on warning if we are running CI tests
     return get_bool_env_var("SGLANG_IS_IN_CI")
@@ -3792,3 +3793,19 @@ def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
         if count % log_interval == 0:
             logger.warning(message)
         setattr(obj, counter_name, count + 1)
+
+
+def detect_nan(logits: torch.Tensor):
+    """
+    Detect if the logits contain NaN values.
+    Args:
+        logits: The logits to detect NaN values.
+    Returns:
+        True if NaN values are detected, False otherwise.
+    """
+    if torch.any(torch.isnan(logits)):
+        logger.warning("Detected errors during sampling! NaN in the logits.")
+        if crash_on_warnings():
+            raise ValueError("Detected errors during sampling! NaN in the logits.")
+        return True
+    return False

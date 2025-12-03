@@ -35,13 +35,13 @@ from sglang.srt.speculative.eagle_info_v2 import (
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
-    detect_nan,
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
+    detect_nan,
     empty_context,
     fast_topk,
     get_available_gpu_memory,
@@ -390,7 +390,12 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch, skip_attn_backend_init=True
             )
             if self.server_args.enable_nan_detection:
-                detect_nan(logits_output)
+                if detect_nan(logits := logits_output.next_token_logits):
+                    logits_output.next_token_logits = torch.where(
+                        torch.isnan(logits),
+                        torch.full_like(logits, -1e5),
+                        logits,
+                    )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
@@ -710,8 +715,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.sampling_info.vocab_mask = None
 
         # Sample
-        if self.enable_nan_detection:
-            detect_nan(logits_output)
+        if self.server_args.enable_nan_detection:
+            if detect_nan(logits := logits_output.next_token_logits):
+                logits_output.next_token_logits = torch.where(
+                    torch.isnan(logits),
+                    torch.full_like(logits, -1e5),
+                    logits,
+                )
         (
             predict,
             accept_length,
