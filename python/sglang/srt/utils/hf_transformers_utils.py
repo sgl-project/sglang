@@ -500,12 +500,20 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
-    config = AutoConfig.from_pretrained(
-        tokenizer_name,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        **kwargs,
-    )
+    if "mistral-large-3" in str(tokenizer_name).lower():
+        config = _load_mistral_large_3_for_causal_LM(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+    else:
+        config = AutoConfig.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
     if _is_deepseek_ocr_model(config):
         # Temporary hack for load deepseek-ocr
         config.model_type = "deepseek-ocr"
