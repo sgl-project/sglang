@@ -1,7 +1,7 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sglang_router_rs::protocols::{
+use sgl_model_gateway::protocols::{
     common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
     responses::{
         ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
@@ -14,7 +14,7 @@ use common::{
     mock_mcp_server::MockMCPServer,
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sglang_router_rs::{config::RouterConfig, routers::RouterFactory};
+use sgl_model_gateway::{config::RouterConfig, routers::RouterFactory};
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -393,7 +393,7 @@ fn test_usage_conversion() {
         completion_tokens: 25,
         total_tokens: 40,
         reasoning_tokens: Some(8),
-        prompt_tokens_details: Some(sglang_router_rs::protocols::common::PromptTokenUsageInfo {
+        prompt_tokens_details: Some(sgl_model_gateway::protocols::common::PromptTokenUsageInfo {
             cached_tokens: 3,
         }),
     };
@@ -781,7 +781,7 @@ async fn test_max_tool_calls_limit() {
 async fn setup_streaming_mcp_test() -> (
     MockMCPServer,
     MockWorker,
-    Box<dyn sglang_router_rs::routers::RouterTrait>,
+    Box<dyn sgl_model_gateway::routers::RouterTrait>,
     tempfile::TempDir,
 ) {
     let mcp = MockMCPServer::start().await.expect("start mcp");

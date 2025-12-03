@@ -19,6 +19,7 @@ from typing import (
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
@@ -28,7 +29,6 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
     from sglang.srt.layers.moe.topk import TopKOutput
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
 
 
 # ------------------------------ Dispatcher Hook -------------------------------------

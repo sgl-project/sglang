@@ -105,9 +105,11 @@ class AscendAttnMaskBuilder:
             )
         else:
             mask_value = torch.finfo(torch.float32).min if dtype == torch.float16 else 1
-        attn_mask = torch.zeros(
-            size=(max_seq_len, max_seq_len), dtype=dtype
-        ).masked_fill_(mask_flag, mask_value)
+        attn_mask = (
+            torch.zeros(size=(max_seq_len, max_seq_len))
+            .masked_fill_(mask_flag, mask_value)
+            .to(dtype)
+        )
         return attn_mask
 
     @staticmethod
