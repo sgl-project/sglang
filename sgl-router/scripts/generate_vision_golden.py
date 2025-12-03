@@ -164,7 +164,9 @@ def generate_golden_llava_next(image_path: str, output_dir: str) -> dict:
         print("LlavaNextImageProcessor not available, skipping llava_next")
         return None
 
-    processor = LlavaNextImageProcessor.from_pretrained("llava-hf/llava-v1.6-mistral-7b-hf")
+    processor = LlavaNextImageProcessor.from_pretrained(
+        "llava-hf/llava-v1.6-mistral-7b-hf"
+    )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
@@ -237,14 +239,20 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
             if data is not None:
                 save_golden(model_key, image_name, data, output_dir)
                 print(f"    pixel_values shape: {data['pixel_values'].shape}")
-                print(f"    pixel_values range: [{data['pixel_values'].min():.4f}, {data['pixel_values'].max():.4f}]")
+                print(
+                    f"    pixel_values range: [{data['pixel_values'].min():.4f}, {data['pixel_values'].max():.4f}]"
+                )
         except Exception as e:
             print(f"    Error: {e}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate golden outputs for vision processor testing")
-    parser.add_argument("--model", "-m", help="Specific model to generate (default: all)")
+    parser = argparse.ArgumentParser(
+        description="Generate golden outputs for vision processor testing"
+    )
+    parser.add_argument(
+        "--model", "-m", help="Specific model to generate (default: all)"
+    )
     parser.add_argument("--image", "-i", action="append", help="Specific image path(s)")
     parser.add_argument(
         "--output-dir",
