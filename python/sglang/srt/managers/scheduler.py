@@ -2087,9 +2087,7 @@ class Scheduler(
                 # If switching from non-spec to spec mode, initialize speculative state
                 batch.spec_init_orig_forward_mode = None
                 if self.last_step_in_spec_mode == False:
-                    logger.info(
-                        f"[DYNAMIC SPEC] Switch: NON-SPEC -> SPEC (bs={batch.batch_size()})"
-                    )
+                    logger.info(f"[DYNAMIC SPEC] Switch: NON-SPEC -> SPEC)")
                     batch.spec_init_orig_forward_mode = (
                         self.initialize_speculative_state(batch)
                     )

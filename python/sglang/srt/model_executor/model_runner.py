@@ -2501,8 +2501,10 @@ class ModelRunner:
             )
             self.server_args.speculative_algorithm = "None"
             self.spec_algorithm = SpeculativeAlgorithm.from_string("None")
-
-            self.graph_runner_nonspec = graph_runners[self.device](self)
+            threshold = self.server_args.speculative_batch_size_threshold
+            self.graph_runner_nonspec = graph_runners[self.device](
+                self, custom_bs_min=threshold, custom_bs_max=None
+            )
 
             # ===== Runner 2: Spec (TARGET_VERIFY mode, tokens_per_bs=32) =====
             log_info_on_rank0(
@@ -2511,7 +2513,9 @@ class ModelRunner:
             self.server_args.speculative_algorithm = original_spec_algo
             self.spec_algorithm = original_spec_algo_obj
 
-            self.graph_runner_spec = graph_runners[self.device](self)
+            self.graph_runner_spec = graph_runners[self.device](
+                self, custom_bs_min=None, custom_bs_max=threshold - 1
+            )
 
             # For compatibility, set default to spec runner
             self.graph_runner = self.graph_runner_spec
