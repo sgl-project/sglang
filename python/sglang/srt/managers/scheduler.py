@@ -843,7 +843,9 @@ class Scheduler(
 
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
-        elif (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()) and self.enable_overlap:
+        elif (
+            self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+        ) and self.enable_overlap:
             draft_token_to_kv_pool = (
                 self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
             )
@@ -917,12 +919,14 @@ class Scheduler(
                 buffer_size,
                 hidden_size=(
                     model_config.hidden_size
-                    if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+                    if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
                     else 16  # minimal padding size for RDMA
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
-                    if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+                    if self.spec_algorithm.is_eagle()
+                    or self.spec_algorithm.is_standalone()
                     else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
@@ -2107,7 +2111,11 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
-            if batch.return_logprob or self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if (
+                batch.return_logprob
+                or self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+            ):
                 extend_input_len_per_req = [req.extend_input_len for req in batch.reqs]
             else:
                 extend_input_len_per_req = None

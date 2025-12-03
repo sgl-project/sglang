@@ -63,7 +63,9 @@ class FutureMap:
             )
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
-        if self.buf_initialized or (not self.spec_algo.is_eagle() and not self.spec_algo.is_standalone()):
+        if self.buf_initialized or (
+            not self.spec_algo.is_eagle() and not self.spec_algo.is_standalone()
+        ):
             return
 
         self.buf_initialized = True
