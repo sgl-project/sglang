@@ -1866,6 +1866,10 @@ class ServerArgs:
                 self.load_format = "auto"
 
     def _handle_e_disaggregation(self):
+        if self.enable_prefix_mm_cache and not self.mm_only:
+            raise ValueError(
+                "--enable-prefix-mm-cache requires --mm-only to be enabled"
+            )
         if self.mm_only and self.language_only:
             raise ValueError("Cannot set --mm-only and --language-only together")
         if self.mm_only and not self.disaggregation_mode == "null":
@@ -4013,7 +4017,7 @@ class ServerArgs:
             "--enable-prefix-mm-cache",
             action="store_true",
             default=ServerArgs.enable_prefix_mm_cache,
-            help="Enable prefix multimodal cache.",
+            help="Enable prefix multimodal cache. Currently only supports mm-only.",
         )
 
         # For registering hooks
