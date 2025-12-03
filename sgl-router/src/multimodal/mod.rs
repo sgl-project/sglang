@@ -9,9 +9,3 @@ pub use media::{ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSou
 pub use registry::{ModelProcessorSpec, ModelRegistry};
 pub use tracker::{AsyncMultiModalTracker, TrackerConfig, TrackerOutput};
 pub use types::*;
-
-#[cfg(feature = "python-mm")]
-pub mod python_bridge;
-
-#[cfg(feature = "python-mm")]
-pub use python_bridge::{EncodedImage, MmProcessRequest, PythonMmBridge, PythonProcessorPool};

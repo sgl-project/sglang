@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use reqwest::Client;
-use sglang_router_rs::multimodal::{
+use sgl_model_gateway::multimodal::{
     AsyncMultiModalTracker, ChatContentPart, ConversationSegment, ImageFetchConfig, ImageSource,
     MediaConnector, MediaConnectorConfig, MediaSource, Modality, TrackerConfig,
 };
