@@ -1300,7 +1300,7 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
-                elif is_blackwell() and is_no_spec_infer_or_topk_one():
+                elif is_blackwell() and is_no_spec_infer_or_topk_one(self):
                     self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
