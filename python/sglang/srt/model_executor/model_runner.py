@@ -378,17 +378,6 @@ class ModelRunner:
         self._model_update_group = {}
         self._weights_send_group = {}
 
-        if _is_npu and (
-            not self.server_args.disable_cuda_graph
-            and self.server_args.enable_torch_compile
-            and not self.model_config.attention_arch == AttentionArch.MLA
-        ):
-            log_info_on_rank0(
-                logger,
-                "Disable torch compile for NPU graph because attention architecture is not suitable",
-            )
-            self.server_args.enable_torch_compile = False
-
     def init_mindspore_runner(self):
         # Init the mindspore runner
         # for now, there is only some communication initialization work
