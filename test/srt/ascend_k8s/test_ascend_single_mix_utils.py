@@ -12,7 +12,6 @@ from sglang.test.test_utils import (
 QWEN3_32B_MODEL_PATH = "/root/.cache/modelscope/hub/models/aleoyang/Qwen3-32B-w8a8-MindIE"
 QWEN3_235B_MODEL_PATH = "/root/.cache/modelscope/hub/models/vllm-ascend/Qwen3-235B-A22B-W8A8"
 QWEN3_30B_A3B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B"
-QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"
 QWEN3_32B_OTHER_ARGS = (
     [
         "--trust-remote-code",
