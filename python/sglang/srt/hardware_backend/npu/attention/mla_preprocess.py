@@ -373,7 +373,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
         assert self.quant_config and self.quant_config.get_name() == "modelslim"
-        _is_w8a8 = self.quant_config and self.quant_config.get_name() == "modelslim"
+        # route by `qkv_a_proj` quant type as MTP layers can be unquantized
+        _is_w8a8 = (
+            hasattr(self.qkv_a_proj.quant_method, "quant_config")
+            and self.qkv_a_proj.quant_method.quant_config.get_name() == "modelslim"
+        )
         if _is_w8a8:
             return self.forward_mlapo(
                 positions, hidden_states, forward_batch, zero_allocator

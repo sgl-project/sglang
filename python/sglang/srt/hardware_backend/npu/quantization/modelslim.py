@@ -165,9 +165,9 @@ class ModelSlimConfig(QuantizationConfig):
             if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
                 return UnquantizedLinearMethod()
             return (
-                NPUW8A8Int8DynamicLinearMethod()
+                NPUW8A8Int8DynamicLinearMethod(self)
                 if self.is_dynamic
-                else NPUW8A8Int8LinearMethod()
+                else NPUW8A8Int8LinearMethod(self)
             )
         elif isinstance(layer, FusedMoE):
             prefix_in_quant_config = prefix + ".0.down_proj.weight"

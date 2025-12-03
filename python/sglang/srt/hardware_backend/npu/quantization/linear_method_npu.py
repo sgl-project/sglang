@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -10,8 +10,21 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
-class NPUW8A8Int8LinearMethod(LinearMethodBase):
+
+class _NPULinearMethodBase(LinearMethodBase):
+
+    def __init__(
+        self,
+        quant_config: Optional["QuantizationConfig"] = None,
+    ):
+        super().__init__()
+        self.quant_config = quant_config
+
+
+class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
     def create_weights(
         self,
@@ -138,7 +151,7 @@ class NPUW8A8Int8LinearMethod(LinearMethodBase):
         )
 
 
-class NPUW8A8Int8DynamicLinearMethod(LinearMethodBase):
+class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
 
     def create_weights(
         self,
