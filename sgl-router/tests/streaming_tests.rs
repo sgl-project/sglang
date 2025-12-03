@@ -6,7 +6,7 @@ use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use sglang_router_rs::{
+use sgl_model_gateway::{
     config::{RouterConfig, RoutingMode},
     routers::{RouterFactory, RouterTrait},
 };

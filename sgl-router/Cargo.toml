@@ -1,6 +1,6 @@
 [package]
-name = "sglang-router"
-version = "0.2.2"
+name = "sgl-model-gateway"
+version = "0.2.3"
 edition = "2021"
 
 [features]
@@ -11,12 +11,11 @@ vendored-openssl = ["openssl/vendored"]
 unused_qualifications = "warn"
 
 [lib]
-name = "sglang_router_rs"
-# Pure Rust library (rlib for the binary and other Rust dependents)
+name = "sgl_model_gateway"
 crate-type = ["rlib"]
 
 [[bin]]
-name = "sglang-router"
+name = "sgl-model-gateway"
 path = "src/main.rs"
 
 [[bin]]
@@ -98,6 +97,7 @@ tonic-prost = "0.14.2"
 deadpool = { version = "0.12", features = ["managed", "rt_tokio_1"] }
 backoff = { version = "0.4", features = ["tokio"] }
 strum = { version = "0.26", features = ["derive"] }
+bitflags = "2.10.0"
 once_cell = "1.21.3"
 tokio-postgres = { version = "0.7.15", features = ["runtime","with-chrono-0_4","with-serde_json-1","array-impls"] }
 deadpool-postgres = "0.14.1"

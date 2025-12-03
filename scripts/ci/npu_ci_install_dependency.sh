@@ -31,7 +31,7 @@ ${PIP_INSTALL} mf-adapter==1.0.0
 ### Install PyTorch and PTA
 PYTORCH_VERSION="2.8.0"
 TORCHVISION_VERSION="0.23.0"
-${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION}
+${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu
 
 PTA_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torch_npu-2.8.0.post2.dev20251113-cp311-cp311-manylinux_2_28_aarch64.whl"
 ${PIP_INSTALL} ${PTA_URL}
@@ -49,7 +49,7 @@ wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./
 
 
 ### Install sgl-kernel-npu
-SGL_KERNEL_NPU_TAG="20251120"
+SGL_KERNEL_NPU_TAG="20251128"
 git clone --depth 1 https://github.com/sgl-project/sgl-kernel-npu.git --branch ${SGL_KERNEL_NPU_TAG}
 (cd sgl-kernel-npu && bash ./build.sh && ${PIP_INSTALL} output/deep_ep*.whl output/sgl_kernel_npu*.whl && cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so)
 
