@@ -78,7 +78,7 @@ The usage of function calling and reasoning parser is the same as DeepSeek V3.1.
 To launch `DeepSeek-V3.2-Exp` with function calling and reasoning parser:
 ```bash
 python3 -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3.2 \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
   --trust-remote-code \
   --tp-size 8 --dp-size 8 --enable-dp-attention \
   --tool-call-parser deepseekv31 \
