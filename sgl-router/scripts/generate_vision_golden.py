@@ -232,7 +232,7 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     if image_grid_thw is not None:
         # image_grid_thw has shape [batch, 3] with [T, H, W]
         grid_thw = image_grid_thw[0]  # First (and only) image
-        num_tokens = int(np.prod(grid_thw) / (merge_size ** 2))
+        num_tokens = int(np.prod(grid_thw) / (merge_size**2))
     else:
         num_tokens = None
 

@@ -65,7 +65,6 @@ pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 /// - Fits within configurable min/max pixel bounds
 /// - Aligns to patch boundaries for efficient vision encoding
 ///
-/// # Image Grid THW
 ///
 /// The processor returns `image_grid_thw` in the model-specific outputs,
 /// which contains the (T, H, W) grid dimensions needed for rotary position
@@ -133,7 +132,9 @@ impl Qwen2VLProcessor {
             merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
             min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
             max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
-            temporal_patch_size: config.temporal_patch_size.unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+            temporal_patch_size: config
+                .temporal_patch_size
+                .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
         }
     }
 
@@ -161,7 +162,11 @@ impl Qwen2VLProcessor {
     /// # Errors
     /// - If height or width is smaller than the factor
     /// - If aspect ratio exceeds 200:1
-    pub fn smart_resize(&self, height: usize, width: usize) -> Result<(usize, usize), TransformError> {
+    pub fn smart_resize(
+        &self,
+        height: usize,
+        width: usize,
+    ) -> Result<(usize, usize), TransformError> {
         let factor = self.get_factor();
 
         // Validate minimum dimensions
@@ -221,7 +226,12 @@ impl Qwen2VLProcessor {
     ///
     /// # Returns
     /// (grid_t, grid_h, grid_w)
-    pub fn calculate_grid_thw(&self, height: usize, width: usize, num_frames: usize) -> (usize, usize, usize) {
+    pub fn calculate_grid_thw(
+        &self,
+        height: usize,
+        width: usize,
+        num_frames: usize,
+    ) -> (usize, usize, usize) {
         let grid_t = num_frames.max(self.temporal_patch_size) / self.temporal_patch_size;
         let grid_h = height / self.patch_size;
         let grid_w = width / self.patch_size;
@@ -242,10 +252,10 @@ impl Qwen2VLProcessor {
     /// - num_patches = grid_t * grid_h * grid_w
     /// - patch_features = C * temporal_patch_size * patch_size * patch_size
     ///
-    /// The transformation follows these steps:
-    /// 1. Start with [C, H, W] tensor
-    /// 2. Reshape to [grid_t, temporal_patch_size, C, grid_h/merge, merge, patch, grid_w/merge, patch, merge]
-    /// 3. Transpose to [grid_t, grid_h/merge, grid_w/merge, merge, merge, C, temporal_patch_size, patch, patch]
+    /// The transformation follows these steps (matching HuggingFace exactly):
+    /// 1. Start with [C, H, W] tensor, expand to [temporal, C, H, W]
+    /// 2. Reshape to [grid_t, temporal, C, grid_h/merge, merge, patch, grid_w/merge, merge, patch]
+    /// 3. Permute to [grid_t, grid_h/merge, grid_w/merge, merge, merge, C, temporal, patch, patch]
     /// 4. Flatten to [num_patches, patch_features]
     ///
     /// # Arguments
@@ -263,6 +273,8 @@ impl Qwen2VLProcessor {
         grid_h: usize,
         grid_w: usize,
     ) -> Vec<f32> {
+        use ndarray::IxDyn;
+
         let channel = tensor.shape()[0];
         let height = tensor.shape()[1];
         let width = tensor.shape()[2];
@@ -272,70 +284,73 @@ impl Qwen2VLProcessor {
         let temporal_patch_size = self.temporal_patch_size;
 
         // Verify dimensions match expected grid
-        debug_assert_eq!(height, grid_h * patch_size, "Height must match grid_h * patch_size");
-        debug_assert_eq!(width, grid_w * patch_size, "Width must match grid_w * patch_size");
+        debug_assert_eq!(
+            height,
+            grid_h * patch_size,
+            "Height must match grid_h * patch_size"
+        );
+        debug_assert_eq!(
+            width,
+            grid_w * patch_size,
+            "Width must match grid_w * patch_size"
+        );
 
-        // For images, we need to replicate the frame for temporal_patch_size
-        // HF does: if patches.shape[0] % temporal_patch_size != 0, repeat last frame
-        // For single image, this means replicating 1 frame to temporal_patch_size frames
+        // Step 1: Expand temporal dimension by replicating the frame
+        // [C, H, W] -> [temporal_patch_size, C, H, W]
+        let expanded = tensor
+            .view()
+            .insert_axis(ndarray::Axis(0))
+            .broadcast((temporal_patch_size, channel, height, width))
+            .expect("Broadcast failed")
+            .to_owned();
 
-        let num_patches = grid_t * grid_h * grid_w;
-        let patch_features = channel * temporal_patch_size * patch_size * patch_size;
-        let mut output = vec![0.0f32; num_patches * patch_features];
-
-        // Iterate through output patches
-        // Output shape: [grid_t, grid_h/merge, grid_w/merge, merge, merge, C, temporal, patch, patch]
-        // After flatten: [grid_t * grid_h * grid_w, C * temporal * patch * patch]
-
+        // Step 2: Reshape to split spatial dimensions into grid and patch components
+        // [temporal, C, H, W] -> [grid_t, temporal, C, grid_h/merge, merge, patch, grid_w/merge, merge, patch]
+        //
+        // Note: For images, grid_t=1 and we have temporal_patch_size frames (replicated)
+        // HF reshape: [grid_t, temporal, C, grid_h/merge, merge, patch, grid_w/merge, merge, patch]
         let grid_h_merged = grid_h / merge_size;
         let grid_w_merged = grid_w / merge_size;
 
-        for gt in 0..grid_t {
-            for gh_m in 0..grid_h_merged {
-                for gw_m in 0..grid_w_merged {
-                    for m_h in 0..merge_size {
-                        for m_w in 0..merge_size {
-                            // Calculate output patch index
-                            let patch_idx = gt * grid_h * grid_w
-                                + (gh_m * merge_size + m_h) * grid_w
-                                + (gw_m * merge_size + m_w);
+        // Use IxDyn for 9-dimensional reshape (ndarray only supports up to Ix6 for fixed dims)
+        let shape_9d = IxDyn(&[
+            grid_t,
+            temporal_patch_size,
+            channel,
+            grid_h_merged,
+            merge_size,
+            patch_size,
+            grid_w_merged,
+            merge_size,
+            patch_size,
+        ]);
 
-                            // Calculate base position in output
-                            let out_base = patch_idx * patch_features;
+        let reshaped = expanded
+            .into_shape_with_order(shape_9d)
+            .expect("Reshape failed");
 
-                            // Fill in patch features: [C, temporal, patch_h, patch_w]
-                            for c in 0..channel {
-                                for t in 0..temporal_patch_size {
-                                    for ph in 0..patch_size {
-                                        for pw in 0..patch_size {
-                                            // Calculate input position
-                                            // Input is [C, H, W] where H = grid_h * patch_size
-                                            let in_h = (gh_m * merge_size + m_h) * patch_size + ph;
-                                            let in_w = (gw_m * merge_size + m_w) * patch_size + pw;
+        // Step 3: Permute axes to match HuggingFace output order
+        // From: [grid_t, temporal, C, grid_h/merge, merge, patch, grid_w/merge, merge, patch]
+        //       [  0   ,    1    , 2,      3      ,   4  ,   5  ,      6      ,   7  ,   8  ]
+        // To:   [grid_t, grid_h/merge, grid_w/merge, merge, merge, C, temporal, patch, patch]
+        //       [  0   ,      3      ,      6      ,   4  ,   7  , 2,    1    ,   5  ,   8  ]
+        let permuted = reshaped.permuted_axes(&[0, 3, 6, 4, 7, 2, 1, 5, 8][..]);
 
-                                            // For single image, all temporal frames are the same
-                                            let in_val = tensor[[c, in_h, in_w]];
+        // Step 4: Flatten to [num_patches, patch_features]
+        // num_patches = grid_t * grid_h * grid_w = grid_t * (grid_h/merge * merge) * (grid_w/merge * merge)
+        // patch_features = C * temporal * patch * patch
+        let num_patches = grid_t * grid_h * grid_w;
+        let patch_features = channel * temporal_patch_size * patch_size * patch_size;
 
-                                            // Output position within patch_features
-                                            let feat_idx = c * temporal_patch_size * patch_size * patch_size
-                                                + t * patch_size * patch_size
-                                                + ph * patch_size
-                                                + pw;
+        // Make contiguous and flatten
+        let contiguous = permuted.as_standard_layout().into_owned();
+        let flat = contiguous
+            .into_shape_with_order(IxDyn(&[num_patches, patch_features]))
+            .expect("Final reshape failed");
 
-                                            output[out_base + feat_idx] = in_val;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        output
+        let (vec, _offset) = flat.into_raw_vec_and_offset();
+        vec
     }
-
 }
 
 impl ImagePreProcessor for Qwen2VLProcessor {
@@ -569,7 +584,7 @@ mod tests {
 
         // With merge_size=2, tokens = (t * h * w) / 4
         let tokens = processor.calculate_tokens_from_grid(1, 32, 32);
-        assert_eq!(tokens, (1 * 32 * 32) / 4); // 256
+        assert_eq!(tokens, (32 * 32) / 4); // 256
     }
 
     #[test]

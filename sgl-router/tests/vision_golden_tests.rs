@@ -290,7 +290,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
 
     // Compare grid dimensions
     println!(
-        "qwen2_vl - {} image - Grid THW: golden={:?}, rust={:?}",
+        "qwen2_vl - {} image - Grid T H W: golden={:?}, rust={:?}",
         image_name, golden_grid_thw, rust_grid_thw
     );
     assert_eq!(
@@ -318,9 +318,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
 
     // Get the tensor for the first image (batch index 0)
     let pixel_values = &result.pixel_values;
-    let tensor_3d = pixel_values
-        .index_axis(ndarray::Axis(0), 0)
-        .to_owned();
+    let tensor_3d = pixel_values.index_axis(ndarray::Axis(0), 0).to_owned();
 
     // Reshape to patches format
     let rust_patches = processor.reshape_to_patches(&tensor_3d, grid_t, grid_h, grid_w);
@@ -333,10 +331,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
 
     println!(
         "qwen2_vl - {} image - Patch shape: golden={:?}, rust=({}, {})",
-        image_name,
-        golden_shape,
-        expected_num_patches,
-        expected_patch_features
+        image_name, golden_shape, expected_num_patches, expected_patch_features
     );
     assert_eq!(
         golden_shape,
