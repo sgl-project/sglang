@@ -1,7 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/vllm/model_executor/layers/quantization/compressed_tensors
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
@@ -214,7 +214,7 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsScheme):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: torch.Tensor | None = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.weight_block_size is not None:
             return self.w8a8_block_fp8_linear(
