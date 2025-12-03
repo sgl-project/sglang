@@ -12,8 +12,6 @@ from sglang.test.test_utils import (
 QWEN3_32B_MODEL_PATH = "/root/.cache/modelscope/hub/models/aleoyang/Qwen3-32B-w8a8-MindIE"
 QWEN3_235B_MODEL_PATH = "/root/.cache/modelscope/hub/models/vllm-ascend/Qwen3-235B-A22B-W8A8"
 QWEN3_30B_A3B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-30B-A3B"
-QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"
-QWEN3_8B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen3-8B-W8A8"
 QWEN3_32B_OTHER_ARGS = (
     [
         "--trust-remote-code",
@@ -259,102 +257,6 @@ QWEN3_30B_A3B_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
 }
 
-QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_OTHER_ARGS = (
-    [
-        "--trust-remote-code",
-        "--nnodes",
-        "1",
-        "--node-rank",
-        "0",
-        "--tp-size",
-        "16",
-        "--dp-size",
-        "4",
-        "--mem-fraction-static",
-        "0.7",
-        "--max-running-requests",
-        "32",
-        "--attention-backend",
-        "ascend",
-        "--device",
-        "npu",
-        "--quantization",
-        "w8a8_int8",
-        "--enable-dp-attention",
-        "--cuda-graph-bs",
-        "8",
-        "--watchdog-timeout",
-        "9000",
-        "--chunked-prefill-size",
-        "32768",
-        "--max-prefill-tokens",
-        "458880",
-        "--prefill-round-robin-balance",
-        "--moe-a2a-backend",
-        "deepep",
-        "--deepep-mode",
-        "auto",
-        "--disable-radix-cache",
-        "--dtype",
-        "bfloat16",
-    ]
-)
-
-QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "8",
-    "HCCL_BUFFSIZE": "1536",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",
-    "HCCL_OP_EXPANSION_MODE": "AIV",
-    "ENABLE_ASCEND_MOE_NZ": "1",
-    "USE_DEEPEP_INT8": "1",
-    "STREAMS_PER_DEVICE": "32",
-}
-
-QWEN3_8B_OTHER_ARGS = (
-    [
-        "--trust-remote-code",
-        "--nnodes",
-        "1",
-        "--node-rank",
-        "0",
-        "--attention-backend",
-        "ascend",
-        "--device",
-        "npu",
-        "--quantization",
-        "w8a8_int8",
-        "--max-running-requests",
-        "16",
-        "--disable-radix-cache",
-        "--chunked-prefill-size",
-        "43008",
-        "--max-prefill-tokens",
-        "525000",
-        "--tp-size",
-        "4",
-        "--mem-fraction-static",
-        "0.8",
-        "--cuda-graph-bs",
-        "16",
-        "--dtype",
-        "bfloat16",    
-    ]
-)
-
-QWEN3_8B_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
-    "HCCL_BUFFSIZE": "400",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",     
-    "HCCL_OP_EXPANSION_MODE": "AIV",
-    
-}
-
 
 def run_command(cmd, shell=True):
     try:
@@ -366,9 +268,8 @@ def run_command(cmd, shell=True):
         print(f"command error: {e}")
         return None
 
-def run_bench_serving(host, port, dataset_name="random", request_rate=8, max_concurrency=8, input_len=1024, output_len=1024,
+def run_bench_serving(host, port, dataset_name="random", request_rate=8, max_concurrency=8, num_prompts=32, input_len=1024, output_len=1024,
                       random_range_ratio=1):
-    num_prompts = max_concurrency * 4
     command = (f"python3 -m sglang.bench_serving --backend sglang --host {host} --port {port} --dataset-name {dataset_name} --request-rate {request_rate} "
                f"--max-concurrency {max_concurrency} --num-prompts {num_prompts} --random-input-len {input_len} "
                f"--random-output-len {output_len} --random-range-ratio {random_range_ratio}")
@@ -384,7 +285,8 @@ class TestSingleMixUtils(CustomTestCase):
     timeout = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 10
     envs = None
     request_rate = None
-    max_concurrency = None
+    max_concurrency = 8
+    num_prompts = int(max_concurrency) * 4
     input_len = None
     output_len = None
     random_range_ratio = None
@@ -419,6 +321,7 @@ class TestSingleMixUtils(CustomTestCase):
             dataset_name=self.dataset_name,
             request_rate=self.request_rate,
             max_concurrency=self.max_concurrency,
+            num_prompts=self.num_prompts,
             input_len=self.input_len,
             output_len=self.output_len,
             random_range_ratio=self.random_range_ratio,
