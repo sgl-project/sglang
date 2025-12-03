@@ -340,6 +340,7 @@ class ForwardBatch:
     attn_backend: AttentionBackend = None
 
     # For DP attention
+    original_global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
@@ -457,6 +458,7 @@ class ForwardBatch:
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
+            ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64

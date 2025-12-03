@@ -337,16 +337,6 @@ class MTPDraftWorker(BaseDraftWorker):
             target_hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
-        # Construct input_ids
-        if not batch.forward_mode.is_idle():
-            pt = 0
-            for i, extend_len in enumerate(batch.extend_seq_lens):
-                input_ids = batch.input_ids[pt : pt + extend_len]
-                batch.input_ids[pt : pt + extend_len] = torch.cat(
-                    (input_ids[1:], next_token_ids[i].reshape(1))
-                )
-                pt += extend_len
-
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
@@ -362,6 +352,16 @@ class MTPDraftWorker(BaseDraftWorker):
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
         forward_batch.return_hidden_states_before_norm = True
+
+        # Construct input_ids
+        if not batch.forward_mode.is_idle():
+            rotate_input_ids_triton(
+                forward_batch.input_ids,
+                forward_batch.extend_start_loc,
+                forward_batch.extend_seq_lens,
+                next_token_ids,
+            )
+
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
@@ -370,26 +370,28 @@ class MTPDraftWorker(BaseDraftWorker):
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
-            rotate_input_ids_triton(
-                forward_batch.input_ids,
-                forward_batch.extend_start_loc,
-                forward_batch.extend_seq_lens,
-                topk_index,
-            )
+            if forward_batch.extend_seq_lens is not None:
+                rotate_input_ids_triton(
+                    forward_batch.input_ids,
+                    forward_batch.extend_start_loc,
+                    forward_batch.extend_seq_lens,
+                    topk_index,
+                )
         next_draft_input.topk_p = torch.cat(topk_p_list, dim=1)
         next_draft_input.topk_index = torch.cat(topk_index_list, dim=1)
         # next_draft_input.hidden_states = logits_output.hidden_states
 
         # Update req_to_hidden_states_pool for KV Cache reversion
-        assign_hidden_states_pool_triton(
-            target_hidden_states,
-            forward_batch.req_pool_indices,
-            self.req_to_hidden_states_pool,
-            self.speculative_num_steps - 1,
-            forward_batch.batch_size,
-            forward_batch.extend_seq_lens,
-            forward_batch.extend_start_loc,
-        )
+        if forward_batch.extend_seq_lens is not None:
+            assign_hidden_states_pool_triton(
+                target_hidden_states,
+                forward_batch.req_pool_indices,
+                self.req_to_hidden_states_pool,
+                self.speculative_num_steps - 1,
+                forward_batch.batch_size,
+                forward_batch.extend_seq_lens,
+                forward_batch.extend_start_loc,
+            )
         return next_draft_input
 
     @nvtx_annotated_method("MTPDraftWorker._draft_extend_for_decode")
@@ -461,18 +463,22 @@ class MTPDraftWorker(BaseDraftWorker):
                     draft_logits_output.next_token_logits[select_index], dim=-1
                 )
                 ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-                rotate_input_ids_triton(
-                    forward_batch.input_ids,
-                    forward_batch.extend_start_loc,
-                    forward_batch.extend_seq_lens,
-                    ret_topk_index,
-                    select_index,
-                )
+                if forward_batch.extend_seq_lens is not None:
+                    rotate_input_ids_triton(
+                        forward_batch.input_ids,
+                        forward_batch.extend_start_loc,
+                        forward_batch.extend_seq_lens,
+                        ret_topk_index,
+                        select_index,
+                    )
             ret_topk_p_list.append(ret_topk_p)
             ret_topk_index_list.append(ret_topk_index)
 
         # Update req_to_hidden_states_pool for KV Cache reversion
-        if self.cuda_graph_runner_for_draft_extend is not None:
+        if (
+            self.cuda_graph_runner_for_draft_extend is not None
+            and forward_batch.extend_seq_lens is not None
+        ):
             last_cuda_graph_runner = (
                 self.cuda_graph_runner_for_draft_extend.get_last_runner()
             )
