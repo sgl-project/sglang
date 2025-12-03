@@ -279,6 +279,7 @@ set(SOURCES
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/elementwise/topk.cu"
+    "csrc/elementwise/rms_quant/layernorm_quant_kernels.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"
 
     "csrc/gemm/awq_kernel.cu"

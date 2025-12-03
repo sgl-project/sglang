@@ -24,11 +24,13 @@ from sgl_kernel.elementwise import (
     concat_mla_k,
     copy_to_gpu_no_ce,
     downcast_fp8,
+    fused_add_rms_norm_static_fp8_quant,
     fused_add_rmsnorm,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
+    rms_norm_static_fp8_quant,
     rmsnorm,
     silu_and_mul,
 )
