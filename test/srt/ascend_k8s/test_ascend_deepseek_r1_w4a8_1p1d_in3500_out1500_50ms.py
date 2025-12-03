@@ -20,8 +20,8 @@ MODEL_CONFIG = {
         "HCCL_BUFFSIZE": "1536",
         "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
         "TASK_QUEUE_ENABLE": "2",
-        "HCCL_SOCKET_IFNAME": "lo",
-        "GLOO_SOCKET_IFNAME": "lo",
+        "HCCL_SOCKET_IFNAME": "enp23s0f3",
+        "GLOO_SOCKET_IFNAME": "enp23s0f3",
     },
     "decode_envs": {
         "SGLANG_SET_CPU_AFFIMITY": "1",
@@ -35,8 +35,8 @@ MODEL_CONFIG = {
         "HCCL_BUFFSIZE": "720",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4",
         "TASK_QUEUE_ENABLE": "0",
-        "HCCL_SOCKET_IFNAME": "lo",
-        "GLOO_SOCKET_IFNAME": "lo",     
+        "HCCL_SOCKET_IFNAME": "enp23s0f3",
+        "GLOO_SOCKET_IFNAME": "enp23s0f3",     
     },
     "prefill_args": [
         "--nnodes",
