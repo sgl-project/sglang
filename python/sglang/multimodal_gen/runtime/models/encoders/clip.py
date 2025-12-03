@@ -182,7 +182,7 @@ class CLIPAttention(nn.Module):
             self.head_dim,
             self.num_heads_per_partition,
             softmax_scale=self.scale,
-            causal=True,  # Use causal mask
+            causal=True,
             supported_attention_backends=config._supported_attention_backends,
         )
 
@@ -222,24 +222,17 @@ class CLIPAttention(nn.Module):
             self.head_dim,
         )
 
-        # Check if using TORCH_SDPA backend, if so use PyTorch SDPA directly to support attention_mask
         if self.attn.backend == AttentionBackendEnum.TORCH_SDPA:
-            # Convert to [batch, num_heads, seq_len, head_dim] format (required by SDPA)
             query_states = query_states.transpose(1, 2)  # [B, H, S, D]
             key_states = key_states.transpose(1, 2)
             value_states = value_states.transpose(1, 2)
 
-            # Process attention_mask: convert from [B, S] to format suitable for SDPA
             if attention_mask is not None:
                 # SDPA requires [B, 1, 1, S] or [B, S, S] format mask
-                # If [B, S] format, need to expand
                 if attention_mask.dim() == 2:
-                    # Expand to [B, 1, 1, S] for broadcasting
-                    # In mask: 1 means valid position, 0 means position to mask
                     attn_mask = attention_mask[:, None, None, :].to(
                         dtype=query_states.dtype
                     )
-                    # Convert 0 to -inf, keep 1 as 0
                     attn_mask = (1.0 - attn_mask) * torch.finfo(query_states.dtype).min
                 else:
                     attn_mask = attention_mask
@@ -251,12 +244,10 @@ class CLIPAttention(nn.Module):
                 key_states,
                 value_states,
                 attn_mask=attn_mask,
-                is_causal=True,  # Use causal mask
+                is_causal=True,
                 scale=self.scale,
             )
-
-            # Convert back to [B, S, H, D] format
-            attn_output = attn_output.transpose(1, 2)  # [B, S, H, D]
+            attn_output = attn_output.transpose(1, 2)
         else:
             # Use LocalAttention (doesn't support attention_mask, but maintains compatibility)
             attn_output = self.attn(query_states, key_states, value_states)
