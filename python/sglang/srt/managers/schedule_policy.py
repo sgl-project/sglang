@@ -174,7 +174,6 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-            cached_key = RadixKey(token_ids=prefix_ids, extra_key=extra_key)
             # NOTE: the prefix_indices must always be aligned with last_node
             match_result = self.tree_cache.match_prefix(
                 rid=r.rid, key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
@@ -212,7 +211,7 @@ class SchedulePolicy:
                 else:
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
-                        cached_key,
+                        RadixKey(token_ids=prefix_ids, extra_key=extra_key),
                         torch.empty(len(prefix_ids), dtype=torch.bool),
                     )
         return temporary_deprioritized
@@ -393,11 +392,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
-        return available_and_evictable
-
-    @property
-    def rem_total_tokens(self):
-        return self._calc_available_and_evictable_tokens() - self.rem_total_token_offset
+        return available_and_evictable - self.rem_total_token_offset
 
     @property
     def cur_rem_tokens(self):
@@ -666,19 +661,20 @@ class PrefillAdder:
         Returns True if preemption was committed, and the new request can be scheduled.
         """
         # Iterate running requests to find preemptible requests
+        priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
+
         valid_running_reqs = (
             r for r in self.running_batch.reqs if r not in self.preempt_list
         )
-        if server_args.schedule_low_priority_values_first:
-            sorted_valid_running_reqs = sorted(
-                valid_running_reqs,
-                key=lambda x: (-x.priority, -x.time_stats.wait_queue_entry_time),
-            )
-        else:
-            sorted_valid_running_reqs = sorted(
-                valid_running_reqs,
-                key=lambda x: (x.priority, -x.time_stats.wait_queue_entry_time),
-            )
+
+        sorted_valid_running_reqs = sorted(
+            self.running_batch.reqs,
+            key=lambda x: (
+                x.priority * (-priority_sign),
+                -x.time_stats.wait_queue_entry_time,
+            ),
+        )
+
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
