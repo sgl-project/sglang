@@ -711,7 +711,11 @@ impl HarmonyBuilder {
                     };
                     harmony_messages.push(harmony_msg);
                 }
-                ChatMessage::Developer { content, name ,tools} => {
+                ChatMessage::Developer {
+                    content,
+                    name,
+                    tools: _,
+                } => {
                     // Developer messages stay as-is
                     let harmony_msg = HarmonyMessage {
                         author: Author {
@@ -760,7 +764,6 @@ impl HarmonyBuilder {
                     };
                     harmony_messages.push(harmony_msg);
                 }
-
 
                 ChatMessage::Assistant {
                     content,
