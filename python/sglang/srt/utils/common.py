@@ -122,6 +122,7 @@ HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
+@lru_cache(maxsize=1)
 def is_hip() -> bool:
     return torch.version.hip is not None
 
