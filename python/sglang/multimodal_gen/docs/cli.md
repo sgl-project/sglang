@@ -13,6 +13,7 @@ The SGLang-diffusion CLI provides a quick way to access the inference pipeline f
 ### Server Arguments
 
 - `--model-path {MODEL_PATH}`: Path to the model or model ID
+- `--vae-path {VAE_PATH}`: Path to a custom VAE model or HuggingFace model ID (e.g., `fal/FLUX.2-Tiny-AutoEncoder`)
 - `--num-gpus {NUM_GPUS}`: Number of GPUs to use
 - `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
 - `--sp-size {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
@@ -57,6 +58,7 @@ Example configuration file (config.json):
 ```json
 {
     "model_path": "FastVideo/FastHunyuan-diffusers",
+    "vae_path": "fal/FLUX.2-Tiny-AutoEncoder",
     "prompt": "A beautiful woman in a red dress walking down a street",
     "output_path": "outputs/",
     "num_gpus": 2,
@@ -91,6 +93,7 @@ Or using YAML format (config.yaml):
 
 ```yaml
 model_path: "FastVideo/FastHunyuan-diffusers"
+vae_path: "fal/FLUX.2-Tiny-AutoEncoder"
 prompt: "A beautiful woman in a red dress walking down a street"
 output_path: "outputs/"
 num_gpus: 2
