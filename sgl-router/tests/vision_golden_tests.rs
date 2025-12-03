@@ -227,16 +227,30 @@ fn test_llava_token_count() {
 // Qwen2-VL tests
 // ============================================================================
 
+/// Load flattened pixel values from Qwen2-VL npz file.
+/// Returns (data, shape) where shape is (num_patches, patch_features).
+fn load_golden_qwen2_vl_pixels(path: &Path) -> (Vec<f32>, (usize, usize)) {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("pixel_values")
+        .expect("Failed to read npz")
+        .expect("No pixel_values");
+
+    let shape = reader.shape().to_vec();
+    assert_eq!(shape.len(), 2, "Expected 2D tensor for Qwen2-VL patches");
+
+    let data: Vec<f32> = reader.into_vec().expect("Failed to read array");
+    (data, (shape[0] as usize, shape[1] as usize))
+}
+
 /// Run a Qwen2-VL golden test for a specific image.
 ///
-/// Unlike LLaVA, Qwen2-VL uses dynamic resolution and returns flattened patches.
 /// This test validates:
 /// 1. image_grid_thw matches the HuggingFace output
 /// 2. num_tokens calculation is correct
-///
-/// Note: Pixel value comparison is not done because HuggingFace returns
-/// patches in a different format (num_patches, patch_features) vs our
-/// [B, C, H, W] format. The reshaping would need to be applied to compare.
+/// 3. Pixel values match after reshaping to patch format
 fn run_qwen2_vl_golden_test(image_name: &str) {
     let golden_dir = Path::new("tests/fixtures/golden/qwen2_vl");
     let image_path = Path::new("tests/fixtures/images").join(format!("{}.jpg", image_name));
@@ -256,6 +270,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
     // Load golden values
     let golden_grid_thw = load_golden_grid_thw(&npz_path);
     let golden_num_tokens = load_golden_num_tokens(&npz_path);
+    let (golden_pixels, golden_shape) = load_golden_qwen2_vl_pixels(&npz_path);
 
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
@@ -293,6 +308,64 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
     assert_eq!(
         golden_num_tokens, rust_num_tokens,
         "num_tokens mismatch for {}",
+        image_name
+    );
+
+    // Compare pixel values by reshaping our output to patch format
+    let grid_t = rust_grid_thw[0] as usize;
+    let grid_h = rust_grid_thw[1] as usize;
+    let grid_w = rust_grid_thw[2] as usize;
+
+    // Get the tensor for the first image (batch index 0)
+    let pixel_values = &result.pixel_values;
+    let tensor_3d = pixel_values
+        .index_axis(ndarray::Axis(0), 0)
+        .to_owned();
+
+    // Reshape to patches format
+    let rust_patches = processor.reshape_to_patches(&tensor_3d, grid_t, grid_h, grid_w);
+
+    // Verify shapes match
+    let expected_num_patches = grid_t * grid_h * grid_w;
+    let patch_size = config.patch_size.unwrap_or(14);
+    let temporal_patch_size = config.temporal_patch_size.unwrap_or(2);
+    let expected_patch_features = 3 * temporal_patch_size * patch_size * patch_size;
+
+    println!(
+        "qwen2_vl - {} image - Patch shape: golden={:?}, rust=({}, {})",
+        image_name,
+        golden_shape,
+        expected_num_patches,
+        expected_patch_features
+    );
+    assert_eq!(
+        golden_shape,
+        (expected_num_patches, expected_patch_features),
+        "Patch shape mismatch"
+    );
+    assert_eq!(
+        rust_patches.len(),
+        expected_num_patches * expected_patch_features,
+        "Rust patches size mismatch"
+    );
+
+    // Compare pixel values
+    let max_diff = rust_patches
+        .iter()
+        .zip(golden_pixels.iter())
+        .map(|(r, g)| (r - g).abs())
+        .fold(0.0f32, f32::max);
+
+    println!(
+        "qwen2_vl - {} image - Max pixel diff: {:.6}",
+        image_name, max_diff
+    );
+
+    // Allow tolerance for floating point and interpolation differences
+    assert!(
+        max_diff < 0.02,
+        "Max pixel difference {} exceeds tolerance 0.02 for {}",
+        max_diff,
         image_name
     );
 }

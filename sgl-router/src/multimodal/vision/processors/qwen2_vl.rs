@@ -29,6 +29,7 @@
 //! ```
 
 use image::{DynamicImage, GenericImageView};
+use ndarray::Array3;
 
 use crate::multimodal::vision::{
     image_processor::{ImagePreProcessor, ModelSpecificValue, PreprocessedImages},
@@ -232,6 +233,107 @@ impl Qwen2VLProcessor {
     /// tokens = (grid_t * grid_h * grid_w) / merge_size²
     pub fn calculate_tokens_from_grid(&self, grid_t: usize, grid_h: usize, grid_w: usize) -> usize {
         (grid_t * grid_h * grid_w) / (self.merge_size * self.merge_size)
+    }
+
+    /// Reshape pixel values from [C, H, W] to flattened patches format.
+    ///
+    /// This matches the HuggingFace Qwen2VLImageProcessor output format:
+    /// `(num_patches, patch_features)` where:
+    /// - num_patches = grid_t * grid_h * grid_w
+    /// - patch_features = C * temporal_patch_size * patch_size * patch_size
+    ///
+    /// The transformation follows these steps:
+    /// 1. Start with [C, H, W] tensor
+    /// 2. Reshape to [grid_t, temporal_patch_size, C, grid_h/merge, merge, patch, grid_w/merge, patch, merge]
+    /// 3. Transpose to [grid_t, grid_h/merge, grid_w/merge, merge, merge, C, temporal_patch_size, patch, patch]
+    /// 4. Flatten to [num_patches, patch_features]
+    ///
+    /// # Arguments
+    /// * `tensor` - Input tensor of shape [C, H, W]
+    /// * `grid_t` - Temporal grid size (1 for images)
+    /// * `grid_h` - Height grid size (H / patch_size)
+    /// * `grid_w` - Width grid size (W / patch_size)
+    ///
+    /// # Returns
+    /// Flattened patches as Vec<f32> with shape semantics (num_patches, patch_features)
+    pub fn reshape_to_patches(
+        &self,
+        tensor: &Array3<f32>,
+        grid_t: usize,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Vec<f32> {
+        let channel = tensor.shape()[0];
+        let height = tensor.shape()[1];
+        let width = tensor.shape()[2];
+
+        let patch_size = self.patch_size;
+        let merge_size = self.merge_size;
+        let temporal_patch_size = self.temporal_patch_size;
+
+        // Verify dimensions match expected grid
+        debug_assert_eq!(height, grid_h * patch_size, "Height must match grid_h * patch_size");
+        debug_assert_eq!(width, grid_w * patch_size, "Width must match grid_w * patch_size");
+
+        // For images, we need to replicate the frame for temporal_patch_size
+        // HF does: if patches.shape[0] % temporal_patch_size != 0, repeat last frame
+        // For single image, this means replicating 1 frame to temporal_patch_size frames
+
+        let num_patches = grid_t * grid_h * grid_w;
+        let patch_features = channel * temporal_patch_size * patch_size * patch_size;
+        let mut output = vec![0.0f32; num_patches * patch_features];
+
+        // Iterate through output patches
+        // Output shape: [grid_t, grid_h/merge, grid_w/merge, merge, merge, C, temporal, patch, patch]
+        // After flatten: [grid_t * grid_h * grid_w, C * temporal * patch * patch]
+
+        let grid_h_merged = grid_h / merge_size;
+        let grid_w_merged = grid_w / merge_size;
+
+        for gt in 0..grid_t {
+            for gh_m in 0..grid_h_merged {
+                for gw_m in 0..grid_w_merged {
+                    for m_h in 0..merge_size {
+                        for m_w in 0..merge_size {
+                            // Calculate output patch index
+                            let patch_idx = gt * grid_h * grid_w
+                                + (gh_m * merge_size + m_h) * grid_w
+                                + (gw_m * merge_size + m_w);
+
+                            // Calculate base position in output
+                            let out_base = patch_idx * patch_features;
+
+                            // Fill in patch features: [C, temporal, patch_h, patch_w]
+                            for c in 0..channel {
+                                for t in 0..temporal_patch_size {
+                                    for ph in 0..patch_size {
+                                        for pw in 0..patch_size {
+                                            // Calculate input position
+                                            // Input is [C, H, W] where H = grid_h * patch_size
+                                            let in_h = (gh_m * merge_size + m_h) * patch_size + ph;
+                                            let in_w = (gw_m * merge_size + m_w) * patch_size + pw;
+
+                                            // For single image, all temporal frames are the same
+                                            let in_val = tensor[[c, in_h, in_w]];
+
+                                            // Output position within patch_features
+                                            let feat_idx = c * temporal_patch_size * patch_size * patch_size
+                                                + t * patch_size * patch_size
+                                                + ph * patch_size
+                                                + pw;
+
+                                            output[out_base + feat_idx] = in_val;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        output
     }
 
 }
