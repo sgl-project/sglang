@@ -645,26 +645,49 @@ void tinygemm_kernel(
       A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
 
-#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE)    \
-  template void tinygemm_kernel<TYPE>(         \
-      const TYPE* __restrict__ A,              \
-      const at::Float8_e4m3fn* __restrict__ B, \
-      TYPE* __restrict__ C,                    \
-      TYPE* __restrict__ Btmp,                 \
-      float* __restrict__ Ctmp,                \
-      const float* __restrict__ scale,         \
-      int64_t M,                               \
-      int64_t N,                               \
-      int64_t K,                               \
-      int64_t lda,                             \
-      int64_t ldb,                             \
-      int64_t ldc,                             \
-      bool brg,                                \
-      int64_t block_size_K,                    \
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
+      A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
+
+#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE_A, TYPE_B, TYPE_S) \
+  template void tinygemm_kernel<TYPE_A>(                      \
+      const TYPE_A* __restrict__ A,                           \
+      const TYPE_B* __restrict__ B,                           \
+      TYPE_A* __restrict__ C,                                 \
+      TYPE_A* __restrict__ Btmp,                              \
+      float* __restrict__ Ctmp,                               \
+      const TYPE_S* __restrict__ scale,                       \
+      int64_t M,                                              \
+      int64_t N,                                              \
+      int64_t K,                                              \
+      int64_t lda,                                            \
+      int64_t ldb,                                            \
+      int64_t ldc,                                            \
+      bool brg,                                               \
+      int64_t block_size_K,                                   \
       bool do_unpack)
 
-INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
-INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, at::Float8_e4m3fn, float);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, uint8_t, uint8_t);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
 
 inline const float* get_bias_data(const std::optional<at::Tensor>& bias, int64_t N) {
   if (bias.has_value()) {
