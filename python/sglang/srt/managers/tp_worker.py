@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
@@ -55,6 +56,25 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
+
+# Minimal shape profiling support (controlled by environment variables)
+_ENABLE_SHAPE_PROFILING = os.environ.get("SGLANG_PROFILE_SHAPES", "0") == "1"
+_SHAPE_PROFILE_RANK = int(os.environ.get("SGLANG_PROFILE_SHAPES_RANK", "0"))
+_SHAPE_PROFILE_FILE = os.environ.get("SGLANG_PROFILE_SHAPES_FILE", "shapes.jsonl")
+_shape_logger_module = None
+
+if _ENABLE_SHAPE_PROFILING:
+    try:
+        import sys
+        _profiler_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../examples/profiler"))
+        if os.path.exists(_profiler_path):
+            sys.path.insert(0, _profiler_path)
+            from torch_shape_logger_rank import CompactRankAwareShapeLogger
+            _shape_logger_module = CompactRankAwareShapeLogger
+            logger.info(f"Shape profiling enabled: rank={_SHAPE_PROFILE_RANK}, file={_SHAPE_PROFILE_FILE}")
+    except Exception as e:
+        logger.warning(f"Failed to load shape profiling: {e}")
+        _ENABLE_SHAPE_PROFILING = False
 
 
 class BaseTpWorker(ABC):
@@ -279,6 +299,20 @@ class TpModelWorker(BaseTpWorker):
                 )
         self.device = self.model_runner.device
 
+        # Initialize shape profiler if enabled
+        self._shape_logger = None
+        self._shape_profiling_started = False
+        if _ENABLE_SHAPE_PROFILING and _shape_logger_module and self.tp_rank == _SHAPE_PROFILE_RANK:
+            try:
+                self._shape_logger = _shape_logger_module(
+                    output_file=_SHAPE_PROFILE_FILE,
+                    verbose=False,
+                    only_rank=_SHAPE_PROFILE_RANK,
+                )
+                logger.info(f"[TP Rank {self.tp_rank}] Shape profiler initialized")
+            except Exception as e:
+                logger.warning(f"[TP Rank {self.tp_rank}] Failed to init shape profiler: {e}")
+
         # Init nccl groups
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
@@ -360,6 +394,16 @@ class TpModelWorker(BaseTpWorker):
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
+
+        # Activate shape profiler on first forward pass (lazy activation)
+        if self._shape_logger and not self._shape_profiling_started:
+            try:
+                self._shape_logger.__enter__()
+                self._shape_profiling_started = True
+                logger.info(f"[TP Rank {self.tp_rank}] Shape profiling activated")
+            except Exception as e:
+                logger.warning(f"[TP Rank {self.tp_rank}] Failed to activate profiler: {e}")
+                self._shape_logger = None
 
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch

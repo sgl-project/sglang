@@ -1,25 +1,14 @@
 # SGLang Shape Profiler
 
-Standalone debug tool to profile tensor shapes during model inference.
+Tool to profile tensor shapes during model inference. Supports both single-GPU and multi-GPU (TP) setups.
 
-## Important Limitations
+## Two Modes
 
-⚠️ **With TP > 1 (multi-GPU), this tool will capture 0 operations.** This is expected behavior because tensor operations happen in worker processes that PyTorch dispatch mode cannot intercept from the main process.
+### Mode 1: Standalone (TP=1 only)
 
-**For TP > 1 profiling, use:**
-- NVIDIA Nsight Systems (`nsys profile`)
-- AMD ROCm Profiler (`rocprof`)
-- PyTorch Profiler
-- Native framework profilers
-
-**This tool only works properly with TP=1** (single GPU) where all operations occur in the main process.
-
-## Usage
-
-### Single GPU (Works - Captures All Operations)
+Simple standalone profiler using PyTorch dispatch mode. **Only works with TP=1.**
 
 ```bash
-# This will successfully capture tensor shapes
 python profile_shapes.py \
   --model-path Qwen/Qwen2.5-7B-Instruct \
   --tp-size 1 \
@@ -27,33 +16,98 @@ python profile_shapes.py \
   --max-tokens 50
 ```
 
-### Multi-GPU (Will Capture 0 Operations - Expected)
+**Limitation:** With TP > 1, captures 0 operations (worker processes can't be intercepted).
+
+### Mode 2: TP Worker Integration (Works with TP > 1)
+
+Enables profiling inside TP workers via environment variables. Profiles operations on a specific GPU rank.
 
 ```bash
-# This will run successfully but capture 0 operations (expected behavior)
-python profile_shapes.py \
+# Profile GPU 0 with TP=8
+SGLANG_PROFILE_SHAPES=1 \
+SGLANG_PROFILE_SHAPES_RANK=0 \
+SGLANG_PROFILE_SHAPES_FILE=gpu0_shapes.jsonl \
+python -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-14B-Instruct \
   --tp-size 8 \
-  --num-prompts 3 \
-  --max-tokens 50
+  --port 30000
 ```
 
-Takes the same parameters as `launch_server`.
+**Environment Variables:**
+- `SGLANG_PROFILE_SHAPES=1` - Enable profiling
+- `SGLANG_PROFILE_SHAPES_RANK=0` - Which GPU rank to profile (0-7 for TP=8)
+- `SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl` - Output file path
+
+**Advantages:**
+- ✅ Works with any TP size
+- ✅ Captures actual tensor operations in workers
+- ✅ Minimal overhead (only profiles one rank)
+- ✅ No code modifications needed
+
+**Example with client:**
+```bash
+# Terminal 1: Start server with profiling
+SGLANG_PROFILE_SHAPES=1 SGLANG_PROFILE_SHAPES_RANK=0 \
+SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl \
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-14B-Instruct \
+  --tp-size 8
+
+# Terminal 2: Send requests
+python -c "
+import openai
+client = openai.Client(base_url='http://localhost:30000/v1', api_key='none')
+response = client.chat.completions.create(
+    model='default',
+    messages=[{'role': 'user', 'content': 'Hello!'}],
+    max_tokens=50
+)
+print(response.choices[0].message.content)
+"
+
+# Profiling output will be in shapes.jsonl
+```
+
+## Which Mode to Use?
+
+| Use Case | Mode | Command |
+|----------|------|---------|
+| Debug small model | Standalone (TP=1) | `python profile_shapes.py --tp-size 1` |
+| Profile production setup | TP Worker (TP > 1) | `SGLANG_PROFILE_SHAPES=1 python -m sglang.launch_server --tp-size 8` |
+| Quick testing | Standalone (TP=1) | `python profile_shapes.py --tp-size 1` |
+| Real workload analysis | TP Worker (TP > 1) | Environment variables + launch_server |
+
+## Analyzing Results
+
+Both modes produce JSONL output files:
+
+```bash
+# Basic analysis
+python analyze_shapes.py shapes.jsonl
+
+# Detailed analysis with shape information
+python analyze_shapes.py shapes.jsonl --show-shapes --top 20
+
+# Filter specific operations
+python analyze_shapes.py shapes.jsonl --filter-op "matmul"
+```
 
 ## Files
 
-- `profile_shapes.py` - Main profiler tool
-- `torch_shape_logger.py` - Shape logging implementation  
+- `profile_shapes.py` - Standalone profiler (TP=1 only)
+- `torch_shape_logger.py` - Base logger implementation
+- `torch_shape_logger_rank.py` - TP-aware logger for worker integration
 - `analyze_shapes.py` - Analysis utilities
 
-## Technical Note
+## Technical Details
 
-This is a **standalone debug tool** that uses PyTorch's dispatch mode to intercept tensor operations. It doesn't modify SGLang's core code.
+**Standalone Mode:**
+- Uses PyTorch dispatch mode in main process
+- Can't intercept worker process operations
+- Zero overhead when not used
 
-**Why TP > 1 doesn't work:**
-- With tensor parallelism, model layers are distributed across multiple GPU processes
-- PyTorch dispatch mode only intercepts operations in the current Python process
-- Worker processes execute independently and their operations aren't visible to the main process
-- The profiler can only see high-level coordination logic, not the actual tensor computations
-
-**Best practice:** Use TP=1 with a smaller model to understand operation patterns, then extrapolate to multi-GPU setups.
+**TP Worker Mode:**
+- Hooks into tp_worker.py via environment variables
+- Activates logger on first forward pass
+- Only logs on specified rank to minimize overhead
+- Automatic cleanup on shutdown
