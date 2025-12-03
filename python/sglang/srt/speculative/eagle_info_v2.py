@@ -22,6 +22,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.nvtx_utils import nvtx_annotated_method
+
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
@@ -81,6 +83,8 @@ def assign_draft_cache_locs_page_size_1(
 
 @dataclass
 class EagleDraftInputV2Mixin:
+
+    @nvtx_annotated_method("eagle_draft_input_v2_mixin.prepare_for_decode")
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
         if isinstance(batch.tree_cache, SWAChunkCache):
             for req in batch.reqs:
@@ -137,6 +141,7 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens.cpu()
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
+    @nvtx_annotated_method("eagle_draft_input_v2_mixin.prepare_for_v2_draft")
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
@@ -175,6 +180,7 @@ class EagleDraftInputV2Mixin:
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
+    @nvtx_annotated_method("eagle_draft_input_v2_mixin.prepare_for_extend_to_fill_draft_kvcache")
     def prepare_for_extend_to_fill_draft_kvcache(
         self,
         batch: ModelWorkerBatch,
@@ -209,6 +215,8 @@ class EagleDraftInputV2Mixin:
 
 @dataclass
 class EagleVerifyInputV2Mixin:
+
+    @nvtx_annotated_method("eagle_verify_input_v2_mixin.prepare_for_v2_verify")
     def prepare_for_v2_verify(
         self: EagleVerifyInput,
         req_to_token_pool: ReqToTokenPool,
@@ -254,6 +262,7 @@ class EagleVerifyInputV2Mixin:
 
         return verify_forward_batch, can_run_cuda_graph
 
+    @nvtx_annotated_method("eagle_verify_input_v2_mixin.sample")
     def sample(
         self: EagleVerifyInput,
         batch: ModelWorkerBatch,

@@ -122,6 +122,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -2124,6 +2125,7 @@ class ModelRunner:
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    @nvtx_annotated_method("model_runner.forward_decode")
     def forward_decode(
         self,
         forward_batch: ForwardBatch,

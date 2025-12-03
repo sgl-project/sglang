@@ -41,7 +41,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.nvtx_utils import nvtx_range
+from sglang.srt.nvtx_utils import nvtx_range, nvtx_annotated_method
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -369,6 +369,7 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.token_to_kv_pool.size,
         )
 
+    @nvtx_annotated_method("target_wroker.forward_batch_generation")
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
