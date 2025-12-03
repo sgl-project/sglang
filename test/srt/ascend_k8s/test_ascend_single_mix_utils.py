@@ -258,60 +258,6 @@ QWEN3_30B_A3B_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
 }
 
-QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_OTHER_ARGS = (
-    [
-        "--trust-remote-code",
-        "--nnodes",
-        "1",
-        "--node-rank",
-        "0",
-        "--tp-size",
-        "16",
-        "--dp-size",
-        "4",
-        "--mem-fraction-static",
-        "0.7",
-        "--max-running-requests",
-        "32",
-        "--attention-backend",
-        "ascend",
-        "--device",
-        "npu",
-        "--quantization",
-        "w8a8_int8",
-        "--enable-dp-attention",
-        "--cuda-graph-bs",
-        "8",
-        "--watchdog-timeout",
-        "9000",
-        "--chunked-prefill-size",
-        "32768",
-        "--max-prefill-tokens",
-        "458880",
-        "--prefill-round-robin-balance",
-        "--moe-a2a-backend",
-        "deepep",
-        "--deepep-mode",
-        "auto",
-        "--disable-radix-cache",
-        "--dtype",
-        "bfloat16",
-    ]
-)
-
-QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "8",
-    "HCCL_BUFFSIZE": "1536",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",
-    "HCCL_OP_EXPANSION_MODE": "AIV",
-    "ENABLE_ASCEND_MOE_NZ": "1",
-    "USE_DEEPEP_INT8": "1",
-    "STREAMS_PER_DEVICE": "32",
-}
-
 
 def run_command(cmd, shell=True):
     try:
