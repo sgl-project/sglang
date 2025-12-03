@@ -362,7 +362,7 @@ class MoriKVManager(CommonKVManager):
 
     def _cleanup_room_tracking(self, bootstrap_room: int) -> None:
         bootstrap_addr = self.room_to_bootstrap_addr.pop(bootstrap_room, None)
-        if bootstrap_addr is not None and hasattr(self, "addr_to_rooms_tracker"):
+        if bootstrap_addr is not None:
             rooms = self.addr_to_rooms_tracker.get(bootstrap_addr)
             if rooms is not None:
                 rooms.discard(bootstrap_room)
@@ -520,18 +520,24 @@ class MoriKVManager(CommonKVManager):
         if not src_groups:
             return []
 
-        local_offsets = [int(src_group[0]) * kv_item_len for src_group in src_groups]
-        remote_offsets = [int(dst_group[0]) * kv_item_len for dst_group in dst_groups]
-        sizes = [len(src_group) * kv_item_len for src_group in src_groups]
-        transfer_uid = self.engine.allocate_transfer_uid()
+        local_mems = [src_desc] * len(src_groups)
+        remote_mems = [dst_desc] * len(src_groups)
+        local_offsets_list = [
+            [int(src_group[0]) * kv_item_len] for src_group in src_groups
+        ]
+        remote_offsets_list = [
+            [int(dst_group[0]) * kv_item_len] for dst_group in dst_groups
+        ]
+        sizes_list = [[len(src_group) * kv_item_len] for src_group in src_groups]
+        transfer_uids = [self.engine.allocate_transfer_uid() for _ in src_groups]
 
         statuses = self.engine.batch_write(
-            [src_desc],
-            [local_offsets],
-            [dst_desc],
-            [remote_offsets],
-            [sizes],
-            [transfer_uid],
+            local_mems,
+            local_offsets_list,
+            remote_mems,
+            remote_offsets_list,
+            sizes_list,
+            transfer_uids,
         )
         return statuses
 
@@ -601,27 +607,40 @@ class MoriKVManager(CommonKVManager):
             return []
 
         limit = min(kv_indices.size, dst_indices.size)
-        local_offsets: List[int] = []
-        remote_offsets: List[int] = []
-        sizes: List[int] = []
+        if not limit:
+            return []
 
-        for i in range(limit):
-            src_page = int(kv_indices[i])
-            dst_page = int(dst_indices[i])
-            src_page_base = src_page * tp_cfg.src_item_len
-            dst_page_base = dst_page * tp_cfg.dst_item_len
-            for token_slot in range(tp_cfg.page_size):
-                local_offsets.append(
-                    src_page_base
-                    + token_slot * tp_cfg.bytes_per_token_src
-                    + tp_cfg.src_head_slice_offset
-                )
-                remote_offsets.append(
-                    dst_page_base
-                    + token_slot * tp_cfg.bytes_per_token_dst
-                    + tp_cfg.dst_head_slice_offset
-                )
-                sizes.append(tp_cfg.heads_bytes_per_token_to_send)
+        src_pages = kv_indices[:limit].astype(np.int64)
+        dst_pages = dst_indices[:limit].astype(np.int64)
+        token_slots = np.arange(tp_cfg.page_size, dtype=np.int64)
+
+        src_page_bases = src_pages * tp_cfg.src_item_len
+        dst_page_bases = dst_pages * tp_cfg.dst_item_len
+
+        src_token_offsets = token_slots * tp_cfg.bytes_per_token_src
+        dst_token_offsets = token_slots * tp_cfg.bytes_per_token_dst
+
+        local_offsets = (
+            (
+                src_page_bases[:, np.newaxis]
+                + src_token_offsets
+                + tp_cfg.src_head_slice_offset
+            )
+            .flatten()
+            .tolist()
+        )
+        remote_offsets = (
+            (
+                dst_page_bases[:, np.newaxis]
+                + dst_token_offsets
+                + tp_cfg.dst_head_slice_offset
+            )
+            .flatten()
+            .tolist()
+        )
+
+        num_transfers = limit * tp_cfg.page_size
+        sizes = [tp_cfg.heads_bytes_per_token_to_send] * num_transfers
 
         if not local_offsets:
             return []
@@ -898,7 +917,7 @@ class MoriKVSender(CommonKVSender):
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status == KVPoll.Bootstrapping:
             elapsed = time.time() - self.init_time
-            if elapsed >= getattr(self.kv_mgr, "bootstrap_timeout", 300):
+            if elapsed >= self.kv_mgr.bootstrap_timeout:
                 reason = (
                     f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
                     "waiting for decode handshake"
@@ -998,10 +1017,7 @@ class MoriKVReceiver(CommonKVReceiver):
         if self.bootstrap_room is None or self.bootstrap_infos is None:
             return
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
-        if hasattr(self.kv_mgr, "room_to_bootstrap_addr"):
-            self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = (
-                self.bootstrap_addr
-            )
+        self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
         self._register_kv_args()
 
@@ -1082,7 +1098,7 @@ class MoriKVReceiver(CommonKVReceiver):
 
         if status == KVPoll.WaitingForInput and self.init_time is not None:
             elapsed = time.time() - self.init_time
-            if elapsed >= getattr(self.kv_mgr, "waiting_timeout", 300):
+            if elapsed >= self.kv_mgr.waiting_timeout:
                 reason = f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s waiting for KV transfer"
                 self.kv_mgr.record_failure(self.bootstrap_room, reason)
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
@@ -1096,10 +1112,8 @@ class MoriKVReceiver(CommonKVReceiver):
             return
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "prefill_response_tracker"):
-            self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
-        if hasattr(self.kv_mgr, "_cleanup_room_tracking"):
-            self.kv_mgr._cleanup_room_tracking(self.bootstrap_room)
+        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        self.kv_mgr._cleanup_room_tracking(self.bootstrap_room)
 
     def failure_exception(self):
         if self.conclude_state is None:
