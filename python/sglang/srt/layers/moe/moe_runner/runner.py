@@ -15,10 +15,10 @@ from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerC
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
     from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput, DispatchOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
-    from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 
 logger = logging.getLogger(__name__)
 
