@@ -235,7 +235,7 @@ def _remap_moe_args(config: dict) -> dict:
             config[new_name] = value
 
     config["topk_method"] = None
-    config["norm_topk_prob"] = True
+    config["routing_method_type"] = 1  # RoutingMethodType.Renormalize
     config["scoring_func"] = "softmax"
 
     return config

@@ -563,7 +563,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
-
         tp_size = get_tensor_model_parallel_world_size()
         if self.block_quant:
             block_n, block_k = (
@@ -913,6 +912,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_scale = torch.nn.Parameter(
                 max_w13_scales, requires_grad=False
             )
+
             if _is_hip:
                 self.process_weights_hip_scale_padding(layer)
 
@@ -996,8 +996,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     output2_scales_scalar, requires_grad=False
                 )
             return
-
-        return
 
     def process_weights_hip_int4(self, layer: Module):
         # TODO: _use_aiter: add after triton kernel added
