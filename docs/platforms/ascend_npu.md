@@ -1,5 +1,5 @@
 
-# SGLang installation with Ascend NPUs support
+# SGLang installation with NPUs support
 
 You can install SGLang using any of the methods below. Please go through `System Settings` section to ensure the clusters are roaring at max performance. Feel free to leave an issue [here at sglang](https://github.com/sgl-project/sglang/issues) if you encounter any issues or have any problems.
 
@@ -18,7 +18,7 @@ conda activate sglang_npu
 
 #### CANN
 
-Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC1 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/softwareinst/instg/instg_0008.html?OS=openEuler&Software=cannToolKit)
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC1 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
 #### MemFabric Adaptor
 
@@ -54,23 +54,13 @@ pip install torch_npu-${PYTORCH_VERSION}.post2.dev20251120-cp311-cp311-manylinux
 
 If you are using other versions of 'torch' install 'torch_npu' from sources, check [installation guide](https://github.com/Ascend/pytorch/blob/master/README.md)
 
-#### vLLM (optional)
-
-vLLM is an optional prerequisite for some SGLang supported models. Due to limitations on 'torch==2.6.0' version it is recommended to use vLLM v0.8.5. If you are using later version of 'torch' you can use later vLLM version.
-
-```shell
-VLLM_TAG=v0.8.5
-git clone --depth 1 https://github.com/vllm-project/vllm.git --branch $VLLM_TAG
-(cd vllm && python use_existing_torch.py && VLLM_TARGET_DEVICE="empty" pip install -v -e .)
-```
-
 #### Triton on Ascend
 
 We provide our own implementation of Triton for Ascend.
 
 ```shell
-BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64.run"
-BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/${BISHENG_NAME}"
+BISHENG_NAME="Ascend-BiSheng-toolkit_aarch64_20251121.run"
+BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
 wget -O "${BISHENG_NAME}" "${BISHENG_URL}" && chmod a+x "${BISHENG_NAME}" && "./${BISHENG_NAME}" --install && rm "${BISHENG_NAME}"
 ```
 ```shell
@@ -79,7 +69,7 @@ pip install triton-ascend==3.2.0rc4
 For installation of Triton on Ascend nightly builds or from sources, follow [installation guide](https://gitcode.com/Ascend/triton-ascend/blob/master/docs/sources/getting-started/installation.md)
 
 #### SGLang Kernels NPU
-We prowide our own set of SGL kernels, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
+We provide our own set of SGL kernels, check [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md).
 
 #### DeepEP-compatible Library
 We provide a DeepEP-compatible Library as a drop-in replacement of deepseek-ai's DeepEP library, check the [installation guide](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/deep_ep/README.md).
@@ -103,7 +93,7 @@ pip install ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 # Use the last release branch
 git clone -b v0.5.5.post3 https://github.com/sgl-project/sglang.git
 cd sglang
-rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml
+mv python/pyproject_other.toml python/pyproject.toml
 pip install -e python[srt_npu]
 ```
 
