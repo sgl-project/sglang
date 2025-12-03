@@ -5,15 +5,22 @@ import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
-from typing import Any, Dict, List, Tuple, TypedDict
+from typing import Any, Dict, List, Tuple
 
 import ray
 import torch
 import triton
 import triton.language as tl
+from common_utils import (
+    BenchmarkConfig,
+    get_config_filename,
+    get_configs_compute_bound,
+    get_default_batch_sizes,
+    get_model_config,
+    sort_config,
+)
 from ray.experimental.tqdm_ray import tqdm
 from sgl_kernel import silu_and_mul
-from transformers import AutoConfig
 
 from sglang.srt.layers.moe.fused_moe_triton import override_config
 from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
@@ -31,15 +38,6 @@ from sglang.srt.utils import is_hip
 _is_hip = is_hip()
 
 
-class BenchmarkConfig(TypedDict):
-    BLOCK_SIZE_M: int
-    BLOCK_SIZE_N: int
-    BLOCK_SIZE_K: int
-    GROUP_SIZE_M: int
-    num_warps: int
-    num_stages: int
-
-
 def benchmark_config(
     config: BenchmarkConfig,
     num_tokens: int,
@@ -54,13 +52,10 @@ def benchmark_config(
     topk_ids_dir: str,
     block_shape: List[int] = None,
     num_iters: int = 100,
-    ep_size: int = 1,
 ) -> float:
     ncu_enable = os.getenv("NCU_ENABLE", "0") == "1"
     if ncu_enable:
         num_iters = 1
-    # In EP mode, each rank only handles a subset of experts
-    local_experts = num_experts // ep_size
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype)
     if use_int8_w8a16 or use_int8_w8a8:
@@ -68,7 +63,7 @@ def benchmark_config(
             -127,
             127,
             (
-                local_experts,
+                num_experts,
                 shard_intermediate_size,
                 hidden_size,
             ),
@@ -78,7 +73,7 @@ def benchmark_config(
             -127,
             127,
             (
-                local_experts,
+                num_experts,
                 hidden_size,
                 shard_intermediate_size // 2,
             ),
@@ -86,14 +81,12 @@ def benchmark_config(
         )
     else:
         w1 = torch.randn(
-            local_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
+            num_experts, shard_intermediate_size, hidden_size, dtype=init_dtype
         )
         w2 = torch.randn(
-            local_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
+            num_experts, hidden_size, shard_intermediate_size // 2, dtype=init_dtype
         )
-    gating_output = torch.randn(
-        num_iters, num_tokens, local_experts, dtype=torch.float32
-    )
+    gating_output = torch.randn(num_iters, num_tokens, num_experts, dtype=torch.float32)
 
     w1_scale = None
     w2_scale = None
@@ -101,18 +94,18 @@ def benchmark_config(
     a2_scale = None
     if use_int8_w8a16:
         w1_scale = torch.randn(
-            (local_experts, 2 * shard_intermediate_size), dtype=torch.float32
+            (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
-        w2_scale = torch.randn((hidden_size, local_experts), dtype=torch.float32)
+        w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
     if use_fp8_w8a8 or use_int8_w8a8:
         if use_int8_w8a8 and block_shape is None:
             w1_scale = torch.randn(
-                local_experts, shard_intermediate_size, dtype=torch.float32
+                num_experts, shard_intermediate_size, dtype=torch.float32
             )
-            w2_scale = torch.randn(local_experts, hidden_size, dtype=torch.float32)
+            w2_scale = torch.randn(num_experts, hidden_size, dtype=torch.float32)
         elif block_shape is None:
-            w1_scale = torch.randn(local_experts, dtype=torch.float32)
-            w2_scale = torch.randn(local_experts, dtype=torch.float32)
+            w1_scale = torch.randn(num_experts, dtype=torch.float32)
+            w2_scale = torch.randn(num_experts, dtype=torch.float32)
             a1_scale = torch.randn(1, dtype=torch.float32)
             a2_scale = torch.randn(1, dtype=torch.float32)
         else:
@@ -122,17 +115,17 @@ def benchmark_config(
             k_tiles_w1 = (hidden_size + block_k - 1) // block_k
             k_tiles_w2 = (shard_intermediate_size // 2 + block_k - 1) // block_k
             w1_scale = torch.rand(
-                (local_experts, n_tiles_w1, k_tiles_w1), dtype=torch.float32
+                (num_experts, n_tiles_w1, k_tiles_w1), dtype=torch.float32
             )
             w2_scale = torch.rand(
-                (local_experts, n_tiles_w2, k_tiles_w2), dtype=torch.float32
+                (num_experts, n_tiles_w2, k_tiles_w2), dtype=torch.float32
             )
 
     if use_fp8_w8a8:
         w1 = w1.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
         w2 = w2.to(torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn)
 
-    input_gating = torch.randn(num_tokens, local_experts, dtype=torch.float32)
+    input_gating = torch.randn(num_tokens, num_experts, dtype=torch.float32)
     topk_config = TopKConfig(
         top_k=topk,
         renormalize=True,
@@ -157,7 +150,7 @@ def benchmark_config(
         topk_weights, topk_ids, _ = topk_output
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], local_experts
+            topk_ids, config["BLOCK_SIZE_M"], num_experts
         )
         M = hidden_states.shape[0]
         E, N, _ = w1.shape
@@ -299,56 +292,6 @@ def benchmark_config(
     return avg, avg_tma, avg1, avg1_tma
 
 
-def get_rocm_configs_compute_bound() -> List[Dict[str, int]]:
-    configs: List[BenchmarkConfig] = []
-    waves_per_eu_range = 0
-    for block_m in [32, 64, 128, 256]:
-        for block_k in [32, 64, 128, 256]:
-            for block_n in [16, 32, 64, 128, 256]:
-                for num_stages in [2]:
-                    for num_warps in [1, 2, 4, 8]:
-                        for group_size in [1, 4, 8, 16, 32]:
-                            configs.append(
-                                {
-                                    "BLOCK_SIZE_M": block_m,
-                                    "BLOCK_SIZE_N": block_n,
-                                    "BLOCK_SIZE_K": block_k,
-                                    "GROUP_SIZE_M": group_size,
-                                    "num_warps": num_warps,
-                                    "num_stages": num_stages,
-                                    "waves_per_eu": waves_per_eu_range,
-                                }
-                            )
-    return configs
-
-
-def get_configs_compute_bound() -> List[Dict[str, int]]:
-    # Reduced search space for faster tuning.
-    # TODO(woosuk): Increase the search space and use a performance model to
-    # prune the search space.
-    configs: List[BenchmarkConfig] = []
-    if _is_hip:
-        configs = get_rocm_configs_compute_bound()
-    else:
-        for block_m in [16, 32, 64, 128, 256]:
-            for block_k in [32, 64, 128, 256]:
-                for block_n in [32, 64, 128, 256]:
-                    for num_stages in [2, 3, 4, 5]:
-                        for num_warps in [4, 8]:
-                            for group_size in [1, 16, 32, 64]:
-                                configs.append(
-                                    {
-                                        "BLOCK_SIZE_M": block_m,
-                                        "BLOCK_SIZE_N": block_n,
-                                        "BLOCK_SIZE_K": block_k,
-                                        "GROUP_SIZE_M": group_size,
-                                        "num_warps": num_warps,
-                                        "num_stages": num_stages,
-                                    }
-                                )
-    return configs
-
-
 class BestConfigTrace:
     def __init__(self, name):
         self.name = name
@@ -404,7 +347,6 @@ class BenchmarkWorker:
         block_shape: List[int],
         cfg: Dict[str, int],
         topk_ids_dir: str,
-        ep_size: int = 1,
     ) -> Tuple[Dict[str, int], float]:
         torch.cuda.manual_seed_all(0)
         dtype_str = get_config_dtype_str(
@@ -428,7 +370,6 @@ class BenchmarkWorker:
                 use_int8_w8a16,
                 topk_ids_dir,
                 block_shape,
-                ep_size=ep_size,
             )
         return cfg, kernel_time
 
@@ -446,7 +387,6 @@ class BenchmarkWorker:
         block_shape: List[int],
         search_space: List[Dict[str, int]],
         topk_ids_dir: str,
-        ep_size: int = 1,
     ) -> Dict[str, int]:
         trace0 = BestConfigTrace("kernel0")
         trace1 = BestConfigTrace("kernel1")
@@ -469,7 +409,6 @@ class BenchmarkWorker:
                         topk_ids_dir,
                         block_shape,
                         num_iters=10,
-                        ep_size=ep_size,
                     )
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
@@ -518,22 +457,7 @@ class BenchmarkWorker:
         )
 
 
-def sort_config(config: BenchmarkConfig) -> BenchmarkConfig:
-    return {
-        "BLOCK_SIZE_M": config["BLOCK_SIZE_M"],
-        "BLOCK_SIZE_N": config["BLOCK_SIZE_N"],
-        "BLOCK_SIZE_K": config["BLOCK_SIZE_K"],
-        "GROUP_SIZE_M": config["GROUP_SIZE_M"],
-        "num_warps": config["num_warps"],
-        "num_stages": config["num_stages"],
-        **(
-            {"waves_per_eu": config["waves_per_eu"]} if "waves_per_eu" in config else {}
-        ),
-        **({"USE_TMA": config["USE_TMA"]} if "USE_TMA" in config else {}),
-    }
-
-
-def save_configs(
+def save_configs_sep(
     configs: Dict[int, BenchmarkConfig],
     num_experts: int,
     shard_intermediate_size: int,
@@ -545,7 +469,6 @@ def save_configs(
     use_int8_w8a16: bool,
     block_shape: List[int],
     down_moe: bool = False,
-    ep_size: int = 1,
 ) -> None:
     dtype_str = get_config_dtype_str(
         dtype,
@@ -556,10 +479,8 @@ def save_configs(
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
-    # For EP mode, use local expert count instead of total expert count
-    local_experts = num_experts // ep_size
     filename = get_config_file_name(
-        local_experts,
+        num_experts,
         shard_intermediate_size // 2,
         dtype_str,
         block_shape,
@@ -575,148 +496,28 @@ def save_configs(
 def main(args: argparse.Namespace):
     print(args)
 
-    # Check EP mode constraint: tp_size must be 1 when ep_size > 1
-    if args.ep_size > 1 and args.tp_size != 1:
-        raise ValueError(
-            f"When using Expert Parallelism (ep_size={args.ep_size}), "
-            f"tp_size must be set to 1, but got tp_size={args.tp_size}. "
-            f"Please set --tp-size 1 when using --ep-size > 1."
-        )
+    model_config = get_model_config(
+        args.model,
+        args.tp_size,
+        args.ep_size,
+        args.disable_shared_experts_fusion,
+        args.topk_ids_dir,
+    )
 
-    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-    if config.architectures[0] == "DbrxForCausalLM":
-        E = config.ffn_config.moe_num_experts
-        topk = config.ffn_config.moe_top_k
-        intermediate_size = config.ffn_config.ffn_hidden_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
-    elif config.architectures[0] == "JambaForCausalLM":
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
-    elif config.architectures[0] in ["Qwen2MoeForCausalLM", "Qwen3MoeForCausalLM"]:
-        E = config.num_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
-    elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
-        E = (
-            config.n_routed_experts + (0 if args.disable_shared_experts_fusion else 1)
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.n_routed_experts
-        )
-        topk = (
-            config.num_experts_per_tok
-            + (0 if args.disable_shared_experts_fusion else 1)
-            if config.architectures[0] in ["DeepseekV3ForCausalLM"]
-            else config.num_experts_per_tok
-        )
-        intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
-    elif config.architectures[0] == "Llama4ForConditionalGeneration":
-        E = config.text_config.num_local_experts + (
-            0 if args.disable_shared_experts_fusion else 1
-        )
-        topk = config.text_config.num_experts_per_tok
-        intermediate_size = config.text_config.intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
-    elif config.architectures[0] in [
-        "Grok1ForCausalLM",
-        "Grok1ImgGen",
-        "Grok1AForCausalLM",
-    ]:
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
-    elif config.architectures[0] in ["Glm4MoeForCausalLM"]:
-        E = config.n_routed_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.moe_intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
-    else:
-        # Default: Mixtral
-        E = config.num_local_experts
-        topk = config.num_experts_per_tok
-        intermediate_size = config.intermediate_size
-        # In EP mode, use original intermediate_size; otherwise apply TP sharding
-        shard_intermediate_size = (
-            intermediate_size
-            if args.ep_size > 1
-            else 2 * intermediate_size // args.tp_size
-        )
+    E = model_config["num_experts"]
+    topk = model_config["topk"]
+    hidden_size = model_config["hidden_size"]
+    shard_intermediate_size = model_config["shard_intermediate_size"]
+    dtype = model_config["dtype"]
+    block_shape = model_config["block_shape"]
 
-    hidden_size = getattr(config, "hidden_size", None) or config.text_config.hidden_size
-    dtype = config.torch_dtype
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
-    block_shape = None
-    if (
-        hasattr(config, "quantization_config")
-        and "weight_block_size" in config.quantization_config
-    ):
-        block_shape = config.quantization_config["weight_block_size"]
-        assert len(block_shape) == 2
 
     topk_ids_dir = args.topk_ids_dir
     if args.batch_size is None:
-        batch_sizes = [
-            1,
-            2,
-            4,
-            8,
-            16,
-            24,
-            32,
-            48,
-            64,
-            96,
-            128,
-            256,
-            512,
-            1024,
-            1536,
-            2048,
-            3072,
-            4096,
-            8192,
-        ]
+        batch_sizes = get_default_batch_sizes()
         batch_sizes.reverse()
     else:
         batch_sizes = [args.batch_size]
@@ -737,7 +538,6 @@ def main(args: argparse.Namespace):
                 block_shape,
                 search_space,
                 topk_ids_dir,
-                args.ep_size,
             )
         else:
             cfg = {
@@ -762,7 +562,6 @@ def main(args: argparse.Namespace):
                 block_shape,
                 cfg,
                 topk_ids_dir,
-                args.ep_size,
             )
             print(f"{t0=}, {t0_tma=}, {t1=}, {t1_tma=}")
         return
@@ -793,7 +592,21 @@ def main(args: argparse.Namespace):
         search_space = [
             config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
         ]
-    print(f"Start tuning over {len(search_space)} configurations...")
+    filename = get_config_filename(
+        E,
+        shard_intermediate_size,
+        hidden_size,
+        topk,
+        dtype,
+        use_fp8_w8a8,
+        use_int8_w8a8,
+        use_int8_w8a16,
+        False,
+        block_shape,
+    )
+    print(
+        f"Start tuning over {len(search_space)} configurations to create {filename}..."
+    )
 
     start = time.perf_counter()
     configs = _distribute(
@@ -812,7 +625,6 @@ def main(args: argparse.Namespace):
                 block_shape,
                 search_space,
                 topk_ids_dir,
-                args.ep_size,
             )
             for batch_size in batch_sizes
         ],
@@ -827,7 +639,7 @@ def main(args: argparse.Namespace):
     configs0.reverse()
     configs1.reverse()
     best_configs0 = {M: sort_config(config) for M, config in zip(batch_sizes, configs0)}
-    save_configs(
+    save_configs_sep(
         best_configs0,
         E,
         shard_intermediate_size,
@@ -838,11 +650,10 @@ def main(args: argparse.Namespace):
         use_int8_w8a8,
         use_int8_w8a16,
         block_shape,
-        ep_size=args.ep_size,
     )
 
     best_configs1 = {M: sort_config(config) for M, config in zip(batch_sizes, configs1)}
-    save_configs(
+    save_configs_sep(
         best_configs1,
         E,
         shard_intermediate_size,
@@ -854,7 +665,6 @@ def main(args: argparse.Namespace):
         use_int8_w8a16,
         block_shape,
         down_moe=True,
-        ep_size=args.ep_size,
     )
     end = time.perf_counter()
     print(f"Tuning took {end - start:.2f} seconds")
@@ -865,7 +675,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
-    parser.add_argument("--tp-size", "--tp", type=int, default=1)
+    parser.add_argument("--tp-size", "--tp", type=int, default=2)
+    parser.add_argument("--ep-size", "--ep", type=int, default=1)
     parser.add_argument(
         "--dtype",
         type=str,
@@ -878,9 +689,6 @@ if __name__ == "__main__":
     parser.add_argument("--disable-shared-experts-fusion", action="store_true")
     parser.add_argument("--configs", type=int, nargs="+", required=False)
     parser.add_argument("--topk-ids-dir", type=str, required=True)
-    parser.add_argument(
-        "--ep-size", "--ep", type=int, default=1, help="Expert parallelism size"
-    )
     args = parser.parse_args()
 
     main(args)

@@ -1,6 +1,6 @@
 //! Step3 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{Step3Parser, ToolParser};
+use sgl_model_gateway::tool_parser::{Step3Parser, ToolParser};
 
 mod common;
 use common::create_test_tools;

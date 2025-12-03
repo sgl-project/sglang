@@ -175,15 +175,15 @@ impl ResponseStorage for NoOpResponseStorage {
         Ok(ResponseChain::new())
     }
 
-    async fn list_user_responses(
+    async fn list_identifier_responses(
         &self,
-        _user: &str,
+        _identifier: &str,
         _limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
         Ok(Vec::new())
     }
 
-    async fn delete_user_responses(&self, _user: &str) -> ResponseResult<usize> {
+    async fn delete_identifier_responses(&self, _identifier: &str) -> ResponseResult<usize> {
         Ok(0)
     }
 }

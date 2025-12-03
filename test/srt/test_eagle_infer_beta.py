@@ -4,7 +4,8 @@ from types import SimpleNamespace
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.kit_matched_stop import MatchedStopMixin
+from sglang.test.kits.matched_stop_kit import MatchedStopMixin
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -65,6 +66,10 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
+    def test_radix_attention(self):
+        run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
+
     def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=5,
@@ -80,6 +85,11 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         self.assertGreater(
             metrics["accuracy"], 0.23
         )  # 0.3333 for 60 questions; 0.234 for 1319 questions
+        assert self.process.poll() is None
+
+
+class TestEagleServerPage(TestEagleServerBase):
+    other_launch_args = ["--page-size", "64"]
 
 
 if __name__ == "__main__":

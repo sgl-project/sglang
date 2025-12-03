@@ -38,11 +38,9 @@ pub(super) fn build_stored_response(
         .map(|s| s.to_string())
         .or_else(|| Some(original_body.model.clone()));
 
-    stored_response.user = response_json
-        .get("user")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| original_body.user.clone());
+    if let Some(safety_identifier) = original_body.user.clone() {
+        stored_response.safety_identifier = Some(safety_identifier);
+    }
 
     // Set conversation id from request if provided
     if let Some(conv_id) = original_body.conversation.clone() {
@@ -146,9 +144,16 @@ pub(super) fn patch_streaming_response_json(
             );
         }
 
-        if obj.get("user").map(|v| v.is_null()).unwrap_or(false) {
-            if let Some(user) = &original_body.user {
-                obj.insert("user".to_string(), Value::String(user.clone()));
+        if obj
+            .get("safety_identifier")
+            .map(|v| v.is_null())
+            .unwrap_or(false)
+        {
+            if let Some(safety_identifier) = &original_body.user {
+                obj.insert(
+                    "safety_identifier".to_string(),
+                    Value::String(safety_identifier.clone()),
+                );
             }
         }
 

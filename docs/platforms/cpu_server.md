@@ -89,7 +89,7 @@ cp pyproject_cpu.toml pyproject.toml
 pip install --upgrade pip setuptools
 conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
 pip install .
-pip install torch==2.7.1 torchvision==0.22.1 triton==3.3.1 --force-reinstall
+pip install torch==2.9.0 torchvision==0.24.0 triton==3.5.0 --force-reinstall
 
 # Build the CPU backend kernels
 cd ../sgl-kernel
@@ -173,7 +173,7 @@ python -m sglang.bench_serving -h
 ```
 
 Additionally, the requests can be formed with
-[OpenAI Completions API](https://docs.sglang.ai/basic_usage/openai_api_completions.html)
+[OpenAI Completions API](https://docs.sglang.io/basic_usage/openai_api_completions.html)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
 ## Example: Running DeepSeek-V3.1-Terminus

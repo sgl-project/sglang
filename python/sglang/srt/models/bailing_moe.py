@@ -420,14 +420,21 @@ class BailingMoEAttention(nn.Module):
         attn_tp_size = get_attention_tp_size()
 
         assert self.total_num_heads % attn_tp_size == 0
-        assert self.total_kv_heads % attn_tp_size == 0
+        if self.total_kv_heads >= attn_tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_kv_heads % attn_tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert attn_tp_size % self.total_kv_heads == 0
         assert self.total_num_heads >= self.total_kv_heads
 
         self.num_heads = self.total_num_heads // attn_tp_size
         self.head_dim = config.head_dim or (self.hidden_size // self.total_num_heads)
         self.q_size = self.head_dim * self.num_heads
 
-        self.num_kv_heads = self.total_kv_heads // attn_tp_size
+        self.num_kv_heads = max(1, self.total_kv_heads // attn_tp_size)
         self.kv_size = max(1, self.num_kv_heads * self.head_dim)
 
         self.scale = self.head_dim**-0.5

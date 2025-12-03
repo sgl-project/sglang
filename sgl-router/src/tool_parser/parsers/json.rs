@@ -39,6 +39,12 @@ pub struct JsonParser {
 
     /// Separator between multiple tool calls
     tool_call_separator: &'static str,
+
+    /// Track whether we're parsing array format `[...]` vs single object `{...}`
+    is_array_format: bool,
+
+    /// Track whether we've already stripped the closing ] bracket (for array format)
+    array_closed: bool,
 }
 
 impl JsonParser {
@@ -52,6 +58,8 @@ impl JsonParser {
             current_tool_name_sent: false,
             streamed_args_for_tool: Vec::new(),
             tool_call_separator: ",",
+            is_array_format: false,
+            array_closed: false,
         }
     }
 
@@ -211,13 +219,30 @@ impl ToolParser for JsonParser {
         self.buffer.push_str(chunk);
         let current_text = &self.buffer.clone();
 
+        // Determine format on first parse (array vs single object)
+        if self.current_tool_id == -1 && self.has_tool_markers(current_text) {
+            self.is_array_format = current_text.trim().starts_with('[');
+        }
+
         // Check if current_text has tool_call
-        let has_tool_start = self.has_tool_markers(current_text)
-            || (self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator));
+        // Once array is closed, don't treat [ or { as tool markers
+        let has_tool_start = (!self.array_closed && self.has_tool_markers(current_text))
+            || (self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator));
 
         if !has_tool_start {
-            let normal_text = self.buffer.clone();
+            let mut normal_text = self.buffer.clone();
             self.buffer.clear();
+
+            // Strip ] only once (the closing bracket of JSON array format)
+            // Only for array format and only if we haven't already closed it
+            if self.is_array_format
+                && !self.array_closed
+                && self.current_tool_id > 0
+                && normal_text.starts_with("]")
+            {
+                normal_text = normal_text.strip_prefix("]").unwrap().to_string();
+                self.array_closed = true;
+            }
 
             return Ok(StreamingParseResult {
                 normal_text,
@@ -233,12 +258,12 @@ impl ToolParser for JsonParser {
         let start_idx = if let Some(bracket_pos) = current_text.find('[') {
             let brace_pos = current_text.find('{');
             match brace_pos {
-                Some(bp) if bp < bracket_pos => bp,
+                Some(bp) => bp,
                 _ => bracket_pos,
             }
         } else if let Some(brace_pos) = current_text.find('{') {
             brace_pos
-        } else if self.current_tool_id >= 0 && current_text.starts_with(self.tool_call_separator) {
+        } else if self.current_tool_id > 0 && current_text.starts_with(self.tool_call_separator) {
             self.tool_call_separator.len()
         } else {
             0
@@ -274,5 +299,7 @@ impl ToolParser for JsonParser {
             &mut self.current_tool_name_sent,
             &mut self.streamed_args_for_tool,
         );
+        self.is_array_format = false;
+        self.array_closed = false;
     }
 }
