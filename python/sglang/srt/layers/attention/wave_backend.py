@@ -394,10 +394,8 @@ class WaveAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        prefix_lens: Optional[torch.Tensor],
     ):
         assert encoder_lens is None, "Not supported"
-        assert prefix_lens is None, "DLLM extend is not supported"
 
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -481,9 +479,7 @@ class WaveAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
     ):
-        assert prefix_lens is None, "DLLM extend is not supported"
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
             # Update kv_indptr, kv_indices

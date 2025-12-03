@@ -504,11 +504,8 @@ class TritonAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        prefix_lens: Optional[torch.Tensor],
     ):
         assert encoder_lens is None, "Not supported"
-        assert prefix_lens is None, "DLLM extend is not supported"
-
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
         window_num_kv_splits = None
@@ -664,9 +661,7 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
     ):
-        assert prefix_lens is None, "DLLM extend is not supported"
         # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
             # Update kv_indptr, kv_indices

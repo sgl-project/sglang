@@ -538,10 +538,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[None],
-        prefix_lens: Optional[torch.Tensor],
     ):
-        assert prefix_lens is None, "DLLM extend is not supported"
-
         metadata = DualChunkFlashAttentionMetadata()
 
         if forward_mode.is_decode_or_idle():
@@ -590,12 +587,10 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[None],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         assert forward_mode.is_decode()
-        assert prefix_lens is None, "DLLM extend is not supported"
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
         metadata = self.decode_metadata[bs]

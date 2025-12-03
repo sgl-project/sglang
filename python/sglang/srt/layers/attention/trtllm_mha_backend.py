@@ -200,13 +200,10 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        prefix_lens: Optional[torch.Tensor],
     ):
         """Initialize metadata for CUDA graph capture."""
         metadata = TRTLLMMHAMetadata()
         device = seq_lens.device
-
-        assert prefix_lens is None, "DLLM extend is not supported"
 
         if forward_mode.is_decode_or_idle():
             if spec_info is not None:
@@ -317,10 +314,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
     ):
         """Replay CUDA graph with new inputs."""
-        assert prefix_lens is None, "DLLM extend is not supported"
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]

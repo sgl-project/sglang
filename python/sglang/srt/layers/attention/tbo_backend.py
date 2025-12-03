@@ -47,10 +47,7 @@ class TboAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: "ForwardMode",
         spec_info: Optional[SpecInput],
-        prefix_lens: Optional[torch.Tensor],
     ):
-        assert prefix_lens is None, "DLLM extend is not supported"
-
         self.primary.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             num_tokens=num_tokens,
@@ -82,10 +79,7 @@ class TboAttnBackend(AttentionBackend):
         forward_mode: "ForwardMode",
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
     ):
-        assert prefix_lens is None, "DLLM extend is not supported"
-
         self.primary.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,

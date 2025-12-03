@@ -1551,12 +1551,9 @@ class FlashAttentionBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        prefix_lens: Optional[torch.Tensor],
     ):
         """Initialize forward metadata for capturing CUDA graph."""
         metadata = FlashAttentionMetadata()
-
-        assert prefix_lens is None, "DLLM extend is not supported"
 
         # metadata_expand is needed for Spec Decoding when top k > 1
         metadata_expand = FlashAttentionMetadata()
@@ -1790,11 +1787,9 @@ class FlashAttentionBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
-        assert prefix_lens is None, "DLLM extend is not supported"
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]

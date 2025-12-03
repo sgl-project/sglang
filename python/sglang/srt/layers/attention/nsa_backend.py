@@ -579,14 +579,10 @@ class NativeSparseAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        prefix_lens: Optional[torch.Tensor],
     ):
         self.set_nsa_prefill_impl(forward_batch=None)
 
         """Initialize forward metadata for capturing CUDA graph."""
-
-        assert prefix_lens is None, "DLLM extend is not supported"
-
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -713,12 +709,10 @@ class NativeSparseAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         assert seq_lens_cpu is not None
-        assert prefix_lens is None, "DLLM extend is not supported"
 
         self.set_nsa_prefill_impl(forward_batch=None)
 

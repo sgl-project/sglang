@@ -25,7 +25,6 @@ class GraphInputBuffers:
     global_num_tokens_for_logprob_gpu: torch.Tensor
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
-    prefix_lens: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -45,7 +44,6 @@ class GraphInputBuffers:
         encoder_len_fill_value: int,
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
-        is_dllm: bool,
     ) -> "GraphInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -80,11 +78,6 @@ class GraphInputBuffers:
             else:
                 encoder_lens = None
 
-            if is_dllm:
-                prefix_lens = torch.zeros((max_bs,), dtype=torch.int32)
-            else:
-                prefix_lens = None
-
             if require_mlp_tp_gather:
                 global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros(
@@ -118,7 +111,6 @@ class GraphInputBuffers:
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
-            prefix_lens=prefix_lens,
         )
 
     def populate_from_forward_batch(
@@ -147,10 +139,6 @@ class GraphInputBuffers:
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
-
-        if self.prefix_lens is not None:
-            self.prefix_lens[:bs].copy_(self.seq_lens[:bs])
-            self.prefix_lens[:bs] -= num_tokens_per_bs
 
         seq_lens_cpu: Optional[torch.Tensor] = None
         if forward_batch.seq_lens_cpu is not None:

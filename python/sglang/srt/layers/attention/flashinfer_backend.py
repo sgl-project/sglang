@@ -126,7 +126,9 @@ class FlashInferAttnBackend(AttentionBackend):
             model_runner.server_args.multi_item_scoring_delimiter
         )
 
+        # FIXME: remove dllm workarounds from flashinfer
         self.is_dllm_model = model_runner.server_args.dllm_algorithm is not None
+        self.dllm_block_size = model_runner.server_args.dllm_block_size
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -540,7 +542,6 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        prefix_lens: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -657,7 +658,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
-                prefix_lens=prefix_lens,
+                prefix_lens=seq_lens - self.dllm_block_size,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=True,
                 encoder_lens=encoder_lens,
@@ -678,7 +679,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -722,7 +722,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=prefix_lens,
+                prefix_lens=seq_lens - self.dllm_block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,

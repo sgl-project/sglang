@@ -339,7 +339,6 @@ class CudaGraphRunner:
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
-            is_dllm=self.is_dllm,
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -561,7 +560,6 @@ class CudaGraphRunner:
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         buffers.num_token_non_padded[...] = num_tokens
-        prefix_lens = buffers.prefix_lens[:bs] if self.is_dllm else None
 
         # pipeline parallelism
         if self.pp_size > 1:
@@ -666,7 +664,6 @@ class CudaGraphRunner:
             encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
-            prefix_lens,
         )
 
         # Run and capture
@@ -810,7 +807,6 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
-            prefix_lens=buffers.prefix_lens[:bs] if self.is_dllm else None,
         )
 
         # Store fields

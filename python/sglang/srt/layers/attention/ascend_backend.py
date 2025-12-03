@@ -299,10 +299,7 @@ class AscendAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
-        prefix_lens: Optional[torch.Tensor],
     ):
-        assert prefix_lens is None, "DLLM extend is not supported"
-
         metadata = ForwardMetadata()
 
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
@@ -343,10 +340,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        prefix_lens: Optional[torch.Tensor],
     ):
-        assert prefix_lens is None, "DLLM extend is not supported"
-
         metadata = self.graph_metadata[bs]
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify():
