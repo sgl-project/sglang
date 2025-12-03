@@ -47,7 +47,10 @@ router = APIRouter(prefix="/v1/videos", tags=["videos"])
 def _build_sampling_params_from_request(
     request_id: str, request: VideoGenerationsRequest
 ) -> SamplingParams:
-    width, height = _parse_size(request.size or "720x1280")
+    if request.size is None:
+        width, height = None, None
+    else:
+        width, height = _parse_size(request.size)
     seconds = request.seconds if request.seconds is not None else 4
     # Prefer user-provided fps/num_frames from request; fallback to defaults
     fps_default = 24

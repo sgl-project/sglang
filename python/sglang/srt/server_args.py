@@ -963,7 +963,12 @@ class ServerArgs:
                             f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
                         )
                     else:
-                        self.dp_size = self.tp_size
+                        # Pure TP and partial DP Attention mode is active for NSA, logging a warning
+                        if self.dp_size < self.tp_size:
+                            logger.warning(
+                                f"NSA with TP mode is active, dp_size={self.dp_size}, tp_size={self.tp_size}, "
+                                f"attn_tp_size={self.tp_size}, attention weights will be sharded across {self.tp_size} ranks."
+                            )
 
                     self.page_size = 64
                     logger.warning("Setting page size to 64 for DeepSeek NSA.")
@@ -1189,6 +1194,23 @@ class ServerArgs:
                 f"Disabling Radix Cache for {model_arch} as it is not yet supported."
             )
             self.disable_radix_cache = True
+        elif model_arch in ["NemotronHForCausalLM"]:
+            if self.model_config.quantization in [
+                "modelopt",
+                "modelopt_fp8",
+                "modelopt_fp4",
+            ]:
+                assert self.model_config.hf_config.mlp_hidden_act == "relu2"
+                if self.model_config.quantization == "modelopt":
+                    self.quantization = (
+                        "modelopt_fp4"
+                        if self.model_config.hf_config.quantization_config["quant_algo"]
+                        == "NVFP4"
+                        else "modelopt_fp8"
+                    )
+                else:
+                    self.quantization = self.model_config.quantization
+                self.moe_runner_backend = "flashinfer_cutlass"
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -1486,9 +1508,11 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
-            assert (
-                self.quantization == "modelopt_fp4" or self.quantization is None
-            ), "modelopt_fp4 quantization or bf16 is required for Flashinfer Cutlass MOE"
+            assert self.quantization in [
+                "modelopt_fp4",
+                "modelopt_fp8",
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,

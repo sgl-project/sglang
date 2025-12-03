@@ -7,10 +7,11 @@ ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
 
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
+ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.18.post1
-ARG SGL_VERSION=0.5.5.post3
+ARG SGL_KERNEL_VERSION=0.3.18.post2
+ARG SGL_VERSION=0.5.6
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
@@ -149,6 +150,12 @@ RUN set -eux; \
       git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
       sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
       cd .. ; \
+    elif [ "$HOPPER_SBO" = "1" ]; then \
+      git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
+      cd DeepEP && \
+      git checkout ${HOPPER_SBO_DEEPEP_COMMIT} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
     else \
       wget -q https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
       unzip ${DEEPEP_COMMIT}.zip && rm ${DEEPEP_COMMIT}.zip && mv DeepEP-${DEEPEP_COMMIT} DeepEP && cd DeepEP && \
@@ -175,10 +182,6 @@ RUN --mount=type=cache,target=/root/.cache/pip cd /sgl-workspace/DeepEP && \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
-# In order to use flashinfer_cutedsl without IMA for WideEP configs we must install
-# latest flashinfer_cutedsl. Once 0.4.3 is officially released, remove this
-RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --upgrade --pre "nvidia-cutlass-dsl==4.3.0.dev0" --extra-index-url https://pypi.org/simple/
-
 # Python tools
 RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
     datamodel_code_generator \
@@ -196,15 +199,18 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
 
 # Some patching packages
 # TODO: Remove this when torch version covers these packages
+# Move cutlass-dsl to pyproject.toml after drivers on CI runners are updated
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
     python3 -m pip install nvidia-nvshmem-cu12==${NVSHMEM_VERSION} --force-reinstall --no-deps; \
+    python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 ; \
     python3 -m pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} --force-reinstall --no-deps; \
+    python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps; \
 fi
 
 # Install development tools and utilities
@@ -230,6 +236,7 @@ RUN --mount=type=cache,target=/var/cache/apt apt-get update && apt-get install -
     bear \
     ccache \
     less \
+    gnuplot \
     && apt install -y rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
@@ -258,7 +265,8 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install --break-sy
     pre-commit \
     pandas \
     matplotlib \
-    tabulate
+    tabulate \
+    termplotlib
 
 # Install diff-so-fancy
 RUN curl -LSso /usr/local/bin/diff-so-fancy https://${GITHUB_ARTIFACTORY}/so-fancy/diff-so-fancy/releases/download/v1.4.4/diff-so-fancy \
@@ -294,7 +302,7 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
-    && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
+    && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc /root/.zshenv 2>/dev/null || true
 
 
 # Add yank script

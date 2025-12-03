@@ -1,6 +1,6 @@
 //! DeepSeek V3 Parser Integration Tests
 
-use sglang_router_rs::tool_parser::{DeepSeekParser, ToolParser};
+use sgl_model_gateway::tool_parser::{DeepSeekParser, ToolParser};
 
 mod common;
 use common::create_test_tools;

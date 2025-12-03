@@ -2,7 +2,7 @@
 //!
 //! Tests for the Llama parser which handles <|python_tag|> format and plain JSON
 
-use sglang_router_rs::tool_parser::{LlamaParser, ToolParser};
+use sgl_model_gateway::tool_parser::{LlamaParser, ToolParser};
 
 mod common;
 use common::{create_test_tools, streaming_helpers::*};
