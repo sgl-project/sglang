@@ -2040,9 +2040,15 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     "Transfer engine is not initialized for remote instance "
                     "model loader with `transfer_engine` backend. "
                 )
+            logger.info(
+                "TransferEngine registering memory regions (this may take a few seconds)..."
+            )
             # register memory region
             self.remote_instance_transfer_engine_weight_info = register_memory_region(
                 model, load_config.remote_instance_weight_loader_transfer_engine
+            )
+            logger.info(
+                "TransferEngine memory regions have been successfully registered."
             )
 
             # transfer weights
