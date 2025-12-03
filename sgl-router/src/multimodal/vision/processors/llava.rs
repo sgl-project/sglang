@@ -674,8 +674,8 @@ fn resize_and_pad_image(image: &DynamicImage, target: (u32, u32)) -> DynamicImag
     );
 
     let mut new_image = DynamicImage::new_rgb8(target_width, target_height);
-    let paste_x = ((target_width - new_width) as f32 / 2.0).ceil() as i64;
-    let paste_y = ((target_height - new_height) as f32 / 2.0).ceil() as i64;
+    let paste_x = (target_width - new_width) as i64 / 2;
+    let paste_y = (target_height - new_height) as i64 / 2;
 
     image::imageops::overlay(&mut new_image, &resized, paste_x, paste_y);
     new_image
