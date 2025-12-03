@@ -11,7 +11,7 @@ register_npu_ci(
     est_time=400,
     suite="nightly-1-npu-a3",
     nightly=True,
-    disabled="cross encoder scores are not all close"
+    disabled="cross encoder scores are not all close",
 )
 
 MODELS = [

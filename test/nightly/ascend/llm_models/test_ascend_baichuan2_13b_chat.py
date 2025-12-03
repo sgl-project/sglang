@@ -9,7 +9,7 @@ register_npu_ci(
     est_time=400,
     suite="nightly-1-npu-a3",
     nightly=True,
-    disabled="The accuracy test result is 0."
+    disabled="The accuracy test result is 0.",
 )
 
 

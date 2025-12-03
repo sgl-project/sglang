@@ -23,4 +23,4 @@ get_sha() {
 }
 get_sha "sglang" "$SGLANG_URL" "$SGLANG_BRANCH"
 get_sha "sgl-kernel" "$SGL_KERNEL_URL" "$SGL_KERNEL_BRANCH"
-chmod 755 scripts/ci/npu_log_print.sh
+chmod +x scripts/ci/npu_log_print.sh
