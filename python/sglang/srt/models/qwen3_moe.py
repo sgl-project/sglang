@@ -456,8 +456,6 @@ class Qwen3MoeAttention(nn.Module):
                 ),
             )
         inner_state = q, k, v, forward_batch
-        
-
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
