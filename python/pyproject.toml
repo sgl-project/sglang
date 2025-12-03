@@ -28,6 +28,7 @@ dependencies = [
   "fastapi",
   "flashinfer_python==0.5.3", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.5.3",
+  "ftfy",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
@@ -53,6 +54,7 @@ dependencies = [
   "nvidia-ml-py",
   "python-multipart",
   "pyzmq>=25.1.2",
+  "regex",
   "requests",
   "scipy",
   "sentencepiece",
@@ -64,7 +66,7 @@ dependencies = [
   "torch_memory_saver==0.0.9",
   "torch==2.9.1",
   "torchcodec==0.7.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
-  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine == 'armv7l')",
+  "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' and platform_machine != 'armv7l')",
   "torchaudio==2.9.1",
   "torchvision",
   "torchao==0.9.0",
