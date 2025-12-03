@@ -264,7 +264,7 @@ class SchedulerOutputProcessorMixin:
         assert result.accept_lens.is_cpu
         assert result.allocate_lens.is_cpu
 
-        next_token_ids = result.next_token_ids_backup.tolist() if self.enable_mtp else result.next_token_ids.tolist()
+        next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
 

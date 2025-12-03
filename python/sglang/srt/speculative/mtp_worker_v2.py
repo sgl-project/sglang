@@ -183,7 +183,7 @@ class MTPDraftWorker(BaseDraftWorker):
 
         if self.server_args.disable_cuda_graph:
             return
-        
+
         self.cuda_graph_runner_for_draft_extend = MTPMultiStepDraftExtendCudaGraphRunner(self)
 
     def reset_cuda_graph_buffers(self, forward_batch, batch_result):
@@ -480,7 +480,7 @@ class MTPDraftWorker(BaseDraftWorker):
         # draft_logits_output.hidden_states = draft_logits_output.hidden_states[
         #     select_index
         # ]
-        batch_result.next_token_ids_backup = next_token_ids_backup
+        batch_result.next_token_ids = next_token_ids_backup
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
         (

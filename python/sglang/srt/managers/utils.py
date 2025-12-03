@@ -26,7 +26,6 @@ class GenerationBatchResult:
     next_token_ids: Optional[torch.Tensor] = None
     num_accepted_tokens: Optional[int] = None
     can_run_cuda_graph: bool = False
-    next_token_ids_backup: Optional[torch.Tensor] = None
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
