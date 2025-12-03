@@ -42,6 +42,8 @@ class TestStressDeepSeekV3(unittest.TestCase):
                     "--tp",
                     "8",
                     "--trust-remote-code",
+                    "--mem-fraction-static",
+                    "0.95",
                 ],
             )
 

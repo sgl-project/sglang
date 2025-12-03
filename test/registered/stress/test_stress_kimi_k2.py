@@ -46,6 +46,8 @@ class TestStressKimiK2(unittest.TestCase):
                     "kimi_k2",
                     "--reasoning-parser",
                     "kimi_k2",
+                    "--mem-fraction-static",
+                    "0.95",
                 ],
             )
 
