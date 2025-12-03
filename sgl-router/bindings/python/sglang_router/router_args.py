@@ -713,14 +713,14 @@ class RouterArgs:
                     f"and --decode-policy '{self.decode_policy}' for decode nodes."
                 )
 
-        # Support `- --selector\n- a=b c=d` case
-        if len(self.selector) == 1 and isinstance(self.selector, list) and (" " in self.selector[0]):
-            self.selector = self.selector[0].split(" ")
-
     @staticmethod
     def _parse_selector(selector_list):
         if not selector_list:
             return {}
+
+        # Support `- --selector\n- a=b c=d` case
+        if len(selector_list) == 1 and (" " in selector_list[0]):
+            selector_list = selector_list[0].split(" ")
 
         selector = {}
         for item in selector_list:
