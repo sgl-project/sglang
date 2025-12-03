@@ -1133,15 +1133,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         (StatusCode::NOT_IMPLEMENTED, "Embeddings not supported").into_response()
     }
 
-    async fn route_rerank(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &RerankRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
-    }
-
     async fn route_classify(
         &self,
         _headers: Option<&HeaderMap>,
@@ -1149,6 +1140,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Classify not supported").into_response()
+    }
+
+    async fn route_rerank(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &RerankRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
     }
 
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {
@@ -1178,10 +1178,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         conversation_id: &str,
     ) -> Response {
         delete_conversation(&self.conversation_storage, conversation_id).await
-    }
-
-    fn router_type(&self) -> &'static str {
-        "openai"
     }
 
     async fn list_conversation_items(
@@ -1257,5 +1253,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             item_id,
         )
         .await
+    }
+
+    fn router_type(&self) -> &'static str {
+        "openai"
     }
 }

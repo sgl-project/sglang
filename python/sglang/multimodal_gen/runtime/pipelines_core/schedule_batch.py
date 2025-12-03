@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
@@ -27,7 +27,6 @@ from sglang.multimodal_gen.configs.sample.teacache import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from torchcodec.decoders import VideoDecoder
 
     from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 
@@ -240,9 +239,3 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
-
-
-@dataclass
-class PreprocessBatch(Req):
-    video_loader: list["VideoDecoder"] | list[str] = field(default_factory=list)
-    video_file_name: list[str] = field(default_factory=list)
