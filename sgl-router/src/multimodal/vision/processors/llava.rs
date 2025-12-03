@@ -66,15 +66,17 @@ pub enum ImageAspectRatio {
     Anyres,
 }
 
-impl ImageAspectRatio {
+impl std::str::FromStr for ImageAspectRatio {
+    type Err = std::convert::Infallible;
+
     /// Parse from string value (e.g., from config).
-    pub fn from_str(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
             "pad" => Self::Pad,
             "anyres" => Self::Anyres,
             _ if s.contains("anyres") => Self::Anyres, // anyres_max_12, etc.
             _ => Self::Square,
-        }
+        })
     }
 }
 
@@ -167,7 +169,7 @@ impl LlavaProcessor {
         let aspect_ratio = config
             .get("image_aspect_ratio")
             .and_then(|v| v.as_str())
-            .map(ImageAspectRatio::from_str)
+            .and_then(|s| s.parse().ok())
             .unwrap_or_default();
 
         Self {
