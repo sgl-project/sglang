@@ -36,7 +36,7 @@ from sglang.srt.utils import (
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
     from deep_ep import Buffer, Config

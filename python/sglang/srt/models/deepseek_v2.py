@@ -29,6 +29,11 @@ import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    MaybeTboDeepEPDispatcher,
+    model_forward_maybe_tbo,
+)
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
@@ -134,12 +139,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.two_batch_overlap import (
-    MaybeTboDeepEPDispatcher,
-    model_forward_maybe_tbo,
-)
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
