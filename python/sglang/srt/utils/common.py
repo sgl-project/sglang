@@ -122,6 +122,7 @@ HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
+@lru_cache(maxsize=1)
 def is_hip() -> bool:
     return torch.version.hip is not None
 
@@ -137,18 +138,22 @@ builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
+@lru_cache(maxsize=1)
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
 
+@lru_cache(maxsize=1)
 def is_cuda_alike():
     return is_cuda() or is_hip()
 
 
+@lru_cache(maxsize=1)
 def is_hpu() -> bool:
     return hasattr(torch, "hpu") and torch.hpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
@@ -158,6 +163,7 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
@@ -167,6 +173,7 @@ def is_host_cpu_x86() -> bool:
     )
 
 
+@lru_cache(maxsize=1)
 def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 
@@ -280,6 +287,17 @@ def get_int_env_var(name: str, default: int = 0) -> int:
         return default
     try:
         return int(value)
+    except ValueError:
+        return default
+
+
+def get_float_env_var(name: str, default: float = 0.0) -> float:
+    # FIXME: move your environment variable to sglang.srt.environ
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
     except ValueError:
         return default
 
@@ -1160,9 +1178,12 @@ def set_ulimit(target_soft_limit=65535):
 
 
 def rank0_log(msg: str):
-    from sglang.srt.distributed import get_tensor_model_parallel_rank
+    from sglang.srt.distributed import (
+        get_tensor_model_parallel_rank,
+        model_parallel_is_initialized,
+    )
 
-    if get_tensor_model_parallel_rank() == 0:
+    if not model_parallel_is_initialized() or get_tensor_model_parallel_rank() == 0:
         logger.info(msg)
 
 

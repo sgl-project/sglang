@@ -1,10 +1,11 @@
-//! Worker registration workflow steps
+//! Local worker registration workflow steps
 //!
-//! Each step is atomic and performs a single operation in the worker registration process.
+//! This workflow handles registration of local inference workers (SGLang, vLLM).
+//! For external API endpoints (OpenAI, xAI, etc.), see external_worker_registration.rs.
 //!
 //! Workflow order:
-//! 1. DetectConnectionMode - Probe both HTTP and gRPC to determine connection mode
-//! 2. DiscoverMetadata - Fetch metadata from the worker
+//! 1. DetectConnectionMode - Probe HTTP and gRPC to determine connection mode
+//! 2. DiscoverMetadata - Fetch metadata from /get_server_info or gRPC
 //! 3. DiscoverDPInfo - Fetch DP (Data Parallel) information (only for DP-aware workers)
 //! 4. CreateWorker - Build worker object(s) with merged config + metadata
 //! 5. RegisterWorker - Register worker(s) in registry
@@ -24,7 +25,7 @@ use crate::{
     app_context::AppContext,
     core::{
         workflow::*, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        DPAwareWorkerBuilder, HealthConfig, RuntimeType, Worker, WorkerType,
+        DPAwareWorkerBuilder, HealthConfig, ModelCard, RuntimeType, Worker, WorkerType,
     },
     protocols::worker_spec::WorkerConfigRequest,
     routers::grpc::client::GrpcClient,
@@ -38,7 +39,7 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .expect("Failed to create HTTP client")
 });
 
-/// Server information returned from worker endpoints
+/// Server information returned from /get_server_info endpoint
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ServerInfo {
     #[serde(alias = "model")]
@@ -60,7 +61,7 @@ pub struct DpInfo {
     pub model_id: String,
 }
 
-/// Parse server info from JSON response using serde
+/// Parse server info from JSON response
 fn parse_server_info(json: Value) -> Result<ServerInfo, String> {
     serde_json::from_value(json).map_err(|e| format!("Failed to parse server info: {}", e))
 }
@@ -117,7 +118,7 @@ async fn get_dp_info(url: &str, api_key: Option<&str>) -> Result<DpInfo, String>
     Ok(DpInfo { dp_size, model_id })
 }
 
-/// Helper: Strip protocol prefix from URL
+/// Strip protocol prefix from URL
 fn strip_protocol(url: &str) -> String {
     url.trim_start_matches("http://")
         .trim_start_matches("https://")
@@ -125,24 +126,17 @@ fn strip_protocol(url: &str) -> String {
         .to_string()
 }
 
-/// Helper: Try HTTP health check
-///
-/// Uses the provided client (from app_context) which supports both HTTP and HTTPS.
-/// For HTTPS URLs, the client's TLS configuration (mTLS, CA certs) is used.
-/// For plain HTTP URLs, the client handles them normally without TLS overhead.
+/// Try HTTP health check
 async fn try_http_health_check(
     url: &str,
     timeout_secs: u64,
     client: &Client,
 ) -> Result<(), String> {
-    // Preserve the protocol (http or https) from the original URL
     let is_https = url.starts_with("https://");
     let protocol = if is_https { "https" } else { "http" };
     let clean_url = strip_protocol(url);
     let health_url = format!("{}://{}/health", protocol, clean_url);
 
-    // Use the AppContext client for both HTTP and HTTPS
-    // The rustls backend handles both protocols correctly
     client
         .get(&health_url)
         .timeout(Duration::from_secs(timeout_secs))
@@ -154,7 +148,7 @@ async fn try_http_health_check(
     Ok(())
 }
 
-/// Helper: Perform gRPC health check with runtime type
+/// Perform gRPC health check with runtime type
 async fn do_grpc_health_check(
     grpc_url: &str,
     timeout_secs: u64,
@@ -175,10 +169,7 @@ async fn do_grpc_health_check(
     Ok(())
 }
 
-/// Helper: Try gRPC health check
-///
-/// If runtime_type is specified, uses the appropriate client (SGLang or vLLM).
-/// If not specified, tries SGLang first, then falls back to vLLM.
+/// Try gRPC health check (tries SGLang first, then vLLM if not specified)
 async fn try_grpc_health_check(
     url: &str,
     timeout_secs: u64,
@@ -193,25 +184,18 @@ async fn try_grpc_health_check(
     match runtime_type {
         Some(runtime) => do_grpc_health_check(&grpc_url, timeout_secs, runtime).await,
         None => {
-            // Runtime not specified: Try SGLang first, then vLLM as fallback
+            // Try SGLang first, then vLLM as fallback
             if let Ok(()) = do_grpc_health_check(&grpc_url, timeout_secs, "sglang").await {
                 return Ok(());
             }
-
-            // Try vLLM as fallback
             do_grpc_health_check(&grpc_url, timeout_secs, "vllm")
                 .await
-                .map_err(|e| {
-                    format!(
-                        "gRPC health check failed (tried both SGLang and vLLM): {}",
-                        e
-                    )
-                })
+                .map_err(|e| format!("gRPC failed (tried SGLang and vLLM): {}", e))
         }
     }
 }
 
-/// Fetch metadata from gRPC server with runtime type
+/// Fetch metadata from gRPC server
 async fn do_fetch_grpc_metadata(
     grpc_url: &str,
     runtime_type: &str,
@@ -228,11 +212,7 @@ async fn do_fetch_grpc_metadata(
     Ok(model_info.to_labels())
 }
 
-/// Helper: Fetch gRPC metadata
-///
-/// If runtime_type is specified, uses the appropriate client (SGLang or vLLM).
-/// If not specified, tries SGLang first, then falls back to vLLM.
-/// Returns (labels, detected_runtime_type)
+/// Fetch gRPC metadata (returns labels and detected runtime type)
 async fn fetch_grpc_metadata(
     url: &str,
     runtime_type: Option<&str>,
@@ -249,26 +229,19 @@ async fn fetch_grpc_metadata(
             Ok((labels, runtime.to_string()))
         }
         None => {
-            // Runtime not specified: Try SGLang first, then vLLM as fallback
+            // Try SGLang first, then vLLM as fallback
             if let Ok(labels) = do_fetch_grpc_metadata(&grpc_url, "sglang").await {
                 return Ok((labels, "sglang".to_string()));
             }
-
-            // Try vLLM as fallback
             let labels = do_fetch_grpc_metadata(&grpc_url, "vllm")
                 .await
-                .map_err(|e| {
-                    format!(
-                        "Failed to fetch gRPC metadata (tried both SGLang and vLLM): {}",
-                        e
-                    )
-                })?;
+                .map_err(|e| format!("gRPC metadata failed (tried SGLang and vLLM): {}", e))?;
             Ok((labels, "vllm".to_string()))
         }
     }
 }
 
-/// Step 1: Detect connection mode by probing both HTTP and gRPC
+/// Step 1: Detect connection mode by probing HTTP and gRPC
 pub struct DetectConnectionModeStep;
 
 #[async_trait]
@@ -286,12 +259,12 @@ impl StepExecutor for DetectConnectionModeStep {
             config.url, config.health_check_timeout_secs, config.max_connection_attempts
         );
 
-        // Try both protocols in parallel using configured timeout
-        // Use the AppContext client which has TLS configuration (CA certs, client identity)
+        // Try both protocols in parallel
         let url = config.url.clone();
         let timeout = config.health_check_timeout_secs;
         let client = &app_context.client;
         let runtime_type = config.runtime.as_deref();
+
         let (http_result, grpc_result) = tokio::join!(
             try_http_health_check(&url, timeout, client),
             try_grpc_health_check(&url, timeout, runtime_type)
@@ -317,14 +290,12 @@ impl StepExecutor for DetectConnectionModeStep {
             }
         };
 
-        // Store connection mode in context
         context.set("connection_mode", connection_mode);
-
         Ok(StepResult::Success)
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true // Connection issues are retryable
+        true
     }
 }
 
@@ -359,7 +330,6 @@ impl StepExecutor for DiscoverMetadataStep {
                         {
                             labels.insert("served_model_name".to_string(), served_model_name);
                         }
-
                         Ok((labels, None))
                     }
                     Err(e) => Err(e),
@@ -383,7 +353,6 @@ impl StepExecutor for DiscoverMetadataStep {
             config.url
         );
 
-        // Store discovered labels and detected runtime in context
         context.set("discovered_labels", discovered_labels);
         if let Some(runtime) = detected_runtime {
             debug!("Detected runtime type: {}", runtime);
@@ -394,7 +363,7 @@ impl StepExecutor for DiscoverMetadataStep {
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true // Metadata discovery failures are retryable
+        true
     }
 }
 
@@ -408,7 +377,6 @@ impl StepExecutor for DiscoverDPInfoStep {
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
 
-        // Skip DP discovery if not DP-aware
         if !config.dp_aware {
             debug!(
                 "Worker {} is not DP-aware, skipping DP discovery",
@@ -419,7 +387,6 @@ impl StepExecutor for DiscoverDPInfoStep {
 
         debug!("Discovering DP info for {} (DP-aware)", config.url);
 
-        // Get DP info from worker
         let dp_info = get_dp_info(&config.url, config.api_key.as_deref())
             .await
             .map_err(|e| WorkflowError::StepFailed {
@@ -432,14 +399,12 @@ impl StepExecutor for DiscoverDPInfoStep {
             dp_info.dp_size, config.url, dp_info.model_id
         );
 
-        // Store DP info in context
         context.set("dp_info", dp_info);
-
         Ok(StepResult::Success)
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true // DP info discovery failures are retryable
+        true
     }
 }
 
@@ -476,26 +441,11 @@ impl StepExecutor for CreateWorkerStep {
 
         // Build labels from config
         let mut config_labels = config.labels.clone();
-        if let Some(model_id) = &config.model_id {
-            config_labels.insert("model_id".to_string(), model_id.clone());
-        }
         if let Some(priority) = config.priority {
             config_labels.insert("priority".to_string(), priority.to_string());
         }
         if let Some(cost) = config.cost {
             config_labels.insert("cost".to_string(), cost.to_string());
-        }
-        if let Some(ref tokenizer_path) = config.tokenizer_path {
-            config_labels.insert("tokenizer_path".to_string(), tokenizer_path.clone());
-        }
-        if let Some(ref reasoning_parser) = config.reasoning_parser {
-            config_labels.insert("reasoning_parser".to_string(), reasoning_parser.clone());
-        }
-        if let Some(ref tool_parser) = config.tool_parser {
-            config_labels.insert("tool_parser".to_string(), tool_parser.clone());
-        }
-        if let Some(ref chat_template) = config.chat_template {
-            config_labels.insert("chat_template".to_string(), chat_template.clone());
         }
 
         // Merge: discovered labels first, then config labels (config takes precedence)
@@ -504,18 +454,35 @@ impl StepExecutor for CreateWorkerStep {
             final_labels.insert(key.clone(), value.clone());
         }
 
-        // Derive model_id if not already set
-        if !final_labels.contains_key("model_id") {
-            let derived_model_id = final_labels
-                .get("served_model_name")
-                .or_else(|| final_labels.get("model_path"))
-                .cloned();
+        // Determine model_id: config > served_model_name > model_path > "unknown"
+        let model_id = config
+            .model_id
+            .clone()
+            .or_else(|| final_labels.get("served_model_name").cloned())
+            .or_else(|| final_labels.get("model_path").cloned())
+            .unwrap_or_else(|| "unknown".to_string());
 
-            if let Some(model_id) = derived_model_id {
-                debug!("Derived model_id from metadata: {}", model_id);
-                final_labels.insert("model_id".to_string(), model_id);
-            }
+        if model_id != "unknown" {
+            debug!("Using model_id: {}", model_id);
         }
+
+        // Create ModelCard
+        let model_card = {
+            let mut card = ModelCard::new(&model_id);
+            if let Some(ref tokenizer_path) = config.tokenizer_path {
+                card = card.with_tokenizer_path(tokenizer_path.clone());
+            }
+            if let Some(ref reasoning_parser) = config.reasoning_parser {
+                card = card.with_reasoning_parser(reasoning_parser.clone());
+            }
+            if let Some(ref tool_parser) = config.tool_parser {
+                card = card.with_tool_parser(tool_parser.clone());
+            }
+            if let Some(ref chat_template) = config.chat_template {
+                card = card.with_chat_template(chat_template.clone());
+            }
+            card
+        };
 
         debug!(
             "Creating worker {} with {} discovered + {} config = {} final labels",
@@ -538,9 +505,8 @@ impl StepExecutor for CreateWorkerStep {
             })
             .unwrap_or(WorkerType::Regular);
 
-        // Get detected runtime type (for gRPC workers)
+        // Get runtime type (for gRPC workers)
         let runtime_type = if matches!(connection_mode.as_ref(), ConnectionMode::Grpc { .. }) {
-            // Try to get detected runtime from context, fall back to config, or default to sglang
             if let Some(detected_runtime) = context.get::<String>("detected_runtime_type") {
                 match detected_runtime.as_str() {
                     "vllm" => RuntimeType::Vllm,
@@ -555,7 +521,7 @@ impl StepExecutor for CreateWorkerStep {
                 RuntimeType::Sglang
             }
         } else {
-            RuntimeType::Sglang // Default for HTTP workers
+            RuntimeType::Sglang
         };
 
         // Build circuit breaker config
@@ -586,10 +552,8 @@ impl StepExecutor for CreateWorkerStep {
             || config.url.starts_with("https://")
             || config.url.starts_with("grpc://")
         {
-            // URL already has protocol, use as-is
             config.url.clone()
         } else {
-            // Bare IP:port format, add appropriate protocol based on detected mode
             match connection_mode.as_ref() {
                 ConnectionMode::Http => format!("http://{}", config.url),
                 ConnectionMode::Grpc { .. } => format!("grpc://{}", config.url),
@@ -607,7 +571,6 @@ impl StepExecutor for CreateWorkerStep {
 
         // Handle DP-aware vs non-DP-aware workers
         if config.dp_aware {
-            // DP-aware path: Create multiple workers (one per rank)
             let dp_info: Arc<DpInfo> = context
                 .get("dp_info")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("dp_info".to_string()))?;
@@ -621,6 +584,7 @@ impl StepExecutor for CreateWorkerStep {
             for rank in 0..dp_info.dp_size {
                 let mut builder =
                     DPAwareWorkerBuilder::new(normalized_url.clone(), rank, dp_info.dp_size)
+                        .model(model_card.clone())
                         .worker_type(worker_type.clone())
                         .connection_mode(connection_mode.as_ref().clone())
                         .runtime_type(runtime_type.clone())
@@ -630,7 +594,6 @@ impl StepExecutor for CreateWorkerStep {
                 if let Some(ref api_key) = config.api_key {
                     builder = builder.api_key(api_key.clone());
                 }
-
                 if !final_labels.is_empty() {
                     builder = builder.labels(final_labels.clone());
                 }
@@ -648,14 +611,11 @@ impl StepExecutor for CreateWorkerStep {
                 );
             }
 
-            // Store workers (plural) and labels in context
             context.set("workers", workers);
             context.set("labels", final_labels);
-
-            Ok(StepResult::Success)
         } else {
-            // Non-DP-aware path: Create single worker
             let mut builder = BasicWorkerBuilder::new(normalized_url.clone())
+                .model(model_card)
                 .worker_type(worker_type)
                 .connection_mode(connection_mode.as_ref().clone())
                 .runtime_type(runtime_type)
@@ -665,7 +625,6 @@ impl StepExecutor for CreateWorkerStep {
             if let Some(ref api_key) = config.api_key {
                 builder = builder.api_key(api_key.clone());
             }
-
             if !final_labels.is_empty() {
                 builder = builder.labels(final_labels.clone());
             }
@@ -680,16 +639,15 @@ impl StepExecutor for CreateWorkerStep {
                 final_labels.len()
             );
 
-            // Store worker (singular) and labels in context
             context.set("worker", worker);
             context.set("labels", final_labels);
-
-            Ok(StepResult::Success)
         }
+
+        Ok(StepResult::Success)
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Worker creation failures are not retryable (likely config issues)
+        false
     }
 }
 
@@ -706,9 +664,7 @@ impl StepExecutor for RegisterWorkerStep {
             .get("app_context")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
 
-        // Check if we have multiple workers (DP-aware) or single worker
         if config.dp_aware {
-            // DP-aware path: Register multiple workers
             let workers: Arc<Vec<Arc<dyn Worker>>> = context
                 .get("workers")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
@@ -724,9 +680,7 @@ impl StepExecutor for RegisterWorkerStep {
             }
 
             context.set("worker_ids", worker_ids);
-            Ok(StepResult::Success)
         } else {
-            // Non-DP-aware path: Register single worker
             let worker: Arc<Arc<dyn Worker>> = context
                 .get("worker")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
@@ -734,16 +688,15 @@ impl StepExecutor for RegisterWorkerStep {
             let worker_id = app_context
                 .worker_registry
                 .register(Arc::clone(worker.as_ref()));
-
             debug!("Registered worker {} with ID {:?}", config.url, worker_id);
             context.set("worker_id", worker_id);
-
-            Ok(StepResult::Success)
         }
+
+        Ok(StepResult::Success)
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Registration failures are not retryable
+        false
     }
 }
 
@@ -765,17 +718,13 @@ impl StepExecutor for UpdatePoliciesStep {
 
         let policy_hint = labels.get("policy").map(|s| s.as_str());
 
-        // Check if we have multiple workers (DP-aware) or single worker
         if config.dp_aware {
-            // DP-aware path: Update policies for multiple workers
             let workers: Arc<Vec<Arc<dyn Worker>>> = context
                 .get("workers")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
-            // Get model_id from first worker (all DP workers have same model)
             let model_id = workers[0].model_id().to_string();
 
-            // Notify policy registry for each worker
             for _ in 0..workers.len() {
                 app_context
                     .policy_registry
@@ -799,14 +748,12 @@ impl StepExecutor for UpdatePoliciesStep {
                 model_id
             );
         } else {
-            // Non-DP-aware path: Update policy for single worker
             let worker: Arc<Arc<dyn Worker>> = context
                 .get("worker")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
 
             let model_id = worker.model_id().to_string();
 
-            // Notify policy registry
             app_context
                 .policy_registry
                 .on_worker_added(&model_id, policy_hint);
@@ -820,6 +767,8 @@ impl StepExecutor for UpdatePoliciesStep {
                         .init_cache_aware_policy(&model_id, &all_workers);
                 }
             }
+
+            // Initialize bucket policies for prefill workers
             let prefill_workers = app_context.worker_registry.get_prefill_workers();
             let policy = app_context.policy_registry.get_prefill_policy();
             if policy.name() == "bucket" {
@@ -838,7 +787,7 @@ impl StepExecutor for UpdatePoliciesStep {
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Policy update failures are not retryable
+        false
     }
 }
 
@@ -852,9 +801,7 @@ impl StepExecutor for ActivateWorkerStep {
             .get("worker_config")
             .ok_or_else(|| WorkflowError::ContextValueNotFound("worker_config".to_string()))?;
 
-        // Check if we have multiple workers (DP-aware) or single worker
         if config.dp_aware {
-            // DP-aware path: Activate multiple workers
             let workers: Arc<Vec<Arc<dyn Worker>>> = context
                 .get("workers")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
@@ -863,13 +810,12 @@ impl StepExecutor for ActivateWorkerStep {
                 worker.set_healthy(true);
             }
 
-            debug!(
-                "Activated {} DP-aware workers {} (marked as healthy)",
+            info!(
+                "Activated {} DP-aware workers from {} (marked as healthy)",
                 workers.len(),
                 config.url
             );
         } else {
-            // Non-DP-aware path: Activate single worker
             let worker: Arc<Arc<dyn Worker>> = context
                 .get("worker")
                 .ok_or_else(|| WorkflowError::ContextValueNotFound("worker".to_string()))?;
@@ -883,31 +829,17 @@ impl StepExecutor for ActivateWorkerStep {
     }
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        false // Activation is just setting a flag, not retryable
+        false
     }
 }
 
-/// Create worker registration workflow definition
-///
-/// Note: Actual health check timeouts and retry attempts are configured per-worker
-/// via WorkerConfigRequest (populated from router config). The timeouts and retry
-/// policies here serve as workflow-level bounds to prevent infinite waiting.
-///
-/// # Arguments
-/// * `router_config` - Router configuration containing health check settings
+/// Create local worker registration workflow definition
 pub fn create_worker_registration_workflow(
     router_config: &crate::config::RouterConfig,
 ) -> WorkflowDefinition {
-    // Use startup timeout from config for worker registration
-    // This is separate from health_check.timeout_secs which is for individual HTTP requests
     let detect_timeout = Duration::from_secs(router_config.worker_startup_timeout_secs);
 
-    // Calculate max_attempts to match the startup_timeout
-    // With Linear backoff (increment 1s, max 5s):
-    // - Attempts 1-5: 0s, 1s, 2s, 3s, 4s = 10s total
-    // - Attempts 6+: 5s each
-    // max_attempts = 5 + (timeout_seconds - 10) / 5
-    // Use 90% of timeout to leave buffer for actual connection attempts
+    // Calculate max_attempts based on timeout
     let timeout_secs = detect_timeout.as_secs() as f64;
     let effective_timeout = timeout_secs * 0.9;
     let max_attempts = if effective_timeout > 10.0 {
@@ -930,7 +862,6 @@ pub fn create_worker_registration_workflow(
                     max: Duration::from_secs(5),
                 },
             })
-            // Workflow-level timeout uses configured health check timeout + buffer
             .with_timeout(detect_timeout)
             .with_failure_action(FailureAction::FailWorkflow),
         )
@@ -945,7 +876,7 @@ pub fn create_worker_registration_workflow(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::ContinueNextStep), // Metadata discovery is optional
+            .with_failure_action(FailureAction::ContinueNextStep),
         )
         .add_step(
             StepDefinition::new(
@@ -958,7 +889,7 @@ pub fn create_worker_registration_workflow(
                 backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
             })
             .with_timeout(Duration::from_secs(10))
-            .with_failure_action(FailureAction::FailWorkflow), // DP info is required for DP-aware workers
+            .with_failure_action(FailureAction::FailWorkflow),
         )
         .add_step(
             StepDefinition::new("create_worker", "Create Worker", Arc::new(CreateWorkerStep))
@@ -981,7 +912,7 @@ pub fn create_worker_registration_workflow(
                 Arc::new(UpdatePoliciesStep),
             )
             .with_timeout(Duration::from_secs(5))
-            .with_failure_action(FailureAction::ContinueNextStep), // Policy updates are optional
+            .with_failure_action(FailureAction::ContinueNextStep),
         )
         .add_step(
             StepDefinition::new(
