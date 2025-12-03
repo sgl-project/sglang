@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 @triton.jit
 def _process_kv_tensor(
     token_id,
+    head_block_id,
     page_id,
     page_offset,
     input_ptr,
@@ -43,43 +44,44 @@ def _process_kv_tensor(
     BLOCK_HEAD: tl.constexpr,
     BLOCK_DIM: tl.constexpr,
 ):
-    """Process a single K or V tensor: load, quantize to FP8, and write to cache."""
-    for head_idx in range(0, num_kv_heads, BLOCK_HEAD):
-        num_heads_in_block = min(BLOCK_HEAD, num_kv_heads - head_idx)
-        for dim_idx in range(0, head_dim, BLOCK_DIM):
-            num_dims_in_block = min(BLOCK_DIM, head_dim - dim_idx)
+    """Process a block of heads for a single K or V tensor."""
+    head_idx = head_block_id * BLOCK_HEAD
+    num_heads_in_block = min(BLOCK_HEAD, num_kv_heads - head_idx)
 
-            head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
-            dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
+    for dim_idx in range(0, head_dim, BLOCK_DIM):
+        num_dims_in_block = min(BLOCK_DIM, head_dim - dim_idx)
 
-            head_mask = head_offsets < (head_idx + num_heads_in_block)
-            dim_mask = dim_offsets < (dim_idx + num_dims_in_block)
+        head_offsets = head_idx + tl.arange(0, BLOCK_HEAD)
+        dim_offsets = dim_idx + tl.arange(0, BLOCK_DIM)
 
-            # Load from input using 3D strides
-            input_offsets = (
-                token_id * input_stride_token
-                + head_offsets[:, None] * input_stride_head
-                + dim_offsets[None, :] * input_stride_dim
-            )
-            mask = head_mask[:, None] & dim_mask[None, :]
+        head_mask = head_offsets < (head_idx + num_heads_in_block)
+        dim_mask = dim_offsets < (dim_idx + num_dims_in_block)
 
-            block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
+        # Load from input using 3D strides
+        input_offsets = (
+            token_id * input_stride_token
+            + head_offsets[:, None] * input_stride_head
+            + dim_offsets[None, :] * input_stride_dim
+        )
+        mask = head_mask[:, None] & dim_mask[None, :]
 
-            # Quantize to FP8
-            if use_provided_scale:
-                block_fp8 = (block * inv_scale).to(tl.float8e4nv)
-            else:
-                block_fp8 = block.to(tl.float8e4nv)
+        block = tl.load(input_ptr + input_offsets, mask=mask, other=0.0)
 
-            # Write to cache at [page_id, page_offset, head, dim]
-            cache_offsets = (
-                page_id * cache_stride_page
-                + page_offset * cache_stride_offset
-                + head_offsets[:, None] * cache_stride_head
-                + dim_offsets[None, :] * cache_stride_dim
-            )
+        # Quantize to FP8
+        if use_provided_scale:
+            block_fp8 = (block * inv_scale).to(tl.float8e4nv)
+        else:
+            block_fp8 = block.to(tl.float8e4nv)
 
-            tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
+        # Write to cache at [page_id, page_offset, head, dim]
+        cache_offsets = (
+            page_id * cache_stride_page
+            + page_offset * cache_stride_offset
+            + head_offsets[:, None] * cache_stride_head
+            + dim_offsets[None, :] * cache_stride_dim
+        )
+
+        tl.store(cache_ptr + cache_offsets, block_fp8, mask=mask)
 
 
 @triton.jit
@@ -125,13 +127,15 @@ def _fused_fp8_set_kv_buffer_kernel(
     """
     Fused FP8 quantization + paged KV cache write kernel.
 
-    Each program processes one token, quantizing its K/V vectors and writing
-    them to the appropriate page in the KV cache.
+    Each program processes one token-head_block-kv combination, quantizing and writing
+    to the appropriate page in the KV cache.
 
-    Grid: (num_tokens,)
+    Grid: (num_tokens, num_head_blocks, 2) where dim2: 0=K, 1=V
     """
-    # Get token ID for this program
+    # Get program IDs
     token_id = tl.program_id(0)
+    head_block_id = tl.program_id(1)
+    kv_idx = tl.program_id(2)  # 0 for K, 1 for V
 
     # Get cache location for this token
     cache_loc = tl.load(cache_loc_ptr + token_id)
@@ -140,53 +144,55 @@ def _fused_fp8_set_kv_buffer_kernel(
     page_id = cache_loc // page_size
     page_offset = cache_loc % page_size
 
-    # Compute inverse scales
-    k_inv_scale = 1.0 / k_scale if use_provided_scale else 1.0
-    v_inv_scale = 1.0 / v_scale if use_provided_scale else 1.0
-
-    # Process K tensor
-    _process_kv_tensor(
-        token_id,
-        page_id,
-        page_offset,
-        k_ptr,
-        k_cache_ptr,
-        k_inv_scale,
-        use_provided_scale,
-        num_kv_heads,
-        head_dim,
-        k_stride_token,
-        k_stride_head,
-        k_stride_dim,
-        k_cache_stride_page,
-        k_cache_stride_offset,
-        k_cache_stride_head,
-        k_cache_stride_dim,
-        BLOCK_HEAD,
-        BLOCK_DIM,
-    )
-
-    # Process V tensor
-    _process_kv_tensor(
-        token_id,
-        page_id,
-        page_offset,
-        v_ptr,
-        v_cache_ptr,
-        v_inv_scale,
-        use_provided_scale,
-        num_kv_heads,
-        head_dim,
-        v_stride_token,
-        v_stride_head,
-        v_stride_dim,
-        v_cache_stride_page,
-        v_cache_stride_offset,
-        v_cache_stride_head,
-        v_cache_stride_dim,
-        BLOCK_HEAD,
-        BLOCK_DIM,
-    )
+    # Select K or V based on kv_idx
+    if kv_idx == 0:
+        # Process K tensor
+        inv_scale = 1.0 / k_scale if use_provided_scale else 1.0
+        _process_kv_tensor(
+            token_id,
+            head_block_id,
+            page_id,
+            page_offset,
+            k_ptr,
+            k_cache_ptr,
+            inv_scale,
+            use_provided_scale,
+            num_kv_heads,
+            head_dim,
+            k_stride_token,
+            k_stride_head,
+            k_stride_dim,
+            k_cache_stride_page,
+            k_cache_stride_offset,
+            k_cache_stride_head,
+            k_cache_stride_dim,
+            BLOCK_HEAD,
+            BLOCK_DIM,
+        )
+    else:
+        # Process V tensor
+        inv_scale = 1.0 / v_scale if use_provided_scale else 1.0
+        _process_kv_tensor(
+            token_id,
+            head_block_id,
+            page_id,
+            page_offset,
+            v_ptr,
+            v_cache_ptr,
+            inv_scale,
+            use_provided_scale,
+            num_kv_heads,
+            head_dim,
+            v_stride_token,
+            v_stride_head,
+            v_stride_dim,
+            v_cache_stride_page,
+            v_cache_stride_offset,
+            v_cache_stride_head,
+            v_cache_stride_dim,
+            BLOCK_HEAD,
+            BLOCK_DIM,
+        )
 
 
 def fused_fp8_set_kv_buffer(
@@ -314,15 +320,14 @@ def fused_fp8_set_kv_buffer(
         BLOCK_HEAD = min(num_kv_heads, 8)  # Process up to 8 heads at once
         BLOCK_DIM = min(head_dim, 128)      # Process up to 128 dims at once
 
-        # Grid: one program per token
-        grid = (num_tokens,)
+        # Compute number of head blocks
+        num_head_blocks = (num_kv_heads + BLOCK_HEAD - 1) // BLOCK_HEAD
 
-        if not hasattr(fused_fp8_set_kv_buffer, "_triton_logged"):
-            logger.debug(
-                "Using Triton FP8 KV cache kernel (num_tokens=%d, num_heads=%d, head_dim=%d)",
-                num_tokens, num_kv_heads, head_dim,
-            )
-            fused_fp8_set_kv_buffer._triton_logged = True
+        # Grid: (num_tokens, num_head_blocks, 2)
+        # - dim 0: tokens
+        # - dim 1: head blocks
+        # - dim 2: K/V (0=K, 1=V)
+        grid = (num_tokens, num_head_blocks, 2)
 
         # Launch Triton kernel
         _fused_fp8_set_kv_buffer_kernel[grid](
@@ -356,13 +361,6 @@ def fused_fp8_set_kv_buffer(
         )
     else:
         # Fallback to naive implementation
-        if not hasattr(fused_fp8_set_kv_buffer, "_naive_logged"):
-            logger.debug(
-                "Using naive FP8 KV cache fallback (num_tokens=%d)",
-                num_tokens,
-            )
-            fused_fp8_set_kv_buffer._naive_logged = True
-
         _naive_fp8_set_kv_buffer(
             k_2d, v_2d, k_cache, v_cache, cache_loc, k_scale, v_scale, page_size
         )
