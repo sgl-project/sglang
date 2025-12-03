@@ -378,7 +378,7 @@ class ServerArgs:
     mm_attention_backend: Optional[str] = None
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
-    enable_flashinfer_autotune: bool = False
+    disable_flashinfer_autotune: bool = False
 
     # Speculative decoding
     speculative_algorithm: Optional[str] = None
@@ -2908,10 +2908,10 @@ class ServerArgs:
             choices=NSA_CHOICES,
         )
         parser.add_argument(
-            "--enable-flashinfer-autotune",
-            default=ServerArgs.enable_flashinfer_autotune,
+            "--disable-flashinfer-autotune",
+            default=ServerArgs.disable_flashinfer_autotune,
             action="store_true",
-            help="Enable FlashInfer autotuning for optimal kernel selection.",
+            help="Disable FlashInfer autotuning.",
         )
 
         # Speculative decoding
