@@ -885,11 +885,12 @@ class Scheduler(
                 draft_token_to_kv_pool = (
                     self.draft_worker.draft_worker.draft_runner_list[0].token_to_kv_pool
                 )
+                model_config = self.draft_worker.draft_worker.draft_runner_list[0].model_config
             else:
                 draft_token_to_kv_pool = (
                     self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
                 )
-            model_config = self.draft_worker.draft_worker.draft_runner.model_config
+                model_config = self.draft_worker.draft_worker.draft_runner.model_config
         else:
             # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool

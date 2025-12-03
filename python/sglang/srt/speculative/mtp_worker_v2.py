@@ -340,7 +340,6 @@ class MTPDraftWorker(BaseDraftWorker):
             hidden_states=target_hidden_states,
             verified_id=next_token_ids,
             new_seq_lens=batch.seq_lens,
-            allocate_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 num token per batch
             num_tokens_per_batch=1,
             num_tokens_for_logprob_per_batch=1,
@@ -544,14 +543,13 @@ class MTPWorkerV2(BaseSpecWorker):
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch, draft_input.allocate_lens)
+            batch_output = self.verify(model_worker_batch)
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
     def verify(
         self,
         batch: ModelWorkerBatch,
-        cur_allocate_lens: torch.Tensor,
     ):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory
@@ -629,7 +627,6 @@ class MTPWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            allocate_lens=cur_allocate_lens,
             verify_done=verify_done,
         )
         return GenerationBatchResult(
@@ -638,7 +635,6 @@ class MTPWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
-            allocate_lens=cur_allocate_lens,
         )
 
     def move_accepted_tokens_to_target_kvcache(

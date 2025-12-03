@@ -359,6 +359,8 @@ class MTPWorker(TpModelWorker):
                 num_seqs * self.speculative_num_steps * self.topk,
                 backup_state=True,
             )
+            duplicate_cache_len = 0
+            source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
         else:
             if self.topk == 1:
                 prefix_lens, seq_lens, last_loc = get_last_loc_large_page_size_top_k_1(
@@ -370,6 +372,8 @@ class MTPWorker(TpModelWorker):
                 prefix_lens_cpu = batch.seq_lens_cpu
                 seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
                 extend_num_tokens = num_seqs * self.speculative_num_steps
+                duplicate_cache_len = 0
+                source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
             else:
                 # In this case, the last partial page needs to be duplicated.
                 # KV cache layout in batch.req_to_token_pool.req_to_token:
@@ -427,6 +431,14 @@ class MTPWorker(TpModelWorker):
                     backup_state=True,
                 )
             )
+            last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
+            duplicate_cache_len = torch.sum(last_page_lens).item() * (self.topk - 1)
+            target_cache_loc = torch.zeros(
+                duplicate_cache_len, dtype=torch.int32, device=self.device
+            )
+            source_cache_loc = torch.zeros(
+                duplicate_cache_len, dtype=torch.int32, device=self.device
+            )
 
         assign_draft_cache_locs[(num_seqs,)](
             batch.req_pool_indices,
@@ -435,6 +447,10 @@ class MTPWorker(TpModelWorker):
             self.extend_lens,
             self.num_new_pages_per_topk,
             out_cache_loc,
+            source_cache_loc,
+            target_cache_loc,
+            last_page_lens_cumsum,
+            duplicate_cache_len,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
             self.speculative_num_steps,
