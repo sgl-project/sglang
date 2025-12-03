@@ -1617,7 +1617,7 @@ class ServerArgs:
                 )
 
         if self.hicache_mem_layout == "page_first_direct":
-            if self.hicache_io_backend != "direct":
+            if self.hicache_io_backend not in ["direct", "kernel_ascend"]:
                 self.hicache_io_backend = "direct"
                 logger.warning(
                     "Page first direct layout only support direct io backend"
