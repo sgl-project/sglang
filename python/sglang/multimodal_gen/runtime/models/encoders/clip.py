@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 # TODO: support quantization
 # from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -176,12 +177,13 @@ class CLIPAttention(nn.Module):
         self.tp_size = get_tp_world_size()
         self.num_heads_per_partition = divide(self.num_heads, self.tp_size)
 
+
         self.attn = LocalAttention(
             self.num_heads_per_partition,
             self.head_dim,
             self.num_heads_per_partition,
             softmax_scale=self.scale,
-            causal=False,
+            causal=True,  # Use causal mask
             supported_attention_backends=config._supported_attention_backends,
         )
 
@@ -195,6 +197,7 @@ class CLIPAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
     ):
         """Input shape: Batch x Time x Channel"""
 
@@ -219,7 +222,43 @@ class CLIPAttention(nn.Module):
             self.num_heads_per_partition,
             self.head_dim,
         )
-        attn_output = self.attn(query_states, key_states, value_states)
+        
+        # Check if using TORCH_SDPA backend, if so use PyTorch SDPA directly to support attention_mask
+        if self.attn.backend == AttentionBackendEnum.TORCH_SDPA:
+            # Convert to [batch, num_heads, seq_len, head_dim] format (required by SDPA)
+            query_states = query_states.transpose(1, 2)  # [B, H, S, D]
+            key_states = key_states.transpose(1, 2)
+            value_states = value_states.transpose(1, 2)
+            
+            # Process attention_mask: convert from [B, S] to format suitable for SDPA
+            if attention_mask is not None:
+                # SDPA requires [B, 1, 1, S] or [B, S, S] format mask
+                # If [B, S] format, need to expand
+                if attention_mask.dim() == 2:
+                    # Expand to [B, 1, 1, S] for broadcasting
+                    # In mask: 1 means valid position, 0 means position to mask
+                    attn_mask = attention_mask[:, None, None, :].to(dtype=query_states.dtype)
+                    # Convert 0 to -inf, keep 1 as 0
+                    attn_mask = (1.0 - attn_mask) * torch.finfo(query_states.dtype).min
+                else:
+                    attn_mask = attention_mask
+            else:
+                attn_mask = None
+            
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attn_mask,
+                is_causal=True,  # Use causal mask
+                scale=self.scale,
+            )
+            
+            # Convert back to [B, S, H, D] format
+            attn_output = attn_output.transpose(1, 2)  # [B, S, H, D]
+        else:
+            # Use LocalAttention (doesn't support attention_mask, but maintains compatibility)
+            attn_output = self.attn(query_states, key_states, value_states)
 
         attn_output = attn_output.reshape(
             attn_output.shape[0],
@@ -283,11 +322,18 @@ class CLIPEncoderLayer(nn.Module):
         self.mlp = CLIPMLP(config, quant_config=quant_config, prefix=f"{prefix}.mlp")
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         residual = hidden_states
 
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states, _ = self.self_attn(hidden_states=hidden_states)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -334,13 +380,19 @@ class CLIPEncoder(nn.Module):
         )
 
     def forward(
-        self, inputs_embeds: torch.Tensor, return_all_hidden_states: bool
+        self, 
+        inputs_embeds: torch.Tensor, 
+        return_all_hidden_states: bool,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         hidden_states_pool = [inputs_embeds]
         hidden_states = inputs_embeds
 
         for idx, encoder_layer in enumerate(self.layers):
-            hidden_states = encoder_layer(hidden_states)
+            hidden_states = encoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+            )
             if return_all_hidden_states:
                 hidden_states_pool.append(hidden_states)
         # If we have multiple feature sample layers, we return all hidden
@@ -417,11 +469,8 @@ class CLIPTextTransformer(nn.Module):
 
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
-            # attention_mask=attention_mask,
-            # causal_attention_mask=causal_attention_mask,
-            # output_attentions=output_attentions,
             return_all_hidden_states=output_hidden_states,
-            # return_dict=return_dict,
+            attention_mask=attention_mask,
         )
 
         last_hidden_state = encoder_outputs[-1]
