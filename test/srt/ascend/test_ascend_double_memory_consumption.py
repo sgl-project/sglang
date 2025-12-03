@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_ascend_w4a4_quantization.TestAscendW4A4.test_gsm8k
+python3 -m unittest test_ascend_double_memory_consumption.TestMemoryConsumptionAscend.test_memory_consumption
 """
 
 import os
