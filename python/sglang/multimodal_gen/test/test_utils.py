@@ -14,7 +14,7 @@ from typing import Optional
 
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -23,6 +23,15 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 )
 
 logger = init_logger(__name__)
+
+
+def is_image_url(image_path: str | Path | None) -> bool:
+    """Check if image_path is a URL."""
+    if image_path is None:
+        return False
+    return isinstance(image_path, str) and (
+        image_path.startswith("http://") or image_path.startswith("https://")
+    )
 
 
 def run_command(command) -> Optional[float]:
@@ -385,8 +394,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_cfg_parallel(self):
         """cfg parallel"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_cfg_parallel",
             args="--num-gpus 2 --enable-cfg-parallel",
@@ -396,8 +403,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_usp(self):
         """usp"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_usp",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=2",
@@ -407,8 +412,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_mixed(self):
         """mixed"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_mixed",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=1 --enable-cfg-parallel",

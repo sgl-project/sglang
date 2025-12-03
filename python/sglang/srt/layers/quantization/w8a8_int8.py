@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
     apply_module_patch,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_npu,
@@ -63,6 +64,8 @@ elif _is_npu:
     else:
         useMindIETurbo = True
 
+    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_rmsnorm_bias
+
 logger = logging.getLogger(__name__)
 
 
@@ -87,10 +90,13 @@ def npu_wrapper_rmsnorm_forward(func):
         if not x.is_contiguous():
             x = x.contiguous()
         if residual is not None:
-            out, _, residual_out = torch_npu.npu_add_rms_norm(
-                residual, x, self.weight.data, self.variance_epsilon
+            out, residual_out = add_rmsnorm_bias(
+                x,
+                residual,
+                self.weight.data,
+                self.bias,
+                self.variance_epsilon,
             )
-            out = out + self.bias
             return out.to(x.dtype), residual_out
 
         out = torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
@@ -1072,15 +1078,23 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
+    def release_weight_cache(self, weight: torch.Tensor):
+        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
+        origin_weight = weight.data.transpose(1, 2)
+        new_weight = origin_weight.contiguous()
+        origin_weight.untyped_storage().resize_(0)
+        return new_weight
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(
-            layer.w13_weight.data.transpose(1, 2).contiguous(), requires_grad=False
-        )
-        layer.w2_weight = Parameter(
-            layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
-        )
+        weight_data = self.release_weight_cache(layer.w13_weight.data)
+        layer.w13_weight = Parameter(weight_data, requires_grad=False)
+
+        weight_data = self.release_weight_cache(layer.w2_weight.data)
+        layer.w2_weight = Parameter(weight_data, requires_grad=False)
+
         layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
+            layer.w13_weight_scale.data.squeeze(-1).contiguous().to(torch.float32),
+            requires_grad=False,
         )
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
@@ -1091,6 +1105,10 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_offset = Parameter(
             layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
         )
+
+        if get_bool_env_var("ENABLE_ASCEND_MOE_NZ"):
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29)
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1145,7 +1163,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         # act_fn: swiglu
         hidden_states, swiglu_out_scale = torch_npu.npu_dequant_swiglu_quant(
             x=hidden_states,
-            weight_scale=layer.w13_weight_scale.to(torch.float32),
+            weight_scale=layer.w13_weight_scale,
             activation_scale=hidden_states_scale,
             bias=None,
             quant_scale=None,

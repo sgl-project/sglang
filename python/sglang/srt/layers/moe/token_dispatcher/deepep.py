@@ -34,7 +34,7 @@ from sglang.srt.utils import (
 _is_npu = is_npu()
 
 if TYPE_CHECKING:
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
     from deep_ep import Buffer, Config
@@ -307,6 +307,7 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
+        # A large value will lead to large memory occupation, thus users should change it accordingly
         self.num_max_dispatch_tokens_per_rank = get_int_env_var(
             "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
         )
@@ -377,6 +378,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass()
+            and not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH")
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(

@@ -155,13 +155,17 @@ class LoRAManager:
         """
 
         # Check if this LoRA adapter is already loaded
-        if any(
-            lora_ref.lora_name == existing_lora_ref.lora_name
-            for existing_lora_ref in self.lora_refs.values()
-        ):
-            raise ValueError(
-                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
-            )
+        for existing_lora_ref in self.lora_refs.values():
+            if lora_ref.lora_name == existing_lora_ref.lora_name:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                )
+
+            if lora_ref.lora_path == existing_lora_ref.lora_path:
+                logger.warning(
+                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)

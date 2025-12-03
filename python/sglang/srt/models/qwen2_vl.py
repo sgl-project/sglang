@@ -39,11 +39,15 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -387,10 +391,7 @@ class Qwen2VisionTransformer(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
         # compute cu_seqlens
-        cu_seqlens = torch.repeat_interleave(
-            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        cu_seqlens = compute_cu_seqlens_from_grid_numpy(grid_thw)
 
         # transformers
         x = x.unsqueeze(1)
@@ -534,21 +535,11 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
-        input_embeds = forward_batch.input_embeds
-        # It may seem strange to assign input_embeds again even after passing it as an argument.
-        # This is for compatibility considerations.
-        # In the 'extend' scenario, this forward function is called from two places:
-        # 1. model_runner calls forward directly,
-        # 2. piece_wise_cuda_graph_runner calls forward and replay.
-
-        # Currently,
-        # In 'extend', input_embeds is passed in.
-        # In 'decode', input_ids is passed in.
-
-        hidden_states = self.model(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
+            language_model=self.model,
+            multimodal_model=self,
             positions=positions,
         )
 
