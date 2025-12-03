@@ -5,7 +5,7 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -22,6 +22,7 @@ def fused_topk_npu(
 
     use_grouped_topk = topk_config.use_grouped_topk
     renormalize = topk_config.renormalize
+    correction_bias = topk_config.correction_bias
 
     if not use_grouped_topk:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
@@ -37,13 +38,13 @@ def fused_topk_npu(
             )
         topk_weights = topk_weights.to(torch.float32)
 
-    elif use_grouped_topk:
+    elif use_grouped_topk and correction_bias is not None:
         routed_scaling_factor = topk_config.routed_scaling_factor or 1
 
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
             k=topk_config.top_k,
-            bias=topk_config.correction_bias.to(torch.float32),
+            bias=correction_bias.to(torch.float32),
             k_group=topk_config.topk_group,
             group_count=topk_config.num_expert_group,
             group_select_mode=1,
@@ -62,7 +63,14 @@ def fused_topk_npu(
             topk_weights = topk_weights / topk_weights_sum
 
     else:
-        raise ValueError(f"Invalid topk configuration: {topk_config}.")
+        topk_config.torch_native = True
+        return select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            topk_config=topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
 
     if expert_location_dispatch_info is not None:
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
