@@ -64,7 +64,9 @@ def is_layer_skipped(
 
         is_skipped = None
         for shard_prefix in shard_prefixes:
-            is_shard_skipped = any(ignored in shard_prefix for ignored in ignored_layers)
+            is_shard_skipped = any(
+                ignored in shard_prefix for ignored in ignored_layers
+            )
 
             if is_skipped is None:
                 is_skipped = is_shard_skipped
