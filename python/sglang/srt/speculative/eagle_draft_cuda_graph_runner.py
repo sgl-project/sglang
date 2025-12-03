@@ -62,7 +62,25 @@ class EAGLEDraftCudaGraphRunner:
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        # For dynamic speculative decoding, only capture batch sizes < threshold
+        # because only small batches use spec (have spare GPU capacity)
+        # Large batches (>= threshold) don't use spec to avoid overhead
+        bs_range_max = None
+        if model_runner.server_args.enable_dynamic_spec:
+            # Check from server_args, not model_runner.spec_algorithm which may be temporarily modified
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            original_spec_alg = SpeculativeAlgorithm.from_string(
+                model_runner.server_args.speculative_algorithm
+            )
+            if original_spec_alg.is_eagle():
+                bs_range_max = (
+                    model_runner.server_args.speculative_batch_size_threshold - 1
+                )
+
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, bs_range_min=None, bs_range_max=bs_range_max
+        )
 
         # Attention backend
         self.num_tokens_per_bs = self.topk

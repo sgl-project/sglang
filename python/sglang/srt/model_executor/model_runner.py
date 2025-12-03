@@ -2410,6 +2410,8 @@ class ModelRunner:
     def init_device_graphs(self):
         """Capture device graphs."""
         self.graph_runner = None
+        self.graph_runner_nonspec = None
+        self.graph_runner_spec = None
         self.graph_mem_usage = 0
 
         if not self.is_generation:
@@ -2437,7 +2439,62 @@ class ModelRunner:
                 "npu": NPUGraphRunner,
             },
         )
-        self.graph_runner = graph_runners[self.device](self)
+
+        # For dynamic spec with EAGLE, create two separate graph runners
+        if (
+            self.server_args.enable_dynamic_spec
+            and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
+            and not self.is_draft_worker
+        ):
+            log_info_on_rank0(
+                logger, "Dynamic spec enabled: creating two separate CUDA graph runners"
+            )
+
+            # Save original spec algorithm
+            original_spec_algo = self.server_args.speculative_algorithm
+            original_spec_algo_obj = self.spec_algorithm
+
+            # Pre-initialize attention backend to avoid metadata conflicts
+            max_bs = max(self.server_args.cuda_graph_bs)
+            max_token_spec = max_bs * self.server_args.speculative_num_draft_tokens
+            max_token_nonspec = max_bs * 1
+            max_num_token = max(max_token_spec, max_token_nonspec)
+
+            log_info_on_rank0(
+                logger,
+                f"Pre-initializing attention backend (max_bs={max_bs}, max_token={max_num_token})",
+            )
+            self.attn_backend.init_cuda_graph_state(max_bs, max_num_token)
+
+            # ===== Runner 1: Non-spec (DECODE mode, tokens_per_bs=1) =====
+            log_info_on_rank0(
+                logger, "Creating non-spec CUDA graph runner (DECODE mode)..."
+            )
+            self.server_args.speculative_algorithm = "None"
+            self.spec_algorithm = SpeculativeAlgorithm.from_string("None")
+            threshold = self.server_args.speculative_batch_size_threshold
+            self.graph_runner_nonspec = graph_runners[self.device](
+                self, custom_bs_min=threshold, custom_bs_max=None
+            )
+
+            # ===== Runner 2: Spec (TARGET_VERIFY mode, tokens_per_bs=32) =====
+            log_info_on_rank0(
+                logger, "Creating spec CUDA graph runner (TARGET_VERIFY mode)..."
+            )
+            self.server_args.speculative_algorithm = original_spec_algo
+            self.spec_algorithm = original_spec_algo_obj
+
+            self.graph_runner_spec = graph_runners[self.device](
+                self, custom_bs_min=None, custom_bs_max=threshold - 1
+            )
+
+            # For compatibility, set default to spec runner
+            self.graph_runner = self.graph_runner_spec
+
+            log_info_on_rank0(logger, "Two CUDA graph runners created successfully")
+        else:
+            # Single runner (original behavior)
+            self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
@@ -2670,14 +2727,26 @@ class ModelRunner:
             if self.device == "cpu"
             else forward_batch.forward_mode.is_cuda_graph
         )
+
+        # Select appropriate graph runner for dynamic spec
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        selected_graph_runner = self.graph_runner
+        if self.graph_runner_nonspec is not None and self.graph_runner_spec is not None:
+            # Dynamic spec: choose runner based on forward_mode
+            if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+                selected_graph_runner = self.graph_runner_spec
+            else:  # DECODE mode
+                selected_graph_runner = self.graph_runner_nonspec
+
         can_run_graph = bool(
             mode_check()
-            and self.graph_runner
-            and self.graph_runner.can_run(forward_batch)
+            and selected_graph_runner
+            and selected_graph_runner.can_run(forward_batch)
         )
 
         if can_run_graph:
-            ret = self.graph_runner.replay(
+            ret = selected_graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,

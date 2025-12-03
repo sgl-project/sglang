@@ -186,7 +186,11 @@ def set_torch_compile_config():
     monkey_patch_torch_compile()
 
 
-def get_batch_sizes_to_capture(model_runner: ModelRunner):
+def get_batch_sizes_to_capture(
+    model_runner: ModelRunner,
+    bs_range_min: Optional[int] = None,
+    bs_range_max: Optional[int] = None,
+):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
@@ -208,6 +212,21 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner):
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
+
+    # Filter by custom batch size range if provided
+    # Allows creating specialized runners for different workload patterns
+    if bs_range_min is not None or bs_range_max is not None:
+        capture_bs = [
+            bs
+            for bs in capture_bs
+            if (bs_range_min is None or bs >= bs_range_min)
+            and (bs_range_max is None or bs <= bs_range_max)
+        ]
+        # Ensure we have at least some batch sizes after filtering
+        if not capture_bs:
+            # Fallback: use original list if filtering removed everything
+            capture_bs = server_args.cuda_graph_bs
+
     compile_bs = (
         [bs for bs in capture_bs if bs <= server_args.torch_compile_max_bs]
         if server_args.enable_torch_compile
@@ -232,9 +251,16 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        is_spec: bool = False,
+        custom_bs_min: Optional[int] = None,
+        custom_bs_max: Optional[int] = None,
+    ):
         # Parse args
         self.model_runner = model_runner
+        self.is_spec = is_spec  # Track whether this runner is for speculative mode
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
@@ -264,8 +290,11 @@ class CudaGraphRunner:
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        # Batch sizes to capture
-        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
+        # Determine which batch sizes to capture for this runner
+        # Custom range allows creating specialized runners for different workloads
+        self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
+            model_runner, custom_bs_min, custom_bs_max
+        )
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
