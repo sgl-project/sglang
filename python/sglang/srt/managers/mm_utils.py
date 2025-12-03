@@ -373,9 +373,10 @@ def _get_chunked_prefill_embedding(
     prefix_length: List[int],
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
-) -> Optional[torch.Tensor]:
+) -> Tuple[Optional[torch.Tensor], int]:
     # Calculate embedding for each request, try to get it from cache to avoid repeated calculation
     embedding_list = []
+    expected_token_count = 0
     # FIXME(Xinyuan): temporary workaround for eagle3, which may have len(items_size) > len(prefix_length)
     if not get_global_server_args().mm_enable_dp_encoder:
         max_iterations = min(len(items_size) - 1, len(prefix_length))
@@ -401,13 +402,14 @@ def _get_chunked_prefill_embedding(
                     )
 
 
-            embedding_per_req_chunk, _, _ = get_embedding_chunk(
+            embedding_per_req_chunk, start_idx, end_idx = get_embedding_chunk(
                 embedding=embedding_per_req,
                 extend_prefix_len=prefix_length[i],
                 extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
                 items_offset=items_offset,
             )
             embedding_list.append(embedding_per_req_chunk)
+            expected_token_count += end_idx - start_idx
     else:
         embedding_items_hash_list = get_embedding_hash_list(embedding_items)
 
@@ -445,16 +447,17 @@ def _get_chunked_prefill_embedding(
                 embeddings_merged_idx += 1
 
         for i in range(len(embedding_items)):
-            embedding_per_req_chunk, _, _ = get_embedding_chunk(
+            embedding_per_req_chunk, start_idx, end_idx = get_embedding_chunk(
                 embedding=embedding_list[i],
                 extend_prefix_len=prefix_length[i],
                 extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
                 items_offset=items_offset_list[i],
             )
             embedding_list[i] = embedding_per_req_chunk
+            expected_token_count += end_idx - start_idx
     if len(embedding_list) == 0:
         return None
-    return torch.concat(embedding_list, dim=0)
+    return torch.concat(embedding_list, dim=0), expected_token_count
 
 
 def _get_multimodal_mask(
@@ -467,16 +470,17 @@ def _adjust_embedding_length(
     embedding: torch.Tensor,
     mask: torch.Tensor,
     logger,
+    expected_token_count: int,
 ) -> torch.Tensor:
     num_mm_tokens_in_embedding = embedding.shape[0]
     num_mm_tokens_in_input_ids = mask.sum().item()
-    if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
+    if expected_token_count != num_mm_tokens_in_embedding:
         logger.warning(
             f"Number of tokens in multimodal embedding does not match those in the input text. "
-            f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
+            f"Got {expected_token_count} tokens in the text but {num_mm_tokens_in_embedding} "
             f"tokens from multimodal embeddings."
         )
-        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
+        if expected_token_count < num_mm_tokens_in_embedding:
             chunked_prefill_size = get_global_server_args().chunked_prefill_size
             if chunked_prefill_size != -1:
                 logger.warning(
@@ -484,13 +488,13 @@ def _adjust_embedding_length(
                 )
             # extract from the end: this is a compromise
             if embedding.dim() == 2:
-                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
+                embedding = embedding[-expected_token_count:, :]
             else:
-                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
+                num_multimodal = expected_token_count // embedding.shape[0]
                 embedding = embedding[-num_multimodal:, :]
         else:
             raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+                f"Insufficient multimodal embedding length: {expected_token_count=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
             )
     return embedding
 
@@ -526,7 +530,7 @@ def get_embedding_and_mask(
     # 1. Get embedding
     embedding = _get_precomputed_embedding(embedding_items)
     if embedding is None:
-        embedding = _get_chunked_prefill_embedding(
+        embedding, expected_token_count = _get_chunked_prefill_embedding(
             data_embedding_func,
             embedding_items,
             items_size,
@@ -541,7 +545,7 @@ def get_embedding_and_mask(
         torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
-    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
+    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger, expected_token_count)
     return embedding, special_multimodal_mask
 
 
