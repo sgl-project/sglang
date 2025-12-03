@@ -145,7 +145,10 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
        d_idx += num_threads * vec_size) {
 
 #pragma unroll
-    for (int i = d_idx; i < min(end, d_idx + vec_size); i++) {
+    for (int i = d_idx; i < d_idx + vec_size; i++) {
+      if (i >= end) {
+        continue;
+      }
       float angles =
           calculate_frequency_and_angle(t_val, i % half, half, max_period);
       o_vec_cos[i - d_idx] = cast_to<O>(cosf(angles));
@@ -202,9 +205,8 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
   DIM_SWITCH(dim, kDim, /* bad case */ 1, [&] {
     // if dim not in [512, 1024, 2048, 4096]:
     //    vec_size = 1
-    constexpr int vec_size = (kDim % 8 == 0)   ? 8
-                             : (kDim % 4 == 0) ? 4
-                             : (kDim % 2 == 0) ? 2
+    constexpr int vec_size = (kDim % 8 == 0)   ? 4
+                             : (kDim % 4 == 0) ? 2
                                                : 1;
     constexpr int num_threads = 512 / vec_size;
     constexpr int BLOCK_SIZE_DIM = vec_size * num_threads;
