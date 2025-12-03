@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::{from_str, to_string, to_value, to_vec};
-use sglang_router_rs::{
+use sgl_model_gateway::{
     core::{BasicWorker, BasicWorkerBuilder, Worker, WorkerType},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
