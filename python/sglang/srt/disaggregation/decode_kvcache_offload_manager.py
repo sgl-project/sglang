@@ -1,9 +1,6 @@
-from __future__ import annotations
-
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
 
 import torch
 
@@ -20,9 +17,6 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
@@ -183,14 +177,14 @@ class DecodeKVCacheOffloadManager:
                 )
             finish_count -= 1
 
-    def _release_finished_req(self, req: Req, prefill_offloaded_len: int):
-        # FIXME: not sure which length to use here: kv_allocated_len or kv_committed_len
+    def _release_finished_req(self, req, prefill_offloaded_len):
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, prefill_offloaded_len : req.kv_allocated_len
+            req.req_pool_idx,
+            : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
         ]
 
         # Free the incremental part of the request
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        self.token_to_kv_pool_allocator.free(kv_indices[prefill_offloaded_len:])
         self.req_to_token_pool.free(req.req_pool_idx)
 
     def _check_backup_progress(self, finish_count):

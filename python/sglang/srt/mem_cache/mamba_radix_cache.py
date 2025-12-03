@@ -430,21 +430,21 @@ class MambaRadixCache(BasePrefixCache):
             value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
         return self._insert_helper(self.root_node, key, value, mamba_value)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
+    def cache_finished_req(self, req: Req, is_insert=True) -> None:
         """Cache request when it finishes."""
-        kv_committed_len = req.pop_committed_kv_cache()
-
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.req_pool_idx,
+                : len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0),
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        cache_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        token_ids = (req.origin_input_ids + req.output_ids)[:cache_len]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :kv_committed_len
+            req.req_pool_idx, : len(token_ids)
         ]
 
         page_aligned_len = len(kv_indices)
