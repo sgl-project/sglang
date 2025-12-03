@@ -10,7 +10,6 @@ pub use media::{ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSou
 pub use registry::{ModelProcessorSpec, ModelRegistry};
 pub use tracker::{AsyncMultiModalTracker, TrackerConfig, TrackerOutput};
 pub use types::*;
-
 // Re-export vision processing components
 pub use vision::{
     ImagePreProcessor, ImageProcessorRegistry, LlavaNextProcessor, LlavaProcessor,

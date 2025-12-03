@@ -12,9 +12,7 @@
 //! python scripts/generate_vision_golden.py
 //! ```
 
-use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::{fs::File, io::Read, path::Path};
 
 use ndarray::Array4;
 use sgl_model_gateway::multimodal::vision::{
@@ -56,7 +54,8 @@ fn load_golden_npz(path: &Path) -> Array4<f32> {
 fn load_config(path: &Path) -> PreProcessorConfig {
     let mut file = File::open(path).expect("Failed to open config");
     let mut contents = String::new();
-    file.read_to_string(&mut contents).expect("Failed to read config");
+    file.read_to_string(&mut contents)
+        .expect("Failed to read config");
     PreProcessorConfig::from_json(&contents).expect("Failed to parse config")
 }
 

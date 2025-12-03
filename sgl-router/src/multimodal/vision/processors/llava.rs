@@ -292,10 +292,19 @@ impl ImagePreProcessor for LlavaProcessor {
             .map(|_| self.calculate_num_tokens(self.image_size, self.image_size, config))
             .collect();
 
-        Ok(PreprocessedImages::new(pixel_values, num_img_tokens, image_sizes))
+        Ok(PreprocessedImages::new(
+            pixel_values,
+            num_img_tokens,
+            image_sizes,
+        ))
     }
 
-    fn calculate_num_tokens(&self, _width: u32, _height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        _width: u32,
+        _height: u32,
+        config: &PreProcessorConfig,
+    ) -> usize {
         // For LLaVA 1.5, token count is based on processed image size and patch size
         let patch_size = config.patch_size.unwrap_or(self.patch_size as usize) as u32;
         let image_size = config
@@ -398,15 +407,7 @@ impl LlavaNextProcessor {
                     })
                     .collect()
             })
-            .unwrap_or_else(|| {
-                vec![
-                    (336, 672),
-                    (672, 336),
-                    (672, 672),
-                    (1008, 336),
-                    (336, 1008),
-                ]
-            });
+            .unwrap_or_else(|| vec![(336, 672), (672, 336), (672, 672), (1008, 336), (336, 1008)]);
 
         Self {
             base,
@@ -506,70 +507,45 @@ impl ImagePreProcessor for LlavaNextProcessor {
             return Err(TransformError::EmptyBatch);
         }
 
-        // For now, process one image at a time (like mistral.rs)
-        // TODO: Support batch processing
-        if images.len() > 1 {
-            // Process batch by iterating
-            let mut all_tensors = Vec::new();
-            let mut all_tokens = Vec::new();
-            let mut all_sizes = Vec::new();
+        let mut all_patches = Vec::new();
+        let mut num_img_tokens = Vec::with_capacity(images.len());
+        let mut image_sizes = Vec::with_capacity(images.len());
 
-            for image in images {
-                let single_result = self.preprocess(std::slice::from_ref(image), config)?;
-                // Collect tensors from each image
-                for i in 0..single_result.batch_size() {
-                    all_tensors.push(
-                        single_result
-                            .pixel_values
-                            .slice(ndarray::s![i, .., .., ..])
-                            .to_owned(),
-                    );
-                }
-                all_tokens.extend(single_result.num_img_tokens);
-                all_sizes.extend(single_result.image_sizes);
-            }
-
-            let pixel_values = stack_batch(&all_tensors)?;
-            return Ok(PreprocessedImages::new(pixel_values, all_tokens, all_sizes));
-        }
-
-        let image = &images[0];
-        let original_size = image.dimensions();
         let filter = pil_to_filter(config.resampling);
         let target_size = config
             .get_target_size()
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
-
-        // Get crop size from config
         let crop_size = config.get_crop_size().unwrap_or((target_size, target_size));
 
-        // Select best resolution and create padded image
-        let best_resolution = self.select_best_resolution(original_size);
-        let image_padded = self.resize_and_pad_image(image, best_resolution);
+        for image in images {
+            let original_size = image.dimensions();
+            image_sizes.push(original_size);
 
-        // Create original resized image (first sample)
-        let image_original_resize = resize(image, target_size, target_size, filter);
+            let best_resolution = self.select_best_resolution(original_size);
+            let image_padded = self.resize_and_pad_image(image, best_resolution);
+            let image_original_resize = resize(image, target_size, target_size, filter);
 
-        // Collect all samples: original + crops
-        let mut samples = vec![image_original_resize];
-        samples.extend(self.divide_to_samples(&image_padded, crop_size));
+            let mut samples = vec![image_original_resize];
+            samples.extend(self.divide_to_samples(&image_padded, crop_size));
 
-        // Process all samples
-        let tensors: Vec<Array3<f32>> = samples
-            .iter()
-            .map(|img| self.process_patch(img, config))
-            .collect::<Result<Vec<_>, _>>()?;
+            for sample in samples {
+                all_patches.push(self.process_patch(&sample, config)?);
+            }
 
-        let pixel_values = stack_batch(&tensors)?;
+            num_img_tokens.push(self.calculate_num_tokens(
+                original_size.0,
+                original_size.1,
+                config,
+            ));
+        }
 
-        // Calculate tokens for this image
-        let num_tokens = self.calculate_num_tokens(original_size.0, original_size.1, config);
+        let pixel_values = stack_batch(&all_patches)?;
 
         Ok(PreprocessedImages::new(
             pixel_values,
-            vec![num_tokens],
-            vec![original_size],
+            num_img_tokens,
+            image_sizes,
         ))
     }
 
@@ -825,13 +801,7 @@ mod tests {
 
     #[test]
     fn test_select_best_resolution() {
-        let pinpoints = vec![
-            (336, 672),
-            (672, 336),
-            (672, 672),
-            (1008, 336),
-            (336, 1008),
-        ];
+        let pinpoints = vec![(336, 672), (672, 336), (672, 672), (1008, 336), (336, 1008)];
 
         // Square image should pick square resolution
         let best = select_best_resolution((500, 500), &pinpoints);
