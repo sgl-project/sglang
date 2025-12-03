@@ -93,6 +93,7 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
+from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
@@ -1965,11 +1966,32 @@ def get_npu_compiler_config():
     return config
 
 
-def get_compiler_backend() -> str:
+def get_compiler_backend(
+    mode=None,
+    model_runner=None,
+    compilation_config: CompilationConfig = None,
+    compilation_context=None,
+) -> str:
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
     if hasattr(torch, "npu") and torch.npu.is_available():
+        if mode == "piecewise":
+            from sglang.srt.model_executor.compilation.piecewise_npu_graph_compiler_backend import (
+                PiecewiseNpuGraphCompilerBackend,
+            )
+
+            return PiecewiseNpuGraphCompilerBackend(
+                model_runner, compilation_config, compilation_context
+            )
+
+        if mode == "npugraph_fused":
+            from sglang.srt.compilation.npu.npu_graph_compiler_backend import (
+                NpuGraphCompilerBackend,
+            )
+
+            return NpuGraphCompilerBackend(model_runner)
+
         try:
             import torchair
             import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
@@ -1980,10 +2002,8 @@ def get_compiler_backend() -> str:
                 "Please install torchair for torch.compile support on NPU."
             )
         compiler_config = CompilerConfig()
-        predefined_config = get_npu_compiler_config()
-        for k, v in predefined_config.items():
-            setattr(compiler_config.experimental_config, k, v)
-
+        # TODO(iforgetmyname): Change this default value once torch_npu version 7.2.0
+        compiler_config.mode = "max-autotune" if mode is None else mode
         npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
         return npu_backend
 
@@ -2053,7 +2073,7 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        my_lib.impl(op_name, op_func, "CUDA")
+        my_lib.impl(op_name, op_func, "CUDA" if not is_npu() else "PrivateUse1")
         if fake_impl is not None:
             my_lib._register_fake(op_name, fake_impl)
     except RuntimeError as error:
