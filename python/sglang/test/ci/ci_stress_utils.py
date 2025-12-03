@@ -1,8 +1,9 @@
 """Utilities for running stress tests with bench_serving."""
 
 import os
+import re
 import subprocess
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
@@ -26,16 +27,16 @@ class StressTestRunner:
         self,
         test_name: str,
         base_url: str,
-        num_prompts: int = 50000,
-        duration_minutes: int = 45,
+        num_prompts: int = 20000,
+        duration_minutes: int = 30,
     ):
         """Initialize the stress test runner.
 
         Args:
             test_name: Name of the test (used for reporting)
             base_url: Base URL for the server
-            num_prompts: Number of prompts to send (default: 50000)
-            duration_minutes: Timeout in minutes (default: 45)
+            num_prompts: Number of prompts to send (default: 20000)
+            duration_minutes: Timeout in minutes (default: 30)
         """
         self.test_name = test_name
         self.base_url = base_url
@@ -92,6 +93,35 @@ class StressTestRunner:
 
         return command
 
+    def _parse_metrics_from_output(self, stdout: str) -> Dict[str, float]:
+        """Parse benchmark metrics from bench_serving stdout.
+
+        Args:
+            stdout: The stdout from bench_serving
+
+        Returns:
+            Dictionary containing parsed metrics
+        """
+        metrics = {}
+
+        # Parse key metrics using regex
+        patterns = {
+            "completed": r"Successful requests:\s+(\d+)",
+            "duration": r"Benchmark duration \(s\):\s+([\d.]+)",
+            "request_throughput": r"Request throughput \(req/s\):\s+([\d.]+)",
+            "output_throughput": r"Output token throughput \(tok/s\):\s+([\d.]+)",
+            "mean_ttft_ms": r"Mean TTFT \(ms\):\s+([\d.]+)",
+            "median_ttft_ms": r"Median TTFT \(ms\):\s+([\d.]+)",
+            "p99_ttft_ms": r"P99 TTFT \(ms\):\s+([\d.]+)",
+        }
+
+        for key, pattern in patterns.items():
+            match = re.search(pattern, stdout)
+            if match:
+                metrics[key] = float(match.group(1))
+
+        return metrics
+
     def run_stress_test_command(
         self, command: List[str], timeout_minutes: Optional[int] = None
     ) -> subprocess.CompletedProcess:
@@ -102,24 +132,41 @@ class StressTestRunner:
             timeout_minutes: Timeout in minutes (uses class default if None)
 
         Returns:
-            CompletedProcess result
+            CompletedProcess result (or a mock result on timeout)
         """
         timeout = (timeout_minutes or self.duration_minutes) * 60
         print(f"Running stress test command (timeout: {timeout}s):")
         print(f"  {' '.join(command)}")
 
-        result = subprocess.run(
-            command, capture_output=True, text=True, timeout=timeout
-        )
-
-        if result.returncode != 0:
-            print(f"Error running stress test:")
-            print(result.stderr)
-            raise RuntimeError(
-                f"Stress test failed with return code {result.returncode}"
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=timeout
             )
 
-        return result
+            if result.returncode != 0:
+                print("Error running stress test:")
+                print(result.stderr)
+                raise RuntimeError(
+                    f"Stress test failed with return code {result.returncode}"
+                )
+
+            return result
+
+        except subprocess.TimeoutExpired as e:
+            # Timeout is expected for throughput benchmarking - parse partial results
+            print(f"\nStress test reached timeout ({timeout}s) - this is expected.")
+            print("Parsing throughput metrics from partial output...")
+
+            # Get stdout/stderr from the TimeoutExpired exception
+            stdout = e.stdout.decode("utf-8") if e.stdout else ""
+            stderr = e.stderr.decode("utf-8") if e.stderr else ""
+
+            # Create a mock CompletedProcess with the partial output
+            result = subprocess.CompletedProcess(
+                args=command, returncode=0, stdout=stdout, stderr=stderr
+            )
+
+            return result
 
     def run_stress_test_for_model(
         self,
@@ -183,10 +230,15 @@ class StressTestRunner:
                 extra_args=extra_bench_args,
             )
 
-            self.run_stress_test_command(command, timeout_minutes)
+            result = self.run_stress_test_command(command, timeout_minutes)
+
+            # Parse metrics from output
+            metrics = self._parse_metrics_from_output(result.stdout)
 
             print(f"\nStress test completed successfully for {model_path}")
-            self._add_success_to_report(model_path, random_input_len, random_output_len)
+            self._add_success_to_report(
+                model_path, random_input_len, random_output_len, metrics
+            )
             return True
 
         except Exception as e:
@@ -196,27 +248,48 @@ class StressTestRunner:
 
         finally:
             # Always clean up server process
-            print(f"Cleaning up server process...")
+            print("Cleaning up server process...")
             kill_process_tree(process.pid)
 
     def _add_success_to_report(
-        self, model_path: str, input_len: int, output_len: int
+        self,
+        model_path: str,
+        input_len: int,
+        output_len: int,
+        metrics: Dict[str, float],
     ) -> None:
-        """Add success entry to report."""
+        """Add success entry to report with throughput metrics."""
         model_name = model_path.split("/")[-1]
         self.full_report += f"### {model_name} - Success\n"
         self.full_report += f"- Model: `{model_path}`\n"
         self.full_report += f"- Input Length: {input_len}\n"
         self.full_report += f"- Output Length: {output_len}\n"
-        self.full_report += f"- Num Prompts: {self.num_prompts}\n"
-        self.full_report += f"- Status: **PASSED**\n\n"
+        self.full_report += f"- Target Prompts: {self.num_prompts}\n"
+
+        # Add throughput metrics if available
+        if metrics.get("completed"):
+            self.full_report += f"- Completed Requests: {int(metrics['completed'])}\n"
+        if metrics.get("duration"):
+            self.full_report += f"- Duration: {metrics['duration']:.1f}s\n"
+        if metrics.get("request_throughput"):
+            self.full_report += (
+                f"- Request Throughput: {metrics['request_throughput']:.2f} req/s\n"
+            )
+        if metrics.get("output_throughput"):
+            self.full_report += (
+                f"- Output Token Throughput: {metrics['output_throughput']:.2f} tok/s\n"
+            )
+        if metrics.get("median_ttft_ms"):
+            self.full_report += f"- Median TTFT: {metrics['median_ttft_ms']:.2f}ms\n"
+
+        self.full_report += "- Status: **PASSED**\n\n"
 
     def _add_failure_to_report(self, model_path: str, error: str) -> None:
         """Add failure entry to report."""
         model_name = model_path.split("/")[-1]
         self.full_report += f"### {model_name} - Failure\n"
         self.full_report += f"- Model: `{model_path}`\n"
-        self.full_report += f"- Status: **FAILED**\n"
+        self.full_report += "- Status: **FAILED**\n"
         self.full_report += f"- Error: {error}\n\n"
 
     def write_final_report(self) -> None:

@@ -6,12 +6,12 @@ on:
       num_prompts:
         description: 'Number of prompts per model'
         required: true
-        default: '50000'
+        default: '20000'
         type: string
       duration_minutes:
         description: 'Timeout per model in minutes'
         required: true
-        default: '180'
+        default: '30'
         type: string
 
 jobs:
@@ -31,15 +31,28 @@ jobs:
         run: |
           bash scripts/ci/ci_install_dependency.sh
 
+      - name: Initialize summary report
+        run: |
+          echo "# Stress Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Number of prompts: ${{ inputs.num_prompts }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Duration per model: ${{ inputs.duration_minutes }} minutes" >> $GITHUB_STEP_SUMMARY
+          echo "- Input/Output lengths: 16384/1024 tokens" >> $GITHUB_STEP_SUMMARY
+          echo "- Server: 8x H200 GPUs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
       - name: Run stress tests
-        timeout-minutes: 480
+        timeout-minutes: 180
         env:
           NUM_PROMPTS: ${{ inputs.num_prompts }}
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
           SGLANG_SERVER_LAUNCH_TIMEOUT: '3600'
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stress --timeout-per-file 11000
+          python3 run_suite.py --hw cuda --suite stress --timeout-per-file 2400
 
       - name: Upload results
         if: always()

@@ -1,4 +1,4 @@
-"""Stress test for Kimi-K2-Thinking model."""
+"""Stress test for DeepSeek-V3 model."""
 
 import os
 import unittest
@@ -7,16 +7,16 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.ci.ci_stress_utils import StressTestRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
-MODEL_PATH = "moonshotai/Kimi-K2-Thinking"
+MODEL_PATH = "deepseek-ai/DeepSeek-V3"
 RANDOM_INPUT_LEN = 16384
 RANDOM_OUTPUT_LEN = 1024
-OUTPUT_FILE = "stress_test_kimi_k2.jsonl"
+OUTPUT_FILE = "stress_test_deepseek_v3.jsonl"
 
 # Register for CI - estimated 30 minutes for throughput benchmarking
 register_cuda_ci(est_time=1800, suite="stress")
 
 
-class TestStressKimiK2(unittest.TestCase):
+class TestStressDeepSeekV3(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL_PATH
@@ -25,13 +25,13 @@ class TestStressKimiK2(unittest.TestCase):
         cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "30"))
 
         cls.runner = StressTestRunner(
-            test_name="Kimi-K2-Thinking Stress Test",
+            test_name="DeepSeek-V3 Stress Test",
             base_url=cls.base_url,
             num_prompts=cls.num_prompts,
             duration_minutes=cls.duration_minutes,
         )
 
-    def test_stress_kimi_k2(self):
+    def test_stress_deepseek_v3(self):
         try:
             success = self.runner.run_stress_test_for_model(
                 model_path=self.model,
@@ -42,10 +42,6 @@ class TestStressKimiK2(unittest.TestCase):
                     "--tp",
                     "8",
                     "--trust-remote-code",
-                    "--tool-call-parser",
-                    "kimi_k2",
-                    "--reasoning-parser",
-                    "kimi_k2",
                     "--mem-fraction-static",
                     "0.90",
                 ],
