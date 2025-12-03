@@ -61,7 +61,6 @@ logger = logging.getLogger(__name__)
 _ENABLE_SHAPE_PROFILING = os.environ.get("SGLANG_PROFILE_SHAPES", "0") == "1"
 _SHAPE_PROFILE_RANK = int(os.environ.get("SGLANG_PROFILE_SHAPES_RANK", "0"))
 _SHAPE_PROFILE_FILE = os.environ.get("SGLANG_PROFILE_SHAPES_FILE", "shapes.jsonl")
-_SHAPE_PROFILE_MAX_OPS = int(os.environ.get("SGLANG_PROFILE_SHAPES_MAX_OPS", "0"))  # 0 = unlimited
 _shape_logger_module = None
 
 if _ENABLE_SHAPE_PROFILING:
@@ -72,7 +71,7 @@ if _ENABLE_SHAPE_PROFILING:
             sys.path.insert(0, _profiler_path)
             from torch_shape_logger_rank import CompactRankAwareShapeLogger
             _shape_logger_module = CompactRankAwareShapeLogger
-            logger.info(f"Shape profiling enabled: rank={_SHAPE_PROFILE_RANK}, file={_SHAPE_PROFILE_FILE}, max_ops={_SHAPE_PROFILE_MAX_OPS or 'unlimited'}")
+            logger.info(f"Shape profiling enabled: rank={_SHAPE_PROFILE_RANK}, file={_SHAPE_PROFILE_FILE}")
     except Exception as e:
         logger.warning(f"Failed to load shape profiling: {e}")
         _ENABLE_SHAPE_PROFILING = False
@@ -309,7 +308,6 @@ class TpModelWorker(BaseTpWorker):
                     output_file=_SHAPE_PROFILE_FILE,
                     verbose=False,
                     only_rank=_SHAPE_PROFILE_RANK,
-                    max_operations=_SHAPE_PROFILE_MAX_OPS if _SHAPE_PROFILE_MAX_OPS > 0 else None,
                 )
                 logger.info(f"[TP Rank {self.tp_rank}] Shape profiler initialized")
             except Exception as e:
@@ -407,95 +405,104 @@ class TpModelWorker(BaseTpWorker):
                 logger.warning(f"[TP Rank {self.tp_rank}] Failed to activate profiler: {e}")
                 self._shape_logger = None
 
-        if model_worker_batch is not None:
-            # update the consumer index of hicache to the running batch
-            self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+        # Mark start of forward pass for profiling
+        if self._shape_logger and self._shape_profiling_started:
+            self._shape_logger.start_forward_pass()
 
-            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        else:
-            # FIXME(lsyin): unify the interface of forward_batch
-            assert forward_batch is not None
+        try:
+            if model_worker_batch is not None:
+                # update the consumer index of hicache to the running batch
+                self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
-        pp_proxy_tensors = None
-        if not self.pp_group.is_first_rank:
-            pp_proxy_tensors = PPProxyTensors(
-                self.pp_group.recv_tensor_dict(
-                    all_gather_group=self.get_attention_tp_group()
+                forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            else:
+                # FIXME(lsyin): unify the interface of forward_batch
+                assert forward_batch is not None
+
+            pp_proxy_tensors = None
+            if not self.pp_group.is_first_rank:
+                pp_proxy_tensors = PPProxyTensors(
+                    self.pp_group.recv_tensor_dict(
+                        all_gather_group=self.get_attention_tp_group()
+                    )
                 )
-            )
 
-        if self.pp_group.is_last_rank:
-            if self.is_dllm():
-                logits_output, next_token_ids, can_run_cuda_graph = (
-                    self.dllm_algorithm.run(self.model_runner, forward_batch)
+            if self.pp_group.is_last_rank:
+                if self.is_dllm():
+                    logits_output, next_token_ids, can_run_cuda_graph = (
+                        self.dllm_algorithm.run(self.model_runner, forward_batch)
+                    )
+                    return GenerationBatchResult(
+                        logits_output=logits_output,
+                        next_token_ids=next_token_ids,
+                        can_run_cuda_graph=can_run_cuda_graph,
+                    )
+
+                logits_output, can_run_cuda_graph = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_attn_backend_init=skip_attn_backend_init,
                 )
-                return GenerationBatchResult(
+                batch_result = GenerationBatchResult(
                     logits_output=logits_output,
-                    next_token_ids=next_token_ids,
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
 
-            logits_output, can_run_cuda_graph = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
-            )
-            batch_result = GenerationBatchResult(
-                logits_output=logits_output,
-                can_run_cuda_graph=can_run_cuda_graph,
-            )
+                if is_verify:
+                    # Skip sampling and return logits for target forward
+                    return batch_result
 
-            if is_verify:
-                # Skip sampling and return logits for target forward
-                return batch_result
+                if (
+                    self.enable_overlap
+                    and not self.enable_spec
+                    and model_worker_batch.sampling_info.grammars is not None
+                ):
 
-            if (
-                self.enable_overlap
-                and not self.enable_spec
-                and model_worker_batch.sampling_info.grammars is not None
-            ):
+                    def sample_batch_func():
+                        batch_result.next_token_ids = self.model_runner.sample(
+                            logits_output, forward_batch
+                        )
+                        return batch_result
 
-                def sample_batch_func():
+                    batch_result.delay_sample_func = sample_batch_func
+                    return batch_result
+
+                if model_worker_batch.is_prefill_only:
+                    # For prefill-only requests, create dummy token IDs on CPU
+                    # The size should match the batch size (number of sequences), not total tokens
+                    batch_result.next_token_ids = torch.zeros(
+                        len(model_worker_batch.seq_lens),
+                        dtype=torch.long,
+                        device=model_worker_batch.input_ids.device,
+                    )
+                    if (
+                        model_worker_batch.return_logprob
+                        and logits_output.next_token_logits is not None
+                    ):
+                        # NOTE: Compute logprobs without full sampling
+                        self.model_runner.compute_logprobs_only(
+                            logits_output, model_worker_batch
+                        )
+                else:
                     batch_result.next_token_ids = self.model_runner.sample(
                         logits_output, forward_batch
                     )
-                    return batch_result
 
-                batch_result.delay_sample_func = sample_batch_func
                 return batch_result
-
-            if model_worker_batch.is_prefill_only:
-                # For prefill-only requests, create dummy token IDs on CPU
-                # The size should match the batch size (number of sequences), not total tokens
-                batch_result.next_token_ids = torch.zeros(
-                    len(model_worker_batch.seq_lens),
-                    dtype=torch.long,
-                    device=model_worker_batch.input_ids.device,
-                )
-                if (
-                    model_worker_batch.return_logprob
-                    and logits_output.next_token_logits is not None
-                ):
-                    # NOTE: Compute logprobs without full sampling
-                    self.model_runner.compute_logprobs_only(
-                        logits_output, model_worker_batch
-                    )
             else:
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
+                pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    skip_attn_backend_init=skip_attn_backend_init,
                 )
-
-            return batch_result
-        else:
-            pp_proxy_tensors, can_run_cuda_graph = self.model_runner.forward(
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                skip_attn_backend_init=skip_attn_backend_init,
-            )
-            return GenerationBatchResult(
-                pp_hidden_states_proxy_tensors=pp_proxy_tensors,
-                can_run_cuda_graph=can_run_cuda_graph,
-            )
+                return GenerationBatchResult(
+                    pp_hidden_states_proxy_tensors=pp_proxy_tensors,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                )
+        finally:
+            # Mark end of forward pass for profiling
+            if self._shape_logger and self._shape_profiling_started:
+                self._shape_logger.end_forward_pass()
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):
         if batch.split_index == 0:

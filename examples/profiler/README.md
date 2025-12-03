@@ -23,11 +23,10 @@ python profile_shapes.py \
 Enables profiling inside TP workers via environment variables. Profiles operations on a specific GPU rank.
 
 ```bash
-# Profile GPU 0 with TP=8, limit to first 1000 operations
+# Profile GPU 0 with TP=8
 SGLANG_PROFILE_SHAPES=1 \
 SGLANG_PROFILE_SHAPES_RANK=0 \
 SGLANG_PROFILE_SHAPES_FILE=gpu0_shapes.jsonl \
-SGLANG_PROFILE_SHAPES_MAX_OPS=1000 \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-14B-Instruct \
   --tp-size 8 \
@@ -38,46 +37,38 @@ python -m sglang.launch_server \
 - `SGLANG_PROFILE_SHAPES=1` - Enable profiling
 - `SGLANG_PROFILE_SHAPES_RANK=0` - Which GPU rank to profile (0-7 for TP=8)
 - `SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl` - Output file path
-- `SGLANG_PROFILE_SHAPES_MAX_OPS=1000` - Limit operations (0 or unset = unlimited)
 
-**Advantages:**
+**Key Points:**
 - ✅ Works with any TP size
+- ✅ Profiles complete forward passes (not arbitrary operation counts)
+- ✅ Only profiles one rank (other ranks are identical in TP)
 - ✅ Captures actual tensor operations in workers
-- ✅ Minimal overhead (only profiles one rank)
-- ✅ Can limit to N operations (avoids huge files)
-- ✅ Auto-stops after limit (no manual intervention)
+- ✅ Minimal overhead
 - ✅ No code modifications needed
-
-**Recommended limits:**
-- Quick check: `MAX_OPS=100` (one batch worth)
-- Full iteration: `MAX_OPS=1000` (prefill + decode)
-- Production profiling: `MAX_OPS=5000` (multiple batches)
-- Unlimited: `MAX_OPS=0` or don't set (use with caution!)
 
 **Example with client:**
 ```bash
-# Terminal 1: Start server with profiling (limit to 1000 ops)
+# Terminal 1: Start server with profiling
 SGLANG_PROFILE_SHAPES=1 SGLANG_PROFILE_SHAPES_RANK=0 \
 SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl \
-SGLANG_PROFILE_SHAPES_MAX_OPS=1000 \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-14B-Instruct \
   --tp-size 8
 
-# Terminal 2: Send requests
+# Terminal 2: Send a few requests  
 python -c "
 import openai
 client = openai.Client(base_url='http://localhost:30000/v1', api_key='none')
-response = client.chat.completions.create(
-    model='default',
-    messages=[{'role': 'user', 'content': 'Hello!'}],
-    max_tokens=50
-)
-print(response.choices[0].message.content)
+for i in range(3):
+    response = client.chat.completions.create(
+        model='default',
+        messages=[{'role': 'user', 'content': f'Request {i+1}'}],
+        max_tokens=50
+    )
+    print(f'{i+1}: {response.choices[0].message.content}')
 "
 
-# Profiling will auto-stop after 1000 operations
-# Output in shapes.jsonl (~50-200KB instead of 3-4MB)
+# Profiling output in shapes.jsonl tracks complete forward passes
 ```
 
 ## Which Mode to Use?

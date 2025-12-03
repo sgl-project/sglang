@@ -6,8 +6,7 @@ Only logs operations on specified rank to avoid overhead.
 
 Usage in TP worker (automatically activated by environment variables):
     SGLANG_PROFILE_SHAPES=1 SGLANG_PROFILE_SHAPES_RANK=0 \\
-    SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl \\
-    SGLANG_PROFILE_SHAPES_MAX_OPS=1000 python -m sglang.launch_server ...
+    SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl python -m sglang.launch_server ...
 """
 
 import atexit
@@ -33,47 +32,50 @@ def get_current_rank() -> int:
 
 
 class CompactRankAwareShapeLogger(TorchDispatchMode):
-    """Compact shape logger that only logs on specified rank with operation limit."""
+    """Compact shape logger that only logs on specified rank."""
 
     def __init__(
         self,
         output_file: str = "shapes.jsonl",
         verbose: bool = False,
         only_rank: Optional[int] = None,
-        max_operations: Optional[int] = None,  # Limit total operations
     ):
         super().__init__()
         self.output_file = output_file
         self.verbose = verbose
         self.only_rank = only_rank
-        self.max_operations = max_operations
         self.call_count = 0
         self.op_counts = defaultdict(int)
         self.file_handle = None
         self.current_rank = get_current_rank()
         self.should_log = (only_rank is None) or (self.current_rank == only_rank)
-        self._stopped = False
+        self._forward_pass_count = 0
+        self._in_forward_pass = False
+
+    def start_forward_pass(self):
+        """Called by tp_worker to mark start of forward pass."""
+        if self.should_log and not self._in_forward_pass:
+            self._in_forward_pass = True
+            self._forward_pass_count += 1
+            if self.verbose:
+                print(f"[Rank {self.current_rank}] Forward pass #{self._forward_pass_count} started")
+
+    def end_forward_pass(self):
+        """Called by tp_worker to mark end of forward pass."""
+        if self.should_log and self._in_forward_pass:
+            self._in_forward_pass = False
+            if self.verbose:
+                print(f"[Rank {self.current_rank}] Forward pass #{self._forward_pass_count} ended, ops={self.call_count}")
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
             kwargs = {}
         result = func(*args, **kwargs)
         
-        # Check if we should stop logging
-        if self.should_log and not self._stopped:
-            if self.max_operations and self.call_count >= self.max_operations:
-                self._stop_logging()
-            else:
-                self._log_operation(func, result)
+        if self.should_log and self._in_forward_pass:
+            self._log_operation(func, result)
         
         return result
-
-    def _stop_logging(self):
-        """Stop logging and cleanup."""
-        if not self._stopped:
-            self._stopped = True
-            print(f"[Rank {self.current_rank}] Reached max operations ({self.max_operations}), stopping profiler")
-            self._cleanup()
 
     def _extract_shapes(self, obj) -> Optional[Any]:
         """Extract only shapes (no dtype/device)."""
@@ -99,6 +101,7 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                 try:
                     log_entry = {
                         "call_id": self.call_count,
+                        "forward_pass": self._forward_pass_count,
                         "operation": op_name,
                         "outputs": output_shapes,
                     }
@@ -113,18 +116,16 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         if self.should_log:
             self.call_count = 0
             self.op_counts.clear()
-            self._stopped = False
+            self._forward_pass_count = 0
+            self._in_forward_pass = False
             self.file_handle = open(self.output_file, "w")
             atexit.register(self._cleanup)
-            msg = f"[Rank {self.current_rank}] Shape profiling enabled → {self.output_file}"
-            if self.max_operations:
-                msg += f" (max {self.max_operations} ops)"
-            print(msg)
+            print(f"[Rank {self.current_rank}] Shape profiling enabled → {self.output_file}")
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         super().__exit__(exc_type, exc_val, exc_tb)
-        if self.should_log and not self._stopped:
+        if self.should_log:
             self._cleanup()
         return False
 
@@ -139,14 +140,14 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                 summary = {
                     "rank": self.current_rank,
                     "total_operations": self.call_count,
+                    "forward_passes": self._forward_pass_count,
                     "unique_operations": len(self.op_counts),
-                    "max_operations": self.max_operations,
-                    "stopped_early": self.max_operations and self.call_count >= self.max_operations,
                     "operation_counts": dict(sorted(self.op_counts.items(), key=lambda x: x[1], reverse=True)[:50]),
                 }
                 with open(summary_file, "w") as f:
                     json.dump(summary, f, indent=2)
-                print(f"[Rank {self.current_rank}] Profiled {self.call_count} ops → {self.output_file}")
+                print(f"[Rank {self.current_rank}] Profiled {self.call_count} ops across {self._forward_pass_count} forward passes → {self.output_file}")
             except Exception:
                 pass
+
 
