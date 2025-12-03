@@ -25,7 +25,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.mtp_kernels import assign_new_state_triton
 from sglang.srt.speculative.spec_utils import fast_topk
@@ -429,7 +428,6 @@ class MTPDraftExtendCudaGraphRunner:
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
-    @nvtx_annotated_method("MTPDraftExtendCudaGraphRunner.init_replay_state")
     def init_replay_state(
         self, forward_batch: ForwardBatch, bs: int, raw_bs: int, num_tokens: int
     ):
@@ -458,7 +456,6 @@ class MTPDraftExtendCudaGraphRunner:
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
 
-    @nvtx_annotated_method("MTPDraftExtendCudaGraphRunner.replay")
     def replay(self, forward_batch: ForwardBatch, init_state: bool = True):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()

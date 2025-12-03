@@ -10,7 +10,6 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
-from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -191,7 +190,6 @@ class MTPDraftWorker(BaseDraftWorker):
                 forward_batch, batch_result
             )
 
-    @nvtx_annotated_method("MTPDraftWorker.draft")
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -256,7 +254,6 @@ class MTPDraftWorker(BaseDraftWorker):
             seq_lens_cpu=None,
         )
 
-    @nvtx_annotated_method("MTPDraftWorker.draft_forward")
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
@@ -322,7 +319,6 @@ class MTPDraftWorker(BaseDraftWorker):
     def draft_extend(self):
         pass
 
-    @nvtx_annotated_method("MTPDraftWorker._draft_extend_for_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ModelWorkerBatch,
@@ -394,7 +390,6 @@ class MTPDraftWorker(BaseDraftWorker):
             )
         return next_draft_input
 
-    @nvtx_annotated_method("MTPDraftWorker._draft_extend_for_decode")
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
@@ -499,7 +494,7 @@ class MTPDraftWorker(BaseDraftWorker):
         # draft_logits_output.hidden_states = draft_logits_output.hidden_states[
         #     select_index
         # ]
-        batch_result.next_token_ids_backup = next_token_ids_backup
+        batch_result.next_token_ids = next_token_ids_backup
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
         (
@@ -605,7 +600,6 @@ class MTPWorkerV2(BaseSpecWorker):
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
-    @nvtx_annotated_method("MTPWorkerV2.verify")
     def verify(
         self,
         batch: ModelWorkerBatch,
