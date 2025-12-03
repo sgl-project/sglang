@@ -118,8 +118,10 @@ class RotaryEmbedding(CustomOp):
             and not (_is_cpu and _is_cpu_amx_available)
             and not (_is_xpu)
         ):
+            from vllm._custom_ops import rotary_embedding
+
             self.use_fallback_kernel = True
-            self.fallback_rotary_embedding = torch.ops.sgl_kernel.rotary_embedding
+            self.fallback_rotary_embedding = rotary_embedding
         else:
             self.use_fallback_kernel = False
 
