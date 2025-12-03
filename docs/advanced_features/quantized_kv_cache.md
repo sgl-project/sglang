@@ -65,15 +65,7 @@ Currently, only per-tensor (scalar) scaling factors are supported.
 Scaling factors can be:
 
 - **Loaded from checkpoints**: Pre-quantized models (e.g., ModelOpt) may include `k_scale` and `v_scale` parameters that are automatically loaded
-- **Provided via JSON**: Supply scaling factors via `--quantization-param-path`:
-
-```bash
-python3 -m sglang.launch_server \
-    --model-path deepseek-ai/DeepSeek-R1-0528 \
-    --kv-cache-dtype fp8_e4m3 \
-    --quantization-param-path /path/to/kv_cache_scales.json \
-    --port 30000 --host 0.0.0.0
-```
+- **Provided via JSON**: Supply scaling factors via `--quantization-param-path`.
 
 The JSON file should follow this format:
 
