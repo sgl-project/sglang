@@ -2033,8 +2033,11 @@ class FlashAttentionBackend(AttentionBackend):
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
 
+            extend_seq_lens_tensor = getattr(spec_info, "extend_seq_lens_tensor", None)
             extend_seq_lens_cpu = getattr(spec_info, "extend_seq_lens_cpu", None)
-            if extend_seq_lens_cpu is not None:
+            if extend_seq_lens_tensor is not None:
+                extend_seq_lens = extend_seq_lens_tensor.to(torch.int32)
+            elif extend_seq_lens_cpu is not None:
                 extend_seq_lens = torch.as_tensor(
                     extend_seq_lens_cpu,
                     dtype=torch.int32,
@@ -2049,8 +2052,8 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 extend_seq_lens_cpu = [default_extend] * bs
 
-            if extend_seq_lens.numel() > 0:
-                metadata.max_seq_len_q = int(extend_seq_lens.max().item())
+            if extend_seq_lens_cpu:
+                metadata.max_seq_len_q = int(max(extend_seq_lens_cpu))
             else:
                 metadata.max_seq_len_q = getattr(
                     spec_info, "num_tokens_per_batch", self.speculative_num_steps + 1
