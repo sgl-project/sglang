@@ -929,8 +929,8 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(tmp_batch, tmp_result)
 
             self.launch_batch_sample_if_needed(batch_result)
+            # self.merge_last_extend_batch()
 
-            self.merge_last_extend_batch()
             queue_size = (
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
@@ -978,6 +978,7 @@ class SchedulerDisaggregationDecodeMixin:
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[Tuple[ScheduleBatch, bool]]:
+        self.merge_last_extend_batch()
         new_prebuilt_batch = self.get_new_prebuilt_batch()
 
         ret: Optional[ScheduleBatch] = None
