@@ -5,6 +5,13 @@ if [ ! -f "${test_case}" ];then
   exit 0
 fi
 
+# speed up by using infra cache services
+CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+pip config set global.index-url http://${CACHING_URL}/pypi/simple
+pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
 pip install kubernetes
 pip3 install xgrammar==0.1.25
 source /usr/local/Ascend/ascend-toolkit/set_env.sh

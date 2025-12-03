@@ -36,7 +36,7 @@ jobs:
       - name: Check npu info
         run: |
           npu-smi info
-          
+
       - name: Run test
         timeout-minutes: 300
         env:
@@ -44,4 +44,16 @@ jobs:
           SGLANG_IS_IN_CI: true
           HF_ENDPOINT: https://hf-mirror.com
         run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+
+          # copy required file from our daily cache
+          cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
+          # copy download through proxy
+          curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
+
           python3 -u ${{ inputs.test_case }}
