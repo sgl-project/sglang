@@ -70,10 +70,16 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
             kwargs = {}
+        
+        # Extract input shapes before execution (if profiling)
+        input_shapes = None
+        if self.should_log and self._in_forward_pass:
+            input_shapes = self._extract_shapes(args)
+        
         result = func(*args, **kwargs)
         
         if self.should_log and self._in_forward_pass:
-            self._log_operation(func, result)
+            self._log_operation(func, input_shapes, result)
         
         return result
 
@@ -89,10 +95,10 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
             return {k: v for k, v in shapes.items() if v is not None} or None
         return None
 
-    def _log_operation(self, func, result):
+    def _log_operation(self, func, input_shapes, result):
         """Log operation with minimal overhead."""
         output_shapes = self._extract_shapes(result)
-        if output_shapes:
+        if input_shapes or output_shapes:  # Log if either input or output has shapes
             self.call_count += 1
             op_name = str(func)
             self.op_counts[op_name] += 1
@@ -103,6 +109,7 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                         "call_id": self.call_count,
                         "forward_pass": self._forward_pass_count,
                         "operation": op_name,
+                        "inputs": input_shapes,
                         "outputs": output_shapes,
                     }
                     self.file_handle.write(json.dumps(log_entry) + "\n")
