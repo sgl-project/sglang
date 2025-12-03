@@ -756,6 +756,9 @@ class GroupCoordinator:
                 torch.distributed.all_gather_into_tensor(
                     output_tensor, input_, group=self.device_group
                 )
+        elif _use_aiter:
+            from aiter.dist.parallel_state import outplace_all_gather
+            output_tensor = outplace_all_gather(input_, group_name=self.unique_name)
         else:
             self.all_gather_into_tensor(output_tensor, input_)
 

@@ -11,6 +11,37 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 
 logger = logging.getLogger(__name__)
 
+# Patch aiter's CustomAllreduce to support larger buffer sizes for vision models
+def _patch_custom_allreduce_for_vision_models():
+    """
+    Monkey patch aiter's CustomAllreduce class to use a larger default buffer size.
+    This is needed for large vision model embeddings (e.g., Qwen3-VL) that can exceed
+    the default 64MB buffer size.
+    """
+    try:
+        from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+        
+        desired_buffer_mb = 512
+        desired_buffer_bytes = desired_buffer_mb * 1024 * 1024
+        
+        original_init = CustomAllreduce.__init__
+        
+        def patched_init(self, group, device, max_size=None, *args, **kwargs):
+            # Use the larger buffer size if max_size is not explicitly provided
+            if max_size is None:
+                max_size = desired_buffer_bytes
+            return original_init(self, group, device, max_size, *args, **kwargs)
+        
+        CustomAllreduce.__init__ = patched_init
+        
+        logger.info(
+            f"Patched aiter CustomAllreduce to use {desired_buffer_mb}MB buffer size "
+        )
+    except Exception as e:
+        logger.warning(f"Failed to patch aiter CustomAllreduce: {e}. Using aiter defaults.")
+
+# Apply the patch before aiter initialization
+_patch_custom_allreduce_for_vision_models()
 
 class AiterCommManager:
     def __init__(self):
