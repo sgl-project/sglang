@@ -29,6 +29,7 @@ from sglang.srt.parser.code_completion_parser import (
     FimPosition,
     completion_template_exists,
     register_completion_template,
+    set_completion_template_name,
 )
 from sglang.srt.parser.conversation import (
     Conversation,
@@ -194,6 +195,8 @@ class TemplateManager:
             self._load_json_completion_template(completion_template_arg)
         else:
             self._completion_template_name = completion_template_arg
+        # Set the global completion template name in the parser
+        set_completion_template_name(self._completion_template_name)
 
     def initialize_templates(
         self,
@@ -287,6 +290,8 @@ class TemplateManager:
                 override=True,
             )
         self._completion_template_name = template["name"]
+        # Set the global completion template name in the parser
+        set_completion_template_name(self._completion_template_name)
 
     def _resolve_hf_chat_template(self, tokenizer_manager) -> Optional[str]:
         """
