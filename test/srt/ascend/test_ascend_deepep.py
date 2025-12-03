@@ -47,6 +47,8 @@ class TestAscendDeepEP(CustomTestCase):
             1,
             "--ep-size",
             16,
+            "--max-running-requests",
+            24,
             "--moe-a2a-backend",
             "deepep",
             "--deepep-mode",
