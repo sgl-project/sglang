@@ -1973,7 +1973,9 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self.chunked_req = adder.add_chunked_req(
+                self.chunked_req, truncation_align_size=self.truncation_align_size
+            )
 
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])

@@ -335,6 +335,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 prefix_lens,
                 prefill_wrapper_paged=self.prefill_wrapper_paged,
                 use_ragged=use_ragged,
+                forward_batch=forward_batch,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrapper_paged, use_ragged
@@ -579,9 +580,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
+            if forward_batch.dcp_kv_buffer is not None:
+                k_buf = forward_batch.dcp_kv_buffer.to(q.dtype)
+            else:
+                k_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+                    layer.layer_id
+                ).to(q.dtype)
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -848,6 +852,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
@@ -868,6 +873,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
             self.qo_indptr,
             use_ragged,
             spec_info,
+            forward_batch=forward_batch,
         )
 
     def call_begin_forward(
@@ -883,6 +889,7 @@ class FlashInferMLAIndicesUpdaterPrefill:
         qo_indptr: torch.Tensor,
         use_ragged: bool,
         spec_info: Optional[SpecInput] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
@@ -934,6 +941,11 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
         else:
             # mla paged prefill
+            if forward_batch is not None:
+                if forward_batch.dcp_kv_indptr is not None:
+                    kv_indptr = forward_batch.dcp_kv_indptr
+                if forward_batch.dcp_kv_indices is not None:
+                    kv_indices = forward_batch.dcp_kv_indices
             kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             wrapper_paged.plan(
                 qo_indptr,

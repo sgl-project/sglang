@@ -1227,9 +1227,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             self.rotary_emb = None
 
-        # TODO(augusto.yjh) 这里要改逻辑， local_heads是all heads, 而且还要返回lse，用来修正attn_out
         self.attn_mqa = RadixAttention(
-            self.num_local_heads * get_dcp_world_size(),
+            self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
             self.scaling,
             num_kv_heads=1,
@@ -1238,6 +1237,18 @@ class DeepseekV2AttentionMLA(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        # TODO(augusto.yjh) 这里要改逻辑， local_heads是all heads, 而且还要返回lse，用来修正attn_out
+        if get_dcp_world_size() > 1:
+            self.attn_mqa_for_dcp_decode = RadixAttention(
+                self.num_local_heads * get_dcp_world_size(),
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                v_head_dim=self.kv_lora_rank,
+                quant_config=quant_config,
+                prefix=add_prefix("attn_mqa", prefix),
+            )
 
         self.attn_mha = RadixAttention(
             self.num_local_heads,
@@ -1910,16 +1921,36 @@ class DeepseekV2AttentionMLA(nn.Module):
                 }
 
             # TODO(augusto.yjh) 返回lse, correct attn_output
-            attn_output, lse = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-                **extra_args,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+                attn_output, lse = self.attn_mqa_for_dcp_decode(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            else:
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -1965,7 +1996,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         # TODO(augusto.yjh) all gather lse，订正attn_output
         # TODO(augusto.yjh) 执行reduce scatter, 先reduce拿到正确的 attn_output, 再按local_num_heads scatter attn_output
-        if get_dcp_world_size() > 1:
+        if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
             attn_output = attn_output.view(
                 -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
             )
