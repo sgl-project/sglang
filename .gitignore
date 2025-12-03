@@ -240,6 +240,9 @@ compile_commands.json
 # Rust lib
 Cargo.lock
 
+# Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
+sgl-router/tests/fixtures/golden/
+
 lmms-eval
 
 **/.claude/
