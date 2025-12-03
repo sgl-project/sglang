@@ -35,7 +35,7 @@ class TestEmbedInterpolate(unittest.TestCase):
     def test_embed_interpolate(self):
         self.assertTrue(issubclass(UnquantizedLinearMethod, LinearMethodBase))
         t_dim = [16, 32]
-        s_dim = [384, 1150]
+        s_dim = [192, 574]
         sarg = ServerArgs(model_path="dummy", device="npu")
         mconf = Qwen3VLConfig(
             hidden_size=1024,
