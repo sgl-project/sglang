@@ -1,4 +1,3 @@
-import itertools
 import unittest
 
 # TODO: use interface in cpu.py
@@ -7,6 +6,7 @@ import torch.nn as nn
 from utils import (
     convert_weight,
     native_w8a8_per_token_matmul,
+    parametrize,
     per_token_quant_int8,
     precision,
 )
@@ -39,7 +39,8 @@ class TestGemm(CustomTestCase):
     N_fp8 = [128, 224]
     K_fp8 = [512, 576]
 
-    def _bf16_gemm(self, M, N, K, has_bias):
+    @parametrize(M=[1, 101], N=[16, 32 * 13], K=[32 * 16], has_bias=[False, True])
+    def test_bf16_gemm(self, M, N, K, has_bias):
 
         mat1 = torch.randn(M, K, dtype=torch.bfloat16)
         mat2 = torch.randn(N, K, dtype=torch.bfloat16)
@@ -64,22 +65,8 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
 
-    def test_bf16_gemm(self):
-        for params in itertools.product(
-            self.M,
-            self.N,
-            self.K,
-            self.has_bias,
-        ):
-            with self.subTest(
-                M=params[0],
-                N=params[1],
-                K=params[2],
-                has_bias=params[3],
-            ):
-                self._bf16_gemm(*params)
-
-    def _int8_gemm(self, M, N, K, has_bias):
+    @parametrize(M=[2, 128], N=[32 * 12], K=[32 * 17], has_bias=[False, True])
+    def test_int8_gemm(self, M, N, K, has_bias):
         dtype = torch.bfloat16
         A = torch.randn((M, K), dtype=dtype) / 10
         Aq, As = per_token_quant_int8(A)
@@ -109,22 +96,8 @@ class TestGemm(CustomTestCase):
         )
         torch.testing.assert_close(ref_out, fused_out, atol=atol, rtol=rtol)
 
-    def test_int8_gemm(self):
-        for params in itertools.product(
-            self.M_int8,
-            self.N_int8,
-            self.K_int8,
-            self.has_bias,
-        ):
-            with self.subTest(
-                M=params[0],
-                N=params[1],
-                K=params[2],
-                has_bias=params[3],
-            ):
-                self._int8_gemm(*params)
-
-    def _fp8_gemm(self, M, N, K, has_bias):
+    @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
+    def test_fp8_gemm(self, M, N, K, has_bias):
         prepack = True
         chunk = False
         scale_block_size_N = 64
@@ -167,21 +140,6 @@ class TestGemm(CustomTestCase):
         )
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, opt, atol=atol, rtol=rtol)
-
-    def test_fp8_gemm(self):
-        for params in itertools.product(
-            self.M_fp8,
-            self.N_fp8,
-            self.K_fp8,
-            self.has_bias,
-        ):
-            with self.subTest(
-                M=params[0],
-                N=params[1],
-                K=params[2],
-                has_bias=params[3],
-            ):
-                self._fp8_gemm(*params)
 
 
 if __name__ == "__main__":
