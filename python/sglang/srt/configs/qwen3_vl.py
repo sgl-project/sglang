@@ -1,12 +1,5 @@
 from transformers import PretrainedConfig
 
-try:
-    from transformers.modeling_rope_utils import (
-        rope_config_validation,  # this method does not exist in transformer 5.x
-    )
-except ImportError:
-    rope_config_validation = None
-
 
 class Qwen3VLVisionConfig(PretrainedConfig):
     model_type = "qwen3_vl"
@@ -192,11 +185,6 @@ class Qwen3VLTextConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-
-        if rope_config_validation is not None:
-            rope_config_validation(
-                self, ignore_keys={"mrope_section", "mrope_interleaved"}
-            )
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
@@ -458,11 +446,6 @@ class Qwen3VLMoeTextConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.rope_scaling = rope_scaling
         self.head_dim = head_dim or hidden_size // num_attention_heads
-
-        if rope_config_validation is not None:
-            rope_config_validation(
-                self, ignore_keys={"mrope_section", "mrope_interleaved"}
-            )
 
         # MoE arguments
         self.decoder_sparse_step = decoder_sparse_step

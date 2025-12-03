@@ -17,14 +17,6 @@
 import enum
 
 from transformers.configuration_utils import PretrainedConfig
-
-try:
-    from transformers.modeling_rope_utils import (
-        rope_config_validation,  # this method does not exist in transformer 5.x
-    )
-except ImportError:
-    rope_config_validation = None
-
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
@@ -233,8 +225,6 @@ class Qwen3NextConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.head_dim = head_dim
-        if rope_config_validation is not None:
-            rope_config_validation(self)
 
         # linear attention (gdn now part)
         self.linear_conv_kernel_dim = linear_conv_kernel_dim
