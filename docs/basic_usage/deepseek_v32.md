@@ -219,7 +219,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 
 Hardcode the thinking mode to be `thinking` in (`_apply_jinja_template`)[https://github.com/sgl-project/sglang/blob/7c38eca1e4a704bf09fe6b52ea040a41d3cfc55d/python/sglang/srt/entrypoints/openai/serving_chat.py#L286`], then launch the server as usual:
 ```
-python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3.2 --trust-remote-code --tp-size 8 --dp-size 8 --enable-dp-attention --reasoning-parser deepseek-v3
+python3 -m sglang.launch_server   --model-path deepseek-ai/DeepSeek-V3.2   --trust-remote-code   --tp-size 8 --dp-size 8 --enable-dp-attention   --tool-call-parser deepseekv32   --reasoning-parser deepseek-v3
 ```
 
 After hardcoding, run the following script to evaluate AIME 2025:
@@ -243,7 +243,8 @@ ns eval \
   --output_dir=nemo_skills_aime25_${MODEL_NAME}_output_${BACKEND}_$(date +%Y%m%d_%H%M%S) \
   ++inference.temperature=1.0 \
   ++inference.top_p=0.95 \
-  ++inference.tokens_to_generate=120000
+  ++inference.tokens_to_generate=64000
+  # ++inference.tokens_to_generate=120000 for Speciale model
 ```
 
 Test results:
