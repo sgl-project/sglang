@@ -3468,6 +3468,11 @@ def is_triton_kernels_available() -> bool:
     return importlib.util.find_spec("triton_kernels") is not None
 
 
+@lru_cache(maxsize=1)
+def is_arctic_inference_available() -> bool:
+    return importlib.util.find_spec("arctic_inference") is not None
+
+
 def check_cuda_result(raw_output):
     import cuda.bindings.runtime as cuda_rt
 
