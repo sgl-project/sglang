@@ -268,9 +268,8 @@ def run_command(cmd, shell=True):
         print(f"command error: {e}")
         return None
 
-def run_bench_serving(host, port, dataset_name="random", request_rate=8, max_concurrency=8, input_len=1024, output_len=1024,
+def run_bench_serving(host, port, dataset_name="random", request_rate=8, max_concurrency=8, num_prompts=32, input_len=1024, output_len=1024,
                       random_range_ratio=1):
-    num_prompts = max_concurrency * 4
     command = (f"python3 -m sglang.bench_serving --backend sglang --host {host} --port {port} --dataset-name {dataset_name} --request-rate {request_rate} "
                f"--max-concurrency {max_concurrency} --num-prompts {num_prompts} --random-input-len {input_len} "
                f"--random-output-len {output_len} --random-range-ratio {random_range_ratio}")
@@ -287,6 +286,7 @@ class TestSingleMixUtils(CustomTestCase):
     envs = None
     request_rate = None
     max_concurrency = None
+    num_prompts = None
     input_len = None
     output_len = None
     random_range_ratio = None
@@ -321,6 +321,7 @@ class TestSingleMixUtils(CustomTestCase):
             dataset_name=self.dataset_name,
             request_rate=self.request_rate,
             max_concurrency=self.max_concurrency,
+            num_prompts=self.num_prompts,
             input_len=self.input_len,
             output_len=self.output_len,
             random_range_ratio=self.random_range_ratio,
