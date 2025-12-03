@@ -65,7 +65,6 @@ suites = {
         TestFile("test_eagle_infer_a.py", 470),
         TestFile("test_eagle_infer_b.py", 473),
         TestFile("test_eagle_infer_beta.py", 194),
-        TestFile("test_embed_interpolate_unittest.py", 1800),
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
         TestFile("test_external_models.py", 30),
@@ -363,6 +362,7 @@ suite_ascend = {
         TestFile("ascend/test_ascend_hicache_mha.py", 400),
         TestFile("ascend/test_ascend_sampling_backend.py", 400),
         TestFile("ascend/test_ascend_tp1_bf16.py", 400),
+        TestFile("test_embed_interpolate_unittest.py", 1800),
     ],
     "per-commit-2-npu-a2": [
         TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
