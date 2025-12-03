@@ -264,6 +264,7 @@ impl ImageProcessorRegistry {
     /// Currently registers:
     /// - `llava-next` -> LlavaNextProcessor
     /// - `llava` -> LlavaProcessor (also matches llava-1.5, etc.)
+    /// - `qwen2-vl` -> Qwen2VLProcessor
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
 
@@ -279,6 +280,16 @@ impl ImageProcessorRegistry {
 
         // Register standard LLaVA (matches llava-1.5, llava-v1.5, etc.)
         registry.register("llava", Box::new(super::processors::LlavaProcessor::new()));
+
+        // Register Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
+        registry.register(
+            "qwen2-vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+        registry.register(
+            "qwen2_vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
 
         registry
     }
