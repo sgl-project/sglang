@@ -2,7 +2,7 @@ test_case=$1
 cd $SGLANG_SOURCE_PATH
 if [ ! -f "${test_case}" ];then
   echo "The test case file is not exist: $test_case"
-  exit 0
+  exit 1
 fi
 
 # speed up by using infra cache services
