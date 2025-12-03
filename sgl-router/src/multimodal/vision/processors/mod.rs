@@ -7,7 +7,10 @@
 //!
 //! - **LLaVA 1.5** (`llava`): CLIP-based preprocessing with configurable aspect ratio
 //! - **LLaVA-NeXT** (`llava`): Multi-crop anyres processing
+//! - **Qwen2-VL** (`qwen2_vl`): Dynamic resolution with smart resizing
 
 pub mod llava;
+pub mod qwen2_vl;
 
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
+pub use qwen2_vl::Qwen2VLProcessor;
