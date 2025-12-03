@@ -4,6 +4,7 @@ import unittest
 import torch
 import torch.nn as nn
 from utils import (
+    MXFP4QuantizeUtil,
     convert_weight,
     native_w8a8_per_token_matmul,
     parametrize,
@@ -28,7 +29,6 @@ class Mod(nn.Module):
 class TestGemm(CustomTestCase):
     @parametrize(M=[1, 101], N=[16, 32 * 13], K=[32 * 16], has_bias=[False, True])
     def test_bf16_gemm(self, M, N, K, has_bias):
-
         mat1 = torch.randn(M, K, dtype=torch.bfloat16)
         mat2 = torch.randn(N, K, dtype=torch.bfloat16)
 
@@ -91,13 +91,13 @@ class TestGemm(CustomTestCase):
         scale_block_size_K = 128
         assert scale_block_size_N <= N
         assert scale_block_size_K <= K
-        A_dtype = torch.bfloat16
+        dtype = torch.bfloat16
 
         model = Mod(K, N, has_bias).eval()
         if chunk:
-            data = torch.randn(M, K + 6, dtype=A_dtype).narrow(1, 0, K)
+            data = torch.randn(M, K + 6, dtype=dtype).narrow(1, 0, K)
         else:
-            data = torch.randn(M, K, dtype=A_dtype)
+            data = torch.randn(M, K, dtype=dtype)
 
         weight = model.linear.weight  # (N, K)
 
@@ -105,18 +105,18 @@ class TestGemm(CustomTestCase):
             bias = model.linear.bias
 
         fp8_weight, scales, dq_weight = convert_weight(
-            weight, [scale_block_size_N, scale_block_size_K], A_dtype
+            weight, [scale_block_size_N, scale_block_size_K], dtype
         )
 
         if has_bias:
-            ref = torch.matmul(data.to(A_dtype), dq_weight.T) + bias.to(A_dtype)
+            ref = torch.matmul(data.to(dtype), dq_weight.T) + bias.to(dtype)
         else:
-            ref = torch.matmul(data.to(A_dtype), dq_weight.T)
+            ref = torch.matmul(data.to(dtype), dq_weight.T)
 
         if prepack:
             fp8_weight = torch.ops.sgl_kernel.convert_weight_packed(fp8_weight)
 
-        opt = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+        out = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
             data,
             fp8_weight,
             scales,
@@ -126,7 +126,36 @@ class TestGemm(CustomTestCase):
             prepack,
         )
         atol = rtol = precision[ref.dtype]
-        torch.testing.assert_close(ref, opt, atol=atol, rtol=rtol)
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
+    def test_mxfp4_gemm(self, M, N, K, has_bias):
+        prepack = True
+        dtype = torch.bfloat16
+
+        A = torch.randn((M, K), dtype=dtype) / 10
+
+        # we randomly generate Bq and Bs, then dequantize it to BFloat16 as reference
+        Bq = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8)
+        Bs = torch.randint(126, 127, (N, K // 32), dtype=torch.uint8)
+
+        Bdq = MXFP4QuantizeUtil.dequantize(Bq, dtype, Bs)
+
+        B_packed = torch.ops.sgl_kernel.convert_weight_packed(Bq)
+        Bs_packed = torch.ops.sgl_kernel.convert_scale_packed(Bs)
+
+        bias = torch.randn(N) if has_bias else None
+
+        ref = torch.matmul(A.float(), Bdq.float().t()).bfloat16()
+        if bias is not None:
+            ref.add_(bias.view(1, -1))
+
+        out = torch.ops.sgl_kernel.mxfp4_scaled_mm_cpu(
+            A, B_packed, Bs_packed, bias, prepack
+        )
+
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
