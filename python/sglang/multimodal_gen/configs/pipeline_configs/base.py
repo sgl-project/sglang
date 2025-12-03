@@ -281,7 +281,7 @@ class PipelineConfig:
         return image_latents
 
     # called after scale_and_shift, before vae decoding
-    def preprocess_decoding(self, latents):
+    def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
     def gather_latents_for_sp(self, latents):
@@ -487,9 +487,30 @@ class PipelineConfig:
             raise ValueError("model_path is required in kwargs")
 
         # 1. Get the pipeline config class from the registry
+        from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+            Flux2PipelineConfig,
+        )
+
         model_info = get_model_info(model_path)
 
-        pipeline_config = model_info.pipeline_config_cls()
+        # 1.5. Adjust pipeline config for fine-tuned VAE if needed
+        pipeline_config_cls = model_info.pipeline_config_cls
+        vae_path = kwargs.get(prefix_with_dot + "vae_path") or kwargs.get("vae_path")
+
+        # Check if this is a Flux2 model with fal/FLUX.2-Tiny-AutoEncoder
+        if (
+            isinstance(pipeline_config_cls, type)
+            and issubclass(pipeline_config_cls, Flux2PipelineConfig)
+            and vae_path is not None
+            and "FLUX.2-Tiny-AutoEncoder" in vae_path
+        ):
+            from sglang.multimodal_gen.configs.pipeline_configs.flux_finetuned import (
+                Flux2FinetunedPipelineConfig,
+            )
+
+            pipeline_config_cls = Flux2FinetunedPipelineConfig
+
+        pipeline_config = pipeline_config_cls()
 
         # 2. Load PipelineConfig from a json file or a PipelineConfig object if provided
         if isinstance(pipeline_config_or_path, str):
