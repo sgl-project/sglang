@@ -208,8 +208,6 @@ class MMEncoder:
                 mm_cache = self.mm_cache.get([mm_item.hash])
                 if mm_cache is not None:
                     mm_embedding = mm_cache
-            if mm_cache is not None:
-                mm_embedding = mm_cache
 
         if mm_embedding is None:
             with torch.inference_mode():
