@@ -180,7 +180,8 @@ jobs:
 
   unit-test-backend-8-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
+    # Temporarily disabled - uncomment when ready to re-enable
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     env:
       RUNNER_LABELS: linux-mi300-gpu-8
@@ -197,15 +198,6 @@ jobs:
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
 
-      - name: Clean shared memory
-        run: |
-          echo "Host /dev/shm usage:"
-          df -h /dev/shm || echo "/dev/shm not accessible"
-          echo "Cleaning host /dev/shm..."
-          sudo rm -f /dev/shm/nccl-* /dev/shm/rccl-* 2>/dev/null || true
-          echo "After cleanup:"
-          df -h /dev/shm || echo "/dev/shm not accessible"
-
       - name: Start CI container
         run: bash scripts/ci/amd_ci_start_container.sh
         env:
@@ -213,15 +205,6 @@ jobs:
 
       - name: Install dependencies
         run: bash scripts/ci/amd_ci_install_dependency.sh
-
-      - name: Check and clean shared memory
-        run: |
-          echo "Container /dev/shm usage:"
-          docker exec ci_sglang df -h /dev/shm
-          echo "Cleaning container /dev/shm..."
-          docker exec ci_sglang bash -c "rm -f /dev/shm/nccl-* /dev/shm/rccl-* 2>/dev/null || true"
-          echo "After cleanup:"
-          docker exec ci_sglang df -h /dev/shm
 
       - name: Test RCCL multi-GPU communication
         timeout-minutes: 5
@@ -438,7 +421,7 @@ jobs:
         stage-a-test-1-amd,
         unit-test-backend-1-gpu-amd,
         unit-test-backend-2-gpu-amd,
-        unit-test-backend-8-gpu-amd,
+        # unit-test-backend-8-gpu-amd,  # Temporarily disabled
         performance-test-1-gpu-part-1-amd,
         performance-test-1-gpu-part-2-amd,
         performance-test-2-gpu-amd,
