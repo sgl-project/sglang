@@ -277,9 +277,11 @@ def _create_standalone_worker(**kwargs: Any) -> Any:
     enable_overlap = kwargs.pop("enable_overlap", False)
     if enable_overlap:
         from sglang.srt.speculative.standalone_worker_v2 import StandaloneWorkerV2
+
         return StandaloneWorkerV2(**kwargs)
 
     from sglang.srt.speculative.standalone_worker import StandaloneWorker
+
     return StandaloneWorker(**kwargs)
 
 
