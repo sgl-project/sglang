@@ -156,7 +156,7 @@ struct RadixTree::Impl {
       }
     };
     for (const auto& [_, child] : m_root) {
-      process_node(child.get())
+      process_node(child.get());
     }
     while (!stack.empty()) {
       const auto node = stack.back();
