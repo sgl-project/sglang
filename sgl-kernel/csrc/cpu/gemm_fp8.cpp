@@ -99,6 +99,55 @@ inline void unpack_B(
 #endif
 }
 
+// mxfp4
+inline void unpack_B(
+    at::BFloat16* __restrict__ Btmp,
+    const uint8_t* __restrict__ packed_B,
+    int64_t N,
+    int64_t K,
+    int64_t ldb,
+    int64_t ldb_tmp,
+    const uint8_t* __restrict__ scale) {
+#if defined(CPU_CAPABILITY_AVX512)
+  // [K/2, N, 2]
+  const int64_t K2 = K >> 1;
+  const int64_t ldb2 = ldb;                                           // ldb * 2 >> 1;
+  const uint8_t* b_ptr = reinterpret_cast<const uint8_t*>(packed_B);  // 2 * 4 bit = 8 bit
+
+  constexpr int BLOCK_N = block_size_n();
+  static_assert(BLOCK_N == 32);
+
+  // prefetch distance
+  constexpr int PREFETCH_SIZE_K = 64;
+
+  // exponent bias 127
+  const __m512i off = _mm512_set1_epi16(0x7F);
+
+  // load 32 bytes only once for each block
+  __m256i s8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(scale));
+  __m512i s16 = _mm512_slli_epi16(_mm512_sub_epi16(_mm512_cvtepu8_epi16(s8), off), 0x7);
+
+  // holds Nx2(64) scales, interleaved as 2 belongs to K dimension
+  // e.g. vs0: { s0,  s0,  s1,  s1, ..., s15, s15}
+  //      vs1: {s16, s16, s17, s17, ..., s31, s31}
+  auto [vscale0, vscale1] = transpose_2x32_16bit(s16, s16);
+
+#pragma GCC unroll 4
+  for (int64_t k = 0; k < K2; ++k) {
+    __m256i b4 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b_ptr + k * ldb2));
+    if constexpr (PREFETCH_SIZE_K > 0) {
+      _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2, _MM_HINT_T0);
+    }
+    auto [vb0, vb1] = CVT_MXFP4_TO_BF16(b4, vscale0, vscale1);
+
+    _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + 0, (__m512i)vb0);
+    _mm512_storeu_si512(Btmp + k * ldb_tmp * 2 + 32, (__m512i)vb1);
+  }
+#else
+  TORCH_CHECK(false, "unpack_B: scalar path not implemented!");
+#endif
+}
+
 template <typename scalar_t, typename packed_t, typename param_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
@@ -217,46 +266,6 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
     Unroll<ROWS * COLS>{}(storec);
   }
 };
-
-inline void print_32x16_i4(const __m512i x) {
-  uint16_t a[32];
-  _mm512_storeu_si512((__m512i*)a, x);
-
-  for (int i = 0; i < 32; i++) {
-    std::cout << (a[i] & 0x0F) << " ";
-  }
-  std::cout << std::endl;
-}
-
-inline void print_32_bf16(const __m512bh x) {
-  at::BFloat16 a[32];
-  _mm512_storeu_si512((__m512i*)a, (__m512i)x);
-
-  for (int i = 0; i < 32; i++) {
-    std::cout << a[i] << " ";
-  }
-  std::cout << std::endl;
-}
-
-inline void print_32x8(const __m256i x) {
-  uint8_t a[32];
-  _mm256_storeu_si256((__m256i*)a, x);
-
-  for (int i = 0; i < 32; i++) {
-    std::cout << int32_t(a[i]) << " ";
-  }
-  std::cout << std::endl;
-}
-
-inline void print_32x16(const __m512i x) {
-  int16_t a[32];
-  _mm512_storeu_si512((__m512i*)a, x);
-
-  for (int i = 0; i < 32; i++) {
-    std::cout << int16_t(a[i]) << " ";
-  }
-  std::cout << std::endl;
-}
 
 template <bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BLOCK_N> {
@@ -454,7 +463,28 @@ struct brgemm<at::BFloat16, uint8_t, uint8_t, has_bias> {
       int ldb,
       int ldc,
       bool do_unpack = true) {
-    std::cout << "### brgemm mxfp4, not implemented yet ..." << std::endl;
+    constexpr int BLOCK_N = block_size_n();
+
+    // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
+    const int ldb_tmp = BLOCK_N;
+
+    if (do_unpack) {
+      // group size 32 for mxfp4
+      for (int k = 0; k < K; k += 32) {
+        unpack_B(Btmp + k * ldb_tmp, B + k * (ldb >> 1), N, 32, ldb, ldb_tmp, scale + (k >> 5) * BLOCK_N);
+      }
+    }
+
+    at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, Ctmp);
+
+    // copy from Ctmp to C
+    for (int m = 0; m < M; ++m) {
+      if constexpr (has_bias) {
+        copy_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, bias, N);
+      } else {
+        copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, N);
+      }
+    }
   }
 };
 
@@ -546,9 +576,6 @@ void fp_scaled_mm_kernel_impl(
 
   // use K/2 for mxfp4 and K for fp8
   const int64_t packed_K = get_row_size<packed_t>(K);
-
-  // std::cout << "### fp_scaled_mm_kernel_impl: use_brgemm: " << use_brgemm << "; M = " << M << "; N = " << N << "; K =
-  // " << K << "; packed_K = " << packed_K << "; sizeof(scale) = " << sizeof(param_t) << std::endl;
 
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {

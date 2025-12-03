@@ -35,7 +35,7 @@ inline bool can_use_brgemm<int8_t>(int M) {
 
 template <>
 inline bool can_use_brgemm<uint8_t>(int M) {
-  return false;
+  return M > 4;
 }
 
 template <>
