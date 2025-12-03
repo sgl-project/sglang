@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
-from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
+
+from python.sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
+
+if ENABLE_JIT_DEEPGEMM:
+    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers import deep_gemm_wrapper
