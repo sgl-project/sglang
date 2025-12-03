@@ -24,6 +24,7 @@ suites = {
         TestFile("models/test_embedding_models.py", 73),
         TestFile("models/test_encoder_embedding_models.py", 460),
         TestFile("models/test_generation_models.py", 103),
+        TestFile("models/test_ministral3_models.py", 350),
         TestFile("models/test_nvidia_nemotron_nano_v2.py", 160),
         TestFile("models/test_nvidia_nemotron_nano_v2_vl.py", 350),  # GSM8k + MMMU
         TestFile("models/test_qwen_models.py", 150),
