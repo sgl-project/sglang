@@ -389,15 +389,16 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_output, _ = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             )
-            if self.server_args.enable_nan_detection:
-                if (
-                    nan_mask := detect_nan(logits := logits_output.next_token_logits)
-                ) is not None:
-                    logits_output.next_token_logits = torch.where(
-                        nan_mask,
-                        torch.full_like(logits, -1e5),
-                        logits,
-                    )
+            if (
+                self.server_args.enable_nan_detection
+                and (nan_mask := detect_nan(logits := logits_output.next_token_logits))
+                is not None
+            ):
+                logits_output.next_token_logits = torch.where(
+                    nan_mask,
+                    torch.full_like(logits, -1e5),
+                    logits,
+                )
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             if self.hot_token_id is not None:
@@ -717,15 +718,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch.sampling_info.vocab_mask = None
 
         # Sample
-        if self.server_args.enable_nan_detection:
-            if (
-                nan_mask := detect_nan(logits := logits_output.next_token_logits)
-            ) is not None:
-                logits_output.next_token_logits = torch.where(
-                    nan_mask,
-                    torch.full_like(logits, -1e5),
-                    logits,
-                )
+        if (
+            self.server_args.enable_nan_detection
+            and (nan_mask := detect_nan(logits := logits_output.next_token_logits))
+            is not None
+        ):
+            logits_output.next_token_logits = torch.where(
+                nan_mask,
+                torch.full_like(logits, -1e5),
+                logits,
+            )
         (
             predict,
             accept_length,
