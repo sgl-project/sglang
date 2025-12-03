@@ -19,7 +19,7 @@ use std::{
 
 use criterion::{black_box, criterion_group, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
-use sglang_router_rs::{
+use sgl_model_gateway::{
     protocols::common::{Function, Tool},
     tool_parser::{JsonParser, ParserFactory as ToolParserFactory, ToolParser},
 };
