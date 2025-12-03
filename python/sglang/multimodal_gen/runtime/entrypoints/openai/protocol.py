@@ -27,7 +27,9 @@ class ImageGenerationsRequest(BaseModel):
     background: Optional[str] = "auto"  # transparent | opaque | auto
     output_format: Optional[str] = None  # png | jpeg | webp
     seed: Optional[int] = 1024  # Random seed for generation
-    generator_device: Optional[str] = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: Optional[str] = (
+        "cuda"  # Device for random generator: "cuda" or "cpu"
+    )
     user: Optional[str] = None
 
 
@@ -57,7 +59,9 @@ class VideoGenerationsRequest(BaseModel):
     fps: Optional[int] = None
     num_frames: Optional[int] = None
     seed: Optional[int] = 1024  # Random seed for generation
-    generator_device: Optional[str] = "cuda"  # Device for random generator: "cuda" or "cpu"
+    generator_device: Optional[str] = (
+        "cuda"  # Device for random generator: "cuda" or "cpu"
+    )
 
 
 class VideoListResponse(BaseModel):
