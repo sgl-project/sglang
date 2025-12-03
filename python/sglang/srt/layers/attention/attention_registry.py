@@ -27,16 +27,37 @@ def create_flashinfer_backend(runner):
     if not runner.use_mla_backend:
         from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 
+        kv_indptr_buf = None
+        kv_last_page_len_buf = None
+
         # Init streams
-        if runner.server_args.speculative_algorithm == "EAGLE":
+        kv_indptr_buf = None
+        kv_last_page_len_buf = None
+        if runner.server_args.speculative_algorithm in ["EAGLE", "SIMPLE_EAGLE","SIMPLE_EAGLE3"]:
             if (
                 not hasattr(runner, "plan_stream_for_flashinfer")
                 or not runner.plan_stream_for_flashinfer
             ):
                 runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(
-            runner, init_new_workspace=runner.init_new_workspace
-        )
+            if runner.server_args.speculative_algorithm == "SIMPLE_EAGLE" or runner.server_args.speculative_algorithm == "SIMPLE_EAGLE3":
+                kv_indptr_buf = torch.zeros(
+                    (runner.req_to_token_pool.size * 2 + 1,),
+                    dtype=torch.int32,
+                    device=runner.device,
+                )
+                kv_last_page_len_buf = torch.ones(
+                    (runner.req_to_token_pool.size * 2,),
+                    dtype=torch.int32,
+                    device=runner.device,
+                )
+            return FlashInferAttnBackend(
+                runner,
+                kv_indptr_buf=kv_indptr_buf,
+                kv_last_page_len_buf=kv_last_page_len_buf,
+            )
+        # return FlashInferAttnBackend(
+        #     runner, init_new_workspace=runner.init_new_workspace
+        # )
     else:
         from sglang.srt.layers.attention.flashinfer_mla_backend import (
             FlashInferMLAAttnBackend,

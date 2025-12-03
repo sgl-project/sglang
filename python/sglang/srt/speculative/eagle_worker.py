@@ -377,6 +377,7 @@ class EAGLEWorker(TpModelWorker):
             for req in batch.reqs:
                 req.kv_allocated_len += self.speculative_num_steps * self.topk
             # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
+
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
                 num_seqs * self.speculative_num_steps * self.topk,

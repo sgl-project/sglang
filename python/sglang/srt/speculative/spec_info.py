@@ -166,6 +166,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
 
     def is_eagle3(self) -> bool:
         return self._has_flag("EAGLE3")
+    
+    def is_simple_eagle(self) -> bool:
+        return self._has_flag("SIMPLE_EAGLE","SIMPLE_EAGLE3")
 
     def is_standalone(self) -> bool:
         return self._has_flag("STANDALONE")
@@ -185,6 +188,8 @@ _REGISTERED_WORKERS: Dict[SpeculativeAlgorithm, DraftWorkerClass] = {}
 _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
     "EAGLE": lambda algorithm: SpeculativeAlgorithm._add_flag("EAGLE", algorithm),
     "EAGLE3": lambda algorithm: SpeculativeAlgorithm._add_flag("EAGLE3", algorithm),
+    "SIMPLE_EAGLE": lambda algorithm: SpeculativeAlgorithm._add_flag("SIMPLE_EAGLE", algorithm),
+    "SIMPLE_EAGLE3": lambda algorithm: SpeculativeAlgorithm._add_flag("SIMPLE_EAGLE3", algorithm),
     "STANDALONE": lambda algorithm: SpeculativeAlgorithm._add_flag(
         "STANDALONE", algorithm
     ),
@@ -272,6 +277,10 @@ def _create_eagle_worker(**kwargs: Any) -> Any:
 
     return EAGLEWorker(**kwargs)
 
+def _create_simple_eagle_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.simple_eagle import SimpleEagleWorker
+    return SimpleEagleWorker(**kwargs)
+
 
 def _create_standalone_worker(**kwargs: Any) -> Any:
     from sglang.srt.speculative.standalone_worker import StandaloneWorker
@@ -297,6 +306,18 @@ register_speculative_algorithm(
     worker_cls=_create_eagle_worker,
     flags=("EAGLE",),
 )
+register_speculative_algorithm(
+    "SIMPLE_EAGLE",
+    worker_cls=_create_simple_eagle_worker,
+    flags=("SIMPLE_EAGLE","EAGLE"),
+)
+
+register_speculative_algorithm(
+    "SIMPLE_EAGLE3",
+    worker_cls=_create_simple_eagle_worker,
+    flags=("SIMPLE_EAGLE3","EAGLE","SIMPLE_EAGLE"),
+)
+
 
 register_speculative_algorithm(
     "EAGLE3",

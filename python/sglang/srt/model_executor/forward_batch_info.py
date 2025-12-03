@@ -80,6 +80,8 @@ class ForwardMode(IntEnum):
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
     DRAFT_EXTEND = auto()
+    SIMPLE_DRAFT_EXTEND = auto()
+    SIMPLE_TARGET_VERIFY = auto()
 
     DRAFT_EXTEND_V2 = auto()
 
@@ -101,6 +103,7 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+            or self == ForwardMode.SIMPLE_DRAFT_EXTEND
         )
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
@@ -126,13 +129,19 @@ class ForwardMode(IntEnum):
     def is_decode_or_idle(self):
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
+    def is_simple_draft(self):
+        return self == ForwardMode.SIMPLE_DRAFT_EXTEND
+
+    def is_simple_verify(self):
+        return self == ForwardMode.SIMPLE_TARGET_VERIFY
+
     def is_target_verify(self):
         return self == ForwardMode.TARGET_VERIFY
 
     def is_draft_extend(self, include_v2: bool = False):
         return self == ForwardMode.DRAFT_EXTEND or (
             include_v2 and self == ForwardMode.DRAFT_EXTEND_V2
-        )
+        ) or self == ForwardMode.SIMPLE_DRAFT_EXTEND
 
     def is_draft_extend_v2(self):
         # For fixed shape logits output in v2 eagle worker
@@ -144,6 +153,7 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.DRAFT_EXTEND
             or self == ForwardMode.MIXED
             or self == ForwardMode.SPLIT_PREFILL
+            or self == ForwardMode.SIMPLE_DRAFT_EXTEND
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
         )
 
@@ -334,6 +344,7 @@ class ForwardBatch:
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
     capture_hidden_mode: CaptureHiddenMode = None
+    simple_eagle_skip_attn_backend_init: bool = False
 
     # For padding
     padded_static_len: int = -1  # -1 if not padded
