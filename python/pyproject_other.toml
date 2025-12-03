@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.5.post3"
+version = "0.5.6"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -61,7 +61,7 @@ runtime_common = [
   "tqdm",
   "transformers==4.57.1",
   "uvicorn",
-  "uvloop==0.21.0",
+  "uvloop",
   "xgrammar==0.1.27",
   "grpcio==1.75.1", # keep it align with compile_proto.py
   "grpcio-tools==1.75.1", # keep it align with compile_proto.py
@@ -83,6 +83,7 @@ srt_hip = [
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
 ]
+
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
@@ -115,8 +116,13 @@ dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
   "srt/layers/moe/fused_moe_triton/configs/*/*.json",
   "srt/layers/quantization/configs/*.json",
   "srt/mem_cache/storage/hf3fs/hf3fs_utils.cpp",
+  "srt/mem_cache/cpp_radix_tree/*.cpp",
+  "srt/mem_cache/cpp_radix_tree/*.h",
   "srt/speculative/cpp_ngram/*.cpp",
   "srt/speculative/cpp_ngram/*.h",
+  "jit_kernel/include/sgl_kernel/*.h",
+  "jit_kernel/include/sgl_kernel/*.cuh",
+  "jit_kernel/csrc/*.cuh"
 ]
 
 [tool.setuptools.packages.find]

@@ -96,6 +96,6 @@ jobs:
           build-args: |
             SGLANG_REPO=${{ steps.prep.outputs.SGLANG_REPO }}
             VER_SGLANG=${{ steps.prep.outputs.VER_SGLANG }}
-            SGLANG_KERNEL_NPU_TAG=20251120
+            SGLANG_KERNEL_NPU_TAG=20251128
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
