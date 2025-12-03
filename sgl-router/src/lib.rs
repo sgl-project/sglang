@@ -8,6 +8,7 @@ pub mod grpc_client;
 pub mod mcp;
 pub mod metrics;
 pub mod middleware;
+pub mod multimodal;
 pub mod policies;
 pub mod protocols;
 pub mod reasoning_parser;

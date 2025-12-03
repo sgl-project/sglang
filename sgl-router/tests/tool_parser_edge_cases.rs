@@ -2,7 +2,7 @@
 //!
 //! Tests for malformed input, edge cases, and error recovery
 
-use sglang_router_rs::tool_parser::{
+use sgl_model_gateway::tool_parser::{
     JsonParser, MistralParser, PythonicParser, QwenParser, ToolParser,
 };
 

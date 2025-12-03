@@ -9,7 +9,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use sglang_router_rs::tokenizer::{
+use sgl_model_gateway::tokenizer::{
     cache::{CacheConfig, CachedTokenizer},
     hub::download_tokenizer_from_hf,
     huggingface::HuggingFaceTokenizer,

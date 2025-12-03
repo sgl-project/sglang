@@ -72,6 +72,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
@@ -126,7 +127,6 @@ from sglang.srt.utils import (
     kill_process_tree,
     set_uvicorn_logging_configs,
 )
-from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
@@ -693,6 +693,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         profile_by_stage=obj.profile_by_stage,
         merge_profiles=obj.merge_profiles,
         profile_prefix=obj.profile_prefix,
+        profile_stages=obj.profile_stages,
     )
     return Response(
         content="Start profiling.\n",
