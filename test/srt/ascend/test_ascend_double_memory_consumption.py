@@ -70,7 +70,6 @@ class TestMemoryConsumptionAscend(CustomTestCase):
         ### Calculate initial used memory
         free_npu_memory, total_npu_memory = torch.npu.mem_get_info()
         used_memory_after_server_starting = (total_npu_memory - free_npu_memory - initial_used_memory) / (1 << 30)
-        print(used_memory_after_server_starting)
         self.assertLessEqual(float(used_memory_after_server_starting), 17.00)
 
         # Clean up everything
