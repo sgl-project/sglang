@@ -283,17 +283,16 @@ class MooncakeKVManager(CommonKVManager):
 
         layers_params = None
 
-        # pp is not supported on the decode side yet
+        # Decode pp size should be equal to prefill pp size or 1
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-            kv_item_len = item_lens[0]
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
                     dst_kv_ptrs[layer_id],
-                    kv_item_len,
+                    item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -301,19 +300,18 @@ class MooncakeKVManager(CommonKVManager):
             src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
                 self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
-            kv_item_len = item_lens[0]
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
                     dst_k_ptrs[layer_id],
-                    kv_item_len,
+                    item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ] + [
                 (
                     src_v_ptrs[layer_id],
                     dst_v_ptrs[layer_id],
-                    kv_item_len,
+                    item_lens[layer_id],
                 )
                 for layer_id in range(layers_current_pp_stage)
             ]
@@ -1201,7 +1199,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
             )
-            # Note(shangming): No need to add pp rank here since pp is not supported on the decode side yet
+            # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
             dst_tp_rank = str(tp_rank).encode("ascii")

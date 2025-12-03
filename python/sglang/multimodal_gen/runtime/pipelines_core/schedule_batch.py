@@ -9,60 +9,26 @@ This module defines the dataclasses used to pass state between pipeline componen
 in a functional manner, reducing the need for explicit parameter passing.
 """
 
+from __future__ import annotations
+
+import os
 import pprint
 from dataclasses import asdict, dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.base import DataType
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.performance_logger import PerformanceLogger
-
-if TYPE_CHECKING:
-    from torchcodec.decoders import VideoDecoder
-
-import time
-from collections import OrderedDict
-
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
+if TYPE_CHECKING:
 
-class PipelineLoggingInfo:
-    """Simple approach using OrderedDict to track stage metrics."""
-
-    def __init__(self):
-        # OrderedDict preserves insertion order and allows easy access
-        self.stages: OrderedDict[str, dict[str, Any]] = OrderedDict()
-
-    def add_stage_execution_time(self, stage_name: str, execution_time: float):
-        """Add execution time for a stage."""
-        if stage_name not in self.stages:
-            self.stages[stage_name] = {}
-        self.stages[stage_name]["execution_time"] = execution_time
-        self.stages[stage_name]["timestamp"] = time.time()
-
-    def add_stage_metric(self, stage_name: str, metric_name: str, value: Any):
-        """Add any metric for a stage."""
-        if stage_name not in self.stages:
-            self.stages[stage_name] = {}
-        self.stages[stage_name][metric_name] = value
-
-    def get_stage_info(self, stage_name: str) -> dict[str, Any]:
-        """Get all info for a specific stage."""
-        return self.stages.get(stage_name, {})
-
-    def get_execution_order(self) -> list[str]:
-        """Get stages in execution order."""
-        return list(self.stages.keys())
-
-    def get_total_execution_time(self) -> float:
-        """Get total pipeline execution time."""
-        return sum(stage.get("execution_time", 0) for stage in self.stages.values())
+    from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 
 
 @dataclass
@@ -88,7 +54,9 @@ class Req:
     image_path: str | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
-    pil_image: torch.Tensor | PIL.Image.Image | None = None
+
+    original_condition_image_size: tuple[int, int] = None
+    condition_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
@@ -126,9 +94,14 @@ class Req:
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    # Flux-2
+    latent_ids: torch.Tensor | None = None
+
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
-    image_latent: torch.Tensor | None = None
+    # vae-encoded condition image
+    image_latent: torch.Tensor | list[torch.Tensor] | None = None
+    condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -191,10 +164,9 @@ class Req:
 
     # VSA parameters
     VSA_sparsity: float = 0.0
-    perf_logger: PerformanceLogger | None = None
 
     # stage logging
-    logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)
+    timings: Optional["RequestTimings"] = None
 
     # profile
     profile: bool = False
@@ -202,6 +174,8 @@ class Req:
 
     # debugging
     debug: bool = False
+    # dummy for now
+    perf_dump_path: str | None = None
 
     # results
     output: torch.Tensor | None = None
@@ -220,6 +194,18 @@ class Req:
         batch_size *= self.num_outputs_per_prompt
         return batch_size
 
+    def output_file_path(self, num_outputs, output_idx):
+        output_file_name = self.output_file_name
+        if num_outputs > 1 and output_file_name:
+            base, ext = os.path.splitext(output_file_name)
+            output_file_name = f"{base}_{output_idx}{ext}"
+
+        return (
+            os.path.join(self.output_path, output_file_name)
+            if output_file_name
+            else None
+        )
+
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
@@ -230,26 +216,13 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-        if self.perf_logger is None:
-            self.perf_logger = PerformanceLogger(self.request_id)
-
-    def set_width_and_height(self, server_args: ServerArgs):
-        if self.height is None or self.width is None:
-            width, height = server_args.pipeline_config.adjust_size(
-                self.width, self.height, self.pil_image
-            )
-            self.width = width
-            self.height = height
+    def adjust_size(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
             self.width = 1280
             self.height = 720
 
     def __str__(self):
         return pprint.pformat(asdict(self), indent=2, width=120)
-
-
-@dataclass
-class ForwardBatch: ...
 
 
 @dataclass
@@ -264,11 +237,5 @@ class OutputBatch:
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
 
-    # Logging info
-    logging_info: PipelineLoggingInfo = field(default_factory=PipelineLoggingInfo)
-
-
-@dataclass
-class PreprocessBatch(Req):
-    video_loader: list["VideoDecoder"] | list[str] = field(default_factory=list)
-    video_file_name: list[str] = field(default_factory=list)
+    # logged timings info, directly from Req.timings
+    timings: Optional["RequestTimings"] = None
