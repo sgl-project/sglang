@@ -51,7 +51,7 @@ jobs:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         test_config:
           - name: test_ascend_deepseek_r1_w4a8_single_in3500_out1500
@@ -105,7 +105,7 @@ jobs:
     uses: ./.github/workflows/nightly-test-ascend-single-node.yml
     with:
       runner:  ${{ matrix.test_config.os }}
-      image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3'
+      image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-910b-ubuntu22.04-py3.11'
       test_config_name: ${{ matrix.test_config.name }}
       test_case: ${{ matrix.test_config.test_case }}
 
