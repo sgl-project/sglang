@@ -116,26 +116,9 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            try:
-                import torch._inductor.config as _inductor_cfg
-
-                _inductor_cfg.reorder_for_compute_comm_overlap = True
-            except Exception:
-                pass
-            mode = os.environ.get(
-                "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-            )
-            # Only compile when it's a module-like object (has forward). Wrap forward like xDiT.
-            if hasattr(self.transformer, "forward"):
-                compiled_forward = torch.compile(
-                    getattr(self.transformer, "forward"), mode=mode
-                )
-                setattr(self.transformer, "forward", compiled_forward)
-            if transformer_2 is not None and hasattr(self.transformer_2, "forward"):
-                compiled_forward_2 = torch.compile(
-                    getattr(self.transformer_2, "forward"), mode=mode
-                )
-                setattr(self.transformer_2, "forward", compiled_forward_2)
+            self.torch_compile_module(self.transformer)
+            if transformer_2 is not None:
+                self.torch_compile_module(self.transformer_2)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -159,6 +142,26 @@ class DenoisingStage(PipelineStage):
 
         # misc
         self.profiler = None
+
+    def torch_compile_module(self, module):
+        """
+        Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object has no forward.
+        """
+        if not self.server_args.enable_torch_compile or module is None:
+            return module
+        if not hasattr(module, "forward"):
+            return module
+        try:
+            import torch._inductor.config as _inductor_cfg
+
+            _inductor_cfg.reorder_for_compute_comm_overlap = True
+        except ImportError:
+            pass
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
+        setattr(module, "forward", compiled_forward)
+        return module
 
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
@@ -210,22 +213,7 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
-            if self.server_args.enable_torch_compile and hasattr(
-                self.transformer, "forward"
-            ):
-                try:
-                    import torch._inductor.config as _inductor_cfg
-
-                    _inductor_cfg.reorder_for_compute_comm_overlap = True
-                except Exception:
-                    pass
-                mode = os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                )
-                compiled_forward = torch.compile(
-                    getattr(self.transformer, "forward"), mode=mode
-                )
-                setattr(self.transformer, "forward", compiled_forward)
+            self.torch_compile_module(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
