@@ -129,7 +129,7 @@ class XverseMoE(nn.Module):
         self.pack_params()
         self.moe_runner_config = MoeRunnerConfig(inplace=True)
 
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernel()
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         if quant_config is None:
             self.quant_method = UnquantizedFusedMoEMethod(self.use_triton_kernels)
             self.quant_method.create_moe_runner(self, self.moe_runner_config)
