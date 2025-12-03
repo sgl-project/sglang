@@ -31,7 +31,7 @@ ${PIP_INSTALL} mf-adapter==1.0.0
 ### Install PyTorch and PTA
 PYTORCH_VERSION="2.8.0"
 TORCHVISION_VERSION="0.23.0"
-${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION}
+${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url https://download.pytorch.org/whl/cpu
 
 PTA_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/torch_npu/torch_npu-2.8.0.post2.dev20251113-cp311-cp311-manylinux_2_28_aarch64.whl"
 ${PIP_INSTALL} ${PTA_URL}
