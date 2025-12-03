@@ -7,6 +7,9 @@ Usage:
     python analyze_shapes.py <log_file.jsonl> [options]
     
 Examples:
+    # Quick summary (doesn't load all data)
+    python analyze_shapes.py shapes.jsonl --quick
+    
     # Basic analysis
     python analyze_shapes.py qwen_kernel_shapes.jsonl
     
@@ -26,15 +29,39 @@ from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 
-def load_log_file(log_file: str) -> List[Dict[str, Any]]:
-    """Load JSONL log file."""
-    entries = []
+def quick_summary(log_file: str) -> Dict[str, Any]:
+    """Fast summary without loading all data into memory."""
+    op_counts = defaultdict(int)
+    total_lines = 0
+    
     with open(log_file, "r") as f:
         for line in f:
+            total_lines += 1
+            try:
+                entry = json.loads(line)
+                op_counts[entry["operation"]] += 1
+            except Exception:
+                pass
+    
+    return {
+        "total_operations": total_lines,
+        "unique_operations": len(op_counts),
+        "op_counts": dict(sorted(op_counts.items(), key=lambda x: x[1], reverse=True)[:50]),
+    }
+
+
+def load_log_file(log_file: str, max_entries: int = None) -> List[Dict[str, Any]]:
+    """Load JSONL log file with optional limit."""
+    entries = []
+    with open(log_file, "r") as f:
+        for line_num, line in enumerate(f, 1):
+            if max_entries and line_num > max_entries:
+                print(f"Limited to first {max_entries} entries")
+                break
             try:
                 entries.append(json.loads(line))
             except json.JSONDecodeError as e:
-                print(f"Warning: Failed to parse line: {e}")
+                print(f"Warning: Failed to parse line {line_num}: {e}")
     return entries
 
 
@@ -222,6 +249,8 @@ def main():
     )
 
     parser.add_argument("log_file", help="Path to JSONL log file")
+    parser.add_argument("--quick", action="store_true", help="Fast summary without loading all data")
+    parser.add_argument("--max-entries", type=int, help="Limit number of entries to load (for large files)")
     parser.add_argument("--top", type=int, default=20, help="Number of top operations to show (default: 20)")
     parser.add_argument("--show-shapes", action="store_true", help="Show detailed shape information")
     parser.add_argument("--max-shapes", type=int, default=10, help="Max shapes to show in detail (default: 10)")
@@ -234,18 +263,29 @@ def main():
 
     args = parser.parse_args()
 
+    # Quick mode - just count operations
+    if args.quick:
+        print(f"Quick analysis of: {args.log_file}")
+        summary = quick_summary(args.log_file)
+        print(f"\nTotal operations: {summary['total_operations']:,}")
+        print(f"Unique operations: {summary['unique_operations']}")
+        print(f"\nTop 20 operations:")
+        for op, count in list(summary['op_counts'].items())[:20]:
+            print(f"  {count:8,d} : {op}")
+        return
+
     print(f"Loading log file: {args.log_file}")
-    entries = load_log_file(args.log_file)
-    print(f"Loaded {len(entries)} entries")
+    entries = load_log_file(args.log_file, max_entries=args.max_entries)
+    print(f"Loaded {len(entries):,} entries")
 
     # Apply filters
     if args.filter_op:
         entries = filter_by_operation(entries, args.filter_op)
-        print(f"Filtered to {len(entries)} entries matching '{args.filter_op}'")
+        print(f"Filtered to {len(entries):,} entries matching '{args.filter_op}'")
 
     if args.min_elements:
         entries = filter_by_min_elements(entries, args.min_elements)
-        print(f"Filtered to {len(entries)} entries with >= {args.min_elements:,} elements")
+        print(f"Filtered to {len(entries):,} entries with >= {args.min_elements:,} elements")
 
     if not entries:
         print("No entries to analyze after filtering!")
@@ -275,7 +315,7 @@ def main():
     print("\n" + "=" * 80)
     print("Summary Statistics")
     print("=" * 80)
-    print(f"Total operations:  {len(entries)}")
+    print(f"Total operations:  {len(entries):,}")
     print(f"Unique operations: {len(analysis['op_counts'])}")
 
     total_elements = sum(analysis["op_total_elements"].values())
@@ -284,7 +324,7 @@ def main():
     # Find most common operation
     if analysis["op_counts"]:
         most_common = max(analysis["op_counts"].items(), key=lambda x: x[1])
-        print(f"Most common operation: {most_common[0]} ({most_common[1]} times)")
+        print(f"Most common operation: {most_common[0]} ({most_common[1]:,} times)")
 
 
 if __name__ == "__main__":

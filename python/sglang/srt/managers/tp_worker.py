@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_SHAPE_PROFILING = os.environ.get("SGLANG_PROFILE_SHAPES", "0") == "1"
 _SHAPE_PROFILE_RANK = int(os.environ.get("SGLANG_PROFILE_SHAPES_RANK", "0"))
 _SHAPE_PROFILE_FILE = os.environ.get("SGLANG_PROFILE_SHAPES_FILE", "shapes.jsonl")
+_SHAPE_PROFILE_MAX_OPS = int(os.environ.get("SGLANG_PROFILE_SHAPES_MAX_OPS", "0"))  # 0 = unlimited
 _shape_logger_module = None
 
 if _ENABLE_SHAPE_PROFILING:
@@ -71,7 +72,7 @@ if _ENABLE_SHAPE_PROFILING:
             sys.path.insert(0, _profiler_path)
             from torch_shape_logger_rank import CompactRankAwareShapeLogger
             _shape_logger_module = CompactRankAwareShapeLogger
-            logger.info(f"Shape profiling enabled: rank={_SHAPE_PROFILE_RANK}, file={_SHAPE_PROFILE_FILE}")
+            logger.info(f"Shape profiling enabled: rank={_SHAPE_PROFILE_RANK}, file={_SHAPE_PROFILE_FILE}, max_ops={_SHAPE_PROFILE_MAX_OPS or 'unlimited'}")
     except Exception as e:
         logger.warning(f"Failed to load shape profiling: {e}")
         _ENABLE_SHAPE_PROFILING = False
@@ -308,6 +309,7 @@ class TpModelWorker(BaseTpWorker):
                     output_file=_SHAPE_PROFILE_FILE,
                     verbose=False,
                     only_rank=_SHAPE_PROFILE_RANK,
+                    max_operations=_SHAPE_PROFILE_MAX_OPS if _SHAPE_PROFILE_MAX_OPS > 0 else None,
                 )
                 logger.info(f"[TP Rank {self.tp_rank}] Shape profiler initialized")
             except Exception as e:

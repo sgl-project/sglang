@@ -23,10 +23,11 @@ python profile_shapes.py \
 Enables profiling inside TP workers via environment variables. Profiles operations on a specific GPU rank.
 
 ```bash
-# Profile GPU 0 with TP=8
+# Profile GPU 0 with TP=8, limit to first 1000 operations
 SGLANG_PROFILE_SHAPES=1 \
 SGLANG_PROFILE_SHAPES_RANK=0 \
 SGLANG_PROFILE_SHAPES_FILE=gpu0_shapes.jsonl \
+SGLANG_PROFILE_SHAPES_MAX_OPS=1000 \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-14B-Instruct \
   --tp-size 8 \
@@ -37,18 +38,28 @@ python -m sglang.launch_server \
 - `SGLANG_PROFILE_SHAPES=1` - Enable profiling
 - `SGLANG_PROFILE_SHAPES_RANK=0` - Which GPU rank to profile (0-7 for TP=8)
 - `SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl` - Output file path
+- `SGLANG_PROFILE_SHAPES_MAX_OPS=1000` - Limit operations (0 or unset = unlimited)
 
 **Advantages:**
 - ✅ Works with any TP size
 - ✅ Captures actual tensor operations in workers
 - ✅ Minimal overhead (only profiles one rank)
+- ✅ Can limit to N operations (avoids huge files)
+- ✅ Auto-stops after limit (no manual intervention)
 - ✅ No code modifications needed
+
+**Recommended limits:**
+- Quick check: `MAX_OPS=100` (one batch worth)
+- Full iteration: `MAX_OPS=1000` (prefill + decode)
+- Production profiling: `MAX_OPS=5000` (multiple batches)
+- Unlimited: `MAX_OPS=0` or don't set (use with caution!)
 
 **Example with client:**
 ```bash
-# Terminal 1: Start server with profiling
+# Terminal 1: Start server with profiling (limit to 1000 ops)
 SGLANG_PROFILE_SHAPES=1 SGLANG_PROFILE_SHAPES_RANK=0 \
 SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl \
+SGLANG_PROFILE_SHAPES_MAX_OPS=1000 \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-14B-Instruct \
   --tp-size 8
@@ -65,7 +76,8 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 "
 
-# Profiling output will be in shapes.jsonl
+# Profiling will auto-stop after 1000 operations
+# Output in shapes.jsonl (~50-200KB instead of 3-4MB)
 ```
 
 ## Which Mode to Use?
@@ -82,8 +94,14 @@ print(response.choices[0].message.content)
 Both modes produce JSONL output files:
 
 ```bash
-# Basic analysis
+# Quick analysis (doesn't load all data, very fast for large files)
+python analyze_shapes.py shapes.jsonl --quick
+
+# Full analysis (loads all data)
 python analyze_shapes.py shapes.jsonl
+
+# Limit loading for large files
+python analyze_shapes.py shapes.jsonl --max-entries 10000
 
 # Detailed analysis with shape information
 python analyze_shapes.py shapes.jsonl --show-shapes --top 20

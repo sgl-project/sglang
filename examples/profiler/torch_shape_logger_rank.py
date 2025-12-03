@@ -6,7 +6,8 @@ Only logs operations on specified rank to avoid overhead.
 
 Usage in TP worker (automatically activated by environment variables):
     SGLANG_PROFILE_SHAPES=1 SGLANG_PROFILE_SHAPES_RANK=0 \\
-    SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl python -m sglang.launch_server ...
+    SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl \\
+    SGLANG_PROFILE_SHAPES_MAX_OPS=1000 python -m sglang.launch_server ...
 """
 
 import atexit
@@ -32,31 +33,47 @@ def get_current_rank() -> int:
 
 
 class CompactRankAwareShapeLogger(TorchDispatchMode):
-    """Compact shape logger that only logs on specified rank."""
+    """Compact shape logger that only logs on specified rank with operation limit."""
 
     def __init__(
         self,
         output_file: str = "shapes.jsonl",
         verbose: bool = False,
         only_rank: Optional[int] = None,
+        max_operations: Optional[int] = None,  # Limit total operations
     ):
         super().__init__()
         self.output_file = output_file
         self.verbose = verbose
         self.only_rank = only_rank
+        self.max_operations = max_operations
         self.call_count = 0
         self.op_counts = defaultdict(int)
         self.file_handle = None
         self.current_rank = get_current_rank()
         self.should_log = (only_rank is None) or (self.current_rank == only_rank)
+        self._stopped = False
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if kwargs is None:
             kwargs = {}
         result = func(*args, **kwargs)
-        if self.should_log:
-            self._log_operation(func, result)
+        
+        # Check if we should stop logging
+        if self.should_log and not self._stopped:
+            if self.max_operations and self.call_count >= self.max_operations:
+                self._stop_logging()
+            else:
+                self._log_operation(func, result)
+        
         return result
+
+    def _stop_logging(self):
+        """Stop logging and cleanup."""
+        if not self._stopped:
+            self._stopped = True
+            print(f"[Rank {self.current_rank}] Reached max operations ({self.max_operations}), stopping profiler")
+            self._cleanup()
 
     def _extract_shapes(self, obj) -> Optional[Any]:
         """Extract only shapes (no dtype/device)."""
@@ -96,14 +113,18 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         if self.should_log:
             self.call_count = 0
             self.op_counts.clear()
+            self._stopped = False
             self.file_handle = open(self.output_file, "w")
             atexit.register(self._cleanup)
-            print(f"[Rank {self.current_rank}] Shape profiling enabled → {self.output_file}")
+            msg = f"[Rank {self.current_rank}] Shape profiling enabled → {self.output_file}"
+            if self.max_operations:
+                msg += f" (max {self.max_operations} ops)"
+            print(msg)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         super().__exit__(exc_type, exc_val, exc_tb)
-        if self.should_log:
+        if self.should_log and not self._stopped:
             self._cleanup()
         return False
 
@@ -119,6 +140,8 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                     "rank": self.current_rank,
                     "total_operations": self.call_count,
                     "unique_operations": len(self.op_counts),
+                    "max_operations": self.max_operations,
+                    "stopped_early": self.max_operations and self.call_count >= self.max_operations,
                     "operation_counts": dict(sorted(self.op_counts.items(), key=lambda x: x[1], reverse=True)[:50]),
                 }
                 with open(summary_file, "w") as f:
@@ -126,3 +149,4 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                 print(f"[Rank {self.current_rank}] Profiled {self.call_count} ops → {self.output_file}")
             except Exception:
                 pass
+
