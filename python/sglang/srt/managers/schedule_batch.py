@@ -191,7 +191,7 @@ class Modality(Enum):
         return [Modality.IMAGE, Modality.VIDEO, Modality.AUDIO]
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(kw_only=True)
 class MultimodalDataItem:
     """
     One MultimodalDataItem contains all inputs for one modality.
@@ -214,6 +214,9 @@ class MultimodalDataItem:
 
     # Model-specific data stored in a dictionary
     model_specific_data: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    class MultimodalDataItemContainsAllItemsOfSameModality(ValueError):
+        """A single MultimodalDataItem contains all items of the same modality"""
 
     def __getattr__(self, name: str):
         if (
