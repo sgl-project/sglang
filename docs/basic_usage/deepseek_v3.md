@@ -144,7 +144,7 @@ Data parallelism attention is not recommended for low-latency, small-batch use c
 
 **Reference**: Check [Blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/#data-parallelism-attention-for-deepseek-models).
 
-### Multi Node Tensor Parallelism
+### Multi-Node Tensor Parallelism
 
 **Description**: For users with limited memory on a single node, SGLang supports serving DeepSeek Series Models, including DeepSeek V3, across multiple nodes using tensor parallelism. This approach partitions the model parameters across multiple GPUs or nodes to handle models that are too large for one node's memory.
 
