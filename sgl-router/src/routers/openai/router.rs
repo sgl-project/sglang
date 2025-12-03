@@ -13,7 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use once_cell::sync::Lazy;
 use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
@@ -154,10 +154,10 @@ impl OpenAIRouter {
         })
     }
 
-    /// Discover models from a single worker using the provided auth header.
+    /// Refresh models for a single external worker by querying its /v1/models endpoint.
     ///
-    /// Returns true if discovery succeeded and models were cached on the worker.
-    async fn discover_models_for_worker(
+    /// Returns true if refresh succeeded and models were cached on the worker.
+    async fn refresh_worker_models(
         &self,
         worker: &Arc<dyn Worker>,
         auth_header: Option<&HeaderValue>,
@@ -183,11 +183,10 @@ impl OpenAIRouter {
 
                             if !model_cards.is_empty() {
                                 tracing::info!(
-                                    "Model discovery: found {} models from {}",
+                                    "Model refresh: found {} models from {}",
                                     model_cards.len(),
                                     url
                                 );
-                                // Cache models on the worker
                                 worker.set_models(model_cards);
                                 return true;
                             }
@@ -202,7 +201,7 @@ impl OpenAIRouter {
             }
             Ok(response) => {
                 tracing::debug!(
-                    "Model discovery returned non-success status {} from {}",
+                    "Model refresh returned non-success status {} from {}",
                     response.status(),
                     url
                 );
@@ -215,35 +214,32 @@ impl OpenAIRouter {
         }
     }
 
-    /// Discover models for ALL wildcard workers in the registry.
-    ///
-    /// This loops through all workers that are:
-    /// - External runtime type (OpenAI-compatible API)
-    /// - Have empty model list (wildcard workers)
-    ///
-    /// For each such worker, it queries /v1/models using the provided auth header
-    /// and caches the discovered models on the worker. After this call,
-    /// `select_worker_for_model` and `get_models` work without special handling.
-    async fn discover_models_for_all_wildcard_workers(&self, auth_header: Option<&HeaderValue>) {
-        let workers = self.worker_registry.get_all();
+    /// Refresh models for ALL external workers in parallel.
+    async fn refresh_external_models(&self, auth_header: Option<&HeaderValue>) {
+        let external_workers = self.worker_registry.get_workers_filtered(
+            None,
+            None,
+            None,
+            Some(RuntimeType::External),
+            true, // healthy_only
+        );
 
-        for worker in workers {
-            // Only process External workers with empty model list
-            if worker.metadata().runtime_type == RuntimeType::External
-                && !worker.has_models_discovered()
-            {
-                // Use worker's stored API key as fallback if no auth header provided
-                let effective_auth = auth_header.cloned().or_else(|| {
-                    worker
-                        .api_key()
-                        .as_ref()
-                        .and_then(|k| HeaderValue::from_str(&format!("Bearer {}", k)).ok())
-                });
-
-                self.discover_models_for_worker(&worker, effective_auth.as_ref())
-                    .await;
-            }
+        if external_workers.is_empty() {
+            return;
         }
+
+        tracing::debug!(
+            "Refreshing models for {} external workers",
+            external_workers.len()
+        );
+
+        // Refresh all workers in parallel
+        let futures: Vec<_> = external_workers
+            .iter()
+            .map(|w| self.refresh_worker_models(w, auth_header))
+            .collect();
+
+        join_all(futures).await;
     }
 
     /// Select a worker for the given model using the WorkerRegistry.
@@ -254,35 +250,51 @@ impl OpenAIRouter {
     /// 2. Worker health status
     /// 3. Circuit breaker state
     ///
-    /// NOTE: Call `discover_models_for_all_wildcard_workers` before this method
-    /// if you have wildcard workers that need model discovery.
+    /// If no worker is found with explicit model support, it will refresh models
+    /// on all external workers in parallel, then retry the search.
     ///
     /// Returns an error response if no suitable worker is found.
-    fn select_worker_for_model(&self, model_id: &str) -> Result<Arc<dyn Worker>, Box<Response>> {
-        // Get all workers from registry and filter for:
-        // 1. External runtime type (OpenAI-compatible API endpoints)
-        // 2. Supports the requested model (checks ModelCard including aliases)
-        // 3. Is healthy
-        // 4. Circuit breaker allows execution
-        let workers = self.worker_registry.get_all();
+    async fn select_worker_for_model(
+        &self,
+        model_id: &str,
+        auth_header: Option<&HeaderValue>,
+    ) -> Result<Arc<dyn Worker>, Box<Response>> {
+        // Helper to find candidates for a model
+        // Note: We get ALL external workers and filter by supports_model() because
+        // wildcard workers (empty models) aren't in the model index but support any model
+        let find_candidates = || {
+            self.worker_registry
+                .get_workers_filtered(
+                    None, // Get all external workers, not just those in model index
+                    None,
+                    None,
+                    Some(RuntimeType::External),
+                    true, // healthy_only
+                )
+                .into_iter()
+                .filter(|w| w.supports_model(model_id) && w.circuit_breaker().can_execute())
+                .collect::<Vec<_>>()
+        };
 
-        let candidates: Vec<_> = workers
-            .iter()
-            .filter(|w| {
-                // Must be external (OpenAI-compatible API)
-                w.metadata().runtime_type == RuntimeType::External
-                    // Must support the model (checks primary ID and aliases)
-                    && w.supports_model(model_id)
-                    // Must be healthy
-                    && w.is_healthy()
-                    // Circuit breaker must allow execution
-                    && w.circuit_breaker().can_execute()
-            })
-            .cloned()
-            .collect();
-
+        // First try: find workers that already support this model
+        let candidates = find_candidates();
         if !candidates.is_empty() {
-            // Simple load balancing: pick worker with lowest load
+            return Ok(candidates
+                .into_iter()
+                .min_by_key(|w| w.load())
+                .expect("candidates is not empty"));
+        }
+
+        // No match found - refresh models on all external workers
+        tracing::debug!(
+            "No worker found for model '{}', refreshing external worker models",
+            model_id
+        );
+        self.refresh_external_models(auth_header).await;
+
+        // Second try: check if any worker now supports the model after refresh
+        let candidates = find_candidates();
+        if !candidates.is_empty() {
             return Ok(candidates
                 .into_iter()
                 .min_by_key(|w| w.load())
@@ -532,48 +544,43 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 .into_response();
         }
 
-        // Discover models for any wildcard workers using user's auth header
+        // Refresh models for all external workers using user's auth header
         let auth_header = extract_auth_header(Some(req.headers()), &None);
-        self.discover_models_for_all_wildcard_workers(auth_header.as_ref())
-            .await;
+        self.refresh_external_models(auth_header.as_ref()).await;
 
-        // Collect models from all workers (either cached or pre-discovered)
+        // Collect models from all workers
         let mut all_models = Vec::new();
         let mut seen_models = HashSet::new();
 
-        // First pass: add all primary model IDs
         for worker in &external_workers {
             for model_card in worker.models() {
-                let model_id = &model_card.id;
-                if seen_models.insert(model_id.clone()) {
+                let owned_by = model_card
+                    .provider
+                    .as_ref()
+                    .map(|p| format!("{:?}", p).to_lowercase())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                // Add primary model ID
+                if seen_models.insert(model_card.id.clone()) {
                     all_models.push(json!({
-                        "id": model_id,
+                        "id": &model_card.id,
                         "object": "model",
                         "created": 0,
-                        "owned_by": model_card.provider.as_ref()
-                            .map(|p| format!("{:?}", p).to_lowercase())
-                            .unwrap_or_else(|| "unknown".to_string()),
+                        "owned_by": &owned_by,
                         "aliases": model_card.aliases,
                         "model_type": format!("{:?}", model_card.model_type),
                     }));
                 }
-            }
-        }
 
-        // Second pass: add aliases as separate entries for compatibility
-        for worker in &external_workers {
-            for model_card in worker.models() {
-                let primary_id = &model_card.id;
+                // Add aliases as separate entries for compatibility
                 for alias in &model_card.aliases {
                     if seen_models.insert(alias.clone()) {
                         all_models.push(json!({
                             "id": alias,
                             "object": "model",
                             "created": 0,
-                            "owned_by": model_card.provider.as_ref()
-                                .map(|p| format!("{:?}", p).to_lowercase())
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            "primary_model": primary_id,
+                            "owned_by": &owned_by,
+                            "primary_model": &model_card.id,
                         }));
                     }
                 }
@@ -621,12 +628,11 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         // Extract auth header for passthrough mode
         let auth_header = extract_auth_header(headers, &None);
 
-        // Discover models for any wildcard workers before selecting
-        self.discover_models_for_all_wildcard_workers(auth_header.as_ref())
-            .await;
-
-        // Select worker for model
-        let worker = match self.select_worker_for_model(body.model.as_str()) {
+        // Select worker for model (discovery happens inside if needed)
+        let worker = match self
+            .select_worker_for_model(body.model.as_str(), auth_header.as_ref())
+            .await
+        {
             Ok(w) => w,
             Err(response) => return *response,
         };
@@ -753,13 +759,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         // Extract auth header for passthrough mode
         let auth_header = extract_auth_header(headers, &None);
 
-        // Discover models for any wildcard workers before selecting
-        self.discover_models_for_all_wildcard_workers(auth_header.as_ref())
-            .await;
-
-        // Select worker for model (use model_id if provided, otherwise use body.model)
+        // Select worker for model (discovery happens inside if needed)
         let model = model_id.unwrap_or(body.model.as_str());
-        let worker = match self.select_worker_for_model(model) {
+        let worker = match self
+            .select_worker_for_model(model, auth_header.as_ref())
+            .await
+        {
             Ok(w) => w,
             Err(response) => return *response,
         };

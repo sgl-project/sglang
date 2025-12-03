@@ -643,10 +643,10 @@ impl Worker for BasicWorker {
         if let Ok(guard) = self.models_override.read() {
             if let Some(ref models) = *guard {
                 // Models were discovered - check if this model is supported
-                return models.is_empty() || models.iter().any(|m| m.matches(model_id));
+                return models.iter().any(|m| m.matches(model_id));
             }
         }
-        // Fall back to metadata.models
+        // Fall back to metadata.models (empty = wildcard = supports nothing until discovery)
         self.metadata.supports_model(model_id)
     }
 
