@@ -719,7 +719,7 @@ class ForwardBatch:
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
-        from sglang.srt.two_batch_overlap import TboForwardBatchPreparer
+        from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
         assert self.global_num_tokens_cpu is not None
         assert self.global_num_tokens_for_logprob_cpu is not None

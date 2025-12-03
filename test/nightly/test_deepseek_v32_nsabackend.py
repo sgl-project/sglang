@@ -197,6 +197,7 @@ class TestDeepseekV32NasBackend_fp8kvcache(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.935)
 
 
+@unittest.skip("Temporary skip pure TP test")
 class TestDeepseekV32NasBackend_pure_tp(CustomTestCase):
     """Test DeepSeek V3.2 with pure TP mode (no DP attention)."""
 

@@ -1,8 +1,11 @@
 # DeepSeek V3.2 Usage
 
-[DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
+DeepSeek-V3.2 model families equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
 
 For reporting issues or tracking upcoming features, please refer to this [Roadmap](https://github.com/sgl-project/sglang/issues/11060).
+
+Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except the tool call parser.
+
 
 ## Installation
 
@@ -31,7 +34,7 @@ pip3 install -e "python"
 ```
 ## Launch DeepSeek V3.2 with SGLang
 
-To serve DeepSeek-V3.2-Exp on 8xH200/B200 GPUs:
+To serve [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) on 8xH200/B200 GPUs:
 
 ```bash
 # Launch with TP + DP (Recommended)
@@ -71,6 +74,36 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 
 ## Function Calling and Reasoning Parser
 The usage of function calling and reasoning parser is the same as DeepSeek V3.1. Please refer to [Reasoning Parser](https://docs.sglang.io/advanced_features/separate_reasoning.html) and [Tool Parser](https://docs.sglang.io/advanced_features/tool_parser.html) documents.
+
+To launch `DeepSeek-V3.2-Exp` with function calling and reasoning parser:
+```bash
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2 \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser deepseekv31 \
+  --reasoning-parser deepseek-v3
+```
+
+To launch `DeepSeek-V3.2` with function calling and reasoning parser:
+```bash
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2 \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --tool-call-parser deepseekv32 \
+  --reasoning-parser deepseek-v3
+```
+
+`DeepSeek-V3.2-Speciale` doesn't support tool calling, so can only be launched with reasoning parser:
+```bash
+python3 -m sglang.launch_server \
+  --model-path deepseek-ai/DeepSeek-V3.2-Speciale \
+  --trust-remote-code \
+  --tp-size 8 --dp-size 8 --enable-dp-attention \
+  --reasoning-parser deepseek-v3
+```
+
 
 ## PD Disaggregation
 
@@ -150,7 +183,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
 
 The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in official tech report.
 ```bash
-Repeat: 8, mean: 0.797
+Repeat: 8, mean: **0**.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
 
@@ -158,9 +191,13 @@ Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 
 Prepare the environment by installing NeMo-Skills in the docker or your own virtual environment:
 
-```
-pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
-```
+  ```
+  pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
+  ```
+
+Nemo Skill can't enable thinking method from client side, so we need some hardcoding before launching server:
+
+**For `DeepSeek-V3.2-Exp`**:
 
 Modify the [`jinja chat_template`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/tokenizer_config.json#L34) by replacing
 
@@ -173,12 +210,19 @@ with
 ```
 and save it to `chat_template_thinking.jinja`.
 
-Launch the SGLang server with the modified chat-template file:
+Then launch the SGLang server with the modified chat-template file:
 ```
 python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention --chat-template chat_template_thinking.jinja
 ```
 
-Run the following script to evaluate AIME 2025:
+**For `DeepSeek-V3.2` and `DeepSeek-V3.2-Speciale`**:
+
+Hardcode the thinking mode to be `thinking` in (`_apply_jinja_template`)[https://github.com/sgl-project/sglang/blob/7c38eca1e4a704bf09fe6b52ea040a41d3cfc55d/python/sglang/srt/entrypoints/openai/serving_chat.py#L286`], then launch the server as usual:
+```
+python3 -m sglang.launch_server   --model-path deepseek-ai/DeepSeek-V3.2   --trust-remote-code   --tp-size 8 --dp-size 8 --enable-dp-attention   --tool-call-parser deepseekv32   --reasoning-parser deepseek-v3
+```
+
+After hardcoding, run the following script to evaluate AIME 2025:
 ```
 #! /bin/bash
 export NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1
@@ -187,7 +231,7 @@ ns prepare_data aime25
 
 PORT=30000
 BACKEND=sglang
-MODEL="deepseek-ai/DeepSeek-V3.2-Exp"
+MODEL="deepseek-ai/DeepSeek-V3.2-Exp" # Should be changed to the model name
 MODEL_NAME="dsv32-fp8"
 
 echo "Starting AIME25 evaluation with model $MODEL on port $PORT using backend $BACKEND..."
@@ -197,13 +241,15 @@ ns eval \
   --model=$MODEL \
   --server_address=http://localhost:${PORT}/v1 \
   --output_dir=nemo_skills_aime25_${MODEL_NAME}_output_${BACKEND}_$(date +%Y%m%d_%H%M%S) \
-  ++max_concurrent_requests=512 \
-  ++server.api_key=dummy \
+  ++inference.temperature=1.0 \
+  ++inference.top_p=0.95 \
   ++inference.tokens_to_generate=64000
+  # ++inference.tokens_to_generate=120000 for Speciale model
 ```
 
 Test results:
 
+DeepSeek-V3.2-Exp：
 
 | evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct     | no_answer |
 |--------------------|-------------|------------|-------------|-----------------------|-----------|
@@ -211,7 +257,23 @@ Test results:
 | majority@4         | 30          | 14410      | 1758        | 90.00%                | 0.00%     |
 | pass@4             | 30          | 14410      | 1758        | 93.33%                | 0.00%     |
 
-Note that the result of problem#3 with id `aime25-2` is marked as false by nemo-skills  but is actually correct because nemo-skills fails to match predicted_answer `016` with expected_answer `16`. If we add 1/30 = 3.33% to the results, the pass@1[avg-of-4] result matches with reference which is 89.3.
+Note that the result of problem#3 with id `aime25-2` is marked as false by nemo-skills  but is actually correct because nemo-skills fails to match predicted_answer `016` with expected_answer `16`. If we add 1/30 = 3.33% to the results, the pass@1[avg-of-4] results match with official reference. (89.3%)
+
+DeepSeek-V3.2:
+| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
+|--------------------|-------------|------------|-------------|-----------------------|-----------|
+| pass@1[avg-of-4]   | 30          | 13311      | 1630        | 90.83% ± 4.19%        | 0.00%     |
+| majority@4         | 30          | 13311      | 1630        | 90.00%                | 0.00%     |
+| pass@4             | 30          | 13311      | 1630        | 96.67%                | 0.00%     |
+
+
+DeepSeek-V3.2-Speciale:
+| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
+|--------------------|-------------|------------|-------------|-----------------------|-----------|
+| pass@1[avg-of-4]   | 30          | 21210      | 3018        | 95.00% ± 3.33%        | 0.00%     |
+| majority@4         | 30          | 21210      | 3018        | 96.67%                | 0.00%     |
+| pass@4             | 30          | 21210      | 3018        | 100.00%               | 0.00%     |
+
 
 
 ## DSA long sequence context parallel optimization(experimental)
