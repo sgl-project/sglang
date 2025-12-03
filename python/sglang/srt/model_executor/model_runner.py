@@ -1950,7 +1950,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 need_sort=need_sort,
                             )
                 else:
-                    assert not self.is_hybrid
+                    assert not self.is_hybrid_swa
                     if get_dcp_world_size() > 1:
                         self.max_total_num_tokens *= get_dcp_world_size()
                         self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
@@ -1972,16 +1972,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
                         )
-                else:
-                    assert not self.is_hybrid_swa
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
         else:
             assert self.is_draft_worker
 
@@ -2620,10 +2610,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 dcp_kv_indptr[1:] = forward_batch.seq_lens.cumsum(dim=0)
                 dcp_kv_indptr = dcp_kv_indptr[: (len(forward_batch.seq_lens) + 1)]
-                forward_batch.dcp_kv_indptr = dcp_kv_indptr
-                forward_batch.dcp_local_prefix_kv_indices = (
-                    dcp_prefix_kv_indices[::8] // get_dcp_world_size()
-                )
                 dcp_kv_indices = torch.zeros(
                     forward_batch.seq_lens_sum,
                     dtype=torch.int32,
@@ -2698,7 +2684,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
                 forward_batch.dcp_kv_indptr = dcp_kv_indptr
                 forward_batch.dcp_local_prefix_kv_indices = (
-                    dcp_prefix_kv_indices[::8] // get_dcp_world_size()
+                    dcp_prefix_kv_indices[
+                        dcp_prefix_kv_indices % get_dcp_world_size() == get_dcp_rank()
+                    ]
+                    // get_dcp_world_size()
                 )
                 forward_batch.dcp_kv_buffer = torch.empty(
                     (

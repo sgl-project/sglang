@@ -652,18 +652,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
 
         o = q_nope.new_empty(q_nope.shape)
-        # TODO(augusto.yjh) 返回lse
+        # TODO(augusto.yjh) for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
         # Direct call to run without the wrapper
-        o, lse = decode_wrapper.run(
+        out = decode_wrapper.run(
             q_nope,
             q_rope,
             k_buffer[:, :, : layer.v_head_dim],
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
-            return_lse=True,
+            return_lse=forward_batch.forward_mode.is_decode()
+            and get_dcp_world_size() > 1,
         )
-
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), lse
+        return out
 
 
 class FlashInferMLAIndicesUpdaterDecode:
