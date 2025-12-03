@@ -287,11 +287,12 @@ class HFRunner:
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
 
+            device = "npu" if is_npu() else "cuda"
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=self.needs_trust_remote_code(model_path),
-            ).cuda()
+            ).to(device)
         else:
             raise Exception(f"Unrecognized model type {self.model_type}")
         self.tokenizer = get_tokenizer(
@@ -348,9 +349,10 @@ class HFRunner:
                         logits = self.model.encode(prompts).tolist()
                     out_queue.put(ModelOutput(embed_logits=logits))
                 elif self.model_type == "cross_encoder":
+                    device = "npu" if is_npu() else "cuda"
                     inputs = self.tokenizer(
                         prompts, padding=True, return_tensors="pt"
-                    ).to("cuda")
+                    ).to(device)
                     scores = self.model(**inputs).logits
                     scores = scores.squeeze().tolist()
                     if not isinstance(scores, list):
