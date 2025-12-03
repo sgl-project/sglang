@@ -40,8 +40,11 @@ A comprehensive toolkit to analyze CI failures and performance trends for the SG
 ### Failures Analyzer (`ci_failures_analysis.py`)
 - **Consecutive Failure Tracking**: Identify jobs currently failing
 - **Runner Health Monitoring**: Track runner failure rates and identify problematic infrastructure
+- **Multi-Workflow Support**: Monitors PR Test (Nvidia), PR Test (AMD), and PR Test (Xeon) workflows
+- **Queue Time Tracking**: Monitor average and P90 queue times per runner type
 - **Alert System**: Automatic alerts for consecutive failures and runner problems
 - **Instance Tracking**: Monitor specific runner instances for targeted remediation
+- **Slack Notifications**: Send condensed alerts to Slack (top 3 jobs/runners by consecutive failures and failure rates)
 - **GitHub Integration**: Generate comprehensive summaries with actionable recommendations
 - **JSON Export**: Export detailed analysis data for further processing
 
@@ -160,6 +163,33 @@ python ci_failures_analysis.py --token $GITHUB_TOKEN --limit 300 --threshold 2
 python ci_failures_analysis.py --token $GITHUB_TOKEN --limit 500 --threshold 3
 ```
 
+#### Monitored Workflows
+
+The Failures Analyzer monitors the following workflows:
+
+- **PR Test** - Nvidia GPU tests (self-hosted runners: 1-gpu-runner, 4-gpu-h100-runner, etc.)
+- **PR Test (AMD)** - AMD GPU tests (AMD-specific runners)
+- **PR Test (Xeon)** - Intel Xeon CPU tests (Xeon-specific runners)
+
+All three workflows are analyzed together, with runner statistics tracked separately by runner type.
+
+#### Slack Notifications
+
+The Failures Analyzer can send condensed alerts to Slack. See [SLACK_SETUP.md](SLACK_SETUP.md) for complete setup instructions.
+
+**What gets sent:**
+- Top 3 jobs with consecutive failures
+- Top 3 runners with consecutive failures
+- Top 3 jobs with highest total failure rate
+- Top 3 runners with highest total failure rate
+- Queue time summary
+
+```bash
+# Send Slack notification from analysis JSON
+export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+python slack_notifier.py --json ci_failure_analysis.json
+```
+
 #### Understanding the Output
 
 The script generates a **2-section report**:
@@ -170,6 +200,7 @@ The script generates a **2-section report**:
 
 **Section 2: Runner Health Analysis**
 - Shows which runners have high failure rates
+- Includes queue time metrics (average and P90)
 - Helps identify infrastructure vs code issues
 
 #### Alert Types

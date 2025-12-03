@@ -48,10 +48,10 @@ use crate::{
     protocols::{
         common::{Function, ToolCall, ToolChoice, ToolChoiceValue, Usage},
         responses::{
-            McpToolInfo, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-            ResponseOutputItem, ResponseReasoningContent, ResponseStatus, ResponseTool,
-            ResponseToolType, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
-            StringOrContentParts,
+            McpToolInfo, OutputTokensDetails, ResponseContentPart, ResponseInput,
+            ResponseInputOutputItem, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+            ResponseTool, ResponseToolType, ResponseUsage, ResponsesRequest, ResponsesResponse,
+            ResponsesUsage, StringOrContentParts,
         },
     },
     routers::grpc::{
@@ -1134,7 +1134,11 @@ fn build_tool_response(
             output_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
             input_tokens_details: None,
-            output_tokens_details: None,
+            output_tokens_details: usage.completion_tokens_details.as_ref().and_then(|d| {
+                d.reasoning_tokens.map(|tokens| OutputTokensDetails {
+                    reasoning_tokens: tokens,
+                })
+            }),
         }))
         .build()
 }

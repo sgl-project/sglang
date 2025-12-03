@@ -66,7 +66,7 @@ except ImportError:
         class IdGenerator:
             pass
 
-    logger.info("opentelemetry package is not installed, tracing disabled")
+    logger.debug("opentelemetry package is not installed, tracing disabled")
 
 
 def is_tracing_enabled() -> bool:

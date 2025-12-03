@@ -294,7 +294,9 @@ class ExpertLocationMetadata:
             num_physical_experts = self.logical_to_all_physical_map_cpu[layer_id].shape[
                 -1
             ]
-            return list(torch.arange(0, num_physical_experts))
+            return list(
+                range(logical_expert_id, num_physical_experts, self.num_logical_experts)
+            )
         return [
             physical_expert_id
             for physical_expert_id in self.logical_to_all_physical_map_cpu[
