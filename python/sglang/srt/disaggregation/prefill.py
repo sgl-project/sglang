@@ -372,6 +372,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+                self.notify_prefill_done(batch, batch_result)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
