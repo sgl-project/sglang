@@ -13,6 +13,7 @@ pub mod circuit_breaker;
 pub mod error;
 pub mod job_queue;
 pub mod metrics_aggregator;
+pub mod model_card;
 pub mod model_type;
 pub mod retry;
 pub mod token_bucket;
@@ -27,6 +28,7 @@ pub use circuit_breaker::{
 };
 pub use error::{WorkerError, WorkerResult};
 pub use job_queue::{Job, JobQueue, JobQueueConfig};
+pub use model_card::{ModelCard, ProviderType};
 pub use model_type::{Endpoint, ModelType};
 pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecutor};
 pub use worker::{
