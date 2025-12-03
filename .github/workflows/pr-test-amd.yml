@@ -157,8 +157,7 @@ jobs:
       - name: Run diffusion server tests
         timeout-minutes: 60
         run: |
-          true
-          docker exec -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server/test_server_performance.py -s -v --log-cli-level=INFO
+          docker exec -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server -s -v --log-cli-level=INFO
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -363,7 +362,7 @@ jobs:
       - name: Benchmark dummy grok (TP=2)
         timeout-minutes: 30
         run: |
-          docker exec -w /sglang-checkout/test/manual/models ci_sglang python3 test_dummy_grok_models.py
+          bash scripts/ci/amd_ci_exec.sh python3 models/test_dummy_grok_models.py
 
       - name: Benchmark single latency (TP=2)
         timeout-minutes: 25
