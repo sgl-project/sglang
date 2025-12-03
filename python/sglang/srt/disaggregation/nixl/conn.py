@@ -281,6 +281,7 @@ class NixlKVManager(CommonKVManager):
         ):
             kv_addrs.append((kv_data_ptr, kv_data_len, self.kv_args.gpu_id, ""))
         self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM")
+        logger.debug(f"Register kv tensors, len(kv_addr)= {len(kv_addrs)}")
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
         aux_addrs = []
@@ -289,6 +290,7 @@ class NixlKVManager(CommonKVManager):
         ):
             aux_addrs.append((aux_data_ptr, aux_data_len, 0, ""))
         self.aux_descs = self.agent.register_memory(aux_addrs, "DRAM")
+        logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
@@ -314,6 +316,7 @@ class NixlKVManager(CommonKVManager):
             prefill_kv_indices, dst_kv_indices
         )
 
+        logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
         # Make descs
         if self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
@@ -360,6 +363,9 @@ class NixlKVManager(CommonKVManager):
                 src_addrs.append((src_addr, length, self.kv_args.gpu_id))
                 dst_addrs.append((dst_addr, length, dst_gpu_id))
 
+        logger.debug(
+            f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
+        )
         src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
         dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
         # Transfer data
@@ -644,6 +650,9 @@ class NixlKVManager(CommonKVManager):
             """This thread recvs transfer info from the decode engine"""
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                logger.debug(
+                    f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
+                )
                 assert (
                     waiting_req_bytes[0] == GUARD
                 ), f"First message should be {GUARD}. Foreign traffic?"
@@ -655,6 +664,7 @@ class NixlKVManager(CommonKVManager):
                     self._add_remote_peer(
                         KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
                     )
+                    logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
                 if room not in self.transfer_infos:
@@ -665,7 +675,9 @@ class NixlKVManager(CommonKVManager):
                 required_dst_info_num = self.transfer_infos[room][
                     agent_name
                 ].required_dst_info_num
+                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
+                    logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -804,8 +816,14 @@ class NixlKVReceiver(CommonKVReceiver):
             return
 
         for bootstrap_info in self.bootstrap_infos:
+            logger.debug(
+                f"Fetched bootstrap info: {bootstrap_info} for engine rank: {self.kv_mgr.kv_args.engine_rank}"
+            )
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
+            logger.debug(
+                f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
+            )
             with lock:
                 sock.send_multipart(
                     [
