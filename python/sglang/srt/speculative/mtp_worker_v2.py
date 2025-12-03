@@ -11,17 +11,13 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
-    EAGLEDraftCudaGraphRunner,
-)
-from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
-    EAGLEDraftExtendCudaGraphRunner,
-)
-from sglang.srt.speculative.eagle_draft_extend_npu_graph_runner import (
-    EAGLEDraftExtendNpuGraphRunner,
+from sglang.srt.speculative.mtp_kernels import rotate_input_ids_triton, assign_hidden_states_pool_triton
+from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
+    MTPMultiStepDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_draft_npu_graph_runner import EAGLEDraftNpuGraphRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -83,6 +79,7 @@ class MTPDraftWorker(BaseDraftWorker):
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.draft_extend_attn_backend_list = []
+        self.model_config = target_worker.model_config
 
         # Args for easy access
         self.device = server_args.device
@@ -130,6 +127,13 @@ class MTPDraftWorker(BaseDraftWorker):
 
         self.init_lm_head()
 
+        # Used for KV Cache reversion
+        self.req_to_hidden_states_pool = torch.empty(
+            (self.req_to_token_pool.size, self.speculative_num_steps - 1, self.model_config.hidden_size),
+            dtype=self.model_config.dtype,
+            device=self.device,
+        )
+
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
             self.draft_runner_list[i].server_args.disable_cuda_graph = backup_disable_cuda_graph
@@ -146,6 +150,9 @@ class MTPDraftWorker(BaseDraftWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+    def mtp_model_runner(self, step: int):
+        return self.draft_runner_list[step]
+
     def init_lm_head(self):
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         # Share the embedding and lm_head
@@ -153,24 +160,21 @@ class MTPDraftWorker(BaseDraftWorker):
             self.draft_runner_list[i].model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
-        # Create multi-step attn backends and cuda graph runners
-
-        self.has_prefill_wrapper_verify = False
-
-        for i in range(self.speculative_num_steps):
-            draft_backend_factory = DraftBackendFactory(
-                self.server_args,
-                self.draft_runner_list[i],
-                self.topk,
-                self.speculative_num_steps,
+        # Create attn backends
+        self.draft_extend_attn_backend_list = []
+        for step in range(self.speculative_num_steps):
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
             )
 
-            # Initialize draft extend attention backend (respects speculative_attention_mode setting)
             self.draft_extend_attn_backend_list.append(
-                draft_backend_factory.create_draft_extend_backend()
+                FlashAttentionBackend(
+                    model_runner=self.draft_runner_list[step],
+                    skip_prefill=False,
+                    speculative_step_id=step,
+                )
             )
-
-            self.tree_mask_mode = TreeMaskMode.FULL_MASK
+            self.draft_runner_list[step].attn_backend = self.draft_extend_attn_backend_list[-1]
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -179,14 +183,14 @@ class MTPDraftWorker(BaseDraftWorker):
 
         if self.server_args.disable_cuda_graph:
             return
+        
+        self.cuda_graph_runner_for_draft_extend = MTPMultiStepDraftExtendCudaGraphRunner(self)
 
-        Device2ExtendCudaGraphRunner = {
-            "npu": EAGLEDraftExtendNpuGraphRunner,
-            "cuda": EAGLEDraftExtendCudaGraphRunner,
-        }
-        # Capture extend
-        # FIXME cuda not support draft_extend capture
+    def reset_cuda_graph_buffers(self, forward_batch, batch_result):
+        if self.cuda_graph_runner_for_draft_extend:
+            self.cuda_graph_runner_for_draft_extend.reset_buffers(forward_batch, batch_result)
 
+    @nvtx_annotated_method("MTPDraftWorker.draft")
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -253,6 +257,7 @@ class MTPDraftWorker(BaseDraftWorker):
             seq_lens_cpu=None,
         )
 
+    @nvtx_annotated_method("MTPDraftWorker.draft_forward")
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
@@ -311,6 +316,7 @@ class MTPDraftWorker(BaseDraftWorker):
     def draft_extend(self):
         pass
 
+    @nvtx_annotated_method("MTPDraftWorker._draft_extend_for_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ModelWorkerBatch,
@@ -359,19 +365,29 @@ class MTPDraftWorker(BaseDraftWorker):
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             topk_p_list.append(topk_p)
             topk_index_list.append(topk_index)
-            pt = 0
-            if forward_batch.extend_seq_lens is not None:
-                for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                    input_ids = forward_batch.input_ids[pt: pt + extend_len]
-                    forward_batch.input_ids[pt: pt + extend_len] = torch.cat(
-                        (input_ids[1:], topk_index[i].reshape(1))
-                    )
-                    pt += extend_len
+            rotate_input_ids_triton(
+                forward_batch.input_ids,
+                forward_batch.extend_start_loc,
+                forward_batch.extend_seq_lens,
+                topk_index,
+            )
         next_draft_input.topk_p = torch.cat(topk_p_list, dim=1)
         next_draft_input.topk_index = torch.cat(topk_index_list, dim=1)
-        next_draft_input.hidden_states = logits_output.hidden_states
+        # next_draft_input.hidden_states = logits_output.hidden_states
+
+        # Update req_to_hidden_states_pool for KV Cache reversion
+        assign_hidden_states_pool_triton(
+            target_hidden_states,
+            forward_batch.req_pool_indices,
+            self.req_to_hidden_states_pool,
+            self.speculative_num_steps - 1,
+            forward_batch.batch_size,
+            forward_batch.extend_seq_lens,
+            forward_batch.extend_start_loc,
+        )
         return next_draft_input
 
+    @nvtx_annotated_method("MTPDraftWorker._draft_extend_for_decode")
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
@@ -380,12 +396,6 @@ class MTPDraftWorker(BaseDraftWorker):
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_batch=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_batch=1,
-        )
-        select_index = (
-            torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
-            + batch_result.accept_lens
-            - 1
         )
 
         # Prepare for draft extend in a separate stream
@@ -398,7 +408,7 @@ class MTPDraftWorker(BaseDraftWorker):
                 self.draft_runner_list[0],
                 self.cuda_graph_runner_for_draft_extend,
             )
-        forward_batch.return_hidden_states_before_norm = True
+            forward_batch.return_hidden_states_before_norm = True
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -412,36 +422,61 @@ class MTPDraftWorker(BaseDraftWorker):
         ret_topk_p_list = []
         ret_topk_index_list = []
         next_token_ids_backup = batch_result.next_token_ids.clone()
+
+        if can_cuda_graph:
+            self.reset_cuda_graph_buffers(forward_batch, batch_result)
+        else:
+            logger.warning_once(f"can't use cuda graph for draft extend! may have correctness issue!")
+            select_index = (
+                torch.arange(len(batch.seq_lens), device=self.device)
+                * self.speculative_num_draft_tokens
+                + batch_result.accept_lens
+                - 1
+            )
+
         for step in range(self.speculative_num_steps):
             # log_info_on_rank0(logger, f"step: {step}, forward_batch.input_ids: {forward_batch.input_ids}")
             if can_cuda_graph:
-                draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
-                    forward_batch
+                draft_logits_output = self.cuda_graph_runner_for_draft_extend.get_runner(step).replay(
+                    forward_batch, init_state=(step == 0)
                 )
+                ret_topk_p, ret_topk_index = draft_logits_output.topk_p, draft_logits_output.topk_index
             else:
                 draft_logits_output, _ = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
                 )
-            probs = torch.softmax(draft_logits_output.next_token_logits[select_index], dim=-1)
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                probs = torch.softmax(draft_logits_output.next_token_logits[select_index], dim=-1)
+                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                rotate_input_ids_triton(
+                    forward_batch.input_ids,
+                    forward_batch.extend_start_loc,
+                    forward_batch.extend_seq_lens,
+                    ret_topk_index,
+                    select_index,
+                )
             ret_topk_p_list.append(ret_topk_p)
             ret_topk_index_list.append(ret_topk_index)
-            pt = 0
-            if forward_batch.extend_seq_lens is not None:
-                for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                    actual_len = select_index[i].item() - pt + 1
-                    input_ids = forward_batch.input_ids[pt: pt + extend_len]
-                    # log_info_on_rank0(logger, f"input_ids: {input_ids}, actual_len: {actual_len}, ret_topk_index: {ret_topk_index}")
-                    forward_batch.input_ids[pt: pt + actual_len] = torch.cat((input_ids[1: actual_len], ret_topk_index[i].reshape(1)))
-                    pt += extend_len
+
+        # Update req_to_hidden_states_pool for KV Cache reversion
+        if self.cuda_graph_runner_for_draft_extend is not None:
+            last_cuda_graph_runner = self.cuda_graph_runner_for_draft_extend.get_last_runner()
+            assign_hidden_states_pool_triton(
+                last_cuda_graph_runner.hidden_states,
+                last_cuda_graph_runner.req_pool_indices,
+                self.req_to_hidden_states_pool,
+                self.speculative_num_steps - 1,
+                forward_batch.batch_size,
+                last_cuda_graph_runner.extend_seq_lens,
+                last_cuda_graph_runner.extend_start_loc,
+            )
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-            select_index
-        ]
+        # draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
+        #     select_index
+        # ]
+        # draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+        #     select_index
+        # ]
         batch_result.next_token_ids_backup = next_token_ids_backup
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
@@ -450,9 +485,9 @@ class MTPDraftWorker(BaseDraftWorker):
             next_draft_input.topk_index,
             next_draft_input.hidden_states,
         ) = (
-            torch.cat(ret_topk_p_list, dim=1),
-            torch.cat(ret_topk_index_list, dim=1),
-            draft_logits_output.hidden_states,
+            torch.cat(ret_topk_p_list, dim=1).clone(),
+            torch.cat(ret_topk_index_list, dim=1).clone(),
+            None,
         )
 
 
@@ -548,6 +583,7 @@ class MTPWorkerV2(BaseSpecWorker):
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
+    @nvtx_annotated_method("MTPWorkerV2.verify")
     def verify(
         self,
         batch: ModelWorkerBatch,

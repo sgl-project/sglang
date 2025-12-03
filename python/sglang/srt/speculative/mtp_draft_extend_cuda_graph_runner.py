@@ -3,7 +3,9 @@ from __future__ import annotations
 import bisect
 from typing import TYPE_CHECKING, Callable
 
+import time
 import torch
+import logging
 
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
@@ -14,6 +16,7 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     get_batch_sizes_to_capture,
     get_global_graph_memory_pool,
     model_capture_mode,
+    get_is_capture_mode,
     set_global_graph_memory_pool,
     set_is_extend_in_batch,
     set_torch_compile_config,
@@ -23,6 +26,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.nvtx_utils import nvtx_annotated_method
+from sglang.srt.speculative.mtp_kernels import assign_new_state_triton
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
@@ -30,19 +35,22 @@ from sglang.srt.utils import (
     require_gathered_buffer,
     require_mlp_sync,
     require_mlp_tp_gather,
+    get_available_gpu_memory,
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.speculative.mtp_worker import MTPWorker
+    from sglang.srt.speculative.mtp_worker_v2 import MTPDraftWorker
 
+
+logger = logging.getLogger(__name__)
 
 class MTPDraftExtendCudaGraphRunner:
-    def __init__(self, mtp_worker: MTPWorker, step:int):
+    def __init__(self, mtp_worker: MTPDraftWorker, step:int):
         # Parse args
         self.step = step
         self.mtp_worker = mtp_worker
         self.model_runner = model_runner = mtp_worker.mtp_model_runner(self.step)
-        self.forward_mode = ForwardMode.DRAFT_EXTEND
+        self.forward_mode = ForwardMode.DRAFT_EXTEND_V2
 
         self.graphs = {}
         self.output_buffers = {}
@@ -55,6 +63,7 @@ class MTPDraftExtendCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.speculative_num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -63,8 +72,8 @@ class MTPDraftExtendCudaGraphRunner:
         self.padded_static_len = -1
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
-        # Attention backend
-        self.num_tokens_per_bs = self.speculative_num_steps + 1
+        # For Attention Backend
+        self.num_tokens_per_bs = self.speculative_num_steps + 1 + step
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
@@ -74,55 +83,52 @@ class MTPDraftExtendCudaGraphRunner:
         self.seq_len_fill_value = (
             self.mtp_worker.draft_extend_attn_backend_list[self.step].get_cuda_graph_seq_len_fill_value()
         )
-        self.seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-        )
+
+    def init_buffers_and_capture(
+        self,
+        cuda_graph_buffers,
+        offset,
+        next_cuda_graph_runner,
+    ):
+        self.next_cuda_graph_runner = next_cuda_graph_runner
+        self.seq_lens_cpu = cuda_graph_buffers["seq_lens_cpu"]
         self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
 
         if self.enable_torch_compile:
             set_torch_compile_config()
 
         # Graph inputs
-        with torch.device(model_runner.device):
-            self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
-            self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            self.out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
-            self.swa_out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
-            self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
+        with torch.device(self.model_runner.device):
+            # sliced buffers
+            # slice according to max_num_token
+            self.input_ids = cuda_graph_buffers["input_ids"][offset : offset + self.max_num_token]
+            self.out_cache_loc = cuda_graph_buffers["out_cache_loc"][offset : offset + self.max_num_token]
+            self.swa_out_cache_loc = cuda_graph_buffers["swa_out_cache_loc"][offset : offset + self.max_num_token]
+            self.positions = cuda_graph_buffers["positions"][offset : offset + self.max_num_token]
+
+            # shared states
+            self.seq_lens = cuda_graph_buffers["seq_lens"]
+            self.req_pool_indices = cuda_graph_buffers["req_pool_indices"]
+            self.accept_length = cuda_graph_buffers["accept_length"]
+
+            self.extend_seq_lens = torch.full(
+                (self.max_bs,),
+                self.num_tokens_per_bs,
+                dtype=torch.int32,
+            )
+            self.extend_start_loc = torch.arange(
+                0, self.max_bs * self.num_tokens_per_bs,
+                step=self.num_tokens_per_bs,
+                dtype=torch.int32,
+            )
+
             self.mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
             )
 
-            if self.mtp_worker.speculative_algorithm.is_eagle3():
-                self.hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        (
-                            self.model_runner.model_config.hf_config.target_hidden_size
-                            * 3
-                            if hasattr(
-                                self.model_runner.model_config.hf_config,
-                                "target_hidden_size",
-                            )
-                            else self.model_runner.model_config.hidden_size * 3
-                        ),
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
-            else:
-                self.hidden_states = torch.zeros(
-                    (self.max_num_token, self.model_runner.model_config.hidden_size),
-                    dtype=self.model_runner.dtype,
-                )
-            self.seq_len_fill_value = (
-                self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
-            )
-            self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-            )
-            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
-            self.accept_length = torch.full(
-                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
+            self.hidden_states = torch.zeros(
+                (self.max_num_token, self.model_runner.model_config.hidden_size),
+                dtype=self.model_runner.dtype,
             )
 
             if self.require_gathered_buffer:
@@ -216,9 +222,7 @@ class MTPDraftExtendCudaGraphRunner:
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
-        graph = self._create_graph()
-        stream = self.stream
+    def get_forward_batch(self, bs: int) -> ForwardBatch:
         num_tokens = bs * self.num_tokens_per_bs
 
         # Graph inputs
@@ -228,6 +232,7 @@ class MTPDraftExtendCudaGraphRunner:
         seq_lens_cpu = self.seq_lens_cpu[:bs]
         extend_seq_lens = self.extend_seq_lens[:bs]
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:bs]
+        extend_start_loc = self.extend_start_loc[:bs]
         accept_length = self.accept_length[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         swa_out_cache_loc = self.swa_out_cache_loc[:num_tokens]
@@ -279,8 +284,6 @@ class MTPDraftExtendCudaGraphRunner:
         )
         spec_info.positions = None
 
-        self.deepep_adapter.capture(is_extend_in_batch=True)
-
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -304,21 +307,36 @@ class MTPDraftExtendCudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
-            capture_hidden_mode=CaptureHiddenMode.LAST,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
             attn_backend=self.mtp_worker.draft_extend_attn_backend_list[self.step],
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             padded_static_len=self.padded_static_len,
+            # added args
+            extend_start_loc=extend_start_loc,
+            extend_num_tokens=self.num_tokens_per_bs * bs,
+            num_token_non_padded_cpu=self.num_tokens_per_bs * bs,
+            return_hidden_states_before_norm=True,
         )
+        return forward_batch
+
+    def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
+        graph = self._create_graph()
+        stream = self.stream
+
+        self.deepep_adapter.capture(is_extend_in_batch=True)
+
+        num_tokens = bs * self.num_tokens_per_bs
+        forward_batch = self.get_forward_batch(bs)
 
         self.mtp_worker.draft_extend_attn_backend_list[self.step].init_forward_metadata_capture_cuda_graph(
             bs=bs,
             num_tokens=num_tokens,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
             encoder_lens=None,
             forward_mode=self.forward_mode,
-            spec_info=spec_info,
+            spec_info=forward_batch.spec_info,
         )
 
         # Run and capture
@@ -326,7 +344,7 @@ class MTPDraftExtendCudaGraphRunner:
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
-                global_dp_buffer_len,
+                forward_batch.global_dp_buffer_len,
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
             )
@@ -341,8 +359,46 @@ class MTPDraftExtendCudaGraphRunner:
                 forward_batch.positions,
                 forward_batch,
             )
-            probs = torch.softmax(ret.next_token_logits, dim=-1)
+
+            select_index = (
+                torch.arange(bs, device=self.model_runner.device)
+                * (self.speculative_num_draft_tokens + self.step)
+                + self.accept_length[:bs]
+                - 1 + self.step
+            )
+
+            probs = torch.softmax(ret.next_token_logits[select_index], dim=-1)
             ret.topk_p, ret.topk_index = fast_topk(probs, self.topk, dim=-1)
+
+            if self.next_cuda_graph_runner is not None:
+                padding_lens = self.speculative_num_draft_tokens - self.accept_length[:bs]
+                assign_new_state_triton(
+                    ret.topk_index,
+                    self.input_ids,
+                    self.positions,
+                    self.hidden_states,
+                    self.out_cache_loc,
+                    self.extend_seq_lens,
+                    self.extend_start_loc,
+                    self.next_cuda_graph_runner.input_ids,
+                    self.next_cuda_graph_runner.positions,
+                    self.next_cuda_graph_runner.hidden_states,
+                    self.next_cuda_graph_runner.out_cache_loc,
+                    self.next_cuda_graph_runner.extend_seq_lens,
+                    self.next_cuda_graph_runner.extend_start_loc,
+                    self.next_cuda_graph_runner.seq_lens,
+                    padding_lens,
+                    forward_batch.batch_size,
+                    self.step,
+                    forward_batch.req_pool_indices,
+                    forward_batch.req_to_token_pool.req_to_token,
+                    self.mtp_worker.req_to_hidden_states_pool,
+                )
+                self.next_cuda_graph_runner.swa_out_cache_loc.copy_(
+                    self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        self.next_cuda_graph_runner.out_cache_loc
+                    )
+                )
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -357,39 +413,14 @@ class MTPDraftExtendCudaGraphRunner:
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
-    def replay(self, forward_batch: ForwardBatch):
-        assert forward_batch.out_cache_loc is not None
-        self.deepep_adapter.replay()
-
-        # batch_size and num_seqs can be different in case there are finished examples
-        # in the batch, which will not be counted as num_seqs
-        raw_bs = forward_batch.batch_size
-        num_tokens = forward_batch.input_ids.shape[0]
-        if self.require_mlp_tp_gather:
-            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = (
-                max_num_tokens // self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                else max_num_tokens
-            )
-            index = bisect.bisect_left(self.capture_bs, max_batch_size)
-        else:
-            index = bisect.bisect_left(self.capture_bs, raw_bs)
-
-        bs = self.capture_bs[index]
-        if bs * self.num_tokens_per_bs != num_tokens:
-            self.seq_lens.fill_(self.seq_len_fill_value)
-            self.out_cache_loc.zero_()
-            self.swa_out_cache_loc.zero_()
-            self.positions.zero_()
-            self.accept_length.fill_(1)
-            self.extend_seq_lens.fill_(1)
-
+    @nvtx_annotated_method("MTPDraftExtendCudaGraphRunner.init_replay_state")
+    def init_replay_state(self, forward_batch: ForwardBatch, bs: int, raw_bs: int, num_tokens: int):
         # Common inputs
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         if forward_batch.extend_seq_lens is not None:
             self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
+            self.extend_start_loc[:raw_bs].copy_(forward_batch.extend_start_loc)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         self.swa_out_cache_loc[:num_tokens].copy_(forward_batch.swa_out_cache_loc)
         self.positions[:num_tokens].copy_(forward_batch.positions)
@@ -415,10 +446,43 @@ class MTPDraftExtendCudaGraphRunner:
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
 
-        if bs != raw_bs:
-            forward_batch.spec_info.positions = self.positions[:num_tokens]
-            forward_batch.spec_info.accept_length = self.accept_length[:bs]
+    @nvtx_annotated_method("MTPDraftExtendCudaGraphRunner.replay")
+    def replay(self, forward_batch: ForwardBatch, init_state: bool = True):
+        assert forward_batch.out_cache_loc is not None
+        self.deepep_adapter.replay()
+        
+        # batch_size and num_seqs can be different in case there are finished examples
+        # in the batch, which will not be counted as num_seqs
+        raw_bs = forward_batch.batch_size
+        num_tokens = raw_bs * self.num_tokens_per_bs
+        # num_tokens = forward_batch.input_ids.shape[0]
+        if self.require_mlp_tp_gather:
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_batch_size = (
+                max_num_tokens // self.num_tokens_per_bs
+                if self.model_runner.spec_algorithm.is_eagle()
+                else max_num_tokens
+            )
+            index = bisect.bisect_left(self.capture_bs, max_batch_size)
+        else:
+            index = bisect.bisect_left(self.capture_bs, raw_bs)
 
+        bs = self.capture_bs[index]
+
+        if init_state:
+            self.init_replay_state(forward_batch, bs, raw_bs, num_tokens)
+
+        if self.require_gathered_buffer:
+            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
+            self.global_num_tokens_for_logprob_gpu.fill_(bs)
+
+        forward_batch.spec_info.hidden_states = self.hidden_states[:num_tokens]
+        forward_batch.spec_info.accept_length = self.accept_length[:bs]
+        forward_batch.spec_info.num_tokens_per_batch = self.num_tokens_per_bs
+        forward_batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        forward_batch.spec_info.positions = self.positions[:num_tokens]
+        forward_batch.spec_info.extend_seq_lens_tensor = self.extend_seq_lens[:bs]
+        
         self.mtp_worker.draft_extend_attn_backend_list[self.step].init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=self.req_pool_indices,
@@ -452,6 +516,102 @@ class MTPDraftExtendCudaGraphRunner:
                 next_token_logits=out.next_token_logits[:unpadding_bs],
                 hidden_states=out.hidden_states[:unpadding_bs],
             )
-            out.topk_p = out_copy.topk_p[:unpadding_bs]
-            out.topk_index = out_copy.topk_index[:unpadding_bs]
+            out.topk_p = out_copy.topk_p[:raw_bs]
+            out.topk_index = out_copy.topk_index[:raw_bs]
         return out
+
+class MTPMultiStepDraftExtendCudaGraphRunner:
+    def __init__(self, mtp_worker: MTPDraftWorker):
+        self.mtp_worker = mtp_worker
+        self.device = mtp_worker.device
+        self.gpu_id = mtp_worker.gpu_id
+        self.speculative_num_steps = mtp_worker.speculative_num_steps
+        self.draft_extend_attn_backend_list = mtp_worker.draft_extend_attn_backend_list
+        
+        self.runners = []
+        self.cuda_graph_buffers = {}
+        self.seq_len_fill_value = 1
+        self.max_bs = 1
+        self.offsets = [0]
+        
+        self._init_and_capture()
+
+    def _init_and_capture(self):
+        if self.mtp_worker.server_args.disable_cuda_graph:
+            self.runners = [None] * self.speculative_num_steps
+            return
+
+        self.runners = []
+        buffer_len_list = []
+
+        # 1. Capture loop
+        for step in range(self.speculative_num_steps):
+            if self.draft_extend_attn_backend_list[step]:                
+                runner = MTPDraftExtendCudaGraphRunner(self.mtp_worker, step)
+                self.runners.append(runner)
+                
+                self.seq_len_fill_value = runner.seq_len_fill_value
+                self.max_bs = runner.max_bs
+                buffer_len_list.append(runner.max_num_token)
+                self.offsets.append(self.offsets[-1] + runner.max_num_token)
+            else:
+                self.runners.append(None)
+
+        # 2. Allocate buffers
+        self.cuda_graph_buffers['seq_lens_cpu'] = torch.full(
+            (self.max_bs,),
+            self.seq_len_fill_value,
+            dtype=torch.int32,
+        )
+        
+        with torch.device(self.device):
+            # Sliced buffers
+            self.cuda_graph_buffers['input_ids'] = torch.zeros((self.offsets[-1],), dtype=torch.int64)
+            self.cuda_graph_buffers['out_cache_loc'] = torch.ones((self.offsets[-1],), dtype=torch.int64)
+            self.cuda_graph_buffers['swa_out_cache_loc'] = torch.ones((self.offsets[-1],), dtype=torch.int64)
+            self.cuda_graph_buffers['positions'] = torch.zeros((self.offsets[-1],), dtype=torch.int64)
+
+            # Shared states
+            self.cuda_graph_buffers['seq_lens'] = torch.full(
+                (self.max_bs,),
+                self.seq_len_fill_value,
+                dtype=torch.int32,
+            )
+            self.cuda_graph_buffers['req_pool_indices'] = torch.zeros((self.max_bs,), dtype=torch.int32)
+            self.cuda_graph_buffers['accept_length'] = torch.full((self.max_bs,), 1, dtype=torch.int32)
+
+        for step in range(self.speculative_num_steps - 1, -1, -1):
+            if self.runners[step] is not None:
+                tic = time.perf_counter()
+                before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+                logger.info(
+                    f"Capture draft extend cuda graph begin (step {step}). This can take up to several minutes. avail mem={before_mem:.2f} GB"
+                )
+
+                self.runners[step].init_buffers_and_capture(
+                    self.cuda_graph_buffers,
+                    self.offsets[step],
+                    self.runners[step + 1] if step + 1 < self.speculative_num_steps else None,
+                )
+
+                after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+                logger.info(
+                    f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+                )
+
+    def reset_buffers(self, forward_batch, batch_result):
+        self.cuda_graph_buffers['input_ids'].zero_()
+        self.cuda_graph_buffers['seq_lens'].fill_(self.seq_len_fill_value)
+        self.cuda_graph_buffers['out_cache_loc'].zero_()
+        self.cuda_graph_buffers['swa_out_cache_loc'].zero_()
+        self.cuda_graph_buffers['positions'].zero_()
+        self.cuda_graph_buffers['accept_length'][:forward_batch.batch_size].copy_(batch_result.accept_lens)
+
+    def get_runner(self, step):
+        return self.runners[step]
+    
+    def get_last_runner(self):
+        return self.runners[-1] if self.runners else None
+
+    def can_run(self, forward_batch):
+        return self.runners[0].can_run(forward_batch)

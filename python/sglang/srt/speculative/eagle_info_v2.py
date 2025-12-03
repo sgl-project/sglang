@@ -379,13 +379,14 @@ def select_top_k_tokens_tmp(
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
-        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        if hidden_states is not None:
+            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
         scores = topk_p  # shape: (b, topk)
 
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
+            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
