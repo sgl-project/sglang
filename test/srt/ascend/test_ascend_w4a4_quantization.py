@@ -32,7 +32,7 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 class TestAscendW4A4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "/mnt/share/weights/Qwen3-32B-w4a4-w4a4_up_1/"
+        cls.model = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/msit/Qwen3-8B-W4A4/"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
