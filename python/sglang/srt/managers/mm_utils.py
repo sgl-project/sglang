@@ -21,7 +21,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.piecewise_cuda_graph_runner import use_original_ca_comm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
@@ -660,6 +659,10 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
+    # Lazy import to allow some monkey patch of piecewise_cuda_graph_runner
+    from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+        use_original_ca_comm,
+    )
 
     tp_group = get_tp_group()
 
