@@ -26,19 +26,6 @@ class Mod(nn.Module):
 
 
 class TestGemm(CustomTestCase):
-    M = [1, 101]
-    N = [16, 32 * 13]
-    K = [32 * 16]
-    has_bias = [False, True]
-
-    M_int8 = [2, 128]
-    N_int8 = [32 * 12]
-    K_int8 = [32 * 17]
-
-    M_fp8 = [1, 11]
-    N_fp8 = [128, 224]
-    K_fp8 = [512, 576]
-
     @parametrize(M=[1, 101], N=[16, 32 * 13], K=[32 * 16], has_bias=[False, True])
     def test_bf16_gemm(self, M, N, K, has_bias):
 
