@@ -71,7 +71,7 @@ class FutureMap:
         # get the template for each tensor
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        hidden_states0 = draft_input.hidden_states[0]
+        # hidden_states0 = draft_input.hidden_states[0]
         verified_id0 = draft_input.verified_id[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
 
@@ -85,11 +85,11 @@ class FutureMap:
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.hidden_states_buf = torch.empty(
-            (self.future_buffer_len, *hidden_states0.shape),
-            dtype=hidden_states0.dtype,
-            device=self.device,
-        )
+        # self.hidden_states_buf = torch.empty(
+        #     (self.future_buffer_len, *hidden_states0.shape),
+        #     dtype=hidden_states0.dtype,
+        #     device=self.device,
+        # )
         self.verified_id_buf = torch.empty(
             (self.future_buffer_len, *verified_id0.shape),
             dtype=verified_id0.dtype,
@@ -120,7 +120,7 @@ class FutureMap:
             indices = draft_input.future_indices.indices
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.hidden_states = self.hidden_states_buf[indices]
+            # draft_input.hidden_states = self.hidden_states_buf[indices]
             draft_input.verified_id = self.verified_id_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
         else:
@@ -153,6 +153,6 @@ class FutureMap:
         self._lazy_init_buf(draft_input)
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index
-        self.hidden_states_buf[intv] = draft_input.hidden_states
+        # self.hidden_states_buf[intv] = draft_input.hidden_states
         self.verified_id_buf[intv] = draft_input.verified_id
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens

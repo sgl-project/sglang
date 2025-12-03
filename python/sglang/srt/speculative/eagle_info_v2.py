@@ -377,6 +377,57 @@ class EagleVerifyInputV2Mixin:
         return predict, accept_length, accept_index
 
 
+@torch.compile(dynamic=True, disable=_is_npu)
+def select_top_k_tokens_tmp(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+):
+    # FIXME(lsyin): remove this duplicate code
+    if i == 0:
+        # The first step after extend
+        input_ids = topk_index.flatten()
+        if hidden_states is not None:
+            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        scores = topk_p  # shape: (b, topk)
+
+        tree_info = (
+            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
+            topk_index,  # shape: (b, topk)
+            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
+            .unsqueeze(0)
+            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
+        )
+    else:
+        # The later decode steps
+        expand_scores = torch.mul(
+            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
+        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
+        topk_cs_p, topk_cs_index = fast_topk(
+            expand_scores.flatten(start_dim=1), topk, dim=-1
+        )  # (b, topk)
+        scores = topk_cs_p  # shape: (b, topk)
+
+        topk_index = topk_index.reshape(-1, topk**2)
+        input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
+
+        selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
+            0, hidden_states.shape[0], step=topk, device=hidden_states.device
+        ).repeat_interleave(topk)
+        hidden_states = hidden_states[selected_input_index, :]
+
+        tree_info = (
+            expand_scores,  # shape: (b, topk, topk)
+            topk_index,  # shape: (b, topk * topk)
+            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
+        )
+
+    return input_ids, hidden_states, scores, tree_info
+
+
 @triton.jit
 def fill_new_verified_id(
     verified_id,
