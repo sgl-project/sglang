@@ -79,6 +79,24 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn encode_prefill_decode(
+        mut self,
+        encode_urls: Vec<String>,
+        prefill_urls: Vec<(String, Option<u16>)>,
+        decode_urls: Vec<String>,
+        prefill_policy: Option<PolicyConfig>,
+        decode_policy: Option<PolicyConfig>,
+    ) -> Self {
+        self.config.mode = RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            prefill_policy,
+            decode_policy,
+        };
+        self
+    }
+
     pub fn openai_mode(mut self, worker_urls: Vec<String>) -> Self {
         self.config.mode = RoutingMode::OpenAI { worker_urls };
         self

@@ -37,6 +37,19 @@ impl RouterFactory {
                     )
                     .await
                 }
+                RoutingMode::EncodePrefillDecode {
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => {
+                    Self::create_grpc_pd_router(
+                        prefill_policy.as_ref(),
+                        decode_policy.as_ref(),
+                        &ctx.router_config.policy,
+                        ctx,
+                    )
+                    .await
+                }
                 RoutingMode::OpenAI { .. } => {
                     Err("OpenAI mode requires HTTP connection_mode".to_string())
                 }
@@ -56,7 +69,23 @@ impl RouterFactory {
                     )
                     .await
                 }
-                RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
+                RoutingMode::EncodePrefillDecode {
+                    prefill_policy,
+                    decode_policy,
+                    ..
+                } => {
+                    Self::create_pd_router(
+                        prefill_policy.as_ref(),
+                        decode_policy.as_ref(),
+                        &ctx.router_config.policy,
+                        ctx,
+                    )
+                    .await
+                }
+
+                RoutingMode::OpenAI { worker_urls } => {
+                    Self::create_openai_router(worker_urls.clone(), ctx).await
+                }
             },
         }
     }

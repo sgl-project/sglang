@@ -135,6 +135,33 @@ impl ConfigValidator {
                     Self::validate_policy(d_policy)?;
                 }
             }
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                prefill_policy,
+                decode_policy,
+            } => {
+                if !encode_urls.is_empty() {
+                    let encode_url_strings: Vec<String> =
+                        encode_urls.iter().map(|url| url.clone()).collect();
+                    Self::validate_urls(&encode_url_strings)?;
+                }
+                if !prefill_urls.is_empty() {
+                    let prefill_url_strings: Vec<String> =
+                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
+                    Self::validate_urls(&prefill_url_strings)?;
+                }
+                if !decode_urls.is_empty() {
+                    Self::validate_urls(decode_urls)?;
+                }
+                if let Some(p_policy) = prefill_policy {
+                    Self::validate_policy(p_policy)?;
+                }
+                if let Some(d_policy) = decode_policy {
+                    Self::validate_policy(d_policy)?;
+                }
+            }
             RoutingMode::OpenAI { worker_urls } => {
                 // Allow empty URLs to support dynamic worker addition
                 // URLs will be validated if provided
@@ -328,6 +355,16 @@ impl ConfigValidator {
                 if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
                     return Err(ConfigError::ValidationFailed {
                         reason: "PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
+                    });
+                }
+            }
+            RoutingMode::EncodePrefillDecode { .. } => {
+                if discovery.encode_selector.is_empty()
+                    && discovery.prefill_selector.is_empty()
+                    && discovery.decode_selector.is_empty()
+                {
+                    return Err(ConfigError::ValidationFailed {
+                        reason: "EPD mode with service discovery requires at least one non-empty selector (encode, prefill, or decode)".to_string(),
                     });
                 }
             }

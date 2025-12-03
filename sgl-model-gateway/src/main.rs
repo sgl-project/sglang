@@ -151,6 +151,9 @@ struct CliArgs {
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
     decode_policy: Option<String>,
 
+    #[arg(long, default_value_t = false)]
+    epd_disaggregation: bool,
+
     #[arg(long, default_value_t = 1800)]
     worker_startup_timeout_secs: u64,
 
@@ -207,6 +210,9 @@ struct CliArgs {
 
     #[arg(long, num_args = 0..)]
     decode_selector: Vec<String>,
+
+    #[arg(long, num_args = 0..)]
+    encode_selector: Vec<String>,
 
     #[arg(long, default_value_t = 29000)]
     prometheus_port: u16,
@@ -552,6 +558,7 @@ impl CliArgs {
                 selector: Self::parse_selector(&self.selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
+                encode_selector: Self::parse_selector(&self.encode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
             })
         } else {
@@ -581,6 +588,18 @@ impl CliArgs {
                 for (url, _) in prefill_urls {
                     all_urls.push(url.clone());
                 }
+                all_urls.extend(decode_urls.clone());
+            }
+            RoutingMode::EncodePrefillDecode {
+                encode_urls,
+                prefill_urls,
+                decode_urls,
+                ..
+            } => {
+                for url in encode_urls {
+                    all_urls.push(url.clone());
+                }
+                all_urls.extend(prefill_urls.iter().map(|(url, _)| url.clone()));
                 all_urls.extend(decode_urls.clone());
             }
             RoutingMode::OpenAI { .. } => {}

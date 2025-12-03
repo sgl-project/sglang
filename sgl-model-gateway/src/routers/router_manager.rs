@@ -146,6 +146,9 @@ impl RouterManager {
             (ConnectionMode::Http, RoutingMode::PrefillDecode { .. }) => {
                 RouterId::new("http-pd".to_string())
             }
+            (ConnectionMode::Http, RoutingMode::EncodePrefillDecode { .. }) => {
+                RouterId::new("http-epd".to_string())
+            }
             (ConnectionMode::Http, RoutingMode::OpenAI { .. }) => {
                 RouterId::new("http-openai".to_string())
             }
@@ -157,6 +160,9 @@ impl RouterManager {
             }
             (ConnectionMode::Grpc { .. }, RoutingMode::OpenAI { .. }) => {
                 RouterId::new("grpc-regular".to_string())
+            }
+            (ConnectionMode::Grpc { .. }, RoutingMode::EncodePrefillDecode { .. }) => {
+                RouterId::new("grpc-epd".to_string())
             }
         }
     }
