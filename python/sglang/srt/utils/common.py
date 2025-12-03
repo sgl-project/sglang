@@ -82,6 +82,7 @@ import torch
 import torch.distributed
 import torch.distributed as dist
 import zmq
+import triton
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
@@ -92,7 +93,6 @@ from torch.profiler import ProfilerActivity, profile, record_function
 from torch.utils._contextlib import _DecoratorContextManager
 from typing_extensions import Literal
 
-import triton
 from sglang.srt.environ import envs
 from sglang.srt.metrics.func_timer import enable_func_timer
 
