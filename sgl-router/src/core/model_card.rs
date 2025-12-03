@@ -90,7 +90,7 @@ impl std::fmt::Display for ProviderType {
 /// # Example
 ///
 /// ```
-/// use sglang_router_rs::core::{ModelCard, ModelType, ProviderType};
+/// use sgl_model_gateway::core::{ModelCard, ModelType, ProviderType};
 ///
 /// let card = ModelCard::new("meta-llama/Llama-3.1-8B-Instruct")
 ///     .with_display_name("Llama 3.1 8B Instruct")

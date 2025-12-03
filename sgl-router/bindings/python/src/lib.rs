@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use sglang_router::*;
+use sgl_model_gateway::*;
 use std::collections::HashMap;
 
 // Define the enums with PyO3 bindings
@@ -704,16 +704,16 @@ impl Router {
     }
 }
 
-/// Get formatted version information string with full build details
+/// Get simple version string (default for --version)
 #[pyfunction]
 fn get_version_string() -> String {
     version::get_version_string()
 }
 
-/// Get short version information string
+/// Get verbose version information string with full build details (for --version-verbose)
 #[pyfunction]
-fn get_short_version_string() -> String {
-    version::get_short_version_string()
+fn get_verbose_version_string() -> String {
+    version::get_verbose_version_string()
 }
 
 #[pymodule]
@@ -725,6 +725,6 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostgresConfig>()?;
     m.add_class::<Router>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
-    m.add_function(wrap_pyfunction!(get_short_version_string, m)?)?;
+    m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     Ok(())
 }
