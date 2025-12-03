@@ -1,4 +1,4 @@
-use sglang_router_rs::{
+use sgl_model_gateway::{
     protocols::chat::{ChatMessage, MessageContent},
     tokenizer::chat_template::{
         detect_chat_template_content_format, ChatTemplateContentFormat, ChatTemplateParams,
