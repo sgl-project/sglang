@@ -65,56 +65,46 @@ fn max_diff(a: &Array4<f32>, b: &Array4<f32>) -> f32 {
     (a - b).mapv(|v| v.abs()).fold(0.0f32, |acc, &v| acc.max(v))
 }
 
-// ============================================================================
-// Standard CLIP mode tests (llava-hf/* models, no expand-to-square)
-// ============================================================================
-
-/// Test LLaVA processor (standard CLIP) against golden outputs
-#[test]
-fn test_llava_golden_square() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava");
-    let image_path = Path::new("tests/fixtures/images/square.jpg");
+/// Run a golden test for a specific mode and image.
+///
+/// # Arguments
+/// * `mode` - Either "llava" (standard CLIP) or "llava_pad" (expand-to-square mode)
+/// * `image_name` - Name of the test image (e.g., "square", "tall", "wide", "small")
+fn run_golden_test(mode: &str, image_name: &str) {
+    let golden_dir = Path::new("tests/fixtures/golden").join(mode);
+    let image_path = Path::new("tests/fixtures/images").join(format!("{}.jpg", image_name));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
+        eprintln!(
+            "Golden test fixtures for {}/{} not found, skipping test",
+            mode, image_name
+        );
         eprintln!("Run: python scripts/generate_vision_golden.py");
         return;
     }
 
-    // Load golden output
-    let golden = load_golden_npz(&golden_dir.join("golden_square.npz"));
+    let golden = load_golden_npz(&golden_dir.join(format!("golden_{}.npz", image_name)));
     let config = load_config(&golden_dir.join("preprocessor_config.json"));
 
-    // Load and process image with Rust (default = Square mode, standard CLIP)
-    let image = image::open(image_path).expect("Failed to open image");
-    let processor = LlavaProcessor::new();
+    let image = image::open(&image_path).expect("Failed to open image");
+
+    let processor: Box<dyn ImagePreProcessor> = match mode {
+        "llava" => Box::new(LlavaProcessor::new()),
+        "llava_pad" => Box::new(LlavaProcessor::new_with_pad()),
+        _ => panic!("Unknown test mode: {}", mode),
+    };
+
     let result = processor
         .preprocess(&[image], &config)
         .expect("Processing failed");
 
-    // Compare
     let diff = max_diff(&golden, &result.pixel_values);
+    println!(
+        "{} - {} image - Max difference: {:.6}",
+        mode, image_name, diff
+    );
     println!("Golden shape: {:?}", golden.shape());
     println!("Rust shape: {:?}", result.pixel_values.shape());
-    println!("Max difference: {:.6}", diff);
-    println!(
-        "Rust range: [{:.4}, {:.4}]",
-        result
-            .pixel_values
-            .iter()
-            .cloned()
-            .fold(f32::INFINITY, f32::min),
-        result
-            .pixel_values
-            .iter()
-            .cloned()
-            .fold(f32::NEG_INFINITY, f32::max)
-    );
-    println!(
-        "Golden range: [{:.4}, {:.4}]",
-        golden.iter().cloned().fold(f32::INFINITY, f32::min),
-        golden.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
-    );
 
     // Allow tolerance for floating point and interpolation algorithm differences
     assert!(
@@ -124,91 +114,28 @@ fn test_llava_golden_square() {
     );
 }
 
+// ============================================================================
+// Standard CLIP mode tests (llava-hf/* models, no expand-to-square)
+// ============================================================================
+
+#[test]
+fn test_llava_golden_square() {
+    run_golden_test("llava", "square");
+}
+
 #[test]
 fn test_llava_golden_tall() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava");
-    let image_path = Path::new("tests/fixtures/images/tall.jpg");
-
-    if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
-        return;
-    }
-
-    let golden = load_golden_npz(&golden_dir.join("golden_tall.npz"));
-    let config = load_config(&golden_dir.join("preprocessor_config.json"));
-
-    let image = image::open(image_path).expect("Failed to open image");
-    let processor = LlavaProcessor::new();
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
-
-    let diff = max_diff(&golden, &result.pixel_values);
-    println!("Tall image - Max difference: {:.6}", diff);
-
-    assert!(
-        diff < 0.02,
-        "Max difference {} exceeds tolerance 0.02",
-        diff
-    );
+    run_golden_test("llava", "tall");
 }
 
 #[test]
 fn test_llava_golden_wide() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava");
-    let image_path = Path::new("tests/fixtures/images/wide.jpg");
-
-    if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
-        return;
-    }
-
-    let golden = load_golden_npz(&golden_dir.join("golden_wide.npz"));
-    let config = load_config(&golden_dir.join("preprocessor_config.json"));
-
-    let image = image::open(image_path).expect("Failed to open image");
-    let processor = LlavaProcessor::new();
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
-
-    let diff = max_diff(&golden, &result.pixel_values);
-    println!("Wide image - Max difference: {:.6}", diff);
-
-    assert!(
-        diff < 0.02,
-        "Max difference {} exceeds tolerance 0.02",
-        diff
-    );
+    run_golden_test("llava", "wide");
 }
 
 #[test]
 fn test_llava_golden_small() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava");
-    let image_path = Path::new("tests/fixtures/images/small.jpg");
-
-    if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
-        return;
-    }
-
-    let golden = load_golden_npz(&golden_dir.join("golden_small.npz"));
-    let config = load_config(&golden_dir.join("preprocessor_config.json"));
-
-    let image = image::open(image_path).expect("Failed to open image");
-    let processor = LlavaProcessor::new();
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
-
-    let diff = max_diff(&golden, &result.pixel_values);
-    println!("Small image - Max difference: {:.6}", diff);
-
-    assert!(
-        diff < 0.02,
-        "Max difference {} exceeds tolerance 0.02",
-        diff
-    );
+    run_golden_test("llava", "small");
 }
 
 // ============================================================================
@@ -217,119 +144,22 @@ fn test_llava_golden_small() {
 
 #[test]
 fn test_llava_pad_golden_square() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava_pad");
-    let image_path = Path::new("tests/fixtures/images/square.jpg");
-
-    if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
-        return;
-    }
-
-    let golden = load_golden_npz(&golden_dir.join("golden_square.npz"));
-    let config = load_config(&golden_dir.join("preprocessor_config.json"));
-
-    let image = image::open(image_path).expect("Failed to open image");
-    // Use pad mode processor
-    let processor = LlavaProcessor::new_with_pad();
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
-
-    let diff = max_diff(&golden, &result.pixel_values);
-    println!("Pad mode - Square image - Max difference: {:.6}", diff);
-
-    assert!(
-        diff < 0.02,
-        "Max difference {} exceeds tolerance 0.02",
-        diff
-    );
+    run_golden_test("llava_pad", "square");
 }
 
 #[test]
 fn test_llava_pad_golden_tall() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava_pad");
-    let image_path = Path::new("tests/fixtures/images/tall.jpg");
-
-    if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
-        return;
-    }
-
-    let golden = load_golden_npz(&golden_dir.join("golden_tall.npz"));
-    let config = load_config(&golden_dir.join("preprocessor_config.json"));
-
-    let image = image::open(image_path).expect("Failed to open image");
-    let processor = LlavaProcessor::new_with_pad();
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
-
-    let diff = max_diff(&golden, &result.pixel_values);
-    println!("Pad mode - Tall image - Max difference: {:.6}", diff);
-
-    assert!(
-        diff < 0.02,
-        "Max difference {} exceeds tolerance 0.02",
-        diff
-    );
+    run_golden_test("llava_pad", "tall");
 }
 
 #[test]
 fn test_llava_pad_golden_wide() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava_pad");
-    let image_path = Path::new("tests/fixtures/images/wide.jpg");
-
-    if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
-        return;
-    }
-
-    let golden = load_golden_npz(&golden_dir.join("golden_wide.npz"));
-    let config = load_config(&golden_dir.join("preprocessor_config.json"));
-
-    let image = image::open(image_path).expect("Failed to open image");
-    let processor = LlavaProcessor::new_with_pad();
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
-
-    let diff = max_diff(&golden, &result.pixel_values);
-    println!("Pad mode - Wide image - Max difference: {:.6}", diff);
-
-    assert!(
-        diff < 0.02,
-        "Max difference {} exceeds tolerance 0.02",
-        diff
-    );
+    run_golden_test("llava_pad", "wide");
 }
 
 #[test]
 fn test_llava_pad_golden_small() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava_pad");
-    let image_path = Path::new("tests/fixtures/images/small.jpg");
-
-    if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
-        return;
-    }
-
-    let golden = load_golden_npz(&golden_dir.join("golden_small.npz"));
-    let config = load_config(&golden_dir.join("preprocessor_config.json"));
-
-    let image = image::open(image_path).expect("Failed to open image");
-    let processor = LlavaProcessor::new_with_pad();
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
-
-    let diff = max_diff(&golden, &result.pixel_values);
-    println!("Pad mode - Small image - Max difference: {:.6}", diff);
-
-    assert!(
-        diff < 0.02,
-        "Max difference {} exceeds tolerance 0.02",
-        diff
-    );
+    run_golden_test("llava_pad", "small");
 }
 
 // ============================================================================
