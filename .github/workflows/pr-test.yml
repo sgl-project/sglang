@@ -15,6 +15,11 @@ on:
         options:
           - "release"
           - "nightly"
+      target_stage:
+        description: "Specific stage to run (optional, for quick testing)"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: pr-test-${{ github.ref }}
@@ -338,9 +343,12 @@ jobs:
   stage-a-test-1:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'stage-a-test-1') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -372,9 +380,12 @@ jobs:
   multimodal-gen-test-1-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      needs.check-changes.outputs.multimodal_gen == 'true'
+      (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        needs.check-changes.outputs.multimodal_gen == 'true'
+      )
     runs-on: 1-gpu-runner
     strategy:
       fail-fast: false
@@ -413,9 +424,12 @@ jobs:
   multimodal-gen-test-2-gpu:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      needs.check-changes.outputs.multimodal_gen == 'true'
+      (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        needs.check-changes.outputs.multimodal_gen == 'true'
+      )
     runs-on: 2-gpu-runner
     strategy:
       fail-fast: false
@@ -454,9 +468,12 @@ jobs:
   quantization-test:
       needs: [check-changes, call-gate, stage-a-test-1]
       if: |
-        always() &&
-        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        (inputs.target_stage == 'quantization-test') ||
+        (
+          always() &&
+          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
       runs-on: 1-gpu-runner
       steps:
         - name: Checkout code
@@ -483,9 +500,12 @@ jobs:
   unit-test-backend-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-1-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -519,9 +539,12 @@ jobs:
   unit-test-backend-2-gpu:
     needs: [check-changes, call-gate, unit-test-backend-1-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-2-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 2-gpu-runner
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -554,9 +577,12 @@ jobs:
   unit-test-backend-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-4-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 4-gpu-h100
     env:
       RUNNER_LABELS: 4-gpu-h100
@@ -589,9 +615,12 @@ jobs:
   unit-test-backend-8-gpu-h200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-8-gpu-h200') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
@@ -624,9 +653,12 @@ jobs:
   unit-test-backend-8-gpu-h20:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-8-gpu-h20') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 8-gpu-h20
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
@@ -660,9 +692,12 @@ jobs:
   performance-test-1-gpu-part-1:
     needs: [check-changes, call-gate, stage-a-test-1]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'performance-test-1-gpu-part-1') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -723,9 +758,12 @@ jobs:
   performance-test-1-gpu-part-2:
     needs: [check-changes, call-gate, stage-a-test-1]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'performance-test-1-gpu-part-2') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -778,9 +816,12 @@ jobs:
   performance-test-1-gpu-part-3:
     needs: [check-changes, call-gate, stage-a-test-1]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'performance-test-1-gpu-part-3') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -827,9 +868,12 @@ jobs:
   performance-test-2-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'performance-test-2-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 2-gpu-runner
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -888,9 +932,12 @@ jobs:
   accuracy-test-1-gpu:
     needs: [check-changes, call-gate, stage-a-test-1]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'accuracy-test-1-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 1-gpu-runner
     env:
       RUNNER_LABELS: 1-gpu-runner
@@ -922,9 +969,12 @@ jobs:
   accuracy-test-2-gpu:
     needs: [check-changes, call-gate, accuracy-test-1-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'accuracy-test-2-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 2-gpu-runner
     env:
       RUNNER_LABELS: 2-gpu-runner
@@ -956,9 +1006,12 @@ jobs:
   unit-test-deepep-4-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-deepep-4-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 4-gpu-h100
     env:
       RUNNER_LABELS: 4-gpu-h100
@@ -987,9 +1040,12 @@ jobs:
   unit-test-deepep-8-gpu:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-deepep-8-gpu') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 8-gpu-h200
     env:
       RUNNER_LABELS: 8-gpu-h200
@@ -1018,9 +1074,12 @@ jobs:
   unit-test-backend-4-gpu-b200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-4-gpu-b200') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 4-gpu-b200
     env:
       RUNNER_LABELS: 4-gpu-b200
@@ -1054,9 +1113,12 @@ jobs:
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
     if: |
-      always() &&
-      (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
+      (
+        always() &&
+        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+      )
     runs-on: 4-gpu-gb200
     env:
       RUNNER_LABELS: 4-gpu-gb200
