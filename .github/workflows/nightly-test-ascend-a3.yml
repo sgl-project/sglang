@@ -29,11 +29,11 @@ jobs:
             decode_size: 2
             router_size: 1
             test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500_50ms.py
-          - name: test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500
+          - name: test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500_50ms
             prefill_size: 1
             decode_size: 1
             router_size: 1
-            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500.py
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500_50ms.py
     uses: ./.github/workflows/nightly-test-ascend-multi-node.yml
     with:
       soc_version: a3
