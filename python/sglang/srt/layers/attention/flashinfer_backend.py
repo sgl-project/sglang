@@ -163,6 +163,10 @@ class FlashInferAttnBackend(AttentionBackend):
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "Qwen3VLForConditionalGeneration"
+            in model_runner.model_config.hf_config.architectures
+            or "Qwen3VLMoeForConditionalGeneration"
+            in model_runner.model_config.hf_config.architectures
         ):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 
