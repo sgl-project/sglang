@@ -3,9 +3,10 @@
 //! This module parses the `preprocessor_config.json` files from HuggingFace model
 //! repositories, providing the configuration needed for image preprocessing.
 
+use std::collections::HashMap;
+
 use image::imageops::FilterType;
 use serde::Deserialize;
-use std::collections::HashMap;
 
 use super::transforms;
 

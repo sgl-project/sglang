@@ -3,12 +3,12 @@
 //! This module defines the interface for model-specific image processors
 //! and the common output format for preprocessed images.
 
-use image::DynamicImage;
-use ndarray::Array4;
 use std::collections::HashMap;
 
-use super::preprocessor_config::PreProcessorConfig;
-use super::transforms::TransformError;
+use image::DynamicImage;
+use ndarray::Array4;
+
+use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 
 /// Model-specific output values that vary by architecture.
 ///
@@ -260,8 +260,9 @@ impl Default for ImageProcessorRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ndarray::Array4;
+
+    use super::*;
 
     #[test]
     fn test_preprocessed_images_accessors() {
