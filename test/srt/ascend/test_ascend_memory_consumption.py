@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m unittest test_ascend_double_memory_consumption.TestMemoryConsumptionAscend.test_memory_consumption
+python3 -m unittest test_ascend_memory_consumption.TestMemoryConsumptionAscend.test_memory_consumption
 """
 
 import os
