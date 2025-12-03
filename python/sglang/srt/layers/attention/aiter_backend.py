@@ -658,8 +658,6 @@ class AiterAttnBackend(AttentionBackend):
         reduce_final_map = None
         reduce_partial_map = None
 
-        # log_info_on_rank0(logger, f"[init_forward_metadata_capture_cuda_graph] {forward_mode=}")
-
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
             kv_last_page_len = None
@@ -903,8 +901,6 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
 
-        # log_info_on_rank0(logger, f"[init_forward_metadata_replay_cuda_graph] {forward_mode=}")
-
         if forward_mode.is_decode_or_idle():
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
@@ -1121,7 +1117,6 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map = self.forward_metadata.reduce_partial_map
 
                 num_kv_splits = self.forward_metadata.num_kv_splits
-                # num_kv_splits_indptr = self.forward_metadata.num_kv_splits_indptr
 
                 if layer.layer_id == 0 and _use_mla_ps_kernel:
                     self.make_mla_meta_data(
@@ -1160,7 +1155,6 @@ class AiterAttnBackend(AttentionBackend):
                     kv_scale=layer.k_scale,
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
-                    # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
                 return o
             elif forward_batch.forward_mode.is_draft_extend():
@@ -1178,7 +1172,6 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_partial_map = self.forward_metadata.reduce_partial_map
 
                 num_kv_splits = self.forward_metadata.num_kv_splits
-                # num_kv_splits_indptr = self.forward_metadata.num_kv_splits_indptr
 
                 if layer.layer_id == 0 and _use_mla_ps_kernel:
                     self.make_mla_meta_data(
@@ -1197,7 +1190,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                 mla_decode_fwd(
-                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    q,
                     K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
                     o,
                     self.forward_metadata.qo_indptr,
@@ -1217,7 +1210,6 @@ class AiterAttnBackend(AttentionBackend):
                     kv_scale=layer.k_scale,
                     intra_batch_mode=intra_batch_mode,
                     num_kv_splits=num_kv_splits,
-                    # num_kv_splits_indptr=num_kv_splits_indptr,
                 )
                 return o
             else:
@@ -1280,9 +1272,7 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         if self.use_mla:
-            k_buffer = (
-                k  # forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            )
+            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
             work_metadata = self.forward_metadata.work_metadata
             work_indptr = self.forward_metadata.work_indptr
@@ -1293,7 +1283,6 @@ class AiterAttnBackend(AttentionBackend):
             reduce_partial_map = self.forward_metadata.reduce_partial_map
 
             num_kv_splits = self.forward_metadata.num_kv_splits
-            # num_kv_splits_indptr = self.forward_metadata.num_kv_splits_indptr
 
             if layer.layer_id == 0 and _use_mla_ps_kernel:
                 self.make_mla_meta_data(
@@ -1332,9 +1321,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_scale=layer.k_scale,
                 intra_batch_mode=intra_batch_mode,
                 num_kv_splits=num_kv_splits,
-                # num_kv_splits_indptr=num_kv_splits_indptr,
             )
-            # k_buffer = k_buffer.view(-1, 1, layer.qk_head_dim)
         else:
             self.logits_soft_cap = layer.logit_cap
 
