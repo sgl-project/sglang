@@ -3795,17 +3795,18 @@ def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
         setattr(obj, counter_name, count + 1)
 
 
-def detect_nan(logits: torch.Tensor):
+def detect_nan(logits: torch.Tensor) -> Optional[torch.Tensor]:
     """
     Detect if the logits contain NaN values.
     Args:
         logits: The logits to detect NaN values.
     Returns:
-        True if NaN values are detected, False otherwise.
+        A boolean mask of NaNs if any are found, otherwise None.
     """
-    if torch.any(torch.isnan(logits)):
+    nan_mask = torch.isnan(logits)
+    if torch.any(nan_mask):
         logger.warning("Detected errors during sampling! NaN in the logits.")
         if crash_on_warnings():
             raise ValueError("Detected errors during sampling! NaN in the logits.")
-        return True
-    return False
+        return nan_mask
+    return None

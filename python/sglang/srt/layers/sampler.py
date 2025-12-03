@@ -52,10 +52,8 @@ class Sampler(nn.Module):
             apply_custom_logit_processor(logits, sampling_info)
 
         # Detect and handle NaN values in logits
-        if self.use_nan_detection and detect_nan(logits):
-            logits = torch.where(
-                torch.isnan(logits), torch.full_like(logits, -1e5), logits
-            )
+        if self.use_nan_detection and (nan_mask := detect_nan(logits)) is not None:
+            logits = torch.where(nan_mask, torch.full_like(logits, -1e5), logits)
 
         return logits
 

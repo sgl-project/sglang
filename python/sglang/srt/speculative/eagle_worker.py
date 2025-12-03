@@ -644,9 +644,11 @@ class EAGLEWorker(TpModelWorker):
                 forward_batch, skip_attn_backend_init=True
             )
             if self.server_args.enable_nan_detection:
-                if detect_nan(logits := logits_output.next_token_logits):
+                if (
+                    nan_mask := detect_nan(logits := logits_output.next_token_logits)
+                ) is not None:
                     logits_output.next_token_logits = torch.where(
-                        torch.isnan(logits),
+                        nan_mask,
                         torch.full_like(logits, -1e5),
                         logits,
                     )
@@ -718,9 +720,11 @@ class EAGLEWorker(TpModelWorker):
                 batch.sampling_info.vocab_mask = None
 
         if self.server_args.enable_nan_detection:
-            if detect_nan(logits := logits_output.next_token_logits):
+            if (
+                nan_mask := detect_nan(logits := logits_output.next_token_logits)
+            ) is not None:
                 logits_output.next_token_logits = torch.where(
-                    torch.isnan(logits),
+                    nan_mask,
                     torch.full_like(logits, -1e5),
                     logits,
                 )
@@ -904,9 +908,11 @@ class EAGLEWorker(TpModelWorker):
         forward_batch.return_logprob = False
         logits_output, _ = self.draft_model_runner.forward(forward_batch)
         if self.server_args.enable_nan_detection:
-            if detect_nan(logits := logits_output.next_token_logits):
+            if (
+                nan_mask := detect_nan(logits := logits_output.next_token_logits)
+            ) is not None:
                 logits_output.next_token_logits = torch.where(
-                    torch.isnan(logits),
+                    nan_mask,
                     torch.full_like(logits, -1e5),
                     logits,
                 )
@@ -1005,9 +1011,11 @@ class EAGLEWorker(TpModelWorker):
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         if self.server_args.enable_nan_detection:
-            if detect_nan(logits := logits_output.next_token_logits):
+            if (
+                nan_mask := detect_nan(logits := logits_output.next_token_logits)
+            ) is not None:
                 logits_output.next_token_logits = torch.where(
-                    torch.isnan(logits),
+                    nan_mask,
                     torch.full_like(logits, -1e5),
                     logits,
                 )
