@@ -78,7 +78,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
         base_url = DEFAULT_URL_FOR_TEST
 
         output_lines = []
-        t = threading.Thread(target=self.read_output, args=(output_lines, ))
+        t = threading.Thread(target=self.read_output, args=(output_lines,))
         t.start()
 
         process = popen_launch_server(
@@ -120,13 +120,13 @@ class TestMemoryConsumptionAscend(CustomTestCase):
         kill_process_tree(process.pid)
         stdout.close()
         stderr.close()
-        
+
     def read_output(self, output_lines: List[str], filename: str = STDERR_FILENAME):
         """Print the output in real time with another thread."""
 
         while not os.path.exists(filename):
             time.sleep(0.01)
-    
+
         pt = 0
         while pt >= 0:
             if pt > 0 and not os.path.exists(filename):
@@ -141,6 +141,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
                 output_lines.append(line)
                 pt += 1
             time.sleep(0.1)
+
 
 if __name__ == "__main__":
     unittest.main()
