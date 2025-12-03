@@ -19,12 +19,12 @@ import requests
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.entrypoints.warmup import warmup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.warmup import warmup
 
 multiprocessing.set_start_method("spawn", force=True)
 

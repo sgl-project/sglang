@@ -135,33 +135,33 @@ def get_diffusers_component_config(
     """Gets a configuration of a submodule for the given diffusers model.
 
     Args:
-        model_path: the path of the submodule
+        model_path: the path of the submodule (can be local path or HuggingFace model ID)
 
     Returns:
         The loaded configuration.
     """
 
-    # Check if the model path exists
-    if os.path.exists(model_path):
-        # tokenizer
-        config_names = ["generation_config.json"]
-        # By default, we load config.json, but scheduler_config.json for scheduler
-        if "scheduler" in model_path:
-            config_names.append("scheduler_config.json")
-        else:
-            config_names.append("config.json")
+    # Download from HuggingFace Hub if path doesn't exist locally
+    if not os.path.exists(model_path):
+        model_path = maybe_download_model(model_path)
 
-        config_file_paths = [
-            os.path.join(model_path, config_name) for config_name in config_names
-        ]
-
-        combined_config = reduce(
-            lambda acc, path: acc | load_dict(path), config_file_paths, {}
-        )
-
-        return combined_config
+    # tokenizer
+    config_names = ["generation_config.json"]
+    # By default, we load config.json, but scheduler_config.json for scheduler
+    if "scheduler" in model_path:
+        config_names.append("scheduler_config.json")
     else:
-        raise RuntimeError(f"Diffusers config file not found at {model_path}")
+        config_names.append("config.json")
+
+    config_file_paths = [
+        os.path.join(model_path, config_name) for config_name in config_names
+    ]
+
+    combined_config = reduce(
+        lambda acc, path: acc | load_dict(path), config_file_paths, {}
+    )
+
+    return combined_config
 
 
 # Models don't use the same configuration key for determining the maximum
@@ -390,9 +390,10 @@ def maybe_download_model(
         logger.info(
             "Downloading model snapshot from HF Hub for %s...", model_name_or_path
         )
-        with get_lock(model_name_or_path).acquire(
-            poll_interval=2
-        ), suppress_other_loggers(not_suppress_on_main_rank=True):
+        with (
+            get_lock(model_name_or_path).acquire(poll_interval=2),
+            suppress_other_loggers(not_suppress_on_main_rank=True),
+        ):
             local_path = snapshot_download(
                 repo_id=model_name_or_path,
                 ignore_patterns=["*.onnx", "*.msgpack"],

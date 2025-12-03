@@ -4,7 +4,10 @@ version = "0.2.3"
 edition = "2021"
 
 [features]
-default = []
+default = ["grpc-client"]
+grpc-client = []
+grpc-server = []
+
 vendored-openssl = ["openssl/vendored"]
 
 [lints.rust]
@@ -36,6 +39,7 @@ serde_json = { version = "1.0", default-features = false, features = [
     "std",
     "preserve_order",
 ] }
+serde_bytes = "0.11"
 bytes = "1.8.0"
 rand = "0.9.2"
 reqwest = { version = "0.12.8", features = ["stream", "blocking", "json", "rustls-tls"], default-features = false }
@@ -86,6 +90,9 @@ oracle = { version = "0.6.3", features = ["chrono"] }
 subtle = "2.6"
 rustpython-parser = "0.4.0"
 num-traits = "0.2"
+image = { version = "0.25.4", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
+ndarray = "0.16"
+base64 = "0.22"
 openai-harmony = { git = "https://github.com/openai/harmony", tag = "v0.0.4" }
 openmetrics-parser = "0.4.4"
 
