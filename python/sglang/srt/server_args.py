@@ -1220,7 +1220,6 @@ class ServerArgs:
                 )
                 self.disable_overlap_schedule = True
             if is_sm100_supported():
-                self.attention_backend = "triton"
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
