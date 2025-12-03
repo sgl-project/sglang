@@ -1,8 +1,7 @@
-import itertools
 import unittest
 from typing import Optional
 
-import sgl_kernel
+import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
 from utils import parametrize, precision
