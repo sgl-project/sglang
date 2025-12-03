@@ -54,6 +54,7 @@ class MoeRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
+    MARLIN = "marlin"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
@@ -71,6 +72,9 @@ class MoeRunnerBackend(Enum):
 
     def is_triton_kernels(self):
         return self == MoeRunnerBackend.TRITON_KERNELS
+
+    def is_marlin(self):
+        return self == MoeRunnerBackend.MARLIN
 
     def is_flashinfer_trtllm(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM
