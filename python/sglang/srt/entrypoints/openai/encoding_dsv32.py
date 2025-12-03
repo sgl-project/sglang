@@ -311,7 +311,7 @@ def encode_messages(
     messages: List[Dict[str, Any]],
     thinking_mode: str,
     context: Optional[List[Dict[str, Any]]] = None,
-    drop_thinking: bool = True,  # False
+    drop_thinking: bool = True,
     add_default_bos_token: bool = True,
 ) -> str:
     context = context if context else []
