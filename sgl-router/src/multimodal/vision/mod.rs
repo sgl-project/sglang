@@ -10,30 +10,34 @@
 //! - `transforms`: Core image transformations (resize, normalize, crop, etc.)
 //! - `preprocessor_config`: HuggingFace config parsing
 //! - `image_processor`: Trait and output types for processors
-//!
-//! Model-specific processors will be added in Phase 2.
+//! - `processors`: Model-specific implementations (LLaVA, Qwen-VL, etc.)
 //!
 //! # Usage
 //!
 //! ```rust,ignore
 //! use sgl_model_gateway::multimodal::vision::{
 //!     PreProcessorConfig,
-//!     transforms,
+//!     processors::LlavaProcessor,
+//!     ImagePreProcessor,
 //! };
 //!
 //! // Load config from HuggingFace
 //! let config = PreProcessorConfig::from_json(config_json)?;
 //!
-//! // Use transforms directly
-//! let tensor = transforms::to_tensor(&image);
-//! transforms::normalize(&mut tensor, &mean, &std);
+//! // Create processor and preprocess images
+//! let processor = LlavaProcessor::new();
+//! let result = processor.preprocess(&images, &config)?;
 //! ```
 
 pub mod image_processor;
 pub mod preprocessor_config;
+pub mod processors;
 pub mod transforms;
 
 // Re-export commonly used types
-pub use image_processor::{ImagePreProcessor, ModelSpecificValue, PreprocessedImages};
+pub use image_processor::{
+    ImagePreProcessor, ImageProcessorRegistry, ModelSpecificValue, PreprocessedImages,
+};
 pub use preprocessor_config::PreProcessorConfig;
+pub use processors::{LlavaNextProcessor, LlavaProcessor};
 pub use transforms::TransformError;
