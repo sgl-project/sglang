@@ -37,6 +37,7 @@ from sglang.srt.utils.common import (
     configure_ipv6,
     cpu_has_amx_support,
     get_bool_env_var,
+    get_int_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -407,7 +408,7 @@ class ServerArgs:
 
     # Expert parallelism
     ep_size: int = 1
-    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep"] = "none"
+    moe_a2a_backend: Literal["none", "deepep", "mooncake", "ascend_fuseep", "mori"] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
@@ -810,6 +811,10 @@ class ServerArgs:
                 self.chunked_prefill_size = 4096
             if self.cuda_graph_max_bs is None:
                 self.cuda_graph_max_bs = 160
+
+        # assert (
+        #     self.chunked_prefill_size <= get_int_env_var("SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096)
+        # ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
         # Set cuda graph batch sizes
         if self.cuda_graph_bs is None:
@@ -3094,7 +3099,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "mooncake", "ascend_fuseep"],
+            choices=["none", "deepep", "mooncake", "ascend_fuseep", "mori"],
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
