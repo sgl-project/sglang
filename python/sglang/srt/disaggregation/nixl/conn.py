@@ -704,7 +704,7 @@ class NixlKVSender(CommonKVSender):
             return
 
         logger.debug(
-            "[DEBUG] release_xfer_handles(): room=%s releasing=%s",
+            "release_xfer_handles(): room=%s releasing=%s",
             self.bootstrap_room,
             self.xfer_handles,
         )
@@ -718,7 +718,7 @@ class NixlKVSender(CommonKVSender):
         self.xfer_handles.clear()
 
         logger.debug(
-            "[DEBUG] release_xfer_handles(): room=%s handles_cleared", self.bootstrap_room
+            "release_xfer_handles(): room=%s handles_cleared", self.bootstrap_room
         )
 
     def send(
@@ -727,7 +727,7 @@ class NixlKVSender(CommonKVSender):
         state_indices: Optional[List[int]] = None,
     ):
         logger.debug(
-            "[DEBUG] send() invoked: room=%s curr_idx=%s len(kv_indices)=%s chunk_id=%s",
+            "send() invoked: room=%s curr_idx=%s len(kv_indices)=%s chunk_id=%s",
             self.bootstrap_room,
             self.curr_idx,
             len(kv_indices),
@@ -751,7 +751,7 @@ class NixlKVSender(CommonKVSender):
             self.has_sent = True
             del self.kv_mgr.request_status[self.bootstrap_room]
         logger.debug(
-            "[DEBUG] send() completed: room=%s is_last=%s total_handles=%s",
+            "send() completed: room=%s is_last=%s total_handles=%s",
             self.bootstrap_room,
             is_last,
             len(self.xfer_handles),
@@ -760,7 +760,7 @@ class NixlKVSender(CommonKVSender):
     def poll(self) -> KVPoll:
         if not self.has_sent:
             logger.debug(
-                "[DEBUG] poll() before send: room=%s status=%s",
+                "poll() before send: room=%s status=%s",
                 self.bootstrap_room,
                 self.kv_mgr.check_status(self.bootstrap_room),
             )
@@ -774,7 +774,7 @@ class NixlKVSender(CommonKVSender):
         has_error = any(state == "ERR" for state in states)
 
         logger.debug(
-            "[DEBUG] poll() states: room=%s handles=%s states=%s to_release=%s",
+            "poll() states: room=%s handles=%s states=%s to_release=%s",
             self.bootstrap_room,
             self.xfer_handles,
             states,
@@ -801,7 +801,7 @@ class NixlKVSender(CommonKVSender):
 
         if not self.xfer_handles:
             logger.debug(
-                "[DEBUG] poll() success: room=%s handles_cleared",
+                "poll() success: room=%s handles_cleared",
                 self.bootstrap_room,
             )
             return KVPoll.Success  # type: ignore
@@ -811,7 +811,7 @@ class NixlKVSender(CommonKVSender):
     def __del__(self):
         # Ensure handles are returned even if poll() is not called again
         logger.debug(
-            "[DEBUG] __del__ invoked: room=%s outstanding_handles=%s",
+            "__del__ invoked: room=%s outstanding_handles=%s",
             self.bootstrap_room,
             len(self.xfer_handles),
         )
@@ -821,7 +821,7 @@ class NixlKVSender(CommonKVSender):
         # Decode-side cancellation should release handles immediately instead of
         # waiting for garbage collection at prefill teardown.
         logger.debug(
-            "[DEBUG] abort() called: room=%s outstanding_handles=%s",
+            "abort() called: room=%s outstanding_handles=%s",
             self.bootstrap_room,
             len(self.xfer_handles),
         )
@@ -829,7 +829,7 @@ class NixlKVSender(CommonKVSender):
         self.has_sent = False
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         logger.debug(
-            "[DEBUG] abort() finished: room=%s status=%s",
+            "abort() finished: room=%s status=%s",
             self.bootstrap_room,
             self.kv_mgr.check_status(self.bootstrap_room),
         )
