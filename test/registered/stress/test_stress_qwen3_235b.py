@@ -8,8 +8,8 @@ from sglang.test.ci.ci_stress_utils import StressTestRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
 MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-RANDOM_INPUT_LEN = 4096
-RANDOM_OUTPUT_LEN = 512
+RANDOM_INPUT_LEN = 16384
+RANDOM_OUTPUT_LEN = 1024
 OUTPUT_FILE = "stress_test_qwen3_235b.jsonl"
 
 # Register for CI - estimated 180 minutes (memory-constrained by KV cache)
