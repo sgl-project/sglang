@@ -70,7 +70,6 @@ def adapt_config_dict(
             "encoder_args"
         )
     )
-    is_eagle = "eagle" in model
 
     assert not (is_vision and is_audio), "Vision and audio are mutually exclusive"
 
@@ -78,8 +77,6 @@ def adapt_config_dict(
         config_dict = _remap_mistral_vision_args(config_dict)
     if is_audio:
         config_dict = _remap_mistral_audio_args(config_dict)
-    if is_eagle:
-        config_dict = _remap_mistral_eagle_args(config_dict)
 
     config = PretrainedConfig.from_dict(config_dict)
 
@@ -208,11 +205,6 @@ def _remap_mistral_audio_args(config: dict) -> dict:
     }
     if quant_config:
         config["quantization_config"] = quant_config
-    return config
-
-
-def _remap_mistral_eagle_args(config: dict) -> dict:
-    config["architectures"] = ["MistralLarge3ForCausalLMEagle"]
     return config
 
 
