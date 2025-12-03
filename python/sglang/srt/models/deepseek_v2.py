@@ -201,7 +201,8 @@ logger = logging.getLogger(__name__)
 
 def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
     return (
-        quant_config is not None
+        get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
+        and quant_config is not None
         and quant_config.get_name() == "modelopt_fp4"
         and get_moe_a2a_backend().is_deepep()
     )
@@ -2422,7 +2423,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         )
 
     def forward_normal_chunked_kv_core(self, q, k, v, forward_batch):
-        has_extend_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        has_extend_prefix = forward_batch.extend_prefix_lens_cpu is not None and any(
+            forward_batch.extend_prefix_lens_cpu
+        )
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.prepare_chunked_prefix_cache_info(q.device)
@@ -3454,6 +3457,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     if self.config.num_hidden_layers == 1
                     else self.config.num_hidden_layers
                 )
+                print("!!!!!!!!!!!nextn_layer_id:",nextn_layer_id)
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 

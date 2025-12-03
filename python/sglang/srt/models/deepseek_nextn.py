@@ -55,7 +55,6 @@ class DeepseekModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
             # refer to real DeepSeek V3 quant config
             moe_quant_config = Fp8Config(
@@ -126,7 +125,7 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
-
+        #print("!!!!!!!!deepseek_nextn.py line 128 hidden_states:", hidden_states)
         if hidden_states.shape[0] > 0:
             hidden_states = self.eh_proj(
                 torch.cat(
@@ -137,13 +136,13 @@ class DeepseekModelNextN(nn.Module):
                     dim=-1,
                 )
             )
-
+        #print("!!!!!!!!deepseek_nextn.py line 139 hidden_states:", hidden_states)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
-
+        #print("!!!!!!!!deepseek_nextn.py line 145 hidden_states:", hidden_states)
         if not forward_batch.forward_mode.is_idle():
             if residual is not None:
                 hidden_states, _ = self.shared_head.norm(hidden_states, residual)
@@ -188,7 +187,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        #print("!!!!!input_ids:",input_ids," positions: ", positions, " forward_batch: ", forward_batch)
         hidden_states = self.model(input_ids, positions, forward_batch)
+        #print("!!!!!!!!!!!hidden_states", hidden_states)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

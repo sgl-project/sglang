@@ -1425,9 +1425,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         elif self.enable_flashinfer_cutedsl_moe:
             # All-expert-one-input-scale is mathematically different from default per-expert-input-scale
             # Thus we allow users to switch the flag to do thorough testing
+            def nanmax(tensor):
+                mask = ~torch.isnan(tensor)
+                if mask.any():
+                    return tensor[mask].max()
+                else:
+                    return torch.tensor(float('nan'), device=tensor.device, dtype=tensor.dtype)
             if CUTEDSL_MOE_SCALAR_INPUT_SCALE:
                 w13_input_scale = (
-                    layer.w13_input_scale.max()
+                    nanmax(layer.w13_input_scale)
                     .to(torch.float32)
                     .repeat(layer.w13_input_scale.shape[0])
                 )

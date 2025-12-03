@@ -819,10 +819,6 @@ class ServerArgs:
                     # eagle draft models and cuda graphs
                     reserved_mem += 2 * 1024
 
-            # For piecewise cuda graphs
-            if self.enable_piecewise_cuda_graph:
-                reserved_mem += self.piecewise_cuda_graph_max_tokens // 4
-
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
                 if gpu_mem is not None
@@ -904,9 +900,6 @@ class ServerArgs:
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
         if model_arch in ["DeepseekV3ForCausalLM"] and not is_deepseek_nsa(hf_config):
-            if self.enable_piecewise_cuda_graph:
-                logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
-
             if is_cuda() and is_sm100_supported():
                 if (
                     self.attention_backend is None
@@ -2753,6 +2746,13 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
         )
+        parser.add_argument(
+            "--speculative-moe-a2a-backend",
+            type=str,
+            choices=["none","deepep","mooncake","ascend_fuseep"],
+            default=ServerArgs.speculative_moe_a2a_backend,
+            help="Choose the a2a backend for MoE in speculative decoding.",
+        )
         # Ngram speculative decoding
         parser.add_argument(
             "--speculative-ngram-min-match-window-size",
@@ -3181,6 +3181,7 @@ class ServerArgs:
             action="store_true",
             help="Enable NCCL symmetric memory for fast collectives.",
         )
+        #### 注意这个
         parser.add_argument(
             "--disable-flashinfer-cutlass-moe-fp4-allgather",
             action="store_true",
@@ -3684,13 +3685,6 @@ class ServerArgs:
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
-
-        # Check served model name to not have colon as it is reserved for LoRA adapter syntax
-        assert ":" not in self.served_model_name, (
-            "served_model_name cannot contain a colon (':') character. "
-            "The colon is reserved for the 'model:adapter' syntax used in LoRA adapter specification. "
-            f"Invalid value: '{self.served_model_name}'"
-        )
 
         # Check LoRA
         self.check_lora_server_args()

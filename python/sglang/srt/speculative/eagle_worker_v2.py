@@ -680,6 +680,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index: The index of the accepted tokens.
             accept_length: The length of the accepted tokens.
         """
+        print("!!!!!!!!! move_accepted_tokens_to_target_kvcache accept_index:",accept_index," accept_length:", accept_length)
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
 
