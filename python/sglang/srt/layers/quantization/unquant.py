@@ -242,8 +242,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             # w1 and w3 have been swapped, so we don't need do that here
             epilogue_tile_m = 128
             block_k = 128
-            w13_weights_bf16_shuffled = []
-            w2_weights_bf16_shuffled = []
+            old_shape_w13 = layer.w13_weight.data[0].shape
+            old_shape_w2 = layer.w2_weight.data[0].shape
+            new_shape_w13 = None
+            new_shape_w2 = None
             for i in range(layer.num_local_experts):
                 permute_indices = _maybe_get_cached_w3_w1_permute_indices(
                     self._cache_permute_indices,
@@ -276,21 +278,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                     tmp_weights2.view(torch.uint8), block_k
                 )
 
-                w13_weights_bf16_shuffled.append(tmp_weights1.view(torch.bfloat16))
-                w2_weights_bf16_shuffled.append(tmp_weights2.view(torch.bfloat16))
+                new_shape_w13 = tmp_weights1.view(torch.bfloat16).shape
+                new_shape_w2 = tmp_weights2.view(torch.bfloat16).shape
+                layer.w13_weight.data[i] = (
+                    tmp_weights1.view(torch.bfloat16)
+                    .contiguous()
+                    .reshape(old_shape_w13)
+                )
+                layer.w2_weight.data[i] = (
+                    tmp_weights2.view(torch.bfloat16).contiguous().reshape(old_shape_w2)
+                )
 
-            # Stack weights for all experts
-            w13_weights_bf16_shuffled = (
-                torch.stack(w13_weights_bf16_shuffled).view(torch.bfloat16).contiguous()
+            layer.w13_weight.data = layer.w13_weight.data.reshape(
+                layer.num_local_experts, *new_shape_w13
             )
-            w2_weights_bf16_shuffled = (
-                torch.stack(w2_weights_bf16_shuffled).view(torch.bfloat16).contiguous()
-            )
-            layer.w13_weight = torch.nn.Parameter(
-                w13_weights_bf16_shuffled, requires_grad=False
-            )
-            layer.w2_weight = torch.nn.Parameter(
-                w2_weights_bf16_shuffled, requires_grad=False
+            layer.w2_weight.data = layer.w2_weight.data.reshape(
+                layer.num_local_experts, *new_shape_w2
             )
 
         return

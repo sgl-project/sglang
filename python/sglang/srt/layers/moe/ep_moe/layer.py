@@ -560,8 +560,10 @@ def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
             from sglang.srt.layers.moe.fused_moe_triton.layer import FlashInferFP4MoE
 
             return FlashInferFP4MoE
-        elif (quant_config is None) or (
-            quant_config is not None and quant_config.get_name() == "fp8"
+        elif (
+            quant_config is None
+            or quant_config.get_name() == "fp8"
+            or quant_config.get_name() == "modelopt_fp8"
         ):
             # FlashInferFusedMoE support bf16 and fp8
             return FlashInferFusedMoE
