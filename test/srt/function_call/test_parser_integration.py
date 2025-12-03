@@ -349,7 +349,10 @@ class TestMultipleDetectors(ParserIntegrationTestCase):
         self.assertIsNotNone(constraint)
         self.assertEqual(constraint[0], "structural_tag")
         tag = constraint[1]
-        self.assertFalse(tag["format"]["stop_after_first"])
+        # Mistral uses nested tags_with_separator - check inner stop_after_first
+        inner_content = tag["format"]["tags"][0]["content"]
+        self.assertEqual(inner_content["type"], "tags_with_separator")
+        self.assertFalse(inner_content["stop_after_first"])
 
     def test_qwen25_detector_auto_mode(self):
         """Test Qwen25 detector with auto mode."""
