@@ -15,7 +15,7 @@ import uvicorn
 import zmq
 import zmq.asyncio
 from fastapi import FastAPI
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, Response
 from transformers import AutoImageProcessor
 from transformers.image_utils import load_images
 
@@ -515,3 +515,15 @@ async def handle_scheduler_receive_url_request(request: dict):
             rid_to_receive_count[rid] = request["receive_count"]
         assert rid_to_receive_count[rid] == request["receive_count"]
         rid_to_receive_endpoint[rid].add(request["receive_url"])
+
+
+@app.get("/health")
+@app.get("/health_generate")
+async def health_generate():
+    """
+    Health check endpoint for the encoder server.
+    Returns 200 if the encoder is initialized and ready.
+    """
+    if encoder is None:
+        return Response(status_code=503)
+    return Response(status_code=200)
