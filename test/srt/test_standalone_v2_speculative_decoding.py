@@ -97,7 +97,9 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
         self.assertGreater(avg_spec_accept_length, self.spec_decode_threshold)
 
 
-class TestStandaloneV2SpeculativeDecodingTriton(TestStandaloneV2SpeculativeDecodingBase):
+class TestStandaloneV2SpeculativeDecodingTriton(
+    TestStandaloneV2SpeculativeDecodingBase
+):
 
     @classmethod
     def get_server_args(cls):

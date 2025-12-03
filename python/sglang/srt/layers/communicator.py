@@ -552,7 +552,10 @@ class LayerCommunicator:
         if (
             is_dp_attention_enabled()
             and self._speculative_algo is not None
-            and (self._speculative_algo.is_eagle() or self._speculative_algo.is_standalone())
+            and (
+                self._speculative_algo.is_eagle()
+                or self._speculative_algo.is_standalone()
+            )
         ):
             return False
 
