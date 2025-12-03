@@ -40,6 +40,8 @@ class PiecewiseNpuGraphCompiler:
             compilation_config,
             compilation_context,
         )
+        backend.init(model_runner.model_config)
+
         torch._dynamo.reset()
         torch.compiler.allow_in_graph(sys.intern)
         torch.compiler.allow_in_graph(pathlib.Path)

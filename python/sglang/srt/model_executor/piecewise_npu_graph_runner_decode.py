@@ -41,7 +41,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import get_available_gpu_memory, rank0_log
 
 torch._dynamo.config.skip_nnmodule_hook_guards = True
@@ -155,7 +154,6 @@ class PiecewiseNPUGraphRunnerDecode:
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros((3, self.max_bs), dtype=torch.int64)
             self.num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-            self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
             self.block_tables = torch.full((160, 160), 0, dtype=torch.int32)
 

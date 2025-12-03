@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import direct_register_custom_op, is_cuda, is_hip, is_hpu, is_npu
+from sglang.srt.utils import direct_register_custom_op, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
