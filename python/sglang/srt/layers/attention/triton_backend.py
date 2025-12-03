@@ -804,7 +804,7 @@ class TritonAttnBackend(AttentionBackend):
             o = torch.empty_like(q)
 
         # Save KV cache first (must do this before unified kernel)
-        if save_kv_cache:
+        if save_kv_cache and layer.attn_type != AttentionType.ENCODER_ONLY:
             forward_batch.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -822,7 +822,11 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         # Normal mode: use original 2-stage kernel
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+        ):
             sliding_window_size = (
                 layer.sliding_window_size
             )  # Needed for sliding window mask
@@ -875,7 +879,11 @@ class TritonAttnBackend(AttentionBackend):
         bs = forward_batch.batch_size
 
         # Determine sliding window settings
-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and layer.attn_type != AttentionType.ENCODER_ONLY
+        ):
             sliding_window_size = layer.sliding_window_size
             # Note: for unified kernel, we use full kv_indptr (not window)
             prefix_kv_indptr = self.forward_metadata.window_kv_indptr
