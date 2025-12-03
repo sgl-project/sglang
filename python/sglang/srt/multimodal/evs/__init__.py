@@ -5,7 +5,7 @@ from .evs_core import (
     compute_retention_mask,
     redistribute_placeholder_tokens_by_tokens_per_frame,
 )
-from .evs_module import EVS, EVSConfig, EVSEmbeddingResult, EVSProcessor, NonEVSConfig
+from .evs_module import EVS, EVSConfig, EVSEmbeddingResult, EVSProcessor
 
 __all__ = [
     "compute_retained_tokens_count",
@@ -14,6 +14,5 @@ __all__ = [
     "EVSEmbeddingResult",
     "EVS",
     "EVSProcessor",
-    "NonEVSConfig",
     "redistribute_placeholder_tokens_by_tokens_per_frame",
 ]

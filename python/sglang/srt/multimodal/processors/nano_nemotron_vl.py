@@ -11,22 +11,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from math import sqrt
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
-from sglang.srt.multimodal.evs import EVSProcessor, NonEVSConfig
+from sglang.srt.multimodal.evs import EVSProcessor
 from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils.common import sample_video_frames
 
 if TYPE_CHECKING:
     from decord import VideoReader
-    from transformers.configuration_utils import PretrainedConfig
 
 DEFAULT_NUM_TILES = 12
 NUM_VIDEO_TILES = 1
@@ -34,15 +37,12 @@ DESIRED_FPS = 2  # TODO: allow desired fps/num frames to be configurable
 MAX_FRAMES = 128
 
 
-class NanoNemotronVLImageProcessor(EVSProcessor):
-    @staticmethod
-    def create_non_evs_config(hf_config: "PretrainedConfig"):
-        return NonEVSConfig(frame_num_tokens=hf_config.num_image_token)
-
+class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
     models = [NemotronH_Nano_VL_V2]
 
     def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _image_processor, *args, **kwargs)
+        self.evs = EVSProcessor(hf_config, models=self.models)
         Image.MAX_IMAGE_PIXELS = None
         self.image_size = hf_config.image_size
         self.VIDEO_CONTEXT_TOKEN = hf_config.video_context_token
@@ -116,6 +116,8 @@ class NanoNemotronVLImageProcessor(EVSProcessor):
         )
 
         prompt = input_text
+        rows = cols = int(sqrt(self.num_image_token))
+        video_thw_grids: list[tuple[int, int, int]] = []
 
         image_feature = None
         if base_output.images:
@@ -130,14 +132,15 @@ class NanoNemotronVLImageProcessor(EVSProcessor):
             image_feature = torch.cat(preprocessed_images, dim=0)
 
         video_feature = None
-        frames_per_video: list[int] = []
         if base_output.videos:
             preprocessed_videos = []
             for video in base_output.videos:
                 video_array, timestamps = self.parse_video(video)
                 num_frames = len(timestamps)
-                frames_per_video.append(num_frames)
-                tokens_per_frame = self.tokens_per_frame(num_frames)
+                video_thw_grids.append((num_frames, rows, cols))
+                tokens_per_frame = self.evs.tokens_per_frame(
+                    num_frames, tokens_per_frame=self.num_image_token
+                )
                 frames_tensors = [
                     self.preprocess_image(
                         Image.fromarray(frame, mode="RGB"),
@@ -181,13 +184,19 @@ class NanoNemotronVLImageProcessor(EVSProcessor):
 
         items = []
         if image_feature is not None:
-            item = MultimodalDataItem(
-                modality=Modality.IMAGE, feature=image_feature, offsets=img_offsets
+            item = self.evs.data_item(
+                modality=Modality.IMAGE,
+                feature=image_feature,
+                offsets=img_offsets,
+                thw_grids=[(1, rows, cols)] * len(base_output.images),
             )
             items.append(item)
         if video_feature is not None:
-            item = self.data_item(
-                frames_per_video, feature=video_feature, offsets=video_offsets
+            item = self.evs.data_item(
+                modality=Modality.VIDEO,
+                feature=video_feature,
+                offsets=video_offsets,
+                thw_grids=video_thw_grids,
             )
             items.append(item)
 

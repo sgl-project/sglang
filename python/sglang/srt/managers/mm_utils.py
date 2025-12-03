@@ -1107,6 +1107,7 @@ def external_mm_preprocess_routine(
             # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
             # just being defensive here
             forward_batch.mm_inputs = None
+            forward_batch.input_ids = None
         else:
             # NOTE: This may reduce the performance for only-text inputs.
             # Using a fixed-address buffer might be better, though it could be a bit dirty.

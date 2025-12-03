@@ -45,10 +45,7 @@ logger = logging.getLogger(__name__)
 class NemotronH_Nano_VL_V2(EVS):
     @staticmethod
     def create_evs_config(config: NemotronH_Nano_VL_V2_Config):
-        return EVSConfig(
-            video_pruning_rate=config.video_pruning_rate,
-            full_frame_num_tokens=config.num_image_token,
-        )
+        return EVSConfig(video_pruning_rate=config.video_pruning_rate)
 
     def __init__(
         self,

@@ -218,6 +218,17 @@ class MultimodalDataItem:
     class MultimodalDataItemContainsAllItemsOfSameModality(ValueError):
         """A single MultimodalDataItem contains all items of the same modality"""
 
+    @classmethod
+    def of(
+        cls, items: list[MultimodalDataItem], modality: Modality
+    ) -> MultimodalDataItem:
+        assert len(items) > 0
+        if len(items) > 1:
+            raise cls.MultimodalDataItemContainsAllItemsOfSameModality
+        item = items[0]
+        assert item.modality == modality
+        return item
+
     def __getattr__(self, name: str):
         if (
             "model_specific_data" in self.__dict__

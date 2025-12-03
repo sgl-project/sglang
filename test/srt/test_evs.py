@@ -5,51 +5,46 @@ import pytest
 
 
 def test_resolve_evs_config():
-    from sglang.srt.multimodal.evs import (
-        EVS,
-        EVSConfig,
-        EVSProcessorMixin,
-        NonEVSConfig,
-    )
+    from sglang.srt.multimodal.evs import EVS, EVSConfig, EVSProcessor
 
     class EVSModel(EVS):
         @classmethod
         def create_evs_config(cls, hf_config):
             return EVSConfig(
                 video_pruning_rate=hf_config.video_pruning_rate,
-                full_frame_num_tokens=256,
+                temporal_patch_size=getattr(hf_config, "temporal_patch_size", 1),
             )
 
     class NonEVSModel:
         pass
 
-    class Processor(EVSProcessorMixin):
-        @staticmethod
-        def create_non_evs_config(*args):
-            return NonEVSConfig(frame_num_tokens=256)
+    models = [EVSModel, NonEVSModel]
 
-        models = [EVSModel, NonEVSModel]
-
-    processor = Processor(
-        SimpleNamespace(model_type=EVSModel.__name__, video_pruning_rate=0.1)
+    processor = EVSProcessor(
+        hf_config=SimpleNamespace(
+            model_type="EVSModel",
+            video_pruning_rate=0.1,
+            temporal_patch_size=2,
+        ),
+        models=models,
     )
-    assert asdict(processor.evs_config) == {
-        "video_pruning_rate": 0.1,
-        "full_frame_num_tokens": 256,
-    }
-    assert asdict(processor.non_evs_config) == {"frame_num_tokens": 256}
+    expected = EVSConfig(
+        video_pruning_rate=0.1, spatial_merge_size=1, temporal_patch_size=2
+    )
+    assert asdict(processor.evs_config) == asdict(expected)
 
     # No EVS for pruning rate 0.0
-    processor = Processor(
-        SimpleNamespace(model_type=EVSModel.__name__, video_pruning_rate=0.0)
+    processor = EVSProcessor(
+        hf_config=SimpleNamespace(model_type="EVSModel", video_pruning_rate=0.0),
+        models=models,
     )
     assert processor.evs_config is None
-    assert asdict(processor.non_evs_config) == {"frame_num_tokens": 256}
 
     # No EVS for non-EVS model
-    processor = Processor(SimpleNamespace(model_type=NonEVSModel.__name__))
+    processor = EVSProcessor(
+        hf_config=SimpleNamespace(model_type="NonEVSModel"), models=models
+    )
     assert processor.evs_config is None
-    assert asdict(processor.non_evs_config) == {"frame_num_tokens": 256}
 
 
 @dataclass(kw_only=True)
