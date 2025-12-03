@@ -149,17 +149,13 @@ class KVArgsRegisterInfo:
 
 
 class AuxDataCodec:
-    """Handles serialization and deserialization of auxiliary data buffers"""
-
     @staticmethod
     def serialize_data_from_buffer(src_addr, data_length):
-        """Serialize data from memory buffer to bytes"""
         buffer = (ctypes.c_byte * data_length).from_address(src_addr)
         return bytes(buffer)
 
     @staticmethod
     def deserialize_data_to_buffer(kv_args, buffer_index, aux_index, data):
-        """Deserialize bytes into target memory buffer"""
         dst_aux_ptr = kv_args.aux_data_ptrs[buffer_index]
         item_len = kv_args.aux_item_lens[buffer_index]
         dst_addr = dst_aux_ptr + item_len * aux_index
@@ -253,19 +249,9 @@ class MoriKVManager(CommonKVManager):
         )
         return engine
 
-    def _register_pointer(
-        self,
-        ptr: int,
-        length: int,
-        device_id: int,
-        location: MemoryLocationType,
-    ) -> MemoryDesc:
-        capsule = ctypes.pythonapi.PyCapsule_New(ctypes.c_void_p(ptr), None, None)
-        return self.engine._engine.RegisterMemory(capsule, length, device_id, location)  # type: ignore[attr-defined]
-
     def _register_local_buffers(self) -> None:
         for ptr, length in zip(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens):
-            mem_desc = self._register_pointer(
+            mem_desc = self.engine.register_memory(
                 ptr,
                 length,
                 self.kv_args.gpu_id,
@@ -273,7 +259,7 @@ class MoriKVManager(CommonKVManager):
             )
             self.kv_mem_descs.append(mem_desc)
         for ptr, length in zip(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens):
-            desc = self._register_pointer(
+            desc = self.engine.register_memory(
                 ptr,
                 length,
                 -1,
@@ -283,7 +269,7 @@ class MoriKVManager(CommonKVManager):
         for ptr, length in zip(
             self.kv_args.state_data_ptrs, getattr(self.kv_args, "state_data_lens", [])
         ):
-            desc = self._register_pointer(
+            desc = self.engine.register_memory(
                 ptr,
                 length,
                 self.kv_args.gpu_id,
@@ -519,25 +505,19 @@ class MoriKVManager(CommonKVManager):
     ) -> List[TransferStatus]:
         if not src_groups:
             return []
+        local_offsets = [int(src_group[0]) * kv_item_len for src_group in src_groups]
+        remote_offsets = [int(dst_group[0]) * kv_item_len for dst_group in dst_groups]
+        sizes = [len(src_group) * kv_item_len for src_group in src_groups]
 
-        local_mems = [src_desc] * len(src_groups)
-        remote_mems = [dst_desc] * len(src_groups)
-        local_offsets_list = [
-            [int(src_group[0]) * kv_item_len] for src_group in src_groups
-        ]
-        remote_offsets_list = [
-            [int(dst_group[0]) * kv_item_len] for dst_group in dst_groups
-        ]
-        sizes_list = [[len(src_group) * kv_item_len] for src_group in src_groups]
-        transfer_uids = [self.engine.allocate_transfer_uid() for _ in src_groups]
+        transfer_uid = self.engine.allocate_transfer_uid()
 
         statuses = self.engine.batch_write(
-            local_mems,
-            local_offsets_list,
-            remote_mems,
-            remote_offsets_list,
-            sizes_list,
-            transfer_uids,
+            [src_desc],
+            [local_offsets],
+            [dst_desc],
+            [remote_offsets],
+            [sizes],
+            [transfer_uid],
         )
         return statuses
 
