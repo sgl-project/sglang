@@ -58,7 +58,6 @@ Example configuration file (config.json):
 ```json
 {
     "model_path": "FastVideo/FastHunyuan-diffusers",
-    "vae_path": "fal/FLUX.2-Tiny-AutoEncoder",
     "prompt": "A beautiful woman in a red dress walking down a street",
     "output_path": "outputs/",
     "num_gpus": 2,
@@ -93,7 +92,6 @@ Or using YAML format (config.yaml):
 
 ```yaml
 model_path: "FastVideo/FastHunyuan-diffusers"
-vae_path: "fal/FLUX.2-Tiny-AutoEncoder"
 prompt: "A beautiful woman in a red dress walking down a street"
 output_path: "outputs/"
 num_gpus: 2
