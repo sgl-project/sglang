@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
@@ -8,13 +9,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 import torch
 
 from sglang.srt.layers.parameter import (
-    BasevLLMParameter,
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     RowvLLMParameter,
-    permute_param_layout_,
 )
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -23,28 +22,18 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.marlin_utils import (
-    apply_gptq_marlin_linear,
     check_marlin_supported,
-    check_marlin_supports_shape,
-    marlin_is_k_full,
-    marlin_make_empty_g_idx,
-    marlin_make_workspace,
     marlin_moe_permute_scales,
-    marlin_permute_scales,
     marlin_repeat_scales_on_all_ranks,
-    marlin_sort_g_idx,
-    marlin_zero_points,
     verify_marlin_supported,
-    unpack_quantized_values_into_int32,
-    pack_quantized_values_into_int32,
 )
-from sgl_kernel.gemm import machete_mm
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
     replace_parameter,
-    unpack_cols,
 )
+from sglang.srt.utils import is_cuda
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -53,12 +42,10 @@ if TYPE_CHECKING:
         CombineInput,
     )
 
-from sglang.srt.utils import is_cuda
-
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle, permute_cols
+    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle
 
 
 logger = logging.getLogger(__name__)
@@ -92,6 +79,10 @@ def gptq_marlin_moe_repack(
     return output
 
 
+def get_compute_capability():
+    return torch.cuda.get_device_capability()[0]*10 + torch.cuda.get_device_capability()[1]
+
+
 @dataclass
 class MarlinLinearLayerConfig:
     full_weight_shape: tuple[int, int]  # [in, out]
@@ -101,6 +92,63 @@ class MarlinLinearLayerConfig:
     group_size: int
     zero_points: bool
     has_g_idx: bool
+
+
+class GPTQKernel(ABC):
+
+    def __init__(self,
+                 c: MarlinLinearLayerConfig,
+                 w_q_param_name: str,
+                 w_s_param_name: str,
+                 w_zp_param_name: Optional[str] = None,
+                 w_gidx_param_name: Optional[str] = None) -> None:
+        #assern self.can_implement(c)
+        self.kernel_config = c
+        self.w_q_name = w_q_param_name
+        self.w_s_name = w_s_param_name
+        if c.zero_points:
+            assert w_zp_param_name is not None
+        if c.has_g_idx:
+            assert w_gidx_param_name is not None
+        self.w_zp_name = w_zp_param_name
+        self.w_gidx_name = w_gidx_param_name
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_weights(self,
+                      layer: torch.nn.Module,
+                      x: torch.Tensor,
+                      bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _transform_param(self, layer: torch.nn.Module, name: Optional[str],
+                         fn: Callable) -> None:
+        if name is not None and getattr(layer, name, None) is not None:
+
+            old_param = getattr(layer, name)
+            new_param = fn(old_param)
+            # replace the parameter with torch.nn.Parameter for TorchDynamo
+            # compatibility
+            replace_parameter(
+                layer, name,
+                torch.nn.Parameter(new_param.data, requires_grad=False))
+
+    def _get_weight_params(
+            self, layer: torch.nn.Module) -> tuple[
+                torch.Tensor,  # w_q
+                torch.Tensor,  # w_s
+                Optional[torch.Tensor],  # w_zp,
+                Optional[torch.Tensor]  # w_gidx
+            ]:
+        return (
+            getattr(layer, self.w_q_name),
+            getattr(layer, self.w_s_name),
+            getattr(layer, self.w_zp_name or "", None),
+            getattr(layer, self.w_gidx_name or "", None),
+        )
 
 
 class GPTQConfig(QuantizationConfig):
@@ -202,6 +250,7 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
@@ -584,6 +633,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+
+        from sglang.srt.layers.quantization.machete_kernel import MacheteLinearKernel
+        from sglang.srt.layers.quantization.marlin_kernel import MarlinLinearKernel
+
         output_size_per_partition = sum(output_partition_sizes)
         is_row_parallel = input_size != input_size_per_partition
         weight_loader = extra_weight_attrs.get("weight_loader")
@@ -687,77 +740,22 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
         layer.register_parameter("qzeros", qzeros)
 
+        cc = get_compute_capability()
+        if cc == 90:
+            kernel_type = MacheteLinearKernel
+        else:
+            kernel_type = MarlinLinearKernel
+
+        self.kernel = kernel_type(
+            self.kernel_config,
+            w_q_param_name="qweight",
+            w_s_param_name="scales",
+            w_zp_param_name="qzeros",
+            w_gidx_param_name="g_idx"
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        c = self.kernel_config
-
-        self.w_q_name = "qweight"
-        self.w_s_name = "scales"
-        self.w_zp_name = "qzeros"
-        self.w_gidx_name = "g_idx"
-
-        if c.has_g_idx:
-            assert self.w_gidx_name is not None
-            perm = torch.argsort(getattr(layer, self.w_gidx_name))\
-                .to(torch.int)
-
-            self.act_perm = lambda x: x[:, perm]
-            # use `ops.permute_cols` if possible
-            if c.act_type in [torch.float16, torch.bfloat16] \
-                and c.partition_weight_shape[0] % 8 == 0:
-                self.act_perm = lambda x: permute_cols(x, perm=perm)
-
-
-        def _transform_param(layer: torch.nn.Module, name: Optional[str],
-                         fn: Callable) -> None:
-            if name is not None and getattr(layer, name, None) is not None:
-
-                old_param = getattr(layer, name)
-                new_param = fn(old_param)
-                # replace the parameter with torch.nn.Parameter for TorchDynamo
-                # compatibility
-                replace_parameter(
-                    layer, name,
-                    torch.nn.Parameter(new_param.data, requires_grad=False))
-
-        def transform_w_q(x):
-            assert isinstance(x, BasevLLMParameter)
-            permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            if c.has_g_idx:
-                x_unpacked = unpack_quantized_values_into_int32(x.data,
-                                                                c.weight_type,
-                                                                packed_dim=0)
-                x_perm = x_unpacked[perm, :]
-                x.data = pack_quantized_values_into_int32(x_perm,
-                                                          c.weight_type,
-                                                          packed_dim=0)
-            x.data = torch.ops.sgl_kernel.machete_prepack_B(x.data.t().contiguous().t(),
-                                           a_type=c.act_type,
-                                           b_type=c.weight_type.id,
-                                           group_scales_type=c.act_type)
-            return x
-
-        def transform_w_s(x):
-            assert isinstance(x, BasevLLMParameter)
-            permute_param_layout_(x, input_dim=0, output_dim=1)
-            x.data = x.data.contiguous()
-            return x
-
-        def transform_w_zp(x):
-            assert isinstance(x, BasevLLMParameter)
-            permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=1)
-            x_unpacked = unpack_quantized_values_into_int32(x.data,
-                                                            c.weight_type,
-                                                            packed_dim=1)
-            w_s = getattr(layer, self.w_s_name).data
-            # pre-apply scales to zero-points
-            x.data = (-1.0 * w_s * (x_unpacked.to(w_s.dtype))).contiguous()
-            return x
-
-        # Repack weights and scales for Machete
-        _transform_param(layer, self.w_q_name, transform_w_q)
-        _transform_param(layer, self.w_s_name, transform_w_s)
-        if c.zero_points:
-            _transform_param(layer, self.w_zp_name, transform_w_zp)
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -765,46 +763,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        c = self.kernel_config
-
-        def _get_weight_params(
-            layer: torch.nn.Module,
-        ) -> tuple[
-            torch.Tensor,  # w_q
-            torch.Tensor,  # w_s
-            Optional[torch.Tensor],  # w_zp,
-            Optional[torch.Tensor],  # w_gidx
-        ]:
-            return (
-                getattr(layer, self.w_q_name),
-                getattr(layer, self.w_s_name),
-                getattr(layer, self.w_zp_name or "", None),
-                getattr(layer, self.w_gidx_name or "", None),
-            )
-
-        w_q, w_s, w_zp, _ = _get_weight_params(layer)
-        x_2d = x.reshape(-1, x.shape[-1])
-        out_shape = x.shape[:-1] + (c.partition_weight_shape[1], )
-
-        if c.has_g_idx:
-            x_2d = self.act_perm(x_2d)
-
-        if c.zero_points:
-            assert w_zp is not None
-        else:
-            w_zp = None
-
-        output = machete_mm(a=x_2d,
-                                b_q=w_q,
-                                b_type=c.weight_type,
-                                b_group_zeros=w_zp,
-                                b_group_scales=w_s,
-                                b_group_size=c.group_size)
-
-        if bias is not None:
-            output.add_(bias)  # In-place add
-
-        return output.reshape(out_shape)
+        return self.kernel.apply_weights(layer, x, bias)
 
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
@@ -1080,3 +1039,50 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             is_k_full=self.is_k_full,
         ).to(orig_dtype)
         return StandardCombineInput(hidden_states=output)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @register_fake_if_exists("sgl_kernel::gptq_gemm")
+    def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
+        return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
+
+    @register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
+    def _(b_q_weight, perm, size_k, size_n, num_bits):
+        return b_q_weight.new_empty(
+            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
+        )
+
+    @register_fake_if_exists("sgl_kernel::gptq_shuffle")
+    def _(q_weight, q_perm, bit):
+        return
+
+    @register_fake_if_exists("sgl_kernel::moe_wna16_marlin_gemm")
+    def _(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        b_zeros,
+        g_idx,
+        perm,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size,
+        top_k,
+        mul_topk_weights,
+        is_ep,
+        b_q_type_id,
+        size_m,
+        size_n,
+        size_k,
+        is_k_full,
+        use_atomic_add,
+        use_fp32_reduce,
+        is_zp_float,
+    ):
+        return c
