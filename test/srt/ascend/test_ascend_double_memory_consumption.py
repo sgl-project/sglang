@@ -4,28 +4,19 @@ python3 -m unittest test_ascend_double_memory_consumption.TestMemoryConsumptionA
 """
 
 import os
+import re
+import threading
 import time
 import unittest
-from types import SimpleNamespace
-from urllib.parse import urlparse
-
-import subprocess
-import requests
-import threading
+from typing import List
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
 )
-
-import re
-
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1"
@@ -36,6 +27,7 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 
 STDERR_FILENAME = "./tmp/stderr.txt"
 STDOUT_FILENAME = "./tmp/stdout.txt"
+
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
@@ -75,8 +67,8 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
         except psutil.NoSuchProcess:
             pass
 
+
 class TestMemoryConsumptionAscend(CustomTestCase):
-        
 
     def test_memory_consumption(self):
         stdout = open(STDOUT_FILENAME, "w")
@@ -84,11 +76,11 @@ class TestMemoryConsumptionAscend(CustomTestCase):
 
         model = "/mnt/share/weights/Qwen3-32B-w8a8/"
         base_url = DEFAULT_URL_FOR_TEST
-        
+
         output_lines = []
         t = threading.Thread(target=self.read_output, args=(output_lines, ))
         t.start()
-        
+
         process = popen_launch_server(
             model,
             base_url,
@@ -111,7 +103,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
                 "--disable-radix-cache",
             ],
         )
-        
+
         # Launch a thread to stream the output
         for line in output_lines:
             if "Load weight end" in line and "mem usage" in line:
@@ -123,7 +115,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
             if "KV Cache is allocated" in line and "V size" in line:
                 match = re.search(r"V size: [+-]?[0-9]+\.[0-9]+ GB", line)
                 self.assertLessEqual(float(match.group(0)[8:-3]), 17.00)
-        
+
         # Clean up everything
         kill_process_tree(process.pid)
         stdout.close()
