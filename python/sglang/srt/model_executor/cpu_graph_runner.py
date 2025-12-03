@@ -29,6 +29,7 @@ import tqdm
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -38,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import (
+    empty_context,
     log_info_on_rank0,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -577,12 +579,22 @@ class CPUGraphRunner:
                 self.encoder_lens = torch.full(
                     (self.max_bs,), self.encoder_len_fill_value, dtype=torch.int64
                 )
+                self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64)
             else:
                 self.encoder_lens = None
+                self.encoder_out_cache_loc = None
 
         # Capture
         try:
-            self.capture()
+            # use model_capture_mode for encoder-decoder models to
+            # set skip_cross_attention to avoid
+            # "Graph Break Reason: Data-dependent branching" caused by
+            # skip_cross_attention = forward_batch.encoder_lens.max() == 0
+            capture_context = (
+                model_capture_mode if self.is_encoder_decoder else empty_context
+            )
+            with capture_context():
+                self.capture()
         except RuntimeError as e:
             raise Exception(
                 f"Capture CPU graph failed: {e}\n{CPU_GRAPH_CAPTURE_FAILED_MSG}"
@@ -596,10 +608,7 @@ class CPUGraphRunner:
         )
 
         is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
-            or torch.all(forward_batch.encoder_lens == 0)
-            if self.is_encoder_decoder
-            else True
+            forward_batch.encoder_lens.max() > 0 if self.is_encoder_decoder else True
         )
 
         requested_capture_hidden_mode = max(
@@ -703,6 +712,7 @@ class CPUGraphRunner:
             seq_lens_sum=seq_lens.sum().item(),
             encoder_lens=encoder_lens,
             encoder_lens_cpu=encoder_lens,
+            encoder_out_cache_loc=self.encoder_out_cache_loc,
             return_logprob=False,
             positions=positions,
             mrope_positions=mrope_positions,
@@ -844,12 +854,16 @@ class CPUGraphRunner:
             pp_proxy_tensors is None
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
 
-        prepared_forward_batch = self.prepare_replay(forward_batch)
-        output = self.graphs[prepared_forward_batch.batch_size](
-            prepared_forward_batch.input_ids,
-            prepared_forward_batch.positions,
-            prepared_forward_batch,
+        replay_context = (
+            model_capture_mode if self.is_encoder_decoder else empty_context
         )
+        with replay_context():
+            prepared_forward_batch = self.prepare_replay(forward_batch)
+            output = self.graphs[prepared_forward_batch.batch_size](
+                prepared_forward_batch.input_ids,
+                prepared_forward_batch.positions,
+                prepared_forward_batch,
+            )
         if forward_batch.batch_size in self.graphs:
             return output
 
