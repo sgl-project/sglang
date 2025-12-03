@@ -8,6 +8,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 import torch
 
+from sglang.srt.batch_overlap.operations import (
+    execute_operations,
+    execute_overlapped_operations,
+)
+from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.communicator import (
@@ -32,15 +37,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.operations import execute_operations, execute_overlapped_operations
-from sglang.srt.operations_strategy import OperationsStrategy
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
-    from sglang.srt.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_hip = is_hip()

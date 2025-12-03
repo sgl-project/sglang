@@ -6,7 +6,7 @@ use std::ptr;
 use std::sync::Arc;
 use serde_json::Value;
 
-use sglang_router::tokenizer::{
+use sgl_model_gateway::tokenizer::{
     create_tokenizer_from_file,
     traits::Tokenizer as TokenizerTrait,
     chat_template::ChatTemplateParams,

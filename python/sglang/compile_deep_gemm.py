@@ -19,12 +19,12 @@ import requests
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.entrypoints.warmup import warmup
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.warmup import warmup
 
 multiprocessing.set_start_method("spawn", force=True)
 
@@ -147,9 +147,6 @@ def refine_server_args(server_args: ServerArgs, compile_args: CompileArgs):
     server_args.disable_cuda_graph = True
     server_args.enable_torch_compile = False
     print(f"Disable CUDA Graph and Torch Compile to save time...")
-
-    server_args.load_format = "dummy"
-    print(f"Set load format to dummy to save time...")
 
     # Set watchdog timeout to compile_args.timeout because compilation will take a long time
     server_args.watchdog_timeout = compile_args.timeout

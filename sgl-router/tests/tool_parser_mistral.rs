@@ -3,7 +3,7 @@
 //! Tests for the Mistral parser which handles [TOOL_CALLS] format
 
 use serde_json::json;
-use sglang_router_rs::tool_parser::{MistralParser, ToolParser};
+use sgl_model_gateway::tool_parser::{MistralParser, ToolParser};
 
 #[tokio::test]
 async fn test_mistral_single_tool() {
@@ -158,14 +158,14 @@ Let me execute these searches for you."#;
 
 #[tokio::test]
 async fn test_mistral_streaming_closing_bracket() {
-    use sglang_router_rs::protocols::common::Tool;
+    use sgl_model_gateway::protocols::common::Tool;
 
     // Test that closing ] is stripped for Mistral array format
     let mut parser = MistralParser::new();
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sglang_router_rs::protocols::common::Function {
+        function: sgl_model_gateway::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: json!({}),
@@ -218,14 +218,14 @@ async fn test_mistral_streaming_closing_bracket() {
 
 #[tokio::test]
 async fn test_mistral_streaming_bracket_in_text_after_tools() {
-    use sglang_router_rs::protocols::common::Tool;
+    use sgl_model_gateway::protocols::common::Tool;
 
     // Test that ] in normal text AFTER tool calls is preserved
     let mut parser = MistralParser::new();
 
     let tools = vec![Tool {
         tool_type: "function".to_string(),
-        function: sglang_router_rs::protocols::common::Function {
+        function: sgl_model_gateway::protocols::common::Function {
             name: "get_weather".to_string(),
             description: Some("Get weather".to_string()),
             parameters: json!({}),

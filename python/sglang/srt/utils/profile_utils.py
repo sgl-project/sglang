@@ -10,6 +10,7 @@ import torch
 
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -34,6 +35,7 @@ class ProfileManager:
         )
         self.tp_rank = tp_rank
         self.cpu_group = cpu_group
+        self.first_rank_in_node = gpu_id == get_global_server_args().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
 
@@ -105,6 +107,7 @@ class ProfileManager:
             **self.profiler_kwargs,
             tp_rank=self.tp_rank,
             cpu_group=self.cpu_group,
+            first_rank_in_node=self.first_rank_in_node,
             output_suffix=f"-{stage}" if stage else "",
         )
         self.profiler.start()
@@ -239,6 +242,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         profile_id: str,
         tp_rank: int,
         cpu_group,
+        first_rank_in_node: bool,
     ):
         self.output_dir = output_dir
         self.output_prefix = output_prefix
@@ -246,6 +250,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.profile_id = profile_id
         self.tp_rank = tp_rank
         self.cpu_group = cpu_group
+        self.first_rank_in_node = first_rank_in_node
 
 
 class _ProfilerTorch(_ProfilerConcreteBase):
@@ -329,12 +334,14 @@ class _ProfilerMemory(_ProfilerConcreteBase):
 
 class _ProfilerCudart(_ProfilerConcreteBase):
     def start(self):
-        logger.info(f"Call cudaProfilerStart")
-        torch.cuda.cudart().cudaProfilerStart()
+        if self.first_rank_in_node:
+            logger.info(f"Call cudaProfilerStart")
+            torch.cuda.cudart().cudaProfilerStart()
 
     def stop(self):
-        logger.info(f"Call cudaProfilerStop")
-        torch.cuda.cudart().cudaProfilerStop()
+        if self.first_rank_in_node:
+            logger.info(f"Call cudaProfilerStop")
+            torch.cuda.cudart().cudaProfilerStop()
 
 
 class _ProfilerRPD(_ProfilerConcreteBase):

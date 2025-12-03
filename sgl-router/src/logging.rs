@@ -28,7 +28,7 @@ impl Default for LoggingConfig {
             log_dir: None,
             colorize: true,
             log_file_name: "sgl-router".to_string(),
-            log_targets: Some(vec!["sglang_router_rs".to_string()]),
+            log_targets: Some(vec!["sgl_model_gateway".to_string()]),
         }
     }
 }
@@ -63,7 +63,7 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
                 })
                 .collect::<String>()
         } else {
-            format!("sglang_router_rs={}", level_filter)
+            format!("sgl_model_gateway={}", level_filter)
         };
 
         EnvFilter::new(filter_string)
