@@ -25,8 +25,8 @@ DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
 )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
-STDERR_FILENAME = "./tmp/stderr.txt"
-STDOUT_FILENAME = "./tmp/stdout.txt"
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 
 class TestMemoryConsumptionAscend(CustomTestCase):
@@ -81,6 +81,11 @@ class TestMemoryConsumptionAscend(CustomTestCase):
         kill_process_tree(process.pid)
         stdout.close()
         stderr.close()
+        if os.path.exists(STDOUT_FILENAME):
+            os.remove(STDOUT_FILENAME)
+        if os.path.exists(STDERR_FILENAME):
+            os.remove(STDERR_FILENAME)
+        t.join()
 
     def read_output(self, output_lines: List[str], filename: str = STDERR_FILENAME):
         """Print the output in real time with another thread."""
