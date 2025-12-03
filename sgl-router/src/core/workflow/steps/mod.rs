@@ -1,22 +1,30 @@
 //! Workflow step implementations
 //!
 //! This module contains concrete step implementations for various workflows:
-//! - Worker registration and activation
+//! - Local worker registration (SGLang, vLLM - gRPC or HTTP modes)
+//! - External worker registration (OpenAI, xAI, Anthropic, etc. - HTTPS only)
 //! - Worker removal
 //! - MCP server registration
-//! - Future: Tokenizer fetching, LoRA updates, etc.
 
+pub mod external_worker_registration;
 pub mod mcp_registration;
 pub mod worker_registration;
 pub mod worker_removal;
 
+pub use external_worker_registration::{
+    create_external_worker_registration_workflow, group_models_into_cards,
+    infer_model_type_from_id, ActivateExternalWorkersStep, CreateExternalWorkersStep,
+    DiscoverModelsStep, ModelInfo, ModelsResponse, RegisterExternalWorkersStep,
+    UpdateExternalPoliciesStep,
+};
 pub use mcp_registration::{
     create_mcp_registration_workflow, ConnectMcpServerStep, DiscoverMcpInventoryStep,
     McpServerConfigRequest, RegisterMcpServerStep, ValidateRegistrationStep,
 };
 pub use worker_registration::{
     create_worker_registration_workflow, ActivateWorkerStep, CreateWorkerStep,
-    DetectConnectionModeStep, DiscoverMetadataStep, RegisterWorkerStep, UpdatePoliciesStep,
+    DetectConnectionModeStep, DiscoverDPInfoStep, DiscoverMetadataStep, RegisterWorkerStep,
+    UpdatePoliciesStep,
 };
 pub use worker_removal::{
     create_worker_removal_workflow, FindWorkersToRemoveStep, RemoveFromPolicyRegistryStep,
