@@ -1565,27 +1565,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_weight_scale_2 = layer.w13_weight_scale_2[:]
         layer.w13_weight_scale_2 = Parameter(w13_weight_scale_2, requires_grad=False)
 
-        def _slice_scale(w):
-            assert w.shape == (layer.num_experts,)
-            assert layer.moe_ep_size * layer.num_local_experts == layer.num_experts
-            return w[
-                layer.moe_ep_rank
-                * layer.num_local_experts : (layer.moe_ep_rank + 1)
-                * layer.num_local_experts
-            ]
-
         # Calculate input scales based on strategy
         if self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_trtllm_moe:
-            w13_input_scale = (
-                layer.w13_input_scale.max().to(torch.float32).expand(layer.num_experts)
-            )
-            w2_input_scale = (
-                layer.w2_input_scale.max().to(torch.float32).expand(layer.num_experts)
-            )
-
-            if layer.moe_ep_size > 1:
-                w13_input_scale = _slice_scale(w13_input_scale)
-                w2_input_scale = _slice_scale(w2_input_scale)
+            w13_input_scale = layer.w13_input_scale.max().to(torch.float32)
+            w2_input_scale = layer.w2_input_scale.max().to(torch.float32)
         elif self.enable_flashinfer_cutedsl_moe:
             # All-expert-one-input-scale is mathematically different from default per-expert-input-scale
             # Thus we allow users to switch the flag to do thorough testing
@@ -1601,6 +1584,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
             w2_input_scale = layer.w2_input_scale
+
+            def _slice_scale(w):
+                assert w.shape == (layer.num_experts,)
+                assert layer.moe_ep_size * layer.num_local_experts == layer.num_experts
+                return w[
+                    layer.moe_ep_rank
+                    * layer.num_local_experts : (layer.moe_ep_rank + 1)
+                    * layer.num_local_experts
+                ]
 
             w13_input_scale = _slice_scale(w13_input_scale)
             w2_input_scale = _slice_scale(w2_input_scale)

@@ -649,9 +649,7 @@ class DeepseekV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=getattr(
-                config, "routing_method_type", RoutingMethodType.DeepSeekV3
-            ),
+            routing_method_type=RoutingMethodType.DeepSeekV3,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -3349,7 +3347,6 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(nn.Module):
     # for quark model load
     packed_modules_mapping = {}
-    model_cls = DeepseekV2Model
 
     def __init__(
         self,
@@ -3376,7 +3373,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.use_nsa = is_deepseek_nsa(config)
-        self.model = self.model_cls(
+        self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         if self.pp_group.is_last_rank:
