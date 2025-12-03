@@ -385,12 +385,8 @@ class Indexer(CustomOp):
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens_cpu[i].item()
             assert isinstance(seq_len, int)
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+            # Use fused Triton kernel to get both K and scale in a single call
+            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
                 layer_id,
                 seq_len,
                 block_tables[i],
