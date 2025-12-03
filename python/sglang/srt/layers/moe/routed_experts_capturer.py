@@ -28,7 +28,9 @@ class _RoutedExpertsDeviceCache:
         self.buffer = torch.zeros(
             (
                 max(
-                    get_global_server_args().chunked_prefill_size, max_running_requests
+                    get_global_server_args().chunked_prefill_size
+                    * get_global_server_args().dp_size,
+                    max_running_requests,
                 ),
                 model_config.hf_text_config.num_hidden_layers,
                 model_config.hf_text_config.num_experts_per_tok,
