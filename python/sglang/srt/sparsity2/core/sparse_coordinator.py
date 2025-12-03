@@ -8,7 +8,6 @@ import torch
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.sparsity2.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
-    SparseMode,
 )
 from sglang.srt.sparsity2.backend.backend_adaptor import BackendAdaptor
 from sglang.srt.sparsity2.core.representation_pool import RepresentationPool
@@ -253,7 +252,6 @@ class SparseCoordinator:
             and self.sparse_kv_cache_manager is not None
         )
 
-    @nvtx.annotate("SparseCoordinator.attention_begin", color="green")
     def attention_begin(
         self,
         query: torch.Tensor,
@@ -265,17 +263,13 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[Any]:
         """Handle attention begin."""
-        if forward_batch.spec_info is not None:
-            return None
-
-        if layer.layer_id == self.start_layer and self.backend_adaptor is not None:
-            self.backend_adaptor.save_original_metadata(attn_metadata)
+        # if layer.layer_id == self.start_layer and self.backend_adaptor is not None:
+        #     self.backend_adaptor.save_original_metadata(attn_metadata)
 
         return self._handle_sparse_retrieve(
             query, layer, forward_batch, attn_metadata, **kwargs
         )
 
-    @nvtx.annotate("SparseCoordinator.attention_end", color="green")
     def attention_end(
         self,
         output: torch.Tensor,
@@ -283,18 +277,18 @@ class SparseCoordinator:
         forward_batch: "ForwardBatch",
     ) -> None:
         """Handle attention end."""
-        layer_id = layer.layer_id
-        self._maybe_construct_representations(layer_id, forward_batch)
+        pass
+        # layer_id = layer.layer_id
+        # self._maybe_construct_representations(layer_id, forward_batch)
 
-        if (
-            layer_id == self.start_layer
-            and forward_batch.forward_mode.is_decode_or_idle()
-        ):
-            self.states.decode_steps[forward_batch.req_pool_indices] += 1
+        # if (
+        #     layer_id == self.start_layer
+        #     and forward_batch.forward_mode.is_decode_or_idle()
+        # ):
+        #     self.states.decode_steps[forward_batch.req_pool_indices] += 1
 
-        self._maybe_incremental_update_representations(layer_id, forward_batch)
+        # self._maybe_incremental_update_representations(layer_id, forward_batch)
 
-    @nvtx.annotate("SparseCoordinator._handle_sparse_retrieve", color="yellow")
     def _handle_sparse_retrieve(
         self,
         query: torch.Tensor,
@@ -319,28 +313,24 @@ class SparseCoordinator:
         )
 
         # Adapt Attention Metadata
-        if self.backend_adaptor is not None:
-            return self.backend_adaptor.adapt_for_attn_metadata(
-                selected_indices=selected_indices,
-                valid_lengths=valid_lengths,
-                sparse_mask=sparse_mask,
-                current_metadata=attn_metadata,
-                forward_batch=forward_batch,
-                req_to_token=self.req_to_token_pool.req_to_token,
-                page_size=self.page_size,
-                layer_id=layer.layer_id,
-            )
+        return self.backend_adaptor.adapt_for_attn_metadata(
+            selected_indices=selected_indices,
+            valid_lengths=valid_lengths,
+            sparse_mask=sparse_mask,
+            current_metadata=attn_metadata,
+            forward_batch=forward_batch,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            page_size=self.page_size,
+            layer_id=layer.layer_id,
+        )
 
-        return None
-
-    @nvtx.annotate("SparseCoordinator._compute_sparse_mask", color="yellow")
     def _compute_sparse_mask(self, req_pool_indices, sparse_mode):
         mask = (
             self.states.prompt_lens[req_pool_indices]
             >= self.config.min_sparse_prompt_len
         )
-        if sparse_mode != SparseMode.ORIGINAL_WISE:
-            mask &= self.states.repr_constructed[req_pool_indices]
+        # if sparse_mode != SparseMode.ORIGINAL_WISE:
+        #     mask &= self.states.repr_constructed[req_pool_indices]
         return mask
 
     def _maybe_construct_representations(

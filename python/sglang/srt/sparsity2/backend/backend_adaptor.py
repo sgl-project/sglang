@@ -230,12 +230,7 @@ class NSABackendAdaptor(BackendAdaptor):
         **kwargs,
     ) -> Optional[torch.Tensor]:
         """Transform NSA topk indices to physical device indices."""
-        if forward_batch.forward_mode.is_extend():
-            # Directly return the selected indices for extend mode
-            return selected_indices
-
         req_pool_indices = forward_batch.req_pool_indices
-
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
         page_table = self.req_to_token_pool.req_to_token[
             :, :max_seqlen_k
@@ -250,6 +245,6 @@ class NSABackendAdaptor(BackendAdaptor):
                 page_table=page_table,
                 layer_id=layer_id,
                 page_size=1,
-            )
+            ).detach().clone()
         ).to(torch.int32)
         return transformed_indices

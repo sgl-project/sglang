@@ -1770,7 +1770,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         topk_indices = None
         if q_lora is not None:
             sparse_coordinator = get_sparse_coordinator()
-            if sparse_coordinator is not None:
+            if forward_batch.forward_mode.is_decode() and sparse_coordinator is not None:
                 topk_indices = sparse_coordinator.attention_begin(
                     query=q_nope_out,
                     key=k_nope,

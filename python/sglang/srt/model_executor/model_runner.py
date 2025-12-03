@@ -2234,6 +2234,9 @@ class ModelRunner:
             self.forward_pass_id,
             forward_batch,
         ):
+            if self.sparse_coordinator is not None:
+                self.sparse_coordinator.forward_begin(forward_batch)
+                
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2241,6 +2244,9 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+
+            if self.sparse_coordinator is not None:
+                self.sparse_coordinator.forward_end(forward_batch)
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
@@ -2278,9 +2284,6 @@ class ModelRunner:
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
 
-        if self.sparse_coordinator is not None:
-            self.sparse_coordinator.forward_begin(forward_batch)
-
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -2303,9 +2306,6 @@ class ModelRunner:
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
-
-        if self.sparse_coordinator is not None:
-            self.sparse_coordinator.forward_end(forward_batch)
 
         if (
             forward_batch.global_num_tokens_cpu is not None

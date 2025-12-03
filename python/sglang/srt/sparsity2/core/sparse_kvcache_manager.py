@@ -88,9 +88,6 @@ class SparseKVCacheManager:
         )
         self.req_states = None
 
-    @nvtx.annotate(
-        "DecodeKVCacheOffloadManager.transform_sparse_top_k_cache", color="red"
-    )
     def transfer_sparse_top_k_cache_v2(
         self,
         req_pool_indices,
@@ -103,7 +100,6 @@ class SparseKVCacheManager:
         page_size,
     ):
         bs = sparse_mask.shape[0]
-        nxtx_range1 = nvtx.start_range(message="diff_kernel", color="blue")
         invoke_nsa_sparse_diff_kernel(
             self.req_states.prev_top_k_result,
             top_k_result,
@@ -121,84 +117,21 @@ class SparseKVCacheManager:
             layer_id,
             page_size,
         )
-        nvtx.end_range(nxtx_range1)
 
-        nxtx_range2 = nvtx.start_range(message="io_kernel_prepare", color="blue")
-        should_load_device_indices = self.req_states.should_load_device_indices
-        should_load_device_indices = should_load_device_indices[
-            should_load_device_indices != -1
-        ]
-        should_load_host_indices = self.req_states.should_load_host_indices
-        should_load_host_indices = should_load_host_indices[
-            should_load_host_indices != -1
-        ]
-        assert len(should_load_device_indices) == len(should_load_host_indices)
-        nvtx.end_range(nxtx_range2)
-
-        nxtx_range3 = nvtx.start_range(message="io_kernel_load", color="blue")
-        # D2H problem here
-        if len(should_load_device_indices) > 0:
-            # load cache from cpu
-            self.host_mem_pool.load_to_device_per_layer(
-                self.host_mem_pool.device_pool,
-                should_load_host_indices,
-                should_load_device_indices,
-                layer_id,
-                "kernel",
-            )
-        nvtx.end_range(nxtx_range3)
-        return self.req_states.curr_device_indices[:bs, :-1]
-
-    @nvtx.annotate(
-        "DecodeKVCacheOffloadManager.transform_sparse_top_k_cache", color="red"
-    )
-    def transfer_sparse_top_k_cache_v1(
-        self,
-        req_pool_indices,
-        top_k_result,
-        out_cache_loc,
-        seq_lens,
-        layer_id,
-    ):
-        nxtx_range = nvtx.start_range(message="init_buffer", color="blue")
-        bs = top_k_result.shape[0]
-        nxtx_range1 = nvtx.start_range(message="diff_kernel", color="blue")
-        invoke_nsa_sparse_diff_kernel(
-            self.req_states.prev_top_k_result,
-            top_k_result,
-            self.req_states.prev_device_indices,
-            self.req_states.curr_device_indices,
-            self.bitmap,
-            self.req_states.full_host_indices,
-            self.req_states.should_load_device_indices,
-            self.req_states.should_load_host_indices,
-            out_cache_loc,
-            seq_lens - 1,
-            req_pool_indices,
-            layer_id,
-        )
-        nvtx.end_range(nxtx_range1)
-
-        nxtx_range2 = nvtx.start_range(message="io_kernel", color="blue")
         should_load_device_indices = self.req_states.should_load_device_indices[:bs]
-        should_load_device_indices = should_load_device_indices[
-            should_load_device_indices != -1
-        ]
         should_load_host_indices = self.req_states.should_load_host_indices[:bs]
-        should_load_host_indices = should_load_host_indices[
-            should_load_host_indices != -1
-        ]
-        assert len(should_load_device_indices) == len(should_load_host_indices)
-        if len(should_load_device_indices) > 0:
-            # load cache from cpu
-            self.host_mem_pool.load_to_device_per_layer(
-                self.host_mem_pool.device_pool,
-                should_load_host_indices,
-                should_load_device_indices,
-                layer_id,
-                "kernel",
-            )
-        nvtx.end_range(nxtx_range2)
+        
+        # if layer_id == 0:
+        #     logger.info(f"[DEBUG] should_load_host_indices shape: {should_load_host_indices.shape}, head: {should_load_host_indices[:bs, :20]}") 
+        
+        # load cache from cpu
+        self.host_mem_pool.load_to_device_per_layer(
+            self.host_mem_pool.device_pool,
+            should_load_host_indices.flatten(),
+            should_load_device_indices.flatten(),
+            layer_id,
+            "kernel",
+        )
         return self.req_states.curr_device_indices[:bs, :-1]
 
     def offload_sparse_decode_req_tokens(
@@ -246,18 +179,7 @@ class SparseKVCacheManager:
         host_indices, req_pool_indices, seq_lens = (
             self.sparse_decode_ongoing_offload.pop(ack_list[0])
         )
-        self.req_states.full_host_indices[req_pool_indices, seq_lens] = host_indices
-        # for i in range(len(req_pool_indices)):
-        #     full_host_indices = self.req_states.full_host_indices[req_pool_indices[i]]
-        #     if len(host_indices) > 0:
-        #         host_idx_i = host_indices[i].to(self.req_states.device).reshape(-1)
-        #         self.req_states.full_host_indices[req_pool_indices[i]] = torch.cat(
-        #             [full_host_indices, host_idx_i]
-        #         )
-        #     else:
-        #         logger.warning(
-        #             f"Host indices is empty for request {req_pool_indices[i]}"
-        #         )
+        self.req_states.full_host_indices[req_pool_indices, seq_lens] = host_indices.to(self.req_states.device)
 
     def offload_prefill_full_kv_cache(self, req):
         offloaded_len = len(req.origin_input_ids)

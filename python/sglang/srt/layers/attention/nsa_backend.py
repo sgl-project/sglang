@@ -837,7 +837,7 @@ class NativeSparseAttnBackend(AttentionBackend):
             new_len = real_table.shape[1]
             metadata.real_page_table[:, :new_len].copy_(real_table)
 
-            # Update index_real_page_table
+            # Update index_real_page_table for hierarchical NSA
             if self.use_hierarchical_nsa:
                 max_len = int(seq_lens_cpu.max().item())
                 index_page_indices = self.req_to_token_pool.req_to_nsa_index_k[
@@ -845,10 +845,6 @@ class NativeSparseAttnBackend(AttentionBackend):
                 ]
                 index_real_table = self._transform_table_1_to_real(index_page_indices)
                 new_len = index_real_table.shape[1]
-                if metadata.index_real_page_table is None:
-                    metadata.index_real_page_table = torch.zeros_like(
-                        metadata.real_page_table
-                    )
                 metadata.index_real_page_table[:, :new_len].copy_(index_real_table)
         else:
             assert metadata.real_page_table is metadata.page_table_1
