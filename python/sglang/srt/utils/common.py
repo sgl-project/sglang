@@ -137,18 +137,22 @@ builtins.FP8_E4M3_MAX = FP8_E4M3_MAX
 builtins.FP8_E4M3_MIN = FP8_E4M3_MIN
 
 
+@lru_cache(maxsize=1)
 def is_cuda():
     return torch.cuda.is_available() and torch.version.cuda
 
 
+@lru_cache(maxsize=1)
 def is_cuda_alike():
     return is_cuda() or is_hip()
 
 
+@lru_cache(maxsize=1)
 def is_hpu() -> bool:
     return hasattr(torch, "hpu") and torch.hpu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_xpu() -> bool:
     return hasattr(torch, "xpu") and torch.xpu.is_available()
 
@@ -158,6 +162,7 @@ def is_npu() -> bool:
     return hasattr(torch, "npu") and torch.npu.is_available()
 
 
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
@@ -167,6 +172,7 @@ def is_host_cpu_x86() -> bool:
     )
 
 
+@lru_cache(maxsize=1)
 def is_cpu() -> bool:
     return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_x86()
 

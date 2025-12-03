@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
