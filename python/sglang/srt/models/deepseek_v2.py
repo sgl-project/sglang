@@ -167,6 +167,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _device_sm = get_device_sm()
 _is_gfx95_supported = is_gfx95_supported()
+_use_npu_einsum_mm = get_bool_env_var("SGLANG_NPU_USE_EINSUM_MM") and _is_npu
 
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
@@ -302,7 +303,7 @@ class AttentionBackendRegistry:
 
 def handle_attention_ascend(attn, forward_batch):
     if (
-        forward_batch.forward_mode.is_extend()
+        (forward_batch.forward_mode.is_extend() or forward_batch.is_extend_in_batch)
         and not forward_batch.forward_mode.is_target_verify()
         and not forward_batch.forward_mode.is_draft_extend()
         and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -2068,6 +2069,19 @@ class DeepseekV2AttentionMLA(nn.Module):
                 torch.bfloat16,
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif _use_npu_einsum_mm:
+            attn_bmm_output = torch.empty(
+                (attn_output.shape[0], self.num_local_heads * self.v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            torch.ops.npu.batch_matmul_transpose(
+                attn_output,
+                self.w_vc,
+                attn_bmm_output.view(
+                    attn_output.shape[0], self.num_local_heads, self.v_head_dim
+                ),
+            )
         else:
             if is_in_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous
@@ -3653,9 +3667,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                )
+                if _use_npu_einsum_mm:
+                    self_attn.w_vc = bind_or_assign(
+                        self_attn.w_vc, w_vc.contiguous().transpose(1, 2).contiguous()
+                    )
+                else:
+                    self_attn.w_vc = bind_or_assign(
+                        self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                    )
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
