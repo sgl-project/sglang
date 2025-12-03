@@ -491,6 +491,7 @@ class DefaultModelLoader(BaseModelLoader):
 
         if self.load_config.draft_model_idx is not None:
             import re
+
             pattern = r"model.mtp.layers.(\d+)."
             filtered_weights = []
             for name, tensor in weights_iterator:

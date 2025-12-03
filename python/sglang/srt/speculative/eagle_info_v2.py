@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -29,8 +30,6 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
-
-from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

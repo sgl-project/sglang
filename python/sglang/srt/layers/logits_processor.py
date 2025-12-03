@@ -490,7 +490,9 @@ class LogitsProcessor(nn.Module):
                 # by a caller.
                 assert extend_len > start_len
                 pruned_states.append(hidden_states[pt + start_len : pt + extend_len])
-                pruned_states_before_norm.append(hidden_states_before_norm[pt + start_len: pt + extend_len])
+                pruned_states_before_norm.append(
+                    hidden_states_before_norm[pt + start_len : pt + extend_len]
+                )
                 # Map each token to its sequence index, for chunked computation
                 # of input logprobs
                 token_to_seq_idx.extend([idx] * (extend_len - start_len))
@@ -557,7 +559,10 @@ class LogitsProcessor(nn.Module):
                 assert False, "Should never reach"
 
         del hidden_states
-        if logits_metadata.return_hidden_states_before_norm and hidden_states_to_store_before_norm is not None:
+        if (
+            logits_metadata.return_hidden_states_before_norm
+            and hidden_states_to_store_before_norm is not None
+        ):
             hidden_states_to_store = hidden_states_to_store_before_norm
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.

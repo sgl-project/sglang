@@ -355,6 +355,7 @@ class Scheduler(
         if self.enable_mtp:
             if self.enable_overlap:
                 from sglang.srt.speculative.mtp_worker_v2 import MTPWorkerV2
+
                 self.draft_worker = MTPWorkerV2(
                     gpu_id=gpu_id,
                     tp_rank=tp_rank,
@@ -366,6 +367,7 @@ class Scheduler(
                 )
             else:
                 from sglang.srt.speculative.mtp_worker import MTPWorker
+
                 self.draft_worker = MTPWorker(
                     gpu_id=gpu_id,
                     tp_rank=tp_rank,
@@ -885,7 +887,9 @@ class Scheduler(
                 draft_token_to_kv_pool = (
                     self.draft_worker.draft_worker.draft_runner_list[0].token_to_kv_pool
                 )
-                model_config = self.draft_worker.draft_worker.draft_runner_list[0].model_config
+                model_config = self.draft_worker.draft_worker.draft_runner_list[
+                    0
+                ].model_config
             else:
                 draft_token_to_kv_pool = (
                     self.draft_worker.draft_worker.draft_runner.token_to_kv_pool

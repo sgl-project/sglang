@@ -972,7 +972,7 @@ class MiMoV2FlashForCausalLM(nn.Module):
                 hidden_states,
                 self.lm_head,
                 forward_batch,
-                hidden_states_before_norm=hidden_states_before_norm
+                hidden_states_before_norm=hidden_states_before_norm,
             )
         else:
             return hidden_states

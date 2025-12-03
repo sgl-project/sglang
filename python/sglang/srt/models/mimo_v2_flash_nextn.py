@@ -236,9 +236,15 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states, hidden_states_before_norm = self.model(input_ids, positions, forward_batch)
+        hidden_states, hidden_states_before_norm = self.model(
+            input_ids, positions, forward_batch
+        )
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch,  hidden_states_before_norm=hidden_states_before_norm
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            hidden_states_before_norm=hidden_states_before_norm,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):

@@ -4,15 +4,17 @@ Unit test for SWATokenToKVPoolAllocator get_cpu_copy/load_cpu_copy.
 This is a faster test that doesn't require running servers.
 """
 
-import torch
 import sys
 from pathlib import Path
+
+import torch
 
 # Add sglang to path
 sys.path.insert(0, str(Path(__file__).parent / "python"))
 
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import SWAKVPool, MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, SWAKVPool
+
 
 def test_swa_allocator_cpu_copy():
     """Test get_cpu_copy and load_cpu_copy for SWA allocator."""
@@ -59,6 +61,7 @@ def test_swa_allocator_cpu_copy():
     except Exception as e:
         print(f"[ERROR] Failed to create SWAKVPool: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -76,6 +79,7 @@ def test_swa_allocator_cpu_copy():
     except Exception as e:
         print(f"[ERROR] Failed to create allocator: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -97,7 +101,10 @@ def test_swa_allocator_cpu_copy():
         v_buffer = kv_pool.get_value_buffer(layer_id)
 
         # Map full indices to SWA indices if needed
-        if layer_id in swa_attention_layer_ids and kv_pool.full_to_swa_index_mapping is not None:
+        if (
+            layer_id in swa_attention_layer_ids
+            and kv_pool.full_to_swa_index_mapping is not None
+        ):
             actual_indices = kv_pool.full_to_swa_index_mapping[indices]
             # Filter out zero indices
             mask = actual_indices > 0
@@ -128,6 +135,7 @@ def test_swa_allocator_cpu_copy():
     except Exception as e:
         print(f"[ERROR] get_cpu_copy() failed: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -138,7 +146,10 @@ def test_swa_allocator_cpu_copy():
         k_buffer = kv_pool.get_key_buffer(layer_id)
         v_buffer = kv_pool.get_value_buffer(layer_id)
 
-        if layer_id in swa_attention_layer_ids and kv_pool.full_to_swa_index_mapping is not None:
+        if (
+            layer_id in swa_attention_layer_ids
+            and kv_pool.full_to_swa_index_mapping is not None
+        ):
             actual_indices = kv_pool.full_to_swa_index_mapping[indices]
             mask = actual_indices > 0
             if mask.any():
@@ -149,8 +160,8 @@ def test_swa_allocator_cpu_copy():
             actual_indices = indices
 
         original_data[layer_id] = {
-            'k': k_buffer[actual_indices].clone(),
-            'v': v_buffer[actual_indices].clone(),
+            "k": k_buffer[actual_indices].clone(),
+            "v": v_buffer[actual_indices].clone(),
         }
 
     # Clear GPU data
@@ -159,7 +170,10 @@ def test_swa_allocator_cpu_copy():
         k_buffer = kv_pool.get_key_buffer(layer_id)
         v_buffer = kv_pool.get_value_buffer(layer_id)
 
-        if layer_id in swa_attention_layer_ids and kv_pool.full_to_swa_index_mapping is not None:
+        if (
+            layer_id in swa_attention_layer_ids
+            and kv_pool.full_to_swa_index_mapping is not None
+        ):
             actual_indices = kv_pool.full_to_swa_index_mapping[indices]
             mask = actual_indices > 0
             if mask.any():
@@ -185,6 +199,7 @@ def test_swa_allocator_cpu_copy():
     except Exception as e:
         print(f"[ERROR] load_cpu_copy() failed: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 
@@ -198,7 +213,10 @@ def test_swa_allocator_cpu_copy():
         k_buffer = kv_pool.get_key_buffer(layer_id)
         v_buffer = kv_pool.get_value_buffer(layer_id)
 
-        if layer_id in swa_attention_layer_ids and kv_pool.full_to_swa_index_mapping is not None:
+        if (
+            layer_id in swa_attention_layer_ids
+            and kv_pool.full_to_swa_index_mapping is not None
+        ):
             actual_indices = kv_pool.full_to_swa_index_mapping[indices]
             mask = actual_indices > 0
             if mask.any():
@@ -211,10 +229,10 @@ def test_swa_allocator_cpu_copy():
         restored_k = k_buffer[actual_indices]
         restored_v = v_buffer[actual_indices]
 
-        if not torch.allclose(restored_k, original_data[layer_id]['k'], rtol=1e-3):
+        if not torch.allclose(restored_k, original_data[layer_id]["k"], rtol=1e-3):
             print(f"[ERROR] Layer {layer_id} K data mismatch!")
             all_match = False
-        if not torch.allclose(restored_v, original_data[layer_id]['v'], rtol=1e-3):
+        if not torch.allclose(restored_v, original_data[layer_id]["v"], rtol=1e-3):
             print(f"[ERROR] Layer {layer_id} V data mismatch!")
             all_match = False
 
@@ -228,6 +246,7 @@ def test_swa_allocator_cpu_copy():
     print("[SUCCESS] All tests PASSED!")
     print("=" * 70)
     return True
+
 
 if __name__ == "__main__":
     success = test_swa_allocator_cpu_copy()

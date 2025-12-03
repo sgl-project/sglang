@@ -293,7 +293,7 @@ class ModelConfig:
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
             moe_router_dtype=server_args.moe_router_dtype,
-            is_mtp = server_args.enable_mtp,
+            is_mtp=server_args.enable_mtp,
             **kwargs,
         )
 

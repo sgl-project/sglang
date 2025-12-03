@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
-from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 
 if TYPE_CHECKING:

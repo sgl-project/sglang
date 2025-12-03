@@ -139,7 +139,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_p = torch.stack(
                     [
                         torch.as_tensor(
-                            req.output_topk_p[:topk * server_args.speculative_num_steps],
+                            req.output_topk_p[
+                                : topk * server_args.speculative_num_steps
+                            ],
                             device=self.device,
                             dtype=torch.float32,
                         )
@@ -150,7 +152,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index = torch.stack(
                     [
                         torch.as_tensor(
-                            req.output_topk_index[:topk * server_args.speculative_num_steps],
+                            req.output_topk_index[
+                                : topk * server_args.speculative_num_steps
+                            ],
                             device=self.device,
                             dtype=torch.int64,
                         )

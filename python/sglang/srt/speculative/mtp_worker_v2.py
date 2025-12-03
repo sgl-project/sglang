@@ -1,6 +1,5 @@
 import contextlib
 import logging
-import time
 from typing import List, Optional, Tuple
 
 import torch
@@ -14,16 +13,12 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
-    EAGLEDraftCudaGraphRunner,
-)
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
 )
-from sglang.srt.speculative.eagle_draft_npu_graph_runner import EAGLEDraftNpuGraphRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
@@ -33,19 +28,8 @@ from sglang.srt.speculative.eagle_info_v2 import (
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import (
-    detect_nan,
-    draft_tp_context,
-    load_token_map,
-)
-from sglang.srt.utils import log_info_on_rank0
-from sglang.srt.utils.common import (
-    empty_context,
-    fast_topk,
-    get_available_gpu_memory,
-    is_npu,
-    next_power_of_2,
-)
+from sglang.srt.speculative.spec_utils import detect_nan, draft_tp_context
+from sglang.srt.utils.common import empty_context, fast_topk, is_npu, next_power_of_2
 
 _is_npu = is_npu()
 
@@ -132,7 +116,9 @@ class MTPDraftWorker(BaseDraftWorker):
 
         # Init attention backend and cuda graphs
         for i in range(self.speculative_num_steps):
-            self.draft_runner_list[i].server_args.disable_cuda_graph = backup_disable_cuda_graph
+            self.draft_runner_list[i].server_args.disable_cuda_graph = (
+                backup_disable_cuda_graph
+            )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -199,9 +185,7 @@ class MTPDraftWorker(BaseDraftWorker):
         )
 
         # Run draft
-        parent_list, top_scores_index, draft_tokens = self.draft_forward(
-            forward_batch
-        )
+        parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
         if model_worker_batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -284,7 +268,14 @@ class MTPDraftWorker(BaseDraftWorker):
                 if i == 0:
                     parents_list.append(tree_info[2])
                 else:
-                    parents_list.append(torch.full((tree_info[2].size(0), 1), i, dtype=torch.long, device="cuda"))
+                    parents_list.append(
+                        torch.full(
+                            (tree_info[2].size(0), 1),
+                            i,
+                            dtype=torch.long,
+                            device="cuda",
+                        )
+                    )
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
@@ -361,8 +352,8 @@ class MTPDraftWorker(BaseDraftWorker):
             pt = 0
             if forward_batch.extend_seq_lens is not None:
                 for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                    input_ids = forward_batch.input_ids[pt: pt + extend_len]
-                    forward_batch.input_ids[pt: pt + extend_len] = torch.cat(
+                    input_ids = forward_batch.input_ids[pt : pt + extend_len]
+                    forward_batch.input_ids[pt : pt + extend_len] = torch.cat(
                         (input_ids[1:], topk_index[i].reshape(1))
                     )
                     pt += extend_len
@@ -421,7 +412,9 @@ class MTPDraftWorker(BaseDraftWorker):
                 draft_logits_output, _ = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
                 )
-            probs = torch.softmax(draft_logits_output.next_token_logits[select_index], dim=-1)
+            probs = torch.softmax(
+                draft_logits_output.next_token_logits[select_index], dim=-1
+            )
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_topk_p_list.append(ret_topk_p)
             ret_topk_index_list.append(ret_topk_index)
@@ -429,9 +422,11 @@ class MTPDraftWorker(BaseDraftWorker):
             if forward_batch.extend_seq_lens is not None:
                 for i, extend_len in enumerate(forward_batch.extend_seq_lens):
                     actual_len = select_index[i].item() - pt + 1
-                    input_ids = forward_batch.input_ids[pt: pt + extend_len]
+                    input_ids = forward_batch.input_ids[pt : pt + extend_len]
                     # log_info_on_rank0(logger, f"input_ids: {input_ids}, actual_len: {actual_len}, ret_topk_index: {ret_topk_index}")
-                    forward_batch.input_ids[pt: pt + actual_len] = torch.cat((input_ids[1: actual_len], ret_topk_index[i].reshape(1)))
+                    forward_batch.input_ids[pt : pt + actual_len] = torch.cat(
+                        (input_ids[1:actual_len], ret_topk_index[i].reshape(1))
+                    )
                     pt += extend_len
 
         # Reorganize the spec info for the next batch

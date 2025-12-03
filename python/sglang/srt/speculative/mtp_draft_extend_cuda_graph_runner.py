@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 
 
 class MTPDraftExtendCudaGraphRunner:
-    def __init__(self, mtp_worker: MTPWorker, step:int):
+    def __init__(self, mtp_worker: MTPWorker, step: int):
         # Parse args
         self.step = step
         self.mtp_worker = mtp_worker
@@ -72,9 +72,9 @@ class MTPDraftExtendCudaGraphRunner:
         self.mtp_worker.draft_extend_attn_backend_list[self.step].init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
-        self.seq_len_fill_value = (
-            self.mtp_worker.draft_extend_attn_backend_list[self.step].get_cuda_graph_seq_len_fill_value()
-        )
+        self.seq_len_fill_value = self.mtp_worker.draft_extend_attn_backend_list[
+            self.step
+        ].get_cuda_graph_seq_len_fill_value()
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
@@ -309,7 +309,9 @@ class MTPDraftExtendCudaGraphRunner:
             padded_static_len=self.padded_static_len,
         )
 
-        self.mtp_worker.draft_extend_attn_backend_list[self.step].init_forward_metadata_capture_cuda_graph(
+        self.mtp_worker.draft_extend_attn_backend_list[
+            self.step
+        ].init_forward_metadata_capture_cuda_graph(
             bs=bs,
             num_tokens=num_tokens,
             req_pool_indices=req_pool_indices,
@@ -415,7 +417,9 @@ class MTPDraftExtendCudaGraphRunner:
             forward_batch.spec_info.positions = self.positions[:num_tokens]
             forward_batch.spec_info.accept_length = self.accept_length[:bs]
 
-        self.mtp_worker.draft_extend_attn_backend_list[self.step].init_forward_metadata_replay_cuda_graph(
+        self.mtp_worker.draft_extend_attn_backend_list[
+            self.step
+        ].init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,

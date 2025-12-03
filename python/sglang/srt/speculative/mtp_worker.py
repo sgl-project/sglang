@@ -25,10 +25,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
-from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
-    MTPDraftExtendCudaGraphRunner,
-)
-from sglang.srt.speculative.eagle_draft_npu_graph_runner import EAGLEDraftNpuGraphRunner
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -37,6 +33,9 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
+)
+from sglang.srt.speculative.mtp_draft_extend_cuda_graph_runner import (
+    MTPDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -201,7 +200,9 @@ class MTPWorker(TpModelWorker):
             )
 
             # Initialize draft extend attention backend (respects speculative_attention_mode setting)
-            self.draft_extend_attn_backend_list.append(draft_backend_factory.create_draft_extend_backend())
+            self.draft_extend_attn_backend_list.append(
+                draft_backend_factory.create_draft_extend_backend()
+            )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -218,9 +219,9 @@ class MTPWorker(TpModelWorker):
                 logger.info(
                     f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
                 )
-                self.cuda_graph_runner_for_draft_extend_list.append(MTPDraftExtendCudaGraphRunner(
-                    self, step
-                ))
+                self.cuda_graph_runner_for_draft_extend_list.append(
+                    MTPDraftExtendCudaGraphRunner(self, step)
+                )
                 after_mem = get_available_gpu_memory(self.device, self.gpu_id)
                 logger.info(
                     f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
@@ -373,7 +374,11 @@ class MTPWorker(TpModelWorker):
                 seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
                 extend_num_tokens = num_seqs * self.speculative_num_steps
                 duplicate_cache_len = 0
-                source_cache_loc, target_cache_loc, last_page_lens_cumsum = None, None, None
+                source_cache_loc, target_cache_loc, last_page_lens_cumsum = (
+                    None,
+                    None,
+                    None,
+                )
             else:
                 # In this case, the last partial page needs to be duplicated.
                 # KV cache layout in batch.req_to_token_pool.req_to_token:
@@ -534,7 +539,14 @@ class MTPWorker(TpModelWorker):
                 if i == 0:
                     parents_list.append(tree_info[2])
                 else:
-                    parents_list.append(torch.full((tree_info[2].size(0), 1), i, dtype=torch.long, device="cuda"))
+                    parents_list.append(
+                        torch.full(
+                            (tree_info[2].size(0), 1),
+                            i,
+                            dtype=torch.long,
+                            device="cuda",
+                        )
+                    )
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
@@ -832,8 +844,8 @@ class MTPWorker(TpModelWorker):
             pt = 0
             if forward_batch.extend_seq_lens is not None:
                 for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                    input_ids = forward_batch.input_ids[pt: pt + extend_len]
-                    forward_batch.input_ids[pt: pt + extend_len] = torch.cat(
+                    input_ids = forward_batch.input_ids[pt : pt + extend_len]
+                    forward_batch.input_ids[pt : pt + extend_len] = torch.cat(
                         (input_ids[1:], topk_index[i].reshape(1))
                     )
                     pt += extend_len
@@ -912,14 +924,15 @@ class MTPWorker(TpModelWorker):
         topk_index_list = []
         # Run
         for step in range(self.speculative_num_steps):
-            can_cuda_graph = (
-                len(self.cuda_graph_runner_for_draft_extend_list)
-                and self.cuda_graph_runner_for_draft_extend_list[step].can_run(forward_batch)
+            can_cuda_graph = len(
+                self.cuda_graph_runner_for_draft_extend_list
+            ) and self.cuda_graph_runner_for_draft_extend_list[step].can_run(
+                forward_batch
             )
             if can_cuda_graph:
-                logits_output = self.cuda_graph_runner_for_draft_extend_list[step].replay(
-                    forward_batch
-                )
+                logits_output = self.cuda_graph_runner_for_draft_extend_list[
+                    step
+                ].replay(forward_batch)
             else:
                 forward_batch.can_run_dp_cuda_graph = False
                 if not forward_batch.forward_mode.is_idle():
@@ -939,8 +952,8 @@ class MTPWorker(TpModelWorker):
             pt = 0
             if forward_batch.extend_seq_lens is not None:
                 for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                    input_ids = forward_batch.input_ids[pt: pt + extend_len]
-                    forward_batch.input_ids[pt: pt + extend_len] = torch.cat(
+                    input_ids = forward_batch.input_ids[pt : pt + extend_len]
+                    forward_batch.input_ids[pt : pt + extend_len] = torch.cat(
                         (input_ids[1:], topk_index[i].reshape(1))
                     )
                     pt += extend_len
@@ -958,6 +971,7 @@ class MTPWorker(TpModelWorker):
         batch.req_pool_indices = req_pool_indices_backup
         batch.spec_info.accept_length = accept_length_backup
         batch.return_logprob = return_logprob_backup
+
 
 @torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(
