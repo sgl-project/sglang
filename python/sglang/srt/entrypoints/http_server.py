@@ -48,6 +48,12 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.engine import _launch_subprocesses
+from sglang.srt.entrypoints.ollama.protocol import (
+    OllamaChatRequest,
+    OllamaGenerateRequest,
+    OllamaShowRequest,
+)
+from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -72,12 +78,6 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
-from sglang.srt.entrypoints.ollama.protocol import (
-    OllamaChatRequest,
-    OllamaGenerateRequest,
-    OllamaShowRequest,
-)
-from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -264,9 +264,7 @@ async def lifespan(fast_api_app: FastAPI):
     )
 
     # Initialize Ollama-compatible serving handler
-    fast_api_app.state.ollama_serving = OllamaServing(
-        _global_state.tokenizer_manager
-    )
+    fast_api_app.state.ollama_serving = OllamaServing(_global_state.tokenizer_manager)
 
     # Launch tool server
     tool_server = None

@@ -286,9 +286,9 @@ class OllamaServing:
             digest="sha256:sglang0000000000000000000000000000000000000000000000000000000000",
             details={
                 "format": "sglang",
-                "family": model_name.split("/")[-1]
-                if "/" in model_name
-                else model_name,
+                "family": (
+                    model_name.split("/")[-1] if "/" in model_name else model_name
+                ),
                 "parameter_size": "unknown",
             },
         )
