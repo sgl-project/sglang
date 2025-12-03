@@ -12,8 +12,8 @@ RANDOM_INPUT_LEN = 16384
 RANDOM_OUTPUT_LEN = 1024
 OUTPUT_FILE = "stress_test_qwen3_235b.jsonl"
 
-# Register for CI - estimated 180 minutes (memory-constrained by KV cache)
-register_cuda_ci(est_time=10800, suite="stress")
+# Register for CI - estimated 30 minutes for throughput benchmarking
+register_cuda_ci(est_time=1800, suite="stress")
 
 
 class TestStressQwen3235B(unittest.TestCase):
@@ -21,8 +21,8 @@ class TestStressQwen3235B(unittest.TestCase):
     def setUpClass(cls):
         cls.model = MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_prompts = int(os.environ.get("NUM_PROMPTS", "50000"))
-        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "180"))
+        cls.num_prompts = int(os.environ.get("NUM_PROMPTS", "20000"))
+        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "30"))
 
         cls.runner = StressTestRunner(
             test_name="Qwen3-235B Stress Test",
