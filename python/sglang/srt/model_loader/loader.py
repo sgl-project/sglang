@@ -35,7 +35,7 @@ import torch
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
-    register_memory_region,
+    register_memory_region_v2,
 )
 from sglang.srt.server_args import get_global_server_args
 
@@ -1563,9 +1563,17 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     "Transfer engine is not initialized for remote instance "
                     "model loader with `transfer_engine` backend. "
                 )
+            logger.info(
+                "TransferEngine registering memory regions (this may take a few seconds)..."
+            )
             # register memory region
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                model, load_config.remote_instance_weight_loader_transfer_engine
+            self.remote_instance_transfer_engine_weight_info = (
+                register_memory_region_v2(
+                    model, load_config.remote_instance_weight_loader_transfer_engine
+                )
+            )
+            logger.info(
+                "TransferEngine memory regions have been successfully registered."
             )
 
             # transfer weights

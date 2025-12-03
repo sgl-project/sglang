@@ -140,7 +140,7 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
-    register_memory_region,
+    register_memory_region_v2,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -449,8 +449,10 @@ class ModelRunner:
             self.server_args.remote_instance_weight_loader_support_transfer_engine
             and self.remote_instance_transfer_engine_weight_info is None
         ):
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                self.model, self.remote_instance_transfer_engine
+            self.remote_instance_transfer_engine_weight_info = (
+                register_memory_region_v2(
+                    self.model, self.remote_instance_transfer_engine
+                )
             )
 
         # Check if the model is using hybrid SWA
