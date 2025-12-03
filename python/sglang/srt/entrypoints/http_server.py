@@ -72,6 +72,12 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.entrypoints.ollama.protocol import (
+    OllamaChatRequest,
+    OllamaGenerateRequest,
+    OllamaShowRequest,
+)
+from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -254,6 +260,11 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
+        _global_state.tokenizer_manager
+    )
+
+    # Initialize Ollama-compatible serving handler
+    fast_api_app.state.ollama_serving = OllamaServing(
         _global_state.tokenizer_manager
     )
 
@@ -1309,6 +1320,42 @@ async def v1_rerank_request(request: V1RerankReqInput, raw_request: Request):
     return await raw_request.app.state.openai_serving_rerank.handle_request(
         request, raw_request
     )
+
+
+##### Ollama-compatible API endpoints #####
+
+
+@app.get("/")
+@app.head("/")
+async def ollama_root():
+    """Ollama-compatible root endpoint for health check."""
+    return "Ollama is running"
+
+
+@app.post("/api/chat")
+async def ollama_chat(request: OllamaChatRequest, raw_request: Request):
+    """Ollama-compatible chat endpoint."""
+    return await raw_request.app.state.ollama_serving.handle_chat(request, raw_request)
+
+
+@app.post("/api/generate")
+async def ollama_generate(request: OllamaGenerateRequest, raw_request: Request):
+    """Ollama-compatible generate endpoint."""
+    return await raw_request.app.state.ollama_serving.handle_generate(
+        request, raw_request
+    )
+
+
+@app.get("/api/tags")
+async def ollama_tags(raw_request: Request):
+    """Ollama-compatible list models endpoint."""
+    return raw_request.app.state.ollama_serving.get_tags()
+
+
+@app.post("/api/show")
+async def ollama_show(request: OllamaShowRequest, raw_request: Request):
+    """Ollama-compatible show model info endpoint."""
+    return raw_request.app.state.ollama_serving.get_show(request.model)
 
 
 ## SageMaker API
