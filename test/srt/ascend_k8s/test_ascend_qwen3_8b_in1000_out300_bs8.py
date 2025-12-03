@@ -2,9 +2,6 @@ import unittest
 
 from test_ascend_single_mix_utils import (
     TestSingleMixUtils,
-    QWEN3_8B_MODEL_PATH,
-    QWEN3_8B_OTHER_ARGS,
-    QWEN3_8B_ENVS,
 )
 
 QWEN3_8B_ENVS = {
@@ -17,6 +14,8 @@ QWEN3_8B_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     
 }
+
+QWEN3_8B_MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen3-8B-W8A8"
 
 QWEN3_8B_OTHER_ARGS = (
     [
@@ -59,7 +58,7 @@ class TestQwen3_8B(TestSingleMixUtils):
     max_concurrency = 8
     input_len = 1000
     output_len = 300
-    random_range_ratio = 0.5
+    random_range_ratio = 1
     ttft = 291.95
     tpot = 18.83
     output_token_throughput = 404.29
