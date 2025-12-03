@@ -132,12 +132,8 @@ class OllamaServing:
             done=True,
             done_reason="stop",
             total_duration=total_duration,
-            prompt_eval_count=response.get("meta_info", {}).get(
-                "prompt_tokens", None
-            ),
-            eval_count=response.get("meta_info", {}).get(
-                "completion_tokens", None
-            ),
+            prompt_eval_count=response.get("meta_info", {}).get("prompt_tokens", None),
+            eval_count=response.get("meta_info", {}).get("completion_tokens", None),
         )
 
     async def _stream_chat_response(
@@ -154,7 +150,7 @@ class OllamaServing:
                 is_done = chunk.get("meta_info", {}).get("finish_reason") is not None
 
                 # Calculate delta (new text since last chunk)
-                delta = text[len(previous_text):]
+                delta = text[len(previous_text) :]
                 previous_text = text
 
                 if is_done:
@@ -233,12 +229,8 @@ class OllamaServing:
             done=True,
             done_reason="stop",
             total_duration=total_duration,
-            prompt_eval_count=response.get("meta_info", {}).get(
-                "prompt_tokens", None
-            ),
-            eval_count=response.get("meta_info", {}).get(
-                "completion_tokens", None
-            ),
+            prompt_eval_count=response.get("meta_info", {}).get("prompt_tokens", None),
+            eval_count=response.get("meta_info", {}).get("completion_tokens", None),
         )
 
     async def _stream_generate_response(
@@ -255,7 +247,7 @@ class OllamaServing:
                 is_done = chunk.get("meta_info", {}).get("finish_reason") is not None
 
                 # Calculate delta (new text since last chunk)
-                delta = text[len(previous_text):]
+                delta = text[len(previous_text) :]
                 previous_text = text
 
                 if is_done:
@@ -294,7 +286,9 @@ class OllamaServing:
             digest="sha256:sglang0000000000000000000000000000000000000000000000000000000000",
             details={
                 "format": "sglang",
-                "family": model_name.split("/")[-1] if "/" in model_name else model_name,
+                "family": model_name.split("/")[-1]
+                if "/" in model_name
+                else model_name,
                 "parameter_size": "unknown",
             },
         )
