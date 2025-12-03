@@ -56,6 +56,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Shape profiling support
+import os as _os
+_ENABLE_SHAPE_PROFILING = _os.environ.get("SGLANG_PROFILE_SHAPES", "0") == "1"
+_SHAPE_PROFILE_RANK = int(_os.environ.get("SGLANG_PROFILE_SHAPES_RANK", "0"))
+_SHAPE_PROFILE_FILE = _os.environ.get("SGLANG_PROFILE_SHAPES_FILE", "shapes.jsonl")
+
+if _ENABLE_SHAPE_PROFILING:
+    import sys as _sys
+    _profiler_path = _os.path.join(_os.path.dirname(__file__), "../../../../examples/profiler")
+    _profiler_path = _os.path.abspath(_profiler_path)
+    if _os.path.exists(_profiler_path):
+        _sys.path.insert(0, _profiler_path)
+        try:
+            from torch_shape_logger_rank import CompactRankAwareShapeLogger
+            print(f"[Shape Profiling] Enabled for rank {_SHAPE_PROFILE_RANK}, output: {_SHAPE_PROFILE_FILE}")
+        except ImportError as e:
+            print(f"[Shape Profiling] Failed to import logger: {e}")
+            _ENABLE_SHAPE_PROFILING = False
+    else:
+        print(f"[Shape Profiling] Profiler path not found: {_profiler_path}")
+        _ENABLE_SHAPE_PROFILING = False
+
 
 class BaseTpWorker(ABC):
     @abstractmethod
@@ -279,6 +301,20 @@ class TpModelWorker(BaseTpWorker):
                 )
         self.device = self.model_runner.device
 
+        # Initialize shape logger if enabled
+        self._shape_logger = None
+        self._shape_logger_active = False
+        if _ENABLE_SHAPE_PROFILING and self.tp_rank == _SHAPE_PROFILE_RANK:
+            try:
+                self._shape_logger = CompactRankAwareShapeLogger(
+                    output_file=_SHAPE_PROFILE_FILE,
+                    verbose=False,
+                    only_rank=_SHAPE_PROFILE_RANK,
+                )
+                print(f"[Rank {self.tp_rank}] Shape logger initialized: {_SHAPE_PROFILE_FILE}")
+            except Exception as e:
+                print(f"[Rank {self.tp_rank}] Failed to create shape logger: {e}")
+
         # Init nccl groups
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
@@ -360,6 +396,15 @@ class TpModelWorker(BaseTpWorker):
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
+
+        # Activate shape logger on first forward
+        if hasattr(self, '_shape_logger') and self._shape_logger and not self._shape_logger_active:
+            try:
+                self._shape_logger.__enter__()
+                self._shape_logger_active = True
+                print(f"[Rank {self.tp_rank}] Shape logging activated")
+            except Exception as e:
+                print(f"[Rank {self.tp_rank}] Failed to activate shape logger: {e}")
 
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
