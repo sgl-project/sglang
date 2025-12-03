@@ -9,7 +9,10 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 import numpy as np
 import numpy.typing as npt
@@ -34,7 +37,9 @@ from sglang.srt.disaggregation.mooncake.utils import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_address
+from sglang.srt.managers.scheduler import GenerationBatchResult
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 logger = logging.getLogger(__name__)
 
 
@@ -226,6 +231,10 @@ class MooncakeKVManager(CommonKVManager):
 
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+
+        self.forward_results: Dict[int, Tuple[ScheduleBatch, GenerationBatchResult]] = defaultdict(tuple)
+        # Callback function to set metadata buffer, set by PrefillBootstrapQueue
+        self.set_buf_callback: Optional[Callable[["Req"], None]] = None
 
     def init_engine(self):
         self.engine = MooncakeTransferEngine(
@@ -695,6 +704,50 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+
+    def maybe_resolve_result(self, batch: ScheduleBatch, result: GenerationBatchResult):
+        (
+            logits_output,
+            next_token_ids,
+            extend_input_len_per_req,
+            extend_logprob_start_len_per_req,
+            copy_done,
+        ) = (
+            result.logits_output,
+            result.next_token_ids,
+            result.extend_input_len_per_req,
+            result.extend_logprob_start_len_per_req,
+            result.copy_done,
+        )
+        copy_done.synchronize()
+        next_token_ids = result.next_token_ids.tolist()
+        from copy import deepcopy
+
+        reqs = deepcopy(batch.reqs)
+
+        for i, (req, next_token_id) in enumerate(zip(reqs, next_token_ids)):
+            if batch.spec_info is not None:
+                req.output_topk_p = batch.spec_info.topk_p[i]
+                req.output_topk_index = batch.spec_info.topk_index[i]
+                req.hidden_states_tensor = (
+                    batch.spec_info.hidden_states[i].cpu().clone()
+                )
+            else:
+                req.hidden_states_tensor = None
+            
+            req.output_ids.append(next_token_id)
+            # Call set_buf callback if available (faster than passing scheduler reference)
+            if self.set_buf_callback is not None:
+                self.set_buf_callback(req)
+            
+
+
+        
+                
+                
+
+        
+
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
@@ -709,6 +762,7 @@ class MooncakeKVManager(CommonKVManager):
                 polls = []
                 dst_ranks_infos = []
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                batch, result = self.forward_results[kv_chunk.room]
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -745,6 +799,9 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+
+                        self.maybe_resolve_result(batch, result)
+
                         if self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
@@ -978,6 +1035,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        result: Optional[GenerationBatchResult] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -1003,6 +1061,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+        self.forward_results[bootstrap_room] = result
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
@@ -1088,6 +1147,7 @@ class MooncakeKVSender(CommonKVSender):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.conclude_state = None
         self.init_time = time.time()
+        self.result = None
 
     def send(
         self,

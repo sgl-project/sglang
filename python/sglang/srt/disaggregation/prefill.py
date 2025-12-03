@@ -24,7 +24,7 @@ import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional, Type
-
+import threading
 import torch
 
 from sglang.srt.disaggregation.base import BaseKVManager, KVPoll
@@ -177,6 +177,9 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Set callback for set_buf to avoid passing scheduler reference
+        if hasattr(kv_manager, 'set_buf_callback'):
+            kv_manager.set_buf_callback = lambda req: self.scheduler.disagg_metadata_buffers.set_buf(req)
         return kv_manager
 
     def add(self, req: Req, num_kv_heads: int) -> None:
@@ -354,6 +357,7 @@ class SchedulerDisaggregationPrefillMixin:
     @torch.no_grad()
     def event_loop_overlap_disagg_prefill(self: Scheduler) -> None:
         self.result_queue = deque()
+        self.event_ = threading.Event()
 
         while True:
             recv_reqs = self.recv_requests()
@@ -383,6 +387,13 @@ class SchedulerDisaggregationPrefillMixin:
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
+    
+    def notify_prefill_done(self: Scheduler,batch: ScheduleBatch,result: GenerationBatchResult) -> None:
+        for i, req in enumerate(batch.reqs):
+            assert req.disagg_kv_sender.result is None
+            req.disagg_kv_sender.result = (batch.copy(), result)
+            self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
+                
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -457,7 +468,7 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+                # self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:
@@ -495,8 +506,8 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         logprob_pt += num_input_logprobs
 
-                if self.enable_overlap:
-                    self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                # if self.enable_overlap:
+                #     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 trace_slice(
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
                 )
@@ -608,7 +619,8 @@ class SchedulerDisaggregationPrefillMixin:
                     len(self.chunked_req.origin_input_ids),
                 )
             else:
-                self.send_kv_chunk(self.chunked_req)
+                pass
+                # self.send_kv_chunk(self.chunked_req)
             # chunked request keeps its rid but will get a new req_pool_idx
             if self.tp_worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
@@ -660,7 +672,8 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            if not self.enable_overlap:
+                self.disagg_metadata_buffers.set_buf(req)
 
             # Prepare extra pool indices for hybrid models
             if isinstance(
