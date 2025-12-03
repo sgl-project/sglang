@@ -5,7 +5,19 @@ Standalone Shape Profiler for SGLang
 A debug tool to profile tensor shapes during model inference without modifying core SGLang code.
 Takes the same parameters as launch_server.
 
+⚠️  IMPORTANT: This tool only works with TP=1 (single GPU).
+    With TP > 1, operations happen in worker processes and 0 operations will be captured (expected).
+    For multi-GPU profiling, use NVIDIA Nsight Systems or AMD ROCm Profiler.
+
 Usage:
+    # Single GPU (captures all operations)
+    python profile_shapes.py \\
+        --model-path Qwen/Qwen2.5-7B-Instruct \\
+        --tp-size 1 \\
+        --num-prompts 3 \\
+        --max-tokens 50
+    
+    # Multi-GPU (will capture 0 operations - use external profilers instead)
     python profile_shapes.py \\
         --model-path Qwen/Qwen2.5-14B-Instruct \\
         --tp-size 8 \\
@@ -39,10 +51,11 @@ def profile_shapes(
     Profile tensor shapes during model inference.
     
     This is a STANDALONE DEBUG TOOL that doesn't modify SGLang's core code.
-    It works by capturing shapes in the main process during generation.
+    It uses PyTorch dispatch mode to intercept operations in the current process.
     
-    Note: With TP > 1, this captures shapes from operations visible to the
-    main process. For detailed per-GPU profiling, use NVIDIA Nsight or similar tools.
+    LIMITATION: Only works with TP=1. With TP > 1, operations happen in worker 
+    processes and cannot be intercepted (0 operations will be captured).
+    For multi-GPU profiling, use NVIDIA Nsight Systems or AMD ROCm Profiler.
     """
     print("=" * 80)
     print("SGLang Shape Profiler (Standalone Debug Tool)")
@@ -106,11 +119,16 @@ def profile_shapes(
         
         if summary['total_operations'] == 0:
             print("\n⚠ WARNING: No operations captured!")
-            print("This is expected with TP > 1 as operations happen in worker processes.")
-            print("\nFor detailed TP profiling, use:")
-            print("  - NVIDIA Nsight Systems")
-            print("  - PyTorch Profiler")
-            print("  - Or run with TP=1 to capture all operations")
+            print("\nThis is EXPECTED with TP > 1 because:")
+            print("  • Tensor operations happen in worker processes")
+            print("  • PyTorch dispatch mode only intercepts the current process")
+            print("  • Worker processes execute independently")
+            print("\nTo profile tensor operations with TP > 1, use:")
+            print("  • NVIDIA Nsight Systems: nsys profile python ...")
+            print("  • AMD ROCm Profiler: rocprof python ...")
+            print("  • PyTorch Profiler with multiprocessing support")
+            print("\nTo use this tool, run with TP=1:")
+            print(f"  python profile_shapes.py --model-path <smaller-model> --tp-size 1")
         else:
             if summary['operation_counts']:
                 print(f"\nTop 10 operations:")
@@ -145,27 +163,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage with TP=8
+  # Single GPU (RECOMMENDED - captures all operations)
   python profile_shapes.py \\
-      --model-path Qwen/Qwen2.5-14B-Instruct \\
-      --tp-size 8
-  
-  # With custom output and more prompts
-  python profile_shapes.py \\
-      --model-path Qwen/Qwen2.5-14B-Instruct \\
-      --tp-size 8 \\
-      --output shapes_tp8.jsonl \\
+      --model-path Qwen/Qwen2.5-7B-Instruct \\
+      --tp-size 1 \\
       --num-prompts 5 \\
       --max-tokens 100
   
-  # Single GPU (captures all operations)
+  # Multi-GPU (will capture 0 operations - expected behavior)
   python profile_shapes.py \\
-      --model-path Qwen/Qwen2.5-7B-Instruct \\
-      --tp-size 1
+      --model-path Qwen/Qwen2.5-14B-Instruct \\
+      --tp-size 8 \\
+      --num-prompts 3
 
-Note: This is a debug tool and doesn't modify SGLang's core code.
-With TP > 1, operations happen in worker processes which this tool cannot capture.
-For detailed TP profiling, use NVIDIA Nsight Systems or similar tools.
+Important Limitation:
+  This tool ONLY works with TP=1. With TP > 1, tensor operations happen in 
+  worker processes that PyTorch dispatch mode cannot intercept, resulting in
+  0 captured operations (this is expected behavior, not a bug).
+
+  For multi-GPU profiling, use:
+    • NVIDIA Nsight Systems: nsys profile python ...
+    • AMD ROCm Profiler: rocprof python ...
+    • PyTorch Profiler with distributed support
         """
     )
     
