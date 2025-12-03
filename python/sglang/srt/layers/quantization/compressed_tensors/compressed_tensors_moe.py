@@ -11,13 +11,7 @@ import torch
 from compressed_tensors import CompressionFormat
 from compressed_tensors.quantization import QuantizationStrategy
 
-from python.sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-
-if ENABLE_JIT_DEEPGEMM:
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -25,11 +19,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
 )
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
-from sglang.srt.layers.quantization.fp8_utils import (
-    expert_weight_is_col_major,
-    normalize_e4m3fn_to_e4m3fnuz,
-    requant_weight_ue8m0_inplace,
-)
+from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.gptq import gptq_marlin_moe_repack
 from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
 from sglang.srt.layers.quantization.utils import (
@@ -369,30 +359,6 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 )
                 torch.cuda.empty_cache()
 
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and self.block_quant:
-            assert layer.weight_block_size is not None
-            # Re-quantise the expert weights so their scales are UE8M0.
-            requant_weight_ue8m0_inplace(
-                layer.w13_weight,
-                layer.w13_weight_scale,
-                layer.weight_block_size,
-            )
-            requant_weight_ue8m0_inplace(
-                layer.w2_weight,
-                layer.w2_weight_scale,
-                layer.weight_block_size,
-            )
-
-            # Ensure column-major TMA alignment expected by DeepGEMM.
-            if expert_weight_is_col_major(layer.w13_weight_scale):
-                layer.w13_weight_scale = get_mn_major_tma_aligned_tensor(
-                    layer.w13_weight_scale
-                )
-            if expert_weight_is_col_major(layer.w2_weight_scale):
-                layer.w2_weight_scale = get_mn_major_tma_aligned_tensor(
-                    layer.w2_weight_scale
-                )
-
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -445,6 +411,18 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 a2_scale=layer.w2_input_scale,
             )
             return StandardCombineInput(hidden_states=output)
+        elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8_w8a8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+                block_shape=self.weight_block_size,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
