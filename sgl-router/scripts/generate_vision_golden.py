@@ -41,11 +41,16 @@ MODELS = {
         "processor_class": "LlavaNextImageProcessor",
         "description": "Multi-crop anyres processing",
     },
-    # Future models:
-    # "qwen2_vl": {
-    #     "model_id": "Qwen/Qwen2-VL-7B-Instruct",
-    #     "processor_class": "Qwen2VLImageProcessor",
-    # },
+    "qwen2_vl": {
+        "model_id": "Qwen/Qwen2-VL-7B-Instruct",
+        "processor_class": "Qwen2VLImageProcessor",
+        "description": "Dynamic resolution with smart resize",
+    },
+    "qwen3_vl": {
+        "model_id": "Qwen/Qwen3-VL-8B-Instruct",
+        "processor_class": "Qwen2VLImageProcessorFast",
+        "description": "Dynamic resolution with patch_size=16 and [0.5,0.5,0.5] normalization",
+    },
 }
 
 # Default test images
@@ -189,6 +194,77 @@ def generate_golden_llava_next(image_path: str, output_dir: str) -> dict:
     return result
 
 
+def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for Qwen2-VL.
+
+    Qwen2-VL uses dynamic resolution with smart resize:
+    1. Smart resize to fit within min/max pixel bounds
+    2. Align dimensions to (patch_size * merge_size) boundary
+    3. Normalize with CLIP mean/std
+    4. Returns image_grid_thw for position encoding
+
+    Default parameters:
+    - patch_size: 14
+    - merge_size: 2
+    - min_pixels: 256 * 28 * 28 = 200,704
+    - max_pixels: 1280 * 28 * 28 = 1,003,520
+    - temporal_patch_size: 2
+    """
+    try:
+        from transformers import Qwen2VLImageProcessor
+    except ImportError:
+        print("Qwen2VLImageProcessor not available, skipping qwen2_vl")
+        return None
+
+    processor = Qwen2VLImageProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image
+    outputs = processor(images=image, return_tensors="np")
+    pixel_values = outputs["pixel_values"]
+    image_grid_thw = outputs.get("image_grid_thw")
+
+    # Get config values for token calculation
+    patch_size = processor.patch_size
+    merge_size = processor.merge_size
+    temporal_patch_size = getattr(processor, "temporal_patch_size", 2)
+    min_pixels = processor.min_pixels
+    max_pixels = processor.max_pixels
+
+    # Calculate number of tokens
+    # tokens = (T * H * W) / merge_size²
+    if image_grid_thw is not None:
+        # image_grid_thw has shape [batch, 3] with [T, H, W]
+        grid_thw = image_grid_thw[0]  # First (and only) image
+        num_tokens = int(np.prod(grid_thw) / (merge_size**2))
+    else:
+        num_tokens = None
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": processor.to_dict(),
+    }
+
+    if image_grid_thw is not None:
+        result["image_grid_thw"] = np.array(image_grid_thw)
+
+    if num_tokens is not None:
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "patch_size": patch_size,
+        "merge_size": merge_size,
+        "temporal_patch_size": temporal_patch_size,
+        "min_pixels": min_pixels,
+        "max_pixels": max_pixels,
+    }
+
+    return result
+
+
 def save_golden(model_key: str, image_name: str, data: dict, output_dir: str):
     """Save golden output to files."""
     model_dir = Path(output_dir) / model_key
@@ -212,6 +288,72 @@ def save_golden(model_key: str, image_name: str, data: dict, output_dir: str):
         print(f"  Saved: {config_path}")
 
 
+def generate_golden_qwen3_vl(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for Qwen3-VL.
+
+    Qwen3-VL uses dynamic resolution with smart resize similar to Qwen2-VL
+    but with different parameters:
+    - patch_size: 16 (vs 14 in Qwen2-VL)
+    - factor: 32 (vs 28 in Qwen2-VL)
+    - normalization: [0.5, 0.5, 0.5] mean/std (vs CLIP values in Qwen2-VL)
+
+    Default parameters:
+    - patch_size: 16
+    - merge_size: 2
+    - temporal_patch_size: 2
+    """
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(
+        "Qwen/Qwen3-VL-8B-Instruct", trust_remote_code=True
+    )
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image using the image processor directly
+    outputs = processor.image_processor(images=image, return_tensors="pt")
+
+    # Convert to numpy for saving
+    pixel_values = outputs["pixel_values"].numpy()
+    image_grid_thw = outputs.get("image_grid_thw")
+    if image_grid_thw is not None:
+        image_grid_thw = image_grid_thw.numpy()
+
+    # Get config values
+    img_processor = processor.image_processor
+    patch_size = getattr(img_processor, "patch_size", 16)
+    merge_size = getattr(img_processor, "merge_size", 2)
+    temporal_patch_size = getattr(img_processor, "temporal_patch_size", 2)
+
+    # Calculate number of tokens
+    if image_grid_thw is not None:
+        grid_thw = image_grid_thw[0]
+        num_tokens = int(np.prod(grid_thw) / (merge_size**2))
+    else:
+        num_tokens = None
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": img_processor.to_dict(),
+    }
+
+    if image_grid_thw is not None:
+        result["image_grid_thw"] = image_grid_thw
+
+    if num_tokens is not None:
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "patch_size": patch_size,
+        "merge_size": merge_size,
+        "temporal_patch_size": temporal_patch_size,
+    }
+
+    return result
+
+
 def generate_for_model(model_key: str, image_paths: list, output_dir: str):
     """Generate golden outputs for a specific model."""
     print(f"\nGenerating golden outputs for {model_key}...")
@@ -220,6 +362,8 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
         "llava": generate_golden_llava,
         "llava_pad": generate_golden_llava_pad,
         "llava_next": generate_golden_llava_next,
+        "qwen2_vl": generate_golden_qwen2_vl,
+        "qwen3_vl": generate_golden_qwen3_vl,
     }.get(model_key)
 
     if generator_fn is None:

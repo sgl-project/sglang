@@ -264,6 +264,9 @@ impl ImageProcessorRegistry {
     /// Currently registers:
     /// - `llava-next` -> LlavaNextProcessor
     /// - `llava` -> LlavaProcessor (also matches llava-1.5, etc.)
+    /// - `qwen2-vl` -> Qwen2VLProcessor
+    /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
+    /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
 
@@ -279,6 +282,40 @@ impl ImageProcessorRegistry {
 
         // Register standard LLaVA (matches llava-1.5, llava-v1.5, etc.)
         registry.register("llava", Box::new(super::processors::LlavaProcessor::new()));
+
+        // Register Qwen3-VL first (more specific pattern - must match before qwen2)
+        registry.register(
+            "qwen3-vl",
+            Box::new(super::processors::Qwen3VLProcessor::new()),
+        );
+        registry.register(
+            "qwen3_vl",
+            Box::new(super::processors::Qwen3VLProcessor::new()),
+        );
+
+        // Register Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
+        registry.register(
+            "qwen2-vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+        registry.register(
+            "qwen2_vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+
+        // Register Qwen2.5-VL (uses identical preprocessing to Qwen2-VL)
+        registry.register(
+            "qwen2.5-vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+        registry.register(
+            "qwen2_5-vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+        registry.register(
+            "qwen2_5_vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
 
         registry
     }
