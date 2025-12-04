@@ -15,6 +15,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -137,7 +138,10 @@ class MambaPool:
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
-            return sum(get_tensor_size_bytes(t) for t in vars(self).values())
+            return sum(
+                get_tensor_size_bytes(getattr(self, f.name))
+                for f in dataclasses.fields(self)
+            )
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
@@ -1188,6 +1192,7 @@ class SWAKVPool(KVCache):
             layer_num=self.full_layer_nums,
             **kwargs,
         )
+        # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
@@ -1225,22 +1230,22 @@ class SWAKVPool(KVCache):
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
-        layer_id_pool, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        if is_swa_layer:
             return self.swa_kv_pool.get_key_buffer(layer_id_pool)
         else:
             return self.full_kv_pool.get_key_buffer(layer_id_pool)
 
     def get_value_buffer(self, layer_id: int):
-        layer_id_pool, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        if is_swa_layer:
             return self.swa_kv_pool.get_value_buffer(layer_id_pool)
         else:
             return self.full_kv_pool.get_value_buffer(layer_id_pool)
 
     def get_kv_buffer(self, layer_id: int):
-        layer_id_pool, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        if is_swa_layer:
             return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
@@ -1260,8 +1265,8 @@ class SWAKVPool(KVCache):
     ):
 
         layer_id = layer.layer_id
-        layer_id_pool, is_swa = self.layers_mapping[layer_id]
-        if is_swa:
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        if is_swa_layer:
             if self.full_to_swa_index_mapping is not None:
                 loc = self.translate_loc_from_full_to_swa(loc)
             self.swa_kv_pool.set_kv_buffer(
@@ -1818,6 +1823,28 @@ class NSATokenToKVPool(MLATokenToKVPool):
     ):
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetS.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        """
+        Fused method to get both index K and scale data in a single call using Triton.
+        More efficient than calling get_index_k_continuous and get_index_k_scale_continuous separately.
+
+        :param layer_id: Layer index
+        :param seq_len: Sequence length
+        :param page_indices: Page indices tensor
+        :return: tuple of (k_fp8, k_scale) where
+                 k_fp8: (seq_len, index_head_dim), uint8
+                 k_scale: (seq_len, 4), uint8
+        """
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetKAndS.execute(
             self, buf, seq_len=seq_len, page_indices=page_indices
         )
 

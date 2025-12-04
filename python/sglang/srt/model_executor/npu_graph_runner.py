@@ -19,11 +19,13 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
+import numpy as np
 import torch
 
-from sglang.srt.configs.model_config import is_deepseek_nsa
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.utils import is_npu
 
@@ -47,6 +49,20 @@ class NPUGraphRunner(CudaGraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.update_attr_name = None
+        self.update_attr_type = None
+        self.model_runner = model_runner
+        self._init_arch_map()
+
+    def _init_arch_map(self):
+        self.attr_name: Dict[str, str] = {
+            AttentionArch.MLA: "actual_seq_lengths_kv",
+            AttentionArch.MHA: "context_lens",
+        }
+        self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
+            AttentionArch.MLA: [],
+            AttentionArch.MHA: torch.Tensor(),
+        }
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
@@ -61,9 +77,22 @@ class NPUGraphRunner(CudaGraphRunner):
             out = run_once_fn()
         return out
 
+    def _get_update_attr_name(self, model_runner):
+        if self.bs < get_attention_tp_size():
+            return self.attr_name[AttentionArch.MLA]
+        return self.attr_name[model_runner.model_config.attention_arch]
+
+    def _get_update_attr_type(self, model_runner):
+        if self.bs < get_attention_tp_size():
+            return self.attr_type[AttentionArch.MLA]
+        return self.attr_type[model_runner.model_config.attention_arch]
+
     def _update_inputs(self, seq_lens):
+        if isinstance(self.update_attr_type, torch.Tensor):
+            seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
+
         self.graphs[self.bs].update(
-            cpu_update_input=[{"actual_seq_lengths_kv": seq_lens}]
+            cpu_update_input=[{self.update_attr_name: seq_lens}]
         )
 
     def _cache_loc_dtype(self):
@@ -110,6 +139,8 @@ class NPUGraphRunner(CudaGraphRunner):
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
+        self.update_attr_name = self._get_update_attr_name(self.model_runner)
+        self.update_attr_type = self._get_update_attr_type(self.model_runner)
         # Replay
         if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():

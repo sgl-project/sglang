@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
 
@@ -103,6 +104,17 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         ]
     )
 
+    def prepare_sigmas(self, sigmas, num_inference_steps):
+        return self._prepare_sigmas(sigmas, num_inference_steps)
+
+    def prepare_image_processor_kwargs(self, batch):
+        if batch.prompt:
+            prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+            txt = prompt_template_encode.format(batch.prompt)
+            return dict(text=[txt], padding=True)
+        else:
+            return {}
+
     def get_vae_scale_factor(self):
         return self.vae_config.arch_config.vae_scale_factor
 
@@ -122,6 +134,18 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         num_channels_latents = self.dit_config.arch_config.in_channels // 4
         # pack latents
         return _pack_latents(latents, batch_size, num_channels_latents, height, width)
+
+    def get_decode_scale_and_shift(self, device, dtype, vae):
+        vae_arch_config = self.vae_config.arch_config
+        scaling_factor = 1.0 / torch.tensor(
+            vae_arch_config.latents_std, device=device
+        ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(device, dtype)
+        shift_factor = (
+            torch.tensor(vae_arch_config.latents_mean)
+            .view(1, vae_arch_config.z_dim, 1, 1, 1)
+            .to(device, dtype)
+        )
+        return scaling_factor, shift_factor
 
     @staticmethod
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
@@ -190,6 +214,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         return latents
 
 
+@dataclass
 class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     """Configuration for the QwenImageEdit pipeline."""
 
@@ -202,8 +227,7 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
         assert batch_size == 1
         height = batch.height
         width = batch.width
-        image = batch.pil_image
-        image_size = image[0].size if isinstance(image, list) else image.size
+        image_size = batch.original_condition_image_size
         edit_width, edit_height, _ = calculate_dimensions(
             1024 * 1024, image_size[0] / image_size[1]
         )
@@ -249,6 +273,41 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
         }
 
+    def preprocess_condition_image(
+        self, image, target_width, target_height, _vae_image_processor
+    ):
+        return resize(image, target_height, target_width, resize_mode="default"), (
+            target_width,
+            target_height,
+        )
+
+    def postprocess_image_latent(self, latent_condition, batch):
+        batch_size = batch.batch_size
+        if batch_size > latent_condition.shape[0]:
+            if batch_size % latent_condition.shape[0] == 0:
+                # expand init_latents for batch_size
+                additional_image_per_prompt = batch_size // latent_condition.shape[0]
+                image_latents = latent_condition.repeat(
+                    additional_image_per_prompt, 1, 1, 1
+                )
+            else:
+                raise ValueError(
+                    f"Cannot duplicate `image` of batch size {latent_condition.shape[0]} to {batch_size} text prompts."
+                )
+        else:
+            image_latents = latent_condition
+        image_latent_height, image_latent_width = image_latents.shape[3:]
+        num_channels_latents = self.dit_config.arch_config.in_channels // 4
+        image_latents = _pack_latents(
+            image_latents,
+            batch_size,
+            num_channels_latents,
+            image_latent_height,
+            image_latent_width,
+        )
+
+        return image_latents
+
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_edit_cond_kwargs(
             batch, batch.prompt_embeds, rotary_emb, device, dtype
@@ -259,26 +318,11 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
             batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
         )
 
-    def preprocess_image(self, image, image_processor):
-        image_size = image[0].size if isinstance(image, list) else image.size
+    def calculate_condition_image_size(self, image, width, height) -> tuple[int, int]:
         calculated_width, calculated_height, _ = calculate_dimensions(
-            1024 * 1024, image_size[0] / image_size[1]
+            1024 * 1024, width / height
         )
-        image = image_processor.resize(image, calculated_height, calculated_width)
-        return image
-
-    def adjust_size(self, width, height, image):
-        image_size = image[0].size if isinstance(image, list) else image.size
-        calculated_width, calculated_height, _ = calculate_dimensions(
-            1024 * 1024, image_size[0] / image_size[1]
-        )
-        height = height or calculated_height
-        width = width or calculated_width
-
-        multiple_of = self.get_vae_scale_factor() * 2
-        width = width // multiple_of * multiple_of
-        height = height // multiple_of * multiple_of
-        return width, height
+        return calculated_width, calculated_height
 
     def slice_noise_pred(self, noise, latents):
         # remove noise over input image

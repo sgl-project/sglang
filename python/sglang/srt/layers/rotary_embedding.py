@@ -135,6 +135,7 @@ class RotaryEmbedding(CustomOp):
             self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
                 self._apply_rotary_emb_wrapped
             )
+        self.position_cos, self.position_sin = None, None
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
@@ -200,6 +201,18 @@ class RotaryEmbedding(CustomOp):
         # Update cache with new rows
         self.cos_sin_cache = torch.cat((self.cos_sin_cache, new_rows), dim=0).to(
             device=device, dtype=dtype
+        )
+
+    def get_cos_sin_with_position(self, positions):
+        cos_sin = self.cos_sin_cache.index_select(0, positions.flatten())
+        last_dim = cos_sin.size()[-1]
+        cos, sin = (
+            cos_sin.reshape(-1, 2, last_dim // 2).repeat(1, 1, 2).chunk(2, dim=-2)
+        )
+        # BSNH
+        self.position_cos, self.position_sin = (
+            cos.view(-1, 1, 1, last_dim).contiguous(),
+            sin.view(-1, 1, 1, last_dim).contiguous(),
         )
 
     def forward_native(

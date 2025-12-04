@@ -24,6 +24,7 @@ suites = {
         TestFile("test_flashinfer_trtllm_gen_attn_backend.py", 300),
         TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
         TestFile("test_fp4_moe.py", 300),
+        TestFile("test_qwen3_fp4_trtllm_gen_moe.py", 300),
     ],
     "nightly-8-gpu-b200": [
         TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),
@@ -72,6 +73,11 @@ def main():
     # Change directory to test/nightly where the test files are located
     nightly_dir = Path(__file__).parent / "nightly"
     os.chdir(nightly_dir)
+
+    # Add test/ to PYTHONPATH so tests can import shared utils
+    test_dir = str(Path(__file__).parent)
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = f"{test_dir}:{pythonpath}" if pythonpath else test_dir
 
     print(f"Running {len(files)} tests from suite: {args.suite}")
     print(f"Test files: {[f.name for f in files]}")

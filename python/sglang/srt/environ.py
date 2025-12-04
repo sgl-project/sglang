@@ -74,6 +74,16 @@ class EnvField:
     def value(self):
         return self.get()
 
+    def __bool__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
+    def __len__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+
 
 class EnvTuple(EnvField):
     def parse(self, value: str) -> tuple[str, ...]:
@@ -135,6 +145,7 @@ class Envs:
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
+    SGLANG_LOG_MS = EnvBool(False)
     SGLANG_DISABLE_REQUEST_LOGGING = EnvBool(False)
 
     # Test & Debug
@@ -143,6 +154,7 @@ class Envs:
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
     SGLANG_PROFILE_WITH_STACK = EnvBool(True)
     SGLANG_PROFILE_RECORD_SHAPES = EnvBool(True)
+    SGLANG_PROFILE_V2 = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
@@ -166,10 +178,19 @@ class Envs:
     SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR = EnvFloat(0.14)
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
+    SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+
+    # Scheduler: recv interval
+    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
+    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE = EnvInt(1)
+    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY = EnvInt(1)
+    SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
+
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
+    SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
 
     # Test: pd-disaggregation
@@ -193,6 +214,7 @@ class Envs:
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+    ASCEND_NPU_PHY_ID = EnvInt(-1)
 
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
@@ -318,6 +340,9 @@ class Envs:
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
+    # Numa
+    SGLANG_NUMA_BIND_V2 = EnvBool(True)
+
     # fmt: on
 
 
@@ -374,6 +399,30 @@ def example_with_subprocess():
     assert output == "None"
 
 
+def example_with_implicit_bool_avoidance():
+    @contextmanager
+    def assert_throws(message_matcher: str):
+        try:
+            yield
+        except Exception as e:
+            assert message_matcher in str(e), f"{e=}"
+            print(f"assert_throws find expected error: {e}")
+            return
+        raise AssertionError(f"assert_throws do not see exceptions")
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.SGLANG_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if (1 != 1) or envs.SGLANG_TEST_RETRACT:
+            pass
+
+    with assert_throws("Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"):
+        if envs.SGLANG_TEST_RETRACT or (1 == 1):
+            pass
+
+
 def examples():
     # Example usage for envs
     envs.SGLANG_TEST_RETRACT.clear()
@@ -403,6 +452,7 @@ def examples():
 
     example_with_exit_stack()
     example_with_subprocess()
+    example_with_implicit_bool_avoidance()
 
 
 if __name__ == "__main__":
