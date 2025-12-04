@@ -153,6 +153,10 @@ from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import (
+    ElasticAllocator,
+    use_elasticmem,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -405,6 +409,9 @@ class Scheduler(
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
             )
+
+        if use_elasticmem:
+            self.emem_orch = self.tp_worker.model_runner.emem_orch
 
         # Print debug info
         if tp_rank == 0:
@@ -809,6 +816,9 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+        if isinstance(self.token_to_kv_pool_allocator, ElasticAllocator):
+            self.token_to_kv_pool_allocator.register_scheduler(self)
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
@@ -1693,6 +1703,9 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
+
+        if use_elasticmem and ret:
+            self.emem_orch.try_resize()
 
         # Handle DP attention
         if need_mlp_sync:

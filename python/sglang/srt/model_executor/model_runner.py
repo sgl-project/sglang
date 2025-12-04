@@ -105,6 +105,14 @@ from sglang.srt.mem_cache.allocator import (
     SWATokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.elastic.elastic_allocator import (
+    ElasticSWATokenToKVPoolAllocator,
+)
+from sglang.srt.mem_cache.elastic.elastic_memory_pool import ElasticSWAKVPool
+from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import (
+    ElasticMempoolOrchestrator,
+    use_elasticmem,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
@@ -1807,6 +1815,9 @@ class ModelRunner:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
+        if use_elasticmem:
+            self.emem_orch = ElasticMempoolOrchestrator()
+
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
         if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
@@ -1904,7 +1915,8 @@ class ModelRunner:
             )
         else:
             if self.is_hybrid_swa:
-                self.token_to_kv_pool = SWAKVPool(
+                swa_pool_class = ElasticSWAKVPool if use_elasticmem else SWAKVPool
+                self.token_to_kv_pool = swa_pool_class(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
@@ -2005,13 +2017,19 @@ class ModelRunner:
             else:
                 if self.page_size == 1:
                     if self.is_hybrid_swa:
-                        self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                        swa_allocator_class = SWATokenToKVPoolAllocator
+                        swa_kwargs = {}
+                        if use_elasticmem:
+                            swa_allocator_class = ElasticSWATokenToKVPoolAllocator
+                            swa_kwargs["emem_orch"] = self.emem_orch
+                        self.token_to_kv_pool_allocator = swa_allocator_class(
                             self.full_max_total_num_tokens,
                             self.swa_max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=self.token_to_kv_pool,
                             need_sort=need_sort,
+                            **swa_kwargs,
                         )
                     else:
                         self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
