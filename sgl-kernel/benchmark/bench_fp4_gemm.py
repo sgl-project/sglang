@@ -6,11 +6,11 @@ import os
 
 import pytest
 import torch
-import triton
-from flashinfer import mm_fp4
 from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 
-from sglang.srt.utils import get_device_capability
+import triton
+from flashinfer import mm_fp4
+from sglang.srt.utils import get_device_capability, is_sm100_supported
 
 # CI environment detection
 IS_CI = (
@@ -237,12 +237,14 @@ if __name__ == "__main__":
             writer = csv.writer(f)
             writer.writerow(["provider", "m", "n", "k", "time_ms"])
 
-    # Check architecture compatibility - FP4 operations require sm100a/sm103a
+    # FP4 operations require Blackwell SM100 support
     major, minor = get_device_capability()
-    if major is None or major < 10:  # Requires compute capability 10.0+ (sm100a/sm103a)
+    if not is_sm100_supported():
         print("Skipping FP4 GEMM benchmark")
         if major is not None:
-            print(f"FP4 operations require sm100a/sm103a, but found sm{major}{minor}")
+            print(
+                f"FP4 operations require SM100 (Blackwell), but found sm{major}{minor}"
+            )
         else:
             print("Could not determine device capability")
     else:
