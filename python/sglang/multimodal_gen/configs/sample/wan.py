@@ -20,7 +20,7 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
     negative_prompt: str = (
         "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     )
-    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
+    num_inference_steps: int = 3  # Reduced for fast CI tests (not testing quality)
 
     teacache_params: WanTeaCacheParams = field(
         default_factory=lambda: WanTeaCacheParams(
@@ -56,7 +56,7 @@ class WanT2V_14B_SamplingParams(SamplingParams):
     negative_prompt: str = (
         "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards"
     )
-    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
+    num_inference_steps: int = 3  # Reduced for fast CI tests (not testing quality)
 
     teacache_params: WanTeaCacheParams = field(
         default_factory=lambda: WanTeaCacheParams(
@@ -84,7 +84,7 @@ class WanT2V_14B_SamplingParams(SamplingParams):
 class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
     # Denoising stage
     guidance_scale: float = 5.0
-    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
+    num_inference_steps: int = 3  # Reduced for fast CI tests (not testing quality)
     # num_inference_steps: int = 40
 
     teacache_params: WanTeaCacheParams = field(
@@ -112,7 +112,7 @@ class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
 class WanI2V_14B_720P_SamplingParam(WanT2V_14B_SamplingParams):
     # Denoising stage
     guidance_scale: float = 5.0
-    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
+    num_inference_steps: int = 3  # Reduced for fast CI tests (not testing quality)
     # num_inference_steps: int = 40
 
     teacache_params: WanTeaCacheParams = field(
@@ -162,7 +162,7 @@ class Wan2_1_Fun_1_3B_InP_SamplingParams(SamplingParams):
         "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
     )
     guidance_scale: float = 6.0
-    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
+    num_inference_steps: int = 3  # Reduced for fast CI tests (not testing quality)
 
 
 # =============================================
@@ -186,7 +186,7 @@ class Wan2_2_TI2V_5B_SamplingParam(Wan2_2_Base_SamplingParams):
     num_frames: int = 121
     fps: int = 24
     guidance_scale: float = 5.0
-    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
+    num_inference_steps: int = 3  # Reduced for fast CI tests (not testing quality)
 
 
 @dataclass

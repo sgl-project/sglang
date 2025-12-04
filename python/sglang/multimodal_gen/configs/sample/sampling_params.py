@@ -115,7 +115,7 @@ class SamplingParams:
     fps: int = 24
 
     # Denoising parameters
-    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
+    num_inference_steps: int = 3  # Reduced for fast CI tests (not testing quality)
     guidance_scale: float = 1.0
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None

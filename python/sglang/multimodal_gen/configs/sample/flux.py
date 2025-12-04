@@ -15,7 +15,7 @@ class FluxSamplingParams(SamplingParams):
     # Denoising stage
     guidance_scale: float = 1.0
     negative_prompt: str = None
-    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
+    num_inference_steps: int = 3  # Reduced for fast CI tests (not testing quality)
 
     def __post_init__(self):
         default_sample_size = 128
