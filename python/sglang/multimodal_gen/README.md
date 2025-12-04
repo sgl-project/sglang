@@ -37,17 +37,14 @@ def main():
         num_gpus=1,  # Adjust based on your hardware
     )
 
-    # Provide a prompt for your video
-    prompt = "A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest."
-
     # Generate the video
     video = generator.generate(
-        sampling_params_kwargs=SamplingParams(
-            prompt=prompt,
+        sampling_params_kwargs=dict(
+            prompt="A curious raccoon peers through a vibrant field of yellow sunflowers, its eyes wide with interest.",
             return_frames=True,  # Also return frames from this call (defaults to False)
             output_path="my_videos/",  # Controls where videos are saved
             save_output=True
-        ).__dict__
+        )
     )
 
 if __name__ == '__main__':
