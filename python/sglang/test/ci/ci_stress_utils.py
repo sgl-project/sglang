@@ -29,7 +29,7 @@ class StressTestRunner:
         test_name: str,
         base_url: str,
         num_prompts: int = 20000,
-        duration_minutes: int = 5,
+        duration_minutes: int = 30,
     ):
         """Initialize the stress test runner.
 
@@ -37,7 +37,7 @@ class StressTestRunner:
             test_name: Name of the test (used for reporting)
             base_url: Base URL for the server
             num_prompts: Number of prompts to send (default: 20000)
-            duration_minutes: Timeout in minutes (default: 5 for debugging)
+            duration_minutes: Timeout in minutes (default: 30)
         """
         self.test_name = test_name
         self.base_url = base_url
@@ -87,6 +87,9 @@ class StressTestRunner:
             str(self.num_prompts),
             "--output-file",
             output_file,
+            # Limit concurrency to prevent overwhelming the server
+            "--max-concurrency",
+            "256",
         ]
 
         if extra_args:
@@ -261,11 +264,14 @@ class StressTestRunner:
 
         # Parse tqdm progress bar format: "XX%|████| 12345/20000 [time<time, XX.XXit/s]"
         # Match patterns like: "50%|████| 10000/20000 [02:30<02:30, 66.67it/s]"
-        # or simpler: "10000/20000 [02:30<02:30, 66.67it/s]"
-        tqdm_pattern = r"(\d+)/(\d+)\s+\[[^\]]+,\s*([\d.]+)it/s\]"
+        # Also match: "0%|          | 0/20000 [00:00<?, ?it/s]" (when no progress yet)
+        # Pattern with rate
+        tqdm_pattern_with_rate = r"(\d+)/(\d+)\s+\[[^\]]+,\s*([\d.]+)it/s\]"
+        # Pattern without rate (when tqdm shows "?it/s")
+        tqdm_pattern_no_rate = r"(\d+)/(\d+)\s+\[[^\]]+,\s*\?it/s\]"
 
-        # Find all matches (get the last one as it's the most recent)
-        matches = list(re.finditer(tqdm_pattern, stderr))
+        # Try pattern with rate first
+        matches = list(re.finditer(tqdm_pattern_with_rate, stderr))
         if matches:
             last_match = matches[-1]
             completed = int(last_match.group(1))
@@ -276,6 +282,18 @@ class StressTestRunner:
             metrics["request_throughput"] = rate
 
             print(f"Parsed from tqdm: {completed}/{total} requests at {rate:.2f} req/s")
+        else:
+            # Try pattern without rate (for 0 progress case)
+            matches = list(re.finditer(tqdm_pattern_no_rate, stderr))
+            if matches:
+                last_match = matches[-1]
+                completed = int(last_match.group(1))
+                total = int(last_match.group(2))
+
+                metrics["completed"] = completed
+                # No rate available when showing "?it/s"
+
+                print(f"Parsed from tqdm: {completed}/{total} requests (rate unknown)")
 
         return metrics
 
