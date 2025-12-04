@@ -1812,7 +1812,10 @@ class ModelRunner:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend":
+        if (
+            self.server_args.attention_backend == "ascend"
+            and self.mambaish_config is None
+        ):
             if self.use_mla_backend:
                 self.token_to_kv_pool = AscendMLAPagedTokenToKVPool(
                     self.max_total_num_tokens,

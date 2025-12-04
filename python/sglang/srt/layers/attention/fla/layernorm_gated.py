@@ -12,12 +12,12 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.utils import device_context, is_npu
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
 
-def rms_norm_ref(
+def rms_norm(
     x,
     weight,
     bias,
@@ -31,6 +31,7 @@ def rms_norm_ref(
     N = x.shape[-1]
     weight = weight.float()
     bias = bias.float() if bias is not None else None
+    mean = None
     if upcast:
         x = x.float()
         z = z.float() if z is not None else z
@@ -39,15 +40,17 @@ def rms_norm_ref(
     if group_size is None:
         rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
         out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
+        rstd_flat = rstd.view(-1)
     else:
         x_group = rearrange(x, "... (g d) -> ... g d", d=group_size)
         rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
         out = rearrange(x_group * rstd, "... g d -> ... (g d)") * weight
+        rstd_flat = rstd.squeeze(-1).transpose(0, 1).contiguous().view(-1)
         if bias is not None:
             out = out + bias
     if z is not None and norm_before_gate:
         out *= F.silu(z)
-    return out.to(dtype)
+    return out.to(dtype), mean, rstd_flat
 
 
 @triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
@@ -141,46 +144,23 @@ def _layer_norm_fwd(
     if bias is not None:
         assert bias.stride(-1) == 1
         assert bias.shape == (N,)
-    # allocate output
-    if out is not None:
-        assert out.shape == x.shape
-    else:
-        out = torch.empty_like(x)
-    assert out.stride(-1) == 1
-    mean = (
-        torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-        if not is_rms_norm
-        else None
+
+    if not is_rms_norm:
+        raise NotImplementedError("LayerNorm not implemented yet")
+    out_native, mean, rstd = rms_norm(
+        x=x,
+        weight=weight,
+        bias=bias,
+        z=z,
+        eps=eps,
+        group_size=None if group_size == N else group_size,
+        norm_before_gate=norm_before_gate,
+        upcast=True,
     )
-    rstd = torch.empty((ngroups * M,), dtype=torch.float32, device=x.device)
-    # Less than 64KB per feature: enqueue fused kernel
-    MAX_FUSED_SIZE = 65536 // x.element_size()
-    BLOCK_N = min(MAX_FUSED_SIZE, triton.next_power_of_2(group_size))
-    if group_size > BLOCK_N:
-        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-    # heuristics for number of warps
-    num_warps = min(max(BLOCK_N // 256, 1), 8)
-    grid = (M, ngroups)
-    with device_context(x.device):
-        _layer_norm_fwd_1pass_kernel[grid](
-            x,
-            out,
-            weight,
-            bias,
-            z,
-            mean,
-            rstd,
-            x.stride(0),
-            out.stride(0),
-            z.stride(0) if z is not None else 0,
-            M,
-            group_size,
-            eps,
-            BLOCK_N=BLOCK_N,
-            NORM_BEFORE_GATE=norm_before_gate,
-            IS_RMS_NORM=is_rms_norm,
-            num_warps=num_warps,
-        )
+    if out is not None:
+        out.copy_(out_native)
+    else:
+        out = out_native
     return out, mean, rstd
 
 
