@@ -121,7 +121,7 @@ class Sampler(nn.Module):
             ):
                 logits[:] = torch.softmax(logits, dim=-1)
             probs = logits
-            del logits
+            # del logits
 
             if can_sample_directly_from_probs:
                 # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
