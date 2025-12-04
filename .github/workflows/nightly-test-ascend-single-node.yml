@@ -49,7 +49,6 @@ jobs:
         NAMESPACE: ascend-sglang-single
         ASCEND_TEST_CASE_PATH: test/srt/ascend_k8s
         KUBE_JOB_TYPE: single
-        KUBE_JOB_NAME: sglang-single
     steps:
       - name: Install system denpendencies
         run: |
@@ -75,14 +74,18 @@ jobs:
       - name: Prepare scripts
         run: |
           # prepare for k8s yaml
+          k8s_job_name=sglang-single-$(uuidgen)
+          echo "k8s job name: $k8s_job_name"
+          cd $ASCEND_TEST_CASE_PATH
+          echo "export KUBE_JOB_NAME=${k8s_job_name}" > env_test_vars.sh
+
           image="${{ inputs.image }}"
           sglang_source_path="${{ inputs.sglang_source_path }}"
           test_case="${{ inputs.test_case }}"
-          k8s_job_name=${KUBE_JOB_NAME}-$(uuidgen)
-          export KUBE_JOB_NAME=${k8s_job_name}
+          
           echo "{ \"image\": $image,                                        \
                   \"name_space\": \"$NAMESPACE\",                           \
-                  \"kube_job_name\": \"$KUBE_JOB_NAME\",                    \
+                  \"kube_job_name\": \"$k8s_job_name\",                    \
                   \"kube_config\": \"$KUBECONFIG\",                         \
                   \"sglang_source_path\": \"$sglang_source_path\",          \
                   \"test_case\": \"$test_case\",                            \
@@ -93,6 +96,7 @@ jobs:
       - name: Clear resources
         run: |
           cd $ASCEND_TEST_CASE_PATH
+          source env_test_vars.sh
           kubectl delete -f ./k8s_single.yaml --ignore-not-found=true || true
 
           pod_name_prefix="${KUBE_JOB_NAME}"
@@ -117,6 +121,7 @@ jobs:
         run: |
 
           cd $ASCEND_TEST_CASE_PATH
+          source env_test_vars.sh
           python3 -u run_ascend_ci.py
 
       - name: Post process
