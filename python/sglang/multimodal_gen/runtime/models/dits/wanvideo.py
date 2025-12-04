@@ -469,7 +469,7 @@ class WanTransformerBlock_VSA(nn.Module):
             logger.error("QK Norm type not supported")
             raise Exception
         assert cross_attn_norm is True
-        self.cross_attn_residual_norm = ScaleResidualNormScaleShift(
+        self.self_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             norm_type="layer",
             eps=eps,
