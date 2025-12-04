@@ -366,16 +366,19 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             batch = self.get_next_disagg_prefill_batch_to_run()
+            logger.info(f"get_next_disagg_prefill_batch_to_run: {batch=}")
             self.cur_batch = batch
 
             batch_result = None
             if batch:
+                logger.info(f"run_batch")
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
                 self.notify_prefill_done(batch, batch_result)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                logger.info(f"process_batch_result_disagg_prefill: {tmp_batch=} {tmp_result=}")
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
             elif batch is None:
                 self.self_check_during_idle()
@@ -529,6 +532,7 @@ class SchedulerDisaggregationPrefillMixin:
             return []
 
         done_reqs = []
+        logger.info(f"process_disagg_prefill_inflight_queue: {self.disagg_prefill_inflight_queue=} {self.attn_tp_cpu_group=}")
 
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
@@ -613,6 +617,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
+        logger.info(f"process_prefill_chunk: {self.chunked_req=} {self.enable_overlap=}")
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
@@ -656,6 +661,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        logger.info(f"send_kv_chunk: {req=} {last_chunk=} {end_idx=}")
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         end_idx = (
