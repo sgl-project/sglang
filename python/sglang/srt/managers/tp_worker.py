@@ -61,7 +61,9 @@ logger = logging.getLogger(__name__)
 _ENABLE_SHAPE_PROFILING = os.environ.get("SGLANG_PROFILE_SHAPES", "0") == "1"
 _SHAPE_PROFILE_RANK = int(os.environ.get("SGLANG_PROFILE_SHAPES_RANK", "0"))
 _SHAPE_PROFILE_FILE = os.environ.get("SGLANG_PROFILE_SHAPES_FILE", "shapes.jsonl")
-_SHAPE_PROFILE_SKIP_WARMUP = int(os.environ.get("SGLANG_PROFILE_SHAPES_SKIP_WARMUP", "2"))  # Skip first 2 forward passes (warmup)
+# Skip first N forward passes (warmup). Default 0 means don't skip (assumes warmup is disabled via --skip-warmup)
+# Set to 2 if warmup is enabled to skip warmup forward passes
+_SHAPE_PROFILE_SKIP_WARMUP = int(os.environ.get("SGLANG_PROFILE_SHAPES_SKIP_WARMUP", "0"))
 _shape_logger_module = None
 
 if _ENABLE_SHAPE_PROFILING:
