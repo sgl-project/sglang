@@ -24,8 +24,8 @@ struct BroadcastParam {
 };
 
 template <typename DType>
-BroadcastParam<DType>
-prepare_scale_shift_tensor(const at::Tensor& tensor, int64_t B, int64_t S, int64_t D, const at::TensorOptions& options) {
+BroadcastParam<DType> prepare_scale_shift_tensor(
+    const at::Tensor& tensor, int64_t B, int64_t S, int64_t D, const at::TensorOptions& options) {
   BroadcastParam<DType> param;
   TORCH_CHECK(tensor.defined(), "Tensor must be defined.");
   auto t = tensor.to(options.dtype());
@@ -316,9 +316,7 @@ std::tuple<at::Tensor, at::Tensor> scale_residual_norm_scale_shift(
   bool is_warp_reduce = D <= CTA_REDUCE_THRESHOLD;
   bool is_d_aligned = D % 4 == 0;
   dim3 block(THREADS_PER_CTA);
-  uint32_t cta_per_grid = is_warp_reduce ? 
-                         (B * S + WARP_PER_CTA - 1) / WARP_PER_CTA :
-                         B * S;
+  uint32_t cta_per_grid = is_warp_reduce ? (B * S + WARP_PER_CTA - 1) / WARP_PER_CTA : B * S;
   dim3 grid(dim3(cta_per_grid, 1, 1));
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 

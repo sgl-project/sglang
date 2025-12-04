@@ -146,7 +146,15 @@ def scale_residual_norm_scale_shift(
         Residual Output tensor, shape (batch_size, seq_len, hidden_dim).
     """
     return torch.ops.sgl_kernel.scale_residual_norm_scale_shift(
-        residual, x, gate, weight, bias, scale, shift, eps, norm_type == "rms",
+        residual,
+        x,
+        gate,
+        weight,
+        bias,
+        scale,
+        shift,
+        eps,
+        norm_type == "rms",
     )
 
 
