@@ -88,13 +88,11 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
 _is_fp8_fnuz = is_fp8_fnuz()
-
-_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
+_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_hip and (_use_aiter or _use_hip_int4):
+if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
@@ -764,6 +762,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     w2_weight_scale, requires_grad=False
                 )
                 layer.w2_input_scale = None
+                if _use_aiter:
+                    # add this section for MI300
+                    # Pre-shuffle weights
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
             elif _use_aiter:
                 # Pre-shuffle weights
                 layer.w13_weight.data = shuffle_weight(
