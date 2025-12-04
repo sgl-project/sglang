@@ -137,12 +137,14 @@ impl std::fmt::Debug for GrpcPDRouter {
                 bootstrap_port: None,
             }),
             Some(ConnectionMode::Grpc { port: None }),
+            None,
             false,
         );
         let decode_workers = self.worker_registry.get_workers_filtered(
             None,
             Some(WorkerType::Decode),
             Some(ConnectionMode::Grpc { port: None }),
+            None,
             false,
         );
         f.debug_struct("GrpcPDRouter")

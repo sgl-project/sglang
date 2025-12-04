@@ -96,6 +96,10 @@ pub struct PreProcessorConfig {
     #[serde(default)]
     pub num_crops: Option<usize>,
 
+    /// Phi4-Vision: dynamic HD max crops
+    #[serde(default)]
+    pub dynamic_hd: Option<usize>,
+
     /// LLaMA-Vision: maximum image tiles
     #[serde(default)]
     pub max_image_tiles: Option<usize>,
