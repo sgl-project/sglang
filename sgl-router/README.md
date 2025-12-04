@@ -598,6 +598,43 @@ curl -X POST "http://localhost:8080/add_worker?url=http://worker3:8000&api_key=w
 - Router logs a warning when a worker is registered without a key while the router expects authentication.
 - When router and workers share the same key, still include the key when invoking dynamic registration APIs.
 
+### mTLS (Mutual TLS) for Worker Connections
+When workers are deployed in different networks, mTLS provides cryptographic authentication between the router and workers.
+
+**Configuration Options**:
+- `--client-cert-path` (env: `SGLANG_CLIENT_CERT_PATH`): Path to client certificate (PEM format)
+- `--client-key-path` (env: `SGLANG_CLIENT_KEY_PATH`): Path to client private key (PEM format)
+- `--ca-cert-path` (env: `SGLANG_CA_CERT_PATH`): Path to CA certificate(s) for verifying workers (can be specified multiple times)
+
+**Example: mTLS with Custom CA**
+```bash
+# Router authenticates to workers with client cert, verifies worker certs with CA
+./target/release/sglang-router \
+  --worker-urls https://worker1:8443 https://worker2:8443 \
+  --client-cert-path /path/to/client.crt \
+  --client-key-path /path/to/client.key \
+  --ca-cert-path /path/to/ca.crt
+
+# Or using environment variables
+export SGLANG_CLIENT_CERT_PATH=/path/to/client.crt
+export SGLANG_CLIENT_KEY_PATH=/path/to/client.key
+export SGLANG_CA_CERT_PATH=/path/to/ca.crt
+./target/release/sglang-router --worker-urls https://worker1:8443
+```
+
+**Example: Multiple CA Certificates**
+```bash
+./target/release/sglang-router \
+  --worker-urls https://worker1:8443 https://worker2:8443 \
+  --ca-cert-path /path/to/ca1.crt \
+  --ca-cert-path /path/to/ca2.crt
+```
+
+**Notes**:
+- Both `--client-cert-path` and `--client-key-path` must be provided together for mTLS client authentication.
+- CA certificates are used to verify worker TLS certificates; useful when workers use self-signed or internal CA certificates.
+- mTLS is applied to all HTTP worker connections; gRPC workers use separate TLS configuration via `grpcs://` URLs.
+
 ## Development & Testing
 ```bash
 # Build Rust components (debug mode, fast)

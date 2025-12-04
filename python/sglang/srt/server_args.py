@@ -250,6 +250,12 @@ class ServerArgs:
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
+    # TLS/SSL configuration
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_keyfile_password: Optional[str] = None
+
     # Quantization and data type
     dtype: str = "auto"
     quantization: Optional[str] = None
@@ -2200,6 +2206,32 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        )
+
+        # TLS/SSL configuration
+        parser.add_argument(
+            "--ssl-keyfile",
+            type=str,
+            default=ServerArgs.ssl_keyfile,
+            help="Path to the SSL private key file (PEM format). Enables HTTPS when provided with --ssl-certfile.",
+        )
+        parser.add_argument(
+            "--ssl-certfile",
+            type=str,
+            default=ServerArgs.ssl_certfile,
+            help="Path to the SSL certificate file (PEM format). Enables HTTPS when provided with --ssl-keyfile.",
+        )
+        parser.add_argument(
+            "--ssl-ca-certs",
+            type=str,
+            default=ServerArgs.ssl_ca_certs,
+            help="Path to the CA certificates file (PEM format) for client certificate verification (mTLS).",
+        )
+        parser.add_argument(
+            "--ssl-keyfile-password",
+            type=str,
+            default=ServerArgs.ssl_keyfile_password,
+            help="Password for the SSL private key file, if encrypted.",
         )
 
         # Quantization and data type

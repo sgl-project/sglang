@@ -69,6 +69,9 @@ pub struct RouterConfig {
     /// PEM format, loaded from ca_cert_paths during config creation
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
+    /// Disable built-in system root certificates and only trust custom CA certificates
+    #[serde(default)]
+    pub tls_disable_builtin_root_certs: bool,
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
     pub mcp_config: Option<crate::mcp::McpConfig>,
@@ -501,6 +504,7 @@ impl Default for RouterConfig {
             tokenizer_cache: TokenizerCacheConfig::default(),
             client_identity: None,
             ca_certificates: vec![],
+            tls_disable_builtin_root_certs: false,
             mcp_config: None,
         }
     }

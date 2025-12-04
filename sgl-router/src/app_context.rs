@@ -293,7 +293,9 @@ impl AppContextBuilder {
         // Use rustls TLS backend when TLS/mTLS is configured (client cert or CA certs provided).
         // This ensures proper PKCS#8 key format support. For plain HTTP workers, use default
         // backend to avoid unnecessary TLS initialization overhead.
-        let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
+        let has_tls_config = config.client_identity.is_some()
+            || !config.ca_certificates.is_empty()
+            || config.tls_disable_builtin_root_certs;
 
         let mut client_builder = Client::builder()
             .pool_idle_timeout(Some(Duration::from_secs(50)))
@@ -306,7 +308,13 @@ impl AppContextBuilder {
         // Force rustls backend when TLS is configured
         if has_tls_config {
             client_builder = client_builder.use_rustls_tls();
-            info!("Using rustls TLS backend for TLS/mTLS connections");
+            // Disable built-in root certificates if explicitly requested
+            if config.tls_disable_builtin_root_certs {
+                client_builder = client_builder.tls_built_in_root_certs(false);
+                info!("Using rustls TLS backend (built-in root certificates disabled, using only custom CA certificates)");
+            } else {
+                info!("Using rustls TLS backend for TLS/mTLS connections");
+            }
         }
 
         // Configure mTLS client identity if provided (certificates already loaded during config creation)

@@ -552,6 +552,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Disable built-in system root certificates and only trust custom CA certificates
+    pub fn tls_disable_builtin_root_certs(mut self, disable: bool) -> Self {
+        self.config.tls_disable_builtin_root_certs = disable;
+        self
+    }
+
     // ==================== MCP ====================
 
     /// Config file loaded during build()

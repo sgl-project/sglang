@@ -345,6 +345,25 @@ struct CliArgs {
 
     #[arg(long)]
     mcp_config_path: Option<String>,
+
+    // ==================== mTLS ====================
+    /// Path to client certificate file (PEM format) for mTLS authentication to workers
+    #[arg(long, env = "SGLANG_CLIENT_CERT_PATH")]
+    client_cert_path: Option<String>,
+
+    /// Path to client private key file (PEM format) for mTLS authentication to workers
+    #[arg(long, env = "SGLANG_CLIENT_KEY_PATH")]
+    client_key_path: Option<String>,
+
+    /// Paths to CA certificate files (PEM format) for verifying worker TLS certificates.
+    /// Can be specified multiple times for multiple CA certificates.
+    #[arg(long, env = "SGLANG_CA_CERT_PATH", action = ArgAction::Append)]
+    ca_cert_path: Vec<String>,
+
+    /// Disable built-in system root certificates and only trust certificates provided via --ca-cert-path.
+    /// Use this when workers use certificates signed by an internal/private CA.
+    #[arg(long, env = "SGLANG_TLS_DISABLE_BUILTIN_ROOT_CERTS", default_value_t = false)]
+    tls_disable_builtin_root_certs: bool,
 }
 
 enum OracleConnectSource {
@@ -634,6 +653,12 @@ impl CliArgs {
             .maybe_reasoning_parser(self.reasoning_parser.as_ref())
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
+            .maybe_client_cert_and_key(
+                self.client_cert_path.as_ref(),
+                self.client_key_path.as_ref(),
+            )
+            .add_ca_certificates(self.ca_cert_path.clone())
+            .tls_disable_builtin_root_certs(self.tls_disable_builtin_root_certs)
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
