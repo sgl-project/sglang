@@ -427,7 +427,6 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
                 .to(device=x.device, dtype=torch.int32),
             ]
         )
-        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
 
         # transformers
         x = x.unsqueeze(1)

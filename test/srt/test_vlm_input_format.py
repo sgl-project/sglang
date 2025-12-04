@@ -95,7 +95,7 @@ class VLMInputTestBase:
                     "content": [
                         {"type": "image_url", "image_url": {"url": self.image_urls[0]}},
                         {"type": "image_url", "image_url": {"url": self.image_urls[1]}},
-                        {"type": "text", "text": "What are in these pictures?"},
+                        {"type": "text", "text": "Describe the first image and the second image in detail "},
                     ],
                 }
             ],
@@ -132,8 +132,10 @@ class VLMInputTestBase:
     async def test_accepts_precomputed_embeddings(self):
         req = self.get_completion_request()
         processor_output, _ = self.get_processor_output(req=req)
+        
         with torch.inference_mode():
             precomputed_embeddings = self.__class__.visual(processor_output)
+            
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[
@@ -185,7 +187,6 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
 
     def _processor_output_image_data(self, processor_output):
         return dict(processor_output, format="processor_output")
-
 
 class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
     # model_path = "google/gemma-3-4b-it"
