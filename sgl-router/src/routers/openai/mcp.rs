@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 use crate::{
     mcp,
     protocols::{
-        event_types::{ItemType, McpEvent, OutputItemEvent},
+        event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
         responses::{generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
     },
     routers::header_utils::apply_request_headers,
@@ -782,9 +782,7 @@ pub(super) fn build_incomplete_response(
         let mut mcp_call_items = Vec::new();
         for item in output_array.iter() {
             let item_type = item.get("type").and_then(|t| t.as_str());
-            if item_type == Some(ItemType::FUNCTION_TOOL_CALL)
-                || item_type == Some(ItemType::FUNCTION_CALL)
-            {
+            if item_type.is_some_and(is_function_call_type) {
                 let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args = item
                     .get("arguments")
@@ -958,7 +956,7 @@ pub(super) fn extract_function_call(resp: &Value) -> Option<(String, String, Str
     for item in output {
         let obj = item.as_object()?;
         let t = obj.get("type")?.as_str()?;
-        if t == ItemType::FUNCTION_TOOL_CALL || t == ItemType::FUNCTION_CALL {
+        if is_function_call_type(t) {
             let call_id = obj
                 .get("call_id")
                 .and_then(|v| v.as_str())

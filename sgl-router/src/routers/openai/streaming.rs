@@ -35,7 +35,10 @@ use super::{
 };
 use crate::{
     protocols::{
-        event_types::{FunctionCallEvent, ItemType, McpEvent, OutputItemEvent, ResponseEvent},
+        event_types::{
+            is_function_call_type, is_response_event, FunctionCallEvent, ItemType, McpEvent,
+            OutputItemEvent, ResponseEvent,
+        },
         responses::{ResponseToolType, ResponsesRequest},
     },
     routers::header_utils::{apply_request_headers, preserve_response_headers},
@@ -314,9 +317,7 @@ impl StreamingToolHandler {
                 // Check if this is a function_call item being added
                 if let Some(item) = parsed.get("item") {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                        if item_type == ItemType::FUNCTION_CALL
-                            || item_type == ItemType::FUNCTION_TOOL_CALL
-                        {
+                        if is_function_call_type(item_type) {
                             match parsed.get("output_index").and_then(|v| v.as_u64()) {
                                 Some(idx) => {
                                     let output_index = idx as usize;
@@ -438,9 +439,7 @@ impl StreamingToolHandler {
         // Check if this is a function call delta
         let item_type = delta.get("type").and_then(|v| v.as_str());
 
-        if item_type == Some(ItemType::FUNCTION_TOOL_CALL)
-            || item_type == Some(ItemType::FUNCTION_CALL)
-        {
+        if item_type.is_some_and(is_function_call_type) {
             self.in_function_call = true;
 
             // Get or create function call for this output index
@@ -564,10 +563,7 @@ pub(super) fn apply_event_transformations_inplace(
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let should_patch = matches!(
-        event_type.as_str(),
-        ResponseEvent::CREATED | ResponseEvent::IN_PROGRESS | ResponseEvent::COMPLETED
-    );
+    let should_patch = is_response_event(event_type.as_str());
 
     if should_patch {
         if let Some(response_obj) = parsed_data
@@ -626,9 +622,7 @@ pub(super) fn apply_event_transformations_inplace(
         OutputItemEvent::ADDED | OutputItemEvent::DONE => {
             if let Some(item) = parsed_data.get_mut("item") {
                 if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                    if item_type == ItemType::FUNCTION_CALL
-                        || item_type == ItemType::FUNCTION_TOOL_CALL
-                    {
+                    if is_function_call_type(item_type) {
                         item["type"] = json!(ItemType::MCP_CALL);
                         item["server_label"] = json!(ctx.server_label);
 

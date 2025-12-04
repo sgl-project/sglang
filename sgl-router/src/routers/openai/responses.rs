@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::{
     data_connector::{ResponseId, StoredResponse},
     protocols::{
-        event_types::ResponseEvent,
+        event_types::is_response_event,
         responses::{ResponseToolType, ResponsesRequest},
     },
 };
@@ -203,10 +203,7 @@ pub(super) fn rewrite_streaming_block(
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
-    let should_patch = matches!(
-        event_type,
-        ResponseEvent::CREATED | ResponseEvent::IN_PROGRESS | ResponseEvent::COMPLETED
-    );
+    let should_patch = is_response_event(event_type);
 
     if !should_patch {
         return None;
