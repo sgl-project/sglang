@@ -45,14 +45,15 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
       - name: Run stress tests
-        timeout-minutes: 180
+        timeout-minutes: 360
         env:
           NUM_PROMPTS: ${{ inputs.num_prompts }}
           DURATION_MINUTES: ${{ inputs.duration_minutes }}
           SGLANG_SERVER_LAUNCH_TIMEOUT: '3600'
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stress --timeout-per-file 2400
+          # Each test: 30min stress test + up to 50min server launch = 80min = 4800s per test
+          python3 run_suite.py --hw cuda --suite stress --timeout-per-file 4800
 
       - name: Upload results
         if: always()
