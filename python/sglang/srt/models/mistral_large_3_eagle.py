@@ -61,6 +61,7 @@ class MistralLarge3Model(DeepseekV2Model):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers_to_capture = []
+        self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
     def forward(
         self,
