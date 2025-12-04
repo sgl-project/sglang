@@ -1,17 +1,13 @@
 import json
 import logging
 import re
+from typing import Any, Dict, List
 
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    StructureInfo,
-    ToolCallItem,
-    _GetInfoFunc,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, ToolCallItem
 from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
 
 logger = logging.getLogger(__name__)
@@ -346,9 +342,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=current_text)
 
-    def structure_info(self) -> _GetInfoFunc:
-        return lambda name: StructureInfo(
-            begin=f'<｜DSML｜invoke name="{name}">',
-            end="</｜DSML｜invoke>",
-            trigger=f"<｜DSML｜invoke",
-        )
+    def supports_structural_tag(self) -> bool:
+        return False
+
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()
