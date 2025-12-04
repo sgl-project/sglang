@@ -570,20 +570,23 @@ def grouped_topk_gpu(
         scores = scores.to(torch.float16)
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
-    group_scores = (
-        scores.view(num_token, num_expert_group, -1).max(dim=-1).values
-    )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
-        1
-    ]  # [n, top_k_group]
-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
-        .reshape(num_token, -1)
-    )  # [n, e]
-    tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+    if num_expert_group > 1:
+        group_scores = (
+            scores.view(num_token, num_expert_group, -1).max(dim=-1).values
+        )  # [n, n_group]
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+            1
+        ]  # [n, top_k_group]
+        group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+        group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+            .reshape(num_token, -1)
+        )  # [n, e]
+        tmp_scores = scores.masked_fill(~score_mask.bool(), 0.0)  # [n, e]
+    else:
+        tmp_scores = scores
     # TODO: NPU can't support directly evaluating a comparison for now
     topk_weights, topk_ids = torch.topk(
         tmp_scores,
@@ -711,24 +714,27 @@ def biased_grouped_topk_impl(
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
     scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
-    group_scores = (
-        scores_for_choice.view(num_token, num_expert_group, -1)
-        .topk(2, dim=-1)[0]
-        .sum(dim=-1)
-    )  # [n, n_group]
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
-        1
-    ]  # [n, top_k_group]
-    group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-    group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
-        .reshape(num_token, -1)
-    )  # [n, e]
-    tmp_scores = scores_for_choice.masked_fill(
-        ~score_mask.bool(), float("-inf")
-    )  # [n, e]
+    if num_expert_group > 1:
+        group_scores = (
+            scores_for_choice.view(num_token, num_expert_group, -1)
+            .topk(2, dim=-1)[0]
+            .sum(dim=-1)
+        )  # [n, n_group]
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[
+            1
+        ]  # [n, top_k_group]
+        group_mask = torch.zeros_like(group_scores)  # [n, n_group]
+        group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_token, num_expert_group, scores.shape[-1] // num_expert_group)
+            .reshape(num_token, -1)
+        )  # [n, e]
+        tmp_scores = scores_for_choice.masked_fill(
+            ~score_mask.bool(), float("-inf")
+        )  # [n, e]
+    else:
+        tmp_scores = scores_for_choice
     # TODO: NPU can't support directly evaluating a comparison for now
     _, topk_ids = torch.topk(
         tmp_scores,
