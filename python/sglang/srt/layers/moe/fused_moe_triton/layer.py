@@ -6,6 +6,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
+from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
@@ -46,8 +48,6 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEM
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
-from sglang.srt.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -268,6 +268,9 @@ class FusedMoE(torch.nn.Module):
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
+        if self.quant_method is not None and hasattr(self.quant_method, "runner"):
+            self.runner = self.quant_method.runner
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -281,7 +284,10 @@ class FusedMoE(torch.nn.Module):
             # We have to keep the weight scales of w1 and w3 because
             # we need to re-quantize w1/w3 weights after weight loading.
             idx = 0 if shard_id == "w1" else 1
-            param_data[expert_id][idx] = loaded_weight
+            if self.moe_runner_config.is_gated:
+                param_data[expert_id][idx] = loaded_weight
+            else:
+                param_data[expert_id] = loaded_weight
         # If we are in the row parallel case (down_proj)
         elif shard_id == "w2":
             param_data[expert_id] = loaded_weight
@@ -345,7 +351,6 @@ class FusedMoE(torch.nn.Module):
         tp_rank: int,
         is_bias: bool = False,
     ):
-
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         assert shard_id in {"w1", "w3", "w13"}
@@ -481,7 +486,6 @@ class FusedMoE(torch.nn.Module):
         loaded_weight: torch.Tensor,
         tp_rank: int,
     ):
-
         if shard_id == "w2":
             self._load_w2(
                 shard_id=shard_id,
@@ -518,7 +522,6 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: Optional[int],
     ) -> None:
-
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
@@ -612,7 +615,6 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
-
         tp_rank = self.moe_tp_rank
 
         # compressed-tensors checkpoints with packed weights are stored flipped
@@ -925,7 +927,6 @@ class FusedMoE(torch.nn.Module):
         ckpt_up_proj_name: str,
         num_experts: int,
     ) -> List[Tuple[str, str, int, str]]:
-
         return [
             # (param_name, weight_name, expert_id, shard_id)
             (
@@ -1012,12 +1013,20 @@ class FusedMoE(torch.nn.Module):
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
     ):
-        self.down_gemm_overlap_args = down_gemm_overlap_args
-        self.meta_overlap_args = meta_overlap_args
+        if hasattr(self, "runner"):
+            self.runner.set_overlap_args(down_gemm_overlap_args, meta_overlap_args)
+        else:
+            # TODO: remove this branch after MoE refactor
+            self.down_gemm_overlap_args = down_gemm_overlap_args
+            self.meta_overlap_args = meta_overlap_args
 
     def clear_overlap_args(self) -> None:
-        self.down_gemm_overlap_args = None
-        self.meta_overlap_args = None
+        if hasattr(self, "runner"):
+            self.runner.clear_overlap_args()
+        else:
+            # TODO: remove this branch after MoE refactor
+            self.down_gemm_overlap_args = None
+            self.meta_overlap_args = None
 
 
 class FlashInferFusedMoE(FusedMoE):
