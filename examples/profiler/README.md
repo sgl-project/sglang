@@ -35,8 +35,11 @@ python3 -m sglang.bench_one_batch_server \
   --input-len 1024 \
   --output-len 512 \
   --show-report \
-  --trust-remote-code
+  --trust-remote-code \
+  --chunked-prefill-size 8192
 ```
+
+**Note:** Use `--chunked-prefill-size 8192` (or larger) to ensure prefill isn't chunked, so you capture the full input length in shapes.
 
 **Alternative: Using `launch_server` with separate client**
 
