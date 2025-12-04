@@ -29,6 +29,11 @@ import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    MaybeTboDeepEPDispatcher,
+    model_forward_maybe_tbo,
+)
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
@@ -109,14 +114,12 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    ENABLE_FLASHINFER_FP8_GEMM,
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
     inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
-    requant_weight_ue8m0_inplace,
     transform_scale_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.int8_utils import (
@@ -137,9 +140,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -416,43 +417,12 @@ def handle_attention_aiter(attn, forward_batch):
 
 def handle_attention_nsa(attn, forward_batch):
     """
-    Select MHA or MLA based on sequence length for optimal performance.
-
-    - Decode: MLA (avoids per-token decompression)
-    - Prefill <= 2048: MHA (topk ineffective, MHA has lower FLOPs)
-    - Prefill > 2048: MLA (topk filtering reduces computation significantly)
+    Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
+    in init_forward_metadata. Read the decision from backend.use_mha.
     """
-    if forward_batch.forward_mode.is_decode_or_idle():
-        return AttnForwardMethod.MLA
-
-    if forward_batch.forward_mode.is_extend_without_speculative() and (
-        not is_nsa_enable_prefill_cp()
-    ):
-        assert forward_batch.seq_lens_cpu is not None
-        max_kv_len = forward_batch.seq_lens_cpu.max().item()
-
-        # MHA path enabled for both H200 (SM90, FA3) and B200 (SM100, TRTLLm ragged)
-        # B200 uses trtllm_ragged_attention_deepseek kernel instead of FA4
-        supports_mha = _device_sm in [90, 100]
-
-        # MHA supports both BF16 and FP8 KV cache (FP8 will be dequantized on-demand)
-        kv_dtype_supported = forward_batch.token_to_kv_pool.dtype in [
-            torch.bfloat16,
-            torch.float8_e4m3fn,
-        ]
-
-        if (
-            max_kv_len <= attn.indexer.index_topk
-            and supports_mha
-            and kv_dtype_supported
-        ):
-            # NSA backend uses varlen kernel which supports MHA_ONE_SHOT
-            # Check if total sequence length fits in chunk capacity
-            sum_seq_lens = sum(forward_batch.seq_lens_cpu)
-            # Use MHA_ONE_SHOT for best performance
-            if sum_seq_lens <= forward_batch.get_max_chunk_capacity():
-                return AttnForwardMethod.MHA_ONE_SHOT
-
+    backend = forward_batch.attn_backend
+    if hasattr(backend, "use_mha") and backend.use_mha:
+        return AttnForwardMethod.MHA_ONE_SHOT
     return AttnForwardMethod.MLA
 
 
@@ -741,13 +711,21 @@ class DeepseekV2MoE(nn.Module):
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
-                assert (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
-                )
-                self.shared_experts_weight_block_size = (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                )
+                if (
+                    _use_aiter
+                    and config.quantization_config.get("quant_method")
+                    == "compressed-tensors"
+                ):
+                    # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    pass
+                else:
+                    assert (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    )
 
         self.top_k = config.num_experts_per_tok
 
@@ -788,12 +766,13 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
-            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
             if (
                 self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
-                and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+                and get_is_capture_mode()
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -987,6 +966,13 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_overlap_dispatch_flag = (
+            sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
+        )
+        sbo_overlap_combine_flag = (
+            sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
+        )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
@@ -1003,8 +989,52 @@ class DeepseekV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        # SBO is not yet implemented for NextN
-        if sbo_enabled_flag:
+        if sbo_overlap_dispatch_flag:
+            shared_output = None
+
+            def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+                for handle in deepep_dispatch_hook_handle:
+                    handle.remove()
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                post_dispatch_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            deepep_dispatch_hook_handle = (
+                self.experts.dispatcher.register_deepep_dispatch_hook(
+                    _deepep_dispatch_hook
+                )
+            )
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
+
+        elif sbo_overlap_combine_flag:
             shared_output = None
 
             def _post_dispatch_hook(
@@ -3435,7 +3465,6 @@ class DeepseekV2ForCausalLM(nn.Module):
             }
         )
         self.capture_aux_hidden_states = False
-        self._executed_weight_requant_ue8m0 = False
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
@@ -3610,13 +3639,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
+                    # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
                     if (
                         should_deepgemm_weight_requant_ue8m0(
                             weight_block_size=getattr(
                                 self.quant_config, "weight_block_size", None
                             )
                         )
-                        and self._executed_weight_requant_ue8m0
+                        and weight_scale.format_ue8m0
                     ):
                         weight_scale = inverse_transform_scale_ue8m0(
                             weight_scale, mn=weight.shape[-2]
@@ -3694,9 +3724,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                )
+                w_vc = w_vc.contiguous().transpose(1, 2)
+                if _is_npu:
+                    w_vc = w_vc.contiguous()
+                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
@@ -3732,109 +3763,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
 
-        if (
-            not ENABLE_FLASHINFER_FP8_GEMM
-            and should_deepgemm_weight_requant_ue8m0(
-                weight_block_size=getattr(self.quant_config, "weight_block_size", None)
-            )
-            and not self._executed_weight_requant_ue8m0
-        ):
-            self._executed_weight_requant_ue8m0 = True
-            self._weight_requant_ue8m0(is_nextn)
-
-        # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
-        ):
-            self._transform_scale_ue8m0(is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             self._transform_scale_nextn_moe_ue8m0()
-
-    def _weight_requant_ue8m0(self, is_nextn=False):
-        weight_block_size = self.quant_config.weight_block_size
-
-        moe_layers = list(
-            range(
-                self.config.first_k_dense_replace,
-                self.config.num_hidden_layers,
-                self.config.moe_layer_freq,
-            )
-        )
-
-        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
-
-        for layer_id in range(num_hidden_layers):
-            if is_nextn:
-                layer = self.model.decoder
-            else:
-                layer = self.model.layers[layer_id]
-
-            module_list = [
-                layer.self_attn.kv_b_proj,
-                layer.self_attn.o_proj,
-            ]
-
-            if self.config.q_lora_rank is not None:
-                module_list.append(layer.self_attn.fused_qkv_a_proj_with_mqa)
-                module_list.append(layer.self_attn.q_b_proj)
-            else:
-                module_list.append(layer.self_attn.kv_a_proj_with_mqa)
-                module_list.append(layer.self_attn.q_proj)
-
-            for module in module_list:
-                requant_weight_ue8m0_inplace(
-                    module.weight, module.weight_scale_inv, weight_block_size
-                )
-
-            if layer_id in moe_layers or is_nextn:
-                shared_experts = getattr(layer.mlp, "shared_experts", None)
-                if shared_experts is not None:
-                    for module in [
-                        shared_experts.gate_up_proj,
-                        shared_experts.down_proj,
-                    ]:
-                        requant_weight_ue8m0_inplace(
-                            module.weight, module.weight_scale_inv, weight_block_size
-                        )
-
-                experts = layer.mlp.experts
-                if isinstance(experts, DeepEPMoE):
-                    for w in [
-                        (experts.w13_weight, experts.w13_weight_scale_inv),
-                        (experts.w2_weight, experts.w2_weight_scale_inv),
-                    ]:
-                        requant_weight_ue8m0_inplace(w[0], w[1], weight_block_size)
-            else:
-                mlp = layer.mlp
-                assert isinstance(mlp, DeepseekV2MLP)
-                for module in [
-                    mlp.gate_up_proj,
-                    mlp.down_proj,
-                ]:
-                    requant_weight_ue8m0_inplace(
-                        module.weight, module.weight_scale_inv, weight_block_size
-                    )
-
-    # TODO can move weight_requant_ue8m0 and transform_scale_ue8m0 into Fp8LinearMethod.process_weights_after_loading
-    def _transform_scale_ue8m0(self, is_nextn=False):
-        num_hidden_layers = 1 if is_nextn else self.config.num_hidden_layers
-
-        for layer_id in range(num_hidden_layers):
-            if is_nextn:
-                layer = self.model.decoder
-            else:
-                layer = self.model.layers[layer_id]
-
-            module_list = []
-            if self.config.q_lora_rank is not None:
-                module_list.append(layer.self_attn.q_b_proj)
-
-            for module in module_list:
-                transform_scale_ue8m0_inplace(
-                    module.weight_scale_inv, mn=module.weight.shape[-2]
-                )
 
     # TODO avoid code dup (currently combine from weight_requant_ue8m0 and transform_scale_ue8m0)
     def _transform_scale_nextn_moe_ue8m0(self):
@@ -3996,6 +3926,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
+                    if _is_npu:
+                        name = name.replace("weight_packed", "weight")
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
                     # we need to skip here BEFORE we update the name, otherwise
@@ -4023,7 +3955,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
+                        if _is_npu:
+                            name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
