@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from sgl_kernel.utils import is_arch_support_pdl
@@ -120,6 +120,47 @@ def gemma_rmsnorm(
         enable_pdl = is_arch_support_pdl()
     torch.ops.sgl_kernel.gemma_rmsnorm.default(out, input, weight, eps, enable_pdl)
     return out
+
+
+def scale_residual_norm_scale_shift(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    gate: torch.Tensor | None,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    eps: float,
+    norm_type: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Gemma-style root mean square normalization.
+
+    ``out[i] = (input[i] / RMS(input)) * (weight[i] + 1)``
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        Input tensor, shape (batch_size, hidden_size).
+    weight: torch.Tensor
+        Weight tensor, shape (hidden_size,).
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        The output tensor, if specified, the kernel will update this tensor inplace.
+    enable_pdl: Optional[bool]
+        Whether to enable `programmatic dependent launch
+        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
+        If None, will be automatically enabled on Hopper architecture.
+
+    Returns
+    -------
+    output: Tuple[torch.Tensor, torch.Tensor]
+        Modulated tensor, shape (batch_size, seq_len, hidden_dim);
+        Residual Output tensor, shape (batch_size, seq_len, hidden_dim).
+    """
+    return torch.ops.sgl_kernel.scale_residual_norm_scale_shift(
+        residual, x, gate, weight, bias, scale, shift, eps, norm_type == "rms",
+    )
 
 
 def gemma_fused_add_rmsnorm(

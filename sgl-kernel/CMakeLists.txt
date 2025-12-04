@@ -332,6 +332,9 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/quantization/gguf/gguf_kernel.cu"
+    
+    "csrc/scale_residual_norm_scale_shift/scale_residual_norm_scale_shift_host.cu"
+
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
