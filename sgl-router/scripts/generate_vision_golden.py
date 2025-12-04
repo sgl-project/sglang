@@ -64,6 +64,12 @@ DEFAULT_IMAGES = [
     "tests/fixtures/images/tall.jpg",
     "tests/fixtures/images/wide.jpg",
     "tests/fixtures/images/small.jpg",
+    "tests/fixtures/images/tiny.jpg",
+    "tests/fixtures/images/very_tall.jpg",
+    "tests/fixtures/images/very_wide.jpg",
+    "tests/fixtures/images/large.jpg",
+    "tests/fixtures/images/odd_dims.jpg",
+    "tests/fixtures/images/grayscale.jpg",
 ]
 
 
