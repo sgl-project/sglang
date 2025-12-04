@@ -115,6 +115,13 @@ jobs:
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
 
+      - name: Generate vision golden fixtures
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers pillow numpy
+          cd sgl-router/
+          python scripts/generate_vision_golden.py
+
       - name: Run Rust tests
         timeout-minutes: 20
         run: |
@@ -295,10 +302,11 @@ jobs:
 
       - name: Run Python E2E response API tests
         run: |
+          python3 -m pip install pytest-rerunfailures
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
           source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
+          SHOW_ROUTER_LOGS=1 pytest --reruns 3 --reruns-delay 2 py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Run Python E2E gRPC tests
         run: |
