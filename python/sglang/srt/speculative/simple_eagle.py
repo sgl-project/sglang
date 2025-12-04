@@ -368,6 +368,10 @@ class SimpleEagleWorker(TpModelWorker):
             num_seqs = batch.batch_size()
             draft_input_spec_info = batch.spec_info
             if self.page_size == 1:
+
+                for req in batch.reqs:
+                    req.kv_allocated_len += 2
+                
                 batch.out_cache_loc = alloc_token_slots(
                     batch.tree_cache,
                     num_seqs * 2,
@@ -613,6 +617,10 @@ class SimpleEagleWorker(TpModelWorker):
                 next_power_of_2(self.num_draft_tokens),
             )
             self.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+        
+        for i, req in enumerate(batch.reqs):
+            req.kv_committed_len += accept_length_cpu[i] + 1
+            req.kv_allocated_len = req.kv_committed_len
             
 
         cumsum = torch.cumsum(batch.spec_info.accept_length + 1, dim=0)
