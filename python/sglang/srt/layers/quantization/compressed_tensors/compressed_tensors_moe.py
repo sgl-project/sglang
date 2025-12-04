@@ -727,11 +727,6 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             is_k_full=self.is_k_full,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
         )
-
-        # Reshape output back to original shape if needed
-        if len(original_shape) == 3:
-            output = output.reshape(original_shape[0], original_shape[1], -1)
-
         return output
 
     def apply_deepep_ll(

@@ -371,7 +371,9 @@ def batched_fused_marlin_moe(
         hidden_states.view(-1, K),
         intermediate_cache1,
         w1,
+        None,  # b_bias_or_none
         w1_scale,
+        None,  # global_scale_or_none
         w1_zeros,
         g_idx1,
         sort_indices1,
@@ -405,7 +407,9 @@ def batched_fused_marlin_moe(
         intermediate_cache2,
         intermediate_cache3,
         w2,
+        None,  # b_bias_or_none
         w2_scale,
+        None,  # global_scale_or_none
         w2_zeros,
         g_idx2,
         sort_indices2,
