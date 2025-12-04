@@ -29,9 +29,9 @@ from sgl_kernel.elementwise import (
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
-    scale_residual_norm_scale_shift,
     rmsnorm,
     rotary_embedding,
+    scale_residual_norm_scale_shift,
     silu_and_mul,
 )
 from sgl_kernel.expert_specialization import (

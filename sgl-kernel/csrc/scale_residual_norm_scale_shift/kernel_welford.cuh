@@ -327,7 +327,7 @@ __global__ __launch_bounds__(THREADS_PER_CTA) void scale_residual_norm_scale_shi
   // Pointer Offset
   int64_t tile_id = is_warp_reduce ? cta_id * WARP_PER_CTA + warp_id : cta_id;
   if (tile_id >= B * S) return;
-  
+
   residual += tile_id * D;
   x += tile_id * D;
   bool has_gate_tensor = gate_frame_len != -1;
