@@ -444,7 +444,6 @@ class SimpleEagleWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
-
         if can_cuda_graph:
             if num_seqs == 0:
                 forward_batch.spec_info_topk_index = draft_input_spec_info.topk_index
@@ -551,7 +550,6 @@ class SimpleEagleWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-
         accept_length_cpu = accept_length.tolist()
         batch.spec_info.accept_length = accept_length
         batch.spec_info.accept_length_cpu = accept_length_cpu
@@ -824,3 +822,4 @@ class SimpleEagleWorker(TpModelWorker):
             repeats = (num_seqs + s0 - 1) // s0
 
             return tensor.repeat(repeats)[:num_seqs]
+

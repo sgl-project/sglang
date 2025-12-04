@@ -13,6 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
 # Adapted from
@@ -20,7 +30,7 @@ from sglang.srt.utils import add_prefix
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
 import copy
-from typing import Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
@@ -50,6 +60,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
             2 * self.hidden_size,
@@ -59,6 +72,8 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
         )
 
         if config.model_type == "llama4_text":
@@ -67,10 +82,27 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             inter_size = config.intermediate_size
 
         self.mlp = LlamaMLP(
-            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
+            config.hidden_size,
+            inter_size,
+            config.hidden_act,
+            quant_config,
+            prefix,
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        self.layer_scatter_modes = LayerScatterModes.init_new(
+            layer_id=layer_id,
+            num_layers=config.num_hidden_layers,
+            is_layer_sparse=False,
+            is_previous_layer_sparse=False,
+        )
+
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.hidden_norm,
+            post_attention_layernorm=self.post_attention_layernorm,
+        )
 
     def forward(
         self,
@@ -80,24 +112,31 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, residual = self.layer_communicator.prepare_attn(
+            hidden_states, residual, forward_batch
+        )
 
-        residual = hidden_states
-        embeds = self.input_layernorm(embeds)
-        hidden_states = self.hidden_norm(hidden_states)
+        if embeds.shape[0] != 0:
+            embeds = self.input_layernorm(embeds)
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         # Self Attention
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            hidden_states = torch.empty_like(embeds)
+        hidden_states, residual = self.layer_communicator.prepare_mlp(
+            hidden_states, residual, forward_batch
         )
-
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
         # Fully Connected
         hidden_states = self.mlp(hidden_states)
-
+        hidden_states, residual = self.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
         return hidden_states, residual
 
 
@@ -125,6 +164,7 @@ class LlamaModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
+            enable_tp=not is_dp_attention_enabled(),
         )
 
         if hasattr(config, "target_hidden_size"):
@@ -175,9 +215,13 @@ class LlamaModel(nn.Module):
             residual,
         )
 
-        hidden_states_to_logits, hidden_states_to_aux = self.norm(
-            hidden_states, residual
-        )
+        if hidden_states.shape[0] != 0:
+            hidden_states_to_logits, hidden_states_to_aux = self.norm(
+                hidden_states, residual
+            )
+        else:
+            hidden_states_to_logits = torch.empty_like(hidden_states)
+            hidden_states_to_aux = torch.empty_like(residual)
 
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
@@ -215,6 +259,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
 
         config_ = copy.deepcopy(config)

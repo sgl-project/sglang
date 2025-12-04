@@ -869,6 +869,7 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        vocab_size = getattr(self.config, "draft_vocab_size", self.config.vocab_size)
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 if self.config.vocab_size % self.attn_tp_size == 0:

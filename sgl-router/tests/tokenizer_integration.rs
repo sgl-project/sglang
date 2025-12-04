@@ -7,7 +7,7 @@ mod common;
 use std::sync::Arc;
 
 use common::{ensure_tokenizer_cached, EXPECTED_HASHES, TEST_PROMPTS};
-use sglang_router_rs::tokenizer::{
+use sgl_model_gateway::tokenizer::{
     factory, huggingface::HuggingFaceTokenizer, sequence::Sequence, stop::*, stream::DecodeStream,
     traits::*,
 };
@@ -269,7 +269,7 @@ fn test_batch_encoding() {
 
 #[test]
 fn test_special_tokens() {
-    use sglang_router_rs::tokenizer::traits::Tokenizer as TokenizerTrait;
+    use sgl_model_gateway::tokenizer::traits::Tokenizer as TokenizerTrait;
 
     let tokenizer_path = ensure_tokenizer_cached();
     let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap())
@@ -398,7 +398,7 @@ fn test_load_chat_template_from_local_file() {
 
 #[tokio::test]
 async fn test_tinyllama_embedded_template() {
-    use sglang_router_rs::tokenizer::hub::download_tokenizer_from_hf;
+    use sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf;
 
     // Skip in CI without HF_TOKEN
 
@@ -434,7 +434,7 @@ async fn test_tinyllama_embedded_template() {
 
 #[tokio::test]
 async fn test_qwen3_next_embedded_template() {
-    use sglang_router_rs::tokenizer::hub::download_tokenizer_from_hf;
+    use sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf;
 
     // Test 3: Qwen3-Next has chat template in tokenizer_config.json
     match download_tokenizer_from_hf("Qwen/Qwen3-Next-80B-A3B-Instruct").await {
@@ -466,7 +466,7 @@ async fn test_qwen3_next_embedded_template() {
 
 #[tokio::test]
 async fn test_qwen3_vl_json_template_priority() {
-    use sglang_router_rs::tokenizer::hub::download_tokenizer_from_hf;
+    use sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf;
 
     // Test 4: Qwen3-VL has both tokenizer_config.json template and chat_template.json
     // Should prioritize chat_template.json
@@ -508,7 +508,7 @@ async fn test_qwen3_vl_json_template_priority() {
 
 #[tokio::test]
 async fn test_llava_separate_jinja_template() {
-    use sglang_router_rs::tokenizer::hub::download_tokenizer_from_hf;
+    use sgl_model_gateway::tokenizer::hub::download_tokenizer_from_hf;
 
     // Test 5: llava has chat_template.jinja as a separate file, not in tokenizer_config.json
     match download_tokenizer_from_hf("llava-hf/llava-1.5-7b-hf").await {

@@ -155,6 +155,7 @@ class SimpleEAGLECudaGraphRunner:
             else:
                 self.global_num_tokens_gpu = None
                 self.global_num_tokens_for_logprob_gpu = None
+
         # Capture
         try:
             with model_capture_mode():
@@ -656,12 +657,6 @@ class SimpleEAGLECudaGraphRunner:
     def forward_draft_extend_after_decode_cuda_graph(
         self, forward_batch: ForwardBatch, accept_index
     ):
-        # # Prepare metadata
-        # forward_batch.forward_mode = ForwardMode.SIMPLE_DRAFT_EXTEND
-        # forward_batch.spec_info.prepare_extend_after_decode_for_simple_eagle(
-        #     forward_batch,
-        #     1,
-        # )
         input_is_idle = forward_batch.forward_mode.is_idle()
         if not input_is_idle:
             # Prepare metadata
@@ -693,7 +688,6 @@ class SimpleEAGLECudaGraphRunner:
                     dtype=self.model_config.dtype,
                 )
                 forward_batch.positions = torch.empty((0,), dtype=torch.long, device=self.device)
-        # Prepare metadata
 
         forward_batch.spec_info.capture_hidden_mode = CaptureHiddenMode.FULL
         forward_batch.return_logprob = False

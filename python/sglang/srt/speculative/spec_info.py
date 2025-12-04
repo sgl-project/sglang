@@ -170,6 +170,9 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_simple_eagle(self) -> bool:
         return self._has_flag("SIMPLE_EAGLE")
 
+    def is_simple_eagle(self) -> bool:
+        return self._has_flag("SIMPLE_EAGLE")
+
     def is_standalone(self) -> bool:
         return self._has_flag("STANDALONE")
 
@@ -275,6 +278,10 @@ def _create_eagle_worker(**kwargs: Any) -> Any:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
     return EAGLEWorker(**kwargs)
+
+def _create_simple_eagle_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.simple_eagle import SimpleEagleWorker
+    return SimpleEagleWorker(**kwargs)
 
 
 def _create_simple_eagle_worker(**kwargs: Any) -> Any:
