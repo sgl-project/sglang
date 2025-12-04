@@ -40,6 +40,7 @@ pub use image_processor::{
 };
 pub use preprocessor_config::PreProcessorConfig;
 pub use processors::{
-    LlavaNextProcessor, LlavaProcessor, Phi3VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
+    LlavaNextProcessor, LlavaProcessor, Phi3VisionProcessor, Phi4VisionProcessor, Qwen2VLProcessor,
+    Qwen3VLProcessor,
 };
 pub use transforms::TransformError;
