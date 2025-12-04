@@ -36,10 +36,13 @@ python3 -m sglang.bench_one_batch_server \
   --output-len 512 \
   --show-report \
   --trust-remote-code \
-  --chunked-prefill-size 8192
+  --chunked-prefill-size 8192 \
+  --disable-cuda-graph
 ```
 
-**Note:** Use `--chunked-prefill-size 8192` (or larger) to ensure prefill isn't chunked, so you capture the full input length in shapes.
+**Notes:**
+- Use `--chunked-prefill-size 8192` (or larger) to ensure prefill isn't chunked, so you capture the full input length in shapes.
+- Use `--disable-cuda-graph` to capture decode operations (decode normally runs in CUDA graph replay which bypasses torch.dispatch).
 
 **Alternative: Using `launch_server` with separate client**
 
