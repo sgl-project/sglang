@@ -148,11 +148,11 @@ impl Phi4VisionProcessor {
     fn compute_target_ratios(&self, min_num: usize, max_num: usize) -> Vec<(usize, usize)> {
         let mut ratios: HashSet<(usize, usize)> = HashSet::new();
         for n in min_num..=max_num {
-            for i in 1..=n {
-                for j in 1..=n {
-                    if i * j >= min_num && i * j <= max_num {
-                        ratios.insert((i, j));
-                    }
+            // Find factor pairs by iterating up to sqrt(n)
+            for i in 1..=(n as f64).sqrt() as usize {
+                if n % i == 0 {
+                    ratios.insert((i, n / i));
+                    ratios.insert((n / i, i));
                 }
             }
         }
