@@ -225,6 +225,7 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
@@ -948,7 +949,7 @@ class AscendAttnBackend(AttentionBackend):
                 topk_indices,
             )
 
-        if self.graph_mode:
+        if self.graph_mode and (not self.enable_torch_compile):
             return self.forward_decode_graph(
                 q,
                 k,
@@ -969,6 +970,12 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
             if self.use_fia:
+                if self.forward_metadata.seq_lens_cpu_int is None:
+                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
+                else:
+                    actual_seq_len_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    )
                 attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                     q.view(
                         forward_batch.batch_size,
@@ -988,7 +995,7 @@ class AscendAttnBackend(AttentionBackend):
                     atten_mask=None,
                     block_size=self.page_size,
                     block_table=self.forward_metadata.block_tables,
-                    actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                    actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
             else:
