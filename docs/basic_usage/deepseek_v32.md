@@ -76,13 +76,15 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 The usage of function calling and reasoning parser is the same as DeepSeek V3.1. Please refer to [Reasoning Parser](https://docs.sglang.io/advanced_features/separate_reasoning.html) and [Tool Parser](https://docs.sglang.io/advanced_features/tool_parser.html) documents.
 
 To launch `DeepSeek-V3.2-Exp` with function calling and reasoning parser:
+> Note: It is recommended to specify the chat-template, ensuring that you are within the sglang's root directory.
 ```bash
 python3 -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3.2 \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
   --trust-remote-code \
   --tp-size 8 --dp-size 8 --enable-dp-attention \
   --tool-call-parser deepseekv31 \
-  --reasoning-parser deepseek-v3
+  --reasoning-parser deepseek-v3 \
+  --chat-template ./examples/chat_template/tool_chat_template_deepseekv32.jinja
 ```
 
 To launch `DeepSeek-V3.2` with function calling and reasoning parser:
