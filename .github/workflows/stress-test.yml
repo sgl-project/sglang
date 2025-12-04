@@ -13,6 +13,23 @@ on:
         required: true
         default: '30'
         type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to checkout'
+        required: false
+        type: string
+        default: ''
+      num_prompts:
+        description: 'Number of prompts per model'
+        required: false
+        type: string
+        default: '20000'
+      duration_minutes:
+        description: 'Timeout per model in minutes'
+        required: false
+        type: string
+        default: '30'
 
 jobs:
   stress-test:
@@ -21,6 +38,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
