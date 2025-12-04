@@ -139,10 +139,13 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         if kwargs is None:
             kwargs = {}
         
-        # Skip shape logging during CUDA graph capture or torch.compile
+        # Skip shape logging during CUDA graph capture (but allow replay) or torch.compile
         should_skip_logging = False
         if _CAN_DETECT_CUDA_GRAPH:
-            should_skip_logging = get_is_capture_mode() or is_in_piecewise_cuda_graph()
+            # Only skip during capture, not during replay (replay is actual inference we want to log)
+            should_skip_logging = get_is_capture_mode()
+            # Note: We don't skip is_in_piecewise_cuda_graph() because that includes both capture and replay
+            # We want to log replay operations but skip capture
         if not should_skip_logging:
             should_skip_logging = _is_torch_compile_mode()
         
