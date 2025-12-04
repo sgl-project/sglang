@@ -92,31 +92,38 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
             effective_pass = self._forward_pass_count - self.skip_first_n_forward_passes
             
             # Add separator markers for prefill and decode
-            if self.file_handle and effective_pass > 0:
-                if effective_pass == 1:
-                    # First forward pass after warmup = prefill
-                    separator = {
-                        "call_id": 0,
-                        "forward_pass": self._forward_pass_count,
-                        "operation": "=" * 80,
-                        "marker": "PREFILL_START",
-                        "inputs": None,
-                        "outputs": None,
-                    }
-                    self.file_handle.write(json.dumps(separator) + "\n")
-                    self.file_handle.write("\n" * 3)  # Large space separator
-                elif effective_pass == 2:
-                    # Second forward pass after warmup = decode
-                    separator = {
-                        "call_id": 0,
-                        "forward_pass": self._forward_pass_count,
-                        "operation": "=" * 80,
-                        "marker": "DECODE_START",
-                        "inputs": None,
-                        "outputs": None,
-                    }
-                    self.file_handle.write(json.dumps(separator) + "\n")
-                    self.file_handle.write("\n" * 3)  # Large space separator
+            # Ensure file handle is open (it should be from __enter__, but check just in case)
+            if effective_pass > 0 and self.file_handle:
+                try:
+                    if effective_pass == 1:
+                        # First forward pass after warmup = prefill
+                        separator = {
+                            "call_id": 0,
+                            "forward_pass": self._forward_pass_count,
+                            "operation": "=" * 80,
+                            "marker": "PREFILL_START",
+                            "inputs": None,
+                            "outputs": None,
+                        }
+                        self.file_handle.write(json.dumps(separator) + "\n")
+                        self.file_handle.write("\n" * 3)  # Large space separator
+                        self.file_handle.flush()
+                    elif effective_pass == 2:
+                        # Second forward pass after warmup = decode
+                        separator = {
+                            "call_id": 0,
+                            "forward_pass": self._forward_pass_count,
+                            "operation": "=" * 80,
+                            "marker": "DECODE_START",
+                            "inputs": None,
+                            "outputs": None,
+                        }
+                        self.file_handle.write(json.dumps(separator) + "\n")
+                        self.file_handle.write("\n" * 3)  # Large space separator
+                        self.file_handle.flush()
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[Rank {self.current_rank}] Error writing marker: {e}")
             
             if self.verbose:
                 print(f"[Rank {self.current_rank}] Forward pass #{self._forward_pass_count} started (effective: {effective_pass})")
@@ -277,6 +284,8 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                         log_entry["inputs"] = named_inputs
                     self.file_handle.write(json.dumps(log_entry) + "\n")
                     if self.call_count % 1000 == 0:  # Flush periodically
+                        self.file_handle.flush()
+                    elif self.call_count <= 10:  # Flush first few entries immediately
                         self.file_handle.flush()
                 except Exception:
                     pass
