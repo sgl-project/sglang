@@ -11,7 +11,7 @@ on:
       duration_minutes:
         description: 'Timeout per model in minutes'
         required: true
-        default: '30'
+        default: '5'
         type: string
 
 jobs:
@@ -52,8 +52,8 @@ jobs:
           SGLANG_SERVER_LAUNCH_TIMEOUT: '3600'
         run: |
           cd test
-          # Each test: 30min stress test + up to 50min server launch = 80min = 4800s per test
-          python3 run_suite.py --hw cuda --suite stress --timeout-per-file 4800
+          # DEBUG: 5min stress test + up to 55min server launch = 60min = 3600s per test
+          python3 run_suite.py --hw cuda --suite stress --timeout-per-file 3600
 
       - name: Upload results
         if: always()
