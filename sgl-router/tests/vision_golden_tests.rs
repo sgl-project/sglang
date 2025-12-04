@@ -19,7 +19,7 @@ use std::{fs::File, io::Read, path::Path};
 use ndarray::{Array4, Array5};
 use sgl_model_gateway::multimodal::vision::{
     image_processor::ModelSpecificValue, ImagePreProcessor, LlavaProcessor, Phi3VisionProcessor,
-    PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
+    Phi4VisionProcessor, PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
 };
 
 /// Load a numpy .npz file and extract pixel_values
@@ -963,4 +963,217 @@ fn test_phi3_vision_golden_odd_dims() {
 #[test]
 fn test_phi3_vision_golden_grayscale() {
     run_phi3_vision_golden_test("grayscale");
+}
+
+// ============================================================================
+// Phi4-Vision tests
+// ============================================================================
+
+/// Load num_img_tokens from Phi4-Vision npz file
+fn load_phi4_num_img_tokens(path: &Path) -> Vec<usize> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("num_img_tokens")
+        .expect("Failed to read npz")
+        .expect("No num_img_tokens");
+
+    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
+    data.into_iter().map(|v| v as usize).collect()
+}
+
+/// Load image_sizes from Phi4-Vision npz file (2D tensor [batch, 2])
+fn load_phi4_image_sizes(path: &Path) -> Vec<(u32, u32)> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("image_sizes")
+        .expect("Failed to read npz")
+        .expect("No image_sizes");
+
+    let shape = reader.shape().to_vec();
+    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
+
+    // Reshape to pairs
+    let num_images = shape[0] as usize;
+    (0..num_images)
+        .map(|i| (data[i * 2] as u32, data[i * 2 + 1] as u32))
+        .collect()
+}
+
+/// Run a Phi4-Vision golden test for a specific image.
+///
+/// This test validates:
+/// 1. Output shape is [1, num_crops+1, 3, 448, 448] (note: 448 base resolution)
+/// 2. image_sizes matches HuggingFace output
+/// 3. num_img_tokens matches HuggingFace output
+/// 4. Pixel values match within tolerance
+///
+/// Key differences from Phi3-Vision:
+/// - Base resolution: 448 (vs 336)
+/// - Normalization: [0.5, 0.5, 0.5] (vs CLIP)
+/// - Default dynamic_hd: 36 (vs 16)
+fn run_phi4_vision_golden_test(image_name: &str) {
+    let golden_dir = Path::new("tests/fixtures/golden/phi4_vision");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{}.jpg", image_name));
+
+    if !golden_dir.exists() || !image_path.exists() {
+        eprintln!(
+            "Golden test fixtures for phi4_vision/{} not found, skipping test",
+            image_name
+        );
+        eprintln!("Run: python scripts/generate_vision_golden.py --model phi4_vision");
+        return;
+    }
+
+    let npz_path = golden_dir.join(format!("golden_{}.npz", image_name));
+    let config = load_config(&golden_dir.join("preprocessor_config.json"));
+
+    // Load golden values
+    let golden_pixels = load_golden_npz_5d(&npz_path);
+    let golden_image_sizes = load_phi4_image_sizes(&npz_path);
+    let golden_num_tokens = load_phi4_num_img_tokens(&npz_path);
+
+    // Process image with our Rust processor
+    let image = image::open(&image_path).expect("Failed to open image");
+    let processor = Phi4VisionProcessor::from_preprocessor_config(&config);
+    let result = processor
+        .preprocess(&[image], &config)
+        .expect("Processing failed");
+
+    // Check output shape
+    let rust_shape = result.pixel_values.shape();
+    let golden_shape = golden_pixels.shape();
+    println!(
+        "phi4_vision - {} image - Shape: golden={:?}, rust={:?}",
+        image_name, golden_shape, rust_shape
+    );
+    assert_eq!(
+        rust_shape, golden_shape,
+        "Shape mismatch for phi4_vision/{}",
+        image_name
+    );
+
+    // Check image_sizes
+    let rust_image_sizes: Vec<(u32, u32)> = match result.model_specific.get("image_sizes") {
+        Some(ModelSpecificValue::UintTensor { data, shape }) => {
+            let num_images = shape[0];
+            (0..num_images)
+                .map(|i| (data[i * 2], data[i * 2 + 1]))
+                .collect()
+        }
+        _ => panic!("Expected image_sizes in model_specific"),
+    };
+
+    println!(
+        "phi4_vision - {} image - Image sizes (h, w): golden={:?}, rust={:?}",
+        image_name, golden_image_sizes, rust_image_sizes
+    );
+    assert_eq!(
+        golden_image_sizes, rust_image_sizes,
+        "image_sizes mismatch for {}",
+        image_name
+    );
+
+    // Check num_img_tokens
+    println!(
+        "phi4_vision - {} image - Num tokens: golden={:?}, rust={:?}",
+        image_name, golden_num_tokens, result.num_img_tokens
+    );
+    assert_eq!(
+        golden_num_tokens, result.num_img_tokens,
+        "num_img_tokens mismatch for {}",
+        image_name
+    );
+
+    // Compare pixel values
+    let rust_pixels = result
+        .pixel_values
+        .clone()
+        .into_dimensionality::<ndarray::Ix5>()
+        .expect("Failed to convert to Ix5");
+
+    let pixel_diff = max_diff_5d(&golden_pixels, &rust_pixels);
+    println!(
+        "phi4_vision - {} image - Max pixel diff: {:.6}",
+        image_name, pixel_diff
+    );
+
+    // If there's a large difference, print detailed info
+    if pixel_diff > 0.1 {
+        let (max_diff, max_pos) =
+            find_max_diff_location_5d(&golden_pixels, &rust_pixels, image_name);
+        println!(
+            "phi4_vision - {} image - Max diff {:.4} at position {:?}",
+            image_name, max_diff, max_pos
+        );
+        let (b, t, c, h, w) = max_pos;
+        println!(
+            "  golden value: {:.4}, rust value: {:.4}",
+            golden_pixels[[b, t, c, h, w]],
+            rust_pixels[[b, t, c, h, w]]
+        );
+    }
+
+    // Allow tolerance for floating point and interpolation differences
+    // Phi4 uses torchvision bilinear+antialias for resize.
+    // Our Rust implementation uses Lanczos3 which provides similar antialiasing.
+    assert!(
+        pixel_diff < 0.2,
+        "Max pixel difference {} exceeds tolerance 0.2 for {}",
+        pixel_diff,
+        image_name
+    );
+}
+
+#[test]
+fn test_phi4_vision_golden_square() {
+    run_phi4_vision_golden_test("square");
+}
+
+#[test]
+fn test_phi4_vision_golden_tall() {
+    run_phi4_vision_golden_test("tall");
+}
+
+#[test]
+fn test_phi4_vision_golden_wide() {
+    run_phi4_vision_golden_test("wide");
+}
+
+#[test]
+fn test_phi4_vision_golden_small() {
+    run_phi4_vision_golden_test("small");
+}
+
+#[test]
+fn test_phi4_vision_golden_tiny() {
+    run_phi4_vision_golden_test("tiny");
+}
+
+#[test]
+fn test_phi4_vision_golden_very_tall() {
+    run_phi4_vision_golden_test("very_tall");
+}
+
+#[test]
+fn test_phi4_vision_golden_very_wide() {
+    run_phi4_vision_golden_test("very_wide");
+}
+
+#[test]
+fn test_phi4_vision_golden_large() {
+    run_phi4_vision_golden_test("large");
+}
+
+#[test]
+fn test_phi4_vision_golden_odd_dims() {
+    run_phi4_vision_golden_test("odd_dims");
+}
+
+#[test]
+fn test_phi4_vision_golden_grayscale() {
+    run_phi4_vision_golden_test("grayscale");
 }
