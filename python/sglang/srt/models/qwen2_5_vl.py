@@ -596,7 +596,8 @@ class Qwen2_5_VLForConditionalGeneration(EVSWithMRope):
             return run_dp_sharded_mrope_vision_model(
                 self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
             )
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        else:
+            image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -611,7 +612,8 @@ class Qwen2_5_VLForConditionalGeneration(EVSWithMRope):
             return run_dp_sharded_mrope_vision_model(
                 self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
             )
-        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        else:
+            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
     def post_process(
