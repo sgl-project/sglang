@@ -149,6 +149,20 @@ void apply_rope_pos_ids_cos_sin_cache(
     const std::optional<at::Tensor>& v_buffer,
     const std::optional<at::Tensor>& kv_cache_loc);
 
+void mla_rope_quantize_fp8_fused(
+    at::Tensor q_nope,
+    at::Tensor q_rope,
+    at::Tensor k_nope,
+    at::Tensor k_rope,
+    at::Tensor cos_sin_cache,
+    at::Tensor pos_ids,
+    bool is_neox,
+    at::Tensor q_out,
+    c10::optional<at::Tensor> k_nope_out,
+    c10::optional<at::Tensor> k_rope_out,
+    c10::optional<at::Tensor> kv_buffer,
+    c10::optional<at::Tensor> kv_cache_loc);
+
 void downcast_fp8(
     at::Tensor& k,
     at::Tensor& v,
