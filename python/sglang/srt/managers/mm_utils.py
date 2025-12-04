@@ -42,7 +42,7 @@ _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 
-def init_feature_buffer(device):
+def init_and_clear_feature_buffer(device):
     global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET
     _BUFFER_OFFSET = 0
     if (
