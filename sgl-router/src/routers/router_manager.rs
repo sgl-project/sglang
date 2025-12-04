@@ -4,14 +4,8 @@
 //! - Single Router Mode (enable_igw=false): Router owns workers directly
 //! - Multi-Router Mode (enable_igw=true): RouterManager coordinates everything
 
-use crate::config::{ConnectionMode, RoutingMode};
-use crate::core::{WorkerRegistry, WorkerType};
-use crate::protocols::spec::{
-    ChatCompletionRequest, CompletionRequest, EmbeddingRequest, GenerateRequest, RerankRequest,
-    ResponsesGetParams, ResponsesRequest,
-};
-use crate::routers::RouterTrait;
-use crate::server::{AppContext, ServerConfig};
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -21,8 +15,24 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde_json::Value;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+use crate::{
+    app_context::AppContext,
+    config::RoutingMode,
+    core::{ConnectionMode, WorkerRegistry, WorkerType},
+    protocols::{
+        chat::ChatCompletionRequest,
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        generate::GenerateRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::RouterTrait,
+    server::ServerConfig,
+};
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RouterId(String);
@@ -139,13 +149,13 @@ impl RouterManager {
             (ConnectionMode::Http, RoutingMode::OpenAI { .. }) => {
                 RouterId::new("http-openai".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::Regular { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::Regular { .. }) => {
                 RouterId::new("grpc-regular".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::PrefillDecode { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::PrefillDecode { .. }) => {
                 RouterId::new("grpc-pd".to_string())
             }
-            (ConnectionMode::Grpc, RoutingMode::OpenAI { .. }) => {
+            (ConnectionMode::Grpc { .. }, RoutingMode::OpenAI { .. }) => {
                 RouterId::new("grpc-regular".to_string())
             }
         }
@@ -259,6 +269,14 @@ impl RouterManager {
         let mut best_router = None;
         let mut best_score = 0.0;
 
+        let num_regular_workers = self
+            .worker_registry
+            .get_all()
+            .iter()
+            .filter(|w| matches!(w.worker_type(), WorkerType::Regular))
+            .count();
+        let num_pd_workers = self.worker_registry.get_all().len() - num_regular_workers;
+
         for router in candidate_routers {
             let mut score = 1.0;
 
@@ -274,7 +292,9 @@ impl RouterManager {
             // - Average worker cost vs max_cost
             // - Current load and health status
 
-            if score > best_score {
+            let valid_router = (router.is_pd_mode() && num_pd_workers > 0)
+                || (!router.is_pd_mode() && num_regular_workers > 0);
+            if score > best_score && valid_router {
                 best_score = score;
                 best_router = Some(router);
             }
@@ -314,15 +334,28 @@ impl RouterTrait for RouterManager {
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        let models = self.worker_registry.get_models();
+        let model_names = self.worker_registry.get_models();
 
-        if models.is_empty() {
+        if model_names.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
         } else {
+            // Convert model names to OpenAI-compatible model objects
+            let models: Vec<Value> = model_names
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "id": name,
+                        "object": "model",
+                        "owned_by": "local"
+                    })
+                })
+                .collect();
+
             (
                 StatusCode::OK,
                 serde_json::json!({
-                    "models": models
+                    "object": "list",
+                    "data": models
                 })
                 .to_string(),
             )
@@ -343,12 +376,12 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, None);
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_generate(headers, body, None).await
+            router.route_generate(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -362,12 +395,12 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router.route_chat(headers, body, Some(&body.model)).await
+            router.route_chat(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -381,14 +414,12 @@ impl RouterTrait for RouterManager {
         &self,
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router
-                .route_completion(headers, body, Some(&body.model))
-                .await
+            router.route_completion(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -404,7 +435,7 @@ impl RouterTrait for RouterManager {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let selected_model = body.model.as_deref().or(model_id);
+        let selected_model = model_id.or(Some(body.model.as_str()));
         let router = self.select_router_for_request(headers, selected_model);
 
         if let Some(router) = router {
@@ -416,26 +447,6 @@ impl RouterTrait for RouterManager {
             )
                 .into_response()
         }
-    }
-
-    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
-    }
-
-    async fn list_response_input_items(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _response_id: &str,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
     }
 
     async fn get_response(
@@ -469,18 +480,62 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "responses api not yet implemented in inference gateway mode",
+        )
+            .into_response()
+    }
+
+    async fn list_response_input_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+    ) -> Response {
+        // Delegate to the default router (typically http-regular)
+        // Response storage is shared across all routers via AppContext
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.list_response_input_items(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to list response input items",
+            )
+                .into_response()
+        }
+    }
+
     async fn route_embeddings(
         &self,
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router
-                .route_embeddings(headers, body, Some(&body.model))
-                .await
+            router.route_embeddings(headers, body, model_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router.route_classify(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -496,7 +551,7 @@ impl RouterTrait for RouterManager {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response {
-        let router = self.select_router_for_request(headers, None);
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
             router.route_rerank(headers, body, model_id).await
@@ -507,10 +562,6 @@ impl RouterTrait for RouterManager {
             )
                 .into_response()
         }
-    }
-
-    fn router_type(&self) -> &'static str {
-        "manager"
     }
 
     // Conversations API delegates
@@ -683,6 +734,10 @@ impl RouterTrait for RouterManager {
             )
                 .into_response()
         }
+    }
+
+    fn router_type(&self) -> &'static str {
+        "manager"
     }
 }
 

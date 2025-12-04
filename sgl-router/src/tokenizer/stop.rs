@@ -1,7 +1,11 @@
-use super::traits::{self, TokenIdType};
+use std::{collections::HashSet, sync::Arc};
+
 use anyhow::Result;
-use std::collections::HashSet;
-use std::sync::Arc;
+
+use super::{
+    sequence::Sequence,
+    traits::{self, TokenIdType},
+};
 
 /// Output from the sequence decoder
 #[derive(Debug, Clone, PartialEq)]
@@ -57,19 +61,13 @@ impl StopSequenceConfig {
 
 /// Decoder that handles stop sequences
 pub struct StopSequenceDecoder {
-    tokenizer: Arc<dyn traits::Tokenizer>,
+    /// Sequence for incremental decoding (replaces token_buffer + offsets)
+    sequence: Sequence,
     config: StopSequenceConfig,
     /// Buffer for partial matches (the "jail")
     jail_buffer: String,
-    /// Accumulated tokens
-    token_buffer: Vec<TokenIdType>,
-    /// Offset where the prefix text starts (for context)
-    prefix_offset: usize,
-    /// Offset marking the end of previously decoded text
-    read_offset: usize,
     /// Whether we've stopped
     stopped: bool,
-    skip_special_tokens: bool,
 }
 
 impl StopSequenceDecoder {
@@ -80,14 +78,10 @@ impl StopSequenceDecoder {
         skip_special_tokens: bool,
     ) -> Self {
         StopSequenceDecoder {
-            tokenizer,
+            sequence: Sequence::new_with_options(tokenizer, skip_special_tokens),
             config,
             jail_buffer: String::new(),
-            token_buffer: Vec::new(),
-            prefix_offset: 0,
-            read_offset: 0,
             stopped: false,
-            skip_special_tokens,
         }
     }
 
@@ -115,57 +109,24 @@ impl StopSequenceDecoder {
 
             // Include jailed text plus the stop token
             let stop_text = self
-                .tokenizer
-                .decode(&[token_id], self.skip_special_tokens)?;
+                .sequence
+                .tokenizer()
+                .decode(&[token_id], self.sequence.skip_special_tokens())?;
             let output = format!("{}{}", self.jail_buffer, stop_text);
             self.jail_buffer.clear();
             return Ok(SequenceDecoderOutput::StoppedWithText(output));
         }
 
-        // Add token to buffer
-        self.token_buffer.push(token_id);
+        // Use Sequence for incremental decoding
+        let new_text = self.sequence.append_token(token_id)?;
 
-        // Use incremental decoding like DecodeStream
-        // First decode the previous context (what we've already output)
-        let prefix_text = if self.read_offset > self.prefix_offset {
-            self.tokenizer.decode(
-                &self.token_buffer[self.prefix_offset..self.read_offset],
-                self.skip_special_tokens,
-            )?
-        } else {
-            String::new()
-        };
+        self.jail_buffer.push_str(&new_text);
 
-        // Now decode from prefix to current position
-        let new_full_text = self.tokenizer.decode(
-            &self.token_buffer[self.prefix_offset..],
-            self.skip_special_tokens,
-        )?;
-
-        // Check for incomplete UTF-8 sequence
-        if new_full_text.ends_with("�") {
-            // Wait for more tokens to complete the sequence
-            return Ok(SequenceDecoderOutput::Held);
-        }
-
-        // Calculate only the NEW text since last successful decode
-        let new_text = if new_full_text.len() > prefix_text.len() {
-            &new_full_text[prefix_text.len()..]
-        } else {
-            // No new text produced (can happen with special tokens)
-            return Ok(SequenceDecoderOutput::Held);
-        };
-
-        // Combine jail buffer with new text for checking
-        let check_text = format!("{}{}", self.jail_buffer, new_text);
-
-        // Check for complete stop sequences
+        // Check for hidden stop sequences
         for stop_seq in &self.config.stop_sequences {
-            if let Some(pos) = check_text.find(stop_seq) {
+            if let Some(pos) = self.jail_buffer.find(stop_seq) {
                 self.stopped = true;
-
-                // Output text before the stop sequence
-                let output = check_text[..pos].to_string();
+                let output = self.jail_buffer[..pos].to_string();
                 self.jail_buffer.clear();
                 return Ok(if output.is_empty() {
                     SequenceDecoderOutput::Stopped
@@ -177,58 +138,70 @@ impl StopSequenceDecoder {
 
         // Check for visible stop sequences
         for stop_seq in &self.config.visible_stop_sequences {
-            if let Some(pos) = check_text.find(stop_seq) {
+            if let Some(pos) = self.jail_buffer.find(stop_seq) {
                 self.stopped = true;
-
-                // Include the stop sequence in output
                 let end_pos = pos + stop_seq.len();
-                let output = check_text[..end_pos].to_string();
+                let output = self.jail_buffer[..end_pos].to_string();
                 self.jail_buffer.clear();
                 return Ok(SequenceDecoderOutput::StoppedWithText(output));
             }
         }
 
-        // Check for partial matches at the end of check_text
-        let mut partial_match_len = 0;
+        // Check for partial matches: is the end of jail_buffer the start of any stop_seq?
+        // This handles stop sequences split across tokens
+        let buffer_len = self.jail_buffer.len();
+        let mut best_split_pos: Option<usize> = None;
+
         for stop_seq in self
             .config
             .stop_sequences
             .iter()
             .chain(&self.config.visible_stop_sequences)
         {
-            // Check all possible suffixes that could be a prefix of stop_seq
-            for i in 1..=check_text.len().min(stop_seq.len() - 1) {
-                let suffix = &check_text[check_text.len() - i..];
-                if stop_seq.starts_with(suffix) {
-                    partial_match_len = partial_match_len.max(i);
+            let stop_len = stop_seq.len();
+
+            if stop_len <= 1 || buffer_len == 0 {
+                continue;
+            }
+
+            let max_len = buffer_len.min(stop_len - 1);
+
+            for len in (1..=max_len).rev() {
+                let suffix_start = buffer_len - len;
+
+                if !self.jail_buffer.is_char_boundary(suffix_start) {
+                    continue;
+                }
+
+                let suffix = &self.jail_buffer[suffix_start..];
+
+                if stop_seq.starts_with(suffix)
+                    && best_split_pos.is_none_or(|current| suffix_start < current)
+                {
+                    best_split_pos = Some(suffix_start);
+                    break;
                 }
             }
         }
 
-        if partial_match_len > 0 {
-            // Split: output safe text, jail the potential match
-            let safe_end = check_text.len() - partial_match_len;
-            let safe_text = &check_text[..safe_end];
-            self.jail_buffer = check_text[safe_end..].to_string();
+        if let Some(split_pos) = best_split_pos {
+            // Hold the partial match, flush the rest
+            // Drain [0..split_pos] as output, keep [split_pos..] in jail_buffer
+            let to_output = self.jail_buffer.drain(..split_pos).collect::<String>();
 
-            // Update offsets for next iteration
-            self.prefix_offset = self.read_offset;
-            self.read_offset = self.token_buffer.len();
-
-            if safe_text.is_empty() {
+            if to_output.is_empty() {
                 Ok(SequenceDecoderOutput::Held)
             } else {
-                Ok(SequenceDecoderOutput::Text(safe_text.to_string()))
+                Ok(SequenceDecoderOutput::Text(to_output))
             }
         } else {
-            // No partial matches - output everything
-            self.jail_buffer.clear();
-
-            // Update offsets for next iteration
-            self.prefix_offset = self.read_offset;
-            self.read_offset = self.token_buffer.len();
-
-            Ok(SequenceDecoderOutput::Text(check_text))
+            // No partial matches - flush everything
+            let output = std::mem::take(&mut self.jail_buffer);
+            if output.is_empty() {
+                Ok(SequenceDecoderOutput::Held)
+            } else {
+                Ok(SequenceDecoderOutput::Text(output))
+            }
         }
     }
 
@@ -263,9 +236,7 @@ impl StopSequenceDecoder {
     /// Reset the decoder state
     pub fn reset(&mut self) {
         self.jail_buffer.clear();
-        self.token_buffer.clear();
-        self.prefix_offset = 0;
-        self.read_offset = 0;
+        self.sequence.clear();
         self.stopped = false;
     }
 }
@@ -500,6 +471,136 @@ mod tests {
                 result,
                 SequenceDecoderOutput::Text(_) | SequenceDecoderOutput::Held
             ));
+        }
+    }
+
+    #[test]
+    fn test_utf8_multibyte_character_boundaries() {
+        // This test verifies the fix for the UTF-8 boundary panic
+        // The panic occurred when trying to slice jail_buffer at a byte index
+        // that was in the middle of a multi-byte UTF-8 character (e.g., '×')
+        use crate::tokenizer::mock::MockTokenizer;
+
+        let tokenizer = Arc::new(MockTokenizer::new());
+
+        // Configure stop sequence with a multi-byte character
+        let config = StopSequenceConfig::default().with_stop_sequence(" ×");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Simulate the scenario: jail_buffer will contain " ×" (space + multiplication sign)
+        // The '×' character is UTF-8 encoded as bytes [0xC3, 0x97] (2 bytes)
+        // When checking for partial matches, we must not slice in the middle of these bytes
+
+        // This should not panic - the fix ensures we only slice at char boundaries
+        let result = decoder.process_token(1); // Will add some text to jail_buffer
+        assert!(result.is_ok());
+
+        // Even with multi-byte UTF-8 characters in the buffer, processing should work
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_delta_character() {
+        // Test for: byte index 1 is not a char boundary; it is inside 'Δ' (bytes 0..2) of `Δ`
+        // 'Δ' (U+0394 GREEK CAPITAL LETTER DELTA) is encoded as [0xCE, 0x94] (2 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence("Δ");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_degree_character() {
+        // Test for: byte index 1 is not a char boundary; it is inside '°' (bytes 0..2) of `°`
+        // '°' (U+00B0 DEGREE SIGN) is encoded as [0xC2, 0xB0] (2 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence("°");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_triangle_character() {
+        // Test for: byte index 4 is not a char boundary; it is inside '∆' (bytes 2..5) of ` (∆`
+        // '∆' (U+2206 INCREMENT) is encoded as [0xE2, 0x88, 0x86] (3 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence(" (∆");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+        let result = decoder.process_token(3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_en_dash_character() {
+        // Test for: byte index 3 is not a char boundary; it is inside '–' (bytes 1..4) of ` –`
+        // '–' (U+2013 EN DASH) is encoded as [0xE2, 0x80, 0x93] (3 bytes)
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let config = StopSequenceConfig::default().with_stop_sequence(" –");
+
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        // Process tokens - should not panic when checking partial matches
+        let result = decoder.process_token(1);
+        assert!(result.is_ok());
+        let result = decoder.process_token(2);
+        assert!(result.is_ok());
+        let result = decoder.process_token(3);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_utf8_multibyte_various_characters() {
+        // Comprehensive test with multiple multi-byte UTF-8 characters
+        // Tests 2-byte, 3-byte, and 4-byte UTF-8 sequences
+        let test_cases = vec![
+            ("×", "multiplication sign - 2 bytes"),
+            ("Δ", "Greek Delta - 2 bytes"),
+            ("°", "degree sign - 2 bytes"),
+            ("∆", "increment - 3 bytes"),
+            ("–", "en dash - 3 bytes"),
+            ("€", "euro sign - 3 bytes"),
+            ("中", "Chinese character - 3 bytes"),
+            ("🚀", "rocket emoji - 4 bytes"),
+            ("💡", "lightbulb emoji - 4 bytes"),
+        ];
+
+        for (stop_char, description) in test_cases {
+            let tokenizer = Arc::new(MockTokenizer::new());
+            let config = StopSequenceConfig::default().with_stop_sequence(stop_char);
+
+            let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+            // Process multiple tokens - should not panic
+            for token_id in 1..=5 {
+                let result = decoder.process_token(token_id);
+                assert!(
+                    result.is_ok(),
+                    "Failed on {} with token {}",
+                    description,
+                    token_id
+                );
+            }
         }
     }
 }

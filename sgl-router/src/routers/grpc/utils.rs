@@ -1,59 +1,84 @@
 //! Shared utilities for gRPC routers
 
-use super::ProcessedMessages;
-use crate::core::Worker;
-use crate::grpc_client::sglang_scheduler::AbortOnDropStream;
-use crate::grpc_client::{proto, SglangSchedulerClient};
-use crate::protocols::spec::{
-    ChatCompletionRequest, ChatLogProbs, ChatLogProbsContent, ChatMessage, FunctionCallResponse,
-    GenerateFinishReason, StringOrArray, Tool, ToolCall, ToolChoice, ToolChoiceValue, TopLogProb,
-};
-use crate::tokenizer::chat_template::{ChatTemplateContentFormat, ChatTemplateParams};
-use crate::tokenizer::traits::Tokenizer;
-use crate::tokenizer::HuggingFaceTokenizer;
-pub use crate::tokenizer::StopSequenceDecoder;
-use axum::{
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    Json,
-};
-use futures::StreamExt;
+use std::{collections::HashMap, sync::Arc};
+
+use axum::response::Response;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+use super::{
+    client::GrpcClient,
+    error,
+    proto_wrapper::{ProtoGenerateComplete, ProtoStream},
+    ProcessedMessages,
+};
+use crate::{
+    core::Worker,
+    grpc_client::sglang_proto::{InputLogProbs, OutputLogProbs},
+    protocols::{
+        chat::{ChatCompletionRequest, ChatMessage},
+        common::{
+            ChatLogProbs, ChatLogProbsContent, FunctionCallResponse, StringOrArray, Tool, ToolCall,
+            ToolChoice, ToolChoiceValue, TopLogProb,
+        },
+        generate::GenerateFinishReason,
+    },
+    reasoning_parser::{
+        ParserFactory as ReasoningParserFactory, PooledParser as ReasoningPooledParser,
+        ReasoningParser,
+    },
+    routers::grpc::proto_wrapper::ProtoResponseVariant,
+    tokenizer::{
+        cache::CachedTokenizer,
+        chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+        stop::StopSequenceDecoderBuilder,
+        traits::Tokenizer,
+        HuggingFaceTokenizer, StopSequenceDecoder,
+    },
+    tool_parser::{
+        ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
+    },
+};
+
 /// Get gRPC client from worker, returning appropriate error response on failure
-pub async fn get_grpc_client_from_worker(
-    worker: &Arc<dyn Worker>,
-) -> Result<SglangSchedulerClient, Response> {
+pub async fn get_grpc_client_from_worker(worker: &Arc<dyn Worker>) -> Result<GrpcClient, Response> {
+    // Get cached client from worker (or create one if not cached yet)
     let client_arc = worker
         .get_grpc_client()
         .await
-        .map_err(|e| internal_error_message(format!("Failed to get gRPC client: {}", e)))?
-        .ok_or_else(|| internal_error_static("Selected worker is not configured for gRPC"))?;
+        .map_err(|e| {
+            error!(
+                function = "get_grpc_client_from_worker",
+                error = %e,
+                "Failed to get gRPC client from worker"
+            );
+            error::internal_error(format!("Failed to get gRPC client: {}", e))
+        })?
+        .ok_or_else(|| {
+            error!(
+                function = "get_grpc_client_from_worker",
+                "Selected worker not configured for gRPC"
+            );
+            error::internal_error("Selected worker is not configured for gRPC")
+        })?;
 
-    let client = client_arc.lock().await.clone();
-    Ok(client)
+    Ok((*client_arc).clone())
 }
 
 /// Process tool call arguments in messages
 /// Per Transformers docs, tool call arguments in assistant messages should be dicts
-pub fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
+fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
     for msg in messages {
-        // Early return if not assistant message
         let role = msg.get("role").and_then(|v| v.as_str());
         if role != Some("assistant") {
             continue;
         }
 
-        // Early return if no tool_calls
         let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) else {
             continue;
         };
 
-        // Process each tool call's arguments
         for call in tool_calls {
             let Some(function) = call.get_mut("function") else {
                 continue;
@@ -103,10 +128,7 @@ pub fn process_content_format(
 }
 
 /// Transform a single content field based on content format
-pub fn transform_content_field(
-    content_value: &mut Value,
-    content_format: ChatTemplateContentFormat,
-) {
+fn transform_content_field(content_value: &mut Value, content_format: ChatTemplateContentFormat) {
     let Some(content_array) = content_value.as_array() else {
         return; // Not multimodal, keep as-is
     };
@@ -158,51 +180,54 @@ pub fn generate_tool_constraints(
     tools: &[Tool],
     tool_choice: &Option<ToolChoice>,
     _model: &str,
-) -> Option<(String, String)> {
-    let choice = tool_choice.as_ref()?;
+) -> Result<Option<(String, String)>, String> {
+    let Some(choice) = tool_choice.as_ref() else {
+        return Ok(None);
+    };
 
     match choice {
         // Specific function: Return parameters schema directly
         // tools should already be filtered to contain only the specific function
         ToolChoice::Function { .. } => {
             if tools.is_empty() {
-                return None;
+                return Ok(None);
             }
             let tool = &tools[0];
 
             // Return the tool's parameters schema directly (not wrapped in array)
-            let params_schema = serde_json::to_string(&tool.function.parameters).ok()?;
-            Some(("json_schema".to_string(), params_schema))
+            let params_schema = serde_json::to_string(&tool.function.parameters)
+                .map_err(|e| format!("Failed to serialize tool parameters: {}", e))?;
+            Ok(Some(("json_schema".to_string(), params_schema)))
         }
 
         // Required: Array of tool calls with minItems: 1
         ToolChoice::Value(ToolChoiceValue::Required) => {
             let schema = build_required_array_schema(tools)?;
-            Some(("json_schema".to_string(), schema))
+            Ok(Some(("json_schema".to_string(), schema)))
         }
 
         // AllowedTools with required mode: tools are already filtered
         ToolChoice::AllowedTools { mode, .. } => {
             if mode == "required" {
                 if tools.is_empty() {
-                    return None;
+                    return Ok(None);
                 }
                 let schema = build_required_array_schema(tools)?;
-                Some(("json_schema".to_string(), schema))
+                Ok(Some(("json_schema".to_string(), schema)))
             } else {
                 // "auto" mode - no constraint needed
-                None
+                Ok(None)
             }
         }
 
         // "auto" or "none" - no constraint
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// Build JSON schema for required tool calls (array with minItems: 1)
 /// Includes $defs consolidation from all tools (matching Python's behavior)
-pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
+fn build_required_array_schema(tools: &[Tool]) -> Result<String, String> {
     // Build anyOf schemas for each tool
     let mut any_of_schemas = Vec::new();
     for tool in tools {
@@ -228,11 +253,12 @@ pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
                     if let Some(existing) = all_defs.get(def_name) {
                         // Check for conflicts
                         if existing != def_schema {
-                            error!(
-                                "Tool definition '{}' has multiple schemas, which is not supported",
+                            let error_msg = format!(
+                                "Tool definition '{}' has multiple conflicting schemas, which is not supported",
                                 def_name
                             );
-                            return None;
+                            error!("{}", error_msg);
+                            return Err(error_msg);
                         }
                     } else {
                         all_defs.insert(def_name.clone(), def_schema.clone());
@@ -260,42 +286,61 @@ pub fn build_required_array_schema(tools: &[Tool]) -> Option<String> {
         }
     }
 
-    serde_json::to_string(&array_schema).ok()
+    serde_json::to_string(&array_schema)
+        .map_err(|e| format!("Failed to serialize tool schema: {}", e))
 }
 
-/// Filter tools based on tool_choice (shared by both routers)
-/// Returns a reference to the original body if no filtering needed,
-/// otherwise returns a cloned and filtered body
-pub fn filter_tools_for_request(
-    body: &ChatCompletionRequest,
-) -> std::borrow::Cow<'_, ChatCompletionRequest> {
-    match &body.tool_choice {
-        Some(ToolChoice::AllowedTools { tools: allowed, .. }) if body.tools.is_some() => {
-            let mut filtered_body = body.clone();
-            let all_tools = filtered_body.tools.as_ref().unwrap();
+/// Filter tools based on tool_choice (generic helper)
+///
+/// Returns filtered tools if filtering is needed, otherwise returns None.
+/// Used by both Chat API and Responses API (Harmony) for constraint generation.
+pub fn filter_tools_by_tool_choice(
+    tools: &[Tool],
+    tool_choice: &Option<ToolChoice>,
+) -> Option<Vec<Tool>> {
+    match tool_choice {
+        Some(ToolChoice::AllowedTools { tools: allowed, .. }) => {
             let allowed_names: std::collections::HashSet<&str> =
-                allowed.iter().map(|t| t.name.as_str()).collect();
-            let filtered_tools: Vec<Tool> = all_tools
+                allowed.iter().filter_map(|t| t.function_name()).collect();
+            let filtered: Vec<Tool> = tools
                 .iter()
                 .filter(|t| allowed_names.contains(t.function.name.as_str()))
                 .cloned()
                 .collect();
-            filtered_body.tools = Some(filtered_tools);
-            std::borrow::Cow::Owned(filtered_body)
+            Some(filtered)
         }
-        Some(ToolChoice::Function { function, .. }) if body.tools.is_some() => {
-            let mut filtered_body = body.clone();
-            let all_tools = filtered_body.tools.as_ref().unwrap();
-            let filtered_tools: Vec<Tool> = all_tools
+        Some(ToolChoice::Function { function, .. }) => {
+            let filtered: Vec<Tool> = tools
                 .iter()
                 .filter(|t| t.function.name == function.name)
                 .cloned()
                 .collect();
-            filtered_body.tools = Some(filtered_tools);
-            std::borrow::Cow::Owned(filtered_body)
+            Some(filtered)
         }
-        _ => std::borrow::Cow::Borrowed(body), // No filtering needed, use original
+        _ => None, // No filtering needed
     }
+}
+
+/// Filter ChatCompletionRequest by tool_choice
+///
+/// Returns a reference to the original request if no filtering needed,
+/// otherwise returns a cloned request with filtered tools.
+///
+/// Note: Tool existence is validated earlier in ChatCompletionRequest::validate(),
+/// so this function assumes tool_choice references valid tools.
+pub fn filter_chat_request_by_tool_choice(
+    body: &ChatCompletionRequest,
+) -> std::borrow::Cow<'_, ChatCompletionRequest> {
+    if let Some(tools) = &body.tools {
+        if let Some(filtered_tools) = filter_tools_by_tool_choice(tools, &body.tool_choice) {
+            let mut filtered_body = body.clone();
+            filtered_body.tools = Some(filtered_tools);
+            return std::borrow::Cow::Owned(filtered_body);
+        }
+    }
+
+    // No filtering needed - return original request
+    std::borrow::Cow::Borrowed(body)
 }
 
 /// Process chat messages and apply template (shared by both routers)
@@ -305,9 +350,24 @@ pub fn process_chat_messages(
     tokenizer: &dyn Tokenizer,
 ) -> Result<ProcessedMessages, String> {
     // Use the tokenizer's chat template - we require HuggingFace tokenizer for gRPC
-    let formatted_text = if let Some(hf_tokenizer) =
-        tokenizer.as_any().downcast_ref::<HuggingFaceTokenizer>()
-    {
+    // First try direct downcast, then try via CachedTokenizer wrapper
+    let hf_tokenizer = tokenizer
+        .as_any()
+        .downcast_ref::<HuggingFaceTokenizer>()
+        .or_else(|| {
+            // If direct downcast fails, try to get inner tokenizer from CachedTokenizer
+            tokenizer
+                .as_any()
+                .downcast_ref::<CachedTokenizer>()
+                .and_then(|cached| {
+                    cached
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<HuggingFaceTokenizer>()
+                })
+        });
+
+    let formatted_text = if let Some(hf_tokenizer) = hf_tokenizer {
         // Get content format and transform messages accordingly
         let content_format = hf_tokenizer.chat_template_content_format();
         let mut transformed_messages = process_content_format(&request.messages, content_format)?;
@@ -354,7 +414,6 @@ pub fn process_chat_messages(
 
         let params = ChatTemplateParams {
             add_generation_prompt: true,
-            continue_final_message: request.continue_final_message,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             ..Default::default()
@@ -406,67 +465,6 @@ pub fn process_chat_messages(
     })
 }
 
-/// Error response helpers (shared between regular and PD routers)
-pub fn internal_error_static(msg: &'static str) -> Response {
-    error!("{}", msg);
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": {
-                "message": msg,
-                "type": "internal_error",
-                "code": 500
-            }
-        })),
-    )
-        .into_response()
-}
-
-pub fn internal_error_message(message: String) -> Response {
-    error!("{}", message);
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": "internal_error",
-                "code": 500
-            }
-        })),
-    )
-        .into_response()
-}
-
-pub fn bad_request_error(message: String) -> Response {
-    error!("{}", message);
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": "invalid_request_error",
-                "code": 400
-            }
-        })),
-    )
-        .into_response()
-}
-
-pub fn service_unavailable_error(message: String) -> Response {
-    warn!("{}", message);
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": "service_unavailable",
-                "code": 503
-            }
-        })),
-    )
-        .into_response()
-}
-
 /// Create a StopSequenceDecoder from stop parameters
 pub fn create_stop_decoder(
     tokenizer: &Arc<dyn Tokenizer>,
@@ -475,8 +473,6 @@ pub fn create_stop_decoder(
     skip_special_tokens: bool,
     no_stop_trim: bool,
 ) -> StopSequenceDecoder {
-    use crate::tokenizer::stop::StopSequenceDecoderBuilder;
-
     // Extract stop sequences
     let stop_sequences: Vec<String> = match stop {
         Some(StringOrArray::String(s)) => vec![s.clone()],
@@ -515,6 +511,8 @@ pub fn create_stop_decoder(
 pub fn parse_json_schema_response(
     processed_text: &str,
     tool_choice: &Option<ToolChoice>,
+    model: &str,
+    history_tool_calls_count: usize,
 ) -> (Option<Vec<ToolCall>>, String) {
     match tool_choice {
         Some(ToolChoice::Function { function, .. }) => {
@@ -522,7 +520,12 @@ pub fn parse_json_schema_response(
             match serde_json::from_str::<Value>(processed_text) {
                 Ok(params) => {
                     let tool_call = ToolCall {
-                        id: format!("call_{}", Uuid::new_v4()),
+                        id: generate_tool_call_id(
+                            model,
+                            &function.name,
+                            0,
+                            history_tool_calls_count,
+                        ),
                         tool_type: "function".to_string(),
                         function: FunctionCallResponse {
                             name: function.name.clone(),
@@ -553,7 +556,12 @@ pub fn parse_json_schema_response(
                             let parameters = obj.get("parameters")?;
 
                             Some(ToolCall {
-                                id: format!("call_{}_{}", i, Uuid::new_v4()),
+                                id: generate_tool_call_id(
+                                    model,
+                                    &name,
+                                    i,
+                                    history_tool_calls_count,
+                                ),
                                 tool_type: "function".to_string(),
                                 function: FunctionCallResponse {
                                     name,
@@ -590,40 +598,39 @@ pub fn parse_json_schema_response(
 /// * `Ok(Vec<GenerateComplete>)` - All complete responses collected from the stream
 /// * `Err(Response)` - Error response if the stream fails or returns an error
 pub async fn collect_stream_responses(
-    stream: &mut AbortOnDropStream,
+    stream: &mut ProtoStream,
     worker_name: &str,
-) -> Result<Vec<proto::GenerateComplete>, Response> {
-    use proto::generate_response::Response::*;
-
+) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
 
     while let Some(response) = stream.next().await {
         match response {
             Ok(gen_response) => {
-                match gen_response.response {
-                    Some(Complete(complete)) => {
+                match gen_response.into_response() {
+                    ProtoResponseVariant::Complete(complete) => {
                         all_responses.push(complete);
                     }
-                    Some(Error(err)) => {
-                        error!("{} error: {}", worker_name, err.message);
+                    ProtoResponseVariant::Error(err) => {
+                        error!(function = "collect_stream_responses", worker = %worker_name, error = %err.message(), "Worker generation error");
                         // Don't mark as completed - let Drop send abort for error cases
-                        return Err(internal_error_message(format!(
+                        return Err(error::internal_error(format!(
                             "{} generation failed: {}",
-                            worker_name, err.message
+                            worker_name,
+                            err.message()
                         )));
                     }
-                    Some(Chunk(_chunk)) => {
+                    ProtoResponseVariant::Chunk(_chunk) => {
                         // Streaming chunk - no action needed
                     }
-                    None => {
+                    ProtoResponseVariant::None => {
                         // Empty response - no action needed
                     }
                 }
             }
             Err(e) => {
-                error!("{} stream error: {:?}", worker_name, e);
+                error!(function = "collect_stream_responses", worker = %worker_name, error = ?e, "Worker stream error");
                 // Don't mark as completed - let Drop send abort for error cases
-                return Err(internal_error_message(format!(
+                return Err(error::internal_error(format!(
                     "{} stream failed: {}",
                     worker_name, e
                 )));
@@ -677,7 +684,7 @@ pub fn generate_tool_call_id(
 
 /// Check if a reasoning parser is available for the given model
 pub fn check_reasoning_parser_availability(
-    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> bool {
@@ -692,7 +699,7 @@ pub fn check_reasoning_parser_availability(
 
 /// Check if a tool parser is available for the given model
 pub fn check_tool_parser_availability(
-    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&String>,
     model: &str,
 ) -> bool {
@@ -709,10 +716,10 @@ pub fn check_tool_parser_availability(
 /// Otherwise, auto-detect based on the model name.
 /// Get a pooled reasoning parser (for non-streaming where state doesn't matter)
 pub fn get_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::reasoning_parser::PooledParser {
+) -> ReasoningPooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -733,10 +740,10 @@ pub fn get_reasoning_parser(
 
 /// Create a fresh reasoning parser instance (for streaming where state isolation is needed)
 pub fn create_reasoning_parser(
-    reasoning_parser_factory: &crate::reasoning_parser::ParserFactory,
+    reasoning_parser_factory: &ReasoningParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> Option<Box<dyn crate::reasoning_parser::ReasoningParser>> {
+) -> Option<Box<dyn ReasoningParser>> {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         reasoning_parser_factory
@@ -761,10 +768,10 @@ pub fn create_reasoning_parser(
 /// Otherwise, auto-detect based on the model name.
 /// Get a pooled tool parser (for non-streaming where state doesn't matter)
 pub fn get_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> crate::tool_parser::PooledParser {
+) -> ToolPooledParser {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
@@ -785,10 +792,10 @@ pub fn get_tool_parser(
 
 /// Create a fresh tool parser instance (for streaming where state isolation is needed)
 pub fn create_tool_parser(
-    tool_parser_factory: &crate::tool_parser::ParserFactory,
+    tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&String>,
     model: &str,
-) -> Option<Box<dyn crate::tool_parser::ToolParser>> {
+) -> Option<Box<dyn ToolParser>> {
     if let Some(parser_name) = configured_parser {
         // Use configured parser if specified
         tool_parser_factory
@@ -807,12 +814,12 @@ pub fn create_tool_parser(
     }
 }
 
-/// Convert proto::OutputLogProbs to OpenAI ChatLogProbs format
+/// Convert OutputLogProbs to OpenAI ChatLogProbs format
 ///
 /// This function decodes token IDs using the tokenizer and builds the logprobs structure
 /// expected by the OpenAI API format.
 pub fn convert_proto_to_openai_logprobs(
-    proto_logprobs: &proto::OutputLogProbs,
+    proto_logprobs: &OutputLogProbs,
     tokenizer: &Arc<dyn Tokenizer>,
 ) -> Result<ChatLogProbs, String> {
     let mut content_items = Vec::new();
@@ -880,13 +887,11 @@ pub fn convert_proto_to_openai_logprobs(
     })
 }
 
-/// Convert proto::OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
+/// Convert OutputLogProbs to Generate format Vec<Vec<Option<f64>>>
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// Each inner vec contains [logprob (f64), token_id (i32), ...]
-pub fn convert_generate_output_logprobs(
-    proto_logprobs: &proto::OutputLogProbs,
-) -> Vec<Vec<Option<f64>>> {
+pub fn convert_generate_output_logprobs(proto_logprobs: &OutputLogProbs) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
         .token_logprobs
         .iter()
@@ -895,13 +900,11 @@ pub fn convert_generate_output_logprobs(
         .collect()
 }
 
-/// Convert proto::InputLogProbs to Generate format Vec<Vec<Option<f64>>>
+/// Convert InputLogProbs to Generate format Vec<Vec<Option<f64>>>
 ///
 /// Generate format: [[logprob, token_id, ...], [logprob, token_id, ...], ...]
 /// First token has null logprob: [[null, token_id], [logprob, token_id], ...]
-pub fn convert_generate_input_logprobs(
-    proto_logprobs: &proto::InputLogProbs,
-) -> Vec<Vec<Option<f64>>> {
+pub fn convert_generate_input_logprobs(proto_logprobs: &InputLogProbs) -> Vec<Vec<Option<f64>>> {
     proto_logprobs
         .token_logprobs
         .iter()
@@ -946,16 +949,21 @@ pub fn parse_finish_reason(reason_str: &str, completion_tokens: i32) -> Generate
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::protocols::spec::{ChatMessage, ContentPart, ImageUrl, UserMessageContent};
-    use crate::tokenizer::chat_template::ChatTemplateContentFormat;
     use serde_json::json;
+
+    use super::*;
+    use crate::{
+        protocols::{
+            chat::{ChatMessage, MessageContent},
+            common::{ContentPart, ImageUrl},
+        },
+        tokenizer::chat_template::ChatTemplateContentFormat,
+    };
 
     #[test]
     fn test_transform_messages_string_format() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Parts(vec![
+            content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Hello".to_string(),
                 },
@@ -988,8 +996,7 @@ mod tests {
     #[test]
     fn test_transform_messages_openai_format() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Parts(vec![
+            content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "Describe this image:".to_string(),
                 },
@@ -1023,8 +1030,7 @@ mod tests {
     #[test]
     fn test_transform_messages_simple_string_content() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Text("Simple text message".to_string()),
+            content: MessageContent::Text("Simple text message".to_string()),
             name: None,
         }];
 
@@ -1044,13 +1050,11 @@ mod tests {
     fn test_transform_messages_multiple_messages() {
         let messages = vec![
             ChatMessage::System {
-                role: "system".to_string(),
-                content: "System prompt".to_string(),
+                content: MessageContent::Text("System prompt".to_string()),
                 name: None,
             },
             ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Parts(vec![
+                content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "User message".to_string(),
                     },
@@ -1081,8 +1085,7 @@ mod tests {
     #[test]
     fn test_transform_messages_empty_text_parts() {
         let messages = vec![ChatMessage::User {
-            role: "user".to_string(),
-            content: UserMessageContent::Parts(vec![ContentPart::ImageUrl {
+            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
                 image_url: ImageUrl {
                     url: "https://example.com/image.jpg".to_string(),
                     detail: None,
@@ -1104,13 +1107,11 @@ mod tests {
     fn test_transform_messages_mixed_content_types() {
         let messages = vec![
             ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Text("Plain text".to_string()),
+                content: MessageContent::Text("Plain text".to_string()),
                 name: None,
             },
             ChatMessage::User {
-                role: "user".to_string(),
-                content: UserMessageContent::Parts(vec![
+                content: MessageContent::Parts(vec![
                     ContentPart::Text {
                         text: "With image".to_string(),
                     },

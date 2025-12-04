@@ -1,12 +1,11 @@
 //! Integration tests for PolicyRegistry with RouterManager
 
-use sglang_router_rs::config::PolicyConfig;
-use sglang_router_rs::core::WorkerRegistry;
-use sglang_router_rs::policies::PolicyRegistry;
-use sglang_router_rs::protocols::worker_spec::WorkerConfigRequest;
-use sglang_router_rs::routers::router_manager::RouterManager;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+use sgl_model_gateway::{
+    config::PolicyConfig, core::WorkerRegistry, policies::PolicyRegistry,
+    protocols::worker_spec::WorkerConfigRequest, routers::router_manager::RouterManager,
+};
 
 #[tokio::test]
 async fn test_policy_registry_with_router_manager() {
@@ -37,6 +36,13 @@ async fn test_policy_registry_with_router_manager() {
         reasoning_parser: None,
         tool_parser: None,
         chat_template: None,
+        runtime: None,
+        health_check_timeout_secs: 30,
+        health_check_interval_secs: 60,
+        health_success_threshold: 2,
+        health_failure_threshold: 3,
+        max_connection_attempts: 20,
+        dp_aware: false,
     };
 
     // This would normally connect to a real worker, but for testing we'll just verify the structure
@@ -62,6 +68,13 @@ async fn test_policy_registry_with_router_manager() {
         reasoning_parser: None,
         tool_parser: None,
         chat_template: None,
+        runtime: None,
+        health_check_timeout_secs: 30,
+        health_check_interval_secs: 60,
+        health_success_threshold: 2,
+        health_failure_threshold: 3,
+        max_connection_attempts: 20,
+        dp_aware: false,
     };
 
     // The second worker should use the same policy as the first (cache_aware)
@@ -82,7 +95,14 @@ async fn test_policy_registry_with_router_manager() {
         tokenizer_path: None,
         reasoning_parser: None,
         tool_parser: None,
+        runtime: None,
         chat_template: None,
+        health_check_timeout_secs: 30,
+        health_check_interval_secs: 60,
+        health_success_threshold: 2,
+        health_failure_threshold: 3,
+        max_connection_attempts: 20,
+        dp_aware: false,
     };
 
     let _gpt_policy = policy_registry.get_policy("gpt-4");
@@ -95,8 +115,7 @@ async fn test_policy_registry_with_router_manager() {
 
 #[test]
 fn test_policy_registry_cleanup() {
-    use sglang_router_rs::config::PolicyConfig;
-    use sglang_router_rs::policies::PolicyRegistry;
+    use sgl_model_gateway::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 
@@ -123,8 +142,7 @@ fn test_policy_registry_cleanup() {
 
 #[test]
 fn test_policy_registry_multiple_models() {
-    use sglang_router_rs::config::PolicyConfig;
-    use sglang_router_rs::policies::PolicyRegistry;
+    use sgl_model_gateway::{config::PolicyConfig, policies::PolicyRegistry};
 
     let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
 

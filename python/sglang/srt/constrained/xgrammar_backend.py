@@ -16,7 +16,7 @@
 import dataclasses
 import json
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from xgrammar import (
@@ -34,6 +34,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarObject,
     GrammarStats,
 )
+from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -103,7 +104,11 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if logits.device.type == "cuda":
+        if (
+            logits.device.type == "cuda"
+            or logits.device.type == "npu"
+            or logits.device.type == "xpu"
+        ):
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
@@ -167,6 +172,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         tokenizer,
         vocab_size: int,
         model_eos_token_ids: Optional[List[int]] = None,
+        any_whitespace: bool = True,
     ):
         super().__init__()
 
@@ -188,6 +194,35 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
+        self.any_whitespace = any_whitespace
+
+    @staticmethod
+    def _sanitize_structural_format(structural_format):
+        """Recursively replace missing json_schema fields with an empty schema."""
+        if not isinstance(structural_format, dict):
+            return
+
+        fmt_type = structural_format.get("type")
+        if fmt_type in {"json_schema", "qwen_xml_parameter"}:
+            if structural_format.get("json_schema") is None:
+                structural_format["json_schema"] = {}
+
+        if fmt_type == "tag":
+            XGrammarGrammarBackend._sanitize_structural_format(
+                structural_format.get("content")
+            )
+        elif fmt_type in {"sequence", "or"}:
+            for element in structural_format.get("elements", []):
+                XGrammarGrammarBackend._sanitize_structural_format(element)
+        elif fmt_type in {"triggered_tags", "tags_with_separator"}:
+            for tag in structural_format.get("tags", []):
+                XGrammarGrammarBackend._sanitize_structural_format(tag)
+
+    @staticmethod
+    def _sanitize_structural_tag_structures(structural_tag: Dict) -> None:
+        for structure in structural_tag.get("structures", []):
+            if structure.get("schema") is None:
+                structure["schema"] = {}
 
     def _from_context(
         self, ctx: CompiledGrammar, key_string: str, grammar_stats: GrammarStats
@@ -212,7 +247,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
-                ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
+                ctx = self.grammar_compiler.compile_json_schema(
+                    schema=key_string, any_whitespace=self.any_whitespace
+                )
 
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")
@@ -237,18 +274,28 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
+            # TODO(dark): it's REALLY stupid to construct object from string and decode it again
             structural_tag = json.loads(key_string)
-            tags = [
-                StructuralTagItem(
-                    begin=structure["begin"],
-                    schema=json.dumps(structure["schema"]),
-                    end=structure["end"],
+            if is_legacy_structural_tag(structural_tag):
+                self._sanitize_structural_tag_structures(structural_tag)
+                tags = [
+                    StructuralTagItem(
+                        begin=structure["begin"],
+                        schema=json.dumps(structure["schema"]),
+                        end=structure["end"],
+                    )
+                    for structure in structural_tag["structures"]
+                ]
+                ctx = self.grammar_compiler.compile_structural_tag(
+                    tags, structural_tag["triggers"]
                 )
-                for structure in structural_tag["structures"]
-            ]
-            ctx = self.grammar_compiler.compile_structural_tag(
-                tags, structural_tag["triggers"]
-            )
+            else:
+                format_dict = structural_tag.get("format")
+                if isinstance(format_dict, dict):
+                    self._sanitize_structural_format(format_dict)
+                    structural_tag["format"] = format_dict
+                    key_string = json.dumps(structural_tag)
+                ctx = self.grammar_compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return INVALID_GRAMMAR_OBJ
@@ -258,3 +305,39 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     def reset(self):
         self.grammar_compiler.clear_cache()
+
+
+def demo_test():
+    from transformers import AutoConfig, AutoTokenizer
+
+    from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
+
+    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_NAME_FOR_TEST)
+    hf_config = AutoConfig.from_pretrained(DEFAULT_MODEL_NAME_FOR_TEST)
+
+    # Should use vocab size from model config
+    vocab_size = hf_config.vocab_size
+    eos_token_id = tokenizer.eos_token_id
+
+    backend = XGrammarGrammarBackend(
+        tokenizer, vocab_size=vocab_size, model_eos_token_ids=[eos_token_id]
+    )
+    regex = r"hello (world|there)"
+    grammar = backend.dispatch_regex(regex)
+    tokens = [
+        tokenizer.encode(t, add_special_tokens=False)[0] for t in ["hello", " world"]
+    ]
+
+    # Test termination
+    grammar.accept_token(tokens[0])  # accept "hello"
+    grammar.accept_token(tokens[1])  # accept " world"
+    grammar.accept_token(eos_token_id)  # accept EOS
+    assert grammar.is_terminated()
+
+    # Test rollback the terminated state
+    grammar.rollback(1)
+    assert not grammar.is_terminated()
+
+
+if __name__ == "__main__":
+    demo_test()

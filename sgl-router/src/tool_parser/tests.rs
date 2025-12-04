@@ -1,9 +1,9 @@
 use super::*;
-use crate::tool_parser::parsers::JsonParser;
-use crate::tool_parser::partial_json::{
-    compute_diff, find_common_prefix, is_complete_json, PartialJson,
+use crate::tool_parser::{
+    parsers::JsonParser,
+    partial_json::{compute_diff, find_common_prefix, is_complete_json, PartialJson},
+    traits::ToolParser,
 };
-use crate::tool_parser::traits::ToolParser;
 
 #[tokio::test]
 async fn test_tool_parser_factory() {

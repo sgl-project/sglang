@@ -170,7 +170,7 @@ class StorageBackendFactory:
             return backend
         elif backend_name == "hf3fs":
             # Calculate bytes_per_page based on memory pool layout
-            if mem_pool_host.layout == "page_first":
+            if mem_pool_host.layout in ["page_first", "page_first_direct"]:
                 bytes_per_page = (
                     mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
                 )

@@ -1,19 +1,29 @@
-use std::convert::TryFrom;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::{
+    convert::TryFrom,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+    time::Duration,
+};
+
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
 
-use crate::protocols::spec::{
-    ChatCompletionRequest, GenerateRequest, ResponseFormat,
-    SamplingParams as GenerateSamplingParams, StringOrArray,
+use crate::protocols::{
+    chat::ChatCompletionRequest,
+    common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
+    generate::GenerateRequest,
+    responses::ResponsesRequest,
+    sampling_params::SamplingParams as GenerateSamplingParams,
 };
 
 // Include the generated protobuf code
+#[allow(clippy::all)]
 pub mod proto {
+    #![allow(clippy::all, unused_qualifications)]
     tonic::include_proto!("sglang.grpc.scheduler");
 }
 
@@ -125,7 +135,6 @@ impl SglangSchedulerClient {
         };
 
         let channel = Channel::from_shared(http_endpoint)?
-            .timeout(Duration::from_secs(600)) // 10 minute timeout for connection
             .http2_keep_alive_interval(Duration::from_secs(30))
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true)
@@ -169,8 +178,8 @@ impl SglangSchedulerClient {
         &self,
     ) -> Result<proto::HealthCheckResponse, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Sending health check request");
-        // Server ignores the request body and creates its own health check internally
-        let request = Request::new(proto::HealthCheckRequest { tokenized: None });
+        // HealthCheckRequest is now empty - server generates its own health check internally
+        let request = Request::new(proto::HealthCheckRequest {});
 
         let mut client = self.client.clone();
         let response = client.health_check(request).await?;
@@ -231,7 +240,7 @@ impl SglangSchedulerClient {
     }
 
     /// Build a single SGLang GenerateRequest from OpenAI ChatCompletionRequest
-    pub fn build_generate_request(
+    pub fn build_generate_request_from_chat(
         &self,
         request_id: String,
         body: &ChatCompletionRequest,
@@ -241,7 +250,8 @@ impl SglangSchedulerClient {
         tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
     ) -> Result<proto::GenerateRequest, String> {
         // Build sampling params
-        let sampling_params = self.build_grpc_sampling_params(body, tool_call_constraint)?;
+        let sampling_params =
+            self.build_grpc_sampling_params_from_chat(body, tool_call_constraint)?;
 
         let grpc_request = proto::GenerateRequest {
             request_id,
@@ -280,41 +290,74 @@ impl SglangSchedulerClient {
                 input_ids: token_ids,
             }),
             sampling_params: Some(sampling_params),
-            return_logprob: body.return_logprob,
-            logprob_start_len: -1,
-            top_logprobs_num: 0,
-            token_ids_logprob: vec![],
+            return_logprob: body.return_logprob.unwrap_or(false),
+            logprob_start_len: body.logprob_start_len.unwrap_or(-1),
+            top_logprobs_num: body.top_logprobs_num.unwrap_or(0),
+            token_ids_logprob: body.token_ids_logprob.clone().unwrap_or_default(),
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
-            log_metrics: true,
+            log_metrics: body.log_metrics,
             ..Default::default()
         };
 
         Ok(grpc_request)
     }
 
-    /// Build gRPC SamplingParams from OpenAI request
-    fn build_grpc_sampling_params(
+    /// Build a GenerateRequest from ResponsesRequest (OpenAI Responses API)
+    ///
+    /// NOTE: This is used by the Harmony router only. The Regular router uses
+    /// responses_to_chat() conversion and goes through the chat pipeline.
+    pub fn build_generate_request_from_responses(
+        &self,
+        request_id: String,
+        body: &ResponsesRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        harmony_stop_ids: Option<Vec<u32>>,
+        constraint: Option<(String, String)>,
+    ) -> Result<proto::GenerateRequest, String> {
+        // Build sampling params from ResponsesRequest
+        let mut sampling_params =
+            self.build_grpc_sampling_params_from_responses(body, constraint)?;
+
+        // Inject Harmony stop token IDs if provided
+        if let Some(stop_ids) = harmony_stop_ids {
+            sampling_params.stop_token_ids = stop_ids;
+        }
+
+        let grpc_request = proto::GenerateRequest {
+            request_id,
+            tokenized: Some(proto::TokenizedInput {
+                original_text: processed_text,
+                input_ids: token_ids,
+            }),
+            mm_inputs: None, // Responses API doesn't support multimodal yet
+            sampling_params: Some(sampling_params),
+            return_logprob: false, // Responses API uses top_logprobs field instead
+            logprob_start_len: -1,
+            top_logprobs_num: body.top_logprobs.unwrap_or(0) as i32,
+            return_hidden_states: false,
+            stream: body.stream.unwrap_or(false),
+            ..Default::default()
+        };
+
+        Ok(grpc_request)
+    }
+
+    /// Build gRPC SamplingParams from ChatCompletionRequest
+    fn build_grpc_sampling_params_from_chat(
         &self,
         request: &ChatCompletionRequest,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = self.extract_stop_strings(request);
 
-        // Handle max tokens: prefer max_completion_tokens (new) over max_tokens (deprecated)
-        // If neither is specified, use None to let the backend decide the default
-        #[allow(deprecated)]
-        let max_new_tokens = request
-            .max_completion_tokens
-            .or(request.max_tokens)
-            .map(|v| v as i32);
+        let max_new_tokens = request.max_completion_tokens.map(|v| v as i32);
 
         // Handle skip_special_tokens: set to false if tools are present and tool_choice is not "none"
         let skip_special_tokens = if request.tools.is_some() {
             match &request.tool_choice {
-                Some(crate::protocols::spec::ToolChoice::Value(
-                    crate::protocols::spec::ToolChoiceValue::None,
-                )) => request.skip_special_tokens,
+                Some(ToolChoice::Value(ToolChoiceValue::None)) => request.skip_special_tokens,
                 Some(_) => false, // tool_choice is not "none"
                 None => false, // TODO: this assumes tool_choice defaults to "auto" when tools present
             }
@@ -322,7 +365,6 @@ impl SglangSchedulerClient {
             request.skip_special_tokens
         };
 
-        #[allow(deprecated)]
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
             top_p: request.top_p.unwrap_or(1.0),
@@ -339,7 +381,7 @@ impl SglangSchedulerClient {
             ignore_eos: request.ignore_eos,
             no_stop_trim: request.no_stop_trim,
             n: request.n.unwrap_or(1) as i32,
-            constraint: self.build_constraint(request, tool_call_constraint)?,
+            constraint: self.build_constraint_for_chat(request, tool_call_constraint)?,
             ..Default::default()
         })
     }
@@ -354,17 +396,30 @@ impl SglangSchedulerClient {
     }
 
     /// Build constraint for structured generation
-    fn build_constraint(
+    fn build_constraint_for_chat(
         &self,
         request: &ChatCompletionRequest,
         tool_call_constraint: Option<(String, String)>,
     ) -> Result<Option<proto::sampling_params::Constraint>, String> {
         let mut constraints = Vec::new();
 
-        if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
-            let schema_str = serde_json::to_string(&json_schema.schema)
-                .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+        // Handle response_format constraints
+        match &request.response_format {
+            Some(ResponseFormat::JsonObject) => {
+                // json_object mode - constrain to valid JSON object
+                let schema = serde_json::json!({"type": "object"});
+                let schema_str = serde_json::to_string(&schema)
+                    .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+            }
+            Some(ResponseFormat::JsonSchema { json_schema }) => {
+                let schema_str = serde_json::to_string(&json_schema.schema)
+                    .map_err(|e| format!("Failed to serialize JSON schema: {}", e))?;
+                constraints.push(proto::sampling_params::Constraint::JsonSchema(schema_str));
+            }
+            Some(ResponseFormat::Text) | None => {
+                // No constraint for text format
+            }
         }
 
         if let Some(ebnf) = &request.ebnf {
@@ -377,7 +432,7 @@ impl SglangSchedulerClient {
             constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
         }
 
-        // Handle tool call constraint
+        // Handle tool call constraint from preparation stage
         if let Some((constraint_type, constraint_value)) = tool_call_constraint {
             if !constraints.is_empty() {
                 return Err("Constrained decoding is not compatible with tool calls.".to_string());
@@ -398,6 +453,65 @@ impl SglangSchedulerClient {
             0 => Ok(None),
             1 => Ok(constraints.pop()),
             _ => Err("Multiple constraints are not allowed.".to_string()),
+        }
+    }
+
+    /// Build gRPC SamplingParams from ResponsesRequest
+    fn build_grpc_sampling_params_from_responses(
+        &self,
+        request: &ResponsesRequest,
+        constraint: Option<(String, String)>,
+    ) -> Result<proto::SamplingParams, String> {
+        // Used by Harmony models only. Regular models use Chat API path.
+        // Constraints come from Harmony preparation stage (structural_tag) or tool handling.
+
+        let max_new_tokens = request.max_output_tokens.map(|v| v as i32);
+
+        Ok(proto::SamplingParams {
+            temperature: request.temperature.unwrap_or(1.0),
+            top_p: request.top_p.unwrap_or(1.0),
+            top_k: -1,               // ResponsesRequest doesn't expose top_k
+            min_p: 0.0,              // ResponsesRequest doesn't expose min_p
+            frequency_penalty: 0.0,  // ResponsesRequest doesn't expose frequency_penalty
+            presence_penalty: 0.0,   // ResponsesRequest doesn't expose presence_penalty
+            repetition_penalty: 1.0, // ResponsesRequest doesn't expose repetition_penalty
+            max_new_tokens,
+            stop: vec![],               // No stop sequences in Responses API
+            stop_token_ids: vec![],     // Handled by Harmony stop tokens
+            skip_special_tokens: false, // Keep special tokens for Harmony
+            spaces_between_special_tokens: true,
+            ignore_eos: false,
+            no_stop_trim: false,
+            n: 1, // Responses API doesn't support n>1
+            constraint: self.build_constraint_for_responses(constraint)?,
+            ..Default::default()
+        })
+    }
+
+    /// Build constraint for Responses API
+    ///
+    /// Handles constraints from Harmony preparation stage (structural_tag for Harmony models,
+    /// structured output via text field, or tool call constraints).
+    ///
+    /// Note: Regular gRPC models use Chat API path with response_format, not this function.
+    fn build_constraint_for_responses(
+        &self,
+        constraint: Option<(String, String)>,
+    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
+        if let Some((constraint_type, constraint_value)) = constraint {
+            let parsed_constraint = match constraint_type.as_str() {
+                "structural_tag" => {
+                    // Harmony models: structural tag from preparation stage
+                    proto::sampling_params::Constraint::StructuralTag(constraint_value)
+                }
+                "json_schema" => proto::sampling_params::Constraint::JsonSchema(constraint_value),
+                "ebnf" => proto::sampling_params::Constraint::EbnfGrammar(constraint_value),
+                "regex" => proto::sampling_params::Constraint::Regex(constraint_value),
+                _ => return Err(format!("Unknown constraint type: {}", constraint_type)),
+            };
+            Ok(Some(parsed_constraint))
+        } else {
+            Ok(None)
         }
     }
 
@@ -485,10 +599,10 @@ impl SglangSchedulerClient {
                 })?);
         }
 
-        // Handle min_tokens with conversion
-        if let Some(min_tokens) = p.min_tokens {
-            sampling.min_new_tokens = i32::try_from(min_tokens)
-                .map_err(|_| "min_tokens must fit into a 32-bit signed integer".to_string())?;
+        // Handle min_new_tokens with conversion
+        if let Some(min_new_tokens) = p.min_new_tokens {
+            sampling.min_new_tokens = i32::try_from(min_new_tokens)
+                .map_err(|_| "min_new_tokens must fit into a 32-bit signed integer".to_string())?;
         }
 
         // Handle n with conversion
@@ -510,13 +624,8 @@ mod tests {
 
     #[test]
     fn test_proto_types_compilation() {
-        let health_req = proto::HealthCheckRequest {
-            tokenized: Some(proto::TokenizedInput {
-                original_text: "test".to_string(),
-                input_ids: vec![1296],
-            }),
-        };
-        assert!(health_req.tokenized.is_some());
+        let _health_req = proto::HealthCheckRequest {};
+        // HealthCheckRequest is now empty - no fields to test
     }
 
     #[test]
@@ -558,13 +667,8 @@ mod tests {
 
     #[test]
     fn test_health_check_request() {
-        let health_req = proto::HealthCheckRequest {
-            tokenized: Some(proto::TokenizedInput {
-                original_text: "test".to_string(),
-                input_ids: vec![1296], // Mock token ID for "test"
-            }),
-        };
-        assert!(health_req.tokenized.is_some());
+        let _health_req = proto::HealthCheckRequest {};
+        // HealthCheckRequest is now empty - server generates its own test internally
     }
 
     #[test]

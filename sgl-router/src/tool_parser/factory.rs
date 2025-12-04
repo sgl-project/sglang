@@ -1,14 +1,19 @@
 // Factory and pool for creating model-specific tool parsers with pooling support.
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
 use tokio::sync::Mutex;
 
-use crate::tool_parser::parsers::{
-    DeepSeekParser, Glm4MoeParser, GptOssHarmonyParser, GptOssParser, JsonParser, KimiK2Parser,
-    LlamaParser, MistralParser, PassthroughParser, PythonicParser, QwenParser, Step3Parser,
+use crate::tool_parser::{
+    parsers::{
+        DeepSeekParser, Glm4MoeParser, JsonParser, KimiK2Parser, LlamaParser, MinimaxM2Parser,
+        MistralParser, PassthroughParser, PythonicParser, QwenParser, Step3Parser,
+    },
+    traits::ToolParser,
 };
-use crate::tool_parser::traits::ToolParser;
 
 /// Type alias for pooled parser instances.
 pub type PooledParser = Arc<Mutex<Box<dyn ToolParser>>>;
@@ -237,17 +242,7 @@ impl ParserFactory {
         registry.register_parser("glm4_moe", || Box::new(Glm4MoeParser::new()));
         registry.register_parser("step3", || Box::new(Step3Parser::new()));
         registry.register_parser("kimik2", || Box::new(KimiK2Parser::new()));
-
-        // Register GPT-OSS parsers
-        registry.register_parser("gpt_oss_legacy", || Box::new(GptOssParser::new()));
-        registry.register_parser("gpt_oss_harmony", || Box::new(GptOssHarmonyParser::new()));
-
-        // Choose which GPT-OSS variant to use as default
-        if use_harmony_gpt_oss() {
-            registry.register_parser("gpt_oss", || Box::new(GptOssHarmonyParser::new()));
-        } else {
-            registry.register_parser("gpt_oss", || Box::new(GptOssParser::new()));
-        }
+        registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
 
         // Register default model mappings
         Self::register_default_mappings(&registry);
@@ -299,9 +294,9 @@ impl ParserFactory {
         registry.map_model("Kimi-K2*", "kimik2");
         registry.map_model("moonshot*/Kimi-K2*", "kimik2");
 
-        // GPT-OSS models
-        registry.map_model("gpt-oss*", "gpt_oss");
-        registry.map_model("t4-*", "gpt_oss");
+        // MiniMax models
+        registry.map_model("minimax*", "minimax_m2");
+        registry.map_model("MiniMax*", "minimax_m2");
 
         // Other models
         registry.map_model("gemini-*", "json");
@@ -386,17 +381,4 @@ impl Default for ParserFactory {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn use_harmony_gpt_oss() -> bool {
-    std::env::var("ROUTER_USE_HARMONY_GPT_OSS")
-        .ok()
-        .map(|value| {
-            let normalized = value.trim();
-            matches!(
-                normalized,
-                "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "Yes" | "on" | "ON" | "On"
-            )
-        })
-        .unwrap_or(false)
 }

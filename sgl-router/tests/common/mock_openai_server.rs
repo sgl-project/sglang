@@ -2,19 +2,21 @@
 
 #![allow(dead_code)]
 
+use std::{net::SocketAddr, sync::Arc};
+
 use axum::{
     body::Body,
     extract::{Request, State},
     http::{HeaderValue, StatusCode},
-    response::sse::{Event, KeepAlive},
-    response::{IntoResponse, Response, Sse},
+    response::{
+        sse::{Event, KeepAlive},
+        IntoResponse, Response, Sse,
+    },
     routing::post,
     Json, Router,
 };
 use futures_util::stream::{self, StreamExt};
 use serde_json::json;
-use std::net::SocketAddr;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 
 /// Mock OpenAI API server for testing

@@ -7,11 +7,8 @@
 //! - MCP tool execution loops within streaming responses
 //! - Event transformation and output index remapping
 
-use crate::data_connector::{
-    SharedConversationItemStorage, SharedConversationStorage, SharedResponseStorage,
-};
-use crate::protocols::spec::{ResponseToolType, ResponsesRequest};
-use crate::routers::header_utils::{apply_request_headers, preserve_response_headers};
+use std::{borrow::Cow, io, sync::Arc};
+
 use axum::{
     body::Body,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
@@ -20,20 +17,26 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::{borrow::Cow, io, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 // Import from sibling modules
 use super::conversations::persist_conversation_items;
-use super::mcp::{
-    build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-    mcp_manager_from_request_tools, prepare_mcp_payload_for_streaming, send_mcp_list_tools_events,
-    McpLoopConfig, ToolLoopState,
+use super::{
+    mcp::{
+        build_resume_payload, ensure_request_mcp_client, execute_streaming_tool_calls,
+        inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
+        send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
+    },
+    responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
+    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
 };
-use super::responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block};
-use super::utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction};
+use crate::{
+    data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage},
+    protocols::responses::{ResponseToolType, ResponsesRequest},
+    routers::header_utils::{apply_request_headers, preserve_response_headers},
+};
 
 // ============================================================================
 // Streaming Response Accumulator
@@ -572,7 +575,7 @@ pub(super) fn apply_event_transformations_inplace(
             .get_mut("response")
             .and_then(|v| v.as_object_mut())
         {
-            let desired_store = Value::Bool(original_request.store);
+            let desired_store = Value::Bool(original_request.store.unwrap_or(false));
             if response_obj.get("store") != Some(&desired_store) {
                 response_obj.insert("store".to_string(), desired_store);
                 changed = true;
@@ -597,8 +600,13 @@ pub(super) fn apply_event_transformations_inplace(
             if response_obj.get("tools").is_some() {
                 let requested_mcp = original_request
                     .tools
-                    .iter()
-                    .any(|t| matches!(t.r#type, ResponseToolType::Mcp));
+                    .as_ref()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .any(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    })
+                    .unwrap_or(false);
 
                 if requested_mcp {
                     if let Some(mcp_tools) = build_mcp_tools_value(original_request) {
@@ -658,8 +666,8 @@ pub(super) fn apply_event_transformations_inplace(
 
 /// Helper to build MCP tools value
 fn build_mcp_tools_value(original_body: &ResponsesRequest) -> Option<Value> {
-    let mcp_tool = original_body
-        .tools
+    let tools = original_body.tools.as_ref()?;
+    let mcp_tool = tools
         .iter()
         .find(|t| matches!(t.r#type, ResponseToolType::Mcp) && t.server_url.is_some())?;
 
@@ -897,7 +905,7 @@ pub(super) fn send_final_response_event(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
     state: &ToolLoopState,
-    active_mcp: Option<&Arc<crate::mcp::McpClientManager>>,
+    active_mcp: Option<&Arc<crate::mcp::McpManager>>,
     original_request: &ResponsesRequest,
     previous_response_id: Option<&str>,
     server_label: &str,
@@ -951,9 +959,9 @@ pub(super) fn send_final_response_event(
 pub(super) async fn handle_simple_streaming_passthrough(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     payload: Value,
@@ -986,10 +994,10 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     if !status.is_success() {
         circuit_breaker.record_failure();
-        let error_body = match response.text().await {
-            Ok(body) => body,
-            Err(err) => format!("Failed to read upstream error body: {}", err),
-        };
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("Failed to read upstream error body: {}", err));
         return (status_code, error_body).into_response();
     }
 
@@ -1000,7 +1008,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
 
-    let should_store = original_body.store;
+    let should_store = original_body.store.unwrap_or(false);
     let original_request = original_body.clone();
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = original_previous_response_id.clone();
@@ -1120,21 +1128,21 @@ pub(super) async fn handle_simple_streaming_passthrough(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     mut payload: Value,
     original_body: &ResponsesRequest,
     original_previous_response_id: Option<String>,
-    active_mcp: &Arc<crate::mcp::McpClientManager>,
+    active_mcp: &Arc<crate::mcp::McpManager>,
 ) -> Response {
     // Transform MCP tools to function tools in payload
     prepare_mcp_payload_for_streaming(&mut payload, active_mcp);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
-    let should_store = original_body.store;
+    let should_store = original_body.store.unwrap_or(false);
     let original_request = original_body.clone();
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = original_previous_response_id.clone();
@@ -1161,9 +1169,13 @@ pub(super) async fn handle_streaming_with_tool_interception(
 
         let server_label = original_request
             .tools
-            .iter()
-            .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
-            .and_then(|t| t.server_label.as_deref())
+            .as_ref()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|t| matches!(t.r#type, ResponseToolType::Mcp))
+                    .and_then(|t| t.server_label.as_deref())
+            })
             .unwrap_or("mcp");
 
         loop {
@@ -1477,10 +1489,10 @@ pub(super) async fn handle_streaming_with_tool_interception(
 pub(super) async fn handle_streaming_response(
     client: &reqwest::Client,
     circuit_breaker: &crate::core::CircuitBreaker,
-    mcp_manager: Option<&Arc<crate::mcp::McpClientManager>>,
-    response_storage: SharedResponseStorage,
-    conversation_storage: SharedConversationStorage,
-    conversation_item_storage: SharedConversationItemStorage,
+    mcp_manager: Option<&Arc<crate::mcp::McpManager>>,
+    response_storage: Arc<dyn ResponseStorage>,
+    conversation_storage: Arc<dyn ConversationStorage>,
+    conversation_item_storage: Arc<dyn ConversationItemStorage>,
     url: String,
     headers: Option<&HeaderMap>,
     payload: Value,
@@ -1488,8 +1500,19 @@ pub(super) async fn handle_streaming_response(
     original_previous_response_id: Option<String>,
 ) -> Response {
     // Check if MCP is active for this request
-    let req_mcp_manager = mcp_manager_from_request_tools(&original_body.tools).await;
-    let active_mcp = req_mcp_manager.as_ref().or(mcp_manager);
+    // Ensure dynamic client is created if needed
+    if let (Some(manager), Some(ref tools)) = (mcp_manager, &original_body.tools) {
+        ensure_request_mcp_client(manager, tools.as_slice()).await;
+    }
+
+    // Use the tool loop if the manager has any tools available (static or dynamic).
+    let active_mcp = mcp_manager.and_then(|mgr| {
+        if mgr.list_tools().is_empty() {
+            None
+        } else {
+            Some(mgr)
+        }
+    });
 
     // If no MCP is active, use simple pass-through streaming
     if active_mcp.is_none() {

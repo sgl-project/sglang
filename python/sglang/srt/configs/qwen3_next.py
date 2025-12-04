@@ -21,18 +21,13 @@ from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.distributed.utils import divide
-from sglang.srt.layers.dp_attention import get_attention_tp_size
 
 logger = logging.get_logger(__name__)
 
 
-# NOTE: HybridLayerType
 class HybridLayerType(enum.Enum):
     full_attention = "attention"
-    swa_attention = "swa_attention"
     linear_attention = "linear_attention"
-    mamba2 = "mamba"
 
 
 class Qwen3NextConfig(PretrainedConfig):
@@ -281,6 +276,8 @@ class Qwen3NextConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
+        from sglang.srt.layers.dp_attention import get_attention_tp_size
+
         shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
             intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,

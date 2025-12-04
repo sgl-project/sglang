@@ -16,13 +16,10 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
-import logging
-import math
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from transformers import PixtralVisionConfig, PretrainedConfig
 from transformers.models.pixtral.modeling_pixtral import PixtralRotaryEmbedding
 from transformers.models.pixtral.modeling_pixtral import (
@@ -109,7 +106,6 @@ class PixtralHFTransformerBlock(nn.Module):
             quant_config=quant_config,
             dropout=0.0,
             use_context_forward=False,
-            softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=f"{prefix}.attention",
         )

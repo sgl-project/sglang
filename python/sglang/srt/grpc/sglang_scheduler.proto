@@ -326,10 +326,7 @@ message EmbedError {
 // Management Operations
 // =====================
 
-message HealthCheckRequest {
-  // Input for health test generation (must be tokenized)
-  TokenizedInput tokenized = 1;
-}
+message HealthCheckRequest {}
 
 message HealthCheckResponse {
   bool healthy = 1;

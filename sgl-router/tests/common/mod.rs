@@ -7,25 +7,277 @@ pub mod mock_worker;
 pub mod streaming_helpers;
 pub mod test_app;
 
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
+};
+
 use serde_json::json;
-use sglang_router_rs::config::RouterConfig;
-use sglang_router_rs::protocols::spec::{Function, Tool};
-use sglang_router_rs::server::AppContext;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use sgl_model_gateway::{
+    app_context::AppContext,
+    config::{RouterConfig, RoutingMode},
+    core::{
+        BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
+    },
+    data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    },
+    middleware::TokenBucket,
+    policies::PolicyRegistry,
+    protocols::common::{Function, Tool},
+};
 
 /// Helper function to create AppContext for tests
-pub fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
-    Arc::new(
-        AppContext::new(
-            config.clone(),
-            reqwest::Client::new(),
-            config.max_concurrent_requests,
-            config.rate_limit_tokens_per_second,
-        )
-        .expect("Failed to create AppContext in test"),
-    )
+pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
+    let client = reqwest::Client::new();
+
+    // Initialize rate limiter
+    let rate_limiter = match config.max_concurrent_requests {
+        n if n <= 0 => None,
+        n => {
+            let rate_limit_tokens = config
+                .rate_limit_tokens_per_second
+                .filter(|&t| t > 0)
+                .unwrap_or(n);
+            Some(Arc::new(TokenBucket::new(
+                n as usize,
+                rate_limit_tokens as usize,
+            )))
+        }
+    };
+
+    // Initialize registries
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+
+    // Initialize storage backends (Memory for tests)
+    let response_storage = Arc::new(MemoryResponseStorage::new());
+    let conversation_storage = Arc::new(MemoryConversationStorage::new());
+    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+    // Initialize load monitor
+    let load_monitor = Some(Arc::new(LoadMonitor::new(
+        worker_registry.clone(),
+        policy_registry.clone(),
+        client.clone(),
+        config.worker_startup_check_interval_secs,
+    )));
+
+    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+    let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engine = Arc::new(OnceLock::new());
+    let mcp_manager_lock = Arc::new(OnceLock::new());
+
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(config.clone())
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer(None) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .mcp_manager(mcp_manager_lock)
+            .build()
+            .unwrap(),
+    );
+
+    // Initialize JobQueue after AppContext is created
+    let weak_context = Arc::downgrade(&app_context);
+    let job_queue = sgl_model_gateway::core::JobQueue::new(
+        sgl_model_gateway::core::JobQueueConfig::default(),
+        weak_context,
+    );
+    app_context
+        .worker_job_queue
+        .set(job_queue)
+        .expect("JobQueue should only be initialized once");
+
+    // Initialize WorkflowEngine and register workflows
+    use sgl_model_gateway::core::workflow::{
+        create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
+    };
+    let engine = Arc::new(WorkflowEngine::new());
+    engine.register_workflow(create_worker_registration_workflow(&config));
+    engine.register_workflow(create_worker_removal_workflow());
+    app_context
+        .workflow_engine
+        .set(engine)
+        .expect("WorkflowEngine should only be initialized once");
+
+    // Register external workers for OpenAI mode
+    if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
+        for url in worker_urls {
+            // Create a worker that supports common test models
+            let models = vec![
+                ModelCard::new("mock-model"),
+                ModelCard::new("gpt-4"),
+                ModelCard::new("gpt-3.5-turbo"),
+            ];
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(RuntimeType::External)
+                    .models(models)
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+    }
+
+    // Initialize MCP manager with empty config
+    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+    let empty_config = McpConfig {
+        servers: vec![],
+        pool: Default::default(),
+        proxy: None,
+        warmup: vec![],
+        inventory: Default::default(),
+    };
+    let mcp_manager = McpManager::with_defaults(empty_config)
+        .await
+        .expect("Failed to create MCP manager");
+    app_context
+        .mcp_manager
+        .set(Arc::new(mcp_manager))
+        .ok()
+        .expect("McpManager should only be initialized once");
+
+    app_context
+}
+
+/// Helper function to create AppContext for tests with MCP config from file
+pub async fn create_test_context_with_mcp_config(
+    config: RouterConfig,
+    mcp_config_path: &str,
+) -> Arc<AppContext> {
+    use sgl_model_gateway::mcp::{McpConfig, McpManager};
+
+    let client = reqwest::Client::new();
+
+    // Initialize rate limiter
+    let rate_limiter = match config.max_concurrent_requests {
+        n if n <= 0 => None,
+        n => {
+            let rate_limit_tokens = config
+                .rate_limit_tokens_per_second
+                .filter(|&t| t > 0)
+                .unwrap_or(n);
+            Some(Arc::new(TokenBucket::new(
+                n as usize,
+                rate_limit_tokens as usize,
+            )))
+        }
+    };
+
+    // Initialize registries
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+
+    // Initialize storage backends (Memory for tests)
+    let response_storage = Arc::new(MemoryResponseStorage::new());
+    let conversation_storage = Arc::new(MemoryConversationStorage::new());
+    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+
+    // Initialize load monitor
+    let load_monitor = Some(Arc::new(LoadMonitor::new(
+        worker_registry.clone(),
+        policy_registry.clone(),
+        client.clone(),
+        config.worker_startup_check_interval_secs,
+    )));
+
+    // Create empty OnceLock for worker job queue, workflow engine, and mcp manager
+    let worker_job_queue = Arc::new(OnceLock::new());
+    let workflow_engine = Arc::new(OnceLock::new());
+    let mcp_manager_lock = Arc::new(OnceLock::new());
+
+    let app_context = Arc::new(
+        AppContext::builder()
+            .router_config(config.clone())
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer(None) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .load_monitor(load_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engine(workflow_engine)
+            .mcp_manager(mcp_manager_lock)
+            .build()
+            .unwrap(),
+    );
+
+    // Initialize JobQueue after AppContext is created
+    let weak_context = Arc::downgrade(&app_context);
+    let job_queue = sgl_model_gateway::core::JobQueue::new(
+        sgl_model_gateway::core::JobQueueConfig::default(),
+        weak_context,
+    );
+    app_context
+        .worker_job_queue
+        .set(job_queue)
+        .expect("JobQueue should only be initialized once");
+
+    // Initialize WorkflowEngine and register workflows
+    use sgl_model_gateway::core::workflow::{
+        create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
+    };
+    let engine = Arc::new(WorkflowEngine::new());
+    engine.register_workflow(create_worker_registration_workflow(&config));
+    engine.register_workflow(create_worker_removal_workflow());
+    app_context
+        .workflow_engine
+        .set(engine)
+        .expect("WorkflowEngine should only be initialized once");
+
+    // Register external workers for OpenAI mode
+    if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
+        for url in worker_urls {
+            // Create a worker that supports common test models
+            let models = vec![
+                ModelCard::new("mock-model"),
+                ModelCard::new("gpt-4"),
+                ModelCard::new("gpt-3.5-turbo"),
+            ];
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(RuntimeType::External)
+                    .models(models)
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+    }
+
+    // Initialize MCP manager from config file
+    let mcp_config = McpConfig::from_file(mcp_config_path)
+        .await
+        .expect("Failed to load MCP config from file");
+    let mcp_manager = McpManager::with_defaults(mcp_config)
+        .await
+        .expect("Failed to create MCP manager");
+    app_context
+        .mcp_manager
+        .set(Arc::new(mcp_manager))
+        .ok()
+        .expect("McpManager should only be initialized once");
+
+    app_context
 }
 
 // Tokenizer download configuration
@@ -119,6 +371,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "query": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -135,6 +388,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "units": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -149,6 +403,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "y": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -164,6 +419,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "target_lang": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -178,6 +434,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "format": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -192,6 +449,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "format": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -206,6 +464,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "notifications": {"type": "boolean"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -214,6 +473,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 name: "ping".to_string(),
                 description: Some("Ping service".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
             },
         },
         Tool {
@@ -222,6 +482,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 name: "test".to_string(),
                 description: Some("Test function".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
             },
         },
         Tool {
@@ -239,6 +500,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "text": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -254,6 +516,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "search_type": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -267,6 +530,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "city": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -282,6 +546,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "optional": {"type": "null"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -297,6 +562,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "none_val": {"type": "null"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -311,6 +577,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "email": {"type": "string"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -325,6 +592,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "y": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -338,6 +606,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "x": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -346,6 +615,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 name: "func1".to_string(),
                 description: Some("Function 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
             },
         },
         Tool {
@@ -359,6 +629,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "y": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
         Tool {
@@ -367,6 +638,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 name: "tool1".to_string(),
                 description: Some("Tool 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
+                strict: None,
             },
         },
         Tool {
@@ -380,6 +652,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                         "y": {"type": "number"}
                     }
                 }),
+                strict: None,
             },
         },
     ]

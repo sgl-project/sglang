@@ -7,16 +7,19 @@ from typing import Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.server_args import get_global_server_args
+
 logger = logging.getLogger(__name__)
 
 from dataclasses import dataclass
 
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -182,6 +185,10 @@ class NgramVerifyInput(SpecInput):
                             )
                             raise e
             req.spec_verify_ct += 1
+            req.spec_accepted_tokens += (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
+
         if has_finished:
             self.accept_length = (self.accept_index != -1).sum(dim=1) - 1
         self.accept_index = self.accept_index[self.accept_index != -1]
@@ -193,7 +200,9 @@ class NgramVerifyInput(SpecInput):
             logits_output.hidden_states = logits_output.hidden_states[self.accept_index]
         self.verified_id = self.predict[self.accept_index]
 
-    def _free_cache(self, batch: ScheduleBatch, page_size: int):
+    def _free_cache(
+        self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
+    ):
         bs = batch.batch_size()
         # Free the KV cache for unaccepted tokens
         if page_size == 1:
@@ -247,6 +256,11 @@ class NgramVerifyInput(SpecInput):
                 tgt_cache_loc, src_cache_loc
             )
             batch.out_cache_loc = tgt_cache_loc
+
+        accept_length_list = accept_length_cpu.tolist()
+        for i, req in enumerate(batch.reqs):
+            req.kv_committed_len += accept_length_list[i] + 1
+            req.kv_allocated_len = req.kv_committed_len
 
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
@@ -350,10 +364,8 @@ class NgramVerifyInput(SpecInput):
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
             draft_probs=draft_probs,
-            threshold_single=global_server_args_dict[
-                "speculative_accept_threshold_single"
-            ],
-            threshold_acc=global_server_args_dict["speculative_accept_threshold_acc"],
+            threshold_single=get_global_server_args().speculative_accept_threshold_single,
+            threshold_acc=get_global_server_args().speculative_accept_threshold_acc,
             deterministic=True,
         )
 
@@ -401,7 +413,9 @@ class NgramVerifyInput(SpecInput):
             )
 
         # Sample tokens. Force greedy sampling on AMD
-        is_all_greedy = sampling_info.is_all_greedy
+        is_all_greedy = (
+            sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
+        )
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
@@ -412,14 +426,14 @@ class NgramVerifyInput(SpecInput):
             self._greedy_verify(batch, logits_output)
         else:
             # NOTE: Compared with greedy_verify, the performance of _sampling_verify is relatively poor.
-            self._greedy_verify(batch, logits_output)
-            # self._sampling_verify(batch, logits_output, sampling_info)
+            self._sampling_verify(batch, logits_output, sampling_info)
 
         self._fill_requests(batch, logits_output)
-        self._free_cache(batch, page_size)
 
         accept_length_cpu = self.accept_length.cpu()
         num_accepted_tokens = accept_length_cpu.sum().item()
+
+        self._free_cache(batch, page_size, accept_length_cpu)
 
         batch.seq_lens.add_(self.accept_length + 1)
         batch.seq_lens_cpu.add_(accept_length_cpu + 1)

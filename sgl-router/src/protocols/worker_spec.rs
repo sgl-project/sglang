@@ -2,8 +2,9 @@
 //!
 //! Defines the request/response structures for worker management endpoints
 
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 /// Worker configuration for API requests
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -35,6 +36,11 @@ pub struct WorkerConfigRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bootstrap_port: Option<u16>,
 
+    /// Runtime type (optional: "sglang", "vllm", default: "sglang")
+    /// Only relevant for gRPC workers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+
     // gRPC-specific configuration (optional, ignored in HTTP mode)
     /// Tokenizer path for gRPC mode
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +61,51 @@ pub struct WorkerConfigRequest {
     /// Additional labels (optional)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
+
+    /// Health check timeout in seconds (default: 30)
+    #[serde(default = "default_health_check_timeout")]
+    pub health_check_timeout_secs: u64,
+
+    /// Health check interval in seconds (default: 60)
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval_secs: u64,
+
+    /// Number of successful health checks needed to mark worker as healthy (default: 2)
+    #[serde(default = "default_health_success_threshold")]
+    pub health_success_threshold: u32,
+
+    /// Number of failed health checks before marking worker as unhealthy (default: 3)
+    #[serde(default = "default_health_failure_threshold")]
+    pub health_failure_threshold: u32,
+
+    /// Maximum connection attempts during worker registration (default: 20)
+    #[serde(default = "default_max_connection_attempts")]
+    pub max_connection_attempts: u32,
+
+    /// Enable data parallelism aware scheduling (default: false)
+    #[serde(default)]
+    pub dp_aware: bool,
+}
+
+// Default value functions for serde
+fn default_health_check_timeout() -> u64 {
+    30
+}
+
+fn default_health_check_interval() -> u64 {
+    60
+}
+
+fn default_health_success_threshold() -> u32 {
+    2
+}
+
+fn default_health_failure_threshold() -> u32 {
+    3
+}
+
+fn default_max_connection_attempts() -> u32 {
+    20
 }
 
 /// Worker information for API responses
@@ -87,6 +138,10 @@ pub struct WorkerInfo {
     /// Connection mode (http or grpc)
     pub connection_mode: String,
 
+    /// Runtime type (sglang or vllm, for gRPC workers)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_type: Option<String>,
+
     // gRPC-specific fields (None for HTTP workers)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokenizer_path: Option<String>,
@@ -100,9 +155,27 @@ pub struct WorkerInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template: Option<String>,
 
+    /// Bootstrap port for prefill workers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_port: Option<u16>,
+
     /// Additional metadata
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, String>,
+
+    /// Job status for async operations (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_status: Option<JobStatus>,
+}
+
+/// Job status for async control plane operations
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStatus {
+    pub job_type: String,
+    pub worker_url: String,
+    pub status: String,
+    pub message: Option<String>,
+    pub timestamp: u64,
 }
 
 /// Worker list response

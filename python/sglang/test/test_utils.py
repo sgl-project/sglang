@@ -14,9 +14,9 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
-from functools import partial
+from functools import partial, wraps
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
@@ -26,6 +26,7 @@ import numpy as np
 import requests
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from sglang.bench_serving import run_benchmark
 from sglang.global_config import global_config
@@ -57,7 +58,8 @@ DEFAULT_MODEL_NAME_FOR_TEST_MLA = "lmsys/sglang-ci-dsv3-test"
 DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN = "lmsys/sglang-ci-dsv3-test-NextN"
 
 # NVFP4 models
-DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-R1-0528-FP4"
+DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
+DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4 = "nvidia/Qwen3-30B-A3B-FP4"
 
 # FP8 models
 DEFAULT_MODEL_NAME_FOR_TEST_FP8 = "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
@@ -71,14 +73,25 @@ DEFAULT_MODEL_NAME_FOR_MODELOPT_QUANT_ACCURACY_TEST_FP8 = (
 DEFAULT_MODEL_NAME_FOR_TEST_QWEN_FP8 = "Qwen/Qwen3-1.7B-FP8"
 DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE = "gaunernst/DeepSeek-V2-Lite-Chat-FP8"
 
+# MXFP4 models
+# Standard MXFP4 MoE test model
+DEFAULT_MODEL_NAME_FOR_TEST_MXFP4_WITH_MOE = "openai/gpt-oss-20b"
+
 # W8A8 models
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8 = "RedHatAI/Llama-3.2-3B-quantized.w8a8"
 DEFAULT_MODEL_NAME_FOR_TEST_W8A8_WITH_MOE = "nytopop/Qwen3-30B-A3B.w8a8"
+
+# INT4 models
+DEFAULT_MODEL_NAME_FOR_TEST_AWQ_INT4 = (
+    "hugging-quants/Meta-Llama-3.1-8B-Instruct-AWQ-INT4"
+)
 
 # EAGLE
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST = "meta-llama/Llama-2-7b-chat-hf"
 DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST = "lmsys/sglang-EAGLE-llama2-chat-7B"
 DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST_EAGLE3 = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_EAGLE_DP_ATTENTION_TARGET_MODEL_FOR_TEST = "Qwen/Qwen3-30B-A3B"
+DEFAULT_EAGLE_DP_ATTENTION_DRAFT_MODEL_FOR_TEST = "Tengyunw/qwen3_30b_moe_eagle3"
 DEFAULT_MODEL_NAME_FOR_TEST_EAGLE3 = "lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B"
 DEFAULT_STANDALONE_SPECULATIVE_TARGET_MODEL_FOR_TEST = (
     "meta-llama/Llama-3.1-8B-Instruct"
@@ -87,12 +100,16 @@ DEFAULT_STANDALONE_SPECULATIVE_DRAFT_MODEL_FOR_TEST = "meta-llama/Llama-3.2-1B-I
 DEFAULT_NGRAM_SPECULATIVE_TARGET_MODEL_FOR_TEST = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # Other use cases
+DEFAULT_AUTOROUND_MODEL_NAME_FOR_TEST = (
+    "OPEA/Qwen2.5-0.5B-Instruct-int4-sym-inc",  # auto_round:auto_gptq
+    "Intel/Qwen2-0.5B-Instruct-int4-sym-AutoRound",  # auto_round:auto_awq
+)
 DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION = (
     "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
 DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
 DEFAULT_REASONING_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-DEFAULT_DEEPPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
+DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST = "deepseek-ai/DeepSeek-V3-0324"
 DEFAULT_AWQ_MOE_MODEL_NAME_FOR_TEST = (
     "hugging-quants/Mixtral-8x7B-Instruct-v0.1-AWQ-INT4"
 )
@@ -108,10 +125,26 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_QUANT_TP1 = "hugging-quants/Meta-Llama-3.1-8
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN = "Qwen/Qwen2.5-1.5B-Instruct"
 DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = "Qwen/Qwen2.5-VL-3B-Instruct"
 
-DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true"
+DEFAULT_IMAGE_URL = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
 DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/dev/onevision_local/assets/jobs.mp4"
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
+
+
+def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Image:
+    for i in range(max_retries):
+        try:
+            response = requests.get(image_url, timeout=30)
+            response.raise_for_status()
+            image = Image.open(BytesIO(response.content))
+            image.load()
+            return image
+        except Exception as e:
+            if i == max_retries - 1:
+                raise RuntimeError(
+                    f"Failed to download image after {max_retries} retries: {image_url}"
+                ) from e
+            time.sleep(2**i)
 
 
 def is_in_ci():
@@ -121,7 +154,12 @@ def is_in_ci():
 
 def is_in_amd_ci():
     """Return whether it is in an AMD CI runner."""
-    return get_bool_env_var("SGLANG_AMD_CI")
+    return get_bool_env_var("SGLANG_IS_IN_CI_AMD")
+
+
+def is_blackwell_system():
+    """Return whether it is running on a Blackwell (B200) system."""
+    return get_bool_env_var("IS_BLACKWELL")
 
 
 def _use_cached_default_models(model_repo: str):
@@ -135,15 +173,18 @@ def _use_cached_default_models(model_repo: str):
 
 if is_in_ci():
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        5000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
     )
 else:
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        7000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
+        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
     )
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
+
+if is_blackwell_system():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 3000
 
 
@@ -396,8 +437,6 @@ def _get_call_generate(args: argparse.Namespace):
         return partial(call_generate_vllm, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "srt-raw":
         return partial(call_generate_srt_raw, url=f"{args.host}:{args.port}/generate")
-    elif args.backend == "gserver":
-        return partial(call_generate_gserver, url=f"{args.host}:{args.port}")
     elif args.backend == "outlines":
         return partial(call_generate_outlines, url=f"{args.host}:{args.port}/generate")
     elif args.backend == "guidance":
@@ -503,7 +542,7 @@ def popen_launch_server(
     base_url: str,
     timeout: float,
     api_key: Optional[str] = None,
-    other_args: list[str] = [],
+    other_args: Optional[list[str]] = None,
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
     device: str = "auto",
@@ -516,10 +555,11 @@ def popen_launch_server(
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
     """
+    other_args = other_args or []
+
     # Auto-detect device if needed
     if device == "auto":
         device = auto_config_device()
-        print(f"Auto-configed device: {device}", flush=True)
         other_args = list(other_args)
         other_args += ["--device", str(device)]
 
@@ -607,7 +647,6 @@ def popen_launch_server(
     start_time = time.perf_counter()
     with requests.Session() as session:
         while time.perf_counter() - start_time < timeout:
-
             return_code = process.poll()
             if return_code is not None:
                 # Server failed to start (non-zero exit code) or crashed
@@ -683,91 +722,6 @@ def popen_launch_pd_server(
     return process
 
 
-def run_with_timeout(
-    func: Callable,
-    args: tuple = (),
-    kwargs: Optional[dict] = None,
-    timeout: float = None,
-):
-    """Run a function with timeout."""
-    ret_value = []
-
-    def _target_func():
-        ret_value.append(func(*args, **(kwargs or {})))
-
-    t = threading.Thread(target=_target_func)
-    t.start()
-    t.join(timeout=timeout)
-    if t.is_alive():
-        raise TimeoutError()
-
-    if not ret_value:
-        raise RuntimeError()
-
-    return ret_value[0]
-
-
-@dataclass
-class TestFile:
-    name: str
-    estimated_time: float = 60
-
-
-def run_unittest_files(files: List[TestFile], timeout_per_file: float):
-    tic = time.perf_counter()
-    success = True
-
-    for i, file in enumerate(files):
-        filename, estimated_time = file.name, file.estimated_time
-        process = None
-
-        def run_one_file(filename):
-            nonlocal process
-
-            filename = os.path.join(os.getcwd(), filename)
-            print(
-                f".\n.\nBegin ({i}/{len(files) - 1}):\npython3 {filename}\n.\n.\n",
-                flush=True,
-            )
-            tic = time.perf_counter()
-
-            process = subprocess.Popen(
-                ["python3", filename], stdout=None, stderr=None, env=os.environ
-            )
-            process.wait()
-            elapsed = time.perf_counter() - tic
-
-            print(
-                f".\n.\nEnd ({i}/{len(files) - 1}):\n{filename=}, {elapsed=:.0f}, {estimated_time=}\n.\n.\n",
-                flush=True,
-            )
-            return process.returncode
-
-        try:
-            ret_code = run_with_timeout(
-                run_one_file, args=(filename,), timeout=timeout_per_file
-            )
-            assert (
-                ret_code == 0
-            ), f"expected return code 0, but {filename} returned {ret_code}"
-        except TimeoutError:
-            kill_process_tree(process.pid)
-            time.sleep(5)
-            print(
-                f"\nTimeout after {timeout_per_file} seconds when running {filename}\n",
-                flush=True,
-            )
-            success = False
-            break
-
-    if success:
-        print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
-    else:
-        print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
-
-    return 0 if success else -1
-
-
 def get_similarities(vec1, vec2):
     return F.cosine_similarity(torch.tensor(vec1), torch.tensor(vec2), dim=0)
 
@@ -789,6 +743,8 @@ def get_benchmark_args(
     device="auto",
     pd_separated: bool = False,
     lora_name=None,
+    lora_request_distribution="uniform",
+    lora_zipf_alpha=1.5,
 ):
     return SimpleNamespace(
         backend="sglang",
@@ -817,6 +773,8 @@ def get_benchmark_args(
         apply_chat_template=False,
         profile=None,
         lora_name=lora_name,
+        lora_request_distribution=lora_request_distribution,
+        lora_zipf_alpha=lora_zipf_alpha,
         prompt_suffix="",
         device=device,
         pd_separated=pd_separated,
@@ -904,6 +862,79 @@ def run_bench_serving(
     return res
 
 
+async def _run_api_benchmark_requests(
+    base_url: str,
+    endpoint: str,
+    test_requests: List[dict],
+    num_requests: int,
+    response_validator: Callable[[dict], bool],
+):
+    """
+    Helper function to run API benchmark requests and collect metrics.
+
+    Args:
+        base_url: The base URL of the server
+        endpoint: The API endpoint to test (e.g., "/v1/score", "/v1/embeddings")
+        test_requests: List of request payloads to send
+        num_requests: Total number of requests expected
+        response_validator: Function to validate if response contains expected data
+
+    Returns:
+        Dictionary with benchmark metrics
+    """
+    start_time = time.monotonic()
+    successful_requests = 0
+    total_latency = 0
+    latencies = []
+
+    async with aiohttp.ClientSession() as session:
+        for request_data in test_requests:
+            try:
+                request_start = time.monotonic()
+                async with session.post(
+                    f"{base_url}{endpoint}",
+                    json=request_data,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as response:
+                    if response.status == 200:
+                        response_data = await response.json()
+                        request_end = time.monotonic()
+
+                        if response_validator(response_data):
+                            latency_ms = (request_end - request_start) * 1000
+                            latencies.append(latency_ms)
+                            total_latency += latency_ms
+                            successful_requests += 1
+            except Exception:
+                continue
+
+    end_time = time.monotonic()
+    total_time = end_time - start_time
+
+    if successful_requests > 0:
+        throughput = successful_requests / total_time
+        avg_latency = total_latency / successful_requests
+        p95_latency = np.percentile(latencies, 95) if latencies else 0
+
+        return {
+            "completed": successful_requests,
+            "total_requests": num_requests,
+            "throughput": throughput,
+            "avg_latency_ms": avg_latency,
+            "p95_latency_ms": p95_latency,
+            "successful_requests": successful_requests,
+        }
+    else:
+        return {
+            "completed": 0,
+            "total_requests": num_requests,
+            "throughput": 0,
+            "avg_latency_ms": 0,
+            "p95_latency_ms": 0,
+            "successful_requests": 0,
+        }
+
+
 def run_score_benchmark(
     model,
     num_requests=100,
@@ -929,7 +960,6 @@ def run_score_benchmark(
     )
 
     async def _run_benchmark():
-
         # Load tokenizer for generating test data
         from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
@@ -990,58 +1020,109 @@ def run_score_benchmark(
             }
             test_requests.append(score_data)
 
-        start_time = time.monotonic()
-        successful_requests = 0
-        total_latency = 0
-        latencies = []
+        # Run benchmark requests using shared helper
+        return await _run_api_benchmark_requests(
+            base_url=base_url,
+            endpoint="/v1/score",
+            test_requests=test_requests,
+            num_requests=num_requests,
+            response_validator=lambda resp: "scores" in resp or "logprobs" in resp,
+        )
 
-        async with aiohttp.ClientSession() as session:
-            for request_data in test_requests:
+    try:
+        res = asyncio.run(_run_benchmark())
+    finally:
+        kill_process_tree(process.pid)
+
+    assert res["completed"] == res["successful_requests"]
+    return res
+
+
+def run_embeddings_benchmark(
+    model,
+    num_requests=100,
+    batch_size=1,
+    input_tokens=500,
+    other_server_args=None,
+    need_warmup=False,
+    device="auto",
+):
+    """Embeddings API benchmark function compatible with run_bench_serving pattern"""
+    if other_server_args is None:
+        other_server_args = []
+
+    if device == "auto":
+        device = auto_config_device()
+
+    # Add --is-embedding flag for embedding models
+    server_args = ["--is-embedding"] + other_server_args
+
+    # Launch the server (consistent with run_bench_serving)
+    base_url = DEFAULT_URL_FOR_TEST
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=server_args,
+    )
+
+    async def _run_benchmark():
+
+        # Load tokenizer for generating test data
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        tokenizer = get_tokenizer(model)
+
+        def generate_text_with_token_count(num_tokens):
+            """Generate text with precise token count using special tokens."""
+            # Use a token that reliably produces 1 token
+            special_token = "<|im_start|>"
+            # Verify it's a single token
+            test_tokens = tokenizer.encode(special_token, add_special_tokens=False)
+            text = special_token * num_tokens
+            return text
+
+        # Generate input text
+        input_text = generate_text_with_token_count(input_tokens)
+
+        if need_warmup:
+            warmup_data = {
+                "input": input_text,
+                "model": model,
+            }
+
+            async with aiohttp.ClientSession() as session:
                 try:
-                    request_start = time.monotonic()
-                    async with session.post(
-                        f"{base_url}/v1/score",
-                        json=request_data,
+                    await session.post(
+                        f"{base_url}/v1/embeddings",
+                        json=warmup_data,
                         timeout=aiohttp.ClientTimeout(total=30),
-                    ) as response:
-                        if response.status == 200:
-                            response_data = await response.json()
-                            request_end = time.monotonic()
+                    )
+                except:
+                    pass  # Ignore warmup errors
 
-                            if "scores" in response_data or "logprobs" in response_data:
-                                latency_ms = (request_end - request_start) * 1000
-                                latencies.append(latency_ms)
-                                total_latency += latency_ms
-                                successful_requests += 1
-                except Exception:
-                    continue
+        test_requests = []
+        for i in range(num_requests):
+            if batch_size == 1:
+                input_data = input_text
+            else:
+                input_data = [input_text for _ in range(batch_size)]
 
-        end_time = time.monotonic()
-        total_time = end_time - start_time
-
-        if successful_requests > 0:
-            throughput = successful_requests / total_time
-            avg_latency = total_latency / successful_requests
-            latencies.sort()
-            p95_latency = latencies[int(len(latencies) * 0.95)] if latencies else 0
-
-            return {
-                "completed": successful_requests,
-                "total_requests": num_requests,
-                "throughput": throughput,
-                "avg_latency_ms": avg_latency,
-                "p95_latency_ms": p95_latency,
-                "successful_requests": successful_requests,
+            embeddings_data = {
+                "input": input_data,
+                "model": model,
             }
-        else:
-            return {
-                "completed": 0,
-                "total_requests": num_requests,
-                "throughput": 0,
-                "avg_latency_ms": 0,
-                "p95_latency_ms": 0,
-                "successful_requests": 0,
-            }
+
+            test_requests.append(embeddings_data)
+
+        # Run benchmark requests using shared helper
+        return await _run_api_benchmark_requests(
+            base_url=base_url,
+            endpoint="/v1/embeddings",
+            test_requests=test_requests,
+            num_requests=num_requests,
+            response_validator=lambda resp: "data" in resp,
+        )
 
     try:
         res = asyncio.run(_run_benchmark())
@@ -1164,8 +1245,8 @@ def run_bench_offline_throughput(model, other_args):
 
     try:
         stdout, stderr = process.communicate()
-        output = stdout.decode()
-        error = stderr.decode()
+        output = stdout.decode(errors="backslashreplace")
+        error = stderr.decode(errors="backslashreplace")
         print(f"Output: {output}", flush=True)
         print(f"Error: {error}", flush=True)
 
@@ -1536,7 +1617,7 @@ def send_generate_requests(base_url: str, num_requests: int) -> List[str]:
                 "text": prompt,
                 "sampling_params": {
                     "temperature": 0,
-                    "max_new_tokens": 50,
+                    "max_new_tokens": 500,
                 },
             },
         )
@@ -1563,7 +1644,7 @@ async def send_concurrent_generate_requests(
                     "text": prompt,
                     "sampling_params": {
                         "temperature": 0,
-                        "max_new_tokens": 50,
+                        "max_new_tokens": 500,
                     },
                 },
             ) as response:
@@ -1587,7 +1668,7 @@ async def send_concurrent_generate_requests_with_custom_params(
                 """,
         "sampling_params": {
             "temperature": 0,
-            "max_new_tokens": 50,
+            "max_new_tokens": 500,
         },
     }
 
@@ -1617,6 +1698,9 @@ class CustomTestCase(unittest.TestCase):
             lambda: super(CustomTestCase, self)._callTestMethod(method),
             max_retry=max_retry,
         )
+
+    def setUp(self):
+        print(f"[CI Test Method] {self.__class__.__name__}.{self._testMethodName}")
 
 
 def dump_bench_raw_result(
@@ -1803,3 +1887,33 @@ def write_results_to_json(model, metrics, mode="a"):
 
     with open("results.json", "w") as f:
         json.dump(existing_results, f, indent=2)
+
+
+def intel_amx_benchmark(extra_args=None, min_throughput=None):
+    def decorator(test_func):
+        @wraps(test_func)
+        def wrapper(self):
+            common_args = [
+                "--attention-backend",
+                "intel_amx",
+                "--disable-radix",
+                "--trust-remote-code",
+            ]
+            full_args = common_args + (extra_args or [])
+
+            model = test_func(self)
+            prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
+                model, full_args
+            )
+
+            print(f"{model=}")
+            print(f"{prefill_latency=}")
+            print(f"{decode_throughput=}")
+            print(f"{decode_latency=}")
+
+            if is_in_ci() and min_throughput is not None:
+                self.assertGreater(decode_throughput, min_throughput)
+
+        return wrapper
+
+    return decorator

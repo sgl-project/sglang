@@ -31,9 +31,9 @@ from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputs,
-    global_server_args_dict,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cpu
 
 _is_cpu = is_cpu()
@@ -173,9 +173,6 @@ class Llama4VisionEncoderLayer(nn.Module):
             use_qkv_parallel=True,
             # vision_model is explicitly ignored in Maverick-17B-128E-Instruct-FP8
             quant_config=None,
-            dropout=0.0,
-            qkv_backend="sdpa",
-            softmax_in_single_precision=False,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
             qkv_bias=True,
@@ -448,7 +445,7 @@ class Llama4ForConditionalGeneration(nn.Module):
             )
 
         self.has_vision = (
-            self.has_vision_weights and global_server_args_dict["enable_multimodal"]
+            self.has_vision_weights and get_global_server_args().enable_multimodal
         )
 
         if self.has_vision:

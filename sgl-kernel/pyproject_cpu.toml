@@ -8,15 +8,14 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "sgl-kernel"
-version = "0.3.15"
+version = "0.3.18.post2"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: Apache Software License",
-  "Environment :: CPU"
+  "License :: OSI Approved :: Apache Software License"
 ]
 dependencies = []
 

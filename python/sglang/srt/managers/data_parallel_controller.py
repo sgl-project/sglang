@@ -21,7 +21,7 @@ import threading
 import time
 from collections import deque
 from enum import Enum, auto
-from typing import List
+from typing import List, Optional
 
 import psutil
 import setproctitle
@@ -34,14 +34,29 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     WatchLoadUpdateReq,
 )
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, RequestStage
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import (
+from sglang.srt.server_args import (
+    DP_ATTENTION_HANDSHAKE_PORT_DELTA,
+    PortArgs,
+    ServerArgs,
+)
+from sglang.srt.tracing.trace import (
+    process_tracing_init,
+    trace_get_proc_propagate_context,
+    trace_set_proc_propagate_context,
+    trace_set_thread_info,
+    trace_slice_end,
+    trace_slice_start,
+)
+from sglang.srt.utils import numa_utils
+from sglang.srt.utils.common import (
     bind_port,
+    configure_ipv6,
     configure_logger,
     get_zmq_socket,
     kill_itself_when_parent_died,
+    maybe_reindex_device_id,
 )
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -105,16 +120,16 @@ class DataParallelController:
     """A controller that dispatches requests to multiple data parallel workers."""
 
     def __init__(self, server_args: ServerArgs, port_args: PortArgs) -> None:
-        # for dp balance
-        self.global_balance_id = 0
-
         # Parse args
-        self.max_total_num_tokens = None
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
             server_args.load_balance_method
         )
+        self.run_scheduler_process = run_scheduler_process
+
+        # For DP balance
+        self.global_balance_id = 0
 
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
@@ -135,28 +150,19 @@ class DataParallelController:
         # Load balance budget
         self.dp_budget = DPBudget()
 
+        # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
+        self.env_lock = threading.Lock()
+
         # Launch data parallel workers
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
 
         if server_args.enable_dp_attention:
-            dp_port_args = self.launch_dp_attention_schedulers(server_args, port_args)
+            self.launch_dp_attention_schedulers(server_args, port_args)
             self.control_message_step = server_args.tp_size
         else:
-            dp_port_args = self.launch_dp_schedulers(server_args, port_args)
+            self.launch_dp_schedulers(server_args, port_args)
             self.control_message_step = 1
-
-        # Only node rank 0 runs the real data parallel controller that dispatches the requests.
-        if server_args.node_rank == 0:
-            for dp_rank in range(server_args.dp_size):
-                self.workers[dp_rank] = get_zmq_socket(
-                    self.context,
-                    zmq.PUSH,
-                    dp_port_args[dp_rank].scheduler_input_ipc_name,
-                    True,
-                )
-
-        self.max_req_input_len = None
 
         self.init_dispatcher()
 
@@ -172,11 +178,22 @@ class DataParallelController:
     def handle_load_update_req(self, obj):
         self.dp_budget.update_budget(obj)
 
+    def dispatching_with_trace(self, req: Req):
+        if self.server_args.enable_trace:
+            trace_set_proc_propagate_context(req.rid, req.trace_context)
+            trace_slice_start(RequestStage.DC_DISPATCH, req.rid)
+            req.trace_context = trace_get_proc_propagate_context(req.rid)
+
+        self.dispatching(req)
+
+        if self.server_args.enable_trace:
+            trace_slice_end(RequestStage.DC_DISPATCH, req.rid, thread_finish_flag=True)
+
     def init_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (TokenizedGenerateReqInput, self.dispatching),
-                (TokenizedEmbeddingReqInput, self.dispatching),
+                (TokenizedGenerateReqInput, self.dispatching_with_trace),
+                (TokenizedEmbeddingReqInput, self.dispatching_with_trace),
                 (BlockReqInput, self.send_to_all_workers),
                 (WatchLoadUpdateReq, self.handle_load_update_req),
             ]
@@ -188,13 +205,11 @@ class DataParallelController:
 
         threads = []
         sockets = []
-        dp_port_args = []
         ready_events = []
         for dp_rank in range(server_args.dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
-            dp_port_args.append(tmp_port_args)
 
             # This port is checked free in PortArgs.init_new.
             # We hold it first so that the next dp worker gets a different port
@@ -213,6 +228,14 @@ class DataParallelController:
                 server_args.tp_size * server_args.pp_size * server_args.gpu_id_step
             )
 
+            if server_args.node_rank == 0:
+                self.workers[dp_rank] = get_zmq_socket(
+                    self.context,
+                    zmq.PUSH,
+                    tmp_port_args.scheduler_input_ipc_name,
+                    True,
+                )
+
         # Free all sockets before starting the threads to launch TP workers
         for sock in sockets:
             sock.close()
@@ -222,8 +245,6 @@ class DataParallelController:
             thread.start()
         for event in ready_events:
             event.wait()
-
-        return dp_port_args
 
     def launch_tensor_parallel_group_thread(
         self,
@@ -241,19 +262,119 @@ class DataParallelController:
         while True:
             time.sleep(30 * 24 * 3600)
 
-    def launch_dp_attention_schedulers(self, server_args, port_args):
-        self.launch_tensor_parallel_group(server_args, port_args, 0, None)
-        dp_port_args = []
-        for dp_rank in range(server_args.dp_size):
-            dp_port_args.append(PortArgs.init_new(server_args, dp_rank))
-        return dp_port_args
+    def _broadcast_worker_ports(
+        self, server_args: ServerArgs, worker_ports: Optional[List[int]] = None
+    ) -> List[int]:
+        """Broadcast worker ports from node 0 to all other nodes.
+
+        Node 0 acts as the server, waiting for all other nodes to connect and
+        sending them the pre-allocated worker ports. Other nodes act as clients,
+        connecting to node 0 to receive their copy of the worker ports.
+
+        Args:
+            server_args: Server arguments containing node configuration.
+            worker_ports: Pre-allocated worker ports to broadcast.
+
+        Returns:
+            List of worker ports (same on all nodes after broadcast).
+        """
+        # Determine the endpoint for inter-node communication
+        if server_args.dist_init_addr is None:
+            endpoint = f"tcp://127.0.0.1:{server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
+        elif server_args.dist_init_addr.startswith("["):  # ipv6 address
+            port, host = configure_ipv6(server_args.dist_init_addr)
+            endpoint = f"tcp://{host}:{int(port) + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
+        else:
+            host, port = server_args.dist_init_addr.split(":")
+            endpoint = f"tcp://{host}:{int(port) + DP_ATTENTION_HANDSHAKE_PORT_DELTA}"
+
+        if server_args.node_rank == 0:
+            # Node 0: Broadcast worker ports to all other nodes
+            return self._broadcast_ports_as_server(
+                endpoint, server_args.nnodes - 1, worker_ports
+            )
+        else:
+            # Other nodes: Receive worker ports from node 0
+            return self._receive_ports_as_client(endpoint, server_args.node_rank)
+
+    def _broadcast_ports_as_server(
+        self, endpoint: str, expected_clients: int, worker_ports: List[int]
+    ) -> List[int]:
+        """Broadcast worker ports to all client nodes."""
+        logger.debug(f"Broadcasting worker ports to {expected_clients} client nodes")
+        logger.debug(f"Worker ports: {worker_ports}")
+
+        rep_socket = get_zmq_socket(self.context, zmq.REP, endpoint, True)
+
+        try:
+            connected_clients = 0
+            while connected_clients < expected_clients:
+                # Wait for client handshake
+                client_rank = rep_socket.recv().decode()
+                logger.debug(f"Received handshake from node {client_rank}")
+
+                # Send worker ports to client
+                rep_socket.send_pyobj(worker_ports)
+                connected_clients += 1
+                logger.debug(
+                    f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
+                )
+
+            logger.debug("Worker port broadcast completed")
+            return worker_ports
+        finally:
+            rep_socket.close()
+
+    def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
+        """Receive worker ports from the server node."""
+        logger.debug(f"Connecting to node 0 to receive worker ports")
+
+        req_socket = get_zmq_socket(self.context, zmq.REQ, endpoint, False)
+        req_socket.setsockopt(zmq.RCVTIMEO, 600 * 1000)  # 10 minute timeout
+        req_socket.setsockopt(zmq.SNDTIMEO, 600 * 1000)
+
+        try:
+            # Send handshake with our node rank
+            req_socket.send(str(node_rank).encode())
+
+            # Receive worker ports
+            worker_ports = req_socket.recv_pyobj()
+            logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
+            return worker_ports
+        except zmq.Again:
+            logger.error("Timeout waiting for worker ports from node 0")
+            raise RuntimeError(
+                "Failed to receive worker ports from node 0 within timeout"
+            )
+        finally:
+            req_socket.close()
+
+    def launch_dp_attention_schedulers(
+        self, server_args: ServerArgs, port_args: PortArgs
+    ):
+        # Pre-allocate worker ports on node 0 to avoid conflicts
+        worker_ports = []
+        if server_args.node_rank == 0:
+            for dp_rank in range(server_args.dp_size):
+                port_and_socket = get_zmq_socket(self.context, zmq.PUSH)
+                worker_ports.append(port_and_socket[0])
+                self.workers[dp_rank] = port_and_socket[1]
+                logger.debug(f"Assigned port {port_and_socket[0]} to worker {dp_rank}")
+
+        broadcasted_ports = self._broadcast_worker_ports(
+            server_args, worker_ports if worker_ports else None
+        )
+        self.launch_tensor_parallel_group(
+            server_args, port_args, 0, None, broadcasted_ports
+        )
 
     def launch_tensor_parallel_group(
         self,
         server_args: ServerArgs,
         port_args: PortArgs,
         base_gpu_id: int,
-        dp_rank: int,
+        dp_rank: Optional[int],
+        worker_ports: Optional[List[int]] = None,
     ):
         if not server_args.enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
@@ -264,17 +385,18 @@ class DataParallelController:
 
         scheduler_pipe_readers = []
 
-        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+        pp_rank_range = range(
+            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+            pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
+        )
+
+        nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
         tp_rank_range = range(
             tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
             tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
-        )
-
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
         )
 
         for pp_rank in pp_rank_range:
@@ -290,7 +412,9 @@ class DataParallelController:
                         server_args.dp_size,
                     )
                     # compute zmq ports for this dp rank
-                    rank_port_args = PortArgs.init_new(server_args, dp_rank)
+                    rank_port_args = PortArgs.init_new(
+                        server_args, dp_rank, worker_ports
+                    )
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
@@ -303,21 +427,24 @@ class DataParallelController:
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
-                proc = mp.Process(
-                    target=run_scheduler_process,
-                    args=(
-                        server_args,
-                        rank_port_args,
-                        gpu_id,
-                        tp_rank,
-                        moe_ep_rank,
-                        pp_rank,
-                        dp_rank,
-                        writer,
-                    ),
-                )
-                with memory_saver_adapter.configure_subprocess():
-                    proc.start()
+                with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
+                    proc = mp.Process(
+                        target=self.run_scheduler_process,
+                        args=(
+                            server_args,
+                            rank_port_args,
+                            gpu_id,
+                            tp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            dp_rank,
+                            writer,
+                        ),
+                    )
+                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
+                        server_args, gpu_id
+                    ):
+                        proc.start()
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
@@ -346,6 +473,9 @@ class DataParallelController:
                 self.workers
             )
         else:
+            assert (
+                req.bootstrap_room is not None
+            ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
             self.workers[req.bootstrap_room % len(self.workers)].send_pyobj(req)
 
     def shortest_queue_scheduler(self, req):
@@ -381,15 +511,25 @@ def run_data_parallel_controller_process(
     server_args: ServerArgs,
     port_args: PortArgs,
     pipe_writer,
+    data_parallel_controller_class=DataParallelController,
 ):
-    kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::data_parallel_controller")
     faulthandler.enable()
-    configure_logger(server_args)
+    kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
+    configure_logger(server_args)
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        thread_label = "DP Controller"
+        if server_args.disaggregation_mode == "prefill":
+            thread_label = "Prefill DP Controller"
+        elif server_args.disaggregation_mode == "decode":
+            thread_label = "Decode DP Controller"
+        trace_set_thread_info(thread_label)
+
     try:
-        controller = DataParallelController(server_args, port_args)
+        controller = data_parallel_controller_class(server_args, port_args)
         pipe_writer.send(
             {
                 "status": "ready",

@@ -1,12 +1,14 @@
 use std::path::PathBuf;
+
 use tracing::Level;
-use tracing_appender::non_blocking::WorkerGuard;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_appender::{
+    non_blocking::WorkerGuard,
+    rolling::{RollingFileAppender, Rotation},
+};
 use tracing_log::LogTracer;
-use tracing_subscriber::fmt::time::ChronoUtc;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::{
+    fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+};
 
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
@@ -26,7 +28,7 @@ impl Default for LoggingConfig {
             log_dir: None,
             colorize: true,
             log_file_name: "sgl-router".to_string(),
-            log_targets: Some(vec!["sglang_router_rs".to_string()]),
+            log_targets: Some(vec!["sgl_model_gateway".to_string()]),
         }
     }
 }
@@ -61,7 +63,7 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
                 })
                 .collect::<String>()
         } else {
-            format!("sglang_router_rs={}", level_filter)
+            format!("sgl_model_gateway={}", level_filter)
         };
 
         EnvFilter::new(filter_string)

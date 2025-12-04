@@ -1,12 +1,19 @@
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
 use axum::{
-    body::Body, extract::Request, extract::State, http::header, http::HeaderValue,
-    http::StatusCode, middleware::Next, response::IntoResponse, response::Response,
+    body::Body,
+    extract::{Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use rand::Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
@@ -14,9 +21,7 @@ use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
-
-use crate::metrics::RouterMetrics;
-use crate::server::AppState;
+use crate::{metrics::RouterMetrics, server::AppState};
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -69,6 +74,8 @@ fn generate_request_id(path: &str) -> String {
         "cmpl-"
     } else if path.contains("/generate") {
         "gnt-"
+    } else if path.contains("/responses") {
+        "resp-"
     } else {
         "req-"
     };
@@ -215,7 +222,7 @@ impl<B> OnRequest<B> for RequestLogger {
 
         // Log the request start
         info!(
-            target: "sglang_router_rs::request",
+            target: "sgl_model_gateway::request",
             "started processing request"
         );
     }
@@ -247,17 +254,17 @@ impl<B> OnResponse<B> for ResponseLogger {
         let _enter = span.enter();
         if status.is_server_error() {
             error!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "request failed with server error"
             );
         } else if status.is_client_error() {
             warn!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "request failed with client error"
             );
         } else {
             info!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "finished processing request"
             );
         }
@@ -296,7 +303,7 @@ pub struct RequestLogEntry {
 pub fn log_request(entry: RequestLogEntry) {
     if entry.status >= 500 {
         tracing::error!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,
@@ -309,7 +316,7 @@ pub fn log_request(entry: RequestLogEntry) {
         );
     } else if entry.status >= 400 {
         tracing::warn!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,
@@ -321,7 +328,7 @@ pub fn log_request(entry: RequestLogEntry) {
         );
     } else {
         tracing::info!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,

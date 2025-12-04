@@ -1,7 +1,8 @@
 #[cfg(test)]
-use super::*;
-#[cfg(test)]
 use std::sync::Arc;
+
+#[cfg(test)]
+use super::*;
 
 #[test]
 fn test_mock_tokenizer_encode() {
@@ -42,7 +43,7 @@ fn test_tokenizer_wrapper() {
     let text = tokenizer.decode(&[1, 2], false).unwrap();
     assert_eq!(text, "Hello world");
 
-    assert_eq!(tokenizer.vocab_size(), 8);
+    assert_eq!(tokenizer.vocab_size(), 14);
 
     assert_eq!(tokenizer.token_to_id("Hello"), Some(1));
     assert_eq!(tokenizer.token_to_id("unknown"), None);

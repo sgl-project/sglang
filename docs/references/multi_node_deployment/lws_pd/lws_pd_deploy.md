@@ -98,7 +98,7 @@ spec:
             value: "1"
           - name: SGLANG_SET_CPU_AFFINITY
             value: "true"
-          - name: SGL_ENABLE_JIT_DEEPGEMM
+          - name: SGLANG_ENABLE_JIT_DEEPGEMM
             value: "1"
           - name: NCCL_IB_QPS_PER_CONNECTION
             value: "8"
@@ -257,7 +257,7 @@ spec:
             value: "0"
           - name: SGLANG_MOONCAKE_TRANS_THREAD
             value: "8"
-          - name: SGL_ENABLE_JIT_DEEPGEMM
+          - name: SGLANG_ENABLE_JIT_DEEPGEMM
             value: "1"
           - name: SGL_CHUNKED_PREFIX_CACHE_THRESHOLD
             value: "0"
@@ -421,7 +421,7 @@ spec:
             value: "true"
           - name: SGLANG_MOONCAKE_TRANS_THREAD
             value: "16"
-          - name: SGL_ENABLE_JIT_DEEPGEMM
+          - name: SGLANG_ENABLE_JIT_DEEPGEMM
             value: "1"
           - name: NCCL_IB_HCA
             value: ^=mlx5_0,mlx5_5,mlx5_6
@@ -560,7 +560,7 @@ spec:
             value: "5"
           - name: SGLANG_MOONCAKE_TRANS_THREAD
             value: "16"
-          - name: SGL_ENABLE_JIT_DEEPGEMM
+          - name: SGLANG_ENABLE_JIT_DEEPGEMM
             value: "1"
           - name: NCCL_IB_HCA
             value: ^=mlx5_0,mlx5_5,mlx5_6

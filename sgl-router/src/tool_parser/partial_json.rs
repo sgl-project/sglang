@@ -1,8 +1,9 @@
+use serde_json::{Map, Value};
+
 use crate::tool_parser::{
     errors::{ParserError, ParserResult},
     traits::PartialJsonParser,
 };
-use serde_json::{Map, Value};
 
 /// Parser for incomplete JSON
 pub struct PartialJson {

@@ -1,15 +1,12 @@
 use super::*;
+use crate::core::ConnectionMode;
 
 /// Configuration validator
 pub struct ConfigValidator;
 
 impl ConfigValidator {
-    /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
-        // Check if service discovery is enabled
-        let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
-
-        Self::validate_mode(&config.mode, has_service_discovery)?;
+        Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
 
@@ -23,32 +20,80 @@ impl ConfigValidator {
 
         Self::validate_compatibility(config)?;
 
-        // Validate effective retry/CB configs (respect disable flags)
         let retry_cfg = config.effective_retry_config();
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
 
-        if config.history_backend == HistoryBackend::Oracle && config.oracle.is_none() {
+        if config.history_backend == HistoryBackend::Oracle {
+            if config.oracle.is_none() {
+                return Err(ConfigError::MissingRequired {
+                    field: "oracle".to_string(),
+                });
+            }
+            if let Some(oracle) = &config.oracle {
+                Self::validate_oracle(oracle)?;
+            }
+        }
+
+        Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    fn validate_oracle(oracle: &OracleConfig) -> ConfigResult<()> {
+        if oracle.username.is_empty() {
             return Err(ConfigError::MissingRequired {
-                field: "oracle".to_string(),
+                field: "oracle.username".to_string(),
+            });
+        }
+
+        if oracle.password.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle.password".to_string(),
+            });
+        }
+
+        if oracle.connect_descriptor.is_empty() {
+            return Err(ConfigError::MissingRequired {
+                field: "oracle_dsn or oracle_tns_alias".to_string(),
+            });
+        }
+
+        if oracle.pool_min < 1 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_min".to_string(),
+                value: oracle.pool_min.to_string(),
+                reason: "Must be at least 1".to_string(),
+            });
+        }
+
+        if oracle.pool_max < oracle.pool_min {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_max".to_string(),
+                value: oracle.pool_max.to_string(),
+                reason: "Must be >= oracle.pool_min".to_string(),
+            });
+        }
+
+        if oracle.pool_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "oracle.pool_timeout_secs".to_string(),
+                value: oracle.pool_timeout_secs.to_string(),
+                reason: "Must be > 0".to_string(),
             });
         }
 
         Ok(())
     }
 
-    /// Validate routing mode configuration
-    fn validate_mode(mode: &RoutingMode, has_service_discovery: bool) -> ConfigResult<()> {
+    fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
         match mode {
             RoutingMode::Regular { worker_urls } => {
-                // Validate URLs if any are provided
                 if !worker_urls.is_empty() {
                     Self::validate_urls(worker_urls)?;
                 }
-                // Note: We allow empty worker URLs even without service discovery
-                // to let the router start and fail at runtime when routing requests.
-                // This matches legacy behavior and test expectations.
+                // Allow empty URLs without service discovery to match legacy behavior
             }
             RoutingMode::PrefillDecode {
                 prefill_urls,
@@ -56,21 +101,8 @@ impl ConfigValidator {
                 prefill_policy,
                 decode_policy,
             } => {
-                // Only require URLs if service discovery is disabled
-                if !has_service_discovery {
-                    if prefill_urls.is_empty() {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: "PD mode requires at least one prefill worker URL".to_string(),
-                        });
-                    }
-                    if decode_urls.is_empty() {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: "PD mode requires at least one decode worker URL".to_string(),
-                        });
-                    }
-                }
-
-                // Validate URLs if any are provided
+                // Allow empty URLs even without service discovery to support dynamic worker addition
+                // URLs will be validated if provided
                 if !prefill_urls.is_empty() {
                     let prefill_url_strings: Vec<String> =
                         prefill_urls.iter().map(|(url, _)| url.clone()).collect();
@@ -80,7 +112,6 @@ impl ConfigValidator {
                     Self::validate_urls(decode_urls)?;
                 }
 
-                // Validate bootstrap ports
                 for (_url, port) in prefill_urls {
                     if let Some(port) = port {
                         if *port == 0 {
@@ -93,7 +124,6 @@ impl ConfigValidator {
                     }
                 }
 
-                // Validate optional prefill and decode policies
                 if let Some(p_policy) = prefill_policy {
                     Self::validate_policy(p_policy)?;
                 }
@@ -102,29 +132,19 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { worker_urls } => {
-                // Require exactly one worker URL for OpenAI router
-                if worker_urls.len() != 1 {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "OpenAI mode requires exactly one --worker-urls entry".to_string(),
-                    });
-                }
-                // Validate URL format
-                if let Err(e) = url::Url::parse(&worker_urls[0]) {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: format!("Invalid OpenAI worker URL '{}': {}", &worker_urls[0], e),
-                    });
+                // Allow empty URLs to support dynamic worker addition
+                // URLs will be validated if provided
+                if !worker_urls.is_empty() {
+                    Self::validate_urls(worker_urls)?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Validate policy configuration
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin => {
-                // No specific validation needed
-            }
+            PolicyConfig::Random | PolicyConfig::RoundRobin => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
@@ -175,11 +195,38 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::Bucket {
+                balance_abs_threshold: _,
+                balance_rel_threshold,
+                bucket_adjust_interval_secs,
+            } => {
+                if *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "balance_rel_threshold".to_string(),
+                        value: balance_rel_threshold.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
+                    });
+                }
+
+                if *bucket_adjust_interval_secs < 1 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "bucket_adjust_interval_secs".to_string(),
+                        value: bucket_adjust_interval_secs.to_string(),
+                        reason: "Must be >= 1s".to_string(),
+                    });
+                }
+                if *bucket_adjust_interval_secs >= 4294967296 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "bucket_adjust_interval_secs".to_string(),
+                        value: bucket_adjust_interval_secs.to_string(),
+                        reason: "Must be < 4294967296s".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }
 
-    /// Validate server configuration
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
@@ -205,6 +252,25 @@ impl ConfigValidator {
             });
         }
 
+        if config.queue_size > 0 && config.queue_timeout_secs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "queue_timeout_secs".to_string(),
+                value: config.queue_timeout_secs.to_string(),
+                reason: "Must be > 0 when queue_size > 0".to_string(),
+            });
+        }
+
+        if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
+            // Allow 0 for pure concurrency limiting (semaphore behavior)
+            if tokens_per_second < 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "rate_limit_tokens_per_second".to_string(),
+                    value: tokens_per_second.to_string(),
+                    reason: "Must be >= 0 when specified".to_string(),
+                });
+            }
+        }
+
         if config.worker_startup_timeout_secs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "worker_startup_timeout_secs".to_string(),
@@ -224,10 +290,9 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate service discovery configuration
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
         if !discovery.enabled {
-            return Ok(()); // No validation needed if disabled
+            return Ok(());
         }
 
         if discovery.port == 0 {
@@ -246,7 +311,6 @@ impl ConfigValidator {
             });
         }
 
-        // Validate selectors based on mode
         match mode {
             RoutingMode::Regular { .. } => {
                 if discovery.selector.is_empty() {
@@ -264,7 +328,6 @@ impl ConfigValidator {
                 }
             }
             RoutingMode::OpenAI { .. } => {
-                // OpenAI mode doesn't use service discovery
                 return Err(ConfigError::ValidationFailed {
                     reason: "OpenAI mode does not support service discovery".to_string(),
                 });
@@ -274,7 +337,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate metrics configuration
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
         if metrics.port == 0 {
             return Err(ConfigError::InvalidValue {
@@ -295,7 +357,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate retry configuration
     fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
         if retry.max_retries < 1 {
             return Err(ConfigError::InvalidValue {
@@ -335,7 +396,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate circuit breaker configuration
     fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
         if cb.failure_threshold < 1 {
             return Err(ConfigError::InvalidValue {
@@ -368,15 +428,52 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate compatibility between different configuration sections
+    fn validate_tokenizer_cache(cache: &TokenizerCacheConfig) -> ConfigResult<()> {
+        if cache.enable_l0 && cache.l0_max_entries == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l0_max_entries".to_string(),
+                value: cache.l0_max_entries.to_string(),
+                reason: "Must be > 0 when L0 cache is enabled".to_string(),
+            });
+        }
+
+        if cache.enable_l1 && cache.l1_max_memory == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "tokenizer_cache.l1_max_memory".to_string(),
+                value: cache.l1_max_memory.to_string(),
+                reason: "Must be > 0 when L1 cache is enabled".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn validate_mtls(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(identity) = &config.client_identity {
+            if identity.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "Client identity cannot be empty".to_string(),
+                });
+            }
+        }
+
+        for (idx, ca_cert) in config.ca_certificates.iter().enumerate() {
+            if ca_cert.is_empty() {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!("CA certificate at index {} cannot be empty", idx),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
-        // IGW mode is independent - skip other compatibility checks when enabled
         if config.enable_igw {
             return Ok(());
         }
 
-        // Validate gRPC connection mode requires tokenizer configuration
-        if config.connection_mode == ConnectionMode::Grpc
+        if matches!(config.connection_mode, ConnectionMode::Grpc { .. })
             && config.tokenizer_path.is_none()
             && config.model_path.is_none()
         {
@@ -385,15 +482,11 @@ impl ConfigValidator {
             });
         }
 
-        // All policies are now supported for both router types thanks to the unified trait design
-        // No mode/policy restrictions needed anymore
+        Self::validate_mtls(config)?;
 
-        // Check if service discovery is enabled for worker count validation
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
 
-        // Only validate worker counts if service discovery is disabled
         if !has_service_discovery {
-            // Check if power-of-two policy makes sense with insufficient workers
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
                 if worker_count < 2 {
@@ -403,7 +496,6 @@ impl ConfigValidator {
                 }
             }
 
-            // For PD mode, validate that policies have sufficient workers
             if let RoutingMode::PrefillDecode {
                 prefill_urls,
                 decode_urls,
@@ -411,7 +503,6 @@ impl ConfigValidator {
                 decode_policy,
             } = &config.mode
             {
-                // Check power-of-two for prefill
                 if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
                     if prefill_urls.len() < 2 {
                         return Err(ConfigError::IncompatibleConfig {
@@ -420,7 +511,6 @@ impl ConfigValidator {
                     }
                 }
 
-                // Check power-of-two for decode
                 if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
                     if decode_urls.len() < 2 {
                         return Err(ConfigError::IncompatibleConfig {
@@ -430,11 +520,16 @@ impl ConfigValidator {
                         });
                     }
                 }
+
+                // Check bucket for decode
+                if let Some(PolicyConfig::Bucket { .. }) = decode_policy {
+                    return Err(ConfigError::IncompatibleConfig {
+                        reason: "Decode policy should not be allowed to be bucket".to_string(),
+                    });
+                }
             }
         }
 
-        // Service discovery is conflict with dp_aware routing for now
-        // since it's not fully supported yet
         if has_service_discovery && config.dp_aware {
             return Err(ConfigError::IncompatibleConfig {
                 reason: "DP-aware routing is not compatible with service discovery".to_string(),
@@ -444,7 +539,6 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Validate URL format
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
         for url in urls {
             if url.is_empty() {
@@ -466,10 +560,8 @@ impl ConfigValidator {
                 });
             }
 
-            // Basic URL validation
             match ::url::Url::parse(url) {
                 Ok(parsed) => {
-                    // Additional validation
                     if parsed.host_str().is_none() {
                         return Err(ConfigError::InvalidValue {
                             field: "worker_url".to_string(),
@@ -723,6 +815,106 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_pd_mode_bucket_policy_restrictions() {
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), None),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+                decode_policy: Some(PolicyConfig::PowerOfTwo {
+                    load_check_interval_secs: 60,
+                }),
+            },
+            PolicyConfig::Random, // Main policy as fallback
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(
+            result.is_ok(),
+            "Prefill policy should be allowed to be bucket"
+        );
+
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![
+                    ("http://prefill1:8000".to_string(), None),
+                    ("http://prefill2:8000".to_string(), None),
+                ],
+                decode_urls: vec![
+                    "http://decode1:8000".to_string(),
+                    "http://decode2:8000".to_string(),
+                ],
+                prefill_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+                decode_policy: Some(PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold: 1.1,
+                    bucket_adjust_interval_secs: 5,
+                }),
+            },
+            PolicyConfig::Random, // Main policy as fallback
+        );
+
+        let result = ConfigValidator::validate(&config);
+        assert!(
+            result.is_err(),
+            "Decode policy should not be allowed to be bucket"
+        );
+    }
+
+    #[test]
+    fn test_validate_empty_urls_allowed_without_service_discovery() {
+        // Test that empty URLs are now allowed in PD mode
+        let config = RouterConfig::new(
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        // Test that empty URLs are allowed in Regular mode
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec![],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        // Test that empty URLs are allowed in OpenAI mode
+        let config = RouterConfig::new(
+            RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            PolicyConfig::Random,
+        );
+
+        // Should pass validation even with empty URLs
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
     fn test_validate_grpc_requires_tokenizer() {
         let mut config = RouterConfig::new(
             RoutingMode::Regular {
@@ -732,7 +924,7 @@ mod tests {
         );
 
         // Set connection mode to gRPC without tokenizer config
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = None;
         config.model_path = None;
 
@@ -752,7 +944,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.model_path = Some("meta-llama/Llama-3-8B".to_string());
 
         let result = ConfigValidator::validate(&config);
@@ -768,7 +960,7 @@ mod tests {
             PolicyConfig::Random,
         );
 
-        config.connection_mode = ConnectionMode::Grpc;
+        config.connection_mode = ConnectionMode::Grpc { port: None };
         config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
 
         let result = ConfigValidator::validate(&config);
