@@ -10,6 +10,8 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     "per-commit-1-gpu": [
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 9),
+        TestFile("function_call/test_parser_integration.py", 10),
+        TestFile("function_call/test_structural_tag_new_format.py", 10),
         TestFile("hicache/test_hicache_storage.py", 96),
         TestFile("hicache/test_hicache_variants.py", 368),
         TestFile("layers/attention/mamba/test_causal_conv1d.py", 25),

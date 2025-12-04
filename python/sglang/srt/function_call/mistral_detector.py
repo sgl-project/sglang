@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
