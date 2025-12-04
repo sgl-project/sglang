@@ -498,6 +498,11 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Prefer the reasoning token count tracked in context if available.
             if getattr(context, "num_reasoning_tokens", 0):
                 num_reasoning_tokens = context.num_reasoning_tokens
+            elif reasoning_content:
+                # Fallback: compute reasoning token length directly from reasoning text.
+                num_reasoning_tokens = len(
+                    tokenizer.encode(reasoning_content, add_special_tokens=False)
+                )
 
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
