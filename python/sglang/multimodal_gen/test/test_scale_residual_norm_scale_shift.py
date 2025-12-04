@@ -5,6 +5,7 @@ import random
 import unittest
 import torch
 from torch import Tensor
+from typing import Tuple
 
 
 def is_float(value):
