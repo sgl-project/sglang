@@ -15,7 +15,7 @@ class TestMinistral3TextOnly(GSM8KMixin, CustomTestCase):
 
 
 class TestMinistral3MMMU(MMMUVLMMixin, CustomTestCase):
-    accuracy = 0.3 
+    accuracy = 0.3
     model = MODEL
     other_args = ["--trust-remote-code"]
     mmmu_args = ["--limit=0.1"]
@@ -26,6 +26,6 @@ class TestMinistral3MMMU(MMMUVLMMixin, CustomTestCase):
             SimpleNamespace(model=self.model, mmmu_accuracy=self.accuracy), "./logs"
         )
 
+
 if __name__ == "__main__":
     unittest.main()
-
