@@ -371,14 +371,14 @@ class SchedulerDisaggregationPrefillMixin:
 
             batch_result = None
             if batch:
-                logger.info(f"run_batch")
+                # logger.info(f"run_batch")
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
                 self.notify_prefill_done(batch, batch_result)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                logger.info(f"process_batch_result_disagg_prefill: {tmp_batch=} {tmp_result=}")
+                # logger.info(f"process_batch_result_disagg_prefill: {tmp_batch=} {tmp_result=}")
                 self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
             elif batch is None:
                 self.self_check_during_idle()
@@ -661,7 +661,7 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
-        logger.info(f"send_kv_chunk: {req=} {last_chunk=} {end_idx=}")
+        # logger.info(f"send_kv_chunk: {req=} {last_chunk=} {end_idx=}")
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         end_idx = (

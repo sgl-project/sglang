@@ -756,7 +756,7 @@ class MooncakeKVManager(CommonKVManager):
                 dst_ranks_infos = []
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
                 assert kv_chunk.room in self.forward_results, f"kv_chunk.room {kv_chunk.room} not in forward_results"
-                logger.info(f"transfer_worker: {kv_chunk.room=} {self.forward_results=}")
+                # logger.info(f"transfer_worker: {kv_chunk.room=} {self.forward_results=}")
                 batch, result = self.forward_results[kv_chunk.room]
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
