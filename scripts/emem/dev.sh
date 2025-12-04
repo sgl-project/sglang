@@ -55,12 +55,13 @@ export CUDA_COREDUMP_GENERATION_FLAGS='skip_nonrelocated_elf_images,skip_global_
 export CUDA_COREDUMP_FILE="/tmp/cuda_coredump_%h.%p.%t"
 export SGLANG_ELASTIC_MEM_POOL=true
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 rm -rf nohup.out
 nohup python3 -m sglang.launch_server \
   --log-level debug \
   --model /data-mnt/tiny-random-llama-4-8E/ \
   --attention-backend fa3 \
-  --cuda-graph-max-bs 256 \
+  --cuda-graph-max-bs 1024 \
   --mem-fraction-static 0.3 \
   --hybrid-kvcache-ratio 1.0 \
   --context-length 65536 &
