@@ -21,7 +21,7 @@ import uuid
 from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
@@ -1344,6 +1344,17 @@ class AbortReq(BaseReq):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+
+@dataclass
+class ModelWorkerTask:
+    task_func: Callable
+    kwargs: Dict[str, Any]
+
+
+@dataclass
+class ModelWorkerTaskOutput:
+    result: Any
 
 
 @dataclass

@@ -922,6 +922,14 @@ class ModelRunner:
                 rank=self.tp_rank,
             )
 
+    def execute_task_in_model_worker(self, task_spec, models=None):
+        """Execute a task on every model worker subprocess"""
+        task_func = task_spec.task_func
+        kwargs = task_spec.kwargs or {}
+        kwargs["model"] = models or self.model
+        kwargs["model_runner"] = self
+        return task_func(**kwargs)
+
     def update_weights_from_disk(
         self,
         model_path: str,

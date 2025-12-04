@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterReqInput,
+    ModelWorkerTask,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -98,6 +99,10 @@ class BaseTpWorker(ABC):
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
         )
+
+    def execute_task_in_model_worker(self, task_spec: ModelWorkerTask, models=None):
+        """Execute a task on every model worker subprocess"""
+        return self.model_runner.execute_task_in_model_worker(task_spec, models=models)
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
