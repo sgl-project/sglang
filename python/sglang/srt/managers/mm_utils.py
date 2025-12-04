@@ -21,7 +21,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.piecewise_cuda_graph_runner import use_original_ca_comm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
@@ -660,6 +659,10 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
+    # Lazy import to allow some monkey patch of piecewise_cuda_graph_runner
+    from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+        use_original_ca_comm,
+    )
 
     tp_group = get_tp_group()
 
@@ -835,3 +838,45 @@ def hash_feature(f):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
         return tensor_hash([reconstruct_t])
     return data_hash(f)
+
+
+def extend_mrope_positions_for_retracted_request(
+    mrope_positions: torch.Tensor, output_ids_len: int
+) -> torch.Tensor:
+    """
+    Extend mrope_positions for retracted requests by appending positions for output_ids.
+
+    When a request is retracted and has multimodal inputs with mrope_positions,
+    we need to extend the positions to cover the output_ids that were already generated.
+    For pure text tokens, all three dimensions use the same incremental sequence.
+
+    Args:
+        mrope_positions: The original mrope positions tensor, shape (3, origin_input_ids_len)
+        output_ids_len: The number of output tokens to generate positions for
+
+    Returns:
+        Extended mrope_positions tensor with shape (3, origin_input_ids_len + output_ids_len)
+    """
+    if output_ids_len <= 0:
+        return mrope_positions
+
+    # Get the last position value corresponding to origin_input_ids
+    # mrope_positions shape: (3, origin_input_ids_len)
+    last_position = mrope_positions[:, -1]  # shape: (3,)
+
+    # Generate pure text mrope positions for output_ids
+    # All three dimensions for pure text are the same incremental sequence
+    start_pos = last_position[0] + 1  # Start from last position + 1
+    output_positions = (
+        torch.arange(
+            start_pos,
+            start_pos + output_ids_len,
+            dtype=torch.int64,
+            device=mrope_positions.device,
+        )
+        .unsqueeze(0)
+        .expand(3, -1)
+    )  # shape: (3, output_ids_len)
+
+    # Concatenate to the original mrope_positions
+    return torch.cat([mrope_positions, output_positions], dim=1)
