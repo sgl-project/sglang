@@ -81,6 +81,56 @@ impl fmt::Display for FunctionCallEvent {
     }
 }
 
+/// Content part streaming events
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContentPartEvent {
+    Added,
+    Done,
+}
+
+impl ContentPartEvent {
+    pub const ADDED: &'static str = "response.content_part.added";
+    pub const DONE: &'static str = "response.content_part.done";
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Added => Self::ADDED,
+            Self::Done => Self::DONE,
+        }
+    }
+}
+
+impl fmt::Display for ContentPartEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Output text streaming events
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputTextEvent {
+    Delta,
+    Done,
+}
+
+impl OutputTextEvent {
+    pub const DELTA: &'static str = "response.output_text.delta";
+    pub const DONE: &'static str = "response.output_text.done";
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Delta => Self::DELTA,
+            Self::Done => Self::DONE,
+        }
+    }
+}
+
+impl fmt::Display for OutputTextEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // ============================================================================
 // MCP Events
 // ============================================================================
@@ -92,6 +142,7 @@ pub enum McpEvent {
     CallArgumentsDone,
     CallInProgress,
     CallCompleted,
+    CallFailed,
     ListToolsInProgress,
     ListToolsCompleted,
 }
@@ -101,6 +152,7 @@ impl McpEvent {
     pub const CALL_ARGUMENTS_DONE: &'static str = "response.mcp_call_arguments.done";
     pub const CALL_IN_PROGRESS: &'static str = "response.mcp_call.in_progress";
     pub const CALL_COMPLETED: &'static str = "response.mcp_call.completed";
+    pub const CALL_FAILED: &'static str = "response.mcp_call.failed";
     pub const LIST_TOOLS_IN_PROGRESS: &'static str = "response.mcp_list_tools.in_progress";
     pub const LIST_TOOLS_COMPLETED: &'static str = "response.mcp_list_tools.completed";
 
@@ -110,6 +162,7 @@ impl McpEvent {
             Self::CallArgumentsDone => Self::CALL_ARGUMENTS_DONE,
             Self::CallInProgress => Self::CALL_IN_PROGRESS,
             Self::CallCompleted => Self::CALL_COMPLETED,
+            Self::CallFailed => Self::CALL_FAILED,
             Self::ListToolsInProgress => Self::LIST_TOOLS_IN_PROGRESS,
             Self::ListToolsCompleted => Self::LIST_TOOLS_COMPLETED,
         }
