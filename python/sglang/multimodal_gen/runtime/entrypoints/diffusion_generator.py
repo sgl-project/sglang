@@ -195,11 +195,9 @@ class DiffGenerator:
                 with suppress_other_loggers():
                     ext = os.path.splitext(save_file_path)[1].lower().lstrip(".")
                     save_format = ext or data_type.get_default_extension()
-
                     is_multiframe = len(frames) > 1
-                    video_like_formats = {"mp4", "gif", "webp", "avi", "mov"}
 
-                    if is_multiframe and save_format in video_like_formats:
+                    if data_type == DataType.VIDEO:
                         imageio.mimsave(
                             save_file_path,
                             frames,
@@ -207,10 +205,10 @@ class DiffGenerator:
                             format=save_format,
                         )
                     else:
-                        if is_multiframe and save_format not in video_like_formats:
+                        if is_multiframe:
                             logger.warning(
-                                "Detected multiple frames but format '%s' is not a video "
-                                "format; saving the first frame only.",
+                                "Detected multiple frames for non-video output '%s'; saving the "
+                                "first frame only.",
                                 save_format,
                             )
                         imageio.imwrite(save_file_path, frames[0], format=save_format)
