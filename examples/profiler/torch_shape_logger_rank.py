@@ -68,6 +68,7 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         verbose: bool = False,
         only_rank: Optional[int] = None,
         log_first_n_forward_passes: int = 2,
+        skip_first_n_forward_passes: int = 2,
     ):
         super().__init__()
         self.output_file = output_file
@@ -81,14 +82,44 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         self._forward_pass_count = 0
         self._in_forward_pass = False
         self.log_first_n_forward_passes = log_first_n_forward_passes
+        self.skip_first_n_forward_passes = skip_first_n_forward_passes
 
     def start_forward_pass(self):
         """Called by tp_worker to mark start of forward pass."""
         if self.should_log and not self._in_forward_pass:
             self._in_forward_pass = True
             self._forward_pass_count += 1
+            effective_pass = self._forward_pass_count - self.skip_first_n_forward_passes
+            
+            # Add separator markers for prefill and decode
+            if self.file_handle and effective_pass > 0:
+                if effective_pass == 1:
+                    # First forward pass after warmup = prefill
+                    separator = {
+                        "call_id": 0,
+                        "forward_pass": self._forward_pass_count,
+                        "operation": "=" * 80,
+                        "marker": "PREFILL_START",
+                        "inputs": None,
+                        "outputs": None,
+                    }
+                    self.file_handle.write(json.dumps(separator) + "\n")
+                    self.file_handle.write("\n" * 3)  # Large space separator
+                elif effective_pass == 2:
+                    # Second forward pass after warmup = decode
+                    separator = {
+                        "call_id": 0,
+                        "forward_pass": self._forward_pass_count,
+                        "operation": "=" * 80,
+                        "marker": "DECODE_START",
+                        "inputs": None,
+                        "outputs": None,
+                    }
+                    self.file_handle.write(json.dumps(separator) + "\n")
+                    self.file_handle.write("\n" * 3)  # Large space separator
+            
             if self.verbose:
-                print(f"[Rank {self.current_rank}] Forward pass #{self._forward_pass_count} started")
+                print(f"[Rank {self.current_rank}] Forward pass #{self._forward_pass_count} started (effective: {effective_pass})")
 
     def end_forward_pass(self):
         """Called by tp_worker to mark end of forward pass."""
@@ -218,8 +249,13 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
 
     def _log_operation(self, func, named_inputs, result):
         """Log operation with minimal overhead."""
-        # Skip logging if we're limiting to first N forward passes and this exceeds that
-        if self.log_first_n_forward_passes > 0 and self._forward_pass_count > self.log_first_n_forward_passes:
+        # Skip warmup forward passes
+        if self._forward_pass_count <= self.skip_first_n_forward_passes:
+            return
+        
+        # Skip logging if we're limiting to first N forward passes after warmup and this exceeds that
+        effective_pass = self._forward_pass_count - self.skip_first_n_forward_passes
+        if self.log_first_n_forward_passes > 0 and effective_pass > self.log_first_n_forward_passes:
             return
         
         output_shapes = self._extract_shapes(result)

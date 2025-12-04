@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_SHAPE_PROFILING = os.environ.get("SGLANG_PROFILE_SHAPES", "0") == "1"
 _SHAPE_PROFILE_RANK = int(os.environ.get("SGLANG_PROFILE_SHAPES_RANK", "0"))
 _SHAPE_PROFILE_FILE = os.environ.get("SGLANG_PROFILE_SHAPES_FILE", "shapes.jsonl")
+_SHAPE_PROFILE_SKIP_WARMUP = int(os.environ.get("SGLANG_PROFILE_SHAPES_SKIP_WARMUP", "2"))  # Skip first 2 forward passes (warmup)
 _shape_logger_module = None
 
 if _ENABLE_SHAPE_PROFILING:
@@ -307,6 +308,7 @@ class TpModelWorker(BaseTpWorker):
                 self._shape_logger = _shape_logger_module(
                     output_file=_SHAPE_PROFILE_FILE,
                     verbose=False,
+                    skip_first_n_forward_passes=_SHAPE_PROFILE_SKIP_WARMUP,
                     only_rank=_SHAPE_PROFILE_RANK,
                 )
                 logger.info(f"[TP Rank {self.tp_rank}] Shape profiler initialized")
