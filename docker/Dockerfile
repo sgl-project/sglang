@@ -244,7 +244,7 @@ RUN set -eux; \
         cd .. ; \
     fi
 
-# Install DeepEP 
+# Install DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/DeepEP && \
     case "$CUDA_VERSION" in \
