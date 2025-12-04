@@ -30,6 +30,29 @@ use crate::multimodal::vision::{
     transforms::{normalize, pil_to_filter, resize, stack_batch, to_tensor, TransformError},
 };
 
+/// Python-compatible rounding (banker's rounding / round half to even).
+///
+/// This matches Python's `round()` behavior where 0.5 is rounded to the nearest
+/// even number, unlike Rust's `f64::round()` which rounds half away from zero.
+///
+/// Examples:
+/// - round_half_to_even(12.5) = 12 (not 13)
+/// - round_half_to_even(13.5) = 14 (not 14)
+/// - round_half_to_even(12.4) = 12
+/// - round_half_to_even(12.6) = 13
+#[inline]
+fn round_half_to_even(x: f64) -> f64 {
+    let rounded = x.round();
+    // Check if we're exactly at a .5 case
+    if (x - x.floor() - 0.5).abs() < 1e-9 {
+        // Round to nearest even
+        if rounded as i64 % 2 != 0 {
+            return rounded - 1.0;
+        }
+    }
+    rounded
+}
+
 /// Configuration for a Qwen VL processor variant.
 #[derive(Debug, Clone)]
 pub struct QwenVLConfig {
@@ -142,9 +165,11 @@ impl QwenVLProcessorBase {
             });
         }
 
-        // Round to nearest factor multiple
-        let mut h_bar = (height as f64 / factor as f64).round() as usize * factor;
-        let mut w_bar = (width as f64 / factor as f64).round() as usize * factor;
+        // Round to nearest factor multiple using Python-compatible rounding
+        // Python uses banker's rounding (round half to even), which affects
+        // edge cases like 400/32 = 12.5 -> 12 (not 13)
+        let mut h_bar = round_half_to_even(height as f64 / factor as f64) as usize * factor;
+        let mut w_bar = round_half_to_even(width as f64 / factor as f64) as usize * factor;
 
         // Ensure minimum size
         h_bar = h_bar.max(factor);
