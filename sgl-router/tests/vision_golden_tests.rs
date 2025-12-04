@@ -674,7 +674,7 @@ fn run_phi3_vision_golden_test(image_name: &str) {
         Some(ModelSpecificValue::UintTensor { data, shape }) => {
             let num_images = shape[0];
             (0..num_images)
-                .map(|i| (data[i * 2] as u32, data[i * 2 + 1] as u32))
+                .map(|i| (data[i * 2], data[i * 2 + 1]))
                 .collect()
         }
         _ => panic!("Expected image_sizes in model_specific"),
