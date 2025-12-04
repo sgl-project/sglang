@@ -205,9 +205,15 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
             input_shapes = self._extract_shapes(args)
             if input_shapes:
                 result["args"] = input_shapes
-            kwarg_shapes = self._extract_shapes(kwargs) if kwargs else None
-            if kwarg_shapes:
-                result.update(kwarg_shapes)
+            # Always include kwargs with their names, even if not tensors
+            if kwargs:
+                for kwarg_name, kwarg_value in kwargs.items():
+                    shape = self._extract_shapes(kwarg_value)
+                    if shape is not None:
+                        result[kwarg_name] = shape
+                    else:
+                        # Include kwargs even if not tensors (e.g., scalars, None)
+                        result[kwarg_name] = None
             return result if result else None
 
     def _log_operation(self, func, named_inputs, result):
