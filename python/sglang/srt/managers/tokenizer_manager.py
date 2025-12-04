@@ -68,6 +68,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
@@ -601,6 +602,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
             if mm_inputs and "input_ids" in mm_inputs:
                 input_ids = mm_inputs["input_ids"]
+                for item in mm_inputs["mm_items"]:
+                    if isinstance(item, MultimodalDataItem):
+                        item.set_pad_value()
         else:
             mm_inputs = None
 
