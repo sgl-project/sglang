@@ -24,16 +24,31 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          - name: test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500_50ms
-            prefill_size: 2
-            decode_size: 2
+          - name: test_ascend_deepseek_r1_w4a8_1p1d_in2048_out2048_50ms
+            prefill_size: 1
+            decode_size: 1
             router_size: 1
-            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500_50ms.py
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in2048_out2048_50ms.py
           - name: test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500_50ms
             prefill_size: 1
             decode_size: 1
             router_size: 1
             test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500_50ms.py
+          - name: test_ascend_deepseek_r1_w8a8_2p1d_in2048_out_2048_50ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w8a8_2p1d_in2048_out_2048_50ms.py
+          - name: test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500_50ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500_50ms.py
+          - name: test_ascend_Qwen3_235B_w8a8_1p1d_in3500_out1500
+            prefill_size: 1
+            decode_size: 2
+            router_size: 1
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_235B_w8a8_1p1d_in3500_out1500.py
     uses: ./.github/workflows/nightly-test-ascend-multi-node.yml
     with:
       soc_version: a3
@@ -51,7 +66,7 @@ jobs:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         test_config:
           - name: test_ascend_qwen3_8b_in1000_out300_bs8
@@ -60,6 +75,48 @@ jobs:
           - name: test_ascend_qwen3_8b_in1000_out300_bs16
             test_case: test/srt/ascend_k8s/test_ascend_qwen3_8b_in1000_out300_bs16.py
             npu_num: 4
+          - name: test_ascend_Qwen3_32B_in1024_out300_bs16
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in1024_out300_bs16.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_32B_in1024_out300_bs32
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in1024_out300_bs32.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_32B_in2048_out2048_bs78
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in2048_out2048_bs78.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_32B_in3500_out1500_bs78
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in3500_out1500_bs78.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_32B_in6144_out1500_bs16
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in6144_out1500_bs16.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_32B_in6144_out1500_bs32
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in6144_out1500_bs32.py
+            npu_num: 4
+          - name: test_ascend_QWQ3_32B_in6144_out1500_bs8
+            test_case: test/srt/ascend_k8s/test_ascend_QWQ3_32B_in6144_out1500_bs8.py
+            npu_num: 4
+          - name: test_ascend_QWQ3_32B_in6144_out1500_bs16
+            test_case: test/srt/ascend_k8s/test_ascend_QWQ3_32B_in6144_out1500_bs16.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs8
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs8.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs16
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs16.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs32
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs32.py
+            npu_num: 4
+          - name: test_ascend_Qwen3_235B_in2048_out2048_bs78
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_235B_in2048_out2048_bs78.py
+            npu_num: 16
+          - name: test_ascend_qwen3_coder_480b_a35b_instruct_w8a8_quarot_in16k_out10k
+            test_case: test/srt/ascend_k8s/test_ascend_qwen3_coder_480b_a35b_instruct_w8a8_quarot_in16k_out10k.py
+            npu_num: 16
+          - name: test_ascend_deepseek_r1_w4a8_single_in3500_out1500
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
+            npu_num: 16
     uses: ./.github/workflows/nightly-test-ascend-single-node.yml
     with:
       soc_version: a3
