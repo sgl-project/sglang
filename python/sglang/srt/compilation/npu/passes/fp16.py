@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import torch
+import sgl_kernel_npu
 
 
 class SplitQkvRmsnormRopeFuse:
@@ -106,7 +107,7 @@ class SplitQkvRmsnormRopeFuse:
         sin_contiguous = sin_view.contiguous()
 
         split_qkv_rmsnorm_rope_default = (
-            torch.ops.sglang.split_qkv_rmsnorm_rope.default(
+            sgl_kernel_npu.norm.split_qkv_rmsnorm_rope.default(
                 output_parallel,
                 sin_contiguous,
                 cos_contiguous,

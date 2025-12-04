@@ -40,9 +40,10 @@ if (
         or get_global_server_args().enable_piecewise_npu_graph_decode
     )
 ):
-    from sglang.srt._custom_ops import get_cmo_stream, wait_cmo_stream
+    from python.sglang.srt.distributed.device_communicators.custom_all_reduce_ops import get_cmo_stream, wait_cmo_stream
 else:
     from sglang.srt.utils import get_cmo_stream, wait_cmo_stream
+from sglang.srt.utils import add_prefix, is_cuda, is_npu
 
 Qwen3Config = None
 

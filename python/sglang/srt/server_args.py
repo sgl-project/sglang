@@ -105,6 +105,7 @@ QUANTIZATION_CHOICES = [
     "mxfp4",
     "auto-round",
     "compressed-tensors",  # for Ktransformers
+    "modelslim",  # for NPU
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -620,6 +621,7 @@ class ServerArgs:
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
+        self._handle_npu_backends()
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -932,6 +934,12 @@ class ServerArgs:
             if self.attention_backend is None:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
+
+    def _handle_npu_backends(self):
+        if self.device == "npu":
+            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
+
+            set_default_server_args(self)
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -1305,8 +1313,6 @@ class ServerArgs:
                     self.attention_backend = "fa3"
                 elif is_hip():
                     self.attention_backend = "aiter"
-                elif is_npu():
-                    self.attention_backend = "ascend"
                 else:
                     self.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
@@ -1324,8 +1330,6 @@ class ServerArgs:
                         self.attention_backend = "aiter"
                     else:
                         self.attention_backend = "triton"
-                elif is_npu():
-                    self.attention_backend = "ascend"
                 else:
                     self.attention_backend = "triton"
 
@@ -1426,13 +1430,6 @@ class ServerArgs:
         if self.attention_backend == "aiter":
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
-
-        # NPU platforms backends
-        if is_npu() and self.attention_backend in ["ascend"]:
-            logger.warning(
-                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
-            )
-            self.page_size = 128
 
         # Other platforms backends
         if (
@@ -1627,7 +1624,7 @@ class ServerArgs:
                 )
 
         if self.hicache_mem_layout == "page_first_direct":
-            if self.hicache_io_backend != "direct":
+            if self.hicache_io_backend not in ["direct", "kernel_ascend"]:
                 self.hicache_io_backend = "direct"
                 logger.warning(
                     "Page first direct layout only support direct io backend"
@@ -1650,20 +1647,6 @@ class ServerArgs:
                     "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
-
-        # Below are the only parameters currently supported on Ascend
-        if self.enable_hierarchical_cache and is_npu():
-            # FIXME(iforgetmyname) fix decode_attention_backend on ascend
-            self.decode_attention_backend = "ascend"
-            self.hicache_io_backend = "kernel_ascend"
-            if self.use_mla_backend():
-                self.hicache_mem_layout = "page_first_kv_split"
-            else:
-                self.hicache_mem_layout = "page_first_direct"
-            logger.warning(
-                f"Ascend NPU Platform detected, change `hicache_io_backend` to `kernel_ascend` and "
-                f"`hicache_mem_layout` to `{self.hicache_mem_layout}`"
-            )
 
     def _handle_speculative_decoding(self):
         if (
