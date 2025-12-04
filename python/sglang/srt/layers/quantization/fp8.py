@@ -763,6 +763,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
                 layer.w2_input_scale = None
                 if _use_aiter:
+                    # add this section for MI300
+                    # Pre-shuffle weights
                     layer.w13_weight.data = shuffle_weight(
                         layer.w13_weight.contiguous(), (16, 16)
                     )
