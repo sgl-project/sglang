@@ -304,6 +304,11 @@ RUN --mount=type=cache,target=/root/.cache/pip curl --proto '=https' --tlsv1.2 -
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc /root/.zshenv 2>/dev/null || true
 
+# Install S3 dependencies
+RUN python3 -m pip install \
+    boto3 \
+    runai-model-streamer \
+    runai-model-streamer-s3
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
