@@ -223,7 +223,7 @@ impl Phi3VisionProcessor {
     /// Transforms [3, H, W] -> [num_tiles, 3, 336, 336]
     /// where H and W are multiples of 336.
     fn reshape_to_tiles(&self, tensor: &Array3<f32>) -> Vec<Array3<f32>> {
-        let (c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
+        let (_c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
         let grid_h = h / TILE_SIZE as usize;
         let grid_w = w / TILE_SIZE as usize;
 
@@ -233,18 +233,11 @@ impl Phi3VisionProcessor {
             for gw in 0..grid_w {
                 let y_start = gh * TILE_SIZE as usize;
                 let x_start = gw * TILE_SIZE as usize;
+                let y_end = y_start + TILE_SIZE as usize;
+                let x_end = x_start + TILE_SIZE as usize;
 
-                let mut tile = Array3::<f32>::zeros((c, TILE_SIZE as usize, TILE_SIZE as usize));
-
-                for cc in 0..c {
-                    for y in 0..TILE_SIZE as usize {
-                        for x in 0..TILE_SIZE as usize {
-                            tile[[cc, y, x]] = tensor[[cc, y_start + y, x_start + x]];
-                        }
-                    }
-                }
-
-                tiles.push(tile);
+                let tile_view = tensor.slice(s![.., y_start..y_end, x_start..x_end]);
+                tiles.push(tile_view.to_owned());
             }
         }
 
@@ -371,7 +364,7 @@ impl ImagePreProcessor for Phi3VisionProcessor {
 
         // Convert to dynamic array for storage
         let shape = batch_tensor.shape().to_vec();
-        let flat_data: Vec<f32> = batch_tensor.iter().copied().collect();
+        let (flat_data, _offset) = batch_tensor.into_raw_vec_and_offset();
 
         // Store image_sizes as model-specific data
         let mut model_specific = std::collections::HashMap::new();
@@ -401,8 +394,8 @@ impl ImagePreProcessor for Phi3VisionProcessor {
         // Phi3-Vision expects [B, num_crops+1, C, H, W]
         let pixel_values = ndarray::ArrayD::<f32>::from_shape_vec(IxDyn(&shape), flat_data)
             .map_err(|e| TransformError::InvalidShape {
-                expected: "valid 5D shape".to_string(),
-                actual: vec![e.to_string().len()],
+                expected: format!("valid 5D shape, but failed with error: {}", e),
+                actual: shape.clone(),
             })?;
 
         Ok(PreprocessedImages {

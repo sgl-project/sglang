@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use image::DynamicImage;
-use ndarray::{Array4, ArrayD, IxDyn};
+use ndarray::{Array4, ArrayD};
 
 use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 
@@ -116,14 +116,8 @@ impl PreprocessedImages {
         num_img_tokens: Vec<usize>,
         image_sizes: Vec<(u32, u32)>,
     ) -> Self {
-        // Convert Array4 to ArrayD
-        let shape = pixel_values.shape().to_vec();
-        let data: Vec<f32> = pixel_values.iter().copied().collect();
-        let pixel_values_dynamic =
-            ArrayD::from_shape_vec(IxDyn(&shape), data).expect("Invalid shape conversion");
-
         Self {
-            pixel_values: pixel_values_dynamic,
+            pixel_values: pixel_values.into_dyn(),
             num_img_tokens,
             image_sizes,
             model_specific: HashMap::new(),
@@ -162,13 +156,13 @@ impl PreprocessedImages {
     /// For 4D tensors [B, C, H, W], returns shape[1].
     /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[2].
     pub fn channels(&self) -> usize {
-        let ndim = self.pixel_values.ndim();
-        if ndim == 4 {
-            self.pixel_values.shape()[1]
-        } else if ndim == 5 {
-            self.pixel_values.shape()[2]
-        } else {
-            self.pixel_values.shape()[1] // Fallback
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[1],
+            5 => self.pixel_values.shape()[2],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
         }
     }
 
@@ -177,13 +171,13 @@ impl PreprocessedImages {
     /// For 4D tensors [B, C, H, W], returns shape[2].
     /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[3].
     pub fn height(&self) -> usize {
-        let ndim = self.pixel_values.ndim();
-        if ndim == 4 {
-            self.pixel_values.shape()[2]
-        } else if ndim == 5 {
-            self.pixel_values.shape()[3]
-        } else {
-            self.pixel_values.shape()[2] // Fallback
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[2],
+            5 => self.pixel_values.shape()[3],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
         }
     }
 
@@ -192,13 +186,13 @@ impl PreprocessedImages {
     /// For 4D tensors [B, C, H, W], returns shape[3].
     /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[4].
     pub fn width(&self) -> usize {
-        let ndim = self.pixel_values.ndim();
-        if ndim == 4 {
-            self.pixel_values.shape()[3]
-        } else if ndim == 5 {
-            self.pixel_values.shape()[4]
-        } else {
-            self.pixel_values.shape()[3] // Fallback
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[3],
+            5 => self.pixel_values.shape()[4],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
         }
     }
 
