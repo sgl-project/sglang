@@ -1474,7 +1474,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        llama_4_scaling: Optional[torch.Tensor],
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         s = self.forward_prepare(
             positions=positions,
@@ -1491,7 +1491,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        llama_4_scaling: Optional[torch.Tensor],
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1767,7 +1767,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
-        llama_4_scaling: Optional[torch.Tensor],
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
