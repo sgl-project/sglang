@@ -211,39 +211,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
         python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
     fi \
-    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-        python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-        python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
-    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-        python3 -m pip uninstall -y torch torchaudio torchvision ; \
-        python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
-        python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-    else \
-        echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
-    fi \
     && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
 
 # Download NVSHMEM and DeepEP sources
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 # TODO: move from Tom's branch to DeepEP hybrid-ep branch
 RUN set -eux; \
-    if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-      pip install nvidia-nvshmem-cu12==3.3.20 ; \
-    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-      pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} ; \
-    else \
-      echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ; \
-    fi && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
-<<<<<<< HEAD
-=======
-        git clone https://github.com/fzyzcjy/DeepEP.git && \
-        cd DeepEP && \
-        git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
-        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-        cd .. ; \
->>>>>>> 3c08e2de2cdf81c7d3c7c17c38ad269d33b6e168
       git clone https://github.com/fzyzcjy/DeepEP.git && \
       cd DeepEP && \
       git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
@@ -318,13 +292,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
-# Install cutlass-dsl and nixl-cu13
+# Patching packages for CUDA 12/13 compatibility
+# TODO: Remove when torch version covers these packages
 # TODO: Move cutlass-dsl to pyproject.toml after drivers on CI runners are updated
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps; \
+    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-nvshmem-cu12==3.3.20 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
+    python3 -m pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 ; \
-    python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps; \
+    python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps ; \
 fi
 
 # Install development tools
