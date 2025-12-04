@@ -229,6 +229,32 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     int64_t kv_lora_rank,
     int64_t qk_rope_head_dim);
 
+// mamba causal conv1d
+at::Tensor causal_conv1d_weight_pack(const at::Tensor& weight);
+
+at::Tensor causal_conv1d_fwd_cpu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id,
+    bool is_vnni);
+
+at::Tensor causal_conv1d_update_cpu(
+    const at::Tensor& x,
+    const at::Tensor& conv_states,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices,
+    int64_t pad_slot_id,
+    bool is_vnni);
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -382,6 +408,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "routed_scaling_factor, bool inplace, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? w1_scale, Tensor? "
       "w2_scale, int[]? block_size, Tensor? a1_scale, Tensor? a2_scale, bool is_vnni) -> Tensor");
   m.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu);
+
+  // causal conv1d
+  m.def("causal_conv1d_weight_pack(Tensor weight) -> Tensor");
+  m.impl("causal_conv1d_weight_pack", torch::kCPU, &causal_conv1d_weight_pack);
+
+  m.def(
+      "causal_conv1d_fwd_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor? conv_states, Tensor? query_start_loc,"
+      "Tensor? cache_indices, Tensor? has_initial_state, bool silu_activation, int pad_slot_id, bool is_vnni) -> "
+      "Tensor");
+  m.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
+
+  m.def(
+      "causal_conv1d_update_cpu(Tensor x, Tensor conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
+      "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
+  m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
 
   // all reduce
   m.def("initialize(int size, int rank) -> ()");

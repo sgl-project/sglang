@@ -323,14 +323,18 @@ suite_amd = {
 }
 
 # Add Intel Xeon tests
-# NOTE: please sort the test cases alphabetically by the test file name
 suite_xeon = {
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_binding.py"),
+        TestFile("cpu/test_causal_conv1d.py"),
+        TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
         TestFile("cpu/test_gemm.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_a.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_b.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_c.py"),
         TestFile("cpu/test_mamba.py"),
         TestFile("cpu/test_mla.py"),
         TestFile("cpu/test_moe.py"),
@@ -340,10 +344,6 @@ suite_xeon = {
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("cpu/test_cpu_graph.py"),
-        TestFile("cpu/test_intel_amx_attention_backend_a.py"),
-        TestFile("cpu/test_intel_amx_attention_backend_b.py"),
-        TestFile("cpu/test_intel_amx_attention_backend_c.py"),
     ],
 }
 
