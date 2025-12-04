@@ -404,10 +404,12 @@ def maybe_download_model(
                 )
             logger.info("Loaded model from cache at %s", local_path)
             return str(local_path)
-        except Exception:
-            # If not in cache, download from HF Hub
+        except Exception as cache_error:
+            # If not in cache or cache is incomplete/corrupted, download from HF Hub
             logger.info(
-                "Model not in cache, downloading from HF Hub for %s...", model_name_or_path
+                "Cache miss or incomplete cache (%s), downloading from HF Hub for %s...", 
+                str(cache_error)[:100], 
+                model_name_or_path
             )
             with (
                 get_lock(model_name_or_path).acquire(poll_interval=2),
