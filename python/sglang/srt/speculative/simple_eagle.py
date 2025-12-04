@@ -462,6 +462,9 @@ class SimpleEagleWorker(TpModelWorker):
             draft_input.seq_lens_for_draft_extend = forward_batch.seq_lens + (
                 accept_length_for_draft_extend + 1
             )
+            draft_input.seq_lens_for_draft_extend_cpu = forward_batch.seq_lens_cpu + (
+                accept_length_for_draft_extend.cpu() + 1
+            ) # fix unsupported operand type(s) for +: 'NoneType' and 'int'
             draft_input.req_pool_indices_for_draft_extend = (
                 forward_batch.req_pool_indices
             )
@@ -492,7 +495,7 @@ class SimpleEagleWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length
         batch.spec_info.accept_length_cpu = accept_length_cpu
         batch.seq_lens.add_(accept_length + 1)
-        batch.seq_lens_cpu.add_(accept_length.cpu() + 1) # fix bug : memory leak
+        batch.seq_lens_cpu.add_(accept_length.cpu() + 1)  # fix bug : memory leak
         batch.seq_lens_sum = batch.seq_lens.sum().item()
 
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
