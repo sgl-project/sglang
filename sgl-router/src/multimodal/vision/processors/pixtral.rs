@@ -279,8 +279,9 @@ impl ImagePreProcessor for PixtralProcessor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use image::{Rgb, RgbImage};
+
+    use super::*;
 
     fn create_test_image(width: u32, height: u32) -> DynamicImage {
         let mut img = RgbImage::new(width, height);

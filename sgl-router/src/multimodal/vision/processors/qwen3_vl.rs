@@ -246,8 +246,9 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
-    use crate::multimodal::vision::image_processor::ModelSpecificValue;
-    use crate::multimodal::vision::preprocessor_config::PatchSize;
+    use crate::multimodal::vision::{
+        image_processor::ModelSpecificValue, preprocessor_config::PatchSize,
+    };
 
     fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))

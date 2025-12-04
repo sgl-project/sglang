@@ -24,8 +24,9 @@ fn deserialize_patch_size<'de, D>(deserializer: D) -> Result<Option<PatchSize>, 
 where
     D: Deserializer<'de>,
 {
-    use serde::de::{self, MapAccess, Visitor};
     use std::fmt;
+
+    use serde::de::{self, MapAccess, Visitor};
 
     struct PatchSizeVisitor;
 
