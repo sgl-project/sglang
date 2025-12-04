@@ -75,13 +75,6 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=1)
-        for num_warps in [1, 2, 4, 8]
-    ],
-    key=["D"],
-)
 @triton.jit
 def rmsnorm_sumsq_kernel_serial(
     x1_ptr,  # T* [B, D]
@@ -117,13 +110,6 @@ def rmsnorm_sumsq_kernel_serial(
     tl.store(sum_sq_ptr + row_id + B, sum_sq2)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=1)
-        for num_warps in [1, 2, 4, 8]
-    ],
-    key=["D"],
-)
 @triton.jit
 def rmsnorm_apply_kernel_serial(
     x1_ptr,  # T* [B, D]
