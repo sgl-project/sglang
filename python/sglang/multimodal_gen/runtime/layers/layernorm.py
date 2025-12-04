@@ -31,6 +31,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
+from sgl_kernel import scale_residual_norm_scale_shit
 
 
 # Copied and adapted from sglang
@@ -311,12 +312,12 @@ class ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ):
-        return torch.ops.sglang_ops.scale_residual_norm_scale_shift(
+        scale_residual_norm_scale_shit(
             residual, x,
             gate if isinstance(gate, torch.Tensor) else None,
             self.norm.weight, self.norm.bias,
             scale, shift,
-            self.eps, self.norm_type == "rms",
+            self.eps, self.norm_type,
         )
 
     def forward_native(
@@ -358,7 +359,7 @@ class ScaleResidualNormScaleShift(CustomOp):
         # 4. apply scale/shift if given
         batch, seq_len, hidden_dim = x.shape
         if scale.ndim <= 3:
-            if scale.ndim == 0 or (scale.ndim == 1 and scale.size == 1):
+            if scale.ndim == 0 or (scale.ndim == 1 and scale.numel() == 1):
                 # (), (1) → (B, S, D)
                 scale = scale.expand(batch, seq_len, hidden_dim)
                 shift = shift.expand(batch, seq_len, hidden_dim)
