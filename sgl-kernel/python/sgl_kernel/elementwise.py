@@ -133,24 +133,11 @@ def scale_residual_norm_scale_shift(
     eps: float,
     norm_type: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Gemma-style root mean square normalization.
+    r"""Fused kernel: scale_residual_norm_scale_shift.
 
-    ``out[i] = (input[i] / RMS(input)) * (weight[i] + 1)``
-
-    Parameters
-    ----------
-    input: torch.Tensor
-        Input tensor, shape (batch_size, hidden_size).
-    weight: torch.Tensor
-        Weight tensor, shape (hidden_size,).
-    eps: float
-        Epsilon for numerical stability.
-    out: Optional[torch.Tensor]
-        The output tensor, if specified, the kernel will update this tensor inplace.
-    enable_pdl: Optional[bool]
-        Whether to enable `programmatic dependent launch
-        <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
-        If None, will be automatically enabled on Hopper architecture.
+    1. residual_out = residual + gate * x
+    2. normalized = norm(residual_out)
+    3. modulated = (1 + scale) * normalized + shift.
 
     Returns
     -------
