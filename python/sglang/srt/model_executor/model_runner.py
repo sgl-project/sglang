@@ -2592,14 +2592,6 @@ class ModelRunner:
         ):
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
-        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-        if (
-            forward_batch.num_token_non_padded is not None
-            and require_gathered_buffer
-            and not is_nsa_enable_prefill_cp()
-        ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp()
-
         if not skip_attn_backend_init:
             self.attn_backend.init_forward_metadata(forward_batch)
 
@@ -2703,6 +2695,14 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+
+        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+        if (
+            forward_batch.num_token_non_padded is not None
+            and require_gathered_buffer
+            and not is_nsa_enable_prefill_cp()
+        ):
+            forward_batch.adjust_num_token_non_padded_for_attn_tp()
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
