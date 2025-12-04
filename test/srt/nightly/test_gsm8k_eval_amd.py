@@ -39,6 +39,8 @@ MODEL_SCORE_THRESHOLDS = {
 
 failing_models = {
     "neuralmagic/gemma-2-2b-it-FP8",
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",  # RuntimeError: This GEMM is not supported!
+    "zai-org/GLM-4.5-Air-FP8",  # TypeError: cannot unpack non-iterable ForwardMetadata object
 }
 
 

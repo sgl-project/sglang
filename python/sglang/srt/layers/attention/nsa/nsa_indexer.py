@@ -1003,7 +1003,7 @@ class Indexer(CustomOp):
         )  # [bs, 64, 64 + 64]
 
         q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(
+        q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
             bs, self.n_heads, self.rope_head_dim
         )  # [bs, n, d]
         q = torch.cat([q_pe, q_nope], dim=-1)
@@ -1017,7 +1017,7 @@ class Indexer(CustomOp):
         )  # [bs, 64 + 64]
 
         k_pe = k_pe.view(-1, 1, 1, self.rope_head_dim)
-        k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin).view(
+        k_pe = torch_npu.npu_rotary_mul(k_pe, cos, sin).view(
             bs, 1, self.rope_head_dim
         )  # [bs, 1, d]
         k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
@@ -1087,7 +1087,7 @@ class Indexer(CustomOp):
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
 
         x = x.view(-1, self.hidden_size)
-        weights = self.weights_proj(x.float())[0]
+        weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
         block_table = (
             block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table
         )

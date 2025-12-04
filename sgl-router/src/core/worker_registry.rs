@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
+use crate::core::{ConnectionMode, RuntimeType, Worker, WorkerType};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -283,12 +283,14 @@ impl WorkerRegistry {
     /// - model_id: Filter by specific model
     /// - worker_type: Filter by worker type (Regular, Prefill, Decode)
     /// - connection_mode: Filter by connection mode (Http, Grpc)
+    /// - runtime_type: Filter by runtime type (Sglang, Vllm, External)
     /// - healthy_only: Only return healthy workers
     pub fn get_workers_filtered(
         &self,
         model_id: Option<&str>,
         worker_type: Option<WorkerType>,
         connection_mode: Option<ConnectionMode>,
+        runtime_type: Option<RuntimeType>,
         healthy_only: bool,
     ) -> Vec<Arc<dyn Worker>> {
         // Start with the most efficient collection based on filters
@@ -313,6 +315,13 @@ impl WorkerRegistry {
                 // Check connection_mode if specified (using matches for flexible gRPC matching)
                 if let Some(ref conn) = connection_mode {
                     if !w.connection_mode().matches(conn) {
+                        return false;
+                    }
+                }
+
+                // Check runtime_type if specified
+                if let Some(ref rt) = runtime_type {
+                    if w.metadata().runtime_type != *rt {
                         return false;
                     }
                 }
