@@ -12,7 +12,9 @@
 //! - **Qwen3-VL** (`qwen3_vl`): Similar to Qwen2-VL but with patch_size=16 and [0.5,0.5,0.5] normalization
 //! - **Phi3-Vision** (`phi3_vision`): Dynamic HD transform with 336x336 tiles
 //! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
+//! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 
+pub mod llama4_vision;
 pub mod llava;
 pub mod phi3_vision;
 pub mod phi4_vision;
@@ -20,6 +22,7 @@ pub mod qwen2_vl;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
+pub use llama4_vision::Llama4VisionProcessor;
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
