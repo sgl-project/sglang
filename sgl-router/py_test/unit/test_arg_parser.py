@@ -476,7 +476,7 @@ class TestParseRouterArgs:
 
     def test_parse_service_discovery_args(self):
         """Test parsing service discovery arguments."""
-        args = [
+        args_a = [
             "--service-discovery",
             "--selector",
             "app=worker",
@@ -486,13 +486,24 @@ class TestParseRouterArgs:
             "--service-discovery-namespace",
             "default",
         ]
+        args_b = [
+            "--service-discovery",
+            "--selector",
+            # OME has this style
+            "app=worker env=prod",
+            "--service-discovery-port",
+            "8080",
+            "--service-discovery-namespace",
+            "default",
+        ]
 
-        router_args = parse_router_args(args)
+        for args in [args_a, args_b]:
+            router_args = parse_router_args(args)
 
-        assert router_args.service_discovery is True
-        assert router_args.selector == {"app": "worker", "env": "prod"}
-        assert router_args.service_discovery_port == 8080
-        assert router_args.service_discovery_namespace == "default"
+            assert router_args.service_discovery is True
+            assert router_args.selector == {"app": "worker", "env": "prod"}
+            assert router_args.service_discovery_port == 8080
+            assert router_args.service_discovery_namespace == "default"
 
     def test_parse_retry_and_circuit_breaker_args(self):
         """Test parsing retry and circuit breaker arguments."""
