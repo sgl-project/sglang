@@ -30,7 +30,6 @@ use super::{
     provider::ProviderRegistry,
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
-    utils::{apply_provider_headers, extract_auth_header},
 };
 use crate::{
     app_context::AppContext,
@@ -48,6 +47,7 @@ use crate::{
             ResponsesGetParams, ResponsesRequest,
         },
     },
+    routers::header_utils::{apply_provider_headers, extract_auth_header},
 };
 
 pub struct OpenAIRouter {

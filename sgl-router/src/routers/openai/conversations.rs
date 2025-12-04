@@ -22,10 +22,6 @@ use crate::{
     protocols::responses::{generate_id, ResponseInput, ResponsesRequest},
 };
 
-// ============================================================================
-// Persistence Operations (OpenAI-specific)
-// ============================================================================
-
 /// Persist conversation items to storage
 ///
 /// This function:
