@@ -36,7 +36,7 @@
 use std::collections::HashSet;
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgb, RgbImage};
-use ndarray::{Array2, Array3, Array4, IxDyn};
+use ndarray::{s, Array2, Array3, Array4, IxDyn};
 
 use crate::multimodal::vision::{
     image_processor::{ImagePreProcessor, ModelSpecificValue, PreprocessedImages},
@@ -288,13 +288,8 @@ impl Phi4VisionProcessor {
         let white = Rgb([255u8, 255, 255]);
         let mut padded = RgbImage::from_pixel(target_w, target_h, white);
 
-        // Copy image to top-left
-        let rgb_image = image.to_rgb8();
-        for y in 0..h {
-            for x in 0..w {
-                padded.put_pixel(x, y, *rgb_image.get_pixel(x, y));
-            }
-        }
+        // Copy image to top-left using efficient overlay
+        image::imageops::overlay(&mut padded, &image.to_rgb8(), 0, 0);
 
         DynamicImage::ImageRgb8(padded)
     }
@@ -399,23 +394,11 @@ impl Phi4VisionProcessor {
         let mut output = Array4::<f32>::zeros((total_crops, 3, base, base));
 
         // First slot is global image
-        for c in 0..3 {
-            for y in 0..base {
-                for x in 0..base {
-                    output[[0, c, y, x]] = global_tensor[[c, y, x]];
-                }
-            }
-        }
+        output.slice_mut(s![0, .., .., ..]).assign(&global_tensor);
 
         // Remaining slots are HD tiles
-        for t in 0..num_hd_tiles {
-            for c in 0..3 {
-                for y in 0..base {
-                    for x in 0..base {
-                        output[[t + 1, c, y, x]] = tiles[[t, c, y, x]];
-                    }
-                }
-            }
+        if num_hd_tiles > 0 {
+            output.slice_mut(s![1.., .., .., ..]).assign(&tiles);
         }
 
         // Step 6: Create combined attention mask [total_crops, mask_resolution, mask_resolution]
@@ -423,11 +406,7 @@ impl Phi4VisionProcessor {
         let mut combined_mask = Array3::<u32>::zeros((total_crops, mask_res, mask_res));
 
         // Global mask is all ones
-        for y in 0..mask_res {
-            for x in 0..mask_res {
-                combined_mask[[0, y, x]] = 1;
-            }
-        }
+        combined_mask.slice_mut(s![0, .., ..]).fill(1);
 
         // Tile attention masks
         for h_idx in 0..h_crops {
@@ -436,12 +415,13 @@ impl Phi4VisionProcessor {
                 let mask_y_start = h_idx * mask_res;
                 let mask_x_start = w_idx * mask_res;
 
-                for y in 0..mask_res {
-                    for x in 0..mask_res {
-                        combined_mask[[tile_idx, y, x]] =
-                            attention_mask[[mask_y_start + y, mask_x_start + x]];
-                    }
-                }
+                let tile_mask = attention_mask.slice(s![
+                    mask_y_start..mask_y_start + mask_res,
+                    mask_x_start..mask_x_start + mask_res
+                ]);
+                combined_mask
+                    .slice_mut(s![tile_idx, .., ..])
+                    .assign(&tile_mask);
             }
         }
 
