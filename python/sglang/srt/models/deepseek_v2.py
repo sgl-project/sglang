@@ -1218,6 +1218,16 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+def _get_llama_4_scaling(
+    original_max_position_embeddings: int, scaling_beta: float, positions: torch.Tensor
+) -> torch.Tensor:
+    scaling = 1 + scaling_beta * torch.log(
+        1 + torch.floor(positions / original_max_position_embeddings)
+    )
+    # Broadcast over num_heads and head_dim
+    return scaling[..., None, None]
+
+
 class DeepseekV2AttentionMLA(nn.Module):
 
     def __init__(
@@ -1519,12 +1529,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            llama_4_scaling=llama_4_scaling,
         )
         return self.forward_core(s)
 
@@ -1534,6 +1546,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1573,7 +1586,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             inner_state = self.forward_absorb_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions, hidden_states, forward_batch, zero_allocator, llama_4_scaling
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
@@ -1797,6 +1810,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -1974,6 +1988,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             zero_allocator,
             positions,
             topk_indices,
+            llama_4_scaling,
         )
 
     def forward_absorb_core(
@@ -1986,6 +2001,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         zero_allocator,
         positions,
         topk_indices,
+        llama_4_scaling,
     ):
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -1993,6 +2009,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 extra_args = {
                     "cos_sin_cache": self.rotary_emb.cos_sin_cache,
                     "is_neox": self.rotary_emb.is_neox_style,
+                    "llama_4_scaling": llama_4_scaling,
                 }
 
             attn_output = self.attn_mqa(
@@ -2022,6 +2039,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
+
+            # Apply llama 4 scaling if provided
+            if llama_4_scaling is not None:
+                q *= llama_4_scaling
 
             attn_output = self.attn_mqa(
                 q,
@@ -2766,6 +2787,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         quant_format = (
             "mxfp4"
@@ -2806,6 +2828,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            llama_4_scaling=llama_4_scaling,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -3024,6 +3047,9 @@ class DeepseekV2Model(nn.Module):
             )
         self.layers_to_capture = []
 
+        # llama_4_scaling: for supporting Mistral-Large-3 model
+        self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
+
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
@@ -3072,6 +3098,18 @@ class DeepseekV2Model(nn.Module):
         if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
 
+        # llama_4_scaling: for supporting Mistral-Large-3 model
+        # Compute llama 4 scaling once per forward pass if enabled
+        llama_4_scaling: Optional[torch.Tensor] = None
+        if self.llama_4_scaling_config is not None:
+            llama_4_scaling = _get_llama_4_scaling(
+                original_max_position_embeddings=self.llama_4_scaling_config[
+                    "original_max_position_embeddings"
+                ],
+                scaling_beta=self.llama_4_scaling_config["beta"],
+                positions=positions,
+            )
+
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
         if forward_batch.can_run_tbo:
@@ -3095,6 +3133,7 @@ class DeepseekV2Model(nn.Module):
                     residual,
                     zero_allocator,
                     gemm_output_zero_allocator,
+                    llama_4_scaling,
                 )
 
         if normal_end_layer != self.end_layer:
@@ -3351,8 +3390,10 @@ class DeepseekV2ForCausalLM(nn.Module):
             ):
                 # For mixed quantization (experts int4, linear fp8), use linear_fp8_config
                 selected_quant_config = getattr(
-                    self.quant_config, "linear_fp8_config", self.quant_config
+                    self.quant_config, "linear_fp8_config", None
                 )
+                if selected_quant_config is None:
+                    selected_quant_config = self.quant_config
                 weight_block_size = getattr(
                     selected_quant_config, "weight_block_size", None
                 )
@@ -3739,16 +3780,24 @@ class DeepseekV2ForCausalLM(nn.Module):
                             ):
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                                cat_dim = 0
-                                if self.quant_config is not None and (
-                                    self.quant_config.get_name() == "awq"
-                                    or self.quant_config.get_name() == "awq_marlin"
-                                    or self.quant_config.get_name() == "moe_wna16"
-                                ):
-                                    cat_dim = 1
-                                fused_weight = torch.cat(
-                                    [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                )
+
+                                if q_a_proj_weight.shape == torch.Size(
+                                    []
+                                ) and kv_a_proj_weight.shape == torch.Size([]):
+                                    fused_weight = q_a_proj_weight
+                                else:
+                                    cat_dim = 0
+                                    if self.quant_config is not None and (
+                                        self.quant_config.get_name() == "awq"
+                                        or self.quant_config.get_name() == "awq_marlin"
+                                        or self.quant_config.get_name() == "moe_wna16"
+                                    ):
+                                        cat_dim = 1
+
+                                    fused_weight = torch.cat(
+                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
+                                    )
+
                                 param_name = (
                                     name.replace(
                                         "q_a_proj", "fused_qkv_a_proj_with_mqa"
