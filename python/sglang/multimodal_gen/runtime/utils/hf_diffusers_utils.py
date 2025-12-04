@@ -379,34 +379,36 @@ def maybe_download_model(
     Returns:
         Local path to the model
     """
-    from huggingface_hub import try_to_load_from_cache
+    import glob
 
     # If the path exists locally, return it
     if os.path.exists(model_name_or_path):
-        logger.info("Model already exists locally")
+        logger.info("Model already exists locally at %s", model_name_or_path)
         return model_name_or_path
 
-    # Otherwise, assume it's a HF Hub model ID and try to download it
+    # Otherwise, assume it's a HF Hub model ID
+    # FAST PATH: Check HF cache directly without any locks or verification
+    # Format: models--Org--Model/snapshots/HASH/
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    cache_dir = os.path.join(hf_home, "hub")
+    
+    # Convert model ID to cache directory format: "Org/Model" -> "models--Org--Model"
+    model_cache_name = f"models--{model_name_or_path.replace('/', '--')}"
+    model_cache_path = os.path.join(cache_dir, model_cache_name, "snapshots")
+    
+    # Check if cached snapshots exist
+    if os.path.exists(model_cache_path):
+        # Find the most recent snapshot (by modification time)
+        snapshots = glob.glob(os.path.join(model_cache_path, "*"))
+        if snapshots:
+            # Use the most recently modified snapshot
+            latest_snapshot = max(snapshots, key=os.path.getmtime)
+            logger.info("Found cached model at %s (NO VERIFICATION)", latest_snapshot)
+            return latest_snapshot
+    
+    # Cache miss - need to download
+    logger.info("Model not in cache, downloading from HF Hub for %s...", model_name_or_path)
     try:
-        # OPTIMIZATION: Check cache WITHOUT file-by-file verification to avoid lock contention
-        # This is critical for multi-GPU setups where multiple ranks would otherwise
-        # compete for locks on every model file
-        logger.info("Checking cache for %s...", model_name_or_path)
-        
-        # Try to find cached snapshot path directly
-        cache_path = try_to_load_from_cache(
-            repo_id=model_name_or_path,
-            filename="model_index.json",  # Check for a key file to verify cache exists
-        )
-        
-        if cache_path is not None and cache_path != "_CACHED_NO_EXIST":
-            # Cache hit! Get the snapshot directory
-            cached_model_dir = os.path.dirname(cache_path)
-            logger.info("Found model in cache at %s", cached_model_dir)
-            return cached_model_dir
-        
-        # Cache miss - need to download
-        logger.info("Model not in cache, downloading from HF Hub for %s...", model_name_or_path)
         with (
             get_lock(model_name_or_path).acquire(poll_interval=2),
             suppress_other_loggers(not_suppress_on_main_rank=True),
