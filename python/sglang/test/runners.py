@@ -361,13 +361,14 @@ class HFRunner:
 
                 elif self.model_type == "reward":
                     scores = []
+                    device = "npu" if is_npu() else "cuda"
                     for conv in prompts:
                         conv_formatted = self.tokenizer.apply_chat_template(
                             conv, tokenize=False, return_dict=False
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
-                        ).to("cuda")
+                        ).to(device)
                         scores.append(
                             float(self.model(**conv_tokenized).logits[0][0].item())
                         )
