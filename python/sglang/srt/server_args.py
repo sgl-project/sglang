@@ -348,6 +348,9 @@ class ServerArgs:
     # FIXME: remove this after dp rank scheduling is fully supported with PD-Disaggregation
     prefill_round_robin_balance: bool = False
 
+    # Context parallelism
+    cp_size: int = 1
+
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
     nnodes: int = 1
@@ -1497,6 +1500,10 @@ class ServerArgs:
             logger.warning(
                 f"DP attention is enabled. The chunked prefill size is adjusted to {self.chunked_prefill_size} to avoid MoE kernel issues. "
             )
+
+        if self.cp_size > 1 and self.disaggregation_mode != "decode":
+            self.enable_dp_attention = True
+            assert self.tp_size % self.cp_size == 0
 
         if self.enable_dp_lm_head:
             assert (
@@ -2743,6 +2750,15 @@ class ServerArgs:
             help="Prefill is round robin balanced. This is used to promise decode server can get the correct dp rank.",
         )
 
+        # Context parallelism
+        parser.add_argument(
+            "--context-parallel-size",
+            "--cp-size",
+            type=int,
+            default=ServerArgs.cp_size,
+            help="The context parallelism size.",
+        )
+
         # Multi-node distributed serving
         parser.add_argument(
             "--dist-init-addr",
@@ -3901,6 +3917,7 @@ class ServerArgs:
         args.tp_size = args.tensor_parallel_size
         args.pp_size = args.pipeline_parallel_size
         args.dp_size = args.data_parallel_size
+        args.cp_size = args.context_parallel_size
         args.ep_size = args.expert_parallel_size
 
         attrs = [attr.name for attr in dataclasses.fields(cls)]

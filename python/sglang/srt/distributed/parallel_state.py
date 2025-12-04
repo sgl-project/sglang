@@ -1440,6 +1440,17 @@ def get_pp_group() -> GroupCoordinator:
 # kept for backward compatibility
 get_pipeline_model_parallel_group = get_pp_group
 
+_CP: Optional[GroupCoordinator] = None
+
+
+def get_cp_group() -> GroupCoordinator:
+    assert _CP is not None, "context model parallel group is not initialized"
+    return _CP
+
+
+# kept for backward compatibility
+get_context_model_parallel_group = get_cp_group
+
 
 @contextmanager
 def graph_capture(stream: Optional[torch.cuda.Stream] = None):
@@ -1554,6 +1565,7 @@ def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    context_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
     torch_compile: Optional[bool] = None,
@@ -1696,6 +1708,24 @@ def initialize_model_parallel(
         group_name="pp",
     )
 
+    num_context_model_parallel_groups: int = world_size // context_model_parallel_size
+    global _CP
+    assert _CP is None, "context model parallel group is already initialized"
+    group_ranks = []
+
+    for i in range(num_context_model_parallel_groups):
+        ranks = list(range(i, world_size, num_context_model_parallel_groups))
+        group_ranks.append(ranks)
+
+    logger.info(f"cp: {group_ranks}, {get_world_group().local_rank}")
+    _CP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_custom_allreduce=False,
+        group_name="cp",
+    )
+
 
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
@@ -1732,7 +1762,7 @@ def ensure_model_parallel_initialized(
 
 def model_parallel_is_initialized():
     """Check if tensor and pipeline parallel groups are initialized."""
-    return _TP is not None and _PP is not None
+    return _TP is not None and _PP is not None and _CP is not None
 
 
 _TP_STATE_PATCHED = False
@@ -1813,6 +1843,16 @@ def get_moe_tensor_parallel_rank():
     return get_moe_tp_group().rank_in_group
 
 
+def get_context_model_parallel_world_size():
+    """Return world size for the context model parallel group."""
+    return get_cp_group().world_size
+
+
+def get_context_model_parallel_rank():
+    """Return my rank for the context model parallel group."""
+    return get_cp_group().rank_in_group
+
+
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _TP
@@ -1829,6 +1869,11 @@ def destroy_model_parallel():
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
         _PDMUX_PREFILL_TP_GROUP.destroy()
     _PDMUX_PREFILL_TP_GROUP = None
+
+    global _CP
+    if _CP:
+        _CP.destroy()
+    _CP = None
 
 
 def destroy_distributed_environment():

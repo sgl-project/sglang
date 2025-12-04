@@ -12,6 +12,7 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
+    get_context_model_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -61,6 +62,9 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
+        if get_context_model_parallel_world_size() > 1:
+            return DpPaddingMode.MAX_LEN
+
         if is_extend_in_batch:
             return DpPaddingMode.SUM_LEN
 
@@ -263,7 +267,7 @@ def initialize_dp_attention(
 
     enable_dp_attention = server_args.enable_dp_attention
     tp_size = server_args.tp_size
-    dp_size = server_args.dp_size
+    dp_size = max(server_args.dp_size, server_args.cp_size)
     moe_dense_tp_size = server_args.moe_dense_tp_size
     pp_size = server_args.pp_size
 
@@ -534,6 +538,11 @@ def dp_scatter(
 ):
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
+    if get_context_model_parallel_world_size() > 1:
+        local_tokens[...] = global_tokens.tensor_split(get_attention_dp_size())[
+            get_attention_dp_rank()
+        ]
+        return
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
     local_tokens.fill_(0)

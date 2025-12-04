@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -207,7 +207,7 @@ class MooncakeKVManager(CommonKVManager):
             self.session_pool = defaultdict(requests.Session)
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker = defaultdict(set)
-            self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            self.prefill_response_tracker: Dict[int, List[int]] = defaultdict(list)
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 float(os.getenv("SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL", 5.0)), 2.0
@@ -897,7 +897,9 @@ class MooncakeKVManager(CommonKVManager):
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:
-                        self.prefill_response_tracker[bootstrap_room].add(prefill_rank)
+                        self.prefill_response_tracker[bootstrap_room].append(
+                            prefill_rank
+                        )
                         expected_response_num = (
                             self.required_prefill_response_num_table[bootstrap_room]
                         )
@@ -917,7 +919,11 @@ class MooncakeKVManager(CommonKVManager):
             while True:
                 time.sleep(self.heartbeat_interval)
                 with self.connection_lock:
-                    addresses = list(self.prefill_dp_size_table.keys())
+                    addresses = (
+                        list(self.prefill_cp_size_table.keys())
+                        if self.cp_size > 1
+                        else list(self.prefill_dp_size_table.keys())
+                    )
 
                 for bootstrap_addr in addresses:
                     session = None
@@ -1048,6 +1054,8 @@ class MooncakeKVManager(CommonKVManager):
                 del self.prefill_attn_tp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_dp_size_table:
                 del self.prefill_dp_size_table[failed_bootstrap_addr]
+            if failed_bootstrap_addr in self.prefill_cp_size_table:
+                del self.prefill_cp_size_table[failed_bootstrap_addr]
             if failed_bootstrap_addr in self.prefill_pp_size_table:
                 del self.prefill_pp_size_table[failed_bootstrap_addr]
 

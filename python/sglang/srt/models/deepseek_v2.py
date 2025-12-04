@@ -43,6 +43,8 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
+    get_context_model_parallel_rank,
+    get_context_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -2627,6 +2629,10 @@ class DeepseekV2AttentionMLA(nn.Module):
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)
             concat_and_cast_mha_k_triton(k, k_nope, k_pe)
         else:
+            cp_size = get_context_model_parallel_world_size()
+            if cp_size > 1:
+                k_shape = list(k_shape)
+                k_shape[0] = k_shape[0] * self.cp_size
             k = k_nope.new_empty(*k_shape)
             k[..., : self.qk_nope_head_dim] = k_nope
             k[..., self.qk_nope_head_dim :] = k_pe
@@ -3275,6 +3281,11 @@ class DeepseekV2ForCausalLM(nn.Module):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
+        else:
+            cp_size = get_context_model_parallel_world_size()
+            if cp_size > 1:
+                cp_rank = get_context_model_parallel_rank()
+                input_ids = input_ids.tensor_split(cp_size)[cp_rank]
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(

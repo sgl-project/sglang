@@ -231,6 +231,7 @@ class Scheduler(
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        cp_rank: Optional[int],
     ):
         # Parse args
         self.server_args = server_args
@@ -238,10 +239,12 @@ class Scheduler(
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
         self.dp_rank = dp_rank
+        self.cp_rank = cp_rank if cp_rank is not None else 0
         self.tp_size = server_args.tp_size
         self.moe_ep_size = server_args.ep_size
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
+        self.cp_size = server_args.cp_size
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
@@ -282,7 +285,7 @@ class Scheduler(
                 server_args.enable_dp_attention,
                 self.tp_rank,
                 self.tp_size,
-                self.dp_size,
+                max(self.dp_size, self.cp_size),
             )
         )
 
@@ -320,6 +323,7 @@ class Scheduler(
             moe_ep_rank=moe_ep_rank,
             pp_rank=pp_rank,
             dp_rank=dp_rank,
+            cp_rank=cp_rank,
             nccl_port=port_args.nccl_port,
         )
 
@@ -332,6 +336,7 @@ class Scheduler(
             nccl_port=port_args.nccl_port,
             target_worker=self.tp_worker,
             dp_rank=dp_rank,
+            cp_rank=cp_rank,
         )
 
         if server_args.speculative_draft_load_format is not None:
@@ -612,7 +617,7 @@ class Scheduler(
 
                 self.socket.send_pyobj(output)
 
-        if self.pp_rank == 0 and self.attn_tp_rank == 0:
+        if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.cp_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 context, zmq.PULL, port_args.scheduler_input_ipc_name, False
             )
@@ -1067,7 +1072,7 @@ class Scheduler(
                 return []
 
         if self.pp_rank == 0:
-            if self.attn_tp_rank == 0:
+            if self.attn_tp_rank == 0 and self.cp_rank == 0:
                 recv_reqs = []
 
                 while True:
@@ -1105,7 +1110,14 @@ class Scheduler(
         if self.input_blocker is not None:
             recv_reqs = self.input_blocker.handle(recv_reqs)
 
-        if self.server_args.enable_dp_attention:
+        if self.cp_size != 1:
+            recv_reqs = broadcast_pyobj(
+                recv_reqs,
+                self.world_group.rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )
+        elif self.server_args.enable_dp_attention:
             if self.attn_tp_rank == 0:
                 work_reqs = [
                     req
@@ -2602,6 +2614,7 @@ def run_scheduler_process(
     moe_ep_rank: int,
     pp_rank: int,
     dp_rank: Optional[int],
+    cp_rank: Optional[int],
     pipe_writer,
 ):
     # Generate the logger prefix
@@ -2613,6 +2626,8 @@ def run_scheduler_process(
         prefix += f" DP{dp_rank}"
     if server_args.pp_size > 1:
         prefix += f" PP{pp_rank}"
+    if cp_rank is not None:
+        prefix += f" CP{cp_rank}"
     if server_args.tp_size > 1:
         prefix += f" TP{tp_rank}"
     if server_args.ep_size > 1:
@@ -2658,6 +2673,7 @@ def run_scheduler_process(
             moe_ep_rank,
             pp_rank,
             dp_rank,
+            cp_rank,
         )
         pipe_writer.send(
             {
