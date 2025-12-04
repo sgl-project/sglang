@@ -61,6 +61,11 @@ MODELS = {
         "processor_class": "Phi4MMImageProcessor",
         "description": "Dynamic HD transform with 448x448 tiles and SiGLIP encoder",
     },
+    "llama4_vision": {
+        "model_id": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        "processor_class": "Llama4ImageProcessorFast",
+        "description": "Tile-based processing with 336x336 tiles and global tile",
+    },
 }
 
 # Default test images
@@ -480,6 +485,68 @@ def generate_golden_phi4_vision(image_path: str, output_dir: str) -> dict:
     return result
 
 
+def generate_golden_llama4_vision(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for LLaMA 4 Vision.
+
+    LLaMA 4 Vision uses tile-based processing:
+    1. Find supported resolutions based on max_patches (default 16)
+    2. Get best fit resolution for the image (minimize upscaling)
+    3. Resize preserving aspect ratio
+    4. Pad with black (0) to target dimensions
+    5. Normalize with [0.5, 0.5, 0.5] mean/std
+    6. Split into tiles of 336x336
+    7. If multiple tiles, add global tile at the end
+
+    Output:
+    - pixel_values: [1, num_tiles, 3, 336, 336]
+    - aspect_ratios: [1, 2] with [h_tiles, w_tiles]
+
+    Token count: num_tiles * (336 / 14)² = num_tiles * 576
+    """
+    from transformers.models.llama4 import Llama4ImageProcessorFast
+
+    processor = Llama4ImageProcessorFast()
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image - Llama4 only supports PyTorch tensors
+    outputs = processor(images=image, return_tensors="pt")
+    # Convert to numpy (need to convert from bfloat16 to float32 first)
+    pixel_values = outputs["pixel_values"].float().numpy()
+    aspect_ratios = outputs.get("aspect_ratios")
+    if aspect_ratios is not None:
+        aspect_ratios = aspect_ratios.numpy()
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": processor.to_dict(),
+    }
+
+    if aspect_ratios is not None:
+        result["aspect_ratios"] = aspect_ratios
+
+    # Calculate num_tokens from aspect_ratios
+    if aspect_ratios is not None:
+        h_tiles = int(aspect_ratios[0][0])
+        w_tiles = int(aspect_ratios[0][1])
+        num_tiles = h_tiles * w_tiles
+        # Add 1 for global tile if num_tiles > 1
+        total_tiles = num_tiles + 1 if num_tiles > 1 else num_tiles
+        tokens_per_tile = (336 // 14) ** 2  # 576
+        num_tokens = total_tiles * tokens_per_tile
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "tile_size": 336,
+        "max_patches": processor.max_patches,
+        "resize_to_max_canvas": processor.resize_to_max_canvas,
+    }
+
+    return result
+
+
 def generate_for_model(model_key: str, image_paths: list, output_dir: str):
     """Generate golden outputs for a specific model."""
     print(f"\nGenerating golden outputs for {model_key}...")
@@ -492,6 +559,7 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
         "qwen3_vl": generate_golden_qwen3_vl,
         "phi3_vision": generate_golden_phi3_vision,
         "phi4_vision": generate_golden_phi4_vision,
+        "llama4_vision": generate_golden_llama4_vision,
     }.get(model_key)
 
     if generator_fn is None:
