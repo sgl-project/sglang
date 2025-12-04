@@ -538,6 +538,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    nsa_prefill_cp_mode: int = 0
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -971,9 +972,10 @@ class ServerArgs:
                     if self.enable_nsa_prefill_context_parallel:
                         # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
                         self.moe_dense_tp_size = 1
-                        self.moe_a2a_backend = "deepep"
-                        self.ep_size = self.tp_size
-                        self.kv_cache_dtype = "bf16"
+                        if self.nsa_prefill_cp_mode != 1:
+                            self.moe_a2a_backend = "deepep"
+                            self.ep_size = self.tp_size
+                            self.kv_cache_dtype = "bf16"
                         assert (
                             self.tp_size == 8
                         ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
@@ -3694,7 +3696,13 @@ class ServerArgs:
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
-
+        parser.add_argument(
+            "--nsa-prefill-cp-mode",
+            type=int,
+            default=ServerArgs.nsa_prefill_cp_mode,
+            choices=[0, 1],
+            help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 0 (default), 1.",
+        )
         # Dynamic batch tokenizer
         parser.add_argument(
             "--enable-dynamic-batch-tokenizer",
