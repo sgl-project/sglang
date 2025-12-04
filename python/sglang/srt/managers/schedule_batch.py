@@ -99,6 +99,53 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 logger = logging.getLogger(__name__)
 
 
+_GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
+_BUFFER_OFFSET = 0
+_BUFFER_SIZE_MB = 2048
+logger = logging.getLogger(__name__)
+
+USE_BUFFER_FOR_FEATURE = envs.SGLANG_ENABLE_MM_BUFFER.get()
+
+
+def init_feature_buffer(device, size_mb=2048):
+    global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET, _BUFFER_SIZE_MB
+    if device == "cpu":
+        return
+    try:
+        _BUFFER_SIZE_MB = size_mb
+        num_elements = int(size_mb * 1024 * 1024 / 4)  # 4 bytes per float32
+        _GPU_FEATURE_BUFFER = torch.empty(
+            num_elements, dtype=torch.float32, device=device
+        )
+        _BUFFER_OFFSET = 0
+        logger.info(f"✅ Preallocated {size_mb}MB GPU buffer")
+    except RuntimeError as e:
+        logger.info(f"❎ Failed to preallocate GPU buffer: {e}")
+        _GPU_FEATURE_BUFFER = None
+
+
+def try_add_to_buffer(tensor: torch.Tensor) -> Optional[torch.Tensor]:
+    global _BUFFER_OFFSET
+
+    if _GPU_FEATURE_BUFFER is None:
+        return tensor
+
+    tensor_size = tensor.numel()
+
+    if _BUFFER_OFFSET + tensor_size <= _GPU_FEATURE_BUFFER.numel():
+        buffer_view = _GPU_FEATURE_BUFFER[_BUFFER_OFFSET : _BUFFER_OFFSET + tensor_size]
+        buffer_view.copy_(tensor.flatten(), non_blocking=True)
+        result = buffer_view.view(tensor.shape)
+        _BUFFER_OFFSET += tensor_size
+        logger.debug(
+            f"✅ Added to buffer ({_BUFFER_OFFSET}/{_GPU_FEATURE_BUFFER.numel()} used)"
+        )
+        return result
+    else:
+        logger.debug(f"❎ Buffer full, keeping on CPU")
+        return tensor
+
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
@@ -328,8 +375,26 @@ class MultimodalInputs:
 
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+
+        if USE_BUFFER_FOR_FEATURE:
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            if _GPU_FEATURE_BUFFER is None:
+                init_feature_buffer(device, size_mb=2048)
+
+            global _BUFFER_OFFSET
+            _BUFFER_OFFSET = 0
+            for item in ret.mm_items:
+                if item.feature is not None:
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = try_add_to_buffer(item.feature)
+
         for item in ret.mm_items:
             item.set_pad_value()
+
+        if USE_BUFFER_FOR_FEATURE:
+            for item in ret.mm_items:
+                if item.feature is not None:
+                    item.feature = item.feature.to("cpu", non_blocking=True)
 
         optional_args = [
             "mrope_positions",
