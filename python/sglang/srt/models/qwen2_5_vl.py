@@ -39,6 +39,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed,
     Qwen2_5_VisionRotaryEmbedding,
 )
+from typing_extensions import override
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -67,10 +68,11 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import permute_inv
-from sglang.srt.multimodal.evs import (
-    compute_mrope_for_media,
-    compute_retention_mask,
-    recompute_mrope_positions,
+from sglang.srt.multimodal.evs import EVSConfig, compute_mrope_for_media
+from sglang.srt.multimodal.evs.evs_module import (
+    EVSDataItem,
+    EVSWithMRope,
+    EVSWithMRopeConfig,
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
@@ -468,7 +470,19 @@ class Qwen2_5_VisionTransformer(nn.Module):
         return x
 
 
-class Qwen2_5_VLForConditionalGeneration(nn.Module):
+class Qwen2_5_VLForConditionalGeneration(EVSWithMRope):
+    @override
+    @staticmethod
+    def create_evs_config(config: Qwen2_5_VLConfig):
+        return EVSWithMRopeConfig(
+            video_pruning_rate=getattr(config, "video_pruning_rate", 0),
+            spatial_merge_size=config.vision_config.spatial_merge_size,
+            temporal_patch_size=config.vision_config.temporal_patch_size,
+            vision_start_token_id=config.vision_start_token_id,
+            image_token_id=config.image_token_id,
+            video_token_id=config.video_token_id,
+        )
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
@@ -493,7 +507,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        super().__init__(config=config)
 
         self.pp_group = get_pp_group()
         self.config = config
@@ -536,64 +550,35 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-        # TODO(yuan-luo): feature flag setting
-        self.video_pruning_rate = 0.2
-        self.is_multimodal_pruning_enabled = self.video_pruning_rate > 0.0
-        self.tokens_per_second = getattr(config.vision_config, "tokens_per_second", 1.0)
+        self.tokens_per_second = float(
+            getattr(config.vision_config, "tokens_per_second", 1.0)
+        )
 
-    def _postprocess_image_embeds_evs(
-        self, image_embeds: torch.Tensor, image_grid_thw: torch.Tensor
-    ):
-        # For each image, attach mRoPE
-        merge = self.visual.spatial_merge_size
-        outs = []
-        sizes = (image_grid_thw.prod(-1) // (merge * merge)).tolist()
-        cursor = 0
-        for (t, h, w), sz in zip(image_grid_thw.tolist(), sizes):
-            emb = image_embeds[cursor : cursor + sz]
-            pos = compute_mrope_for_media(
-                torch.tensor([t, h, w], device=emb.device),
-                spatial_merge_size=merge,
-                tokens_per_second=self.tokens_per_second,
-                video_second_per_grid=1,
-            )
-            emb = torch.cat([emb, pos.to(emb.device)], dim=1)
-            outs.append(emb)
-            cursor += sz
-        return torch.cat(outs, dim=0)
+    @override
+    def compute_local_positions_images(self, *, item: EVSDataItem, config: EVSConfig):
+        positions = [
+            compute_mrope_for_media(grid, config.spatial_merge_size)
+            for grid in item.thw_grids
+        ]
+        return positions
 
-    def _postprocess_video_embeds_evs(
+    @override
+    def compute_local_positions_videos(
         self,
-        video_embeds: torch.Tensor,
-        video_grid_thw: torch.Tensor,
-        second_per_grid_ts: Optional[torch.Tensor] = None,
+        *,
+        item: EVSDataItem,
+        config: EVSConfig,
     ):
-        merge = self.visual.spatial_merge_size
-        outs = []
-        sizes = (video_grid_thw.prod(-1) // (merge * merge)).tolist()
-        cursor = 0
-        for idx, ((t, h, w), sz) in enumerate(zip(video_grid_thw.tolist(), sizes)):
-            emb = video_embeds[cursor : cursor + sz]
-            s_pg = (
-                1 if second_per_grid_ts is None else int(second_per_grid_ts[idx].item())
-            )
-
-            mask = compute_retention_mask(
-                emb, (t, h, w), spatial_merge_size=merge, q=self.video_pruning_rate
-            )
-            emb_kept = emb[mask]
-
-            pos = compute_mrope_for_media(
-                torch.tensor([t, h, w], device=emb.device),
-                spatial_merge_size=merge,
+        positions = [
+            compute_mrope_for_media(
+                grid,
+                config.spatial_merge_size,
                 tokens_per_second=self.tokens_per_second,
-                video_second_per_grid=s_pg,
-            ).to(emb.device)
-            pos_kept = pos[mask]
-            emb_plus4 = torch.cat([emb_kept, pos_kept], dim=1)
-            outs.append(emb_plus4)
-            cursor += sz
-        return torch.cat(outs, dim=0)
+                video_second_per_grid=getattr(item, "second_per_grid_ts", 1),
+            )
+            for grid in item.thw_grids
+        ]
+        return positions
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -612,10 +597,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
             )
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        if self.is_multimodal_pruning_enabled:
-            image_embeds = self._postprocess_image_embeds_evs(
-                image_embeds, image_grid_thw
-            )
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -630,19 +611,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             return run_dp_sharded_mrope_vision_model(
                 self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
             )
-        else:
-            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
-        if self.is_multimodal_pruning_enabled:
-            second = None
-            if (
-                hasattr(items[0], "second_per_grid_ts")
-                and items[0].second_per_grid_ts is not None
-            ):
-                second = torch.concat([it.second_per_grid_ts for it in items], dim=0)
-            video_embeds = self._postprocess_video_embeds_evs(
-                video_embeds, video_grid_thw, second_per_grid_ts=second
-            )
-
+        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
     def post_process(
@@ -701,27 +670,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
-
-        if (
-            getattr(self, "_mm_positions_cache", None)
-            and len(self._mm_positions_cache) > 0
-        ):
-            cfg = self.config
-            new_pos, delta = recompute_mrope_positions(
-                input_ids=input_ids,
-                multimodal_positions=self._mm_positions_cache,  # List[(4, K_i)]
-                mrope_positions=positions,  # (3, N) or (4, N)
-                num_computed_tokens=(
-                    forward_batch.num_computed_tokens
-                    if hasattr(forward_batch, "num_computed_tokens")
-                    else 0
-                ),
-                vision_start_token_id=cfg.vision_start_token_id,
-                image_token_id=cfg.image_token_id,
-                video_token_id=cfg.video_token_id,
-            )
-            positions = new_pos
-            self._mm_positions_cache = []
 
         input_embeds = forward_batch.input_embeds
         # It may seem strange to assign input_embeds again even after passing it as an argument.
