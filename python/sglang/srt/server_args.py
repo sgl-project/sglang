@@ -1376,9 +1376,7 @@ class ServerArgs:
             if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
                 # TODO (Hubert): Put this back later
                 # self.enable_aiter_allreduce_fusion = True
-                logger.info(
-                    "Enable Aiter AllReduce Fusion for GptOssForCausalLM"
-                )
+                logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
             quantization_config = getattr(hf_config, "quantization_config", None)
             is_mxfp4_quant_format = (
                 quantization_config is not None
