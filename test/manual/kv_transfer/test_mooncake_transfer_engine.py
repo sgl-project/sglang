@@ -43,11 +43,13 @@ def run_cmd(args):
         cmd += ["--use_vram=false"]
 
     cmd += ["--auto_discovery"]
-    cmd = " ".join(cmd)
-
-    print(f"cmd={cmd}")
-
-    os.system(cmd)
+    print(f"Executing command: {' '.join(cmd)}")
+    import subprocess
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Command failed with error: {e}")
+        exit(1)
 
 
 def main():
