@@ -366,7 +366,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
             batch = self.get_next_disagg_prefill_batch_to_run()
-            logger.info(f"get_next_disagg_prefill_batch_to_run: {batch=}")
+            # logger.info(f"get_next_disagg_prefill_batch_to_run: {batch=}")
             self.cur_batch = batch
 
             batch_result = None
@@ -532,7 +532,7 @@ class SchedulerDisaggregationPrefillMixin:
             return []
 
         done_reqs = []
-        logger.info(f"process_disagg_prefill_inflight_queue: {self.disagg_prefill_inflight_queue=} {self.attn_tp_cpu_group=}")
+        # logger.info(f"process_disagg_prefill_inflight_queue: {self.disagg_prefill_inflight_queue=} {self.attn_tp_cpu_group=}")
 
         polls = poll_and_all_reduce(
             [req.disagg_kv_sender for req in self.disagg_prefill_inflight_queue],
@@ -617,7 +617,7 @@ class SchedulerDisaggregationPrefillMixin:
 
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
-        logger.info(f"process_prefill_chunk: {self.chunked_req=} {self.enable_overlap=}")
+        # logger.info(f"process_prefill_chunk: {self.chunked_req=} {self.enable_overlap=}")
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
