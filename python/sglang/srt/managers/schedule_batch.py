@@ -721,9 +721,9 @@ class Req:
 
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
-            assert not self.kv_committed_freed, (
-                f"Committed KV cache already freed ({self.kv_committed_len=})"
-            )
+            assert (
+                not self.kv_committed_freed
+            ), f"Committed KV cache already freed ({self.kv_committed_len=})"
             self.kv_committed_freed = True
             return self.kv_committed_len
         else:
@@ -735,9 +735,9 @@ class Req:
         # NOTE: This function is called when there is over-allocation of KV cache.
         # Over-allocation: we allocate more KV cache than the committed length.
         # e.g., speculative decoding may allocate more KV cache than actually used.
-        assert not self.kv_overallocated_freed, (
-            f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
-        )
+        assert (
+            not self.kv_overallocated_freed
+        ), f"Overallocated KV cache already freed, {self.kv_committed_len=}, {self.kv_allocated_len=}"
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
 
@@ -1197,9 +1197,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 tree_cache is None
                 or isinstance(tree_cache, SWARadixCache)
                 or isinstance(tree_cache, SWAChunkCache)
-            ), (
-                "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
-            )
+            ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid_swa = True
 
         return cls(
@@ -1300,9 +1298,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
 
-        assert len(self.out_cache_loc) == self.extend_num_tokens, (
-            f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
-        )
+        assert (
+            len(self.out_cache_loc) == self.extend_num_tokens
+        ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1623,13 +1621,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     swa_available_size = (
                         self.token_to_kv_pool_allocator.swa_available_size()
                     )
-                    assert full_available_size > 0 and swa_available_size > 0, (
-                        f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
-                    )
+                    assert (
+                        full_available_size > 0 and swa_available_size > 0
+                    ), f"No space left for only one request in SWA mode {full_available_size=}, {swa_available_size=}"
                 else:
-                    assert self.token_to_kv_pool_allocator.available_size() > 0, (
-                        f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
-                    )
+                    assert (
+                        self.token_to_kv_pool_allocator.available_size() > 0
+                    ), f"No space left for only one request, {self.token_to_kv_pool_allocator.available_size()=}"
                 break
 
             first_iter = False
@@ -1654,7 +1652,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         new_estimate_ratio = (
             total_decoded_tokens
             + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(self.reqs)
-        ) / (total_max_new_tokens + 1)  # avoid zero division
+        ) / (
+            total_max_new_tokens + 1
+        )  # avoid zero division
         new_estimate_ratio = min(1.0, new_estimate_ratio)
 
         return retracted_reqs, new_estimate_ratio, []

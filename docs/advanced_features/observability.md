@@ -9,6 +9,10 @@ curl http://localhost:30000/metrics
 
 See [Production Metrics](../references/production_metrics.md) and [Production Request Tracing](../references/production_request_trace.md) for more details.
 
+## Reasoning Token Accounting
+- If you launch with `--reasoning-parser <parser>`, tokens generated inside the model's reasoning span (for example, between `<think>...</think>` for DeepSeek/Qwen-style models) are counted separately.
+- The OpenAI Responses API surface returns this as `usage.reasoning_tokens`, so you can track reasoning cost/latency independently from normal completion tokens.
+
 ## Logging
 
 By default, SGLang does not log any request contents. You can log them by using `--log-requests`.
