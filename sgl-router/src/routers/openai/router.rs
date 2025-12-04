@@ -4,7 +4,6 @@ use std::{
     any::Any,
     collections::HashSet,
     sync::{atomic::AtomicBool, Arc},
-    time::{Duration, Instant},
 };
 
 use axum::{
@@ -14,8 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use dashmap::DashMap;
-use futures_util::StreamExt;
+use futures_util::{future::join_all, StreamExt};
 use once_cell::sync::Lazy;
 use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
@@ -35,10 +33,11 @@ use super::{
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
-    utils::{apply_provider_headers, extract_auth_header, probe_endpoint_for_model},
+    utils::{apply_provider_headers, extract_auth_header},
 };
 use crate::{
-    core::{CircuitBreaker, CircuitBreakerConfig as CoreCircuitBreakerConfig},
+    app_context::AppContext,
+    core::{ModelCard, RuntimeType, Worker, WorkerRegistry},
     data_connector::{
         ConversationId, ConversationItemStorage, ConversationStorage, ListParams, ResponseId,
         ResponseStorage, SortOrder,
@@ -56,7 +55,6 @@ use crate::{
             ResponsesGetParams, ResponsesRequest,
         },
     },
-    routers::header_utils::apply_request_headers,
 };
 
 // ============================================================================
@@ -89,23 +87,16 @@ static SGLANG_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     ])
 });
 
-/// Cached endpoint information
-#[derive(Clone, Debug)]
-struct CachedEndpoint {
-    url: String,
-    cached_at: Instant,
-}
-
 /// Router for OpenAI backend
+///
+/// This router manages connections to OpenAI-compatible API endpoints (OpenAI, xAI, etc.)
+/// using the Worker abstraction. Workers are registered via the external worker registration
+/// workflow and stored in the WorkerRegistry.
 pub struct OpenAIRouter {
     /// HTTP client for upstream OpenAI-compatible API
     client: reqwest::Client,
-    /// Multiple OpenAI-compatible API endpoints (OpenAI, xAI, etc.)
-    worker_urls: Vec<String>,
-    /// Model cache: model_id -> endpoint URL
-    model_cache: Arc<DashMap<String, CachedEndpoint>>,
-    /// Circuit breaker
-    circuit_breaker: CircuitBreaker,
+    /// Worker registry for model-based worker lookup
+    worker_registry: Arc<WorkerRegistry>,
     /// Health status
     healthy: AtomicBool,
     /// Response storage for managing conversation history
@@ -120,8 +111,11 @@ pub struct OpenAIRouter {
 
 impl std::fmt::Debug for OpenAIRouter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let registry_stats = self.worker_registry.stats();
         f.debug_struct("OpenAIRouter")
-            .field("worker_urls", &self.worker_urls)
+            .field("registered_workers", &registry_stats.total_workers)
+            .field("registered_models", &registry_stats.total_models)
+            .field("healthy_workers", &registry_stats.healthy_workers)
             .field("healthy", &self.healthy)
             .finish()
     }
@@ -131,33 +125,16 @@ impl OpenAIRouter {
     /// Maximum number of conversation items to attach as input when a conversation is provided
     const MAX_CONVERSATION_HISTORY_ITEMS: usize = 100;
 
-    /// Model discovery cache TTL (1 hour)
-    const MODEL_CACHE_TTL_SECS: u64 = 3600;
-
     /// Create a new OpenAI router
-    pub async fn new(
-        worker_urls: Vec<String>,
-        ctx: &Arc<crate::app_context::AppContext>,
-    ) -> Result<Self, String> {
+    ///
+    /// Workers are registered separately via the external worker registration workflow.
+    /// This router queries the WorkerRegistry to find workers that support requested models.
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         // Use HTTP client from AppContext
         let client = ctx.client.clone();
 
-        // Normalize URLs (remove trailing slashes)
-        let worker_urls: Vec<String> = worker_urls
-            .into_iter()
-            .map(|url| url.trim_end_matches('/').to_string())
-            .collect();
-
-        // Convert circuit breaker config from AppContext
-        let cb = &ctx.router_config.circuit_breaker;
-        let core_cb_config = CoreCircuitBreakerConfig {
-            failure_threshold: cb.failure_threshold,
-            success_threshold: cb.success_threshold,
-            timeout_duration: Duration::from_secs(cb.timeout_duration_secs),
-            window_duration: Duration::from_secs(cb.window_duration_secs),
-        };
-
-        let circuit_breaker = CircuitBreaker::with_config(core_cb_config);
+        // Get worker registry from AppContext
+        let worker_registry = ctx.worker_registry.clone();
 
         // Get MCP manager from AppContext (must be initialized)
         let mcp_manager = ctx
@@ -168,9 +145,7 @@ impl OpenAIRouter {
 
         Ok(Self {
             client,
-            worker_urls,
-            model_cache: Arc::new(DashMap::new()),
-            circuit_breaker,
+            worker_registry,
             healthy: AtomicBool::new(true),
             response_storage: ctx.response_storage.clone(),
             conversation_storage: ctx.conversation_storage.clone(),
@@ -179,76 +154,178 @@ impl OpenAIRouter {
         })
     }
 
-    /// Discover which endpoint has the model
-    async fn find_endpoint_for_model(
+    /// Refresh models for a single external worker by querying its /v1/models endpoint.
+    ///
+    /// Returns true if refresh succeeded and models were cached on the worker.
+    async fn refresh_worker_models(
+        &self,
+        worker: &Arc<dyn Worker>,
+        auth_header: Option<&HeaderValue>,
+    ) -> bool {
+        let url = format!("{}/v1/models", worker.url());
+
+        // Build request to backend
+        let mut backend_req = self.client.get(&url);
+        if let Some(auth) = auth_header {
+            backend_req = apply_provider_headers(backend_req, &url, Some(auth));
+        }
+
+        match backend_req.send().await {
+            Ok(response) if response.status().is_success() => {
+                match response.json::<Value>().await {
+                    Ok(json_response) => {
+                        if let Some(data) = json_response.get("data").and_then(|d| d.as_array()) {
+                            let model_cards: Vec<ModelCard> = data
+                                .iter()
+                                .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
+                                .map(ModelCard::new)
+                                .collect();
+
+                            if !model_cards.is_empty() {
+                                tracing::info!(
+                                    "Model refresh: found {} models from {}",
+                                    model_cards.len(),
+                                    url
+                                );
+                                worker.set_models(model_cards);
+                                return true;
+                            }
+                        }
+                        false
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse models response: {}", e);
+                        false
+                    }
+                }
+            }
+            Ok(response) => {
+                tracing::debug!(
+                    "Model refresh returned non-success status {} from {}",
+                    response.status(),
+                    url
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!("Failed to fetch models from backend: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Refresh models for ALL external workers in parallel.
+    async fn refresh_external_models(&self, auth_header: Option<&HeaderValue>) {
+        let external_workers = self.worker_registry.get_workers_filtered(
+            None,
+            None,
+            None,
+            Some(RuntimeType::External),
+            true, // healthy_only
+        );
+
+        if external_workers.is_empty() {
+            return;
+        }
+
+        tracing::debug!(
+            "Refreshing models for {} external workers",
+            external_workers.len()
+        );
+
+        // Refresh all workers in parallel
+        let futures: Vec<_> = external_workers
+            .iter()
+            .map(|w| self.refresh_worker_models(w, auth_header))
+            .collect();
+
+        join_all(futures).await;
+    }
+
+    /// Select a worker for the given model using the WorkerRegistry.
+    ///
+    /// This method queries the registry for external workers (RuntimeType::External)
+    /// that support the requested model. It checks:
+    /// 1. Workers registered with matching model ID (including aliases via ModelCard)
+    /// 2. Worker health status
+    /// 3. Circuit breaker state
+    ///
+    /// If no worker is found with explicit model support, it will refresh models
+    /// on all external workers in parallel, then retry the search.
+    ///
+    /// Returns an error response if no suitable worker is found.
+    async fn select_worker_for_model(
         &self,
         model_id: &str,
-        auth_header: Option<&str>,
-    ) -> Result<String, Response> {
-        // Single endpoint - fast path
-        if self.worker_urls.len() == 1 {
-            return Ok(self.worker_urls[0].clone());
+        auth_header: Option<&HeaderValue>,
+    ) -> Result<Arc<dyn Worker>, Box<Response>> {
+        // Helper to find candidates for a model
+        // Note: We get ALL external workers and filter by supports_model() because
+        // wildcard workers (empty models) aren't in the model index but support any model
+        let find_candidates = || {
+            self.worker_registry
+                .get_workers_filtered(
+                    None, // Get all external workers, not just those in model index
+                    None,
+                    None,
+                    Some(RuntimeType::External),
+                    true, // healthy_only
+                )
+                .into_iter()
+                .filter(|w| w.supports_model(model_id) && w.circuit_breaker().can_execute())
+                .collect::<Vec<_>>()
+        };
+
+        // First try: find workers that already support this model
+        let candidates = find_candidates();
+        if !candidates.is_empty() {
+            return Ok(candidates
+                .into_iter()
+                .min_by_key(|w| w.load())
+                .expect("candidates is not empty"));
         }
 
-        // Check cache
-        if let Some(entry) = self.model_cache.get(model_id) {
-            if entry.cached_at.elapsed() < Duration::from_secs(Self::MODEL_CACHE_TTL_SECS) {
-                return Ok(entry.url.clone());
-            }
+        // No match found - refresh models on all external workers
+        tracing::debug!(
+            "No worker found for model '{}', refreshing external worker models",
+            model_id
+        );
+        self.refresh_external_models(auth_header).await;
+
+        // Second try: check if any worker now supports the model after refresh
+        let candidates = find_candidates();
+        if !candidates.is_empty() {
+            return Ok(candidates
+                .into_iter()
+                .min_by_key(|w| w.load())
+                .expect("candidates is not empty"));
         }
 
-        // Probe all endpoints in parallel
-        let mut handles = vec![];
-        let model = model_id.to_string();
-        let auth = auth_header.map(|s| s.to_string());
-
-        for url in &self.worker_urls {
-            let handle = tokio::spawn(probe_endpoint_for_model(
-                self.client.clone(),
-                url.clone(),
-                model.clone(),
-                auth.clone(),
-            ));
-            handles.push(handle);
-        }
-
-        // Return first successful endpoint
-        for handle in handles {
-            if let Ok(Ok(url)) = handle.await {
-                // Cache it
-                self.model_cache.insert(
-                    model_id.to_string(),
-                    CachedEndpoint {
-                        url: url.clone(),
-                        cached_at: Instant::now(),
-                    },
-                );
-                return Ok(url);
-            }
-        }
-
-        // Model not found on any endpoint
-        Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "error": {
-                    "message": format!("Model '{}' not found on any endpoint", model_id),
-                    "type": "model_not_found",
-                }
-            })),
-        )
-            .into_response())
+        Err(Box::new(
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "error": {
+                        "message": format!("No worker available for model '{}'", model_id),
+                        "type": "model_not_found",
+                    }
+                })),
+            )
+                .into_response(),
+        ))
     }
 
     /// Handle non-streaming response with optional MCP tool loop
     async fn handle_non_streaming_response(
         &self,
-        url: String,
+        worker: &Arc<dyn Worker>,
         headers: Option<&HeaderMap>,
         mut payload: Value,
         original_body: &ResponsesRequest,
         original_previous_response_id: Option<String>,
     ) -> Response {
+        let url = format!("{}/v1/responses", worker.url());
+
         // Check if MCP is active for this request
         // Ensure dynamic client is created if needed
         if let Some(ref tools) = original_body.tools {
@@ -284,7 +361,7 @@ impl OpenAIRouter {
             {
                 Ok(resp) => response_json = resp,
                 Err(err) => {
-                    self.circuit_breaker.record_failure();
+                    worker.circuit_breaker().record_failure();
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(json!({"error": {"message": err}})),
@@ -296,14 +373,16 @@ impl OpenAIRouter {
             // No MCP - simple request
 
             let mut request_builder = self.client.post(&url).json(&payload);
-            if let Some(h) = headers {
-                request_builder = apply_request_headers(h, request_builder, true);
-            }
+
+            // Apply provider-specific headers (handles Anthropic x-api-key, etc.)
+            // Passthrough mode: user's auth header takes priority, worker's key is fallback
+            let auth_header = extract_auth_header(headers, worker.api_key());
+            request_builder = apply_provider_headers(request_builder, &url, auth_header.as_ref());
 
             let response = match request_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    self.circuit_breaker.record_failure();
+                    worker.circuit_breaker().record_failure();
                     tracing::error!(
                         url = %url,
                         error = %e,
@@ -318,7 +397,7 @@ impl OpenAIRouter {
             };
 
             if !response.status().is_success() {
-                self.circuit_breaker.record_failure();
+                worker.circuit_breaker().record_failure();
                 let status = StatusCode::from_u16(response.status().as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let body = response.text().await.unwrap_or_default();
@@ -328,7 +407,7 @@ impl OpenAIRouter {
             response_json = match response.json::<Value>().await {
                 Ok(r) => r,
                 Err(e) => {
-                    self.circuit_breaker.record_failure();
+                    worker.circuit_breaker().record_failure();
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to parse upstream response: {}", e),
@@ -337,7 +416,7 @@ impl OpenAIRouter {
                 }
             };
 
-            self.circuit_breaker.record_success();
+            worker.circuit_breaker().record_success();
         }
 
         // Patch response with metadata
@@ -376,134 +455,134 @@ impl crate::routers::RouterTrait for OpenAIRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // Check all endpoints in parallel - only healthy if ALL are healthy
-        if self.worker_urls.is_empty() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "No endpoints configured").into_response();
+        // Check health of all external workers
+        let external_workers: Vec<_> = self
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .filter(|w| w.metadata().runtime_type == RuntimeType::External)
+            .collect();
+
+        if external_workers.is_empty() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No external workers registered",
+            )
+                .into_response();
         }
 
-        let mut handles = vec![];
-        for url in &self.worker_urls {
-            let url = url.clone();
-            let client = self.client.clone();
+        let mut healthy_count = 0;
+        let mut unhealthy_workers = Vec::new();
 
-            let handle = tokio::spawn(async move {
-                let probe_url = format!("{}/v1/models", url);
-                match client
-                    .get(&probe_url)
-                    .timeout(Duration::from_secs(2))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        let code = resp.status();
-                        // Treat success and auth-required as healthy (endpoint reachable)
-                        if code.is_success() || code.as_u16() == 401 || code.as_u16() == 403 {
-                            Ok(())
-                        } else {
-                            Err(format!("Endpoint {} returned status {}", url, code))
-                        }
-                    }
-                    Err(e) => Err(format!("Endpoint {} error: {}", url, e)),
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        // Collect all results
-        let mut errors = Vec::new();
-        for handle in handles {
-            match handle.await {
-                Ok(Ok(())) => (),
-                Ok(Err(e)) => errors.push(e),
-                Err(e) => errors.push(format!("Task join error: {}", e)),
+        for worker in &external_workers {
+            if worker.is_healthy() {
+                healthy_count += 1;
+            } else {
+                unhealthy_workers.push(format!("{} ({})", worker.model_id(), worker.url()));
             }
         }
 
-        if errors.is_empty() {
-            (StatusCode::OK, "OK").into_response()
+        if unhealthy_workers.is_empty() {
+            (
+                StatusCode::OK,
+                format!("OK - {} workers healthy", healthy_count),
+            )
+                .into_response()
         } else {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("Some endpoints unhealthy: {}", errors.join(", ")),
+                format!(
+                    "{}/{} workers unhealthy: {}",
+                    unhealthy_workers.len(),
+                    external_workers.len(),
+                    unhealthy_workers.join(", ")
+                ),
             )
                 .into_response()
         }
     }
 
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
+        let stats = self.worker_registry.stats();
+        let external_workers: Vec<_> = self
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .filter(|w| w.metadata().runtime_type == RuntimeType::External)
+            .collect();
+
+        let worker_urls: Vec<String> = external_workers
+            .iter()
+            .map(|w| w.url().to_string())
+            .collect();
+
         let info = json!({
             "router_type": "openai",
-            "workers": self.worker_urls.len(),
-            "worker_urls": &self.worker_urls
+            "total_workers": stats.total_workers,
+            "external_workers": external_workers.len(),
+            "healthy_workers": stats.healthy_workers,
+            "total_models": stats.total_models,
+            "worker_urls": worker_urls
         });
         (StatusCode::OK, info.to_string()).into_response()
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
-        // Aggregate models from all endpoints
-        if self.worker_urls.is_empty() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "No endpoints configured").into_response();
+        // Return models from all registered external workers
+        let external_workers: Vec<_> = self
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .filter(|w| w.metadata().runtime_type == RuntimeType::External)
+            .collect();
+
+        if external_workers.is_empty() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No external workers registered",
+            )
+                .into_response();
         }
 
-        let headers = req.headers();
-        let auth = headers
-            .get("authorization")
-            .or_else(|| headers.get("Authorization"));
+        // Refresh models for all external workers using user's auth header
+        let auth_header = extract_auth_header(Some(req.headers()), &None);
+        self.refresh_external_models(auth_header.as_ref()).await;
 
-        // Query all endpoints in parallel
-        let mut handles = vec![];
-        for url in &self.worker_urls {
-            let url = url.clone();
-            let client = self.client.clone();
-            let auth = auth.cloned();
-
-            let handle = tokio::spawn(async move {
-                let models_url = format!("{}/v1/models", url);
-                let req = client.get(&models_url);
-
-                // Apply provider-specific headers (handles Anthropic, xAI, OpenAI, etc.)
-                let req = apply_provider_headers(req, &url, auth.as_ref());
-
-                match req.send().await {
-                    Ok(res) => {
-                        if res.status().is_success() {
-                            match res.json::<Value>().await {
-                                Ok(json) => Ok(json),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to parse models response from '{}': {}",
-                                        url,
-                                        e
-                                    );
-                                    Err(())
-                                }
-                            }
-                        } else {
-                            tracing::warn!(
-                                "Getting models from '{}' failed with status: {}",
-                                url,
-                                res.status()
-                            );
-                            Err(())
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Request to get models from '{}' failed: {}", url, e);
-                        Err(())
-                    }
-                }
-            });
-
-            handles.push(handle);
-        }
-
-        // Collect all model lists
+        // Collect models from all workers
         let mut all_models = Vec::new();
-        for handle in handles {
-            if let Ok(Ok(json)) = handle.await {
-                if let Some(data) = json.get("data").and_then(|v| v.as_array()) {
-                    all_models.extend_from_slice(data);
+        let mut seen_models = HashSet::new();
+
+        for worker in &external_workers {
+            for model_card in worker.models() {
+                let owned_by = model_card
+                    .provider
+                    .as_ref()
+                    .map(|p| format!("{:?}", p).to_lowercase())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                // Add primary model ID
+                if seen_models.insert(model_card.id.clone()) {
+                    all_models.push(json!({
+                        "id": &model_card.id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": &owned_by,
+                        "aliases": model_card.aliases,
+                        "model_type": format!("{:?}", model_card.model_type),
+                    }));
+                }
+
+                // Add aliases as separate entries for compatibility
+                for alias in &model_card.aliases {
+                    if seen_models.insert(alias.clone()) {
+                        all_models.push(json!({
+                            "id": alias,
+                            "object": "model",
+                            "created": 0,
+                            "owned_by": &owned_by,
+                            "primary_model": &model_card.id,
+                        }));
+                    }
                 }
             }
         }
@@ -546,20 +625,16 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        if !self.circuit_breaker.can_execute() {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response();
-        }
+        // Extract auth header for passthrough mode
+        let auth_header = extract_auth_header(headers, &None);
 
-        // Extract auth header
-        let auth = extract_auth_header(headers);
-
-        // Find endpoint for model
-        let base_url = match self
-            .find_endpoint_for_model(body.model.as_str(), auth)
+        // Select worker for model (discovery happens inside if needed)
+        let worker = match self
+            .select_worker_for_model(body.model.as_str(), auth_header.as_ref())
             .await
         {
-            Ok(url) => url,
-            Err(response) => return response,
+            Ok(w) => w,
+            Err(response) => return *response,
         };
 
         // Serialize request body, removing SGLang-only fields
@@ -582,15 +657,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         }
 
-        let url = format!("{}/v1/chat/completions", base_url);
+        let url = format!("{}/v1/chat/completions", worker.url());
         let mut req = self.client.post(&url).json(&payload);
 
-        // Forward Authorization header if provided
-        if let Some(h) = headers {
-            if let Some(auth) = h.get("authorization").or_else(|| h.get("Authorization")) {
-                req = req.header("Authorization", auth);
-            }
-        }
+        // Apply provider-specific headers (handles Anthropic x-api-key, etc.)
+        // Passthrough mode: user's auth header takes priority, worker's key is fallback
+        let auth_header = extract_auth_header(headers, worker.api_key());
+        req = apply_provider_headers(req, &url, auth_header.as_ref());
 
         // Accept SSE when stream=true
         if body.stream {
@@ -600,7 +673,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
-                self.circuit_breaker.record_failure();
+                worker.circuit_breaker().record_failure();
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("Failed to contact upstream: {}", e),
@@ -617,7 +690,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             let content_type = resp.headers().get(CONTENT_TYPE).cloned();
             match resp.bytes().await {
                 Ok(body) => {
-                    self.circuit_breaker.record_success();
+                    worker.circuit_breaker().record_success();
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     if let Some(ct) = content_type {
@@ -626,7 +699,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     response
                 }
                 Err(e) => {
-                    self.circuit_breaker.record_failure();
+                    worker.circuit_breaker().record_failure();
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to read response: {}", e),
@@ -683,17 +756,18 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Extract auth header
-        let auth = extract_auth_header(headers);
+        // Extract auth header for passthrough mode
+        let auth_header = extract_auth_header(headers, &None);
 
-        // Find endpoint for model (use model_id if provided, otherwise use body.model)
+        // Select worker for model (discovery happens inside if needed)
         let model = model_id.unwrap_or(body.model.as_str());
-        let base_url = match self.find_endpoint_for_model(model, auth).await {
-            Ok(url) => url,
-            Err(response) => return response,
+        let worker = match self
+            .select_worker_for_model(model, auth_header.as_ref())
+            .await
+        {
+            Ok(w) => w,
+            Err(response) => return *response,
         };
-
-        let url = format!("{}/v1/responses", base_url);
 
         // Clone the body for validation and logic, but we'll build payload differently
         let mut request_body = body.clone();
@@ -992,10 +1066,11 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         // Delegate to streaming or non-streaming handler
+        let url = format!("{}/v1/responses", worker.url());
         if body.stream.unwrap_or(false) {
             handle_streaming_response(
                 &self.client,
-                &self.circuit_breaker,
+                worker.circuit_breaker(),
                 Some(&self.mcp_manager),
                 self.response_storage.clone(),
                 self.conversation_storage.clone(),
@@ -1009,7 +1084,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             .await
         } else {
             self.handle_non_streaming_response(
-                url,
+                &worker,
                 headers,
                 payload,
                 body,
