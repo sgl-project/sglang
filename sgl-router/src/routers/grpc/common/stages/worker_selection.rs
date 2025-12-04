@@ -120,6 +120,7 @@ impl WorkerSelectionStage {
             model_id,
             Some(WorkerType::Regular),
             Some(ConnectionMode::Grpc { port: None }),
+            None,  // any runtime type
             false, // get all workers, we'll filter by is_available() next
         );
 
@@ -153,6 +154,7 @@ impl WorkerSelectionStage {
             model_id,
             None,
             Some(ConnectionMode::Grpc { port: None }), // Match any gRPC worker
+            None,                                      // any runtime type
             false,
         );
 

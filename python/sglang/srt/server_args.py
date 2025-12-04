@@ -103,6 +103,7 @@ QUANTIZATION_CHOICES = [
     "mxfp4",
     "auto-round",
     "compressed-tensors",  # for Ktransformers
+    "modelslim",  # for NPU
 ]
 
 ATTENTION_BACKEND_CHOICES = [
@@ -615,6 +616,7 @@ class ServerArgs:
         # Handle device-specific backends.
         self._handle_hpu_backends()
         self._handle_cpu_backends()
+        self._handle_npu_backends()
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -928,6 +930,12 @@ class ServerArgs:
                 self.attention_backend = "intel_amx"
             self.sampling_backend = "pytorch"
 
+    def _handle_npu_backends(self):
+        if self.device == "npu":
+            from sglang.srt.hardware_backend.npu.utils import set_default_server_args
+
+            set_default_server_args(self)
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
 
@@ -936,7 +944,18 @@ class ServerArgs:
 
         hf_config = self.get_hf_config()
         model_arch = hf_config.architectures[0]
-        if model_arch in ["DeepseekV3ForCausalLM"]:
+
+        if model_arch in [
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+        ]:
+            self.dtype = "bfloat16"
+
+        if model_arch in [
+            "DeepseekV3ForCausalLM",
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+        ]:
             if is_deepseek_nsa(hf_config):
                 if (
                     self.attention_backend is None
@@ -1042,7 +1061,7 @@ class ServerArgs:
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
                     # flashinfer_trtllm MoE runner backend.
-                    if quant_method is None:
+                    if quant_method is None and model_arch == "DeepseekV3ForCausalLM":
                         self.quantization = "fp8"
                         logger.info(
                             "Quantization not specified, default to fp8 for DeepSeek on sm100"
@@ -1194,6 +1213,23 @@ class ServerArgs:
                 f"Disabling Radix Cache for {model_arch} as it is not yet supported."
             )
             self.disable_radix_cache = True
+        elif model_arch in ["NemotronHForCausalLM"]:
+            if self.model_config.quantization in [
+                "modelopt",
+                "modelopt_fp8",
+                "modelopt_fp4",
+            ]:
+                assert self.model_config.hf_config.mlp_hidden_act == "relu2"
+                if self.model_config.quantization == "modelopt":
+                    self.quantization = (
+                        "modelopt_fp4"
+                        if self.model_config.hf_config.quantization_config["quant_algo"]
+                        == "NVFP4"
+                        else "modelopt_fp8"
+                    )
+                else:
+                    self.quantization = self.model_config.quantization
+                self.moe_runner_backend = "flashinfer_cutlass"
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -1225,7 +1261,6 @@ class ServerArgs:
                 )
                 self.disable_overlap_schedule = True
             if is_sm100_supported():
-                self.attention_backend = "triton"
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
@@ -1283,8 +1318,6 @@ class ServerArgs:
                     self.attention_backend = "fa3"
                 elif is_hip():
                     self.attention_backend = "aiter"
-                elif is_npu():
-                    self.attention_backend = "ascend"
                 else:
                     self.attention_backend = (
                         "flashinfer" if is_flashinfer_available() else "triton"
@@ -1302,8 +1335,6 @@ class ServerArgs:
                         self.attention_backend = "aiter"
                     else:
                         self.attention_backend = "triton"
-                elif is_npu():
-                    self.attention_backend = "ascend"
                 else:
                     self.attention_backend = "triton"
 
@@ -1404,13 +1435,6 @@ class ServerArgs:
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
 
-        # NPU platforms backends
-        if is_npu() and self.attention_backend in ["ascend"]:
-            logger.warning(
-                "At this moment Ascend attention backend only supports a page_size of 128, change page_size to 128."
-            )
-            self.page_size = 128
-
         # Other platforms backends
         if (
             self.attention_backend == "intel_amx"
@@ -1491,9 +1515,11 @@ class ServerArgs:
 
     def _handle_moe_kernel_config(self):
         if self.moe_runner_backend == "flashinfer_cutlass":
-            assert (
-                self.quantization == "modelopt_fp4" or self.quantization is None
-            ), "modelopt_fp4 quantization or bf16 is required for Flashinfer Cutlass MOE"
+            assert self.quantization in [
+                "modelopt_fp4",
+                "modelopt_fp8",
+                None,
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', or bfloat16 (None)."
             assert self.ep_size in [
                 1,
                 self.tp_size,
@@ -1601,7 +1627,7 @@ class ServerArgs:
                 )
 
         if self.hicache_mem_layout == "page_first_direct":
-            if self.hicache_io_backend != "direct":
+            if self.hicache_io_backend not in ["direct", "kernel_ascend"]:
                 self.hicache_io_backend = "direct"
                 logger.warning(
                     "Page first direct layout only support direct io backend"
@@ -1624,20 +1650,6 @@ class ServerArgs:
                     "FlashAttention3 decode backend is not compatible with hierarchical cache. "
                     "Setting hicache_io_backend to vanilla I/O, which may lead to suboptimal performance with small page sizes."
                 )
-
-        # Below are the only parameters currently supported on Ascend
-        if self.enable_hierarchical_cache and is_npu():
-            # FIXME(iforgetmyname) fix decode_attention_backend on ascend
-            self.decode_attention_backend = "ascend"
-            self.hicache_io_backend = "kernel_ascend"
-            if self.use_mla_backend():
-                self.hicache_mem_layout = "page_first_kv_split"
-            else:
-                self.hicache_mem_layout = "page_first_direct"
-            logger.warning(
-                f"Ascend NPU Platform detected, change `hicache_io_backend` to `kernel_ascend` and "
-                f"`hicache_mem_layout` to `{self.hicache_mem_layout}`"
-            )
 
     def _handle_speculative_decoding(self):
         if (
@@ -1691,6 +1703,8 @@ class ServerArgs:
                 "Glm4MoeForCausalLM",
                 "BailingMoeForCausalLM",
                 "BailingMoeV2ForCausalLM",
+                "MistralLarge3ForCausalLM",
+                "PixtralForConditionalGeneration",
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -1931,6 +1945,8 @@ class ServerArgs:
                         "DeepseekV2ForCausalLM",
                         "DeepseekV3ForCausalLM",
                         "DeepseekV32ForCausalLM",
+                        "MistralLarge3ForCausalLM",
+                        "PixtralForConditionalGeneration",
                     ]
                 except Exception:
                     pass
@@ -4524,6 +4540,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "GptOssForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "PixtralForConditionalGeneration",
     ]:
         # The default value for deepseek and gpt-oss
         return (3, 1, 4)
