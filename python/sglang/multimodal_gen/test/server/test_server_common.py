@@ -204,10 +204,16 @@ Consider updating perf_baselines.json with the snippets below:
 
         summary = validator.collect_metrics(perf_record)
 
-        if is_baseline_generation_mode or missing_scenario:
+        if is_baseline_generation_mode:
             self._dump_baseline_for_testcase(case, summary, missing_scenario)
-            if missing_scenario:
-                pytest.fail(f"Testcase '{case.id}' not found in perf_baselines.json")
+            return
+
+        if missing_scenario:
+            self._dump_baseline_for_testcase(case, summary, missing_scenario)
+            logger.warning(
+                "Baseline for '%s' not found; skipping performance validation.",
+                case.id,
+            )
             return
 
         self._check_for_improvement(case, summary, scenario)

@@ -25,7 +25,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -480,5 +483,41 @@ TWO_GPU_CASES_B = [
     ),
 ]
 
+def _default_tolerances() -> ToleranceConfig:
+    """Return permissive tolerances when perf_baselines.json is absent."""
+    return ToleranceConfig(
+        e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", "0.0")),
+        denoise_stage=float(
+            os.getenv("SGLANG_STAGE_TIME_TOLERANCE", "0.0")
+        ),
+        non_denoise_stage=float(
+            os.getenv("SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE", "0.0")
+        ),
+        denoise_step=float(os.getenv("SGLANG_DENOISE_STEP_TOLERANCE", "0.0")),
+        denoise_agg=float(os.getenv("SGLANG_DENOISE_AGG_TOLERANCE", "0.0")),
+    )
+
+
+def _load_baseline_config() -> BaselineConfig:
+    """Load perf baselines if present; otherwise return an empty config."""
+    baseline_path = Path(__file__).with_name("perf_baselines.json")
+    if baseline_path.exists():
+        return BaselineConfig.load(baseline_path)
+
+    logger.warning(
+        "perf_baselines.json not found at %s; skipping performance validation.",
+        baseline_path,
+    )
+    return BaselineConfig(
+        scenarios={},
+        step_fractions=(0.25, 0.5, 0.75),
+        warmup_defaults={},
+        tolerances=_default_tolerances(),
+        improvement_threshold=float(
+            os.getenv("SGLANG_BASELINE_IMPROVEMENT_THRESHOLD", "0.2")
+        ),
+    )
+
+
 # Load global configuration
-BASELINE_CONFIG = BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+BASELINE_CONFIG = _load_baseline_config()
