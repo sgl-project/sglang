@@ -13,11 +13,13 @@
 //! - **Phi3-Vision** (`phi3_vision`): Dynamic HD transform with 336x336 tiles
 //! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
+//! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 
 pub mod llama4_vision;
 pub mod llava;
 pub mod phi3_vision;
 pub mod phi4_vision;
+pub mod pixtral;
 pub mod qwen2_vl;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
@@ -26,5 +28,6 @@ pub use llama4_vision::Llama4VisionProcessor;
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
+pub use pixtral::PixtralProcessor;
 pub use qwen2_vl::Qwen2VLProcessor;
 pub use qwen3_vl::Qwen3VLProcessor;
