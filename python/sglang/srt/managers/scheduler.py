@@ -1914,7 +1914,7 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
-            self.num_retracted_reqs = len(retracted_reqs)
+            self.num_retracted_reqs += len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
