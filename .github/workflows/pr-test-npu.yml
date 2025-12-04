@@ -45,7 +45,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-1
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-910b
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -59,7 +59,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh 910b
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -88,7 +88,7 @@ jobs:
       matrix:
         part: [0, 1, 2]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-910b
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -102,7 +102,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh 910b
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -127,7 +127,7 @@ jobs:
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: linux-arm64-npu-4
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-910b-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-910b
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -141,7 +141,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh 910b
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
@@ -170,7 +170,7 @@ jobs:
       matrix:
         part: [0, 1]
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:8.3.rc1-a3-ubuntu22.04-py3.11
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -184,7 +184,7 @@ jobs:
           pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
           pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
 
-          bash scripts/ci/npu_ci_install_dependency.sh a3
+          bash scripts/ci/npu_ci_install_dependency.sh
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
           # copy download through proxy
