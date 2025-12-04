@@ -62,15 +62,30 @@ def post_process_sample(
     if save_output:
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
-            if data_type == DataType.VIDEO:
+            # Prefer the extension from the file path when available to avoid
+            # forcing video writers for single-frame images (e.g., JPEG).
+            ext = os.path.splitext(save_file_path)[1].lower().lstrip(".")
+            save_format = ext or data_type.get_default_extension()
+
+            is_multiframe = len(frames) > 1
+            video_like_formats = {"mp4", "gif", "webp", "avi", "mov"}
+            image_like_formats = {"jpg", "jpeg", "png", "webp"}
+
+            if is_multiframe and save_format in video_like_formats:
                 imageio.mimsave(
                     save_file_path,
                     frames,
                     fps=fps,
-                    format=data_type.get_default_extension(),
+                    format=save_format,
                 )
             else:
-                imageio.imwrite(save_file_path, frames[0])
+                if is_multiframe and save_format not in video_like_formats:
+                    logger.warning(
+                        "Detected multiple frames but format '%s' is not a video "
+                        "format; saving the first frame only.",
+                        save_format,
+                    )
+                imageio.imwrite(save_file_path, frames[0], format=save_format)
             logger.info(f"Saved output to {save_file_path}")
         else:
             logger.info(f"No output path provided, output not saved")

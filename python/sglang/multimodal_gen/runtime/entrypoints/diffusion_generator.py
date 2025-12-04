@@ -193,15 +193,27 @@ class DiffGenerator:
             if save_file_path:
                 os.makedirs(os.path.dirname(save_file_path), exist_ok=True)
                 with suppress_other_loggers():
-                    if data_type == DataType.VIDEO:
+                    ext = os.path.splitext(save_file_path)[1].lower().lstrip(".")
+                    save_format = ext or data_type.get_default_extension()
+
+                    is_multiframe = len(frames) > 1
+                    video_like_formats = {"mp4", "gif", "webp", "avi", "mov"}
+
+                    if is_multiframe and save_format in video_like_formats:
                         imageio.mimsave(
                             save_file_path,
                             frames,
                             fps=fps,
-                            format=data_type.get_default_extension(),
+                            format=save_format,
                         )
                     else:
-                        imageio.imwrite(save_file_path, frames[0])
+                        if is_multiframe and save_format not in video_like_formats:
+                            logger.warning(
+                                "Detected multiple frames but format '%s' is not a video "
+                                "format; saving the first frame only.",
+                                save_format,
+                            )
+                        imageio.imwrite(save_file_path, frames[0], format=save_format)
                 logger.info("Saved output to %s", save_file_path)
             else:
                 logger.warning("No output path provided, output not saved")
