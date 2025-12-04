@@ -365,21 +365,24 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            batch = self.get_next_disagg_prefill_batch_to_run()
+            with torch.cuda.nvtx.range("schedule"):
+                batch = self.get_next_disagg_prefill_batch_to_run()
             # logger.info(f"get_next_disagg_prefill_batch_to_run: {batch=}")
             self.cur_batch = batch
 
             batch_result = None
             if batch:
                 # logger.info(f"run_batch")
-                batch_result = self.run_batch(batch)
+                with torch.cuda.nvtx.range("forward"):
+                    batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
                 self.notify_prefill_done(batch, batch_result)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 # logger.info(f"process_batch_result_disagg_prefill: {tmp_batch=} {tmp_result=}")
-                self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
+                with torch.cuda.nvtx.range("post"):
+                    self.process_batch_result_disagg_prefill(tmp_batch, tmp_result)
             elif batch is None:
                 self.self_check_during_idle()
 
