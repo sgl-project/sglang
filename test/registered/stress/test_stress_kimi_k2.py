@@ -12,8 +12,9 @@ RANDOM_OUTPUT_LEN = 1024
 OUTPUT_FILE = "stress_test_kimi_k2.jsonl"
 
 # Register for CI - estimated 30 minutes for throughput benchmarking
-# TEMP: Disabled for debugging - testing only Qwen3
-# register_cuda_ci(est_time=1800, suite="stress")
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=1800, suite="stress")
 
 
 class TestStressKimiK2(unittest.TestCase):
@@ -22,7 +23,7 @@ class TestStressKimiK2(unittest.TestCase):
         cls.model = MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_prompts = int(os.environ.get("NUM_PROMPTS", "20000"))
-        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "5"))
+        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "30"))
 
         cls.runner = StressTestRunner(
             test_name="Kimi-K2-Thinking Stress Test",
