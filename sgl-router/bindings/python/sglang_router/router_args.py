@@ -109,6 +109,8 @@ class RouterArgs:
     oracle_pool_min: int = 1
     oracle_pool_max: int = 16
     oracle_pool_timeout_secs: int = 30
+    postgres_db_url: Optional[str] = None
+    postgres_pool_max: int = 16
     # mTLS configuration for worker communication
     client_cert_path: Optional[str] = None
     client_key_path: Optional[str] = None
@@ -598,6 +600,19 @@ class RouterArgs:
             ),
             help="Oracle connection pool timeout in seconds (default: 30, env: ATP_POOL_TIMEOUT_SECS)",
         )
+        # Postgres configuration
+        parser.add_argument(
+            f"--{prefix}postgres-db-url",
+            type=str,
+            default=os.getenv("POSTGRES_DB_URL"),
+            help="PostgreSQL database connection URL (env: POSTGRES_DB_URL)",
+        )
+        parser.add_argument(
+            f"--{prefix}postgres-pool-max",
+            type=int,
+            default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
+            help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
+        )
         # mTLS configuration
         parser.add_argument(
             f"--{prefix}client-cert-path",
@@ -702,6 +717,10 @@ class RouterArgs:
     def _parse_selector(selector_list):
         if not selector_list:
             return {}
+
+        # Support `- --selector\n- a=b c=d` case
+        if len(selector_list) == 1 and (" " in selector_list[0]):
+            selector_list = selector_list[0].split(" ")
 
         selector = {}
         for item in selector_list:

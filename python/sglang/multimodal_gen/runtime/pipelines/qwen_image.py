@@ -1,8 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from diffusers.image_processor import VaeImageProcessor
 
+from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -58,7 +58,7 @@ def prepare_mu(batch: Req, server_args: ServerArgs):
     return "mu", mu
 
 
-class QwenImagePipeline(ComposedPipelineBase):
+class QwenImagePipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImagePipeline"
 
     _required_config_modules = [
@@ -119,7 +119,7 @@ class QwenImagePipeline(ComposedPipelineBase):
         )
 
 
-class QwenImageEditPipeline(ComposedPipelineBase):
+class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
     pipeline_name = "QwenImageEditPipeline"
 
     _required_config_modules = [
@@ -143,20 +143,12 @@ class QwenImageEditPipeline(ComposedPipelineBase):
             stage=ImageEncodingStage(
                 image_processor=self.get_module("processor"),
                 text_encoder=self.get_module("text_encoder"),
-                vae_image_processor=VaeImageProcessor(
-                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-                    * 2
-                ),
             ),
         )
 
         self.add_stage(
             stage_name="image_encoding_stage_primary",
             stage=ImageVAEEncodingStage(
-                vae_image_processor=VaeImageProcessor(
-                    vae_scale_factor=server_args.pipeline_config.vae_config.arch_config.vae_scale_factor
-                    * 2
-                ),
                 vae=self.get_module("vae"),
             ),
         )
