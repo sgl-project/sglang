@@ -1,5 +1,3 @@
-// PD (Prefill-Decode) gRPC Router Implementation
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -139,12 +137,14 @@ impl std::fmt::Debug for GrpcPDRouter {
                 bootstrap_port: None,
             }),
             Some(ConnectionMode::Grpc { port: None }),
+            None,
             false,
         );
         let decode_workers = self.worker_registry.get_workers_filtered(
             None,
             Some(WorkerType::Decode),
             Some(ConnectionMode::Grpc { port: None }),
+            None,
             false,
         );
         f.debug_struct("GrpcPDRouter")
@@ -161,7 +161,6 @@ impl RouterTrait for GrpcPDRouter {
     }
 
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        // TODO: Implement actual generation test for gRPC PD mode
         (
             StatusCode::NOT_IMPLEMENTED,
             "Health generate not yet implemented for gRPC PD",

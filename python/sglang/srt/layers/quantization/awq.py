@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    npu_fused_experts,
+)
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -31,7 +34,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
-from sglang.srt.layers.quantization.w8a8_int8 import npu_fused_experts
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -51,12 +54,7 @@ if _is_npu:
     import torch_npu
 
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        awq_marlin_moe_repack,
-        awq_marlin_repack,
-        fused_marlin_moe,
-    )
+    from sgl_kernel import awq_dequantize, awq_marlin_moe_repack, awq_marlin_repack
 
 
 elif _is_hip:
@@ -834,6 +832,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (
@@ -954,3 +955,25 @@ class AWQMoEAscendMethod(AWQMoEMethod):
             use_wna16=True,
         )
         return StandardCombineInput(hidden_states=output)
+
+
+# Register fake implementations for torch.compile support
+if _is_cuda:
+
+    @register_fake_if_exists("sgl_kernel::awq_dequantize")
+    def _(
+        qweight,
+        scales,
+        qzeros,
+        ch_axis,
+        group_size,
+        num_bits,
+    ):
+        out_shape = qweight.shape[:-1] + (qweight.shape[-1] * 32 // num_bits,)
+        return qweight.new_empty(out_shape, dtype=scales.dtype)
+
+    @register_fake_if_exists("sgl_kernel::awq_marlin_repack")
+    def _(b_q_weight, size_k, size_n, num_bits):
+        return b_q_weight.new_empty(
+            (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
+        )

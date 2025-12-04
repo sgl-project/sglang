@@ -1,6 +1,5 @@
 import unittest
 
-import sgl_kernel
 import torch
 from utils import (
     convert_weight,

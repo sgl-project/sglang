@@ -10,7 +10,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -105,15 +105,15 @@ impl JobStatus {
 pub struct JobQueueConfig {
     /// Maximum pending jobs in queue
     pub queue_capacity: usize,
-    /// Number of worker tasks processing jobs
-    pub worker_count: usize,
+    /// Maximum number of jobs executing concurrently
+    pub max_concurrent_jobs: usize,
 }
 
 impl Default for JobQueueConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 1000,
-            worker_count: 10,
+            max_concurrent_jobs: 10,
         }
     }
 }
@@ -126,6 +126,8 @@ pub struct JobQueue {
     context: Weak<AppContext>,
     /// Job status tracking by worker URL
     status_map: Arc<DashMap<String, JobStatus>>,
+    /// Semaphore to limit concurrent job execution
+    concurrency_limit: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for JobQueue {
@@ -137,36 +139,51 @@ impl std::fmt::Debug for JobQueue {
 }
 
 impl JobQueue {
-    /// Create a new job queue with background workers (spawns tasks)
+    /// Create a new job queue with semaphore-based concurrency control
     ///
     /// Takes a Weak reference to AppContext to avoid circular strong references.
-    /// Spawns background worker tasks that will process jobs asynchronously.
+    /// Spawns a single dispatcher task that spawns individual job tasks with semaphore control.
     pub fn new(config: JobQueueConfig, context: Weak<AppContext>) -> Arc<Self> {
-        let (tx, rx) = mpsc::channel(config.queue_capacity);
+        let (tx, mut rx) = mpsc::channel(config.queue_capacity);
 
         debug!(
-            "Initializing worker job queue: capacity={}, workers={}",
-            config.queue_capacity, config.worker_count
+            "Initializing job queue: capacity={}, max_concurrent={}",
+            config.queue_capacity, config.max_concurrent_jobs
         );
 
-        let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let status_map = Arc::new(DashMap::new());
+        let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
 
         let queue = Arc::new(Self {
             tx,
             context: context.clone(),
             status_map: status_map.clone(),
+            concurrency_limit: concurrency_limit.clone(),
         });
 
-        for i in 0..config.worker_count {
-            let rx = Arc::clone(&rx);
-            let context = context.clone();
-            let status_map = status_map.clone();
+        // Single dispatcher task
+        let ctx = context.clone();
+        let status = status_map.clone();
+        let sem = concurrency_limit.clone();
 
-            tokio::spawn(async move {
-                Self::worker_loop(i, rx, context, status_map).await;
-            });
-        }
+        tokio::spawn(async move {
+            while let Some(job) = rx.recv().await {
+                // Acquire permit (blocks if at concurrency limit)
+                let Ok(permit) = sem.clone().acquire_owned().await else {
+                    error!("Semaphore closed, stopping dispatcher");
+                    break;
+                };
+
+                let ctx_clone = ctx.clone();
+                let status_clone = status.clone();
+
+                tokio::spawn(async move {
+                    Self::process_job(job, ctx_clone, status_clone, permit).await;
+                });
+            }
+
+            debug!("Job dispatcher stopped");
+        });
 
         // Spawn cleanup task for old job statuses (TTL 5 minutes)
         let cleanup_status_map = status_map.clone();
@@ -177,7 +194,14 @@ impl JobQueue {
         queue
     }
 
-    /// Submit a job
+    /// Get current queue and concurrency status
+    pub fn get_load_info(&self) -> (usize, usize) {
+        let queue_depth = self.tx.max_capacity() - self.tx.capacity();
+        let available_permits = self.concurrency_limit.available_permits();
+        (queue_depth, available_permits)
+    }
+
+    /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
         if self.context.upgrade().is_none() {
@@ -197,18 +221,23 @@ impl JobQueue {
 
         match self.tx.send(job).await {
             Ok(_) => {
-                let queue_depth = self.tx.max_capacity() - self.tx.capacity();
+                let (queue_depth, available_permits) = self.get_load_info();
                 RouterMetrics::set_job_queue_depth(queue_depth);
                 debug!(
-                    "Job submitted: type={}, worker={}, queue_depth={}",
-                    job_type, worker_url, queue_depth
+                    "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
+                    job_type, worker_url, queue_depth, available_permits
                 );
                 Ok(())
             }
             Err(_) => {
                 RouterMetrics::record_job_queue_full();
                 self.status_map.remove(&worker_url);
-                Err("Worker job queue full".to_string())
+                let (queue_depth, _) = self.get_load_info();
+                Err(format!(
+                    "Job queue full: {} jobs pending (capacity: {})",
+                    queue_depth,
+                    self.tx.max_capacity()
+                ))
             }
         }
     }
@@ -223,78 +252,46 @@ impl JobQueue {
         self.status_map.remove(worker_url);
     }
 
-    /// Worker loop that processes jobs
-    async fn worker_loop(
-        worker_id: usize,
-        rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Job>>>,
+    /// Process a single job with status tracking and error handling
+    async fn process_job(
+        job: Job,
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
+        _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        debug!("Worker job queue worker {} started", worker_id);
+        let job_type = job.job_type().to_string();
+        let worker_url = job.worker_url().to_string();
+        let start = std::time::Instant::now();
 
-        loop {
-            // Lock the receiver and try to receive a job
-            let job = {
-                let mut rx_guard = rx.lock().await;
-                rx_guard.recv().await
-            };
+        // Update to processing
+        status_map.insert(
+            worker_url.clone(),
+            JobStatus::processing(&job_type, &worker_url),
+        );
 
-            match job {
-                Some(job) => {
-                    let job_type = job.job_type().to_string();
-                    let worker_url = job.worker_url().to_string();
-                    let start = std::time::Instant::now();
+        debug!("Processing job: type={}, worker={}", job_type, worker_url);
 
-                    // Update status to processing
-                    status_map.insert(
-                        worker_url.clone(),
-                        JobStatus::processing(&job_type, &worker_url),
-                    );
-
-                    debug!(
-                        "Worker {} processing job: type={}, worker={}",
-                        worker_id, job_type, worker_url
-                    );
-
-                    // Upgrade weak reference to process job
-                    match context.upgrade() {
-                        Some(ctx) => {
-                            let result = Self::execute_job(&job, &ctx).await;
-                            let duration = start.elapsed();
-                            Self::record_job_completion(
-                                &job_type,
-                                &worker_url,
-                                worker_id,
-                                duration,
-                                &result,
-                                &status_map,
-                            );
-                        }
-                        None => {
-                            let error_msg = "AppContext dropped".to_string();
-                            status_map.insert(
-                                worker_url.clone(),
-                                JobStatus::failed(&job_type, &worker_url, error_msg),
-                            );
-                            error!(
-                                "Worker {}: AppContext dropped, cannot process job: type={}, worker={}",
-                                worker_id, job_type, worker_url
-                            );
-                            break;
-                        }
-                    }
-                }
-                None => {
-                    warn!(
-                        "Worker job queue worker {} channel closed, stopping",
-                        worker_id
-                    );
-                    break;
-                }
+        // Execute job
+        match context.upgrade() {
+            Some(ctx) => {
+                let result = Self::execute_job(&job, &ctx).await;
+                let duration = start.elapsed();
+                Self::record_job_completion(&job_type, &worker_url, duration, &result, &status_map);
+            }
+            None => {
+                let error_msg = "AppContext dropped".to_string();
+                status_map.insert(
+                    worker_url.clone(),
+                    JobStatus::failed(&job_type, &worker_url, error_msg),
+                );
+                error!(
+                    "AppContext dropped, cannot process job: type={}, worker={}",
+                    job_type, worker_url
+                );
             }
         }
 
-        debug!("Worker job queue worker {} stopped", worker_id);
+        // Permit automatically released when dropped
     }
 
     /// Execute a specific job
@@ -374,9 +371,71 @@ impl JobQueue {
 
                         prefill_workers.chain(decode_workers).collect()
                     }
-                    RoutingMode::OpenAI { .. } => {
-                        info!("OpenAI mode: no workers to initialize");
-                        return Ok("OpenAI mode: no workers to initialize".to_string());
+                    RoutingMode::OpenAI { worker_urls } => {
+                        // OpenAI mode: submit AddWorker jobs with runtime: "external"
+                        // The external_worker_registration workflow handles model discovery
+                        let api_key = router_config.api_key.clone();
+                        let mut submitted_count = 0;
+
+                        for url in worker_urls {
+                            let url_for_error = url.clone();
+                            let config = WorkerConfigRequest {
+                                url: url.clone(),
+                                api_key: api_key.clone(),
+                                worker_type: Some("regular".to_string()),
+                                labels: HashMap::new(),
+                                model_id: None,
+                                priority: None,
+                                cost: None,
+                                runtime: Some("external".to_string()),
+                                tokenizer_path: None,
+                                reasoning_parser: None,
+                                tool_parser: None,
+                                chat_template: None,
+                                bootstrap_port: None,
+                                health_check_timeout_secs: router_config.health_check.timeout_secs,
+                                health_check_interval_secs: router_config
+                                    .health_check
+                                    .check_interval_secs,
+                                health_success_threshold: router_config
+                                    .health_check
+                                    .success_threshold,
+                                health_failure_threshold: router_config
+                                    .health_check
+                                    .failure_threshold,
+                                max_connection_attempts: router_config
+                                    .health_check
+                                    .success_threshold
+                                    * 10,
+                                dp_aware: false,
+                            };
+
+                            let job = Job::AddWorker {
+                                config: Box::new(config),
+                            };
+
+                            if let Some(queue) = context.worker_job_queue.get() {
+                                queue.submit(job).await.map_err(|e| {
+                                    format!(
+                                        "Failed to submit AddWorker job for external endpoint {}: {}",
+                                        url_for_error, e
+                                    )
+                                })?;
+                                submitted_count += 1;
+                            } else {
+                                return Err("JobQueue not available".to_string());
+                            }
+                        }
+
+                        if submitted_count == 0 {
+                            info!("OpenAI mode: no worker URLs provided");
+                            return Ok("OpenAI mode: no worker URLs to initialize".to_string());
+                        }
+
+                        return Ok(format!(
+                            "Submitted {} AddWorker jobs for external endpoints",
+                            submitted_count
+                        ));
                     }
                 };
 
@@ -396,6 +455,7 @@ impl JobQueue {
                         model_id: None,
                         priority: None,
                         cost: None,
+                        runtime: None,
                         tokenizer_path: None,
                         reasoning_parser: None,
                         tool_parser: None,
@@ -499,8 +559,14 @@ impl JobQueue {
         workflow_context.set("worker_config", config.clone());
         workflow_context.set_arc("app_context", Arc::clone(context));
 
+        // Select workflow based on runtime field
+        let workflow_id = match config.runtime.as_deref() {
+            Some("external") => WorkflowId::new("external_worker_registration"),
+            _ => WorkflowId::new("worker_registration"),
+        };
+
         engine
-            .start_workflow(WorkflowId::new("worker_registration"), workflow_context)
+            .start_workflow(workflow_id, workflow_context)
             .await
             .map_err(|e| format!("Failed to start worker registration workflow: {:?}", e))
     }
@@ -608,7 +674,6 @@ impl JobQueue {
     fn record_job_completion(
         job_type: &str,
         worker_url: &str,
-        worker_id: usize,
         duration: Duration,
         result: &Result<String, String>,
         status_map: &Arc<DashMap<String, JobStatus>>,
@@ -620,8 +685,7 @@ impl JobQueue {
                 RouterMetrics::record_job_success(job_type);
                 status_map.remove(worker_url);
                 debug!(
-                    "Worker {} completed job: type={}, worker={}, duration={:.3}s, result={}",
-                    worker_id,
+                    "Completed job: type={}, worker={}, duration={:.3}s, result={}",
                     job_type,
                     worker_url,
                     duration.as_secs_f64(),
@@ -635,8 +699,7 @@ impl JobQueue {
                     JobStatus::failed(job_type, worker_url, error.clone()),
                 );
                 warn!(
-                    "Worker {} failed job: type={}, worker={}, duration={:.3}s, error={}",
-                    worker_id,
+                    "Failed job: type={}, worker={}, duration={:.3}s, error={}",
                     job_type,
                     worker_url,
                     duration.as_secs_f64(),

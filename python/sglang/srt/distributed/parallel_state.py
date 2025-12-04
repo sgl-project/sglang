@@ -43,6 +43,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import (
     direct_register_custom_op,
     get_bool_env_var,
+    get_current_device_stream_fast,
     get_int_env_var,
     get_local_ip_auto,
     is_cpu,
@@ -187,6 +188,27 @@ if _supports_custom_op:
         fake_impl=reg_all_gather_into_tensor_fake,
     )
 
+    def reg_reduce_scatter_tensor(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
+        assert group_name in _groups, f"Group {group_name} is not found."
+        group = _groups[group_name]()
+        if group is None:
+            raise ValueError(f"Group {group_name} is destroyed.")
+        group._reduce_scatter_tensor(output, input)
+
+    def reg_reduce_scatter_tensor_fake(
+        output: torch.Tensor, input: torch.Tensor, group_name: str
+    ) -> None:
+        pass
+
+    direct_register_custom_op(
+        op_name="reg_reduce_scatter_tensor",
+        op_func=reg_reduce_scatter_tensor,
+        mutates_args=["output"],
+        fake_impl=reg_reduce_scatter_tensor_fake,
+    )
+
 
 class GroupCoordinator:
     """
@@ -305,7 +327,7 @@ class GroupCoordinator:
 
         # Lazy import to avoid documentation build error
         from sglang.srt.distributed.device_communicators.custom_all_reduce import (
-            CustomAllreduce,
+            dispatch_custom_allreduce,
         )
         from sglang.srt.distributed.device_communicators.pymscclpp import (
             PyMscclppCommunicator,
@@ -313,10 +335,16 @@ class GroupCoordinator:
         from sglang.srt.distributed.device_communicators.pynccl import (
             PyNcclCommunicator,
         )
+        from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+            is_symmetric_memory_enabled,
+            use_symmetric_memory,
+        )
         from sglang.srt.distributed.device_communicators.torch_symm_mem import (
             TorchSymmMemCommunicator,
         )
 
+        self.is_symmetric_memory_enabled = is_symmetric_memory_enabled
+        self.use_symmetric_memory = use_symmetric_memory
         if is_hip():
             from sglang.srt.distributed.device_communicators.quick_all_reduce import (
                 QuickAllReduce,
@@ -338,12 +366,13 @@ class GroupCoordinator:
                 device=self.device,
             )
 
-        self.ca_comm: Optional[CustomAllreduce] = None
+        self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                self.ca_comm = CustomAllreduce(
+                CAClass = dispatch_custom_allreduce()
+                self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
                 )
@@ -466,7 +495,7 @@ class GroupCoordinator:
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
-        curr_stream = self.device_module.current_stream()
+        curr_stream = get_current_device_stream_fast()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
@@ -500,7 +529,7 @@ class GroupCoordinator:
                 maybe_pynccl_context = nullcontext()
             else:
                 maybe_pynccl_context = pynccl_comm.change_state(
-                    enable=True, stream=torch.get_device_module().current_stream()
+                    enable=True, stream=get_current_device_stream_fast()
                 )
 
             pymscclpp_comm = self.pymscclpp_comm
@@ -551,13 +580,9 @@ class GroupCoordinator:
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        if (
-            self.pynccl_comm is not None
-            and hasattr(input_, "symmetric_memory")
-            and input_.symmetric_memory
-        ):
+        if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
             with self.pynccl_comm.change_state(
-                enable=True, stream=torch.get_device_module().current_stream()
+                enable=True, stream=get_current_device_stream_fast()
             ):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
@@ -630,14 +655,32 @@ class GroupCoordinator:
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
 
-    def reduce_scatter_tensor(
+    def _reduce_scatter_tensor(
         self,
         output: torch.Tensor,
         input: torch.Tensor,
-    ) -> None:
-        # TODO(ch-wan): support other backends
-        torch.distributed.reduce_scatter_tensor(output, input, group=self.device_group)
+    ) -> torch.Tensor:
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and (
+            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
+        ):
+            with pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
+                pynccl_comm.reduce_scatter(output, input)
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                output, input, group=self.device_group
+            )
         return output
+
+    def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        if _is_npu or not supports_custom_op():
+            self._reduce_scatter_tensor(output, input)
+        else:
+            torch.ops.sglang.reg_reduce_scatter_tensor(
+                output, input, group_name=self.unique_name
+            )
 
     def reduce_scatter(
         self,
@@ -658,7 +701,7 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(
-            enable=True, stream=torch.get_device_module().current_stream()
+            enable=True, stream=get_current_device_stream_fast()
         ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
@@ -685,8 +728,13 @@ class GroupCoordinator:
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.all_gather(output, input)
+        if pynccl_comm is not None and (
+            not pynccl_comm.disabled or self.is_symmetric_memory_enabled()
+        ):
+            with pynccl_comm.change_state(
+                enable=True, stream=get_current_device_stream_fast()
+            ):
+                pynccl_comm.all_gather(output, input)
         else:
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
@@ -696,6 +744,27 @@ class GroupCoordinator:
         if _is_npu or _is_xpu or not _supports_custom_op:
             self._all_gather_into_tensor(output, input)
         else:
+            torch.ops.sglang.reg_all_gather_into_tensor(
+                output, input, group_name=self.unique_name
+            )
+
+    def cp_all_gather_into_tensor_async(
+        self, output: torch.Tensor, input: torch.Tensor, stream=None
+    ):
+        """
+        Implement an asynchronous `allgather` operation on a specified stream.
+        (the default `torch.distributed.all_gather_into_tensor` will trigger event synchronization),
+        eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
+        The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
+        """
+        assert (
+            stream is not None
+        ), f"Invalid params stream ({stream}, Please specify the stream to use when calling cp_all_gather_into_tensor_async.)"
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None:
+            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
+        else:
+            logger.warning("not all_gather_into_tensor_async")
             torch.ops.sglang.reg_all_gather_into_tensor(
                 output, input, group_name=self.unique_name
             )
@@ -748,9 +817,10 @@ class GroupCoordinator:
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
         output_size = (input_size[0] * world_size,) + input_size[1:]
         # Allocate output tensor.
-        output_tensor = torch.empty(
-            output_size, dtype=input_.dtype, device=input_.device
-        )
+        with self.use_symmetric_memory(self):
+            output_tensor = torch.empty(
+                output_size, dtype=input_.dtype, device=input_.device
+            )
 
         # All-gather.
         if input_.is_cpu:
@@ -784,13 +854,13 @@ class GroupCoordinator:
         pynccl_comm = self.pynccl_comm
 
         with pynccl_comm.change_state(
-            enable=True, stream=torch.get_device_module().current_stream()
+            enable=True, stream=get_current_device_stream_fast()
         ):
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for all_gatherv"
 
-            def _all_gather_single(
+            def _all_gather_allocate_output(
                 input_: torch.Tensor, sizes: Optional[List[int]] = None
             ):
                 input_size = input_.size()
@@ -804,19 +874,25 @@ class GroupCoordinator:
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
                 # Allocate output tensor.
-                output_tensor = torch.empty(
-                    output_size, dtype=input_.dtype, device=input_.device
-                )
-                pynccl_comm.all_gather(output_tensor, input_, sizes=sizes)
-                return output_tensor
+                with self.use_symmetric_memory(self, disabled=sizes is not None):
+                    output_tensor = torch.empty(
+                        output_size, dtype=input_.dtype, device=input_.device
+                    )
+                return output_tensor, sizes
 
             if isinstance(input_, torch.Tensor):
-                return _all_gather_single(input_, sizes)
+                input_ = [input_]
 
             output_list = []
-            pynccl_comm.group_start()
+            size_list = []
             for inp in input_:
-                output_list.append(_all_gather_single(inp, sizes=sizes))
+                output_tensor, s = _all_gather_allocate_output(inp, sizes=sizes)
+                output_list.append(output_tensor)
+                size_list.append(s)
+
+            pynccl_comm.group_start()
+            for i, inp in enumerate(input_):
+                pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
             pynccl_comm.group_end()
 
             return output_list
