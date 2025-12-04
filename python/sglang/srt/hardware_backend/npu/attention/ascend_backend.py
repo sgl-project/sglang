@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import torch_npu
 
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.distributed import (
+    get_context_model_parallel_rank,
+    get_context_model_parallel_world_size,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
@@ -42,6 +46,7 @@ class ForwardMetadata:
     seq_lens_list_cumsum: Optional[List[int]] = None
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
+    actual_seq_lengths_kv: Optional[torch.Tensor] = None
 
 
 class AscendAttnMaskBuilder:
@@ -237,6 +242,7 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mtp_mask,
             self.ascend_attn_mask_builder.mix_mask_cache,
         )
+        self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
 
     def get_verify_buffers_to_fill_after_draft(self):
         """
@@ -253,7 +259,6 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        tp_size = get_attention_tp_size()
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
@@ -283,6 +288,38 @@ class AscendAttnBackend(AttentionBackend):
             self.mix_mask = self.ascend_attn_mask_builder.update_mask(
                 self.forward_metadata
             )
+        if self.use_nsa:
+            is_prefill = (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend()
+            )
+            if is_prefill:
+                actual_seq_lengths_kv = forward_batch.seq_lens.clone().int()
+                actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0).int()
+                cp_size = get_context_model_parallel_world_size()
+                cp_rank = get_context_model_parallel_rank()
+                if cp_size > 1:
+                    rank_offset = cp_rank
+                    bsz = forward_batch.input_ids.numel() // cp_size  # q_nope.shape[0]
+                    actual_seq_qlen -= bsz * rank_offset
+                    actual_seq_qlen.clip_(min=0, max=bsz)
+
+                    total_num = bsz * (rank_offset + 1)
+                    for i in range(len(actual_seq_lengths_kv)):
+                        if total_num <= actual_seq_lengths_kv[i]:
+                            actual_seq_lengths_kv[i] = total_num
+                            total_num = 0
+                        else:
+                            total_num -= actual_seq_lengths_kv[i]
+                self.forward_metadata.actual_seq_lengths_q = actual_seq_qlen
+                self.forward_metadata.actual_seq_lengths_kv = (
+                    actual_seq_lengths_kv  # self.forward_metadata.seq_lens_cpu_int
+                )
+            else:
+                self.forward_metadata.actual_seq_lengths_q = None
+                self.forward_metadata.actual_seq_lengths_kv = None
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
@@ -324,7 +361,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         else:
             metadata.actual_seq_lengths_q = torch.tensor(
-                [1 + i * 1 for i in range(bs)],
+                list(range(1, bs + 1)),
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
@@ -397,9 +434,9 @@ class AscendAttnBackend(AttentionBackend):
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        block_table = self.forward_metadata.block_tables
+
         if is_prefill:
-            actual_seq_qlen = torch.cumsum(forward_batch.seq_lens, dim=0)
+            actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
         else:
             if self.forward_metadata.actual_seq_lengths_q is None:
                 if (
@@ -428,10 +465,13 @@ class AscendAttnBackend(AttentionBackend):
                     )
             else:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
-        if self.forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = self.forward_metadata.seq_lens
-        else:
+
+        if self.forward_metadata.actual_seq_lengths_kv is not None:
+            actual_seq_lengths_kv = self.forward_metadata.actual_seq_lengths_kv
+        elif self.forward_metadata.seq_lens_cpu_int is not None:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int
+        else:
+            actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
         attn_out = torch.ops.custom.npu_sparse_flash_attention(
             query=q_nope,
@@ -441,9 +481,9 @@ class AscendAttnBackend(AttentionBackend):
             key_rope=k_pe,
             sparse_indices=topk_indices,
             scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen.to(torch.int32),
+            actual_seq_lengths_query=actual_seq_qlen,
             actual_seq_lengths_kv=actual_seq_lengths_kv.to(q.device),
-            block_table=block_table,
+            block_table=self.forward_metadata.block_tables,
             sparse_block_size=1,
             layout_query="TND",
             layout_kv="PA_BSND",
@@ -607,6 +647,21 @@ class AscendAttnBackend(AttentionBackend):
             q_nope, q_rope = q.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
             k_nope, k_rope = k.split([layer.v_head_dim, self.qk_rope_head_dim], dim=-1)
 
+            actual_seq_qlen = self.forward_metadata.seq_lens_list_cumsum.copy()
+            cp_size = get_context_model_parallel_world_size()
+            if cp_size > 1:
+                cp_rank = get_context_model_parallel_rank()
+                bsz = q_nope.shape[0]
+                actual_seq_qlen -= bsz * cp_rank
+                np.clip(actual_seq_qlen, 0, bsz, out=actual_seq_qlen)
+                if actual_seq_qlen[-1] == 0:
+                    return q_nope.new_zeros(
+                        (q_nope.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+                    )
+                elif actual_seq_qlen[-1] < bsz:
+                    q_nope = q_nope[: actual_seq_qlen[-1]]
+                    q_rope = q_rope[: actual_seq_qlen[-1]]
+
             attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                 q_nope,
                 k_nope,
@@ -617,7 +672,7 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="TND",
                 atten_mask=self.fia_mask,
                 sparse_mode=3,
-                actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                actual_seq_lengths=actual_seq_qlen,
                 actual_seq_lengths_kv=self.forward_metadata.seq_lens_list_cumsum,
                 scale=layer.scaling,
                 next_tokens=0,
@@ -786,9 +841,7 @@ class AscendAttnBackend(AttentionBackend):
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
-                    actual_seq_len_kv = (
-                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-                    )
+                    actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_int.tolist()
                 num_tokens = query.shape[0]
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_get_max_workspace(
