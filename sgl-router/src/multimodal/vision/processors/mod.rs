@@ -14,6 +14,7 @@
 pub mod llava;
 pub mod qwen2_vl;
 pub mod qwen3_vl;
+pub mod qwen_vl_base;
 
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
 pub use qwen2_vl::Qwen2VLProcessor;
