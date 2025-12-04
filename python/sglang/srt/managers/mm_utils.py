@@ -47,17 +47,16 @@ def init_feature_buffer(device):
     _BUFFER_OFFSET = 0
     if (
         device == "cpu"
-        or envs.SGLANG_MM_BUFFER_SIZE.get() == 0
+        or envs.SGLANG_MM_BUFFER_SIZE_MB.get() == 0
         or _GPU_FEATURE_BUFFER is not None
     ):
         return
     try:
-        size_mb = envs.SGLANG_MM_BUFFER_SIZE.get()
+        size_mb = envs.SGLANG_MM_BUFFER_SIZE_MB.get()
         num_elements = int(size_mb * 1024 * 1024 / 4)
         _GPU_FEATURE_BUFFER = torch.empty(
             num_elements, dtype=torch.float32, device=device
         )
-        _BUFFER_OFFSET = 0
         logger.info(f"Preallocated {size_mb}MB GPU buffer")
     except RuntimeError as e:
         _GPU_FEATURE_BUFFER = None

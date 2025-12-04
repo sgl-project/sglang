@@ -329,7 +329,7 @@ class MultimodalInputs:
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
 
-        if envs.SGLANG_MM_BUFFER_SIZE.get() > 0:
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             from sglang.srt.managers.mm_utils import (
                 init_feature_buffer,
                 try_add_to_buffer,
@@ -345,7 +345,7 @@ class MultimodalInputs:
         for item in ret.mm_items:
             item.set_pad_value()
 
-        if envs.SGLANG_MM_BUFFER_SIZE.get() > 0:
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             for item in ret.mm_items:
                 if item.feature is not None:
                     item.feature = item.feature.to("cpu", non_blocking=True)
