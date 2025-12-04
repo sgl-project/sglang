@@ -75,7 +75,7 @@ Its core features include:
    platforms/cpu_server.md
    platforms/tpu.md
    platforms/nvidia_jetson.md
-   platforms/ascend_npu.md
+   platforms/ascend_npu_support.rst
    platforms/xpu.md
 
 .. toctree::
