@@ -548,7 +548,7 @@ class SimpleEagleWorker(TpModelWorker):
         batch.spec_info.accept_length = accept_length
         batch.spec_info.accept_length_cpu = accept_length_cpu
         batch.seq_lens.add_(accept_length + 1)
-        batch.seq_lens_cpu.add_(torch.tensor(accept_length_cpu,dtype=torch.int32) + 1)
+        batch.seq_lens_cpu.add_(accept_length.cpu() + 1)
         batch.seq_lens_sum = batch.seq_lens.sum().item()
 
         batch.extend_lens = [x + 1 for x in accept_length_cpu]
@@ -593,6 +593,7 @@ class SimpleEagleWorker(TpModelWorker):
 
         if has_finished:
             accept_length = (accept_index != -1).sum(dim=1) - 1
+            accept_length_cpu = accept_length.tolist()
 
         evict_mask = torch.full_like(batch.out_cache_loc, True, dtype=torch.bool)
         evict_mask[accept_index[accept_index != -1]] = False
