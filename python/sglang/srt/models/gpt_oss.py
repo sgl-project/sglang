@@ -79,21 +79,8 @@ _is_npu = is_npu()
 if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
 
-
-# When using the Ascend backend, the silu activation function (torch_npu.npu_swiglu)
-# caused precision issues with the GPT-OSS model; switching to a custom implementation
-# of the swiglu activation function resolved the problem.
-def _swiglu_oai(layer, hidden_states):
-    E, N, _ = layer.w13_weight.size()
-    gate_up = hidden_states.view(-1, N)
-    alpha = layer.moe_runner_config.gemm1_alpha
-    limit = layer.moe_runner_config.gemm1_clamp_limit
-    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-    gate = gate.clamp(min=None, max=limit)
-    up = up.clamp(min=-limit, max=limit)
-    glu = gate * torch.sigmoid(gate * alpha)
-    gated_output = (up + 1) * glu
-    return gated_output
+if _is_npu:
+    from sgl_kernel_npu.moe.swiglu_oai import swiglu_oai
 
 
 class GptOssConfig(PretrainedConfig):
@@ -150,7 +137,7 @@ class GptOssSparseMoeBlock(nn.Module):
                 logger.warning(
                     "Warning: GPT-OSS use custom activate function on FusedMoE when using ascend backend."
                 )
-            custom_act_fn = _swiglu_oai
+            custom_act_fn = swiglu_oai
         self.experts = experts_type(
             num_experts=config.num_local_experts
             + get_global_server_args().ep_num_redundant_experts,
