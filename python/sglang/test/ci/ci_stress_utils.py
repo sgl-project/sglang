@@ -107,9 +107,52 @@ class StressTestRunner:
 
         metrics = {}
 
-        if not os.path.exists(output_file):
-            print(f"Output file not found: {output_file}")
+        # Check if file exists and print debug info
+        print(f"Checking for JSONL file: {output_file}")
+        print(f"Current working directory: {os.getcwd()}")
+
+        # Try multiple possible locations for the JSONL file
+        possible_paths = [
+            output_file,  # Relative to current directory
+            os.path.abspath(output_file),  # Absolute path from current directory
+            os.path.join(os.getcwd(), output_file),  # Explicitly in current directory
+            os.path.join(os.path.dirname(os.getcwd()), output_file),  # Parent directory
+            os.path.join("/Users/doug/sglang", output_file),  # Project root
+        ]
+
+        # Also search for any .jsonl files in current and parent directories
+        for search_dir in [
+            os.getcwd(),
+            os.path.dirname(os.getcwd()),
+            "/Users/doug/sglang",
+        ]:
+            try:
+                files = os.listdir(search_dir)
+                jsonl_files = [f for f in files if f.endswith(".jsonl")]
+                if jsonl_files:
+                    print(f"JSONL files in {search_dir}: {jsonl_files}")
+                    # Add any matching files to possible paths
+                    for jf in jsonl_files:
+                        if os.path.basename(output_file) in jf:
+                            possible_paths.append(os.path.join(search_dir, jf))
+            except Exception as e:
+                print(f"Error listing directory {search_dir}: {e}")
+
+        # Try each possible path
+        found_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                print(f"Found JSONL file at: {path}")
+                found_path = path
+                break
+
+        if not found_path:
+            print(
+                f"Output file not found in any of {len(possible_paths)} locations tried"
+            )
             return metrics
+
+        output_file = found_path
 
         try:
             # Read all completed requests from JSONL
@@ -205,6 +248,37 @@ class StressTestRunner:
 
         return metrics
 
+    def _parse_tqdm_progress(self, stderr: str) -> Dict[str, float]:
+        """Parse completed request count from tqdm progress bar in stderr.
+
+        Args:
+            stderr: The stderr output containing tqdm progress
+
+        Returns:
+            Dictionary with 'completed' count if found
+        """
+        metrics = {}
+
+        # Parse tqdm progress bar format: "XX%|████| 12345/20000 [time<time, XX.XXit/s]"
+        # Match patterns like: "50%|████| 10000/20000 [02:30<02:30, 66.67it/s]"
+        # or simpler: "10000/20000 [02:30<02:30, 66.67it/s]"
+        tqdm_pattern = r"(\d+)/(\d+)\s+\[[^\]]+,\s*([\d.]+)it/s\]"
+
+        # Find all matches (get the last one as it's the most recent)
+        matches = list(re.finditer(tqdm_pattern, stderr))
+        if matches:
+            last_match = matches[-1]
+            completed = int(last_match.group(1))
+            total = int(last_match.group(2))
+            rate = float(last_match.group(3))
+
+            metrics["completed"] = completed
+            metrics["request_throughput"] = rate
+
+            print(f"Parsed from tqdm: {completed}/{total} requests at {rate:.2f} req/s")
+
+        return metrics
+
     def run_stress_test_command(
         self, command: List[str], timeout_minutes: Optional[int] = None
     ) -> subprocess.CompletedProcess:
@@ -220,6 +294,7 @@ class StressTestRunner:
         timeout = (timeout_minutes or self.duration_minutes) * 60
         print(f"Running stress test command (timeout: {timeout}s):")
         print(f"  {' '.join(command)}")
+        print(f"Current working directory for subprocess: {os.getcwd()}")
 
         try:
             result = subprocess.run(
@@ -243,6 +318,16 @@ class StressTestRunner:
             # Get stdout/stderr from the TimeoutExpired exception
             stdout = e.stdout.decode("utf-8") if e.stdout else ""
             stderr = e.stderr.decode("utf-8") if e.stderr else ""
+
+            # Debug: print what we got
+            print(f"\nTimeout exception stdout length: {len(stdout)} chars")
+            print(f"Timeout exception stderr length: {len(stderr)} chars")
+            if stdout:
+                print(f"First 500 chars of timeout stdout:\n{stdout[:500]}")
+                print(f"Last 500 chars of timeout stdout:\n{stdout[-500:]}")
+            if stderr:
+                print(f"First 500 chars of timeout stderr:\n{stderr[:500]}")
+                print(f"Last 500 chars of timeout stderr:\n{stderr[-500:]}")
 
             # Create a mock CompletedProcess with the partial output
             result = subprocess.CompletedProcess(
@@ -326,12 +411,22 @@ class StressTestRunner:
                 if not metrics and result.stderr:
                     metrics = self._parse_metrics_from_output(result.stderr)
 
+            # If still no metrics, try parsing tqdm progress from stderr
+            if not metrics and result.stderr:
+                print("Trying to parse tqdm progress from stderr...")
+                metrics = self._parse_tqdm_progress(result.stderr)
+
             # Debug: print parsed metrics
             print(f"\nParsed metrics: {metrics}")
             if not metrics:
                 print("WARNING: No metrics were parsed!")
                 print(f"stdout length: {len(result.stdout)} chars")
                 print(f"stderr length: {len(result.stderr)} chars")
+                print(f"\nFirst 500 chars of stdout:\n{result.stdout[:500]}")
+                print(f"\nLast 500 chars of stdout:\n{result.stdout[-500:]}")
+                if result.stderr:
+                    print(f"\nFirst 500 chars of stderr:\n{result.stderr[:500]}")
+                    print(f"\nLast 500 chars of stderr:\n{result.stderr[-500:]}")
 
             print(f"\nStress test completed successfully for {model_path}")
             self._add_success_to_report(
