@@ -108,30 +108,21 @@ def parse_img_path(text):
 
 def process_single_sample(data):
     question = data["question"]
-    o_imgs_paths = []
-    for option in data["options"]:
-        current_o_imgs_paths = parse_img_path(option)
-        for img_path in current_o_imgs_paths:
-            o_imgs_paths.append(img_path)
+    # Collect all valid images from image_1 to image_7
+    images = []
+    for i in range(1, 8):
+        key = f"image_{i}"
+        if key in data and data[key] is not None:
+            images.append(data[key])
 
-    if len(o_imgs_paths) > 1:  # multiple images in options, used for random selection
-        return {
-            "id": data["id"],
-            "question": question,
-            "options": data["options"],
-            "answer": data["answer"],
-            "image": None,
-            "question_type": data["question_type"],
-        }
-    else:
-        return {
-            "id": data["id"],
-            "question": question,
-            "options": data["options"],
-            "answer": data["answer"],
-            "image": data["image_1"],
-            "question_type": data["question_type"],
-        }
+    return {
+        "id": data["id"],
+        "question": question,
+        "options": data["options"],
+        "answer": data["answer"],
+        "images": images,
+        "question_type": data["question_type"],
+    }
 
 
 # DATA SAVING
@@ -174,6 +165,7 @@ def construct_prompt(sample, config):
     question = sample["question"]
     options = eval(sample["options"])
     example = ""
+    assert sample["question_type"] in ["multiple-choice", "open"]
     if sample["question_type"] == "multiple-choice":
         start_chr = "A"
         prediction_range = []

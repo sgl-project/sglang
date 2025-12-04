@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional
 
 import numpy as np
+import openai
 import torch
 from data_utils import (
     CAT_SHORT2LONG,
@@ -36,7 +37,7 @@ class EvalArgs:
     profile: bool = False
     profile_number: int = 5
     concurrency: int = 1
-    max_new_tokens: int = 30
+    max_new_tokens: int = 4096
     response_answer_regex: str = "(.*)"
     lora_path: Optional[str] = None
 
@@ -202,15 +203,17 @@ def prepare_samples(eval_args: EvalArgs):
     def process_sample(i, sample):
         sample = process_single_sample(sample)
         sample = construct_prompt(sample, eval_args.config)
-        image = sample["image"]
-        width, height = image.size
-        if 0 < eval_args.image_pixels_limit <= width * height:
-            return None, True
-        # Use a unique identifier for the image path to avoid potential collisions if indices reset
-        image_path = f"{images_path}/image_{sample['id']}.png"
-        if not os.path.exists(image_path):
-            image.save(image_path)
-        sample["image_path"] = image_path
+        images = sample["images"]
+        image_paths = []
+
+        for idx, image in enumerate(images):
+            # Use a unique identifier for the image path to avoid potential collisions if indices reset
+            image_path = f"{images_path}/image_{sample['id']}_{idx}.png"
+            if not os.path.exists(image_path):
+                image.save(image_path)
+            image_paths.append(image_path)
+
+        sample["image_paths"] = image_paths
         return sample, False
 
     print("Processing samples...")
@@ -545,15 +548,53 @@ def calculate_ins_level_acc(results: Dict):
     return acc / ins_num
 
 
+def extract_answer_by_llm(response, sample):
+    try:
+        client = openai.OpenAI()
+        if sample["question_type"] == "multiple-choice":
+            prompt = (
+                f"Question: {sample['question']}\n"
+                f"Options: {sample['options']}\n"
+                f"Model Response: {response}\n\n"
+                "Please extract the final answer from the model response. "
+                "Return only the option letter (e.g., A, B, C, D) that matches the model's choice. "
+                "If the model refuses or is unclear, return 'Unknown'."
+            )
+        else:
+            prompt = (
+                f"Question: {sample['question']}\n"
+                f"Model Response: {response}\n\n"
+                "Please extract the final short answer from the model response. "
+                "Return only the exact answer content."
+            )
+
+        completion = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that extracts answers from model outputs.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"LLM Judge failed: {e}")
+        if sample["question_type"] == "multiple-choice":
+            return parse_multi_choice_response(
+                response, sample["all_choices"], sample["index2ans"]
+            )
+        else:
+            return response
+
+
 def process_result(response, sample, answer_dict, out_samples):
     if response is None:
         return
-    if sample["question_type"] == "multiple-choice":
-        pred_ans = parse_multi_choice_response(
-            response, sample["all_choices"], sample["index2ans"]
-        )
-    else:  # open question
-        pred_ans = response
+
+    pred_ans = extract_answer_by_llm(response, sample)
 
     out_samples[sample["id"]] = {
         "pred_ans": pred_ans,
