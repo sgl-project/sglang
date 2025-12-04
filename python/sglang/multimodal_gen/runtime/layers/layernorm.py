@@ -269,6 +269,122 @@ class FP32LayerNorm(nn.LayerNorm):
         ).to(origin_dtype)
 
 
+@CustomOp.register("scale_residual_norm_scale_shift")
+class ScaleResidualNormScaleShift(CustomOp):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        eps=1e-6,
+        norm_type: str = "rms",
+        elementwise_affine: bool = False,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.norm_type = norm_type.lower()
+        self.norm = nn.Module()
+
+        factory_kwargs = {"device": device, "dtype": dtype}
+        if elementwise_affine:
+            self.norm.weight = torch.nn.Parameter(
+                torch.empty(hidden_size, **factory_kwargs)
+            )
+            if self.norm_type == "layer" and bias:
+                self.norm.bias = torch.nn.Parameter(
+                    torch.empty(hidden_size, **factory_kwargs)
+                )
+            else:
+                self.norm.register_parameter("bias", None)
+        else:
+            self.norm.register_parameter("weight", None)
+            self.norm.register_parameter("bias", None)
+
+    def forward_cuda(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ):
+        return torch.ops.sglang_ops.scale_residual_norm_scale_shift(
+            residual, x,
+            gate if isinstance(gate, torch.Tensor) else None,
+            self.norm.weight, self.norm.bias,
+            scale, shift,
+            self.eps, self.norm_type == "rms",
+        )
+
+    def forward_native(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ):
+        # 1. residual add
+        if isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_out = residual + (
+                    x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                ).flatten(1, 2)
+            else:
+                # gate.shape: [batch_size, 1, inner_dim]
+                residual_out = residual + x * gate
+        else:
+            residual_out = residual + x * gate
+        # 2. normalize
+        if self.norm_type == "layer":   # LayerNorm
+            mean = residual_out.mean(dim=-1, keepdim=True)
+            var = residual_out.var(dim=-1, unbiased=False, keepdim=True)
+            normalized = (residual_out - mean) / torch.sqrt(var + self.eps)
+        elif self.norm_type == "rms":   # RMSNorm
+            rms = residual_out.pow(2).mean(dim=-1, keepdim=True)
+            normalized = residual_out / torch.sqrt(rms + self.eps)
+        # 3. apply affine transform if given
+        norm_weight, norm_bias = self.norm.weight, self.norm.bias
+        if norm_weight is not None and norm_bias is not None:
+            normalized = normalized * norm_weight + norm_bias
+        elif norm_weight is not None:
+            normalized = normalized * norm_weight
+        # 4. apply scale/shift if given
+        batch, seq_len, hidden_dim = x.shape
+        if scale.ndim <= 3:
+            if scale.ndim == 0 or (scale.ndim == 1 and scale.size == 1):
+                # (), (1) → (B, S, D)
+                scale = scale.expand(batch, seq_len, hidden_dim)
+                shift = shift.expand(batch, seq_len, hidden_dim)
+            elif scale.ndim == 2 and scale.shape in [(1, hidden_dim), (batch, hidden_dim)]:
+                # (B, D) or (1, D) → (B, S, 1, D)
+                scale = scale[:, None, :].expand(batch, seq_len, hidden_dim)
+                shift = shift[:, None, :].expand(batch, seq_len, hidden_dim)
+            elif scale.ndim == 3 and scale.shape in [
+                (batch, seq_len, hidden_dim),
+                (batch, 1, hidden_dim),
+                (1, seq_len, hidden_dim),
+                (1, 1, hidden_dim),
+            ]:
+                # (B, S, D), (B, 1, D), (1, S, D), (1, 1, D) → (B, S, 1, D)
+                scale = scale.expand(batch, seq_len, hidden_dim)
+                shift = shift.expand(batch, seq_len, hidden_dim)
+            normalized = normalized * (1.0 + scale) + shift
+        elif scale.ndim == 4 and scale.shape == (batch, scale.shape[1], 1, hidden_dim):
+            num_frames = scale.shape[1]
+            frame_seqlen = normalized.shape[1] // num_frames
+            normalized = (
+                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+                * (1.0 + scale) + shift).flatten(1, 2)
+        return normalized, residual_out
+
+
 class ScaleResidualLayerNormScaleShift(nn.Module):
     """
     Fused operation that combines:

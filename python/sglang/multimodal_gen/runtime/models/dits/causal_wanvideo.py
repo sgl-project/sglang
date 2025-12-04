@@ -29,7 +29,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidual,
-    ScaleResidualLayerNormScaleShift,
+    ScaleResidualNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -292,25 +292,24 @@ class CausalWanTransformerBlock(nn.Module):
             print("QK Norm type not supported")
             raise Exception
         assert cross_attn_norm is True
-        self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        self.self_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             norm_type="layer",
             eps=eps,
             elementwise_affine=True,
+            bias=True,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 2. Cross-attention
         # Only T2V for now
         self.attn2 = WanT2VCrossAttention(dim, num_heads, qk_norm=qk_norm, eps=eps)
-        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        self.cross_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             norm_type="layer",
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward
