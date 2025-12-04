@@ -32,6 +32,7 @@ DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 10
 class TestAscendW8A8(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        #TODO: Move model to CI or Modelscope
         cls.model = "vllm-ascend/Qwen2.5-0.5B-Instruct-w8a8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -103,6 +104,7 @@ class TestAscendW8A8(CustomTestCase):
 class TestAscendW8A8CompressedTensors(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        #TODO: Move model to CI or Modelscope
         cls.model = "RedHatAI/Qwen2.5-0.5B-Instruct-quantized.w8a8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
