@@ -203,7 +203,7 @@ RUN --mount=type=cache,target=/root/.cache/pip python3 -m pip install \
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps; \
-    python3 -m pip install nvidia-nvshmem-cu12==${NVSHMEM_VERSION} --force-reinstall --no-deps; \
+    python3 -m pip install nvidia-nvshmem-cu12==3.3.20 --force-reinstall --no-deps; \
     python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
