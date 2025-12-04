@@ -467,9 +467,9 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 3001,
-            max_payload_size: 536_870_912, // 512MB
-            request_timeout_secs: 1800,    // 30 minutes
-            worker_startup_timeout_secs: 600,
+            max_payload_size: 536_870_912,     // 512MB
+            request_timeout_secs: 1800,        // 30 minutes
+            worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
             api_key: None,
@@ -580,7 +580,7 @@ mod tests {
         assert_eq!(config.port, 3001);
         assert_eq!(config.max_payload_size, 536_870_912);
         assert_eq!(config.request_timeout_secs, 1800);
-        assert_eq!(config.worker_startup_timeout_secs, 600);
+        assert_eq!(config.worker_startup_timeout_secs, 1800);
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert!(config.discovery.is_none());
         assert!(config.metrics.is_none());
