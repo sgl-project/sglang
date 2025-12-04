@@ -1069,6 +1069,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 out=torch.zeros(*output_shape, dtype=q.dtype, device=q.device),
             )
 
+        out = None
+        if self.data_type == torch.float8_e4m3fn:
+            out = torch.empty(
+                q.shape[0],
+                q.shape[1],
+                v.shape[2],
+                device=q.device,
+                dtype=torch.bfloat16,
+            )
+            q = q.to(torch.float8_e4m3fn)
+            k = k.to(torch.float8_e4m3fn)
+            v = v.to(torch.float8_e4m3fn)
+
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
@@ -1087,6 +1100,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             enable_pdl=False,
             is_causal=True,
             return_lse=forward_batch.mha_return_lse,
+            out=out,
         )
 
 
