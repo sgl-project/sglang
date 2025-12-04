@@ -51,6 +51,16 @@ MODELS = {
         "processor_class": "Qwen2VLImageProcessorFast",
         "description": "Dynamic resolution with patch_size=16 and [0.5,0.5,0.5] normalization",
     },
+    "phi3_vision": {
+        "model_id": "microsoft/Phi-3-vision-128k-instruct",
+        "processor_class": "Phi3VImageProcessor",
+        "description": "Dynamic HD transform with 336x336 tiles",
+    },
+    "phi4_vision": {
+        "model_id": "microsoft/Phi-4-multimodal-instruct",
+        "processor_class": "Phi4MMImageProcessor",
+        "description": "Dynamic HD transform with 448x448 tiles and SiGLIP encoder",
+    },
 }
 
 # Default test images
@@ -59,6 +69,12 @@ DEFAULT_IMAGES = [
     "tests/fixtures/images/tall.jpg",
     "tests/fixtures/images/wide.jpg",
     "tests/fixtures/images/small.jpg",
+    "tests/fixtures/images/tiny.jpg",
+    "tests/fixtures/images/very_tall.jpg",
+    "tests/fixtures/images/very_wide.jpg",
+    "tests/fixtures/images/large.jpg",
+    "tests/fixtures/images/odd_dims.jpg",
+    "tests/fixtures/images/grayscale.jpg",
 ]
 
 
@@ -354,6 +370,116 @@ def generate_golden_qwen3_vl(image_path: str, output_dir: str) -> dict:
     return result
 
 
+def generate_golden_phi3_vision(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for Phi3-Vision.
+
+    Phi3-Vision uses Dynamic HD transform:
+    1. If width < height, transpose image
+    2. Calculate scale: while scale * ceil(scale/ratio) <= hd_num: scale++
+    3. Resize to new_w = scale * 336, new_h = new_w / ratio
+    4. Pad height to multiple of 336 (centered, white padding)
+    5. If transposed, transpose back
+    6. Normalize with CLIP mean/std
+    7. Create global image (336x336 via bicubic)
+    8. Reshape into tiles [num_tiles, 3, 336, 336]
+    9. Concatenate [global, tiles] and pad to [num_crops+1, 3, 336, 336]
+
+    Default parameters:
+    - num_crops: 16
+    - num_img_tokens: 144 (per tile)
+    - normalization: CLIP mean/std
+    """
+    from transformers import AutoImageProcessor
+
+    processor = AutoImageProcessor.from_pretrained(
+        "microsoft/Phi-3-vision-128k-instruct", trust_remote_code=True
+    )
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image
+    outputs = processor(images=image, return_tensors="np")
+    pixel_values = outputs["pixel_values"]
+    image_sizes = outputs.get("image_sizes")
+    num_img_tokens = outputs.get("num_img_tokens")
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": processor.to_dict(),
+    }
+
+    if image_sizes is not None:
+        result["image_sizes"] = np.array(image_sizes)
+
+    if num_img_tokens is not None:
+        result["num_img_tokens"] = np.array(num_img_tokens)
+
+    # Add debug info
+    result["config_info"] = {
+        "num_crops": processor.num_crops,
+        "num_img_tokens": processor.num_img_tokens,
+    }
+
+    return result
+
+
+def generate_golden_phi4_vision(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for Phi4-Vision (Phi-4-multimodal).
+
+    Phi4-Vision uses Dynamic HD transform similar to Phi3 but with:
+    - Base resolution: 448 (vs 336 in Phi3)
+    - Normalization: [0.5, 0.5, 0.5] mean/std (vs CLIP in Phi3)
+    - Default dynamic_hd: 36 (vs 16 num_crops in Phi3)
+    - Uses SiGLIP vision encoder (vs CLIP in Phi3)
+    - Has per-crop attention masks
+
+    Token count formula:
+    256 + 1 + mask_sum + mask_col0_sum + 16
+
+    Note: Phi4 uses 'input_image_embeds' key instead of 'pixel_values'
+    """
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(
+        "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True
+    )
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image using the image processor directly
+    outputs = processor.image_processor(images=image, return_tensors="np")
+
+    # Phi4 uses 'input_image_embeds' instead of 'pixel_values'
+    pixel_values = outputs.get("input_image_embeds")
+    pixel_attention_mask = outputs.get("image_attention_mask")
+    image_sizes = outputs.get("image_sizes")
+    num_img_tokens = outputs.get("num_img_tokens")
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": processor.image_processor.to_dict(),
+    }
+
+    if pixel_attention_mask is not None:
+        result["pixel_attention_mask"] = np.array(pixel_attention_mask)
+
+    if image_sizes is not None:
+        result["image_sizes"] = np.array(image_sizes)
+
+    if num_img_tokens is not None:
+        result["num_img_tokens"] = np.array(num_img_tokens)
+
+    # Add debug info
+    result["config_info"] = {
+        "dynamic_hd": getattr(processor.image_processor, "dynamic_hd", 36),
+        "base_resolution": 448,
+    }
+
+    return result
+
+
 def generate_for_model(model_key: str, image_paths: list, output_dir: str):
     """Generate golden outputs for a specific model."""
     print(f"\nGenerating golden outputs for {model_key}...")
@@ -364,6 +490,8 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
         "llava_next": generate_golden_llava_next,
         "qwen2_vl": generate_golden_qwen2_vl,
         "qwen3_vl": generate_golden_qwen3_vl,
+        "phi3_vision": generate_golden_phi3_vision,
+        "phi4_vision": generate_golden_phi4_vision,
     }.get(model_key)
 
     if generator_fn is None:

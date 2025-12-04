@@ -443,4 +443,20 @@ mod tests {
         assert_eq!(processor.default_mean(), [0.5, 0.5, 0.5]);
         assert_eq!(processor.default_std(), [0.5, 0.5, 0.5]);
     }
+
+    #[test]
+    fn test_smart_resize_grayscale_400x300() {
+        // grayscale.jpg is 400x300
+        // 400/32 = 12.5 -> rounds to 12 (banker's rounding) -> 384
+        // 300/32 = 9.375 -> rounds to 9 -> 288
+        // Expected: 384x288, giving grid [1, 18, 24]
+        let processor = Qwen3VLProcessor::new();
+
+        // smart_resize takes (height, width)
+        let (h, w) = processor.smart_resize(300, 400).unwrap();
+
+        // Expected from HuggingFace: 288x384 -> grid [1, 18, 24]
+        assert_eq!(h, 288, "Height should be 288");
+        assert_eq!(w, 384, "Width should be 384");
+    }
 }
