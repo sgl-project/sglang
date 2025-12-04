@@ -67,7 +67,7 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         output_file: str = "shapes.jsonl",
         verbose: bool = False,
         only_rank: Optional[int] = None,
-        log_only_first_forward_pass: bool = True,
+        log_first_n_forward_passes: int = 2,
     ):
         super().__init__()
         self.output_file = output_file
@@ -80,7 +80,7 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         self.should_log = (only_rank is None) or (self.current_rank == only_rank)
         self._forward_pass_count = 0
         self._in_forward_pass = False
-        self.log_only_first_forward_pass = log_only_first_forward_pass
+        self.log_first_n_forward_passes = log_first_n_forward_passes
 
     def start_forward_pass(self):
         """Called by tp_worker to mark start of forward pass."""
@@ -212,8 +212,8 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
 
     def _log_operation(self, func, named_inputs, result):
         """Log operation with minimal overhead."""
-        # Skip logging if we're only logging first forward pass and this is not it
-        if self.log_only_first_forward_pass and self._forward_pass_count > 1:
+        # Skip logging if we're limiting to first N forward passes and this exceeds that
+        if self.log_first_n_forward_passes > 0 and self._forward_pass_count > self.log_first_n_forward_passes:
             return
         
         output_shapes = self._extract_shapes(result)
