@@ -152,7 +152,6 @@ class MTPDraftExtendCudaGraphRunner:
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    assert False, "assume not reached"
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
