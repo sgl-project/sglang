@@ -156,11 +156,8 @@ jobs:
 
       - name: Run 1-GPU diffusion server tests
         timeout-minutes: 60
-        env:
-          # Skip performance validation entirely for AMD CI - only test correctness
-          SGLANG_GEN_BASELINE: "1"  # This skips validation, only collects metrics
         run: |
-          docker exec -e SGLANG_GEN_BASELINE -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server/test_server_a.py sglang/multimodal_gen/test/server/test_server_b.py -s -v --log-cli-level=INFO -k "not flux_2"
+          docker exec -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server/test_server_a.py sglang/multimodal_gen/test/server/test_server_b.py -s -v --log-cli-level=INFO -k "not flux_2"
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
@@ -196,11 +193,8 @@ jobs:
 
       - name: Run 2-GPU diffusion server tests
         timeout-minutes: 60
-        env:
-          # Skip performance validation entirely for AMD CI - only test correctness
-          SGLANG_GEN_BASELINE: "1"  # This skips validation, only collects metrics
         run: |
-          docker exec -e SGLANG_GEN_BASELINE -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server/test_server_2_gpu_a.py sglang/multimodal_gen/test/server/test_server_2_gpu_b.py -s -v --log-cli-level=INFO
+          docker exec -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server/test_server_2_gpu_a.py sglang/multimodal_gen/test/server/test_server_2_gpu_b.py -s -v --log-cli-level=INFO
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
