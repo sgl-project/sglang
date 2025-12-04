@@ -577,6 +577,11 @@ class GrpcRequestManager:
                     "cached_tokens": (
                         batch_out.cached_tokens[i] if batch_out.cached_tokens else 0
                     ),
+                    "reasoning_tokens": (
+                        batch_out.reasoning_tokens[i]
+                        if getattr(batch_out, "reasoning_tokens", None)
+                        else 0
+                    ),
                     "finish_reason": (
                         batch_out.finished_reasons[i]
                         if batch_out.finished_reasons[i]

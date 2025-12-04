@@ -271,7 +271,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         else:
                             context = HarmonyContext(messages, tool_sessions)
                     else:
-                        context = SimpleContext()
+                        context = SimpleContext(
+                            reasoning_parser=self.reasoning_parser,
+                            tokenizer=self.tokenizer_manager.tokenizer,
+                        )
 
                     # Create GenerateReqInput for SGLang
                     adapted_request = GenerateReqInput(
@@ -459,8 +462,10 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
+            reasoning_content = getattr(context, "reasoning_text", None)
+            content_text = getattr(context, "normal_text", None) or final_res["text"]
             output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
+                request, content_text, tokenizer, reasoning_content
             )
 
             # Calculate usage from actual output
@@ -468,6 +473,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
                 num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
+                num_reasoning_tokens = final_res.meta_info.get("reasoning_tokens", 0)
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
@@ -481,13 +487,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else 0
                 )
                 num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
-                num_reasoning_tokens = 0
+                num_reasoning_tokens = getattr(context, "num_reasoning_tokens", 0)
             else:
                 # Final fallback
                 num_prompt_tokens = 0
                 num_generated_tokens = 0
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
+
+            # Prefer the reasoning token count tracked in context if available.
+            if getattr(context, "num_reasoning_tokens", 0):
+                num_reasoning_tokens = context.num_reasoning_tokens
 
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
@@ -525,16 +535,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         request: ResponsesRequest,
         final_output: Any,
         tokenizer: Any,
+        reasoning_content: Optional[str] = None,
     ):
         # Handle reasoning parsing if enabled
-        if self.reasoning_parser:
-            # Use standard reasoning parser (openai maps to T4Detector internally)
+        if reasoning_content is None and self.reasoning_parser:
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser, stream_reasoning=False
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
-            reasoning_content = None
             content = final_output
 
         output_items = []
