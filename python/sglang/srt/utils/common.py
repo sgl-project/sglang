@@ -81,8 +81,8 @@ import requests
 import torch
 import torch.distributed
 import torch.distributed as dist
-import zmq
 import triton
+import zmq
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
