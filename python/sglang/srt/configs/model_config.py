@@ -25,7 +25,7 @@ from transformers import PretrainedConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var, is_hip, retry
+from sglang.srt.utils import is_hip, retry
 from sglang.srt.utils.hf_transformers_utils import (
     get_config,
     get_context_length,
@@ -519,7 +519,7 @@ class ModelConfig:
             is_local = os.path.exists(self.model_path)
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
-                if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+                if envs.SGLANG_USE_MODELSCOPE is True:
                     from modelscope import HubApi
 
                     hf_api = HubApi()
