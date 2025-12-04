@@ -1,5 +1,5 @@
 ARG CUDA_VERSION=12.9.1
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04 AS base
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
@@ -46,8 +46,10 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py \
+    && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
+    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
+    && python3 -m pip config set global.break-system-packages true \
     # Fix for apt-add-repository
     && cd /usr/lib/python3/dist-packages/ \
     && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
@@ -425,8 +427,21 @@ WORKDIR /sgl-workspace/sglang
 ########################################################
 ########## Runtime Image ##############################
 ########################################################
-
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04 AS runtime
+#
+# PURPOSE: Lightweight production runtime environment
+#
+# This stage creates a production-ready image containing:
+# - Pre-compiled SGLang and DeepEP components
+# - Essential runtime dependencies only (no build tools)
+# - Optimized for inference workloads and deployment
+# - Significantly smaller than the framework image
+#
+# Use this stage when you need:
+# - Production deployment of SGLang
+# - Minimal runtime footprint without build tools
+# - Ready-to-run inference server environment
+#
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu24.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
@@ -468,14 +483,14 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     libnl-3-200 \
     libnl-route-3-200 \
     ibverbs-providers \
-    libgoogle-glog0v5 \
+    libgoogle-glog0v6t64 \
     libunwind8 \
-    libboost-system1.74.0 \
-    libboost-thread1.74.0 \
-    libboost-filesystem1.74.0 \
-    libgrpc++1 \
-    libprotobuf23 \
-    libhiredis0.14 \
+    libboost-system1.83.0 \
+    libboost-thread1.83.0 \
+    libboost-filesystem1.83.0 \
+    libgrpc++1.51t64 \
+    libprotobuf32t64 \
+    libhiredis1.1.0 \
     libcurl4 \
     libczmq4 \
     libfabric1 \
@@ -488,8 +503,10 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
-    && python3 get-pip.py \
+    && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
+    # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
+    && python3 -m pip config set global.break-system-packages true \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
