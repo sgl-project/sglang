@@ -45,11 +45,18 @@ class ConversationContext(ABC):
 
 class SimpleContext(ConversationContext):
 
-    def __init__(self, reasoning_parser: str | None = None, tokenizer=None):
+    def __init__(
+        self,
+        reasoning_parser: str | None = None,
+        tokenizer=None,
+    ):
         self.last_output = None
         self.reasoning_text = None
         self.normal_text = None
         self.num_reasoning_tokens = 0
+        self.num_output_tokens = 0
+        self.num_prompt_tokens = 0
+        self.num_cached_tokens = 0
         self._reasoning_parser = (
             ReasoningParser(model_type=reasoning_parser, stream_reasoning=False)
             if reasoning_parser
@@ -67,6 +74,12 @@ class SimpleContext(ConversationContext):
 
         if meta_info and meta_info.get("reasoning_tokens") is not None:
             self.num_reasoning_tokens = meta_info["reasoning_tokens"]
+        if meta_info and meta_info.get("completion_tokens") is not None:
+            self.num_output_tokens = meta_info["completion_tokens"]
+        if meta_info and meta_info.get("prompt_tokens") is not None:
+            self.num_prompt_tokens = meta_info["prompt_tokens"]
+        if meta_info and meta_info.get("cached_tokens") is not None:
+            self.num_cached_tokens = meta_info["cached_tokens"]
 
         if self._reasoning_parser and text is not None:
             reasoning_content, content = self._reasoning_parser.parse_non_stream(text)
@@ -77,6 +90,10 @@ class SimpleContext(ConversationContext):
             self.reasoning_text = reasoning_content
         if content is not None:
             self.normal_text = content
+        if self.num_output_tokens == 0:
+            output_ids = output.get("output_ids")
+            if output_ids:
+                self.num_output_tokens = len(output_ids)
 
     def need_builtin_tool_call(self) -> bool:
         return False

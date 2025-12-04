@@ -470,10 +470,18 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Calculate usage from actual output
             if hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
-                num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
-                num_reasoning_tokens = final_res.meta_info.get("reasoning_tokens", 0)
+                num_prompt_tokens = final_res.meta_info.get(
+                    "prompt_tokens", context.num_prompt_tokens
+                )
+                num_generated_tokens = final_res.meta_info.get(
+                    "completion_tokens", context.num_output_tokens
+                )
+                num_cached_tokens = final_res.meta_info.get(
+                    "cached_tokens", context.num_cached_tokens
+                )
+                num_reasoning_tokens = final_res.meta_info.get(
+                    "reasoning_tokens", context.num_reasoning_tokens
+                )
             elif hasattr(final_res, "prompt_token_ids") and hasattr(
                 final_res, "outputs"
             ):
@@ -489,20 +497,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
                 num_reasoning_tokens = getattr(context, "num_reasoning_tokens", 0)
             else:
-                # Final fallback
-                num_prompt_tokens = 0
-                num_generated_tokens = 0
-                num_cached_tokens = 0
-                num_reasoning_tokens = 0
-
-            # Prefer the reasoning token count tracked in context if available.
-            if getattr(context, "num_reasoning_tokens", 0):
-                num_reasoning_tokens = context.num_reasoning_tokens
-            elif reasoning_content:
-                # Fallback: compute reasoning token length directly from reasoning text.
-                num_reasoning_tokens = len(
-                    tokenizer.encode(reasoning_content, add_special_tokens=False)
-                )
+                # Final fallback: use context hints
+                num_prompt_tokens = getattr(context, "num_prompt_tokens", 0)
+                num_generated_tokens = getattr(context, "num_output_tokens", 0)
+                num_cached_tokens = getattr(context, "num_cached_tokens", 0)
+                num_reasoning_tokens = getattr(context, "num_reasoning_tokens", 0)
 
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
