@@ -137,7 +137,7 @@ impl Llama4VisionProcessor {
     fn get_factors(n: usize) -> HashSet<usize> {
         let mut factors = HashSet::new();
         for i in 1..=(n as f64).sqrt() as usize {
-            if n % i == 0 {
+            if n.is_multiple_of(i) {
                 factors.insert(i);
                 factors.insert(n / i);
             }
