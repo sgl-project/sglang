@@ -645,10 +645,7 @@ class GroupCoordinator:
         )
         # We check for None because custom_fused_ar_rms may not be supported or enabled on the communicator.
         # If it's not available, we can't perform fused all-reduce + RMSNorm, so we return None.
-        if fused_outputs is None:
-            return None
-        residual_out, hidden_out = fused_outputs
-        return hidden_out, residual_out
+        return fused_outputs
 
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
