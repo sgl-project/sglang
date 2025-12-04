@@ -1535,6 +1535,56 @@ def add_prometheus_track_response_middleware(app):
 
         return response
 
+def launch_metrics_server(host: str, port: int):
+    """Launch a separate metrics server on the specified port.
+
+    This function starts a lightweight HTTP server that serves only the
+    /metrics endpoint for Prometheus scraping on a dedicated port.
+    """
+    import asyncio
+
+    import uvicorn
+    from fastapi import FastAPI
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    set_prometheus_multiproc_dir()
+
+    metrics_app = FastAPI()
+
+    # Create prometheus metrics endpoint
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    metrics_app.routes.append(metrics_route)
+
+    config = uvicorn.Config(
+        metrics_app,
+        host=host,
+        port=port,
+        timeout_keep_alive=5,
+        loop="auto",
+        log_config=None,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config=config)
+
+    # Run server in a background daemon thread with its own event loop
+    def run_server():
+        try:
+            asyncio.run(server.serve())
+        except Exception as e:
+            logger.error(f"Metrics server failed to start: {e}")
+            raise
+        finally:
+            logger.info(f"Metrics server stopped at {host}:{port}")
+
+    thread = threading.Thread(target=run_server, daemon=True, name="metrics-server")
+    thread.start()
+    logger.info(f"Metrics server started in background thread at {host}:{port}")
+
 
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""

@@ -35,7 +35,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import (
+    kill_process_tree,
+    launch_metrics_server,
+    set_prometheus_multiproc_dir,
+)
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -703,6 +707,11 @@ async def serve_grpc(
     model_info: Optional[Dict] = None,
 ):
     """Start the standalone gRPC server with integrated scheduler."""
+
+    # Set prometheus multiproc dir BEFORE launching scheduler processes
+    # This ensures the environment variable is inherited by child processes
+    if server_args.enable_metrics:
+        set_prometheus_multiproc_dir()
 
     # Start bootstrap server BEFORE launching scheduler processes (only in PREFILL mode)
     # This ensures the bootstrap server is ready when prefill schedulers try to register
