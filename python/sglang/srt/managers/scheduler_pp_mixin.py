@@ -14,6 +14,7 @@ import torch.distributed
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import DisaggregationMode, poll_and_all_reduce
 from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -120,6 +121,7 @@ class ChunkSizePredictor:
     def predict_next_chunk_size(
         self,
         history_len: int,
+        base_chunk_size: int,
         page_size: int,
         context_len: int,
         max_chunk_size: Optional[int] = None,
@@ -129,6 +131,7 @@ class ChunkSizePredictor:
 
         Args:
             history_len: Current sequence length (L)
+            base_chunk_size: Base chunk size
             page_size: Page size for alignment
             context_len: Maximum context length
             max_chunk_size: Maximum allowed chunk size (optional)
@@ -170,7 +173,12 @@ class ChunkSizePredictor:
             )
             return None
 
-        calculated_chunk_size = int(calculated_chunk_size_float)
+        # Use a smooth coefficient to reduce the abrupt decrease in chunk size
+        smooth_coeff = envs.SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR.get()
+        smoothed_chunk_size = base_chunk_size + smooth_coeff * (
+            calculated_chunk_size_float - base_chunk_size
+        )
+        calculated_chunk_size = int(smoothed_chunk_size)
 
         # Align to page_size (round down to nearest multiple)
         alignment_size = max(page_size, 1)
@@ -353,6 +361,7 @@ class SchedulerPPMixin:
         max_chunk_size = getattr(self, "max_prefill_tokens", None)
         predicted_size = self.length_predictor.predict_next_chunk_size(
             history_len=history_len,
+            base_chunk_size=self.chunked_prefill_size,
             page_size=self.page_size,
             context_len=self.model_config.context_len,
             max_chunk_size=max_chunk_size,

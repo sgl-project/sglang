@@ -251,8 +251,6 @@ class PrefillBootstrapQueue:
                 # if req not in reqs_info_to_check, skip
                 if req.rid not in rids_to_check:
                     continue
-                # Either waiting for input or failed
-                assert poll == KVPoll.WaitingForInput or poll == KVPoll.Failed
 
             if poll == KVPoll.Bootstrapping:
                 continue
