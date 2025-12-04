@@ -22,7 +22,14 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
             raise unittest.SkipTest("FP8 requires compute capability >= 9.0")
 
     def _test_kernel_correctness(
-        self, num_tokens, num_kv_heads, head_dim, page_size, use_scale, input_ndim, cache_ndim
+        self,
+        num_tokens,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        use_scale,
+        input_ndim,
+        cache_ndim,
     ):
         """Compare Triton kernel output against naive implementation."""
         device = torch.device("cuda")
@@ -30,11 +37,19 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
 
         # Create input tensors
         if input_ndim == 3:
-            k = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
-            v = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype)
+            k = torch.randn(
+                num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype
+            )
+            v = torch.randn(
+                num_tokens, num_kv_heads, head_dim, device=device, dtype=dtype
+            )
         else:
-            k = torch.randn(num_tokens, num_kv_heads * head_dim, device=device, dtype=dtype)
-            v = torch.randn(num_tokens, num_kv_heads * head_dim, device=device, dtype=dtype)
+            k = torch.randn(
+                num_tokens, num_kv_heads * head_dim, device=device, dtype=dtype
+            )
+            v = torch.randn(
+                num_tokens, num_kv_heads * head_dim, device=device, dtype=dtype
+            )
 
         # Create cache tensors (use FP8 to match real runtime behavior)
         num_pages = 128
@@ -55,20 +70,42 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
             )
         else:
             k_cache_triton = torch.zeros(
-                num_pages, page_size, num_kv_heads, head_dim, device=device, dtype=cache_dtype
+                num_pages,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                device=device,
+                dtype=cache_dtype,
             )
             v_cache_triton = torch.zeros(
-                num_pages, page_size, num_kv_heads, head_dim, device=device, dtype=cache_dtype
+                num_pages,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                device=device,
+                dtype=cache_dtype,
             )
             k_cache_naive = torch.zeros(
-                num_pages, page_size, num_kv_heads, head_dim, device=device, dtype=cache_dtype
+                num_pages,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                device=device,
+                dtype=cache_dtype,
             )
             v_cache_naive = torch.zeros(
-                num_pages, page_size, num_kv_heads, head_dim, device=device, dtype=cache_dtype
+                num_pages,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                device=device,
+                dtype=cache_dtype,
             )
 
         # Create cache locations (ensure unique indices to avoid race conditions)
-        cache_loc = torch.randperm(total_slots, device=device, dtype=torch.int32)[:num_tokens]
+        cache_loc = torch.randperm(total_slots, device=device, dtype=torch.int32)[
+            :num_tokens
+        ]
 
         # Optional scales
         k_scale = 0.5 if use_scale else None
@@ -235,10 +272,18 @@ class TestTRTLLMFP8KVKernel(CustomTestCase):
         # Cache (use FP8 to match real runtime behavior)
         total_slots = 128
         k_cache = torch.zeros(
-            total_slots, num_kv_heads, head_dim, device=device, dtype=torch.float8_e4m3fn
+            total_slots,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float8_e4m3fn,
         )
         v_cache = torch.zeros(
-            total_slots, num_kv_heads, head_dim, device=device, dtype=torch.float8_e4m3fn
+            total_slots,
+            num_kv_heads,
+            head_dim,
+            device=device,
+            dtype=torch.float8_e4m3fn,
         )
 
         # Empty cache locations

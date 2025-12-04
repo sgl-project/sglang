@@ -5,9 +5,9 @@ Support attention backend for TRTLLM MHA kernels from flashinfer.
 The kernel supports sm100 only, with sliding window and attention sink features.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
-import logging
 
 import torch
 
@@ -415,15 +415,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def _should_use_fused_fp8_path(
-        self, save_kv_cache: bool, k: torch.Tensor
-    ) -> bool:
+    def _should_use_fused_fp8_path(self, save_kv_cache: bool, k: torch.Tensor) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
-        return (
-            save_kv_cache
-            and k is not None
-            and self.data_type == torch.float8_e4m3fn
-        )
+        return save_kv_cache and k is not None and self.data_type == torch.float8_e4m3fn
 
     def _fused_fp8_set_kv_buffer(
         self,

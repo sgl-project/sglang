@@ -12,8 +12,8 @@ Performance benefits:
 - Better memory bandwidth utilization
 """
 
-from typing import Optional
 import logging
+from typing import Optional
 
 import torch
 import triton
@@ -122,7 +122,7 @@ def _fused_fp8_set_kv_buffer_kernel(
     v_cache_stride_dim: tl.constexpr,
     # Block sizes
     BLOCK_HEAD: tl.constexpr,  # Number of heads per block
-    BLOCK_DIM: tl.constexpr,   # Head dimension block size
+    BLOCK_DIM: tl.constexpr,  # Head dimension block size
 ):
     """
     Fused FP8 quantization + paged KV cache write kernel.
@@ -201,7 +201,9 @@ def fused_fp8_set_kv_buffer(
     k_cache: torch.Tensor,  # [total_slots, num_kv_heads, head_dim] or [num_pages, page_size, num_kv_heads, head_dim]
     v_cache: torch.Tensor,  # [total_slots, num_kv_heads, head_dim] or [num_pages, page_size, num_kv_heads, head_dim]
     cache_loc: torch.Tensor,  # [num_tokens], dtype=int32
-    k_scale: Optional[float] = None,  # Scalar scale (matching original set_kv_buffer signature)
+    k_scale: Optional[
+        float
+    ] = None,  # Scalar scale (matching original set_kv_buffer signature)
     v_scale: Optional[float] = None,
     page_size: int = 16,
     use_triton: bool = True,  # Whether to use Triton kernel (set to False to force naive fallback)
@@ -229,12 +231,16 @@ def fused_fp8_set_kv_buffer(
     if k_cache.ndim == 3:
         # 3D cache layout: [total_slots, num_kv_heads, head_dim]
         total_slots, num_kv_heads, head_dim = k_cache.shape
-        assert total_slots % page_size == 0, f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
+        assert (
+            total_slots % page_size == 0
+        ), f"total_slots ({total_slots}) must be divisible by page_size ({page_size})"
         num_pages = total_slots // page_size
     elif k_cache.ndim == 4:
         # 4D cache layout: [num_pages, page_size, num_kv_heads, head_dim]
         num_pages, ps, num_kv_heads, head_dim = k_cache.shape
-        assert ps == page_size, f"page_size mismatch: cache has {ps}, expected {page_size}"
+        assert (
+            ps == page_size
+        ), f"page_size mismatch: cache has {ps}, expected {page_size}"
         total_slots = num_pages * page_size
     else:
         raise ValueError(f"Unsupported k_cache.ndim={k_cache.ndim}, expected 3 or 4")
@@ -246,8 +252,12 @@ def fused_fp8_set_kv_buffer(
 
     if k.ndim == 3:
         # Input is [num_tokens, num_kv_heads, head_dim]
-        assert k.shape[1] == num_kv_heads, f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
-        assert k.shape[2] == head_dim, f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
+        assert (
+            k.shape[1] == num_kv_heads
+        ), f"num_kv_heads mismatch: k.shape[1]={k.shape[1]} vs cache={num_kv_heads}"
+        assert (
+            k.shape[2] == head_dim
+        ), f"head_dim mismatch: k.shape[2]={k.shape[2]} vs cache={head_dim}"
         assert v.shape[1] == num_kv_heads and v.shape[2] == head_dim, "v shape mismatch"
 
         # Keep 3D for Triton kernel
@@ -258,8 +268,12 @@ def fused_fp8_set_kv_buffer(
         v_2d = v.reshape(num_tokens, num_kv_heads * head_dim)
     elif k.ndim == 2:
         # Input is already [num_tokens, num_kv_heads * head_dim]
-        assert k.shape[1] == num_kv_heads * head_dim, f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
-        assert v.shape[1] == num_kv_heads * head_dim, f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
+        assert (
+            k.shape[1] == num_kv_heads * head_dim
+        ), f"k.shape[1]={k.shape[1]} != {num_kv_heads * head_dim}"
+        assert (
+            v.shape[1] == num_kv_heads * head_dim
+        ), f"v.shape[1]={v.shape[1]} != {num_kv_heads * head_dim}"
 
         # Create 3D view for Triton kernel
         k_3d = k.view(num_tokens, num_kv_heads, head_dim)
@@ -318,7 +332,7 @@ def fused_fp8_set_kv_buffer(
 
         # Block sizes for tiling (tunable)
         BLOCK_HEAD = min(num_kv_heads, 8)  # Process up to 8 heads at once
-        BLOCK_DIM = min(head_dim, 128)      # Process up to 128 dims at once
+        BLOCK_DIM = min(head_dim, 128)  # Process up to 128 dims at once
 
         # Compute number of head blocks
         num_head_blocks = (num_kv_heads + BLOCK_HEAD - 1) // BLOCK_HEAD
