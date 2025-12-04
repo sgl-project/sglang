@@ -24,6 +24,9 @@ pub enum TransformError {
 
     #[error("Inconsistent tensor shapes in batch")]
     InconsistentShapes,
+
+    #[error("Shape error: {0}")]
+    ShapeError(String),
 }
 
 pub type Result<T> = std::result::Result<T, TransformError>;
