@@ -421,6 +421,12 @@ COPY docker/configs/.gitconfig /tmp/.gitconfig
 RUN cat /tmp/.gitconfig >> /root/.gitconfig && rm /tmp/.gitconfig
 COPY docker/configs/.zshrc /root/.zshrc
 
+# Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
+RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
+        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
+        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+    fi
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
@@ -538,6 +544,12 @@ COPY --from=framework /usr/local/cuda/nvvm /usr/local/cuda/nvvm
 COPY --from=framework /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/
 RUN ln -s /usr/local/cuda/lib64/libcublas.so.12 /usr/local/cuda/lib64/libcublas.so
 RUN ln -s /usr/local/cuda/lib64/libcublasLt.so.12 /usr/local/cuda/lib64/libcublasLt.so
+
+# Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
+RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
+        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
+        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
+    fi
 
 # Copy GDRCopy runtime libraries (but not the build artifacts)
 COPY --from=framework /usr/lib/libgdrapi.so* /usr/lib/
