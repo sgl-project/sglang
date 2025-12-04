@@ -42,9 +42,8 @@ _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 
-def init_and_clear_feature_buffer(device):
+def init_feature_buffer(device):
     global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET
-    _BUFFER_OFFSET = 0
     if (
         device == "cpu"
         or envs.SGLANG_MM_BUFFER_SIZE_MB.get() == 0
@@ -60,6 +59,16 @@ def init_and_clear_feature_buffer(device):
         logger.info(f"Preallocated {size_mb}MB GPU buffer")
     except RuntimeError as e:
         _GPU_FEATURE_BUFFER = None
+
+def reset_buffer_offset():
+    global _BUFFER_OFFSET
+    _BUFFER_OFFSET = 0
+
+def is_feature_buffer_initialized():
+    global _GPU_FEATURE_BUFFER
+    if _GPU_FEATURE_BUFFER is None:
+        return False
+    return True
 
 
 def try_add_to_buffer(tensor: torch.Tensor) -> Optional[torch.Tensor]:

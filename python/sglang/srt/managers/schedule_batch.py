@@ -331,12 +331,16 @@ class MultimodalInputs:
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             from sglang.srt.managers.mm_utils import (
-                init_and_clear_feature_buffer,
+                init_feature_buffer,
+                reset_buffer_offset,
+                is_feature_buffer_initialized,
                 try_add_to_buffer,
             )
 
             device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-            init_and_clear_feature_buffer(device)
+            if not is_feature_buffer_initialized():
+                init_feature_buffer(device)
+            reset_buffer_offset()
             for item in ret.mm_items:
                 if item.feature is not None:
                     if isinstance(item.feature, torch.Tensor):
