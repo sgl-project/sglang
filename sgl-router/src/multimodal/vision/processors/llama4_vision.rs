@@ -412,7 +412,11 @@ impl ImagePreProcessor for Llama4VisionProcessor {
             });
         }
 
-        let processor = if config.max_image_tiles.is_some() || config.image_mean.is_some() {
+        let processor = if config.max_image_tiles.is_some()
+            || config.image_mean.is_some()
+            || config.image_std.is_some()
+            || config.size.is_some()
+        {
             Self::from_preprocessor_config(config)
         } else {
             self.clone()
