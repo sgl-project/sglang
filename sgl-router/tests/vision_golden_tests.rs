@@ -904,12 +904,10 @@ fn run_phi3_vision_golden_test(image_name: &str) {
     }
 
     // Allow tolerance for floating point and interpolation differences
-    // HuggingFace uses bicubic interpolation while we use bilinear with PyTorch-compatible
-    // coordinate mapping. The max difference is ~0.17 for large images due to interpolation
-    // method differences, which is acceptable since the normalized value range is [-1.8, 2.2].
+    // Using bicubic for global image and bilinear for HD resize to match HuggingFace.
     assert!(
-        pixel_diff < 0.2,
-        "Max pixel difference {} exceeds tolerance 0.2 for {}",
+        pixel_diff < 0.08,
+        "Max pixel difference {} exceeds tolerance 0.08 for {}",
         pixel_diff,
         image_name
     );
@@ -1118,11 +1116,10 @@ fn run_phi4_vision_golden_test(image_name: &str) {
     }
 
     // Allow tolerance for floating point and interpolation differences
-    // Phi4 uses torchvision bilinear+antialias for resize.
-    // Our Rust implementation uses Lanczos3 which provides similar antialiasing.
+    // Using bilinear for HD resize and bicubic for global image to match HuggingFace.
     assert!(
-        pixel_diff < 0.2,
-        "Max pixel difference {} exceeds tolerance 0.2 for {}",
+        pixel_diff < 0.05,
+        "Max pixel difference {} exceeds tolerance 0.05 for {}",
         pixel_diff,
         image_name
     );

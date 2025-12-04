@@ -66,6 +66,55 @@ pub const PATCH_SIZE: usize = 14;
 /// Contains (pixel_values, attention_mask, (height, width), num_tokens).
 type SingleImageResult = (Array4<f32>, Array3<u32>, (u32, u32), usize);
 
+/// Cubic interpolation weight function (Keys bicubic kernel with a=-0.5).
+///
+/// This matches PyTorch's bicubic interpolation.
+#[inline]
+fn cubic_weight(x: f32) -> f32 {
+    let x = x.abs();
+    if x < 1.0 {
+        (1.5 * x - 2.5) * x * x + 1.0
+    } else if x < 2.0 {
+        ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0
+    } else {
+        0.0
+    }
+}
+
+/// Perform bicubic interpolation at a single point.
+///
+/// Uses a 4x4 kernel with Keys bicubic weights (a=-0.5) to match PyTorch.
+fn bicubic_interpolate(
+    tensor: &Array3<f32>,
+    c: usize,
+    src_y: f32,
+    src_x: f32,
+    h: usize,
+    w: usize,
+) -> f32 {
+    let y_int = src_y.floor() as i32;
+    let x_int = src_x.floor() as i32;
+    let y_frac = src_y - y_int as f32;
+    let x_frac = src_x - x_int as f32;
+
+    let mut result = 0.0f32;
+
+    // Sample 4x4 neighborhood
+    for dy in -1..=2 {
+        let y_idx = (y_int + dy).clamp(0, h as i32 - 1) as usize;
+        let y_weight = cubic_weight(y_frac - dy as f32);
+
+        for dx in -1..=2 {
+            let x_idx = (x_int + dx).clamp(0, w as i32 - 1) as usize;
+            let x_weight = cubic_weight(x_frac - dx as f32);
+
+            result += tensor[[c, y_idx, x_idx]] * y_weight * x_weight;
+        }
+    }
+
+    result
+}
+
 /// Phi4-Vision image processor.
 ///
 /// Implements Dynamic HD transform with aspect ratio matching.
@@ -267,9 +316,9 @@ impl Phi4VisionProcessor {
         }
 
         // Resize image with bilinear interpolation (matching HuggingFace torchvision)
-        // HuggingFace uses bilinear with antialias=True. FilterType::Triangle is bilinear,
-        // but for better antialiasing during downscaling, Lanczos3 provides similar results.
-        let resized = image.resize_exact(new_w, new_h, FilterType::Lanczos3);
+        // HuggingFace uses torchvision.transforms.functional.resize with BILINEAR + antialias=True.
+        // FilterType::Triangle (bilinear) closely matches this behavior.
+        let resized = image.resize_exact(new_w, new_h, FilterType::Triangle);
 
         // Pad to target dimensions (white padding on right/bottom)
         let padded = self.pad_image(&resized, target_width, target_height);
@@ -299,9 +348,10 @@ impl Phi4VisionProcessor {
         DynamicImage::ImageRgb8(padded)
     }
 
-    /// Create global image by resizing to base resolution.
+    /// Create global image by bicubic interpolation to base resolution.
     ///
-    /// Uses PyTorch-compatible coordinate mapping with align_corners=False.
+    /// Uses PyTorch-compatible bicubic interpolation with align_corners=False.
+    /// This matches torch.nn.functional.interpolate(mode='bicubic').
     fn create_global_image(&self, tensor: &Array3<f32>) -> Array3<f32> {
         let (c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
         let target = self.base_resolution as usize;
@@ -315,28 +365,10 @@ impl Phi4VisionProcessor {
             for y in 0..target {
                 for x in 0..target {
                     // PyTorch align_corners=False: src = (dst + 0.5) * scale - 0.5
-                    let src_y = ((y as f32 + 0.5) * scale_h - 0.5).max(0.0);
-                    let src_x = ((x as f32 + 0.5) * scale_w - 0.5).max(0.0);
+                    let src_y = (y as f32 + 0.5) * scale_h - 0.5;
+                    let src_x = (x as f32 + 0.5) * scale_w - 0.5;
 
-                    // Bilinear interpolation
-                    let y0 = (src_y.floor() as usize).min(h - 1);
-                    let y1 = (y0 + 1).min(h - 1);
-                    let x0 = (src_x.floor() as usize).min(w - 1);
-                    let x1 = (x0 + 1).min(w - 1);
-
-                    let y_frac = src_y - y0 as f32;
-                    let x_frac = src_x - x0 as f32;
-
-                    let v00 = tensor[[ch, y0, x0]];
-                    let v01 = tensor[[ch, y0, x1]];
-                    let v10 = tensor[[ch, y1, x0]];
-                    let v11 = tensor[[ch, y1, x1]];
-
-                    let value = v00 * (1.0 - y_frac) * (1.0 - x_frac)
-                        + v01 * (1.0 - y_frac) * x_frac
-                        + v10 * y_frac * (1.0 - x_frac)
-                        + v11 * y_frac * x_frac;
-
+                    let value = bicubic_interpolate(tensor, ch, src_y, src_x, h, w);
                     global[[ch, y, x]] = value;
                 }
             }
