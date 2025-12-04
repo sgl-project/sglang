@@ -349,7 +349,7 @@ class HFRunner:
                 elif self.model_type == "cross_encoder":
                     inputs = self.tokenizer(
                         prompts, padding=True, return_tensors="pt"
-                    ).cuda()
+                    ).to("cuda")
                     scores = self.model(**inputs).logits
                     scores = scores.squeeze().tolist()
                     if not isinstance(scores, list):
@@ -364,7 +364,7 @@ class HFRunner:
                         )
                         conv_tokenized = self.tokenizer(
                             conv_formatted, return_tensors="pt"
-                        ).cuda()
+                        ).to("cuda")
                         scores.append(
                             float(self.model(**conv_tokenized).logits[0][0].item())
                         )
@@ -423,7 +423,7 @@ class HFRunner:
             if isinstance(p, str):
                 input_ids = tokenizer.encode(p, return_tensors="pt").cuda()
             else:
-                input_ids = torch.tensor([p], device=device)
+                input_ids = torch.tensor([p], device="cuda")
 
             if lora_paths is not None and lora_paths[i] is not None:
                 from peft import PeftModel
