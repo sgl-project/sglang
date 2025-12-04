@@ -150,6 +150,9 @@ impl WorkerRegistry {
                 conn_workers.retain(|id| id != worker_id);
             }
 
+            // TODO we may even remove it from Prometheus exports
+            worker.set_healthy(false);
+
             Some(worker)
         } else {
             None
