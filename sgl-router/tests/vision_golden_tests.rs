@@ -7,6 +7,7 @@
 //! - `llava/` - Standard CLIP processing (llava-hf/* models, no expand-to-square)
 //! - `llava_pad/` - Expand-to-square mode (liuhaotian/llava-* models, image_aspect_ratio=pad)
 //! - `qwen2_vl/` - Dynamic resolution with smart resize (Qwen/Qwen2-VL-* models)
+//! - `qwen3_vl/` - Dynamic resolution with patch_size=16 and [0.5,0.5,0.5] norm (Qwen/Qwen3-VL-* models)
 //!
 //! To regenerate golden outputs:
 //! ```bash
@@ -18,7 +19,7 @@ use std::{fs::File, io::Read, path::Path};
 use ndarray::Array4;
 use sgl_model_gateway::multimodal::vision::{
     image_processor::ModelSpecificValue, ImagePreProcessor, LlavaProcessor, PreProcessorConfig,
-    Qwen2VLProcessor,
+    Qwen2VLProcessor, Qwen3VLProcessor,
 };
 
 /// Load a numpy .npz file and extract pixel_values
@@ -383,4 +384,153 @@ fn test_qwen2_vl_golden_wide() {
 #[test]
 fn test_qwen2_vl_golden_small() {
     run_qwen2_vl_golden_test("small");
+}
+
+// ============================================================================
+// Qwen3-VL tests
+// ============================================================================
+
+/// Run a Qwen3-VL golden test for a specific image.
+///
+/// This test validates:
+/// 1. image_grid_thw matches the HuggingFace output
+/// 2. num_tokens calculation is correct
+/// 3. Pixel values match after reshaping to patch format
+///
+/// Key differences from Qwen2-VL:
+/// - patch_size: 16 (vs 14)
+/// - factor: 32 (vs 28)
+/// - normalization: [0.5, 0.5, 0.5] (vs CLIP)
+fn run_qwen3_vl_golden_test(image_name: &str) {
+    let golden_dir = Path::new("tests/fixtures/golden/qwen3_vl");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{}.jpg", image_name));
+
+    if !golden_dir.exists() || !image_path.exists() {
+        eprintln!(
+            "Golden test fixtures for qwen3_vl/{} not found, skipping test",
+            image_name
+        );
+        eprintln!("Run: python scripts/generate_vision_golden.py --model qwen3_vl");
+        return;
+    }
+
+    let npz_path = golden_dir.join(format!("golden_{}.npz", image_name));
+    let config = load_config(&golden_dir.join("preprocessor_config.json"));
+
+    // Load golden values
+    let golden_grid_thw = load_golden_grid_thw(&npz_path);
+    let golden_num_tokens = load_golden_num_tokens(&npz_path);
+    let (golden_pixels, golden_shape) = load_golden_qwen2_vl_pixels(&npz_path);
+
+    // Process image with our Rust processor
+    let image = image::open(&image_path).expect("Failed to open image");
+    let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
+    let result = processor
+        .preprocess(&[image], &config)
+        .expect("Processing failed");
+
+    // Extract image_grid_thw from result
+    let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
+        Some(ModelSpecificValue::UintTensor { data, shape }) => {
+            assert_eq!(shape, &[1, 3], "Expected shape [1, 3] for single image");
+            data.clone()
+        }
+        _ => panic!("Expected image_grid_thw in model_specific"),
+    };
+
+    // Compare grid dimensions
+    println!(
+        "qwen3_vl - {} image - Grid T H W: golden={:?}, rust={:?}",
+        image_name, golden_grid_thw, rust_grid_thw
+    );
+    assert_eq!(
+        golden_grid_thw, rust_grid_thw,
+        "image_grid_thw mismatch for {}",
+        image_name
+    );
+
+    // Compare token counts
+    let rust_num_tokens = result.num_img_tokens[0];
+    println!(
+        "qwen3_vl - {} image - Tokens: golden={}, rust={}",
+        image_name, golden_num_tokens, rust_num_tokens
+    );
+    assert_eq!(
+        golden_num_tokens, rust_num_tokens,
+        "num_tokens mismatch for {}",
+        image_name
+    );
+
+    // Compare pixel values by reshaping our output to patch format
+    let grid_t = rust_grid_thw[0] as usize;
+    let grid_h = rust_grid_thw[1] as usize;
+    let grid_w = rust_grid_thw[2] as usize;
+
+    // Get the tensor for the first image (batch index 0)
+    let pixel_values = &result.pixel_values;
+    let tensor_3d = pixel_values.index_axis(ndarray::Axis(0), 0).to_owned();
+
+    // Reshape to patches format
+    let rust_patches = processor.reshape_to_patches(&tensor_3d, grid_t, grid_h, grid_w);
+
+    // Verify shapes match (Qwen3-VL has patch_size=16)
+    let expected_num_patches = grid_t * grid_h * grid_w;
+    let patch_size = config.patch_size.unwrap_or(16);
+    let temporal_patch_size = config.temporal_patch_size.unwrap_or(2);
+    let expected_patch_features = 3 * temporal_patch_size * patch_size * patch_size;
+
+    println!(
+        "qwen3_vl - {} image - Patch shape: golden={:?}, rust=({}, {})",
+        image_name, golden_shape, expected_num_patches, expected_patch_features
+    );
+    assert_eq!(
+        golden_shape,
+        (expected_num_patches, expected_patch_features),
+        "Patch shape mismatch"
+    );
+    assert_eq!(
+        rust_patches.len(),
+        expected_num_patches * expected_patch_features,
+        "Rust patches size mismatch"
+    );
+
+    // Compare pixel values
+    let max_diff = rust_patches
+        .iter()
+        .zip(golden_pixels.iter())
+        .map(|(r, g)| (r - g).abs())
+        .fold(0.0f32, f32::max);
+
+    println!(
+        "qwen3_vl - {} image - Max pixel diff: {:.6}",
+        image_name, max_diff
+    );
+
+    // Allow tolerance for floating point and interpolation differences
+    assert!(
+        max_diff < 0.02,
+        "Max pixel difference {} exceeds tolerance 0.02 for {}",
+        max_diff,
+        image_name
+    );
+}
+
+#[test]
+fn test_qwen3_vl_golden_square() {
+    run_qwen3_vl_golden_test("square");
+}
+
+#[test]
+fn test_qwen3_vl_golden_tall() {
+    run_qwen3_vl_golden_test("tall");
+}
+
+#[test]
+fn test_qwen3_vl_golden_wide() {
+    run_qwen3_vl_golden_test("wide");
+}
+
+#[test]
+fn test_qwen3_vl_golden_small() {
+    run_qwen3_vl_golden_test("small");
 }

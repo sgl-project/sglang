@@ -9,9 +9,13 @@
 //! - **LLaVA-NeXT** (`llava`): Multi-crop anyres processing
 //! - **Qwen2-VL** (`qwen2_vl`): Dynamic resolution with smart resizing
 //! - **Qwen2.5-VL** (`qwen2_vl`): Same processor as Qwen2-VL (identical preprocessing)
+//! - **Qwen3-VL** (`qwen3_vl`): Similar to Qwen2-VL but with patch_size=16 and [0.5,0.5,0.5] normalization
 
 pub mod llava;
 pub mod qwen2_vl;
+pub mod qwen3_vl;
+pub mod qwen_vl_base;
 
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
 pub use qwen2_vl::Qwen2VLProcessor;
+pub use qwen3_vl::Qwen3VLProcessor;

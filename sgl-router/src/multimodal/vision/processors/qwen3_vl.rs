@@ -1,21 +1,20 @@
-//! Qwen2-VL family image processors.
+//! Qwen3-VL family image processors.
 //!
-//! This module provides the Qwen2-VL processor which wraps the shared
-//! `QwenVLProcessorBase` with Qwen2-VL specific default parameters.
+//! This module provides the Qwen3-VL processor which wraps the shared
+//! `QwenVLProcessorBase` with Qwen3-VL specific default parameters.
 //!
-//! # Key Features
+//! # Key Differences from Qwen2-VL
 //!
-//! - **Smart Resize**: Resizes images to fit within min/max pixel bounds while
-//!   preserving aspect ratio and aligning to patch boundaries
-//! - **Dynamic Token Count**: Token count depends on actual image dimensions
-//! - **image_grid_thw**: Returns (T, H, W) grid dimensions for position encoding
+//! - **Patch Size**: 16 (vs 14 in Qwen2-VL)
+//! - **Factor**: 32 (patch_size * merge_size) (vs 28 in Qwen2-VL)
+//! - **Normalization**: [0.5, 0.5, 0.5] mean/std (vs CLIP in Qwen2-VL)
 //!
-//! # Qwen2-VL Parameters
+//! # Qwen3-VL Parameters
 //!
-//! - patch_size: 14
+//! - patch_size: 16
 //! - merge_size: 2
-//! - factor: 28 (patch_size * merge_size)
-//! - normalization: CLIP mean/std
+//! - factor: 32 (patch_size * merge_size)
+//! - normalization: [0.5, 0.5, 0.5] mean/std
 
 use std::ops::Deref;
 
@@ -29,20 +28,22 @@ use crate::multimodal::vision::{
     transforms::TransformError,
 };
 
-/// CLIP normalization mean values used by Qwen2-VL models.
-pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+/// Qwen3-VL normalization mean values (simple [0.5, 0.5, 0.5]).
+pub const QWEN3_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
 
-/// CLIP normalization std values used by Qwen2-VL models.
-pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+/// Qwen3-VL normalization std values (simple [0.5, 0.5, 0.5]).
+pub const QWEN3_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
-/// Default minimum pixels (256 * 28 * 28 = 200,704)
-pub const DEFAULT_MIN_PIXELS: usize = 256 * 28 * 28;
+/// Default minimum pixels for Qwen3-VL
+/// This corresponds to shortest_edge = 65536 from HF config
+pub const DEFAULT_MIN_PIXELS: usize = 65536;
 
-/// Default maximum pixels (1280 * 28 * 28 = 1,003,520)
-pub const DEFAULT_MAX_PIXELS: usize = 1280 * 28 * 28;
+/// Default maximum pixels for Qwen3-VL
+/// This corresponds to longest_edge = 16777216 from HF config
+pub const DEFAULT_MAX_PIXELS: usize = 16777216;
 
-/// Default patch size
-pub const DEFAULT_PATCH_SIZE: usize = 14;
+/// Default patch size for Qwen3-VL (16, vs 14 in Qwen2-VL)
+pub const DEFAULT_PATCH_SIZE: usize = 16;
 
 /// Default merge size for token reduction
 pub const DEFAULT_MERGE_SIZE: usize = 2;
@@ -50,34 +51,34 @@ pub const DEFAULT_MERGE_SIZE: usize = 2;
 /// Default temporal patch size (for video frames)
 pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
-/// Qwen2-VL image processor.
+/// Qwen3-VL image processor.
 ///
-/// This is a thin wrapper around `QwenVLProcessorBase` with Qwen2-VL
+/// This is a thin wrapper around `QwenVLProcessorBase` with Qwen3-VL
 /// specific default parameters:
-/// - patch_size: 14
+/// - patch_size: 16
 /// - merge_size: 2
-/// - CLIP normalization mean/std
+/// - [0.5, 0.5, 0.5] normalization mean/std
 #[derive(Debug, Clone)]
-pub struct Qwen2VLProcessor {
+pub struct Qwen3VLProcessor {
     inner: QwenVLProcessorBase,
 }
 
-impl Default for Qwen2VLProcessor {
+impl Default for Qwen3VLProcessor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Qwen2VLProcessor {
-    /// Create a new Qwen2-VL processor with default settings.
+impl Qwen3VLProcessor {
+    /// Create a new Qwen3-VL processor with default settings.
     ///
     /// Defaults:
-    /// - patch_size: 14
+    /// - patch_size: 16
     /// - merge_size: 2
-    /// - min_pixels: 200,704 (256 * 28 * 28)
-    /// - max_pixels: 1,003,520 (1280 * 28 * 28)
+    /// - min_pixels: 65,536
+    /// - max_pixels: 16,777,216
     /// - temporal_patch_size: 2
-    /// - normalization: CLIP mean/std
+    /// - normalization: [0.5, 0.5, 0.5] mean/std
     pub fn new() -> Self {
         Self {
             inner: QwenVLProcessorBase::new(QwenVLConfig {
@@ -86,9 +87,9 @@ impl Qwen2VLProcessor {
                 min_pixels: DEFAULT_MIN_PIXELS,
                 max_pixels: DEFAULT_MAX_PIXELS,
                 temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
-                mean: CLIP_MEAN,
-                std: CLIP_STD,
-                model_name: "qwen2-vl",
+                mean: QWEN3_MEAN,
+                std: QWEN3_STD,
+                model_name: "qwen3-vl",
             }),
         }
     }
@@ -108,9 +109,9 @@ impl Qwen2VLProcessor {
                 min_pixels,
                 max_pixels,
                 temporal_patch_size,
-                mean: CLIP_MEAN,
-                std: CLIP_STD,
-                model_name: "qwen2-vl",
+                mean: QWEN3_MEAN,
+                std: QWEN3_STD,
+                model_name: "qwen3-vl",
             }),
         }
     }
@@ -126,9 +127,9 @@ impl Qwen2VLProcessor {
                 temporal_patch_size: config
                     .temporal_patch_size
                     .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
-                mean: CLIP_MEAN,
-                std: CLIP_STD,
-                model_name: "qwen2-vl",
+                mean: QWEN3_MEAN,
+                std: QWEN3_STD,
+                model_name: "qwen3-vl",
             }),
         }
     }
@@ -164,7 +165,7 @@ impl Qwen2VLProcessor {
         self.inner.get_factor()
     }
 
-    /// Smart resize algorithm for Qwen2-VL.
+    /// Smart resize algorithm for Qwen3-VL.
     pub fn smart_resize(
         &self,
         height: usize,
@@ -202,7 +203,7 @@ impl Qwen2VLProcessor {
     }
 }
 
-impl Deref for Qwen2VLProcessor {
+impl Deref for Qwen3VLProcessor {
     type Target = QwenVLProcessorBase;
 
     fn deref(&self) -> &Self::Target {
@@ -210,7 +211,7 @@ impl Deref for Qwen2VLProcessor {
     }
 }
 
-impl ImagePreProcessor for Qwen2VLProcessor {
+impl ImagePreProcessor for Qwen3VLProcessor {
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -252,25 +253,25 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen2_vl_processor_default() {
-        let processor = Qwen2VLProcessor::new();
-        assert_eq!(processor.patch_size(), 14);
+    fn test_qwen3_vl_processor_default() {
+        let processor = Qwen3VLProcessor::new();
+        assert_eq!(processor.patch_size(), 16);
         assert_eq!(processor.merge_size(), 2);
         assert_eq!(processor.min_pixels(), DEFAULT_MIN_PIXELS);
         assert_eq!(processor.max_pixels(), DEFAULT_MAX_PIXELS);
-        assert_eq!(processor.get_factor(), 28); // 14 * 2
+        assert_eq!(processor.get_factor(), 32); // 16 * 2
     }
 
     #[test]
     fn test_smart_resize_within_bounds() {
-        let processor = Qwen2VLProcessor::new();
+        let processor = Qwen3VLProcessor::new();
 
-        // Image that's already within bounds
+        // Image that's within bounds
         let (h, w) = processor.smart_resize(500, 500).unwrap();
 
-        // Should be aligned to factor (28)
-        assert_eq!(h % 28, 0);
-        assert_eq!(w % 28, 0);
+        // Should be aligned to factor (32)
+        assert_eq!(h % 32, 0);
+        assert_eq!(w % 32, 0);
 
         // Should be within bounds
         assert!(h * w >= processor.min_pixels());
@@ -278,34 +279,8 @@ mod tests {
     }
 
     #[test]
-    fn test_smart_resize_too_large() {
-        let processor = Qwen2VLProcessor::new();
-
-        // Very large image
-        let (h, w) = processor.smart_resize(3000, 3000).unwrap();
-
-        // Should be scaled down
-        assert!(h * w <= processor.max_pixels());
-        assert_eq!(h % 28, 0);
-        assert_eq!(w % 28, 0);
-    }
-
-    #[test]
-    fn test_smart_resize_too_small() {
-        let processor = Qwen2VLProcessor::new();
-
-        // Small image (but above minimum dimension)
-        let (h, w) = processor.smart_resize(100, 100).unwrap();
-
-        // Should be scaled up to min_pixels
-        assert!(h * w >= processor.min_pixels());
-        assert_eq!(h % 28, 0);
-        assert_eq!(w % 28, 0);
-    }
-
-    #[test]
     fn test_smart_resize_aspect_ratio_preserved() {
-        let processor = Qwen2VLProcessor::new();
+        let processor = Qwen3VLProcessor::new();
 
         // 2:1 aspect ratio
         let (h, w) = processor.smart_resize(400, 800).unwrap();
@@ -318,7 +293,7 @@ mod tests {
 
     #[test]
     fn test_smart_resize_extreme_aspect_ratio_error() {
-        let processor = Qwen2VLProcessor::new();
+        let processor = Qwen3VLProcessor::new();
 
         // 300:1 aspect ratio - should fail
         let result = processor.smart_resize(100, 30000);
@@ -327,59 +302,60 @@ mod tests {
 
     #[test]
     fn test_smart_resize_too_small_dimension_error() {
-        let processor = Qwen2VLProcessor::new();
+        let processor = Qwen3VLProcessor::new();
 
-        // Dimension smaller than factor
+        // Dimension smaller than factor (32)
         let result = processor.smart_resize(10, 100);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_calculate_grid_thw_image() {
-        let processor = Qwen2VLProcessor::new();
+        let processor = Qwen3VLProcessor::new();
 
-        // 448x448 image (16x16 grid patches)
-        let (t, h, w) = processor.calculate_grid_thw(448, 448, 1);
+        // 480x640 image
+        let (t, h, w) = processor.calculate_grid_thw(480, 640, 1);
 
         assert_eq!(t, 1); // Single image
-        assert_eq!(h, 448 / 14); // 32
-        assert_eq!(w, 448 / 14); // 32
+        assert_eq!(h, 480 / 16); // 30
+        assert_eq!(w, 640 / 16); // 40
     }
 
     #[test]
     fn test_calculate_tokens() {
-        let processor = Qwen2VLProcessor::new();
+        let processor = Qwen3VLProcessor::new();
 
         // With merge_size=2, tokens = (t * h * w) / 4
-        let tokens = processor.calculate_tokens_from_grid(1, 32, 32);
-        assert_eq!(tokens, (32 * 32) / 4); // 256
+        let tokens = processor.calculate_tokens_from_grid(1, 30, 40);
+        assert_eq!(tokens, (30 * 40) / 4); // 300
     }
 
     #[test]
-    fn test_qwen2_vl_preprocess() {
-        let processor = Qwen2VLProcessor::new();
+    fn test_qwen3_vl_preprocess() {
+        let processor = Qwen3VLProcessor::new();
         let config = PreProcessorConfig {
             do_resize: Some(true),
             do_normalize: Some(true),
-            image_mean: Some(CLIP_MEAN.to_vec()),
-            image_std: Some(CLIP_STD.to_vec()),
-            patch_size: Some(14),
+            image_mean: Some(QWEN3_MEAN.to_vec()),
+            image_std: Some(QWEN3_STD.to_vec()),
+            patch_size: Some(16),
             merge_size: Some(2),
             min_pixels: Some(DEFAULT_MIN_PIXELS),
             max_pixels: Some(DEFAULT_MAX_PIXELS),
             ..Default::default()
         };
 
-        let image = create_test_image(600, 400, Rgb([128, 128, 128]));
+        let image = create_test_image(640, 480, Rgb([128, 128, 128]));
         let result = processor.preprocess(&[image], &config).unwrap();
 
         assert_eq!(result.batch_size(), 1);
 
         // Check pixel values are normalized
         let flat = result.pixel_values_flat();
-        // After normalization with CLIP mean/std, gray (0.5) should be near 0
-        // (0.5 - 0.48) / 0.27 ≈ 0.07
-        assert!(flat.iter().all(|&v| v.abs() < 1.0)); // Should be normalized
+        // After normalization with [0.5, 0.5, 0.5] mean/std:
+        // (0.5 - 0.5) / 0.5 = 0.0 for gray
+        // Values should be in [-1, 1] range
+        assert!(flat.iter().all(|&v| (-1.5..=1.5).contains(&v)));
 
         // Check image_grid_thw is present
         assert!(result.model_specific.contains_key("image_grid_thw"));
@@ -389,13 +365,17 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen2_vl_preprocess_multiple() {
-        let processor = Qwen2VLProcessor::new();
-        let config = PreProcessorConfig::default();
+    fn test_qwen3_vl_preprocess_multiple() {
+        let processor = Qwen3VLProcessor::new();
+        let config = PreProcessorConfig {
+            image_mean: Some(QWEN3_MEAN.to_vec()),
+            image_std: Some(QWEN3_STD.to_vec()),
+            ..Default::default()
+        };
 
         let images = vec![
-            create_test_image(600, 400, Rgb([100, 100, 100])),
-            create_test_image(400, 600, Rgb([150, 150, 150])),
+            create_test_image(640, 480, Rgb([100, 100, 100])),
+            create_test_image(480, 640, Rgb([150, 150, 150])),
         ];
 
         let result = processor.preprocess(&images, &config).unwrap();
@@ -416,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_qwen2_vl_from_config() {
+    fn test_qwen3_vl_from_config() {
         let config = PreProcessorConfig {
             patch_size: Some(16),
             merge_size: Some(4),
@@ -426,7 +406,7 @@ mod tests {
             ..Default::default()
         };
 
-        let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
+        let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
 
         assert_eq!(processor.patch_size(), 16);
         assert_eq!(processor.merge_size(), 4);
@@ -437,14 +417,30 @@ mod tests {
 
     #[test]
     fn test_model_name() {
-        let processor = Qwen2VLProcessor::new();
-        assert_eq!(processor.model_name(), "qwen2-vl");
+        let processor = Qwen3VLProcessor::new();
+        assert_eq!(processor.model_name(), "qwen3-vl");
     }
 
     #[test]
     fn test_default_mean_std() {
-        let processor = Qwen2VLProcessor::new();
-        assert_eq!(processor.default_mean(), CLIP_MEAN);
-        assert_eq!(processor.default_std(), CLIP_STD);
+        let processor = Qwen3VLProcessor::new();
+        assert_eq!(processor.default_mean(), QWEN3_MEAN);
+        assert_eq!(processor.default_std(), QWEN3_STD);
+    }
+
+    #[test]
+    fn test_qwen3_vs_qwen2_differences() {
+        // Verify the key differences from Qwen2-VL
+        let processor = Qwen3VLProcessor::new();
+
+        // Qwen3-VL uses patch_size=16 (vs 14 in Qwen2)
+        assert_eq!(processor.patch_size(), 16);
+
+        // Factor is 32 (vs 28 in Qwen2)
+        assert_eq!(processor.get_factor(), 32);
+
+        // Mean/std are [0.5, 0.5, 0.5] (vs CLIP values in Qwen2)
+        assert_eq!(processor.default_mean(), [0.5, 0.5, 0.5]);
+        assert_eq!(processor.default_std(), [0.5, 0.5, 0.5]);
     }
 }
