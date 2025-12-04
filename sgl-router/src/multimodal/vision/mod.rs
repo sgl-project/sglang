@@ -41,6 +41,6 @@ pub use image_processor::{
 pub use preprocessor_config::PreProcessorConfig;
 pub use processors::{
     Llama4VisionProcessor, LlavaNextProcessor, LlavaProcessor, Phi3VisionProcessor,
-    Phi4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
+    Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
 };
 pub use transforms::TransformError;
