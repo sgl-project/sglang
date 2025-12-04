@@ -20,6 +20,7 @@ import torch
 import torch.distributed
 from torch.distributed import P2POp
 
+from sglang.srt.distributed import get_moe_ep_group
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
     get_global_expert_location_metadata,
@@ -332,7 +333,8 @@ def update_expert_weights_single_layer(
                     P2POp(
                         op=torch.distributed.irecv,
                         tensor=_get_tensor(temp_buffers, i, dst_expert_location),
-                        peer=src_rank,
+                        peer=get_moe_ep_group().ranks[src_rank],
+                        group=get_moe_ep_group().device_group,
                     )
                     for i in range(num_tensors)
                 ],
@@ -382,7 +384,8 @@ def update_expert_weights_single_layer(
                         tensor=_get_tensor(
                             routed_experts_weights, i, src_expert_location
                         ),
-                        peer=dst_rank,
+                        peer=get_moe_ep_group().ranks[dst_rank],
+                        group=get_moe_ep_group().device_group,
                     )
                     for dst_rank in all_dst_ranks
                     for i in range(num_tensors)

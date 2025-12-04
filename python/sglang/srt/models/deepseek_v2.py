@@ -3444,6 +3444,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
                 for layer_id, layer in enumerate(self.model.layers)
+                if isinstance(layer, DeepseekV2DecoderLayer)
                 if isinstance(layer.mlp, DeepseekV2MoE)
             }
         )
