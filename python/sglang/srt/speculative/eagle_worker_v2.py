@@ -390,7 +390,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
             # Run forward
             logits_output, _ = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=False
+                forward_batch, skip_attn_backend_init=True
             )
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
@@ -515,7 +515,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         else:
             draft_logits_output, _ = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=False
+                forward_batch, skip_attn_backend_init=True
             )
 
         # Reorganize the spec info for the next batch
@@ -698,7 +698,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             model_worker_batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=False,
+            skip_attn_backend_init=True,
         )
         logits_output = forward_batch_output.logits_output
 

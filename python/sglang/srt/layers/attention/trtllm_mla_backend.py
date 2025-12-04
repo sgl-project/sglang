@@ -622,6 +622,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             self.forward_decode_metadata.block_kv_indices = block_kv_indices
             self.forward_decode_metadata.max_seq_len_k = int(max_seq)
+            self.forward_decode_metadata.batch_size = bs
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
         else:
@@ -855,6 +856,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             or self.forward_decode_metadata
         )
 
+        # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
+        # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
+        # and padding logic in prepare_mlp_sync_batch to avoid this
+        batch_size = getattr(metadata, "batch_size", None)
+        if batch_size is not None and batch_size < forward_batch.batch_size:
+            self.init_forward_metadata(forward_batch)
+            metadata = forward_batch.decode_trtllm_mla_metadata
+
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
         # Scale components:
@@ -961,6 +970,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 getattr(forward_batch, "decode_trtllm_mla_metadata", None)
                 or self.forward_decode_metadata
             )
+
+            # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
+            # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
+            # and padding logic in prepare_mlp_sync_batch to avoid this
+            batch_size = getattr(metadata, "batch_size", None)
+            if batch_size is not None and batch_size < forward_batch.batch_size:
+                self.init_forward_metadata(forward_batch)
+                metadata = forward_batch.decode_trtllm_mla_metadata
 
             # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
             bs = forward_batch.batch_size
