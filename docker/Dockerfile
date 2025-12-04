@@ -451,8 +451,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     GDRCOPY_HOME=/usr/src/gdrdrv-${GDRCOPY_VERSION}/
 
-# Add GKE default lib and bin locations
-ENV PATH="${PATH}:/usr/local/nvidia/bin" \
+# Add GKE default lib and bin locations + CUDA compiler paths for FlashInfer JIT
+ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 # Install ONLY runtime dependencies (no build tools)
