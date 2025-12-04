@@ -185,7 +185,8 @@ impl Qwen2VLProcessor {
 
     /// Calculate the number of image tokens after merge.
     pub fn calculate_tokens_from_grid(&self, grid_t: usize, grid_h: usize, grid_w: usize) -> usize {
-        self.inner.calculate_tokens_from_grid(grid_t, grid_h, grid_w)
+        self.inner
+            .calculate_tokens_from_grid(grid_t, grid_h, grid_w)
     }
 
     /// Reshape pixel values from [C, H, W] to flattened patches format.
@@ -196,7 +197,8 @@ impl Qwen2VLProcessor {
         grid_h: usize,
         grid_w: usize,
     ) -> Vec<f32> {
-        self.inner.reshape_to_patches(tensor, grid_t, grid_h, grid_w)
+        self.inner
+            .reshape_to_patches(tensor, grid_t, grid_h, grid_w)
     }
 }
 
