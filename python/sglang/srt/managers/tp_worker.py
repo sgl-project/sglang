@@ -514,19 +514,29 @@ class TpModelWorker(BaseTpWorker):
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
             batch.split_forward_batch = forward_batch
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
+            
+            # Mark start of forward pass for profiling (chunked prefill)
+            if self._shape_logger and self._shape_profiling_started:
+                self._shape_logger.start_forward_pass()
         else:
             model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
 
-        logits_output, can_run_cuda_graph = self.model_runner.forward(
-            batch.split_forward_batch, split_forward_count=batch.split_forward_count
-        )
-        if logits_output:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
-        else:
-            next_token_ids = None
-        batch_result = GenerationBatchResult(
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
-        batch_result.next_token_ids = next_token_ids
-        return batch_result
+        try:
+            logits_output, can_run_cuda_graph = self.model_runner.forward(
+                batch.split_forward_batch, split_forward_count=batch.split_forward_count
+            )
+            if logits_output:
+                next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            else:
+                next_token_ids = None
+            batch_result = GenerationBatchResult(
+                logits_output=logits_output,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
+            batch_result.next_token_ids = next_token_ids
+            return batch_result
+        finally:
+            # Mark end of forward pass for profiling (chunked prefill)
+            if batch.split_index == batch.split_forward_count - 1:  # Last chunk
+                if self._shape_logger and self._shape_profiling_started:
+                    self._shape_logger.end_forward_pass()
