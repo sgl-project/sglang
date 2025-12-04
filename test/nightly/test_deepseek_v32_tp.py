@@ -22,11 +22,68 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2-Exp"
 TEST_RESULTS = []
 
 
-class TestDeepseekV32NasBackend_flashmla(CustomTestCase):
+class TestDeepseekV32_TP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Pure TP configuration without --dp and --enable-dp-attention
+        other_args = [
+            "--trust-remote-code",
+            "--attention-backend",
+            "nsa",
+            "--nsa-prefill-backend",
+            "flashmla_sparse",
+            "--nsa-decode-backend",
+            "flashmla_kv",
+            "--tp",
+            "8",
+        ]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(
+        self,
+    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
+        args = SimpleNamespace(
+            num_shots=20,
+            data_path=None,
+            num_questions=1400,
+            parallel=1400,
+            max_new_tokens=512,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval_few_shot_gsm8k(args)
+        print(f"{metrics=}")
+
+        if is_in_ci():
+            TEST_RESULTS.append(
+                {
+                    "variant": "pure_tp",
+                    "prefill_backend": "flashmla_sparse",
+                    "decode_backend": "flashmla_kv",
+                    "kv_cache": "fp16",
+                    "accuracy": metrics["accuracy"],
+                }
+            )
+        self.assertGreater(metrics["accuracy"], 0.935)
+
+
+class TestDeepseekV32_Partial_TP(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEEPSEEK_V32_MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        # Partial TP configuration with dp=4 and dp-attention enabled
         other_args = [
             "--trust-remote-code",
             "--attention-backend",
@@ -38,7 +95,7 @@ class TestDeepseekV32NasBackend_flashmla(CustomTestCase):
             "--tp",
             "8",
             "--dp",
-            "8",
+            "4",
             "--enable-dp-attention",
         ]
         cls.process = popen_launch_server(
@@ -70,124 +127,10 @@ class TestDeepseekV32NasBackend_flashmla(CustomTestCase):
         if is_in_ci():
             TEST_RESULTS.append(
                 {
-                    "variant": "flashmla",
+                    "variant": "partial_tp",
                     "prefill_backend": "flashmla_sparse",
                     "decode_backend": "flashmla_kv",
                     "kv_cache": "fp16",
-                    "accuracy": metrics["accuracy"],
-                }
-            )
-        self.assertGreater(metrics["accuracy"], 0.935)
-
-
-class TestDeepseekV32NasBackend_fa3(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEEPSEEK_V32_MODEL_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = [
-            "--trust-remote-code",
-            "--attention-backend",
-            "nsa",
-            "--nsa-prefill-backend",
-            "fa3",
-            "--nsa-decode-backend",
-            "fa3",
-            "--tp",
-            "8",
-            "--dp",
-            "8",
-            "--enable-dp-attention",
-        ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_a_gsm8k(
-        self,
-    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
-        args = SimpleNamespace(
-            num_shots=20,
-            data_path=None,
-            num_questions=1400,
-            parallel=1400,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-
-        if is_in_ci():
-            TEST_RESULTS.append(
-                {
-                    "variant": "fa3",
-                    "prefill_backend": "fa3",
-                    "decode_backend": "fa3",
-                    "kv_cache": "fp16",
-                    "accuracy": metrics["accuracy"],
-                }
-            )
-        self.assertGreater(metrics["accuracy"], 0.935)
-
-
-class TestDeepseekV32NasBackend_fp8kvcache(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEEPSEEK_V32_MODEL_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = [
-            "--trust-remote-code",
-            "--attention-backend",
-            "nsa",
-            "--kv-cache-dtype",
-            "fp8_e4m3",
-            "--tp",
-            "8",
-            "--dp",
-            "8",
-            "--enable-dp-attention",
-        ]
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_a_gsm8k(
-        self,
-    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
-        args = SimpleNamespace(
-            num_shots=20,
-            data_path=None,
-            num_questions=1400,
-            parallel=1400,
-            max_new_tokens=512,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-
-        if is_in_ci():
-            TEST_RESULTS.append(
-                {
-                    "variant": "fp8kvcache",
-                    "prefill_backend": "default",
-                    "decode_backend": "default",
-                    "kv_cache": "fp8_e4m3",
                     "accuracy": metrics["accuracy"],
                 }
             )
@@ -205,7 +148,9 @@ def _write_summary_table():
     gpu_config = os.getenv("GPU_CONFIG", "8-gpu-h200")
 
     # Build table header
-    summary = f"### {DEEPSEEK_V32_MODEL_PATH} GSM8K Accuracy [{gpu_config}]\n\n"
+    summary = (
+        f"### {DEEPSEEK_V32_MODEL_PATH} GSM8K Accuracy (TP Tests) [{gpu_config}]\n\n"
+    )
     summary += "| Variant | Prefill Backend | Decode Backend | KV Cache | Accuracy |\n"
     summary += "|---------|-----------------|----------------|----------|----------|\n"
 
