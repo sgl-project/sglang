@@ -835,10 +835,13 @@ def tensor_hash(tensor_list) -> int:
     tensor = tensor_list
     if isinstance(tensor_list, list):
         tensor_list = flatten_nested_list(tensor_list)
-        tensor_list = [
-            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
-        ]
-        tensor = torch.concat(tensor_list)
+        if len(tensor_list) == 1:
+            tensor = tensor_list[0]
+        else:
+            tensor_list = [
+                x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
+            ]
+            tensor = torch.concat(tensor_list)
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
