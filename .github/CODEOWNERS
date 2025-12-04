@@ -14,15 +14,13 @@
 /python/sglang/srt/eplb @fzyzcjy @ch-wan
 /python/sglang/srt/function_call @CatherineSue @JustinTong0323
 /python/sglang/srt/grpc @CatherineSue @slin1237
+/python/sglang/srt/hardware_backend/npu @ping1jing2 @iforgetmyname
 /python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ
-/python/sglang/srt/layers/attention/ascend_backend.py @ping1jing2 @iforgetmyname
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @zhyncs
 /python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
-/python/sglang/srt/mem_cache/allocator_ascend.py @ping1jing2 @iforgetmyname
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
-/python/sglang/srt/model_executor/npu_graph_runner.py @ping1jing2 @iforgetmyname
 /python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py @hebiao064
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
