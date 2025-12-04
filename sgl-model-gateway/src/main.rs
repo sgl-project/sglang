@@ -16,13 +16,13 @@ use sgl_model_gateway::{
     service_discovery::ServiceDiscoveryConfig,
     version,
 };
-fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
+fn parse_worker_args(flag: &str) -> Vec<(String, Option<u16>)> {
     let args: Vec<String> = std::env::args().collect();
-    let mut prefill_entries = Vec::new();
+    let mut entries = Vec::new();
     let mut i = 0;
 
     while i < args.len() {
-        if args[i] == "--prefill" && i + 1 < args.len() {
+        if args[i] == flag && i + 1 < args.len() {
             let url = args[i + 1].clone();
             let bootstrap_port = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
                 if let Ok(port) = args[i + 2].parse::<u16>() {
@@ -37,14 +37,26 @@ fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
             } else {
                 None
             };
-            prefill_entries.push((url, bootstrap_port));
+            entries.push((url, bootstrap_port));
             i += 2;
         } else {
             i += 1;
         }
     }
 
-    prefill_entries
+    entries
+}
+
+fn parse_prefill_args() -> Vec<(String, Option<u16>)> {
+    parse_worker_args("--prefill")
+}
+
+fn parse_encode_args() -> Vec<(String, Option<u16>)> {
+    parse_worker_args("--encode")
+}
+
+fn is_bootstrap_flag(arg: &str) -> bool {
+    matches!(arg, "--prefill" | "--encode")
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -144,6 +156,9 @@ struct CliArgs {
 
     #[arg(long, action = ArgAction::Append)]
     decode: Vec<String>,
+
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
+    encode_policy: Option<String>,
 
     #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two"])]
     prefill_policy: Option<String>,
@@ -521,6 +536,7 @@ impl CliArgs {
     fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
+        encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         let mode = if self.enable_igw {
             RoutingMode::Regular {
@@ -530,20 +546,34 @@ impl CliArgs {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
-        } else if self.pd_disaggregation {
+        } else {
+            let has_encode_workers = !encode_urls.is_empty();
+            let has_encode_discovery = self.service_discovery && !self.encode_selector.is_empty();
+            let has_encode_stage = has_encode_workers || has_encode_discovery;
+            let wants_disaggregation = self.pd_disaggregation || self.epd_disaggregation;
             let decode_urls = self.decode.clone();
 
-            // Allow empty URLs to support dynamic worker addition
-            RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
-                decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
-            }
-        } else {
-            // Allow empty URLs to support dynamic worker addition
-            RoutingMode::Regular {
-                worker_urls: self.worker_urls.clone(),
+            if wants_disaggregation && has_encode_stage {
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls,
+                    prefill_urls,
+                    decode_urls,
+                    encode_policy: self.encode_policy.as_ref().map(|p| self.parse_policy(p)),
+                    prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+                    decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                }
+            } else if wants_disaggregation {
+                RoutingMode::PrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                    prefill_policy: self.prefill_policy.as_ref().map(|p| self.parse_policy(p)),
+                    decode_policy: self.decode_policy.as_ref().map(|p| self.parse_policy(p)),
+                }
+            } else {
+                // Allow empty URLs to support dynamic worker addition
+                RoutingMode::Regular {
+                    worker_urls: self.worker_urls.clone(),
+                }
             }
         };
 
@@ -596,7 +626,7 @@ impl CliArgs {
                 decode_urls,
                 ..
             } => {
-                for url in encode_urls {
+                for (url, _) in encode_urls {
                     all_urls.push(url.clone());
                 }
                 all_urls.extend(prefill_urls.iter().map(|(url, _)| url.clone()));
@@ -698,13 +728,18 @@ impl CliArgs {
 
     fn to_server_config(&self, router_config: RouterConfig) -> ServerConfig {
         let service_discovery_config = if self.service_discovery {
+            let is_pd_disagg = matches!(router_config.mode, RoutingMode::PrefillDecode { .. });
+            let is_epd_disagg =
+                matches!(router_config.mode, RoutingMode::EncodePrefillDecode { .. });
             Some(ServiceDiscoveryConfig {
                 enabled: true,
                 selector: Self::parse_selector(&self.selector),
                 check_interval: std::time::Duration::from_secs(60),
                 port: self.service_discovery_port,
                 namespace: self.service_discovery_namespace.clone(),
-                pd_mode: self.pd_disaggregation,
+                pd_mode: is_pd_disagg,
+                epd_mode: is_epd_disagg,
+                encode_selector: Self::parse_selector(&self.encode_selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
                 decode_selector: Self::parse_selector(&self.decode_selector),
                 bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
@@ -758,13 +793,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let prefill_urls = parse_prefill_args();
+    let encode_urls = parse_encode_args();
 
     let mut filtered_args: Vec<String> = Vec::new();
     let raw_args: Vec<String> = std::env::args().collect();
     let mut i = 0;
 
     while i < raw_args.len() {
-        if raw_args[i] == "--prefill" && i + 1 < raw_args.len() {
+        if is_bootstrap_flag(&raw_args[i]) && i + 1 < raw_args.len() {
             i += 2;
             if i < raw_args.len()
                 && !raw_args[i].starts_with("--")
@@ -786,13 +822,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => cli.router_args,
     };
 
+    let wants_disaggregation = cli_args.pd_disaggregation || cli_args.epd_disaggregation;
+    let has_encode_discovery = cli_args.service_discovery && !cli_args.encode_selector.is_empty();
+    let encode_configured = !encode_urls.is_empty() || has_encode_discovery;
+    let epd_mode = wants_disaggregation && encode_configured;
+    let pd_mode = wants_disaggregation && !epd_mode;
+
     println!("SGLang Router starting...");
     println!("Host: {}:{}", cli_args.host, cli_args.port);
     let mode_str = if cli_args.enable_igw {
         "IGW (Inference Gateway)".to_string()
     } else if matches!(cli_args.backend, Backend::Openai) {
         "OpenAI Backend".to_string()
-    } else if cli_args.pd_disaggregation {
+    } else if epd_mode {
+        "EPD Disaggregated".to_string()
+    } else if pd_mode {
         "PD Disaggregated".to_string()
     } else {
         format!("Regular ({})", cli_args.backend)
@@ -813,13 +857,23 @@ Provide --worker-urls or PD flags as usual.",
     if !cli_args.enable_igw {
         println!("Policy: {}", cli_args.policy);
 
-        if cli_args.pd_disaggregation && !prefill_urls.is_empty() {
-            println!("Prefill nodes: {:?}", prefill_urls);
+        if epd_mode {
+            if !encode_urls.is_empty() {
+                println!("Encode nodes: {:?}", encode_urls);
+            }
+            if !prefill_urls.is_empty() {
+                println!("Prefill nodes: {:?}", prefill_urls);
+            }
+            println!("Decode nodes: {:?}", cli_args.decode);
+        } else if pd_mode {
+            if !prefill_urls.is_empty() {
+                println!("Prefill nodes: {:?}", prefill_urls);
+            }
             println!("Decode nodes: {:?}", cli_args.decode);
         }
     }
 
-    let router_config = cli_args.to_router_config(prefill_urls)?;
+    let router_config = cli_args.to_router_config(prefill_urls, encode_urls)?;
     router_config.validate()?;
     let server_config = cli_args.to_server_config(router_config);
     let runtime = tokio::runtime::Runtime::new()?;

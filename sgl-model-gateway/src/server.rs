@@ -104,7 +104,7 @@ async fn readiness(State(state): State<Arc<AppState>>) -> Response {
             RoutingMode::EncodePrefillDecode { .. } => {
                 let has_encode = healthy_workers
                     .iter()
-                    .any(|w| matches!(w.worker_type(), WorkerType::Encode));
+                    .any(|w| matches!(w.worker_type(), WorkerType::Encode { .. }));
                 let has_prefill = healthy_workers
                     .iter()
                     .any(|w| matches!(w.worker_type(), WorkerType::Prefill { .. }));

@@ -489,8 +489,9 @@ impl JobQueue {
                         decode_urls,
                         ..
                     } => {
-                        let encode_workers =
-                            encode_urls.iter().map(|url| (url.clone(), "encode", None));
+                        let encode_workers = encode_urls
+                            .iter()
+                            .map(|(url, port)| (url.clone(), "encode", *port));
 
                         let prefill_workers = prefill_urls
                             .iter()

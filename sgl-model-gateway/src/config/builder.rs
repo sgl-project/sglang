@@ -79,11 +79,13 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn encode_prefill_decode(
+    // TODO: sperate the policies
+    pub fn encode_prefill_decode_mode(
         mut self,
-        encode_urls: Vec<String>,
+        encode_urls: Vec<(String, Option<u16>)>,
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
+        encode_policy: Option<PolicyConfig>,
         prefill_policy: Option<PolicyConfig>,
         decode_policy: Option<PolicyConfig>,
     ) -> Self {
@@ -91,6 +93,7 @@ impl RouterConfigBuilder {
             encode_urls,
             prefill_urls,
             decode_urls,
+            encode_policy,
             prefill_policy,
             decode_policy,
         };

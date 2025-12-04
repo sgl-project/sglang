@@ -139,12 +139,13 @@ impl ConfigValidator {
                 encode_urls,
                 prefill_urls,
                 decode_urls,
+                encode_policy,
                 prefill_policy,
                 decode_policy,
             } => {
                 if !encode_urls.is_empty() {
                     let encode_url_strings: Vec<String> =
-                        encode_urls.iter().map(|url| url.clone()).collect();
+                        encode_urls.iter().map(|(url, _)| url.clone()).collect();
                     Self::validate_urls(&encode_url_strings)?;
                 }
                 if !prefill_urls.is_empty() {
@@ -154,6 +155,9 @@ impl ConfigValidator {
                 }
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
+                }
+                if let Some(e_policy) = encode_policy {
+                    Self::validate_policy(e_policy)?;
                 }
                 if let Some(p_policy) = prefill_policy {
                     Self::validate_policy(p_policy)?;

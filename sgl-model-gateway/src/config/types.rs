@@ -263,9 +263,13 @@ pub enum RoutingMode {
     },
     #[serde(rename = "encode_prefill_decode")]
     EncodePrefillDecode {
-        encode_urls: Vec<String>,
+        /// Encode workers (optional bootstrap port)
+        #[serde(default)]
+        encode_urls: Vec<(String, Option<u16>)>,
         prefill_urls: Vec<(String, Option<u16>)>,
         decode_urls: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encode_policy: Option<PolicyConfig>,
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,6 +282,10 @@ pub enum RoutingMode {
 impl RoutingMode {
     pub fn is_pd_mode(&self) -> bool {
         matches!(self, RoutingMode::PrefillDecode { .. })
+    }
+
+    pub fn is_epd_mode(&self) -> bool {
+        matches!(self, RoutingMode::EncodePrefillDecode { .. })
     }
 
     pub fn worker_count(&self) -> usize {
@@ -304,6 +312,16 @@ impl RoutingMode {
         match self {
             RoutingMode::PrefillDecode { prefill_policy, .. } => {
                 prefill_policy.as_ref().unwrap_or(main_policy)
+            }
+            _ => main_policy,
+        }
+    }
+
+    /// Get the effective encode policy for EPD mode
+    pub fn get_encode_policy<'a>(&'a self, main_policy: &'a PolicyConfig) -> &'a PolicyConfig {
+        match self {
+            RoutingMode::EncodePrefillDecode { encode_policy, .. } => {
+                encode_policy.as_ref().unwrap_or(main_policy)
             }
             _ => main_policy,
         }
@@ -393,9 +411,9 @@ impl Default for DiscoveryConfig {
             port: 8000,
             check_interval_secs: 120,
             selector: HashMap::new(),
+            encode_selector: HashMap::new(),
             prefill_selector: HashMap::new(),
             decode_selector: HashMap::new(),
-            encode_selector: HashMap::new(),
             bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
         }
     }
