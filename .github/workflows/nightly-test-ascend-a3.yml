@@ -1,0 +1,74 @@
+name: 'ascend test / nightly-a3'
+
+on:
+  schedule:
+      # Run test at 24:00 Beijing time (UTC+8)
+      - cron: "0 0 * * *"
+  pull_request: 
+    branches:
+      - 'main'
+    paths:
+      - ".github/workflows/nightly-test-ascend-a3.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ascend-nightly-test-${{ github.ref }}-a3
+  cancel-in-progress: true
+
+jobs:
+  multi-node-tests:
+    name: multi-node
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        test_config:
+          - name: test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500_50ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w8a8_2p1d_in3500_out1500_50ms.py
+          - name: test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500_50ms
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500_50ms.py
+    uses: ./.github/workflows/nightly-test-ascend-multi-node.yml
+    with:
+      soc_version: a3
+      runner: linux-amd64-cpu-0
+      image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3'
+      test_config_name: ${{ matrix.test_config.name }}
+      prefill_size: ${{ matrix.test_config.prefill_size }}
+      decode_size: ${{ matrix.test_config.decode_size }}
+      router_size: ${{ matrix.test_config.router_size }}
+      sglang_source_path: '/data/.cache/tests/sglang'
+      test_case: ${{ matrix.test_config.test_case }}
+
+  single-node-tests:
+    name: single-node
+    if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        test_config:
+          - name: test_ascend_qwen3_8b_in1000_out300_bs8
+            test_case: test/srt/ascend_k8s/test_ascend_qwen3_8b_in1000_out300_bs8.py
+            npu_num: 4
+          - name: test_ascend_qwen3_8b_in1000_out300_bs16
+            test_case: test/srt/ascend_k8s/test_ascend_qwen3_8b_in1000_out300_bs16.py
+            npu_num: 4
+    uses: ./.github/workflows/nightly-test-ascend-single-node.yml
+    with:
+      soc_version: a3
+      runner: linux-amd64-cpu-0
+      image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3'
+      test_config_name: ${{ matrix.test_config.name }}
+      sglang_source_path: '/data/.cache/tests/sglang'
+      test_case: ${{ matrix.test_config.test_case }}
+      nup_num: ${{ matrix.test_config.npu_num }}
+
+
+

@@ -1,0 +1,90 @@
+apiVersion: batch.volcano.sh/v1alpha1
+kind: Job
+metadata:
+  name: {{ kube_job_name }}
+  namespace: {{ name_space }}
+  labels:
+    ring-controller.atlas: ascend-1980
+    fault-scheduling: "force"
+spec:
+  minAvailable: 1
+  schedulerName: volcano
+  policies:
+    - event: PodEvicted
+      action: RestartJob
+  tasks:
+  - name: "pod"
+    replicas: 1
+    template:
+      metadata:
+        labels:
+          app: sgl-ascend
+          ring-controller.atlas: ascend-1980
+      spec:
+        hostNetwork: True
+        containers:
+        - image: {{ image }}
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+          name: sgl-ascend
+          env:
+          - name: HOSTNAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+          - name: ASCEND_VISIBLE_DEVICES
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.annotations['huawei.com/ascend-1980']
+          - name: SGLANG_SOURCE_PATH
+            value: "{{ sglang_source_path }}"
+          - name: KUBECONFIG
+            value: "{{ kube_config }}"
+          - name: NAMESPACE
+            value: "ascend-sglang-single"
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+               bash $SGLANG_SOURCE_PATH/test/srt/ascend_k8s/run_ascend_testcase.sh {{ test_case }}
+          resources:
+            requests:
+              huawei.com/ascend-1980: {{ npu_num }}
+              cpu: "4"
+            limits:
+              huawei.com/ascend-1980: {{ npu_num }}
+              cpu: "4"
+          volumeMounts:
+          - name: ascend-driver
+            mountPath: /usr/local/Ascend/driver
+          - name: localtime
+            mountPath: /etc/localtime
+          - name: kube-config
+            mountPath: /root/script
+          - name: share
+            mountPath: /data
+          - name: modelscope
+            mountPath: /root/.cache/modelscope
+        volumes:
+        - name: kube-config
+          hostPath:
+            path: /root/script
+        - name: share
+          hostPath:
+            path: /data
+        - name: modelscope
+          hostPath:
+            path: /data/ascend-ci-share-pkking-sglang/modelscope
+        - name: ascend-driver
+          hostPath:
+            path: /usr/local/Ascend/driver
+        - name: localtime
+          hostPath:
+            path: /etc/localtime
+        nodeSelector:
+          accelerator/huawei-npu: ascend-snt9c
+        restartPolicy: OnFailure
