@@ -405,9 +405,7 @@ class LayerCommunicator:
                     )
                     if fused_outputs is not None:
                         hidden_states, residual = fused_outputs
-                    elif hasattr(
-                        self.input_layernorm, "forward_with_allreduce_fusion"
-                    ):
+                    elif hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                         hidden_states, residual = (
                             self.input_layernorm.forward_with_allreduce_fusion(
                                 hidden_states, residual
@@ -819,7 +817,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and get_global_server_args().enable_aiter_allreduce_fusion
             ):
                 fused_outputs = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    hidden_states, residual, layernorm.weight, layernorm.variance_epsilon
+                    hidden_states,
+                    residual,
+                    layernorm.weight,
+                    layernorm.variance_epsilon,
                 )
                 if fused_outputs is not None:
                     hidden_states, residual = fused_outputs
