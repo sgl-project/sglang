@@ -25,6 +25,16 @@ namespace {
 //     3. abstract at::native::cpublas::brgemm with WoQ gemm (M = 1 & M != 1)
 //
 
+enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1 };
+
+constexpr bool operator==(CPUAcTMethod a, int b) {
+  return static_cast<int>(a) == b;
+}
+
+constexpr bool operator==(int a, CPUAcTMethod b) {
+  return a == static_cast<int>(b);
+}
+
 template <typename scalar_t>
 inline void fill_stub(scalar_t* __restrict__ out, scalar_t val, int64_t size) {
   using Vec = at::vec::Vectorized<scalar_t>;
@@ -130,36 +140,6 @@ inline void add_mul_stub(
     out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
   }
 }
-
-// // out = input + input2 * scale
-// template <typename scalar_t>
-// inline void add_bias_stub(
-//     scalar_t* __restrict__ out,
-//     const float* __restrict__ input,
-//     const scalar_t* __restrict__ input2,
-//     int64_t size) {
-//   using bVec = at::vec::Vectorized<scalar_t>;
-//   using fVec = at::vec::Vectorized<float>;
-//   constexpr int kVecSize = bVec::size();
-//   int64_t d;
-// #pragma GCC unroll 4
-//   for (d = 0; d <= size - kVecSize; d += kVecSize) {
-//     fVec x0 = fVec::loadu(input + d);
-//     fVec x1 = fVec::loadu(input + d + fVec::size());
-
-//     bVec y_bvec = bVec::loadu(input2 + d);
-//     fVec y0, y1;
-//     std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
-
-//     x0 = x0 + y0;
-//     x1 = x1 + y1;
-//     bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-//     out_vec.store(out + d);
-//   }
-//   for (; d < size; ++d) {
-//     out[d] = static_cast<scalar_t>(input[d] + float(input2[d]));
-//   }
-// }
 
 // out = input + input2 * scale
 template <typename scalar_t>
@@ -320,7 +300,7 @@ inline void silu_and_mul(
 }
 
 template <typename scalar_t, int BLOCK_N>
-inline void clamp_sigmoid_and_mul_blockfree(
+inline void clamp_sigmoid_and_mul(
     scalar_t* __restrict__ output,
     const float* __restrict__ input0,
     int64_t m_size,
@@ -365,73 +345,6 @@ inline void clamp_sigmoid_and_mul_blockfree(
       x0 = x0 * y0;
       // // convert
       convert_from_float_and_store<scalar_t>(out + d / 2 + offset, x0);
-    }
-  }
-}
-
-template <typename scalar_t, int BLOCK_N>
-inline void clamp_sigmoid_and_mul(
-    scalar_t* __restrict__ output,
-    const float* __restrict__ input0,
-    int64_t m_size,
-    int64_t N,
-    const float alpha,
-    const float limit,
-    int64_t offset) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-
-  const fVec one = fVec(1.f);
-  const fVec zero = fVec(0.f);
-  const fVec limit_v = fVec(limit);
-  const fVec nlimit_v = fVec(-limit);
-  const fVec alpha_v = fVec(alpha);
-
-  // no remainder
-  for (int64_t m = 0; m < m_size; ++m) {
-    scalar_t* __restrict__ out = output + m * N;
-    const float* __restrict__ cur_ptr = input0 + m * BLOCK_N;
-    // TODO:
-    // remove this assert and make block_n common to meet below interleaved x and y
-    static_assert(BLOCK_N == 64);
-    for (int64_t d = 0; d < BLOCK_N; d += 64) {
-      float tmp_glu0[fVec::size()];     // 16
-      float tmp_glu1[fVec::size()];     // 16
-      float tmp_linear0[fVec::size()];  // 16
-      float tmp_linear1[fVec::size()];  // 16
-
-      // interleaved: x[2i] = glu, x[2i+1] = linear
-      for (int j = 0; j < 16; ++j) {
-        // x0 [0,2,..30]
-        tmp_glu0[j] = cur_ptr[j * 2];
-        // x1 [32,34,..62]
-        tmp_glu1[j] = cur_ptr[32 + j * 2];
-        // y0 [1,3,...31]
-        tmp_linear0[j] = cur_ptr[j * 2 + 1];
-        // y1 [33,35,..63]
-        tmp_linear1[j] = cur_ptr[32 + j * 2 + 1];
-      }
-      fVec x0 = fVec::loadu(tmp_glu0);
-      fVec x1 = fVec::loadu(tmp_glu1);
-      fVec y0 = fVec::loadu(tmp_linear0);
-      fVec y1 = fVec::loadu(tmp_linear1);
-
-      // clamp
-      x0 = at::vec::minimum(x0, limit_v);
-      x1 = at::vec::minimum(x1, limit_v);
-      y0 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y0));
-      y1 = at::vec::minimum(limit_v, at::vec::maximum(nlimit_v, y1));
-      // x * sigmoid(x * alpha)
-      x0 = x0 / (one + (x0 * alpha_v).neg().exp_u20());
-      x1 = x1 / (one + (x1 * alpha_v).neg().exp_u20());
-      // (y + 1) * x
-      y0 = y0 + one;
-      y1 = y1 + one;
-      x0 = x0 * y0;
-      x1 = x1 * y1;
-      // convert
-      bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-      out_vec.store(out + offset);
     }
   }
 }
@@ -970,7 +883,7 @@ void fused_experts_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    int act_func,
+    CPUAcTMethod act_func,
     bool with_bias) {
   // handle 2 tiles per block
   constexpr int64_t BLOCK_M = block_size_m();
@@ -1049,7 +962,7 @@ void fused_experts_kernel_impl(
 
       } else {
         const int64_t offset = offsets[mb];
-        if (act_func == 2) {
+        if (act_func == CPUAcTMethod::swiglu) {
           tinygemm_kernel(
               /* A     */ A,
               /* B     */ B0,
@@ -1093,12 +1006,11 @@ void fused_experts_kernel_impl(
       }
       // 1.d silu and mul
       const int64_t offset = offsets[mb];
-      if (act_func == 1 && use_brgemm) {
+      if (act_func == CPUAcTMethod::silu_and_mul && use_brgemm) {
         silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
       } else {
-        clamp_sigmoid_and_mul_blockfree<scalar_t, BLOCK_N>(
-            ic1 + offset * N, C0, m_size, N, alpha, limit, 0 + nb * BLOCK_N / 2);
-        clamp_sigmoid_and_mul_blockfree<scalar_t, BLOCK_N>(
+        clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N, C0, m_size, N, alpha, limit, 0 + nb * BLOCK_N / 2);
+        clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(
             ic1 + offset * N, C1, m_size, N, alpha, limit, N / 2 + nb * BLOCK_N / 2);
       }
     });
@@ -1601,9 +1513,8 @@ at::Tensor fused_experts_cpu(
     } else {
       scalar_t* __restrict__ A_tmp = intermediate_cache2 + M * topk * K;
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
-      // TODO: This "with_bias" is only for gptoss models,
-      //       refine this check to support common cases.
       bool with_bias = w1_bias.has_value();
+      auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
 
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
@@ -1626,9 +1537,9 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad,
-          with_bias ? float(alpha.value()) : 0,
-          with_bias ? float(limit.value()) : 0,
-          with_bias ? 2 : 1,
+          alpha.has_value() ? float(alpha.value()) : 0,
+          limit.has_value() ? float(limit.value()) : 0,
+          act_func,
           with_bias);
     }
   });
