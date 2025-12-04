@@ -90,7 +90,7 @@ jobs:
                   \"sglang_source_path\": \"$sglang_source_path\",          \
                   \"test_case\": \"$test_case\",                            \
                   \"npu_num\": $npu_num }"                                 |\
-              jinja2 ${ASCEND_TEST_CASE_PATH}/k8s_single.yaml.jinja2 -o ${ASCEND_TEST_CASE_PATH}/k8s_single.yaml
+              jinja2 k8s_single.yaml.jinja2 -o k8s_single.yaml
           echo "Kubelete config file is generated: ${ASCEND_TEST_CASE_PATH}/k8s_single.yaml"
 
       - name: Clear resources
