@@ -387,20 +387,39 @@ def maybe_download_model(
 
     # Otherwise, assume it's a HF Hub model ID and try to download it
     try:
+        # First, try to use cached version only (much faster, no network/verification overhead)
         logger.info(
-            "Downloading model snapshot from HF Hub for %s...", model_name_or_path
+            "Attempting to load model from cache for %s...", model_name_or_path
         )
-        with (
-            get_lock(model_name_or_path).acquire(poll_interval=2),
-            suppress_other_loggers(not_suppress_on_main_rank=True),
-        ):
-            local_path = snapshot_download(
-                repo_id=model_name_or_path,
-                ignore_patterns=["*.onnx", "*.msgpack"],
-                local_dir=local_dir,
+        try:
+            with (
+                get_lock(model_name_or_path).acquire(poll_interval=2),
+                suppress_other_loggers(not_suppress_on_main_rank=True),
+            ):
+                local_path = snapshot_download(
+                    repo_id=model_name_or_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    local_dir=local_dir,
+                    local_files_only=True,
+                )
+            logger.info("Loaded model from cache at %s", local_path)
+            return str(local_path)
+        except Exception:
+            # If not in cache, download from HF Hub
+            logger.info(
+                "Model not in cache, downloading from HF Hub for %s...", model_name_or_path
             )
-        logger.info("Downloaded model to %s", local_path)
-        return str(local_path)
+            with (
+                get_lock(model_name_or_path).acquire(poll_interval=2),
+                suppress_other_loggers(not_suppress_on_main_rank=True),
+            ):
+                local_path = snapshot_download(
+                    repo_id=model_name_or_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    local_dir=local_dir,
+                )
+            logger.info("Downloaded model to %s", local_path)
+            return str(local_path)
     except Exception as e:
         raise ValueError(
             f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
