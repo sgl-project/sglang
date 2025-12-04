@@ -68,8 +68,8 @@ from sglang.srt.utils import (
     add_prefix,
     get_bool_env_var,
     is_cuda,
-    is_hip,
     is_flashinfer_available,
+    is_hip,
     is_non_idle_and_non_empty,
 )
 
@@ -81,6 +81,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
@@ -160,6 +161,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -405,13 +408,16 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if (
-            (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] == 0)
-             or (isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] == 0)
+        if (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] == 0) or (
+            isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] == 0
         ):
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        if _use_aiter and self.rope_scaling is not None and "aiter_rope_fused_qknorm" in self.rope_scaling:
+        if (
+            _use_aiter
+            and self.rope_scaling is not None
+            and "aiter_rope_fused_qknorm" in self.rope_scaling
+        ):
             assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
             q, k, v = self.rotary_emb(
                 qkv,
@@ -562,7 +568,9 @@ class Qwen3MoeDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _use_aiter and self.self_attn.qkv_proj.weight.dtype == getattr(torch, "float8_e4m3fnuz", None):
+        if _use_aiter and self.self_attn.qkv_proj.weight.dtype == getattr(
+            torch, "float8_e4m3fnuz", None
+        ):
             quant_format = "fp8_e4m3fnuz"
         else:
             quant_format = ""
@@ -573,9 +581,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
             forward_batch,
             quant_format,
         )
-        if (
-            (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] != 0)
-             or (isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] != 0)
+        if (isinstance(hidden_states, tuple) and hidden_states[0].shape[0] != 0) or (
+            isinstance(hidden_states, torch.Tensor) and hidden_states.shape[0] != 0
         ):
             hidden_states = self.self_attn(
                 positions=positions,

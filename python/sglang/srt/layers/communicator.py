@@ -238,7 +238,9 @@ class LayerCommunicator:
             ):
                 hidden_states, residual = (
                     self.input_layernorm.forward_with_allreduce_fusion(
-                        hidden_states, residual
+                        hidden_states,
+                        residual,
+                        quant_format=quant_format,
                     )
                 )
             else:
@@ -545,6 +547,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         forward_batch: ForwardBatch,
         layernorm: torch.nn.Module,
         context: CommunicateContext,
+        quant_format: str = "",
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
@@ -560,6 +563,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        quant_format: str = "",
     ):
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
@@ -605,7 +609,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and get_global_server_args().enable_aiter_allreduce_fusion
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
-                    hidden_states, residual
+                    hidden_states,
+                    residual,
+                    quant_format=quant_format,
                 )
             else:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
@@ -623,6 +629,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         context: CommunicateContext,
         *,
         residual_input_mode,
+        quant_format: str = "",
     ):
         input_hidden_states = hidden_states
         hidden_states = hidden_states.tensor_split(context.attn_tp_size)[

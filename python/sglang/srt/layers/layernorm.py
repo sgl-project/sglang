@@ -248,6 +248,7 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        quant_format: str = "",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Forward method with allreduce fusion
@@ -267,15 +268,19 @@ class RMSNorm(CustomOp):
                 )
 
                 if get_tensor_model_parallel_world_size() > 1:
+                    fp8_out = "fp8_e4m3fnuz" in quant_format
                     fused_result = fused_op(
                         allreduce_in=x,
                         residual_in=residual,
                         rms_weight=self.weight,
                         eps=self.variance_epsilon,
-                        fp8_out=False,
+                        fp8_out=fp8_out,
                     )
                     residual_out, norm_out, scale_out = fused_result
                     if norm_out is not None:
+                        # If fp8 quantization is applied, return quantized output with scale
+                        if fp8_out and scale_out is not None:
+                            return (norm_out, scale_out), residual_out
                         return norm_out, residual_out
             else:
                 from sglang.srt.layers.flashinfer_comm_fusion import (
