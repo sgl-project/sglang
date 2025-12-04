@@ -353,6 +353,19 @@ def apply_rope_with_cos_sin_cache_inplace(
     )
 
 
+def rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+):
+    torch.ops.sgl_kernel.rotary_embedding.default(
+        positions, query, key, head_size, cos_sin_cache, is_neox
+    )
+
+
 def downcast_fp8(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -369,7 +382,7 @@ def downcast_fp8(
     )
 
 
-def copy_to_gpu_no_ce(input: List[int], output: torch.Tensor):
+def copy_to_gpu_no_ce(input: torch.Tensor, output: torch.Tensor):
     torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
 
 

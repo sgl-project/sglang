@@ -1,5 +1,5 @@
 use serde_json::json;
-use sglang_router_rs::protocols::chat::{ChatMessage, UserMessageContent};
+use sgl_model_gateway::protocols::chat::{ChatMessage, MessageContent};
 
 #[test]
 fn test_chat_message_tagged_by_role_system() {
@@ -11,7 +11,10 @@ fn test_chat_message_tagged_by_role_system() {
     let msg: ChatMessage = serde_json::from_value(json).unwrap();
     match msg {
         ChatMessage::System { content, .. } => {
-            assert_eq!(content, "You are a helpful assistant");
+            assert_eq!(
+                content,
+                MessageContent::Text("You are a helpful assistant".to_string())
+            )
         }
         _ => panic!("Expected System variant"),
     }
@@ -27,7 +30,7 @@ fn test_chat_message_tagged_by_role_user() {
     let msg: ChatMessage = serde_json::from_value(json).unwrap();
     match msg {
         ChatMessage::User { content, .. } => match content {
-            UserMessageContent::Text(text) => assert_eq!(text, "Hello"),
+            MessageContent::Text(text) => assert_eq!(text, "Hello"),
             _ => panic!("Expected text content"),
         },
         _ => panic!("Expected User variant"),
@@ -44,7 +47,7 @@ fn test_chat_message_tagged_by_role_assistant() {
     let msg: ChatMessage = serde_json::from_value(json).unwrap();
     match msg {
         ChatMessage::Assistant { content, .. } => {
-            assert_eq!(content, Some("Hi there!".to_string()));
+            assert_eq!(content, Some(MessageContent::Text("Hi there!".to_string())));
         }
         _ => panic!("Expected Assistant variant"),
     }
@@ -64,7 +67,12 @@ fn test_chat_message_tagged_by_role_tool() {
             content,
             tool_call_id,
         } => {
-            assert_eq!(content, "Tool result");
+            match content {
+                MessageContent::Text(text) => {
+                    assert_eq!(text, "Tool result");
+                }
+                _ => panic!("Expected content to be a string"),
+            }
             assert_eq!(tool_call_id, "call_123");
         }
         _ => panic!("Expected Tool variant"),

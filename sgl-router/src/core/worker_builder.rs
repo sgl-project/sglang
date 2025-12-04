@@ -2,11 +2,14 @@ use std::collections::HashMap;
 
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+    model_card::ModelCard,
+    model_type::ModelType,
     worker::{
-        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+        BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RuntimeType, WorkerMetadata,
+        WorkerType,
     },
 };
-use crate::grpc_client::SglangSchedulerClient;
+use crate::routers::grpc::client::GrpcClient;
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
@@ -14,10 +17,12 @@ pub struct BasicWorkerBuilder {
     api_key: Option<String>,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
+    runtime_type: RuntimeType,
     labels: HashMap<String, String>,
+    models: Vec<ModelCard>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<SglangSchedulerClient>,
+    grpc_client: Option<GrpcClient>,
 }
 
 impl BasicWorkerBuilder {
@@ -28,7 +33,9 @@ impl BasicWorkerBuilder {
             api_key: None,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
+            models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -42,7 +49,9 @@ impl BasicWorkerBuilder {
             api_key: None,
             worker_type,
             connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
+            models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -64,6 +73,12 @@ impl BasicWorkerBuilder {
     /// Set the connection mode (HTTP or gRPC)
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.connection_mode = mode;
+        self
+    }
+
+    /// Set the runtime type (SGLang or vLLM)
+    pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
+        self.runtime_type = runtime_type;
         self
     }
 
@@ -92,8 +107,20 @@ impl BasicWorkerBuilder {
     }
 
     /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: SglangSchedulerClient) -> Self {
+    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
         self.grpc_client = Some(client);
+        self
+    }
+
+    /// Set models this worker can serve
+    pub fn models(mut self, models: Vec<ModelCard>) -> Self {
+        self.models = models;
+        self
+    }
+
+    /// Add a single model this worker can serve
+    pub fn model(mut self, model: ModelCard) -> Self {
+        self.models.push(model);
         self
     }
 
@@ -101,7 +128,7 @@ impl BasicWorkerBuilder {
     pub fn build(self) -> BasicWorker {
         use std::sync::{
             atomic::{AtomicBool, AtomicUsize},
-            Arc,
+            Arc, RwLock as StdRwLock,
         };
 
         use tokio::sync::RwLock;
@@ -139,10 +166,14 @@ impl BasicWorkerBuilder {
             api_key: self.api_key,
             worker_type: self.worker_type,
             connection_mode: self.connection_mode,
+            runtime_type: self.runtime_type,
             labels: self.labels,
             health_config: self.health_config,
             bootstrap_host,
             bootstrap_port,
+            models: self.models,                // Empty = accepts any model
+            default_provider: None,             // Native/passthrough
+            default_model_type: ModelType::LLM, // Standard LLM capabilities
         };
 
         let grpc_client = Arc::new(RwLock::new(self.grpc_client.map(Arc::new)));
@@ -156,6 +187,7 @@ impl BasicWorkerBuilder {
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
             grpc_client,
+            models_override: Arc::new(StdRwLock::new(None)),
         }
     }
 }
@@ -168,10 +200,12 @@ pub struct DPAwareWorkerBuilder {
     dp_size: usize,
     worker_type: WorkerType,
     connection_mode: ConnectionMode,
+    runtime_type: RuntimeType,
     labels: HashMap<String, String>,
+    models: Vec<ModelCard>,
     health_config: HealthConfig,
     circuit_breaker_config: CircuitBreakerConfig,
-    grpc_client: Option<SglangSchedulerClient>,
+    grpc_client: Option<GrpcClient>,
 }
 
 impl DPAwareWorkerBuilder {
@@ -184,7 +218,9 @@ impl DPAwareWorkerBuilder {
             dp_size,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
+            models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -205,7 +241,9 @@ impl DPAwareWorkerBuilder {
             dp_size,
             worker_type,
             connection_mode: ConnectionMode::Http,
+            runtime_type: RuntimeType::default(),
             labels: HashMap::new(),
+            models: Vec::new(),
             health_config: HealthConfig::default(),
             circuit_breaker_config: CircuitBreakerConfig::default(),
             grpc_client: None,
@@ -227,6 +265,12 @@ impl DPAwareWorkerBuilder {
     /// Set the connection mode (HTTP or gRPC)
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {
         self.connection_mode = mode;
+        self
+    }
+
+    /// Set the runtime type (SGLang or vLLM)
+    pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
+        self.runtime_type = runtime_type;
         self
     }
 
@@ -255,8 +299,20 @@ impl DPAwareWorkerBuilder {
     }
 
     /// Set gRPC client for gRPC workers
-    pub fn grpc_client(mut self, client: SglangSchedulerClient) -> Self {
+    pub fn grpc_client(mut self, client: GrpcClient) -> Self {
         self.grpc_client = Some(client);
+        self
+    }
+
+    /// Set models this worker can serve
+    pub fn models(mut self, models: Vec<ModelCard>) -> Self {
+        self.models = models;
+        self
+    }
+
+    /// Add a single model this worker can serve
+    pub fn model(mut self, model: ModelCard) -> Self {
+        self.models.push(model);
         self
     }
 
@@ -264,8 +320,10 @@ impl DPAwareWorkerBuilder {
     pub fn build(self) -> DPAwareWorker {
         let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
         let mut builder = BasicWorkerBuilder::new(worker_url)
+            .models(self.models)
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
+            .runtime_type(self.runtime_type)
             .labels(self.labels)
             .health_config(self.health_config)
             .circuit_breaker_config(self.circuit_breaker_config);

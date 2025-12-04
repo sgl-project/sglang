@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -224,6 +225,10 @@ class TestTBO(CustomTestCase):
                 "--max-running-requests",
                 "512",
             ],
+            env={
+                **os.environ,
+                "SGLANG_TBO_DEBUG": "1",
+            },
         )
 
     @classmethod
@@ -317,7 +322,6 @@ class TestMTP(CustomTestCase):
 class TestMTPWithTBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        import os
 
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -352,6 +356,10 @@ class TestMTPWithTBO(CustomTestCase):
                 "--max-running-requests",
                 "128",
             ],
+            env={
+                **os.environ,
+                "SGLANG_TBO_DEBUG": "1",
+            },
         )
 
     @classmethod

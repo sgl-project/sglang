@@ -58,6 +58,7 @@ from sglang.srt.utils import (
     is_cuda,
     make_layers,
 )
+from sglang.srt.utils.common import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
 
@@ -164,7 +165,7 @@ class Llama4MoE(nn.Module):
     def _forward_core_shared_routed_overlap(self, hidden_states):
         alt_stream = _get_or_create_alt_stream(self.device_module)
 
-        alt_stream.wait_stream(self.device_module.current_stream())
+        alt_stream.wait_stream(get_current_device_stream_fast())
 
         shared_out = self.shared_expert(hidden_states)
 
@@ -173,7 +174,7 @@ class Llama4MoE(nn.Module):
             router_logits, _ = self.router(hidden_states)
             topk_output = self.topk(hidden_states, router_logits)
             routed_out = self.experts(hidden_states, topk_output)
-        self.device_module.current_stream().wait_stream(alt_stream)
+        get_current_device_stream_fast().wait_stream(alt_stream)
 
         return shared_out, routed_out
 

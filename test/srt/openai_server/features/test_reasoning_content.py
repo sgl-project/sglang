@@ -9,11 +9,9 @@ python3 -m unittest openai_server.features.test_reasoning_content.TestReasoningC
 python3 -m unittest openai_server.features.test_reasoning_content.TestReasoningContentStartup.test_streaming
 """
 
-import json
 import unittest
 
 import openai
-import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (

@@ -12,8 +12,8 @@ use tracing::{debug, info, warn};
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::{config::types::PolicyConfig, core::Worker};
 
@@ -176,6 +176,7 @@ impl PolicyRegistry {
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
+            "bucket" => Arc::new(BucketPolicy::new()),
             _ => {
                 warn!("Unknown policy type '{}', using default", policy_type);
                 Arc::clone(&self.default_policy)
@@ -205,6 +206,18 @@ impl PolicyRegistry {
                 Arc::new(CacheAwarePolicy::with_config(cache_config))
             }
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
+            PolicyConfig::Bucket {
+                balance_abs_threshold,
+                balance_rel_threshold,
+                bucket_adjust_interval_secs,
+            } => {
+                let config = BucketConfig {
+                    balance_abs_threshold: *balance_abs_threshold,
+                    balance_rel_threshold: *balance_rel_threshold,
+                    bucket_adjust_interval_secs: *bucket_adjust_interval_secs,
+                };
+                Arc::new(BucketPolicy::with_config(config))
+            }
         }
     }
 
@@ -370,6 +383,23 @@ impl PolicyRegistry {
                             decode_workers.len()
                         );
                         cache_aware.init_workers(decode_workers);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn init_pd_bucket_policies(&self, prefill_workers: &[Arc<dyn Worker>]) {
+        // Initialize prefill policy if it's bucket
+        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
+            if prefill_policy.name() == "bucket" {
+                if let Some(bucket) = prefill_policy.as_any().downcast_ref::<BucketPolicy>() {
+                    if !prefill_workers.is_empty() {
+                        debug!(
+                            "Initializing prefill bucket policy with {} workers",
+                            prefill_workers.len()
+                        );
+                        bucket.init_prefill_worker_urls(prefill_workers);
                     }
                 }
             }

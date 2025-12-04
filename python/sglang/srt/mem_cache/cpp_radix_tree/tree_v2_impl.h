@@ -115,20 +115,24 @@ struct RadixTree::Impl {
   std::vector<TreeNode*> collect_leaves() const {
     std::vector<TreeNode*> leaves;
     std::vector<TreeNode*> stack = {};
-    for (const auto& [_, child] : m_root) {
-      stack.push_back(child.get());
-    }
-    while (!stack.empty()) {
-      const auto node = stack.back();
-      stack.pop_back();
+
+    auto process_node = [&](TreeNode* node) {
       if (node->is_leaf()) {
         if (node->ref_count == 0) {
           leaves.push_back(node);
         }
       } else {
-        for (const auto& [_, child] : *node) {
-          stack.push_back(child.get());
-        }
+        stack.push_back(node);
+      }
+    };
+    for (const auto& [_, child] : m_root) {
+      process_node(child.get());
+    }
+    while (!stack.empty()) {
+      const auto node = stack.back();
+      stack.pop_back();
+      for (const auto& [_, child] : *node) {
+        process_node(child.get());
       }
     }
     return leaves;
@@ -139,23 +143,29 @@ struct RadixTree::Impl {
     if (!use_hicache) return collect_leaves();
     std::vector<TreeNode*> leaves;
     std::vector<TreeNode*> stack = {};
-    for (const auto& [_, child] : m_root) {
-      stack.push_back(child.get());
-    }
-    while (!stack.empty()) {
-      const auto node = stack.back();
-      stack.pop_back();
-      if (!node->on_gpu()) continue;  // skip nodes that are not on GPU
+
+    auto process_node = [&](TreeNode* node) {
+      if (!node->on_gpu()) return;  // skip nodes that are not on GPU
+
       if (node->is_leaf_device()) {
         if (node->ref_count == 0) {
           leaves.push_back(node);
         }
       } else {
-        for (const auto& [_, child] : *node) {
-          stack.push_back(child.get());
-        }
+        stack.push_back(node);
+      }
+    };
+    for (const auto& [_, child] : m_root) {
+      process_node(child.get());
+    }
+    while (!stack.empty()) {
+      const auto node = stack.back();
+      stack.pop_back();
+      for (const auto& [_, child] : *node) {
+        process_node(child.get());
       }
     }
+
     return leaves;
   }
 

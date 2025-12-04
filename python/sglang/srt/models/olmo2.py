@@ -101,6 +101,7 @@ class Olmo2Attention(nn.Module):
             self.hidden_size,
             self.head_dim,
             self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),

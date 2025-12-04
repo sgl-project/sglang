@@ -23,6 +23,7 @@ fn get_harmony_encoding() -> &'static HarmonyEncoding {
 pub struct HarmonyParserAdapter {
     parser: StreamableParser,
     prev_recipient: Option<String>,
+    reasoning_token_count: u32,
 }
 
 impl HarmonyParserAdapter {
@@ -35,6 +36,7 @@ impl HarmonyParserAdapter {
         Ok(Self {
             parser,
             prev_recipient: None,
+            reasoning_token_count: 0,
         })
     }
 
@@ -106,7 +108,7 @@ impl HarmonyParserAdapter {
     pub fn parse_messages(
         messages: &[openai_harmony::chat::Message],
     ) -> (Option<String>, Option<Vec<ToolCall>>, String) {
-        let mut analysis = None;
+        let mut analysis: Option<String> = None;
         let mut commentary: Option<Vec<ToolCall>> = None;
         let mut final_text = String::new();
 
@@ -119,6 +121,60 @@ impl HarmonyParserAdapter {
             let channel = msg.channel.as_deref().unwrap_or("");
             let recipient = msg.recipient.as_deref();
 
+            // IMPORTANT: Check recipient FIRST before channel
+            // The model sometimes generates tool calls with channel="analysis" + recipient="functions.*"
+            // instead of channel="commentary" + recipient="functions.*"
+            // We should trust the recipient field to determine if this is a tool call
+            if let Some(recipient_str) = recipient {
+                if recipient_str.starts_with("functions.") {
+                    // This is a tool call, regardless of channel
+                    let function_name = recipient_str.strip_prefix("functions.").unwrap();
+
+                    // Process each content item separately
+                    for content in &msg.content {
+                        if let openai_harmony::chat::Content::Text(tc) = content {
+                            let call_id = format!("call_{}", Uuid::new_v4());
+                            let tool_call = ToolCall {
+                                id: call_id,
+                                tool_type: "function".to_string(),
+                                function: FunctionCallResponse {
+                                    name: function_name.to_string(),
+                                    arguments: Some(tc.text.clone()),
+                                },
+                            };
+
+                            match commentary.as_mut() {
+                                Some(calls) => calls.push(tool_call),
+                                None => commentary = Some(vec![tool_call]),
+                            }
+                        }
+                    }
+                    // Skip further channel processing for this message
+                    continue;
+                } else if recipient_str.starts_with("python")
+                    || recipient_str.starts_with("browser")
+                    || recipient_str.starts_with("container")
+                {
+                    // Built-in tools → treat as reasoning
+                    // For Chat API, we add to analysis content
+                    let text = Self::extract_text_from_content(&msg.content);
+
+                    if !text.is_empty() {
+                        // Append to analysis (built-in tools are reasoning)
+                        match analysis.as_mut() {
+                            Some(existing) => {
+                                existing.push('\n');
+                                existing.push_str(&text);
+                            }
+                            None => analysis = Some(text),
+                        }
+                    }
+                    // Skip further channel processing
+                    continue;
+                }
+            }
+
+            // Now process by channel (only if not already handled by recipient)
             match channel {
                 "analysis" => {
                     // Process each content item
@@ -130,51 +186,25 @@ impl HarmonyParserAdapter {
                     }
                 }
                 "commentary" => {
-                    // Handle different recipient types
-                    if let Some(recipient_str) = recipient {
-                        if recipient_str.starts_with("functions.") {
-                            let function_name = recipient_str.strip_prefix("functions.").unwrap();
+                    // If we reach here, recipient was not "functions.*" or built-in tools
+                    // Commentary channel should always have a recipient
+                    // This is likely a model bug - log warning and treat as reasoning
+                    tracing::warn!(
+                        channel = "commentary",
+                        recipient = ?recipient,
+                        "Commentary message without valid recipient, treating as reasoning"
+                    );
 
-                            // Process each content item separately
-                            for content in &msg.content {
-                                if let openai_harmony::chat::Content::Text(tc) = content {
-                                    let call_id = format!("call_{}", Uuid::new_v4());
-                                    let tool_call = ToolCall {
-                                        id: call_id,
-                                        tool_type: "function".to_string(),
-                                        function: FunctionCallResponse {
-                                            name: function_name.to_string(),
-                                            arguments: Some(tc.text.clone()),
-                                        },
-                                    };
+                    let text = Self::extract_text_from_content(&msg.content);
 
-                                    match commentary.as_mut() {
-                                        Some(calls) => calls.push(tool_call),
-                                        None => commentary = Some(vec![tool_call]),
-                                    }
-                                }
+                    if !text.is_empty() {
+                        match analysis.as_mut() {
+                            Some(existing) => {
+                                existing.push('\n');
+                                existing.push_str(&text);
                             }
-                        } else if recipient_str.starts_with("python")
-                            || recipient_str.starts_with("browser")
-                            || recipient_str.starts_with("container")
-                        {
-                            // Built-in tools → treat as reasoning
-                            // For Chat API, we add to analysis content
-                            let text = Self::extract_text_from_content(&msg.content);
-
-                            if !text.is_empty() {
-                                // Append to analysis (built-in tools are reasoning)
-                                match analysis.as_mut() {
-                                    Some(existing) => {
-                                        existing.push('\n');
-                                        existing.push_str(&text);
-                                    }
-                                    None => analysis = Some(text),
-                                }
-                            }
+                            None => analysis = Some(text),
                         }
-                        // Unknown recipient would raise ValueError
-                        // For now, we silently ignore (can add logging later)
                     }
                 }
                 "final" => {
@@ -213,18 +243,20 @@ impl HarmonyParserAdapter {
         finish_reason: String,
         matched_stop: Option<serde_json::Value>,
     ) -> Result<HarmonyChannelOutput, String> {
+        let mut reasoning_token_count = 0u32;
+
         // Feed all tokens to the parser
         for &token_id in output_ids {
-            self.parser.process(token_id).map_err(|e| {
-                // Log the full output_ids context on error
-                tracing::error!(
-                    token_id = token_id,
-                    output_ids = ?output_ids,
-                    error = %e,
-                    "Harmony parser failed to process token"
-                );
-                format!("Failed to process token {}: {}", token_id, e)
-            })?;
+            self.parser
+                .process(token_id)
+                .map_err(|e| format!("Failed to process token {}: {}", token_id, e))?;
+
+            // Count reasoning tokens (analysis + commentary channels)
+            if let Some(channel) = self.parser.current_channel() {
+                if channel == "analysis" || channel == "commentary" {
+                    reasoning_token_count += 1;
+                }
+            }
         }
 
         // Extract all completed messages from the parser
@@ -240,7 +272,7 @@ impl HarmonyParserAdapter {
         let final_finish_reason = if commentary.is_some() {
             "tool_calls".to_string()
         } else {
-            finish_reason
+            finish_reason.clone()
         };
 
         Ok(HarmonyChannelOutput {
@@ -249,6 +281,7 @@ impl HarmonyParserAdapter {
             final_text,
             finish_reason: final_finish_reason,
             matched_stop,
+            reasoning_token_count,
         })
     }
 
@@ -337,6 +370,13 @@ impl HarmonyParserAdapter {
             self.parser
                 .process(token_id)
                 .map_err(|e| format!("Failed to process token {}: {}", token_id, e))?;
+
+            // Count reasoning tokens (analysis + commentary channels)
+            if let Some(channel) = self.parser.current_channel() {
+                if channel == "analysis" || channel == "commentary" {
+                    self.reasoning_token_count += 1;
+                }
+            }
 
             // Check for content delta
             if let Ok(Some(delta_text)) = self.parser.last_content_delta() {
@@ -470,6 +510,7 @@ impl HarmonyParserAdapter {
             final_text,
             finish_reason: final_finish_reason,
             matched_stop,
+            reasoning_token_count: self.reasoning_token_count,
         })
     }
 
@@ -482,6 +523,7 @@ impl HarmonyParserAdapter {
         self.parser = StreamableParser::new(encoding.clone(), Some(Role::Assistant))
             .map_err(|e| format!("Failed to reset parser: {}", e))?;
         self.prev_recipient = None;
+        self.reasoning_token_count = 0;
         Ok(())
     }
 }

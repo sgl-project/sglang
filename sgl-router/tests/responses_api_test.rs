@@ -1,7 +1,7 @@
 // Integration test for Responses API
 
 use axum::http::StatusCode;
-use sglang_router_rs::protocols::{
+use sgl_model_gateway::protocols::{
     common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
     responses::{
         ReasoningEffort, ResponseInput, ResponseReasoningParam, ResponseTool, ResponseToolType,
@@ -14,7 +14,7 @@ use common::{
     mock_mcp_server::MockMCPServer,
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sglang_router_rs::{config::RouterConfig, routers::RouterFactory};
+use sgl_model_gateway::{config::RouterConfig, routers::RouterFactory};
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -91,6 +91,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         top_logprobs: Some(0),
         top_p: None,
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_test_mcp_e2e".to_string()),
         priority: 0,
@@ -312,6 +313,7 @@ fn test_responses_request_creation() {
         top_logprobs: Some(5),
         top_p: Some(0.9),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: Some("test-user".to_string()),
         request_id: Some("resp_test123".to_string()),
         priority: 0,
@@ -354,6 +356,7 @@ fn test_responses_request_sglang_extensions() {
         top_logprobs: Some(0),
         top_p: Some(0.95),
         truncation: Some(Truncation::Auto),
+        text: None,
         user: None,
         request_id: Some("resp_test456".to_string()),
         priority: 0,
@@ -390,7 +393,7 @@ fn test_usage_conversion() {
         completion_tokens: 25,
         total_tokens: 40,
         reasoning_tokens: Some(8),
-        prompt_tokens_details: Some(sglang_router_rs::protocols::common::PromptTokenUsageInfo {
+        prompt_tokens_details: Some(sgl_model_gateway::protocols::common::PromptTokenUsageInfo {
             cached_tokens: 3,
         }),
     };
@@ -469,6 +472,7 @@ fn test_json_serialization() {
         top_logprobs: Some(10),
         top_p: Some(0.8),
         truncation: Some(Truncation::Auto),
+        text: None,
         user: Some("test_user".to_string()),
         request_id: Some("resp_comprehensive_test".to_string()),
         priority: 1,
@@ -574,6 +578,7 @@ async fn test_multi_turn_loop_with_mcp() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_multi_turn_test".to_string()),
         priority: 0,
@@ -722,6 +727,7 @@ async fn test_max_tool_calls_limit() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_max_calls_test".to_string()),
         priority: 0,
@@ -775,7 +781,7 @@ async fn test_max_tool_calls_limit() {
 async fn setup_streaming_mcp_test() -> (
     MockMCPServer,
     MockWorker,
-    Box<dyn sglang_router_rs::routers::RouterTrait>,
+    Box<dyn sgl_model_gateway::routers::RouterTrait>,
     tempfile::TempDir,
 ) {
     let mcp = MockMCPServer::start().await.expect("start mcp");
@@ -893,6 +899,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_streaming_mcp_test".to_string()),
         priority: 0,
@@ -1172,6 +1179,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         top_logprobs: Some(0),
         top_p: Some(1.0),
         truncation: Some(Truncation::Disabled),
+        text: None,
         user: None,
         request_id: Some("resp_streaming_multiturn_test".to_string()),
         priority: 0,

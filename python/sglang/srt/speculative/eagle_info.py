@@ -38,9 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
-
-_is_npu = is_npu()
+from sglang.srt.utils import is_cuda, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -77,22 +75,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
-        if not _is_npu:
-            device = "cuda"
-        else:
-            device = "npu"
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device=device),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
-            positions=torch.empty((0,), dtype=torch.int64, device=device),
+            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
+            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
             retrive_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_cum_len=None,
             topk=topk,
@@ -116,6 +110,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 len(batch.input_ids),
             )
             end_offset = batch.seq_lens + self.draft_token_num
+            for req in batch.reqs:
+                req.kv_allocated_len += 1
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
@@ -280,7 +276,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(
@@ -415,6 +411,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if page_size == 1:
             # TODO: boolean array index leads to a device sync. Remove it.
             token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            for i, req in enumerate(batch.reqs):
+                req.kv_committed_len += accept_length_list[i] + 1
+                req.kv_allocated_len = req.kv_committed_len
         else:
             if self.topk == 1:
                 # Only evict full empty page. Do not evict partial empty page
@@ -426,6 +425,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     next_power_of_2(self.draft_token_num),
                 )
                 token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                for i, req in enumerate(batch.reqs):
+                    req.kv_committed_len += accept_length_list[i] + 1
+                    req.kv_allocated_len = req.kv_committed_len
             else:
                 # Shift the accepted tokens to the beginning.
                 # Only evict the last part
@@ -616,7 +618,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
-    allocate_lens: Optional[torch.Tensor] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
 
@@ -657,6 +658,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
+            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length=torch.empty((0,), device=device, dtype=torch.int32),
             accept_length_cpu=[],
         )
@@ -728,7 +730,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
-            self.allocate_lens = self.allocate_lens[new_indices]
             return
 
         if has_been_filtered:
@@ -756,9 +757,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 indices=torch.cat(
                     [self.future_indices.indices, spec_info.future_indices.indices]
                 )
-            )
-            self.allocate_lens = torch.cat(
-                [self.allocate_lens, spec_info.allocate_lens]
             )
             return
 

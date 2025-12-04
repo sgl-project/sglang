@@ -1,0 +1,68 @@
+name: Bot Bump Kernel Version to SGLang
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump-kernel-version-to-sglang:
+    runs-on: ubuntu-latest
+    outputs:
+      branch_name: ${{ steps.set_output.outputs.branch_name }}
+      needs_sync: ${{ steps.check_sync.outputs.needs_sync }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          pip install tomli
+
+      - name: Check if sync is needed
+        id: check_sync
+        run: |
+          python scripts/release/check_kernel_version_to_sglang.py
+
+      - name: Configure Git and branch
+        if: steps.check_sync.outputs.needs_sync == 'true'
+        id: set_output
+        run: |
+          git config user.name "sglang-bot"
+          git config user.email "sglang-bot@users.noreply.github.com"
+          RANDOM_SUFFIX=$(echo $RANDOM | md5sum | head -c 4)
+          KERNEL_VERSION="${{ steps.check_sync.outputs.kernel_version }}"
+          BRANCH_NAME="bot/bump-kernel-version-to-sglang-${KERNEL_VERSION}-${RANDOM_SUFFIX}"
+          git checkout -b "$BRANCH_NAME"
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> $GITHUB_ENV
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: Run kernel version bump script
+        if: steps.check_sync.outputs.needs_sync == 'true'
+        run: |
+          python scripts/release/bump_kernel_version_to_sglang.py
+
+      - name: Commit and create PR
+        if: steps.check_sync.outputs.needs_sync == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+        run: |
+          bash scripts/release/commit_and_pr_kernel_to_sglang.sh "$KERNEL_VERSION" "$BRANCH_NAME"
+
+  run-nightly-tests:
+    needs: bump-kernel-version-to-sglang
+    if: needs.bump-kernel-version-to-sglang.outputs.needs_sync == 'true'
+    uses: ./.github/workflows/nightly-test-nvidia.yml
+    with:
+      ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
+    secrets: inherit

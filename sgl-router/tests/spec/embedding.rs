@@ -1,5 +1,5 @@
 use serde_json::{from_str, json, to_string};
-use sglang_router_rs::protocols::{common::GenerationRequest, embedding::EmbeddingRequest};
+use sgl_model_gateway::protocols::{common::GenerationRequest, embedding::EmbeddingRequest};
 
 #[test]
 fn test_embedding_request_serialization_string_input() {

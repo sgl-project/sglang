@@ -23,6 +23,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
+    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
 )
@@ -225,7 +226,10 @@ class BaseMultimodalProcessor(ABC):
         ]
 
         if SGL_USE_CUDA_IPC:
-            self.cudaipc_mmfeature_pool = MmItemMemoryPool(MM_FEATURE_CACHE_SIZE)
+            self.cudaipc_mmfeature_pool = MmItemMemoryPool(
+                MM_FEATURE_CACHE_SIZE,
+                MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+            )
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -245,6 +249,8 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
+                kwargs["audio_kwargs"] = {}
+                kwargs["audio_kwargs"].setdefault("truncation", False)
             else:
                 kwargs["audios"] = audios
 
