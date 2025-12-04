@@ -10,7 +10,7 @@ sglang serve \
 
 # Serve VL
 CUDA_VISIBLE_DEVICES=1 \
-python3 -m sglang.launch_server \
+sglang serve \
     --model-path /home/t4/models/lvm-data/Qwen2.5-VL-7B-Instruct \
     --tensor-parallel-size 1 \
     --port 30000
