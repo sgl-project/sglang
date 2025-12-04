@@ -42,6 +42,29 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _update_reasoning_tokens_for_req(
+        self: Scheduler, req: Req, token_id: int
+    ) -> None:
+        if self.server_args.reasoning_parser is None:
+            return
+        tokenizer = req.tokenizer
+        think_start_id = tokenizer.think_start_id
+        think_end_id = tokenizer.think_end_id
+
+        if token_id == think_start_id:
+            req.in_reasoning_phase = True
+            return
+
+        if token_id == think_end_id:
+            req.in_reasoning_phase = False
+            return
+
+        if think_start_id is None and not req.in_reasoning_phase:
+            req.in_reasoning_phase = True
+
+        if req.in_reasoning_phase:
+            req.num_reasoning_tokens += 1
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -109,6 +132,7 @@ class SchedulerOutputProcessorMixin:
                 if req.is_chunked <= 0:
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
+                    self._update_reasoning_tokens_for_req(req, next_token_id)
                     req.check_finished()
 
                     if req.finished():
@@ -299,6 +323,7 @@ class SchedulerOutputProcessorMixin:
 
         for next_token_id in next_token_ids:
             req.output_ids.append(next_token_id)
+            self._update_reasoning_tokens_for_req(req, next_token_id)
             req.check_finished()
 
             if req.finished():
@@ -354,9 +379,12 @@ class SchedulerOutputProcessorMixin:
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
+                self._update_reasoning_tokens_for_req(req, next_token_id)
             elif batch.is_v2_eagle:
                 # Only v2 eagle's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
+                for token_id in next_token_id:
+                    self._update_reasoning_tokens_for_req(req, token_id)
                 new_accepted_len = len(next_token_id)
 
             req.check_finished(new_accepted_len)
