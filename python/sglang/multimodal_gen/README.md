@@ -28,7 +28,7 @@ For more installation methods (e.g. pypi, uv, docker), check [install.md](https:
 Here's a minimal example to generate a video using the default settings:
 
 ```python
-from sglang.multimodal_gen import DiffGenerator, SamplingParams
+from sglang.multimodal_gen import DiffGenerator
 
 def main():
     # Create a diff generator from a pre-trained model
