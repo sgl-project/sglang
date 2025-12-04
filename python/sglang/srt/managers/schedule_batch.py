@@ -1456,6 +1456,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids = torch.tensor(
                 extend_input_logprob_token_ids
             )
+            # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
+            # so they stay within the vocab boundary before being sent to GPU.
+            extend_input_logprob_token_ids.clamp_(
+                0, self.model_config.vocab_size - 1
+            )
         else:
             extend_input_logprob_token_ids = None
 
