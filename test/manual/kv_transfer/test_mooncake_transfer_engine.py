@@ -65,8 +65,10 @@ def main():
     args = parser.parse_args()
 
     print("Running Mooncake transfer engine benchmark...")
-    if not check_args(args):
-        return
+    if not args.initiator and not args.target:
+        parser.error("Please specify --initiator or --target")
+    if args.initiator and args.mc_segment_id is None:
+        parser.error("Please specify --mc-segment-id for initiator")
 
     run_cmd(args)
 
