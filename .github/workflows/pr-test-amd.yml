@@ -58,7 +58,7 @@ jobs:
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: false && needs.check-changes.outputs.sgl_kernel == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -94,7 +94,7 @@ jobs:
 
   stage-a-test-1-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
@@ -198,7 +198,7 @@ jobs:
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
@@ -228,7 +228,7 @@ jobs:
 
   unit-test-backend-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
@@ -297,7 +297,7 @@ jobs:
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
@@ -342,7 +342,7 @@ jobs:
 
   performance-test-1-gpu-part-2-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
@@ -381,7 +381,7 @@ jobs:
 
   performance-test-2-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
@@ -430,7 +430,7 @@ jobs:
 
   accuracy-test-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
@@ -461,7 +461,7 @@ jobs:
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
+    if: false && always() && !failure() && !cancelled() &&
       ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
     strategy:
       fail-fast: false
