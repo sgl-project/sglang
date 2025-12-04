@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
-from python.sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -29,7 +28,6 @@ if TYPE_CHECKING:
 @dataclass
 class MarlinRunnerInput(RunnerInput):
     """Input bundle passed to the Marlin runner core."""
-
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -56,12 +54,22 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w2_qweight: torch.Tensor
     w13_scales: torch.Tensor
     w2_scales: torch.Tensor
-    w13_g_idx: torch.Tensor
-    w2_g_idx: torch.Tensor
-    w13_g_idx_sort_indices: torch.Tensor
-    w2_g_idx_sort_indices: torch.Tensor
+    w13_g_idx_sort_indices: Optional[torch.Tensor]
+    w2_g_idx_sort_indices: Optional[torch.Tensor]
     weight_bits: int
-    is_k_full: bool
+    
+    # GPTQ specific (Optional)
+    w13_g_idx: Optional[torch.Tensor] = None
+    w2_g_idx: Optional[torch.Tensor] = None
+    is_k_full: bool = True
+    
+    # AWQ specific (Optional)
+    w13_qzeros: Optional[torch.Tensor] = None
+    w2_qzeros: Optional[torch.Tensor] = None
+    
+    # Optional
+    workspace: Optional[torch.Tensor] = None
+    expert_map: Optional[torch.Tensor] = None
 
 class MarlinRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
@@ -76,12 +84,11 @@ class MarlinRunnerCore(MoeRunnerCore):
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             fused_marlin_moe,
         )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = runner_input.hidden_states
         
         assert (
-            self.moe_runner_config.activation == "silu"
+            self.config.activation == "silu"
         ), "Only SiLU activation is supported."
         
         # The input must currently be float16
@@ -89,20 +96,26 @@ class MarlinRunnerCore(MoeRunnerCore):
         x = x.half()
 
         output = fused_marlin_moe(
-            x,
-            quant_info.w13_qweight,
-            quant_info.w2_qweight,
-            quant_info.w13_scales,
-            quant_info.w2_scales,
-            runner_input.router_logits,
-            runner_input.topk_weights,
-            runner_input.topk_ids,
+            hidden_states=x,
+            w1=quant_info.w13_qweight,
+            w2=quant_info.w2_qweight,
+            w1_scale=quant_info.w13_scales,
+            w2_scale=quant_info.w2_scales,
+            gating_output=runner_input.router_logits,
+            topk_weights=runner_input.topk_weights,
+            topk_ids=runner_input.topk_ids,
+            expert_map=quant_info.expert_map,
             g_idx1=quant_info.w13_g_idx,
             g_idx2=quant_info.w2_g_idx,
             sort_indices1=quant_info.w13_g_idx_sort_indices,
             sort_indices2=quant_info.w2_g_idx_sort_indices,
+            w1_zeros=quant_info.w13_qzeros,
+            w2_zeros=quant_info.w2_qzeros,
+            workspace=quant_info.workspace,
             num_bits=quant_info.weight_bits,
             is_k_full=quant_info.is_k_full,
+            inplace=self.config.inplace,
+            routed_scaling_factor=self.config.routed_scaling_factor,
         ).to(orig_dtype)
 
         return MarlinRunnerOutput(
@@ -116,7 +129,7 @@ class MarlinRunnerCore(MoeRunnerCore):
 @register_pre_permute("standard", "marlin")
 def pre_permute_standard_to_marlin(
     dispatch_output: StandardDispatchOutput,
-    quant_info: TritonMoeQuantInfo,
+    quant_info: MarlinMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> MarlinRunnerInput:
@@ -136,7 +149,7 @@ def pre_permute_standard_to_marlin(
         router_logits=topk_output.router_logits,
     )
 
-@register_post_permute("triton_kernel", "standard")
+@register_post_permute("marlin", "standard")
 def post_permute_marlin_to_standard(
     runner_output: MarlinRunnerOutput,
     quant_info: MarlinMoeQuantInfo,

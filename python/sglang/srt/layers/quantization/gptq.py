@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 import torch
 
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 
 from sglang.srt.layers.parameter import (
@@ -49,7 +49,7 @@ from sglang.srt.utils import is_cuda
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    # from sglang.srt.layers.moe.moe_runner import (MoeRunnerConfig)
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -1063,13 +1063,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        # from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-        #     fused_marlin_moe,
-        # )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.moe_runner.marlin import (
-            MarlinMoeQuantInfo
-        )
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_qweight,
             w2_qweight=layer.w2_qweight,
@@ -1079,11 +1072,49 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             w2_g_idx=layer.w2_g_idx,
             w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
             w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
-            weight_bits=self.quant_config.weight_bits,
+            num_bits=self.quant_config.weight_bits,
             is_k_full=self.is_k_full,
+            workspace=layer.workspace,
         )
 
         return self.runner.run(dispatch_output, quant_info)
+
+        # from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        #     fused_marlin_moe,
+        # )
+        # from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        # x = dispatch_output.hidden_states
+        # topk_output = dispatch_output.topk_output
+
+        # assert (
+        #     self.moe_runner_config.activation == "silu"
+        # ), "Only SiLU activation is supported."
+
+        # # The input must currently be float16
+        # orig_dtype = x.dtype
+        # x = x.half()
+
+        # topk_weights, topk_ids, router_logits = topk_output
+
+        # output = fused_marlin_moe(
+        #     x,
+        #     layer.w13_qweight,
+        #     layer.w2_qweight,
+        #     layer.w13_scales,
+        #     layer.w2_scales,
+        #     router_logits,
+        #     topk_weights,
+        #     topk_ids,
+        #     g_idx1=layer.w13_g_idx,
+        #     g_idx2=layer.w2_g_idx,
+        #     sort_indices1=layer.w13_g_idx_sort_indices,
+        #     sort_indices2=layer.w2_g_idx_sort_indices,
+        #     num_bits=self.quant_config.weight_bits,
+        #     is_k_full=self.is_k_full,
+        # ).to(orig_dtype)
+        # return StandardCombineInput(hidden_states=output)
+
 
 # Register fake implementations for torch.compile support
 if _is_cuda:

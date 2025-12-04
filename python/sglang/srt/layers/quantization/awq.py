@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
+from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -35,7 +38,7 @@ from sglang.srt.layers.quantization.w8a8_int8 import npu_fused_experts
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    # from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardDispatchOutput,
         CombineInput,
@@ -824,43 +827,59 @@ class AWQMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
     def apply(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
+
+        quant_info = MarlinMoeQuantInfo(
+            w13_qweight=layer.w13_qweight,
+            w2_qweight=layer.w2_qweight,
+            w13_scales=layer.w13_scales,
+            w2_scales=layer.w2_scales,
+            w13_g_idx_sort_indices=layer.w13_g_idx_sort_indices,
+            w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
+            w13_qzeros=layer.w13_qzeros,
+            w2_qzeros=layer.w2_qzeros,
+            weight_bits=self.quant_config.weight_bits,
+            workspace=layer.workspace,
         )
-        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        return self.moe_runner.run(dispatch_output, quant_info)
+        # from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        #     fused_marlin_moe,
+        # )
+        # from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        orig_dtype = x.dtype
+        # assert (
+        #     self.moe_runner_config.activation == "silu"
+        # ), "Only SiLU activation is supported."
 
-        topk_weights, topk_ids, router_logits = topk_output
+        # x = dispatch_output.hidden_states
+        # topk_output = dispatch_output.topk_output
+        # orig_dtype = x.dtype
 
-        output = fused_marlin_moe(
-            x,
-            layer.w13_qweight,
-            layer.w2_qweight,
-            layer.w13_scales,
-            layer.w2_scales,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            sort_indices1=layer.w13_g_idx_sort_indices,
-            sort_indices2=layer.w2_g_idx_sort_indices,
-            w1_zeros=layer.w13_qzeros,
-            w2_zeros=layer.w2_qzeros,
-            num_bits=self.quant_config.weight_bits,
-        ).to(orig_dtype)
-        return StandardCombineInput(hidden_states=output)
+        # topk_weights, topk_ids, router_logits = topk_output
+
+        # output = fused_marlin_moe(
+        #     x,
+        #     layer.w13_qweight,
+        #     layer.w2_qweight,
+        #     layer.w13_scales,
+        #     layer.w2_scales,
+        #     router_logits,
+        #     topk_weights,
+        #     topk_ids,
+        #     sort_indices1=layer.w13_g_idx_sort_indices,
+        #     sort_indices2=layer.w2_g_idx_sort_indices,
+        #     w1_zeros=layer.w13_qzeros,
+        #     w2_zeros=layer.w2_qzeros,
+        #     num_bits=self.quant_config.weight_bits,
+        # ).to(orig_dtype)
+        # return StandardCombineInput(hidden_states=output)
 
 
 class AWQMoEAscendMethod(AWQMoEMethod):
