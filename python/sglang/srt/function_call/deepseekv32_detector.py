@@ -118,8 +118,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
         Parse parameters from either XML-like format or JSON format to dict.
 
         Supports two formats:
-        1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
-           or simplified: <parameter name="..." string="...">value</parameter>
+        1. XML parameter tags: Supports mixed DSML tags:
+           - <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter> (both DSML)
+           - <parameter name="..." string="...">value</parameter> (both simple)
+           - <｜DSML｜parameter name="..." string="...">value</parameter> (start DSML, end simple)
+           - <parameter name="..." string="...">value</｜DSML｜parameter> (start simple, end DSML)
         2. Direct JSON: { "key": "value" }
         """
         # First, try to parse as direct JSON (new format)
@@ -137,13 +140,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 pass
 
         # Fall back to XML parameter tag parsing (original format)
-        parameters = {}
-        # Choose the appropriate regex based on format
-        param_regex = (
-            self.parameter_regex_simple if use_simple_format else self.parameter_regex
-        )
+        # Use flexible regex that supports mixed DSML tags
+        # Matches: <(｜DSML｜)?parameter ...>(.*?)</(｜DSML｜)?parameter>
+        param_regex = r'<(｜DSML｜)?parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</(｜DSML｜)?parameter>'
         param_matches = re.findall(param_regex, invoke_content, re.DOTALL)
-        for param_name, param_type, param_value in param_matches:
+        parameters = {}
+        for start_dsml, param_name, param_type, param_value, end_dsml in param_matches:
             # Convert value based on type
             if param_type == "true":  # string type
                 parameters[param_name] = param_value.strip()
@@ -179,17 +181,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         calls = []
         try:
-            # Choose patterns based on format
-            if use_simple_format:
-                function_calls_pattern = r"<function_calls>(.*?)</function_calls>"
-                invoke_pattern = r'<invoke\s+name="([^"]+)"\s*>(.*?)</invoke>'
-            else:
-                function_calls_pattern = (
-                    r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>"
-                )
-                invoke_pattern = (
-                    r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)</｜DSML｜invoke>'
-                )
+            # Use flexible patterns that support mixed DSML tags
+            # Match function_calls with optional DSML: <(｜DSML｜)?function_calls>(.*?)</(｜DSML｜)?function_calls>
+            function_calls_pattern = (
+                r"<(｜DSML｜)?function_calls>(.*?)</(｜DSML｜)?function_calls>"
+            )
+            # Match invoke with optional DSML: <(｜DSML｜)?invoke name="...">(.*?)</(｜DSML｜)?invoke>
+            invoke_pattern = (
+                r'<(｜DSML｜)?invoke\s+name="([^"]+)"\s*>(.*?)</(｜DSML｜)?invoke>'
+            )
 
             # Extract content between function_calls tags
             function_calls_match = re.search(
@@ -200,18 +200,18 @@ class DeepSeekV32Detector(BaseFormatDetector):
             if not function_calls_match:
                 return StreamingParseResult(normal_text=normal_text, calls=[])
 
-            function_calls_content = function_calls_match.group(1)
+            function_calls_content = function_calls_match.group(
+                2
+            )  # Content is in group 2
 
             # Find all invoke blocks
             invoke_matches = re.findall(
                 invoke_pattern, function_calls_content, re.DOTALL
             )
 
-            for func_name, invoke_content in invoke_matches:
-                # Parse parameters from XML format
-                func_args = self._parse_parameters_from_xml(
-                    invoke_content, use_simple_format
-                )
+            for start_dsml, func_name, invoke_content, end_dsml in invoke_matches:
+                # Parse parameters from XML format (no longer need use_simple_format)
+                func_args = self._parse_parameters_from_xml(invoke_content)
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": func_args}
                 calls.extend(self.parse_base_json(match_result, tools))
@@ -311,11 +311,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
             # Loop to handle multiple consecutive invoke blocks
             while True:
-                # Choose pattern based on format
-                if use_simple_format:
-                    invoke_pattern = r'<invoke\s+name="([^"]+)"\s*>(.*?)(</invoke>|$)'
-                else:
-                    invoke_pattern = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)'
+                # Use flexible pattern that supports mixed DSML tags
+                # Match: <(｜DSML｜)?invoke name="...">(.*?)(</(｜DSML｜)?invoke>|$)
+                invoke_pattern = r'<(｜DSML｜)?invoke\s+name="([^"]+)"\s*>(.*?)(</(｜DSML｜)?invoke>|$)'
 
                 # Try to match an invoke block (may be partial)
                 invoke_match = re.search(
@@ -327,10 +325,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if not invoke_match:
                     break
 
-                func_name = invoke_match.group(1).strip()
-                invoke_content = invoke_match.group(2)
-                # group(3) is either closing tag (complete) or "" (incomplete, matched with $)
-                is_tool_end = bool(invoke_match.group(3))
+                start_dsml = invoke_match.group(1)
+                func_name = invoke_match.group(2).strip()
+                invoke_content = invoke_match.group(3)
+                # group(4) is either closing tag (complete) or "" (incomplete, matched with $)
+                # group(5) is DSML in end tag (if present)
+                is_tool_end = bool(invoke_match.group(4))
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -338,10 +338,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
 
-                # Parse current parameters from XML/JSON
-                current_params = self._parse_parameters_from_xml(
-                    invoke_content, use_simple_format
-                )
+                # Parse current parameters from XML/JSON (no longer need use_simple_format)
+                current_params = self._parse_parameters_from_xml(invoke_content)
                 current_args_json = json.dumps(current_params, ensure_ascii=False)
 
                 # Check if tool call is complete (has closing tag)

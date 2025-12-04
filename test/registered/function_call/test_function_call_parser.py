@@ -1122,6 +1122,28 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                     },
                 ),
             ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather information for a location.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {
+                                "type": "string",
+                                "description": "Location to get weather for",
+                            },
+                            "unit": {
+                                "type": "string",
+                                "description": "Temperature unit",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
         ]
         self.detector = DeepSeekV32Detector()
 
@@ -1424,6 +1446,170 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params_str = tool_calls_by_index[0]["parameters"].strip()
         params = json.loads(params_str)
         self.assertEqual(params["city"], "San Francisco")
+
+    def test_streaming_xml_format_multiple_parameters_bug(self):
+        """Test streaming parsing of XML format with multiple parameters to catch the bug where
+        XML tags are incorrectly included in parameter values during streaming.
+
+        This test reproduces the issue where arguments contained:
+        {"location": "Boston, MA</parameter>\\n<｜DSML｜parameter name=\\\"unit\\\" string=\\\"true\\\">fahrenheit"}
+        """
+        text = """<｜DSML｜function_calls>
+            <｜DSML｜invoke name="get_weather">
+                <｜DSML｜parameter name="location" string="true">Boston, MA</｜DSML｜parameter>
+                <｜DSML｜parameter name="unit" string="true">fahrenheit</｜DSML｜parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜function_calls>"""
+
+        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
+
+        # Parse parameters and verify they are clean (no XML tags in values)
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+
+        # Verify location is clean (should not contain XML tags)
+        self.assertEqual(params["location"], "Boston, MA")
+        self.assertNotIn("</parameter>", params["location"])
+        self.assertNotIn("<｜DSML｜parameter", params["location"])
+
+        # Verify unit is clean
+        self.assertEqual(params["unit"], "fahrenheit")
+        self.assertNotIn("</parameter>", params["unit"])
+        self.assertNotIn("<｜DSML｜parameter", params["unit"])
+
+    def test_mixed_dsml_tags_parameter_start_dsml_end_simple(self):
+        """Test parsing parameter with DSML start tag and simple end tag"""
+        text = """<｜DSML｜function_calls>
+            <｜DSML｜invoke name="get_weather">
+                <｜DSML｜parameter name="location" string="true">Boston, MA</parameter>
+                <｜DSML｜parameter name="unit" string="true">fahrenheit</parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜function_calls>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+        params = json.loads(call.parameters)
+        self.assertEqual(params["location"], "Boston, MA")
+        self.assertEqual(params["unit"], "fahrenheit")
+
+    def test_mixed_dsml_tags_parameter_start_simple_end_dsml(self):
+        """Test parsing parameter with simple start tag and DSML end tag"""
+        text = """<｜DSML｜function_calls>
+            <｜DSML｜invoke name="get_weather">
+                <parameter name="location" string="true">Boston, MA</｜DSML｜parameter>
+                <parameter name="unit" string="true">fahrenheit</｜DSML｜parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜function_calls>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+        params = json.loads(call.parameters)
+        self.assertEqual(params["location"], "Boston, MA")
+        self.assertEqual(params["unit"], "fahrenheit")
+
+    def test_mixed_dsml_tags_invoke_start_dsml_end_simple(self):
+        """Test parsing invoke with DSML start tag and simple end tag"""
+        text = """<｜DSML｜function_calls>
+            <｜DSML｜invoke name="get_weather">
+                <parameter name="location" string="true">Boston, MA</parameter>
+                <parameter name="unit" string="true">fahrenheit</parameter>
+            </invoke>
+        </｜DSML｜function_calls>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+        params = json.loads(call.parameters)
+        self.assertEqual(params["location"], "Boston, MA")
+        self.assertEqual(params["unit"], "fahrenheit")
+
+    def test_mixed_dsml_tags_invoke_start_simple_end_dsml(self):
+        """Test parsing invoke with simple start tag and DSML end tag"""
+        text = """<｜DSML｜function_calls>
+            <invoke name="get_weather">
+                <parameter name="location" string="true">Boston, MA</parameter>
+                <parameter name="unit" string="true">fahrenheit</parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜function_calls>"""
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_weather")
+        params = json.loads(call.parameters)
+        self.assertEqual(params["location"], "Boston, MA")
+        self.assertEqual(params["unit"], "fahrenheit")
+
+    def test_streaming_mixed_dsml_tags_parameter(self):
+        """Test streaming parsing with mixed DSML tags in parameters"""
+        text = """<｜DSML｜function_calls>
+            <｜DSML｜invoke name="get_weather">
+                <｜DSML｜parameter name="location" string="true">Boston, MA</parameter>
+                <parameter name="unit" string="true">fahrenheit</｜DSML｜parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜function_calls>"""
+
+        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_weather")
+
+        # Parse parameters and verify they are clean
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+        self.assertEqual(params["location"], "Boston, MA")
+        self.assertEqual(params["unit"], "fahrenheit")
+        # Verify no XML tags in parameter values
+        self.assertNotIn("</parameter>", params["location"])
+        self.assertNotIn("<｜DSML｜parameter", params["location"])
+        self.assertNotIn("</parameter>", params["unit"])
+        self.assertNotIn("<｜DSML｜parameter", params["unit"])
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
