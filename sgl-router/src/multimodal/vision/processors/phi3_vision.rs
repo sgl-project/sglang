@@ -106,7 +106,7 @@ impl Phi3VisionProcessor {
     /// HD transform: resize and pad image to multiples of 336.
     ///
     /// Algorithm:
-    /// 1. If width < height, transpose (rotate 90°)
+    /// 1. If width < height, transpose (flip over main diagonal)
     /// 2. Calculate scale: while scale * ceil(scale/ratio) <= hd_num: scale++
     /// 3. Resize to new_w = scale * 336, new_h = new_w / ratio
     /// 4. Pad height to multiple of 336 (centered, white padding)
@@ -115,8 +115,9 @@ impl Phi3VisionProcessor {
         let (width, height) = image.dimensions();
 
         let (img, transposed) = if width < height {
-            // Transpose: rotate 90° clockwise
-            (image.rotate90(), true)
+            // Transpose (PIL's Image.TRANSPOSE): equivalent to fliph + rotate270 (ccw 90°)
+            // This swaps x and y coordinates: pixel at (x, y) goes to (y, x)
+            (image.fliph().rotate270(), true)
         } else {
             (image.clone(), false)
         };
@@ -134,15 +135,15 @@ impl Phi3VisionProcessor {
         let new_w = (scale * TILE_SIZE as f64) as u32;
         let new_h = (new_w as f64 / ratio) as u32;
 
-        // Resize using nearest neighbor (matching mistral.rs / HuggingFace)
+        // Resize using bilinear filter (matching HuggingFace's default)
         let resized = img.resize_exact(new_w, new_h, FilterType::Triangle);
 
         // Pad height to multiple of 336
         let padded = self.padding_336(&resized);
 
-        // Transpose back if needed
+        // Transpose back if needed (transpose is self-inverse)
         if transposed {
-            padded.rotate270()
+            padded.fliph().rotate270()
         } else {
             padded
         }
@@ -169,7 +170,10 @@ impl Phi3VisionProcessor {
         new_image
     }
 
-    /// Create global image by bicubic interpolation to 336x336.
+    /// Create global image by bilinear interpolation to 336x336.
+    ///
+    /// Uses PyTorch-compatible coordinate mapping with align_corners=False:
+    /// `src = (dst + 0.5) * (src_size / dst_size) - 0.5`
     fn create_global_image(&self, tensor: &Array3<f32>) -> Array3<f32> {
         // tensor is [C, H, W], we need to resize to [C, 336, 336]
         let (_c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
@@ -178,18 +182,18 @@ impl Phi3VisionProcessor {
             return tensor.clone();
         }
 
-        // Use simple bilinear interpolation for the global image
-        // Note: HuggingFace uses bicubic, but bilinear is close enough
         let mut result = Array3::<f32>::zeros((3, TILE_SIZE as usize, TILE_SIZE as usize));
 
+        // PyTorch align_corners=False coordinate mapping
         let scale_h = h as f32 / TILE_SIZE as f32;
         let scale_w = w as f32 / TILE_SIZE as f32;
 
         for c in 0..3 {
             for y in 0..TILE_SIZE as usize {
                 for x in 0..TILE_SIZE as usize {
-                    let src_y = y as f32 * scale_h;
-                    let src_x = x as f32 * scale_w;
+                    // PyTorch align_corners=False: src = (dst + 0.5) * scale - 0.5
+                    let src_y = ((y as f32 + 0.5) * scale_h - 0.5).max(0.0);
+                    let src_x = ((x as f32 + 0.5) * scale_w - 0.5).max(0.0);
 
                     // Bilinear interpolation
                     let y0 = src_y.floor() as usize;
@@ -562,5 +566,27 @@ mod tests {
 
         let processor = Phi3VisionProcessor::from_preprocessor_config(&config);
         assert_eq!(processor.num_crops(), 8);
+    }
+
+    #[test]
+    fn test_transpose_equivalence() {
+        // Test that fliph().rotate270() correctly implements PIL's Image.TRANSPOSE
+        // TRANSPOSE swaps x and y coordinates: pixel at (x, y) goes to (y, x)
+        use image::{GenericImageView, Rgb, RgbImage};
+
+        let mut img = RgbImage::new(100, 200);
+        img.put_pixel(0, 0, Rgb([255, 0, 0])); // Top-left = red
+        img.put_pixel(99, 0, Rgb([0, 255, 0])); // Top-right = green
+        img.put_pixel(0, 199, Rgb([0, 0, 255])); // Bottom-left = blue
+        img.put_pixel(99, 199, Rgb([255, 255, 0])); // Bottom-right = yellow
+
+        let img = DynamicImage::ImageRgb8(img);
+        let transposed = img.fliph().rotate270();
+
+        // After TRANSPOSE: (x, y) -> (y, x)
+        assert_eq!(transposed.get_pixel(0, 0).0[0..3], [255, 0, 0]); // (0,0) -> (0,0)
+        assert_eq!(transposed.get_pixel(0, 99).0[0..3], [0, 255, 0]); // (99,0) -> (0,99)
+        assert_eq!(transposed.get_pixel(199, 0).0[0..3], [0, 0, 255]); // (0,199) -> (199,0)
+        assert_eq!(transposed.get_pixel(199, 99).0[0..3], [255, 255, 0]); // (99,199) -> (199,99)
     }
 }
