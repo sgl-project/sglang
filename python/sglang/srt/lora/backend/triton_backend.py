@@ -10,6 +10,7 @@ from sglang.srt.lora.triton_ops import (
     #########cuda lora###########
     #############################
     embedding_lora_a_fwd,
+    embedding_extra_tokens_fwd,
     #############################
     #############################
     #############################
@@ -48,6 +49,24 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info=self.batch_info,
             vocab_size=vocab_size,
             extra_embeddings=extra_embeddings,
+        )
+    
+    def run_extra_token_embedding(
+        self,
+        input_ids: torch.Tensor,
+        output: torch.Tensor,
+        extra_embeddings: torch.Tensor,
+        vocab_size: int,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run extra token embedding lookup using Triton kernel."""
+        return embedding_extra_tokens_fwd(
+            input_ids=input_ids,
+            output=output,
+            extra_embeddings=extra_embeddings,
+            batch_info=self.batch_info,
+            vocab_size=self.vocab_size,
         )
     #############################
     #############################
@@ -138,20 +157,14 @@ class TritonLoRABackend(BaseLoRABackend):
                 seg_lens=torch.full(
                     (max_bs_in_cuda_graph,), num_tokens_per_bs, dtype=torch.int32
                 ),
-                seg_indptr=torch.empty(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
                 max_len=num_tokens_per_bs,
                 weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
                 lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 permutation=None,
             )
-            ##############################
-            ##########cuda lora###########
-            ##############################
-            self.cuda_graph_batch_info.seg_indptr[0] = 0
-            ##############################
-            ##############################
-            ##############################
+            # self.cuda_graph_batch_info.seg_indptr[0] = 0
 
             # Initialize seg_indptr for CUDA graph as they remain constant
             # across batches.
@@ -199,14 +212,7 @@ class TritonLoRABackend(BaseLoRABackend):
             seg_lens = (
                 forward_batch.extend_seq_lens
                 if forward_batch.forward_mode.is_extend()
-                ##############################
-                ##########cuda lora###########
-                ##############################
-                # else torch.ones(bs, device=self.device)
                 else torch.ones(bs, dtype=torch.int32, device=self.device)
-                ##############################
-                ##############################
-                ##############################
             )
             seg_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
             seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
@@ -222,14 +228,7 @@ class TritonLoRABackend(BaseLoRABackend):
                     (bs,), dtype=torch.int32, device=self.device
                 ),
                 lora_ranks=torch.empty(
-                    ##############################
-                    ##########cuda lora###########
-                    ##############################
-                    # (self.max_loras_per_batch,), dtype=torch.int64, device=self.device
                     (self.max_loras_per_batch,), dtype=torch.int32, device=self.device
-                    ##############################
-                    ##############################
-                    ##############################
                 ),
                 scalings=torch.empty(
                     (self.max_loras_per_batch,), dtype=torch.float, device=self.device
