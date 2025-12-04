@@ -85,8 +85,8 @@ class MultiModalStaticCache(MultimodalCache):
     def get(
         self, mm_hashes: List[int], combined_hash: Optional[int] = None
     ) -> Optional[torch.Tensor]:
-        combined_hash = self.combine_hashes(mm_hashes)
-        # MultiModalStaticCache does not fallback to individual item lookup
+        if not combined_hash:
+            combined_hash = self.combine_hashes(mm_hashes)
 
         embedding = self.mm_cache.get(combined_hash)
         if embedding is not None:
