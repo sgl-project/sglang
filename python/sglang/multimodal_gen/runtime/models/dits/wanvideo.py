@@ -473,8 +473,8 @@ class WanTransformerBlock_VSA(nn.Module):
             dim,
             norm_type="layer",
             eps=eps,
-            elementwise_affine=False,
-            bias=False,
+            elementwise_affine=True,
+            bias=True,
             dtype=torch.float32,
         )
 
