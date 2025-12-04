@@ -467,7 +467,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # Python runtime
     software-properties-common \
     && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends \
+    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     python3.12-full \
     python3.12-dev \
     wget \
@@ -508,6 +508,9 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     # Build tools needed for FlashInfer JIT compilation
     ninja-build \
     g++ \
+    # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
+    libnccl2 \
+    libnccl-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
