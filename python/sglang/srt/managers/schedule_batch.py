@@ -555,17 +555,6 @@ class MultimodalInputs:
 
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
-
-        ## TODO: in fact, image is loaded into gpu, but feature is in cpu now. We need fix it.
-        device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-
-        for item in ret.mm_items:
-            if item.feature is not None:
-                if isinstance(item.feature, np.ndarray):
-                    item.feature = torch.from_numpy(item.feature)
-                if isinstance(item.feature, torch.Tensor):
-                    item.feature = item.feature.to(device, non_blocking=True)
-
         for item in ret.mm_items:
             item.set_pad_value()
 
