@@ -53,6 +53,8 @@ struct ServerInfo {
     max_prefill_tokens: Option<usize>,
     max_running_requests: Option<usize>,
     max_num_reqs: Option<usize>,
+    model_type: Option<String>,
+    architectures: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +332,18 @@ impl StepExecutor for DiscoverMetadataStep {
                         {
                             labels.insert("served_model_name".to_string(), served_model_name);
                         }
+                        // Extract model_type if present
+                        if let Some(model_type) = server_info.model_type.filter(|s| !s.is_empty()) {
+                            labels.insert("model_type".to_string(), model_type);
+                        }
+                        // Extract architectures if present (serialize to JSON)
+                        if let Some(architectures) =
+                            server_info.architectures.filter(|a| !a.is_empty())
+                        {
+                            if let Ok(json_str) = serde_json::to_string(&architectures) {
+                                labels.insert("architectures".to_string(), json_str);
+                            }
+                        }
                         Ok((labels, None))
                     }
                     Err(e) => Err(e),
@@ -480,6 +494,16 @@ impl StepExecutor for CreateWorkerStep {
             }
             if let Some(ref chat_template) = config.chat_template {
                 card = card.with_chat_template(chat_template.clone());
+            }
+            // Set HuggingFace model type from discovered labels
+            if let Some(model_type_str) = final_labels.get("model_type") {
+                card = card.with_hf_model_type(model_type_str.clone());
+            }
+            // Set architectures from discovered labels (JSON array string)
+            if let Some(architectures_json) = final_labels.get("architectures") {
+                if let Ok(architectures) = serde_json::from_str::<Vec<String>>(architectures_json) {
+                    card = card.with_architectures(architectures);
+                }
             }
             card
         };

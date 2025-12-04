@@ -545,6 +545,15 @@ async def server_info():
         await _global_state.tokenizer_manager.get_internal_state()
     )
 
+    # Extract model info from tokenizer_manager's model_config
+    model_config = getattr(_global_state.tokenizer_manager, "model_config", None)
+    model_info = {}
+    if model_config is not None:
+        model_info = {
+            "model_type": getattr(model_config.hf_config, "model_type", None),
+            "architectures": getattr(model_config.hf_config, "architectures", None),
+        }
+
     # This field is not serializable.
     if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
         del _global_state.tokenizer_manager.server_args.model_config
@@ -552,6 +561,7 @@ async def server_info():
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
+        **model_info,
         "internal_states": internal_states,
         "version": __version__,
     }
