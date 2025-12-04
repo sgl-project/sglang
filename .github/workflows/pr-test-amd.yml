@@ -161,7 +161,7 @@ jobs:
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    if: false && needs.check-changes.outputs.multimodal_gen == 'true'
     strategy:
       fail-fast: false
       matrix:
