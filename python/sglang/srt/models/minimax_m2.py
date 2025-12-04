@@ -19,6 +19,8 @@ import logging
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -70,10 +72,8 @@ from sglang.srt.utils import (
     make_layers,
 )
 
-import triton
-import triton.language as tl
-
 logger = logging.getLogger(__name__)
+
 
 @triton.autotune(
     configs=[
@@ -211,13 +211,7 @@ def rms_apply_serial(
     tp_world: int = 1,
     eps: float = 1e-5,
 ) -> torch.Tensor:
-    assert (
-        x1.is_cuda
-        and x2.is_cuda
-        and w1.is_cuda
-        and w2.is_cuda
-        and sum_sq.is_cuda
-    )
+    assert x1.is_cuda and x2.is_cuda and w1.is_cuda and w2.is_cuda and sum_sq.is_cuda
     B, D1 = x1.shape
     B2, D2 = x2.shape
     assert B == B2
@@ -251,7 +245,6 @@ def rms_apply_serial(
         BLOCK_SIZE2,
     )
     return out1, out2
-
 
 
 class MiniMaxM2RMSNormTP(nn.Module):
@@ -317,7 +310,15 @@ class MiniMaxM2RMSNormTP(nn.Module):
         if q_norm.tp_world > 1:
             sum_sq = tensor_model_parallel_all_reduce(sum_sq)
 
-        q, k = rms_apply_serial(q, k, q_norm.weight, k_norm.weight, sum_sq, q_norm.tp_world, q_norm.variance_epsilon)
+        q, k = rms_apply_serial(
+            q,
+            k,
+            q_norm.weight,
+            k_norm.weight,
+            sum_sq,
+            q_norm.tp_world,
+            q_norm.variance_epsilon,
+        )
 
         return q, k
 
