@@ -46,14 +46,6 @@ class BaseLayerWithLoRA(nn.Module):
         pass
 
 
-
-#############################
-#########emb lora############
-#############################
-
-######org
-######
-######
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """
     Vocab parallel embedding layer with LoRA support (simplified for TP=1, no extra tokens).
@@ -74,25 +66,13 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
     def set_lora_info(
         self,
-        ##############################
-        ##########emb lora############
-        ##############################
         new_embeddings_buffer: Optional[torch.Tensor],  # For extra tokens 
-        ##############################
-        ##############################
-        ##############################
         embedding_A_buffer: torch.Tensor,
         embedding_B_buffer: torch.Tensor,
     ):
         """Set LoRA buffers for embedding layer."""
         self.set_lora = True
-        ##############################
-        ##########emb lora############
-        ##############################
         self.new_embeddings_buffer = new_embeddings_buffer
-        ##############################
-        ##############################
-        ##############################
         self.embedding_A_buffer = embedding_A_buffer  # (num_loras, rank, vocab_size)
         self.embedding_B_buffer = embedding_B_buffer  # (num_loras, embed_dim, rank)
 
@@ -106,26 +86,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         # Efficient embedding lookup for LoRA A (cannot call run_lora_a_sgemm since needing index lookup)
         lora_a_output = self.run_lora_a_embedding(input_, batch_info)
-        print("=====")
-        lora_a_output_noncuda = self.run_lora_a_embedding_no_cuda(input_, batch_info)
-
-        # 比較兩個輸出
-        print("🔍 Comparing CUDA vs Non-CUDA LoRA A outputs:")
-        print(f"  Shape - CUDA: {lora_a_output.shape}, Non-CUDA: {lora_a_output_noncuda.shape}")
-        print(f"  Device - CUDA: {lora_a_output.device}, Non-CUDA: {lora_a_output_noncuda.device}")
-        print(f"  Dtype - CUDA: {lora_a_output.dtype}, Non-CUDA: {lora_a_output_noncuda.dtype}")
-
-        # 計算差異
-        abs_diff = torch.abs(lora_a_output - lora_a_output_noncuda)
-        rel_diff = abs_diff / (torch.abs(lora_a_output) + 1e-8)
-
-        print(f"\n📊 Difference Statistics:")
-        print(f"  Max absolute difference: {abs_diff.max().item():.6e}")
-        print(f"  Mean absolute difference: {abs_diff.mean().item():.6e}")
-        print(f"  Max relative difference: {rel_diff.max().item():.6e}")
-        print(f"  Mean relative difference: {rel_diff.mean().item():.6e}")
-        
-        print("=====")
         
         # Apply LoRA B weights using backend
         lora_output = self.lora_backend.run_lora_b_sgemm(
@@ -136,29 +96,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         return lora_output
 
 
-    def run_lora_a_embedding_no_cuda(
-        self, input_: torch.Tensor, batch_info: LoRABatchInfo
-    ) -> torch.Tensor:
-        # non-cuda
-        """
-        Apply LoRA A weights using efficient embedding lookup.
-        Maps tokens to their corresponding LoRA adapters internally.
-        """
-        token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-        lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
-
-        return lora_a_output 
-
-
     def run_lora_a_embedding(
         self, input_: torch.Tensor, batch_info: LoRABatchInfo
     ) -> torch.Tensor:
-        #############################
-        #########cuda lora###########
-        #############################
-        # batch_info = self.lora_backend.batch_info
-        # if batch_info.use_cuda_graph:
-        # cuda
         """
         Apply LoRA A weights using efficient embedding lookup with CUDA graph support.
         Maps tokens to their corresponding LoRA adapters internally.
@@ -171,85 +111,33 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             extra_embeddings=self.new_embeddings_buffer if hasattr(self, 'new_embeddings_buffer') and self.new_embeddings_buffer is not None else None,
         )
 
-        # else:
-        #     # non-cuda
-        #     """
-        #     Apply LoRA A weights using efficient embedding lookup.
-        #     Maps tokens to their corresponding LoRA adapters internally.
-        #     """
-        #     token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-        #     lora_a_output = self._run_lora_a_embedding(input_, token_weight_indices)
-        #############################
-        #############################
-        #############################
-
         return lora_a_output 
-        
-    def _get_token_weight_indices(
-        self, input_: torch.Tensor, batch_info: LoRABatchInfo
-    ) -> torch.Tensor:
-        # (Step1) Get token-to-lora mapping
-        token_weight_indices = torch.zeros(
-            input_.shape[0], dtype=torch.int32, device=input_.device
-        )
-        
-        current_pos = 0
-        for i in range(batch_info.bs):
-            seg_len = batch_info.seg_lens[i]
-            weight_idx = batch_info.weight_indices[i]
-            token_weight_indices[current_pos : current_pos+seg_len] = weight_idx
-            current_pos += seg_len
-        
-        return token_weight_indices
-    
-    def _run_lora_a_embedding(
-        self, input_: torch.Tensor, token_weight_indices: torch.Tensor
-    ) -> torch.Tensor:
-        # (Step2) Apply embedding lookup for each LoRA adapter
-        lora_a_output = torch.zeros(
-            (input_.shape[0], self.embedding_A_buffer.shape[1]),
-            dtype=self.embedding_A_buffer.dtype,
-            device=input_.device,
-        )
-        
-        unique_weight_indices = torch.unique(token_weight_indices)
-        
-        for idx in unique_weight_indices:
-            token_mask = token_weight_indices == idx
-            lora_a_weights = self.embedding_A_buffer[idx]  # (rank, vocab_size)
-            lora_a_output[token_mask] = F.embedding(
-                input_[token_mask], lora_a_weights.t()
-            )
 
-        return lora_a_output
+    
+    def extra_token_embedding(self, input_: torch.Tensor, base_output: torch.Tensor) -> torch.Tensor:
+        """
+        Process extra tokens (tokens >= vocab_size) by looking up their embeddings
+        from the new_embeddings_buffer and replacing them in base_output.
+        
+        Args:
+            input_: (s,) token IDs
+            base_output: (s, embed_dim) base embedding output to be modified in-place
+            
+        Returns:
+            base_output: (s, embed_dim) modified output with extra token embeddings
+        """
+        
+        output_base_output = self.lora_backend.run_extra_token_embedding(
+            input_ids=input_,
+            output=base_output,
+            extra_embeddings=self.new_embeddings_buffer,
+            vocab_size=self.vocab_size,
+        )
+
+        return output_base_output 
+    
 
     def forward(self, input_: torch.Tensor):
-        ##############################
-        ##########emb lora############
-        ##############################
-        # # Get base embedding output ( do not consider extra tokens)
-        # base_output = self.base_layer.forward(input_)
-        
-        # # Apply LoRA if configured
-        # if self.set_lora:
-        #     batch_info = self.lora_backend.batch_info
-        #     output = self.apply_lora(base_output, input_, batch_info)
-        # else:
-        #     output = base_output
-        
-        # return output
-
-        ###############
-        ############### consider both non-extra and extra tokens
-        ###############
-
-        ##############################
-        ##########cuda lora###########
-        ##############################
-        
-        # batch_info = self.lora_backend.batch_info
-
-        # if batch_info.use_cuda_graph:
         """
         Forward pass with LoRA support and CUDA graph compatibility.
         
@@ -264,17 +152,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         added_tokens_mask = input_ > self.vocab_size - 1
         base_output = self.base_layer.forward(input_.masked_fill(added_tokens_mask, 0))
 
-        # is there's extra tokens
-        if added_tokens_mask.any():
-            base_output = self.extra_token_embedding(
-                input_, added_tokens_mask, batch_info, base_output.clone() 
-            )    
+        # Extra tokens - It will replace extra token embedding with self.new_embeddings_buffer's emb (Default is 0)  
+        base_output = self.extra_token_embedding(input_, base_output)
 
-            # base_output_noncuda = self._extra_token_embedding_no_cuda(
-            #     input_, added_tokens_mask, batch_info, base_output.clone() 
-            # )   
-
-        
         # Apply LoRA if configured
         if self.set_lora:
             # The backend's run_lora_a_embedding now handles both regular
@@ -285,78 +165,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         return output
 
-    def extra_token_embedding(
-        self,
-        input_: torch.Tensor,
-        added_tokens_mask: torch.Tensor,
-        batch_info: LoRABatchInfo,
-        base_output: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Apply extra token embeddings using efficient Triton kernel.
-        This method is CUDA graph compatible.
-        """
-        # Use backend's efficient kernel (CUDA graph compatible)
-        base_output = self.lora_backend.run_extra_token_embedding(
-            input_ids=input_,
-            output=base_output,
-            extra_embeddings=self.new_embeddings_buffer,
-            vocab_size=self.vocab_size,
-        )
-        return base_output
-    
-
-    def _extra_token_embedding_no_cuda(
-        self,
-        input_: torch.Tensor,
-        added_tokens_mask: torch.Tensor,
-        batch_info: LoRABatchInfo,
-        base_output: torch.Tensor,
-    ) -> torch.Tensor:
-        token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-        added_weight_indices = token_weight_indices[added_tokens_mask]
-        unique_added_weight_indices = torch.unique(added_weight_indices)
-
-        for idx in unique_added_weight_indices:
-            lora_mask = added_weight_indices == idx
-            added_token_positions = torch.where(added_tokens_mask)[0][lora_mask]
-            x = input_[added_token_positions] - self.vocab_size
-            new_embeddings = F.embedding(x, self.new_embeddings_buffer[idx])
-            base_output[added_token_positions] = new_embeddings
-
-        return base_output
-        ##############################
-        ##############################
-        ##############################
-        # else: 
-        #     batch_info = self.lora_backend.batch_info
-        #     # Handle added tokens (tokens beyond base vocabulary)
-        #     added_tokens_mask = input_ > self.vocab_size - 1
-        #     base_output = self.base_layer.forward(input_.masked_fill(added_tokens_mask, 0))
-
-        #     # Process extra tokens if they exist
-        #     if added_tokens_mask.any():
-        #         token_weight_indices = self._get_token_weight_indices(input_, batch_info)
-        #         added_weight_indices = token_weight_indices[added_tokens_mask]
-        #         unique_added_weight_indices = torch.unique(added_weight_indices)
-
-        #         for idx in unique_added_weight_indices:
-        #             lora_mask = added_weight_indices == idx
-        #             added_token_positions = torch.where(added_tokens_mask)[0][lora_mask]
-        #             x = input_[added_token_positions] - self.vocab_size
-        #             new_embeddings = F.embedding(x, self.new_embeddings_buffer[idx])
-        #             base_output[added_token_positions] = new_embeddings
-
-        #     # Apply LoRA if set
-        #     if self.set_lora:
-        #         output = self.apply_lora(base_output, input_, batch_info)
-        #     else:
-        #         output = base_output
-
-        # return output
-        ##############################
-        ##############################
-        ##############################
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
@@ -422,11 +230,6 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             weights=self.lm_head_B_buffer,
             base_output=base_output,
         )
-
-        # lora_output = self.run_lora_b_scatter(
-        #     lora_a_output=lora_a_output,
-        #     base_output=base_output,
-        # )
         
         return lora_output
 
@@ -453,11 +256,6 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         # For TP=1, no slicing needed
         # For TP>1, would slice along vocab dimension, eed to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
         return B
-
-#############################
-#############################
-#############################
-
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
@@ -737,49 +535,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
         return B
 
-##############################
-##########emb lora############
-##############################
-# def get_lora_layer(
-#     layer: nn.Module, lora_backend: BaseLoRABackend
-# ) -> BaseLayerWithLoRA:
-#     supported_layer_types = {
-#         # the order matters
-#         VocabParallelEmbedding: VocabParallelEmbeddingWithLoRA,
-#         QKVParallelLinear: QKVParallelLinearWithLoRA,
-#         MergedColumnParallelLinear: MergedColumnParallelLinearWithLoRA,
-#         ColumnParallelLinear: ColumnParallelLinearWithLoRA,
-#         RowParallelLinear: RowParallelLinearWithLoRA,
-#     }
-#     for src_layer_type, lora_layer_type in supported_layer_types.items():
-#         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
-#             ret = lora_layer_type(layer, lora_backend)
-#             return ret
-#     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
-
-
-
-# def get_lora_layer(
-#     layer: nn.Module, lora_backend: BaseLoRABackend, lora_extra_vocab_size: int = 0
-# ) -> BaseLayerWithLoRA:
-    
-#     supported_layer_types = {
-#         # the order matters - check ParallelLMHead before VocabParallelEmbedding
-#         # since ParallelLMHead is a subclass of VocabParallelEmbedding
-#         ParallelLMHead: lambda l, b: ParallelLMHeadWithLoRA(l, b, lora_extra_vocab_size),
-#         VocabParallelEmbedding: lambda l, b: VocabParallelEmbeddingWithLoRA(l, b, lora_extra_vocab_size),
-#         QKVParallelLinear: lambda l, b: QKVParallelLinearWithLoRA(l, b),
-#         MergedColumnParallelLinear: lambda l, b: MergedColumnParallelLinearWithLoRA(l, b),
-#         ColumnParallelLinear: lambda l, b: ColumnParallelLinearWithLoRA(l, b),
-#         RowParallelLinear: lambda l, b: RowParallelLinearWithLoRA(l, b),
-#     }
-#     for src_layer_type, lora_layer_factory in supported_layer_types.items():
-#         if isinstance(layer, src_layer_type):
-#             ret = lora_layer_factory(layer, lora_backend)
-#             return ret
-#     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
-
-
 
 def get_lora_layer(
     layer: nn.Module, lora_backend: BaseLoRABackend
@@ -798,6 +553,3 @@ def get_lora_layer(
             ret = lora_layer_type(layer, lora_backend)
             return ret
     raise Exception(f"No corresponding LoRA layer supported for {type(layer)}.")
-##############################
-##############################
-##############################

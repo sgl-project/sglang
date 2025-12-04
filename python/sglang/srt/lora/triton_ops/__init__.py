@@ -8,7 +8,7 @@ from .sgemm_lora_b import sgemm_lora_b_fwd
 #########cuda lora###########
 #############################
 from .embedding_lora_a import embedding_lora_a_fwd
-from .embedding_extra_tokens import embedding_extra_tokens_fwd
+from .embedding_extra_tokens import embedding_extra_tokens_modified
 #############################
 #############################
 #############################
@@ -24,7 +24,7 @@ __all__ = [
     #########cuda lora###########
     ############################# 
     "embedding_lora_a_fwd",
-    "embedding_extra_tokens_fwd",
+    "embedding_extra_tokens_modified",
     #############################
     #############################
     #############################

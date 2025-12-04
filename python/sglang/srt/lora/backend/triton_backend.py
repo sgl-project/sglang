@@ -10,7 +10,7 @@ from sglang.srt.lora.triton_ops import (
     #########cuda lora###########
     #############################
     embedding_lora_a_fwd,
-    embedding_extra_tokens_fwd,
+    embedding_extra_tokens_modified,
     #############################
     #############################
     #############################
@@ -61,12 +61,12 @@ class TritonLoRABackend(BaseLoRABackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run extra token embedding lookup using Triton kernel."""
-        return embedding_extra_tokens_fwd(
+        return embedding_extra_tokens_modified(
             input_ids=input_ids,
             output=output,
             extra_embeddings=extra_embeddings,
             batch_info=self.batch_info,
-            vocab_size=self.vocab_size,
+            vocab_size=vocab_size,
         )
     #############################
     #############################

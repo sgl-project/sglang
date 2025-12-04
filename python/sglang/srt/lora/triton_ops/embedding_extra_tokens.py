@@ -84,7 +84,7 @@ def _embedding_extra_tokens_kernel(
         tl.store(output_ptr, emb_values, mask=embed_mask)
 
 
-def embedding_extra_tokens_fwd(
+def embedding_extra_tokens_modified(
     input_ids: torch.Tensor,
     output: torch.Tensor,  # Will be modified in-place
     extra_embeddings: torch.Tensor,

@@ -8,7 +8,7 @@ from sglang.srt.lora.triton_ops import (
     #########cuda lora###########
     #############################
     embedding_lora_a_fwd,
-    embedding_extra_tokens_fwd,
+    embedding_extra_tokens_modified,
     #############################
     #############################
     #############################
@@ -81,7 +81,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         For chunked backend, we use the same triton kernel as triton backend
         since embedding lookup doesn't benefit from chunking.
         """
-        return embedding_extra_tokens_fwd(
+        return embedding_extra_tokens_modified(
             input_ids=input_ids,
             output=output,
             extra_embeddings=extra_embeddings,

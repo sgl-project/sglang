@@ -812,26 +812,11 @@ class LogitsProcessor(nn.Module):
             )
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
-        ##############################
-        ##########emb lora############
-        ##############################
+
         if hasattr(lm_head, 'set_lora') and hasattr(lm_head, 'apply_lora'):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)
-            # logits = torch.matmul(
-            #         hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
-            #     )
-            # print("====")
-            # print(self.use_fp32_lm_head)
-            # print("====")
-            # exit()
-
-    
-        # if hasattr(lm_head, "weight"):
         elif hasattr(lm_head, "weight"):
-        ##############################
-        ##############################
-        ##############################
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T

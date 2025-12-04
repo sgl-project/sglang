@@ -78,28 +78,14 @@ def get_hidden_dim(
             return config.hidden_size, config.intermediate_size * 2
         elif module_name == "down_proj":
             return config.intermediate_size, config.hidden_size
-
-        ##############################
-        ##########emb lora############
-        ############################## 
-        #Handle embed_tokens
-        # elif "embed_tokens" in module_name:
-        # elif "embed_tokens" in module_name:
         elif module_name == "embed_tokens":
             # For embedding: input is vocab_size (as embedding lookup), output is hidden_size
             # if contain extra tokens will be added; otherwise is 0.
             return config.vocab_size + lora_added_vocab_size, config.hidden_size
-        
-        #Handle lm_head
-        # elif "lm_head" in module_name:
-        # elif "lm_head" in module_name:
         elif module_name == "lm_head":
             # For lm_head: input is hidden_size, output is vocab_size
             # if contain extra tokens will be added; otherwise is 0.
             return config.hidden_size, config.vocab_size + lora_added_vocab_size
-        ##############################
-        ##############################
-        ############################## 
         else:
             raise NotImplementedError()
 
@@ -117,18 +103,12 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
-        ##############################
-        ##########emb lora############
-        ############################## 
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
         "embeddings": "embed_tokens",
         "word_embeddings": "embed_tokens",
         "lm_head": "lm_head",
         "output": "lm_head",
-        ############################## 
-        ############################## 
-        ############################## 
     }
 
     result = set()
@@ -164,11 +144,5 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
         f"Cannot find target module name for {full_module_name} in {target_modules}"
     )
 
-##############################
-##########emb lora############
-##############################
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-##############################
-##############################
-##############################
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]

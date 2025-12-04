@@ -67,13 +67,6 @@ class LoRAManager:
         target_modules: Optional[Iterable[str]] = None,
         lora_paths: Optional[List[LoRARef]] = None,
         server_args: Optional[ServerArgs] = None,
-        ##############################
-        ##########emb lora############
-        ##############################
-        # lora_extra_vocab_size: int = 0,
-        ##############################
-        ##############################
-        ##############################
     ):
         self.base_model: torch.nn.Module = base_model
         self.base_hf_config: AutoConfig = base_hf_config
@@ -83,16 +76,7 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
-        ##############################
-        ##########emb lora############
-        ##############################
-        # self.lora_extra_vocab_size: int = lora_extra_vocab_size
-        # Will infer self.lora_extra_vocab_size in the later init_lora_shapes() if it find the value == None
-        # self.lora_added_vocab_size: Optional[int] = None 
         self.lora_added_tokens_size: Optional[int] = None 
-        ##############################
-        ##############################
-        ##############################
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -266,14 +250,8 @@ class LoRAManager:
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
             lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
-            ##############################
-            ##########emb lora############
-            ##############################
             lora_embed_tokens_module=self.embed_tokens_module, #merge into embedding or lora module
             lora_lm_head_module=self.lm_head_module, #merge into embedding or lora module
-            ##############################
-            ##############################
-            ##############################
         )
 
         # set up batch info shared by all lora modules
@@ -326,9 +304,6 @@ class LoRAManager:
                     ),
                 )
 
-        ##############################
-        ##########emb lora############
-        ##############################
         # Update embedding layer if present - gotta merge (refer to PR codebase)
         if self.embed_tokens_module is not None:
             self.embed_tokens_module.set_lora_info(
@@ -343,9 +318,6 @@ class LoRAManager:
                 self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_A),
                 self.memory_pool.get_embedding_tensor("lm_head", LoRAType.LORA_B),
             )
-        ##############################
-        ##############################
-        ##############################
 
     def init_state(
         self,
@@ -441,9 +413,6 @@ class LoRAManager:
                 default=0,
             )
         
-        #############################
-        #########emb lora############
-        #############################
         # Auto-infer self.lora_added_vocab_size from loaded LoRA configs
         # This happens automatically without requiring user input
         # if self.lora_added_vocab_size is None:
@@ -457,9 +426,6 @@ class LoRAManager:
                     f"self.lora_added_tokens_size={inferred_extra_vocab_size} from LoRA adapters."
                 )
             self.lora_added_tokens_size = inferred_extra_vocab_size
-        #############################
-        #############################
-        #############################
 
     def load_lora_weights(self, lora_ref: LoRARef):
         """
@@ -487,14 +453,7 @@ class LoRAManager:
             target_modules=self.target_modules,
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
-            ##############################
-            ##########emb lora############
-            ##############################
-            # lora_added_vocab_size=self.lora_added_vocab_size, # check whether read from the config
             lora_added_tokens_size = self.lora_added_tokens_size
-            ##############################
-            ##############################
-            ##############################
         )
 
     def set_lora_module(self, module_name, module):
@@ -508,15 +467,8 @@ class LoRAManager:
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
 
-        ##############################
-        ##########emb lora############
-        ############################## 
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
-        ############################## 
-        ############################## 
-        ############################## 
-        
 
         for module_name, module in self.base_model.named_modules():
             # TODO (lifuhuang): in the future, we should consider generalizing the
@@ -529,9 +481,6 @@ class LoRAManager:
             ) and not self.base_model.should_apply_lora(module_name):
                 continue
 
-            ##############################
-            ##########emb lora############
-            ############################## 
             # Handle embed_tokens
             if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
                 if isinstance(module, VocabParallelEmbedding) and not isinstance(module, BaseLayerWithLoRA):
@@ -545,9 +494,6 @@ class LoRAManager:
                     lora_module = self.set_lora_module(module_name, module)
                     self.lm_head_module = lora_module 
                     continue
-            ############################## 
-            ############################## 
-            ############################## 
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:

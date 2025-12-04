@@ -30,16 +30,10 @@ class LoRAConfig:
         self.r = self.hf_config["r"]
         self.lora_alpha = self.hf_config["lora_alpha"]
 
-        ##############################
-        ##########emb lora############
-        ##############################
         self.added_tokens_config = self.get_added_tokens_config()
         self.lora_added_tokens_size = (
             len(self.added_tokens_config) if self.added_tokens_config is not None else 0
         )
-        ##############################
-        ##############################
-        ##############################
 
     def get_lora_config(self, dummy=False):
         if dummy:
@@ -53,9 +47,6 @@ class LoRAConfig:
             with open(os.path.join(weights_dir, config_name), "r") as f:
                 return json.load(f)
 
-    ##############################
-    ##########emb lora############
-    ##############################
     def get_added_tokens_config(self):
         """Load added tokens from the LoRA adapter if the file exists."""
         # Determine the weights directory
@@ -81,6 +72,3 @@ class LoRAConfig:
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to parse added_tokens.json: {e}")
             return None
-    ##############################
-    ##############################
-    ##############################

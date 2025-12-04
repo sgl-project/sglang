@@ -418,24 +418,6 @@ class HFRunner:
             else:
                 input_ids = torch.tensor([p], device="cuda")
 
-            ##############################
-            ##########emb lora############
-            ##############################
-            # # (original)
-            # if lora_paths is not None and lora_paths[i] is not None:
-            #     from peft import PeftModel
-
-            #     model = PeftModel.from_pretrained(
-            #         base_model,
-            #         lora_paths[i],
-            #         torch_dtype=torch_dtype,
-            #         is_trainable=False,
-            #     )
-            # else:
-            #     model = base_model
-
-            # PR version
-            # current_tokenizer = tokenizer
             if lora_paths is not None and lora_paths[i] is not None:
                 from peft import PeftConfig, PeftModel
                 from sglang.srt.lora.lora_config import LoRAConfig
@@ -455,9 +437,6 @@ class HFRunner:
                 )
             else:
                 model = base_model
-            ##############################
-            ##############################
-            ##############################
             if patch_model_do_sample_false:
                 model.generation_config.do_sample = False
             outputs = model.generate(
