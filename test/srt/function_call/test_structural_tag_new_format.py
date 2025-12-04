@@ -1178,7 +1178,7 @@ class TestKimiK2Detector(StructuralTagFormatTestCase):
         self.assert_no_format_tag_key(tag)
 
 
-# Note: Glm4MoeDetector, PythonicDetector, Step3Detector, and MinimaxM2Detector
+# Note: Glm4MoeDetector, PythonicDetector, Step3Detector, MinimaxM2Detector, and DeepSeekV32Detector
 # return False for supports_structural_tag() and raise NotImplementedError
 # for build_structural_tag(), so they are not tested here.
 
