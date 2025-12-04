@@ -93,6 +93,11 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    get_global_experts_capturer,
+    set_global_experts_capturer,
+)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
@@ -511,6 +516,10 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
+
+        # Init routed experts capturer
+        self.init_routed_experts_capturer()
+
         if self.device == "cuda":
             self.init_cublas()
             self.init_attention_backend()
@@ -553,6 +562,31 @@ class ModelRunner:
 
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
+
+    def init_routed_experts_capturer(self):
+        # TODO: the redundant logic with TpModelWorker
+        max_running_requests = min(
+            (
+                self.max_total_num_tokens // 2
+                if self.server_args.max_running_requests is None
+                else self.server_args.max_running_requests
+                // (
+                    self.server_args.dp_size
+                    if self.server_args.enable_dp_attention
+                    else 1
+                )
+            ),
+            self.req_to_token_pool.size,
+        )
+        set_global_experts_capturer(
+            RoutedExpertsCapturer.create(
+                enable=get_global_server_args().enable_return_routed_experts,
+                model_config=self.model_config,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=max_running_requests,
+                device=self.device,
+            )
+        )
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -2640,9 +2674,12 @@ class ModelRunner:
     ) -> Tuple[Union[LogitsProcessorOutput, PPProxyTensors], bool]:
         self.forward_pass_id += 1
 
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id,
-            forward_batch,
+        with (
+            get_global_expert_distribution_recorder().with_forward_pass(
+                self.forward_pass_id,
+                forward_batch,
+            ),
+            get_global_experts_capturer().with_forward(forward_batch),
         ):
             output = self._forward_raw(
                 forward_batch,
@@ -2650,6 +2687,10 @@ class ModelRunner:
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
+            )
+            # Copy cached routing experts' buffers back to CPU cache
+            get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
+                forward_batch.out_cache_loc, forward_batch.out_cache_loc_cpu
             )
 
         if self.eplb_manager is not None:

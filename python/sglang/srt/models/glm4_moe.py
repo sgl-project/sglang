@@ -379,6 +379,17 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         self.gate = Glm4MoeGate(config=config, prefix=add_prefix("gate", prefix))
 
+        self.topk = TopK(
+            top_k=self.top_k,
+            layer_id=self.layer_id,
+            renormalize=config.norm_topk_prob,
+            use_grouped_topk=True,
+            num_expert_group=config.n_group,
+            topk_group=config.topk_group,
+            correction_bias=self.gate.e_score_correction_bias,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts + self.num_fused_shared_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
