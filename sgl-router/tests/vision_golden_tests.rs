@@ -16,10 +16,10 @@
 
 use std::{fs::File, io::Read, path::Path};
 
-use ndarray::Array4;
+use ndarray::{Array4, Array5};
 use sgl_model_gateway::multimodal::vision::{
-    image_processor::ModelSpecificValue, ImagePreProcessor, LlavaProcessor, PreProcessorConfig,
-    Qwen2VLProcessor, Qwen3VLProcessor,
+    image_processor::ModelSpecificValue, ImagePreProcessor, LlavaProcessor, Phi3VisionProcessor,
+    PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
 };
 
 /// Load a numpy .npz file and extract pixel_values
@@ -62,10 +62,17 @@ fn load_config(path: &Path) -> PreProcessorConfig {
     PreProcessorConfig::from_json(&contents).expect("Failed to parse config")
 }
 
-/// Compare two tensors and return max absolute difference
-fn max_diff(a: &Array4<f32>, b: &Array4<f32>) -> f32 {
+/// Compare two 4D tensors and return max absolute difference
+fn max_diff(a: &Array4<f32>, b: &ndarray::ArrayD<f32>) -> f32 {
     assert_eq!(a.shape(), b.shape(), "Shape mismatch");
-    (a - b).mapv(|v| v.abs()).fold(0.0f32, |acc, &v| acc.max(v))
+    // Convert ArrayD to Array4 for comparison
+    let b_4d = b
+        .clone()
+        .into_dimensionality::<ndarray::Ix4>()
+        .expect("Expected 4D tensor");
+    (a - &b_4d)
+        .mapv(|v| v.abs())
+        .fold(0.0f32, |acc, &v| acc.max(v))
 }
 
 /// Load image_grid_thw from npz file
@@ -319,7 +326,10 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
 
     // Get the tensor for the first image (batch index 0)
     let pixel_values = &result.pixel_values;
-    let tensor_3d = pixel_values.index_axis(ndarray::Axis(0), 0).to_owned();
+    let tensor_3d_dyn = pixel_values.index_axis(ndarray::Axis(0), 0).to_owned();
+    let tensor_3d = tensor_3d_dyn
+        .into_dimensionality::<ndarray::Ix3>()
+        .expect("Expected 3D tensor for Qwen2-VL");
 
     // Reshape to patches format
     let rust_patches = processor.reshape_to_patches(&tensor_3d, grid_t, grid_h, grid_w);
@@ -468,7 +478,10 @@ fn run_qwen3_vl_golden_test(image_name: &str) {
 
     // Get the tensor for the first image (batch index 0)
     let pixel_values = &result.pixel_values;
-    let tensor_3d = pixel_values.index_axis(ndarray::Axis(0), 0).to_owned();
+    let tensor_3d_dyn = pixel_values.index_axis(ndarray::Axis(0), 0).to_owned();
+    let tensor_3d = tensor_3d_dyn
+        .into_dimensionality::<ndarray::Ix3>()
+        .expect("Expected 3D tensor for Qwen3-VL");
 
     // Reshape to patches format
     let rust_patches = processor.reshape_to_patches(&tensor_3d, grid_t, grid_h, grid_w);
@@ -533,4 +546,201 @@ fn test_qwen3_vl_golden_wide() {
 #[test]
 fn test_qwen3_vl_golden_small() {
     run_qwen3_vl_golden_test("small");
+}
+
+// ============================================================================
+// Phi3-Vision tests
+// ============================================================================
+
+/// Load a 5D numpy .npz file for Phi3-Vision (batch, num_crops+1, C, H, W)
+fn load_golden_npz_5d(path: &Path) -> Array5<f32> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("pixel_values")
+        .expect("Failed to read npz")
+        .expect("No pixel_values");
+
+    let shape = reader.shape().to_vec();
+    assert_eq!(shape.len(), 5, "Expected 5D tensor [B, N, C, H, W]");
+
+    let data: Vec<f32> = reader.into_vec().expect("Failed to read array");
+
+    Array5::from_shape_vec(
+        (
+            shape[0] as usize,
+            shape[1] as usize,
+            shape[2] as usize,
+            shape[3] as usize,
+            shape[4] as usize,
+        ),
+        data,
+    )
+    .expect("Shape conversion failed")
+}
+
+/// Load image_sizes from Phi3-Vision npz file (2D tensor [batch, 2])
+fn load_phi3_image_sizes(path: &Path) -> Vec<(u32, u32)> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("image_sizes")
+        .expect("Failed to read npz")
+        .expect("No image_sizes");
+
+    let shape = reader.shape().to_vec();
+    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
+
+    // Reshape to pairs
+    let num_images = shape[0] as usize;
+    (0..num_images)
+        .map(|i| (data[i * 2] as u32, data[i * 2 + 1] as u32))
+        .collect()
+}
+
+/// Load num_img_tokens from Phi3-Vision npz file
+fn load_phi3_num_img_tokens(path: &Path) -> Vec<usize> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("num_img_tokens")
+        .expect("Failed to read npz")
+        .expect("No num_img_tokens");
+
+    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
+    data.into_iter().map(|v| v as usize).collect()
+}
+
+/// Compare two 5D tensors and return max absolute difference
+fn max_diff_5d(a: &Array5<f32>, b: &Array5<f32>) -> f32 {
+    assert_eq!(a.shape(), b.shape(), "Shape mismatch");
+    (a - b).mapv(|v| v.abs()).fold(0.0f32, |acc, &v| acc.max(v))
+}
+
+/// Run a Phi3-Vision golden test for a specific image.
+///
+/// This test validates:
+/// 1. Output shape is [1, num_crops+1, 3, 336, 336]
+/// 2. image_sizes matches HuggingFace output
+/// 3. num_img_tokens matches HuggingFace output
+/// 4. Pixel values match within tolerance
+fn run_phi3_vision_golden_test(image_name: &str) {
+    let golden_dir = Path::new("tests/fixtures/golden/phi3_vision");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{}.jpg", image_name));
+
+    if !golden_dir.exists() || !image_path.exists() {
+        eprintln!(
+            "Golden test fixtures for phi3_vision/{} not found, skipping test",
+            image_name
+        );
+        eprintln!("Run: python scripts/generate_vision_golden.py --model phi3_vision");
+        return;
+    }
+
+    let npz_path = golden_dir.join(format!("golden_{}.npz", image_name));
+    let config = load_config(&golden_dir.join("preprocessor_config.json"));
+
+    // Load golden values
+    let golden_pixels = load_golden_npz_5d(&npz_path);
+    let golden_image_sizes = load_phi3_image_sizes(&npz_path);
+    let golden_num_tokens = load_phi3_num_img_tokens(&npz_path);
+
+    // Process image with our Rust processor
+    let image = image::open(&image_path).expect("Failed to open image");
+    let processor = Phi3VisionProcessor::from_preprocessor_config(&config);
+    let result = processor
+        .preprocess(&[image], &config)
+        .expect("Processing failed");
+
+    // Check output shape
+    let rust_shape = result.pixel_values.shape();
+    let golden_shape = golden_pixels.shape();
+    println!(
+        "phi3_vision - {} image - Shape: golden={:?}, rust={:?}",
+        image_name, golden_shape, rust_shape
+    );
+    assert_eq!(
+        rust_shape, golden_shape,
+        "Shape mismatch for phi3_vision/{}",
+        image_name
+    );
+
+    // Check image_sizes
+    // Note: HuggingFace returns [h, w], we store as (w, h) but model_specific stores (h, w)
+    let rust_image_sizes: Vec<(u32, u32)> = match result.model_specific.get("image_sizes") {
+        Some(ModelSpecificValue::UintTensor { data, shape }) => {
+            let num_images = shape[0];
+            (0..num_images)
+                .map(|i| (data[i * 2] as u32, data[i * 2 + 1] as u32))
+                .collect()
+        }
+        _ => panic!("Expected image_sizes in model_specific"),
+    };
+
+    println!(
+        "phi3_vision - {} image - Image sizes (h, w): golden={:?}, rust={:?}",
+        image_name, golden_image_sizes, rust_image_sizes
+    );
+    assert_eq!(
+        golden_image_sizes, rust_image_sizes,
+        "image_sizes mismatch for {}",
+        image_name
+    );
+
+    // Check num_img_tokens
+    println!(
+        "phi3_vision - {} image - Num tokens: golden={:?}, rust={:?}",
+        image_name, golden_num_tokens, result.num_img_tokens
+    );
+    assert_eq!(
+        golden_num_tokens, result.num_img_tokens,
+        "num_img_tokens mismatch for {}",
+        image_name
+    );
+
+    // Compare pixel values
+    // Convert rust ArrayD to Array5 for comparison
+    let rust_pixels = result
+        .pixel_values
+        .clone()
+        .into_dimensionality::<ndarray::Ix5>()
+        .expect("Failed to convert to Ix5");
+
+    let pixel_diff = max_diff_5d(&golden_pixels, &rust_pixels);
+    println!(
+        "phi3_vision - {} image - Max pixel diff: {:.6}",
+        image_name, pixel_diff
+    );
+
+    // Allow tolerance for floating point and interpolation differences
+    // Phi3-Vision uses bicubic interpolation which can have slight differences
+    assert!(
+        pixel_diff < 0.1,
+        "Max pixel difference {} exceeds tolerance 0.1 for {}",
+        pixel_diff,
+        image_name
+    );
+}
+
+#[test]
+fn test_phi3_vision_golden_square() {
+    run_phi3_vision_golden_test("square");
+}
+
+#[test]
+fn test_phi3_vision_golden_tall() {
+    run_phi3_vision_golden_test("tall");
+}
+
+#[test]
+fn test_phi3_vision_golden_wide() {
+    run_phi3_vision_golden_test("wide");
+}
+
+#[test]
+fn test_phi3_vision_golden_small() {
+    run_phi3_vision_golden_test("small");
 }
