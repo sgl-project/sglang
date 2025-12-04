@@ -57,7 +57,7 @@ fn is_chat_template_file(filename: &str) -> bool {
 pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
     let model_id = model_id.as_ref();
     let token = env::var(HF_TOKEN_ENV_VAR).ok();
-    let api = ApiBuilder::new()
+    let api = ApiBuilder::from_env()
         .with_progress(true)
         .with_token(token)
         .build()?;
