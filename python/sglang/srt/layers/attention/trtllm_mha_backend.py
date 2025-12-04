@@ -569,13 +569,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
-            if not hasattr(self, "_fused_decode_path_logged"):
-                logger.debug(
-                    "Using fused FP8 KV cache write in forward_decode (layer_id=%s)",
-                    layer.layer_id,
-                )
-                self._fused_decode_path_logged = True
-
             self._fused_fp8_set_kv_buffer(
                 q=q,
                 k=k,
@@ -653,13 +646,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if use_fused_fp8_path:
             # Use fused FP8 quantization + KV cache write path
-            if not hasattr(self, "_fused_extend_path_logged"):
-                logger.debug(
-                    "Using fused FP8 KV cache write in forward_extend (layer_id=%s)",
-                    layer.layer_id,
-                )
-                self._fused_extend_path_logged = True
-
             self._fused_fp8_set_kv_buffer(
                 q=q,
                 k=k,
