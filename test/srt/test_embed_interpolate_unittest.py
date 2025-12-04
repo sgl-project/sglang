@@ -53,7 +53,7 @@ class TestEmbedInterpolate(unittest.TestCase):
         )
         set_global_server_args_for_scheduler(sarg)
         init_distributed_environment(
-            backend="nccl",
+            backend="gloo",
             world_size=1,
             rank=0,
             local_rank=0,
