@@ -363,13 +363,25 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        // TODO: Extract model from request and route to appropriate router
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Model info endpoint not yet implemented in RouterManager",
-        )
-            .into_response()
+    async fn get_model_info(&self, req: Request<Body>) -> Response {
+        // Route to default router or first available router
+        let router_id = {
+            let default_router = self.default_router.read().unwrap();
+            default_router.clone()
+        };
+
+        let router = if let Some(id) = router_id {
+            self.routers.get(&id).map(|r| r.clone())
+        } else {
+            // If no default, use first available router
+            self.routers.iter().next().map(|r| r.value().clone())
+        };
+
+        if let Some(router) = router {
+            router.get_model_info(req).await
+        } else {
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
+        }
     }
 
     async fn route_generate(
