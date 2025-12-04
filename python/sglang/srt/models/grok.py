@@ -18,6 +18,7 @@ import math
 from typing import Iterable, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -59,7 +60,9 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +103,10 @@ class Grok1MLP(nn.Module):
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
-        x, _ = gelu_and_mul_triton(gate_up)
+        if _is_npu:
+            x = self.act_fn(gate_up)
+        else:
+            x, _ = gelu_and_mul_triton(gate_up)
         x, _ = self.down_proj(x)
         return x
 
@@ -142,7 +148,7 @@ class Grok1MoE(nn.Module):
         self.topk = TopK(
             top_k=top_k,
             renormalize=False,
-            custom_routing_function=custom_routing_function,
+            custom_routing_function=None if _is_npu else custom_routing_function,
         )
 
         self.experts = FusedMoE(
@@ -161,8 +167,21 @@ class Grok1MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        topk_output = self.topk(hidden_states, self.gate.weight)
-        return self.experts(hidden_states, topk_output)
+        if _is_npu:
+            orig_shape = hidden_states.shape
+            hidden_states = hidden_states.view(-1, self.hidden_size)
+
+            router_logits, _ = self.gate(hidden_states)
+            router_logits = self.router_logit_softcapping * F.tanh(
+                router_logits / self.router_logit_softcapping
+            )
+            topk_output = self.topk(hidden_states, router_logits)
+
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            return final_hidden_states.view(orig_shape)
+        else:
+            topk_output = self.topk(hidden_states, self.gate.weight)
+            return self.experts(hidden_states, topk_output)
 
 
 def _yarn_linear_ramp_mask(
@@ -336,7 +355,7 @@ class Grok1Attention(nn.Module):
         self.rope_theta = rope_theta
         rope_scaling = get_rope_scaling(config)
         self.load_presharded_attn = load_presharded_attn
-        self.alt_stream = alt_stream or torch.cuda.Stream()
+        self.alt_stream = alt_stream or torch.get_device_module().Stream()
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -450,7 +469,7 @@ class Grok1DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.residual_moe = getattr(config, "residual_moe", False)
         self.layer_id = layer_id
-        self.alt_stream = alt_stream or torch.cuda.Stream()
+        self.alt_stream = alt_stream or torch.get_device_module().Stream()
 
         rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = Grok1Attention(
@@ -582,10 +601,10 @@ class Grok1DecoderLayer(nn.Module):
 
     def moe_with_rmoe(self, x):
         if self.alt_stream is not None and get_is_capture_mode():
-            current_stream = torch.cuda.current_stream()
+            current_stream = torch.get_device_module().current_stream()
             self.alt_stream.wait_stream(current_stream)
             mlp_result = self.mlp(x)
-            with torch.cuda.stream(self.alt_stream):
+            with torch.get_device_module().stream(self.alt_stream):
                 moe_result = self.block_sparse_moe(x)
             current_stream.wait_stream(self.alt_stream)
         else:
@@ -619,7 +638,7 @@ class Grok1Model(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = torch.get_device_module().Stream()
         self.layers = nn.ModuleList(
             [
                 Grok1DecoderLayer(
