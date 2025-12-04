@@ -3,7 +3,6 @@
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.ci.ci_stress_utils import StressTestRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 
@@ -13,7 +12,8 @@ RANDOM_OUTPUT_LEN = 1024
 OUTPUT_FILE = "stress_test_glm_4_6.jsonl"
 
 # Register for CI - estimated 30 minutes for throughput benchmarking
-register_cuda_ci(est_time=1800, suite="stress")
+# TEMP: Disabled for debugging - testing only Qwen3
+# register_cuda_ci(est_time=1800, suite="stress")
 
 
 class TestStressGLM46(unittest.TestCase):
