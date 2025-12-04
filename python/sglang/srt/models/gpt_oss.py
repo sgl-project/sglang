@@ -80,7 +80,7 @@ if _is_cuda:
     from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
 
 if _is_npu:
-    from sgl_kernel_npu.moe.swiglu_oai import swiglu_oai
+    from sgl_kernel_npu.activation.swiglu_oai import swiglu_oai
 
 
 class GptOssConfig(PretrainedConfig):
