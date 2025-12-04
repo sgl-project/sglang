@@ -712,6 +712,9 @@ async def serve_grpc(
     # This ensures the environment variable is inherited by child processes
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
+        # Launch metrics server on separate port if specified
+        if server_args.metrics_port is not None:
+            launch_metrics_server(server_args.host, server_args.metrics_port)
 
     # Start bootstrap server BEFORE launching scheduler processes (only in PREFILL mode)
     # This ensures the bootstrap server is ready when prefill schedulers try to register

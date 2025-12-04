@@ -133,6 +133,7 @@ from sglang.srt.utils import (
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
+    launch_metrics_server,
     set_uvicorn_logging_configs,
 )
 from sglang.utils import get_exception_traceback
@@ -229,9 +230,14 @@ async def lifespan(fast_api_app: FastAPI):
         warmup_thread_kwargs = dict(server_args=server_args)
         thread_label = f"MultiTokenizer-{_global_state.tokenizer_manager.worker_id}"
 
-    # Add prometheus middleware
+    # Add prometheus middleware or launch separate metrics server
     if server_args.enable_metrics:
-        add_prometheus_middleware(app)
+        if server_args.metrics_port is not None:
+            # Launch metrics on a separate port
+            launch_metrics_server(server_args.host, server_args.metrics_port)
+        else:
+            # Add metrics endpoint to the main server
+            add_prometheus_middleware(app)
         enable_func_timer()
 
     # Init tracing

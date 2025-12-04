@@ -2,6 +2,8 @@
 
 SGLang exposes the following metrics via Prometheus. You can enable it by adding `--enable-metrics` when you launch the server.
 
+By default, metrics are served on the main server's `/metrics` endpoint. You can optionally serve metrics on a separate port by specifying `--metrics-port <port>`, which is useful when you want to isolate metrics traffic from the main API server.
+
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
 Here is an example of the metrics:
