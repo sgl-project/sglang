@@ -379,6 +379,7 @@ def maybe_download_model(
     Returns:
         Local path to the model
     """
+    from huggingface_hub import try_to_load_from_cache
 
     # If the path exists locally, return it
     if os.path.exists(model_name_or_path):
@@ -387,41 +388,36 @@ def maybe_download_model(
 
     # Otherwise, assume it's a HF Hub model ID and try to download it
     try:
-        # First, try to use cached version only (much faster, no network/verification overhead)
-        logger.info(
-            "Attempting to load model from cache for %s...", model_name_or_path
+        # OPTIMIZATION: Check cache WITHOUT file-by-file verification to avoid lock contention
+        # This is critical for multi-GPU setups where multiple ranks would otherwise
+        # compete for locks on every model file
+        logger.info("Checking cache for %s...", model_name_or_path)
+        
+        # Try to find cached snapshot path directly
+        cache_path = try_to_load_from_cache(
+            repo_id=model_name_or_path,
+            filename="model_index.json",  # Check for a key file to verify cache exists
         )
-        try:
-            with (
-                get_lock(model_name_or_path).acquire(poll_interval=2),
-                suppress_other_loggers(not_suppress_on_main_rank=True),
-            ):
-                local_path = snapshot_download(
-                    repo_id=model_name_or_path,
-                    ignore_patterns=["*.onnx", "*.msgpack"],
-                    local_dir=local_dir,
-                    local_files_only=True,
-                )
-            logger.info("Loaded model from cache at %s", local_path)
-            return str(local_path)
-        except Exception as cache_error:
-            # If not in cache or cache is incomplete/corrupted, download from HF Hub
-            logger.info(
-                "Cache miss or incomplete cache (%s), downloading from HF Hub for %s...", 
-                str(cache_error)[:100], 
-                model_name_or_path
+        
+        if cache_path is not None and cache_path != "_CACHED_NO_EXIST":
+            # Cache hit! Get the snapshot directory
+            cached_model_dir = os.path.dirname(cache_path)
+            logger.info("Found model in cache at %s", cached_model_dir)
+            return cached_model_dir
+        
+        # Cache miss - need to download
+        logger.info("Model not in cache, downloading from HF Hub for %s...", model_name_or_path)
+        with (
+            get_lock(model_name_or_path).acquire(poll_interval=2),
+            suppress_other_loggers(not_suppress_on_main_rank=True),
+        ):
+            local_path = snapshot_download(
+                repo_id=model_name_or_path,
+                ignore_patterns=["*.onnx", "*.msgpack"],
+                local_dir=local_dir,
             )
-            with (
-                get_lock(model_name_or_path).acquire(poll_interval=2),
-                suppress_other_loggers(not_suppress_on_main_rank=True),
-            ):
-                local_path = snapshot_download(
-                    repo_id=model_name_or_path,
-                    ignore_patterns=["*.onnx", "*.msgpack"],
-                    local_dir=local_dir,
-                )
-            logger.info("Downloaded model to %s", local_path)
-            return str(local_path)
+        logger.info("Downloaded model to %s", local_path)
+        return str(local_path)
     except Exception as e:
         raise ValueError(
             f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
