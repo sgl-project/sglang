@@ -44,6 +44,7 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     is_cuda,
+    is_hip,
     is_npu,
     make_layers,
     set_weight_attrs,
@@ -51,6 +52,7 @@ from sglang.srt.utils import (
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 import triton
@@ -62,8 +64,10 @@ if _is_hip:
         fused_qkvzba_split_reshape_cat_prefill,
     )
     fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_decode
-    from sglang.srt.layers.elementwise import fused_sigmoid_mul
     
+
+if _is_hip:
+    from sglang.srt.layers.elementwise import fused_sigmoid_mul
 
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
@@ -658,8 +662,10 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+            if _is_hip:
+                attn_output = fused_sigmoid_mul(gate, attn_output)
+            else:
+                attn_output = torch.sigmoid(gate) * attn_output
 
         output, _ = self.o_proj(attn_output)
         return output

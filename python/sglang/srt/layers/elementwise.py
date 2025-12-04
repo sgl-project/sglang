@@ -582,3 +582,130 @@ def silu_and_mul_triton(
         return out_hidden_states, out_scales
     else:
         return out_hidden_states, None
+
+@triton.jit
+def _fused_sigmoid_mul_kernel(
+    X,  # input to sigmoid
+    Y,  # input to multiply
+    OUT,  # output
+    N,  # total elements
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused kernel: sigmoid(x) * y"""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < N
+
+    x = tl.load(X + offsets, mask=mask)
+    y = tl.load(Y + offsets, mask=mask)
+
+    sigmoid_x = 1.0 / (1.0 + tl.exp(-x.to(tl.float32)))
+    out = sigmoid_x * y.to(tl.float32)
+
+    tl.store(OUT + offsets, out.to(OUT.dtype.element_ty), mask=mask)
+
+
+def fused_sigmoid_mul(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    """
+    Fused sigmoid(x) * y operation.
+    
+    Combines two kernels (sigmoid + elementwise mul) into one for better performance.
+    
+    Args:
+        x: Input tensor for sigmoid
+        y: Input tensor to multiply with sigmoid(x)
+        out: Optional output tensor (if None, allocates new tensor)
+    
+    Returns:
+        sigmoid(x) * y
+    """
+    assert x.shape == y.shape, f"Shape mismatch: {x.shape} vs {y.shape}"
+    
+    if out is None:
+        out = torch.empty_like(y)
+    
+    N = x.numel()
+    BLOCK_SIZE = 1024
+    grid = (triton.cdiv(N, BLOCK_SIZE),)
+
+    _fused_sigmoid_mul_kernel[grid](
+        x, y, out, N,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=4,
+    )
+    return out
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 128, "BLOCK_H": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 64, "BLOCK_H": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 64, "BLOCK_H": 512}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 32, "BLOCK_H": 512}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 32, "BLOCK_H": 1024}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 16, "BLOCK_H": 1024}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 16, "BLOCK_H": 2048}, num_warps=8, num_stages=2),
+        
+        triton.Config({"BLOCK_N": 8, "BLOCK_H": 2048}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 4, "BLOCK_H": 2048}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 8, "BLOCK_H": 1024}, num_warps=4, num_stages=2),
+    ],
+    key=["N", "H"],
+)
+@triton.jit
+def _fused_sigmoid_mul_broadcast_kernel(
+    X, Y, OUT, N, H, stride_y,
+    BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Fused sigmoid(x) * y with broadcast from [N,1] to [N,H]."""
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    
+    row_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    
+    row_mask = row_offsets < N
+    col_mask = col_offsets < H
+    
+    x = tl.load(X + row_offsets, mask=row_mask, other=0.0)
+    sigmoid_x = 1.0 / (1.0 + tl.exp(-x.to(tl.float32)))
+    
+    y_ptrs = Y + row_offsets[:, None] * stride_y + col_offsets[None, :]
+    mask_2d = row_mask[:, None] & col_mask[None, :]
+    y = tl.load(y_ptrs, mask=mask_2d, other=0.0)
+    
+    out = sigmoid_x[:, None] * y.to(tl.float32)
+    
+    out_ptrs = OUT + row_offsets[:, None] * stride_y + col_offsets[None, :]
+    tl.store(out_ptrs, out.to(OUT.dtype.element_ty), mask=mask_2d)
+
+
+def fused_sigmoid_mul_broadcast(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
+    """
+    Fused sigmoid(x) * y operation
+    
+    Args:
+        x: Input tensor for sigmoid, shape [N, 1]
+        y: Input tensor to multiply with sigmoid(x), shape [N, H]
+        out: Optional output tensor (if None, allocates new tensor)
+    
+    Returns:
+        sigmoid(x) * y with broadcast, shape [N, H]
+    """
+    assert x.dim() == 2 and y.dim() == 2, f"Expected 2D tensors, got {x.dim()}D and {y.dim()}D"
+    assert x.shape[0] == y.shape[0], f"Batch size mismatch: {x.shape[0]} vs {y.shape[0]}"
+    assert x.shape[1] == 1, f"Expected x.shape[1]==1 for broadcast, got {x.shape[1]}"
+    
+    N, H = y.shape
+    
+    if out is None:
+        out = torch.empty_like(y)
+    
+    def grid(META):
+        return (triton.cdiv(N, META["BLOCK_N"]), triton.cdiv(H, META["BLOCK_H"]))
+
+    _fused_sigmoid_mul_broadcast_kernel[grid](
+        x, y, out, N, H, y.stride(0),
+    )
+    return out

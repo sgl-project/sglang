@@ -35,6 +35,11 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+if _is_hip:
+    from sglang.srt.layers.elementwise import fused_sigmoid_mul_broadcast
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -209,9 +214,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
+                if _is_hip:
+                    gate_output = self.shared_expert_gate(hidden_states)
+                    shared_output = fused_sigmoid_mul_broadcast(gate_output, shared_output)
+                else:
+                    shared_output = (
+                        F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
+                    )
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
