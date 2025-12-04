@@ -896,9 +896,6 @@ class ServerArgs:
         ), f"Invalid execution mode: {self.mode}"
 
         # Validate workload type
-        assert isinstance(
-            self.workload_type, WorkloadType
-        ), f"Workload type must be a WorkloadType enum, got {type(self.workload_type)}"
         assert (
             self.workload_type in WorkloadType.choices()
         ), f"Invalid workload type: {self.workload_type}"
