@@ -661,10 +661,14 @@ class ServerArgs:
 
     def scheduler_endpoint(self):
         """
-        Internal endpoint for scheduler
+        Internal endpoint for scheduler.
+
+        Prefers the configured host but normalizes localhost -> 127.0.0.1 to avoid ZMQ issues.
 
         """
-        scheduler_host = self.host or "localhost"
+        scheduler_host = self.host
+        if scheduler_host is None or scheduler_host == "localhost":
+            scheduler_host = "127.0.0.1"
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
@@ -712,7 +716,8 @@ class ServerArgs:
         Post init when in serve mode
         """
         if self.host is None:
-            self.host = "localhost"
+            # Use 127.0.0.1 for consistency with text model server (srt) default
+            self.host = "127.0.0.1"
         if self.port is None:
             self.port = 3000
         self.port = self.settle_port(self.port)

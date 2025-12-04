@@ -680,6 +680,7 @@ class TransformerLoader(ComponentLoader):
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             output_dtype=None,
+            strict=False,
         )
 
         total_params = sum(p.numel() for p in model.parameters())

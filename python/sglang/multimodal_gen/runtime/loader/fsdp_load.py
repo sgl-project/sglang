@@ -79,6 +79,7 @@ def maybe_load_fsdp_model(
     fsdp_inference: bool = False,
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
+    strict: bool = True,
 ) -> torch.nn.Module:
     """
     Load the model with FSDP if is training, else load the model without FSDP.
@@ -137,8 +138,9 @@ def maybe_load_fsdp_model(
         model,
         weight_iterator,
         device,
+        param_dtype,
         default_dtype,
-        strict=True,
+        strict=strict,
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
     )
@@ -223,7 +225,8 @@ def load_model_from_full_model_state_dict(
     full_sd_iterator: Generator[tuple[str, torch.Tensor], None, None],
     device: torch.device,
     param_dtype: torch.dtype,
-    strict: bool = False,
+    default_dtype: torch.dtype,
+    strict: bool = True,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
 ) -> _IncompatibleKeys:
@@ -235,6 +238,7 @@ def load_model_from_full_model_state_dict(
         full_sd_iterator (Generator): an iterator yielding (param_name, tensor) pairs
         device (torch.device): device used to move full state dict tensors
         param_dtype (torch.dtype): dtype used to move full state dict tensors
+        default_dtype (torch.dtype): default dtype for model parameters
         strict (bool): flag to check if to load the model in strict mode
         cpu_offload (bool): flag to check if FSDP offload is enabled
         param_names_mapping (Optional[Callable[[str], str]]): a function that maps full param name to sharded param name
@@ -254,9 +258,16 @@ def load_model_from_full_model_state_dict(
     for target_param_name, full_tensor in custom_param_sd.items():
         meta_sharded_param = meta_sd.get(target_param_name)
         if meta_sharded_param is None:
-            raise ValueError(
-                f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
-            )
+            if strict:
+                raise ValueError(
+                    f"Parameter {target_param_name} not found in custom model state dict. The hf to custom mapping may be incorrect."
+                )
+            else:
+                logger.warning(
+                    f"Parameter '{target_param_name}' from checkpoint not found in model; skipping. "
+                    "This is expected for optional parameters."
+                )
+                continue
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=param_dtype)
             # In cases where parts of the model aren't sharded, some parameters will be plain tensors
