@@ -67,6 +67,7 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         output_file: str = "shapes.jsonl",
         verbose: bool = False,
         only_rank: Optional[int] = None,
+        log_only_first_forward_pass: bool = True,
     ):
         super().__init__()
         self.output_file = output_file
@@ -79,6 +80,7 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         self.should_log = (only_rank is None) or (self.current_rank == only_rank)
         self._forward_pass_count = 0
         self._in_forward_pass = False
+        self.log_only_first_forward_pass = log_only_first_forward_pass
 
     def start_forward_pass(self):
         """Called by tp_worker to mark start of forward pass."""
@@ -133,6 +135,8 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
     def _extract_shapes_with_names(self, func, args, kwargs) -> Optional[Dict[str, Any]]:
         """Extract shapes with argument names from function signature."""
         try:
+            named_args = {}
+            
             # Try to get function signature to map args to parameter names
             sig = None
             try:
@@ -141,10 +145,8 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                 # Some torch operations don't have inspectable signatures
                 pass
             
-            named_args = {}
-            
             if sig:
-                # Map positional args to parameter names
+                # Map positional args and kwargs to parameter names
                 param_names = list(sig.parameters.keys())
                 bound_args = None
                 try:
@@ -155,44 +157,65 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                     pass
                 
                 if bound_args:
+                    # bound_args.arguments includes both positional args and kwargs
                     for param_name, arg_value in bound_args.arguments.items():
                         shape = self._extract_shapes(arg_value)
+                        # Include parameter even if shape is None (for non-tensor args like scalars)
+                        # This ensures kwargs names are always visible
                         if shape is not None:
                             named_args[param_name] = shape
+                        elif param_name in kwargs:
+                            # Include kwargs even if they're not tensors (e.g., scalars, None)
+                            # This ensures kwargs names are visible
+                            named_args[param_name] = None
                 else:
-                    # Fallback: map positional args by index
+                    # Fallback: map positional args by index, then add kwargs separately
                     for i, arg in enumerate(args):
                         if i < len(param_names):
                             shape = self._extract_shapes(arg)
                             if shape is not None:
                                 named_args[param_names[i]] = shape
+                    # Add kwargs separately in fallback case
+                    for kwarg_name, kwarg_value in kwargs.items():
+                        shape = self._extract_shapes(kwarg_value)
+                        # Always include kwargs names, even if not tensors
+                        if shape is not None:
+                            named_args[kwarg_name] = shape
+                        else:
+                            named_args[kwarg_name] = None
             else:
                 # No signature available: use positional indices and kwargs
                 for i, arg in enumerate(args):
                     shape = self._extract_shapes(arg)
                     if shape is not None:
                         named_args[f"arg{i}"] = shape
-            
-            # Add kwargs (they already have names)
-            for kwarg_name, kwarg_value in kwargs.items():
-                shape = self._extract_shapes(kwarg_value)
-                if shape is not None:
-                    named_args[kwarg_name] = shape
+                # Add kwargs (they already have names)
+                # Always include kwargs names, even if not tensors
+                for kwarg_name, kwarg_value in kwargs.items():
+                    shape = self._extract_shapes(kwarg_value)
+                    if shape is not None:
+                        named_args[kwarg_name] = shape
+                    else:
+                        named_args[kwarg_name] = None
             
             return named_args if named_args else None
-        except Exception:
+        except Exception as e:
             # Fallback to simple extraction without names
-            input_shapes = self._extract_shapes(args)
-            kwarg_shapes = self._extract_shapes(kwargs) if kwargs else None
             result = {}
+            input_shapes = self._extract_shapes(args)
             if input_shapes:
                 result["args"] = input_shapes
+            kwarg_shapes = self._extract_shapes(kwargs) if kwargs else None
             if kwarg_shapes:
                 result.update(kwarg_shapes)
             return result if result else None
 
     def _log_operation(self, func, named_inputs, result):
         """Log operation with minimal overhead."""
+        # Skip logging if we're only logging first forward pass and this is not it
+        if self.log_only_first_forward_pass and self._forward_pass_count > 1:
+            return
+        
         output_shapes = self._extract_shapes(result)
         if named_inputs or output_shapes:  # Log if any shapes present
             self.call_count += 1
