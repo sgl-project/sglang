@@ -241,7 +241,7 @@ def _dispatch_auto_backend() -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
-    # 2. FlashInfer TRTLLM (if Blackwell GPU and Flashinfer available)
+    # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if Hopper+ GPU and CUDA 12.0+)
     # 4. AITER (if AMD GPU with AITER enabled)
     # 5. Triton (fallback)
