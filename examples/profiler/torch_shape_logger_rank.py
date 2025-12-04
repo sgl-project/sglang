@@ -14,6 +14,7 @@ Or with bench_one_batch_server (recommended):
 """
 
 import atexit
+import inspect
 import json
 import os
 import signal
@@ -105,18 +106,15 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         if not should_skip_logging:
             should_skip_logging = _is_torch_compile_mode()
         
-        # Extract input shapes before execution (if profiling and not skipping)
-        input_shapes = None
-        kwarg_shapes = None
+        # Extract input shapes with argument names (if profiling and not skipping)
+        named_inputs = None
         if self.should_log and self._in_forward_pass and not should_skip_logging:
-            input_shapes = self._extract_shapes(args)
-            if kwargs:
-                kwarg_shapes = self._extract_shapes(kwargs)
+            named_inputs = self._extract_shapes_with_names(func, args, kwargs)
         
         result = func(*args, **kwargs)
         
         if self.should_log and self._in_forward_pass and not should_skip_logging:
-            self._log_operation(func, input_shapes, kwarg_shapes, result)
+            self._log_operation(func, named_inputs, result)
         
         return result
 
@@ -132,10 +130,71 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
             return {k: v for k, v in shapes.items() if v is not None} or None
         return None
 
-    def _log_operation(self, func, input_shapes, kwarg_shapes, result):
+    def _extract_shapes_with_names(self, func, args, kwargs) -> Optional[Dict[str, Any]]:
+        """Extract shapes with argument names from function signature."""
+        try:
+            # Try to get function signature to map args to parameter names
+            sig = None
+            try:
+                sig = inspect.signature(func)
+            except (ValueError, TypeError):
+                # Some torch operations don't have inspectable signatures
+                pass
+            
+            named_args = {}
+            
+            if sig:
+                # Map positional args to parameter names
+                param_names = list(sig.parameters.keys())
+                bound_args = None
+                try:
+                    bound_args = sig.bind(*args, **kwargs)
+                    bound_args.apply_defaults()
+                except TypeError:
+                    # If binding fails, fall back to positional mapping
+                    pass
+                
+                if bound_args:
+                    for param_name, arg_value in bound_args.arguments.items():
+                        shape = self._extract_shapes(arg_value)
+                        if shape is not None:
+                            named_args[param_name] = shape
+                else:
+                    # Fallback: map positional args by index
+                    for i, arg in enumerate(args):
+                        if i < len(param_names):
+                            shape = self._extract_shapes(arg)
+                            if shape is not None:
+                                named_args[param_names[i]] = shape
+            else:
+                # No signature available: use positional indices and kwargs
+                for i, arg in enumerate(args):
+                    shape = self._extract_shapes(arg)
+                    if shape is not None:
+                        named_args[f"arg{i}"] = shape
+            
+            # Add kwargs (they already have names)
+            for kwarg_name, kwarg_value in kwargs.items():
+                shape = self._extract_shapes(kwarg_value)
+                if shape is not None:
+                    named_args[kwarg_name] = shape
+            
+            return named_args if named_args else None
+        except Exception:
+            # Fallback to simple extraction without names
+            input_shapes = self._extract_shapes(args)
+            kwarg_shapes = self._extract_shapes(kwargs) if kwargs else None
+            result = {}
+            if input_shapes:
+                result["args"] = input_shapes
+            if kwarg_shapes:
+                result.update(kwarg_shapes)
+            return result if result else None
+
+    def _log_operation(self, func, named_inputs, result):
         """Log operation with minimal overhead."""
         output_shapes = self._extract_shapes(result)
-        if input_shapes or kwarg_shapes or output_shapes:  # Log if any shapes present
+        if named_inputs or output_shapes:  # Log if any shapes present
             self.call_count += 1
             op_name = str(func)
             self.op_counts[op_name] += 1
@@ -146,12 +205,11 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                         "call_id": self.call_count,
                         "forward_pass": self._forward_pass_count,
                         "operation": op_name,
-                        "inputs": input_shapes,
                         "outputs": output_shapes,
                     }
-                    # Only add kwargs if present to keep logs compact
-                    if kwarg_shapes:
-                        log_entry["kwargs"] = kwarg_shapes
+                    # Add named inputs (includes both positional args with names and kwargs)
+                    if named_inputs:
+                        log_entry["inputs"] = named_inputs
                     self.file_handle.write(json.dumps(log_entry) + "\n")
                     if self.call_count % 1000 == 0:  # Flush periodically
                         self.file_handle.flush()
