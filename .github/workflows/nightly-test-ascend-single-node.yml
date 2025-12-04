@@ -71,13 +71,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Prepare scripts
+      - name: Run tests
+        timeout-minutes: 300
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
         run: |
-          # prepare for k8s yaml
-          k8s_job_name=sglang-single-$(uuidgen)
-          echo "k8s job name: $k8s_job_name"
+          echo "================prepare for k8s yaml=================="
           cd $ASCEND_TEST_CASE_PATH
-          echo "export KUBE_JOB_NAME=${k8s_job_name}" > env_test_vars.sh
+          k8s_job_name=sglang-single-$(uuidgen)
+          export KUBE_JOB_NAME=${k8s_job_name}
+          echo "k8s job name: $KUBE_JOB_NAME"         
 
           image="${{ inputs.image }}"
           sglang_source_path="${{ inputs.sglang_source_path }}"
@@ -93,10 +98,8 @@ jobs:
               jinja2 k8s_single.yaml.jinja2 -o k8s_single.yaml
           echo "Kubelete config file is generated: ${ASCEND_TEST_CASE_PATH}/k8s_single.yaml"
 
-      - name: Clear resources
-        run: |
+          echo "================clear resources=================="
           cd $ASCEND_TEST_CASE_PATH
-          source env_test_vars.sh
           kubectl delete -f ./k8s_single.yaml --ignore-not-found=true || true
 
           pod_name_prefix="${KUBE_JOB_NAME}"
@@ -112,16 +115,7 @@ jobs:
             fi
           done
 
-      - name: Run test
-        timeout-minutes: 300
-        env:
-          SGLANG_USE_MODELSCOPE: true
-          SGLANG_IS_IN_CI: true
-          HF_ENDPOINT: https://hf-mirror.com
-        run: |
-
-          cd $ASCEND_TEST_CASE_PATH
-          source env_test_vars.sh
+          echo "================Run testcase=================="
           python3 -u run_ascend_ci.py
 
       - name: Post process
