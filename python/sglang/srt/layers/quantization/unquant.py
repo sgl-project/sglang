@@ -191,7 +191,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         if self.with_bias:
             w2_weight_bias = torch.nn.Parameter(
-                torch.ones(num_experts, hidden_size, dtype=torch.float32),
+                torch.empty(num_experts, hidden_size, dtype=torch.float32),
                 requires_grad=False,
             )
             layer.register_parameter("w2_weight_bias", w2_weight_bias)
@@ -213,6 +213,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
         return
 
     def create_moe_runner(
