@@ -434,10 +434,6 @@ class Indexer(CustomOp):
         token_nums, _, _ = q_fp8.shape
         device = q_fp8.device
 
-        token_to_batch_idx_tensor = torch.tensor(
-            token_to_batch_idx, dtype=torch.long, device=device
-        )
-
         # Check if we need to chunk to avoid OOM
         need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
 
@@ -483,6 +479,13 @@ class Indexer(CustomOp):
         topk_result = torch.full(
             (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
         )
+
+        # Only materialize batch index tensor when PAGED path needs it
+        token_to_batch_idx_tensor = None
+        if global_topk_offset is None:
+            token_to_batch_idx_tensor = torch.tensor(
+                token_to_batch_idx, dtype=torch.long, device=device
+            )
 
         start = 0
         while start < q_offset:
