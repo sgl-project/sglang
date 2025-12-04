@@ -2699,6 +2699,7 @@ class ModelRunner:
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         if (
             forward_batch.num_token_non_padded is not None
+            and forward_batch.global_num_tokens_gpu is not None
             and require_gathered_buffer
             and not is_nsa_enable_prefill_cp()
         ):
