@@ -1,5 +1,3 @@
-# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
-
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
 
@@ -29,6 +27,11 @@ class FluxVAEArchConfig(VAEArchConfig):
 
 
 @dataclass
+class Flux2VAEArchConfig(FluxVAEArchConfig):
+    pass
+
+
+@dataclass
 class FluxVAEConfig(VAEConfig):
     arch_config: FluxVAEArchConfig = field(default_factory=FluxVAEArchConfig)
 
@@ -48,3 +51,8 @@ class FluxVAEConfig(VAEConfig):
             len(self.arch_config.block_out_channels) - 1
         )
         self.arch_config.spatial_compression_ratio = self.arch_config.vae_scale_factor
+
+
+@dataclass
+class Flux2VAEConfig(FluxVAEConfig):
+    arch_config: Flux2VAEArchConfig = field(default_factory=Flux2VAEArchConfig)

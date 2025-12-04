@@ -7,11 +7,13 @@
 // - oracle.rs: All Oracle ATP storage implementations
 // - factory.rs: Storage creation function
 
+mod common;
 mod core;
 mod factory;
 mod memory;
 mod noop;
 mod oracle;
+mod postgres;
 
 pub use core::{
     Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,

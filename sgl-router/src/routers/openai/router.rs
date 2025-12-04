@@ -695,23 +695,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
 
         let url = format!("{}/v1/responses", base_url);
 
-        // Validate mutually exclusive params: previous_response_id and conversation
-        // TODO: this validation logic should move the right place, also we need a proper error message module
-        if body.previous_response_id.is_some() && body.conversation.is_some() {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
-                        "type": "invalid_request_error",
-                        "param": Value::Null,
-                        "code": "mutually_exclusive_parameters"
-                    }
-                })),
-            )
-                .into_response();
-        }
-
         // Clone the body for validation and logic, but we'll build payload differently
         let mut request_body = body.clone();
         if let Some(model) = model_id {
@@ -1150,15 +1133,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         (StatusCode::NOT_IMPLEMENTED, "Embeddings not supported").into_response()
     }
 
-    async fn route_rerank(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _body: &RerankRequest,
-        _model_id: Option<&str>,
-    ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
-    }
-
     async fn route_classify(
         &self,
         _headers: Option<&HeaderMap>,
@@ -1166,6 +1140,15 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _model_id: Option<&str>,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Classify not supported").into_response()
+    }
+
+    async fn route_rerank(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _body: &RerankRequest,
+        _model_id: Option<&str>,
+    ) -> Response {
+        (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
     }
 
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {
@@ -1195,10 +1178,6 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         conversation_id: &str,
     ) -> Response {
         delete_conversation(&self.conversation_storage, conversation_id).await
-    }
-
-    fn router_type(&self) -> &'static str {
-        "openai"
     }
 
     async fn list_conversation_items(
@@ -1274,5 +1253,9 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             item_id,
         )
         .await
+    }
+
+    fn router_type(&self) -> &'static str {
+        "openai"
     }
 }

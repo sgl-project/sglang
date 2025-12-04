@@ -99,6 +99,9 @@ class LogitsProcessorOutput:
     )
     input_token_ids_logprobs_idx: Optional[List] = None
 
+    ## Part 4: Diffusion LLM only.
+    full_logits: Optional[torch.Tensor] = None
+
 
 @dataclasses.dataclass
 class LogitsMetadata:
@@ -230,7 +233,11 @@ class LogitsMetadata:
 
 class LogitsProcessor(nn.Module):
     def __init__(
-        self, config, skip_all_gather: bool = False, logit_scale: Optional[float] = None
+        self,
+        config,
+        skip_all_gather: bool = False,
+        logit_scale: Optional[float] = None,
+        return_full_logits: bool = False,
     ):
         super().__init__()
         self.config = config
@@ -258,6 +265,8 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
+
+        self.return_full_logits = return_full_logits
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.value
@@ -494,6 +503,12 @@ class LogitsProcessor(nn.Module):
                 input_logprob_indices, device=pruned_states.device, dtype=torch.int64
             )
 
+        full_logits = (
+            self._get_logits(hidden_states, lm_head, logits_metadata)
+            if self.return_full_logits
+            else None
+        )
+
         hidden_states_to_store: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
@@ -532,6 +547,7 @@ class LogitsProcessor(nn.Module):
 
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
+                full_logits=full_logits,
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
             )
@@ -588,6 +604,7 @@ class LogitsProcessor(nn.Module):
             )
 
         return LogitsProcessorOutput(
+            full_logits=full_logits,
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
             input_token_logprobs=logprobs_result.input_token_logprobs,

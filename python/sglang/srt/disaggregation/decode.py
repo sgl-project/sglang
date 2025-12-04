@@ -51,6 +51,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, Sched
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -169,6 +170,10 @@ class DecodeRequest:
     kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+
+    @property
+    def seqlen(self) -> int:
+        return self.req.seqlen
 
 
 class DecodePreallocQueue:
@@ -564,7 +569,7 @@ class DecodePreallocQueue:
             else 0
         )
 
-        if self.scheduler.model_config.is_hybrid:
+        if self.scheduler.model_config.is_hybrid_swa:
             available_size = min(
                 self.token_to_kv_pool_allocator.full_available_size(),
                 self.token_to_kv_pool_allocator.swa_available_size(),
@@ -618,37 +623,21 @@ class DecodePreallocQueue:
 
         req.req_pool_idx = req_pool_indices[0]
 
+        # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
+        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        req.kv_allocated_len = fill_len
+        req.kv_committed_len = fill_len
         if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-            )
+            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
-            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [0],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                prefix_lens_cpu=torch.tensor(
-                    [0],
-                    dtype=torch.int64,
-                ),
-                seq_lens=torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                seq_lens_cpu=torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int64,
-                ),
-                last_loc=torch.tensor(
-                    [-1],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                extend_num_tokens=num_tokens,
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
             )
 
         assert (
@@ -763,7 +752,7 @@ class DecodeTransferQueue:
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                self.tree_cache.cache_finished_req(decode_req.req, is_insert=False)
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -894,8 +883,7 @@ class SchedulerDisaggregationDecodeMixin:
             ret = self.prepare_mlp_sync_batch(ret)
 
         if ret:
-            attrs = {"bid": hex(id(ret)), "batch_size": ret.batch_size()}
-            trace_event_batch("schedule", ret.reqs, attrs=attrs)
+            trace_event_batch("schedule", ret.reqs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -946,7 +934,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        new_batch.process_prebuilt(self.server_args, self.model_config)
+        new_batch.process_prebuilt(self.server_args, self.future_map)
 
         return new_batch
 

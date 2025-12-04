@@ -23,7 +23,7 @@ use sglang_router_rs::{
     },
     data_connector::{ResponseId, StoredResponse},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, UserMessageContent},
+        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         common::StringOrArray,
         completion::CompletionRequest,
         generate::GenerateRequest,
@@ -602,6 +602,7 @@ async fn test_unsupported_endpoints() {
 
     let generate_request = GenerateRequest {
         text: Some("Hello world".to_string()),
+        model: None,
         input_ids: None,
         input_embeds: None,
         image_data: None,
@@ -661,7 +662,7 @@ async fn test_openai_router_chat_completion_with_mock() {
     // Create a minimal chat completion request
     let mut chat_request = create_minimal_chat_request();
     chat_request.messages = vec![ChatMessage::User {
-        content: UserMessageContent::Text("Hello, how are you?".to_string()),
+        content: MessageContent::Text("Hello, how are you?".to_string()),
         name: None,
     }];
     chat_request.temperature = Some(0.7);

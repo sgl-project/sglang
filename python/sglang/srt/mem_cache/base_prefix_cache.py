@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
@@ -15,6 +16,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.metrics.collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -39,16 +41,36 @@ class MatchResult(NamedTuple):
                             this **must** be the same as `last_device_node`.
         host_hit_length :   Length of the KV cache hit on the host, if applicable.
                             0 if HiCache is not enabled.
+        mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
+                                page-aligned position that could've been cache hit if there
+                                exists a mamba state.
     """
 
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
     host_hit_length: int = 0
+    mamba_branching_seqlen: Optional[int] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
+
+    metrics_collector: Optional[RadixCacheMetricsCollector] = (
+        None  # metrics collector for the cache
+    )
+
+    def init_metrics_collector(self):
+        self.metrics_collector = RadixCacheMetricsCollector(
+            labels={"cache_type": self.__class__.__name__}
+        )
+
+    def update_eviction_metrics(self, num_evicted: int, start_time: float):
+        if self.metrics_collector is not None and num_evicted > 0:
+            self.metrics_collector.observe_eviction_duration(
+                time.perf_counter() - start_time
+            )
+            self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
     @abstractmethod
     def reset(self):

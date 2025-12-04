@@ -47,15 +47,25 @@ def test_disable_retries_surfaces_failure(router_manager, mock_workers):
         },
     )
 
-    r = requests.post(
-        f"{rh.url}/v1/completions",
-        json={
-            "model": "test-model",
-            "prompt": "x",
-            "max_tokens": 1,
-            "stream": False,
-        },
-        timeout=5,
-    )
-    assert r.status_code == 500
+    saw_500 = False
+    for _ in range(8):
+        r = requests.post(
+            f"{rh.url}/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "x",
+                "max_tokens": 1,
+                "stream": False,
+            },
+            timeout=5,
+        )
+        if r.status_code == 500:
+            # Worker starts, continue to check
+            saw_500 = True
+            break
+        assert (
+            r.status_code == 503
+        ), "Should only see 503 when waiting for worker to start"
+
+    assert saw_500
     # mock_workers fixture handles cleanup
