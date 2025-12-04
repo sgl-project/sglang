@@ -723,7 +723,7 @@ class MooncakeKVManager(CommonKVManager):
         next_token_ids = result.next_token_ids.tolist()
         from copy import deepcopy
 
-        reqs = deepcopy(batch.reqs)
+        reqs = batch.reqs
 
         for i, (req, next_token_id) in enumerate(zip(reqs, next_token_ids)):
             if batch.spec_info is not None:
@@ -739,14 +739,7 @@ class MooncakeKVManager(CommonKVManager):
             # Call set_buf callback if available (faster than passing scheduler reference)
             if self.set_buf_callback is not None:
                 self.set_buf_callback(req)
-            
 
-
-        
-                
-                
-
-        
 
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
@@ -763,6 +756,7 @@ class MooncakeKVManager(CommonKVManager):
                 dst_ranks_infos = []
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
                 assert kv_chunk.room in self.forward_results, f"kv_chunk.room {kv_chunk.room} not in forward_results"
+                logger.info(f"transfer_worker: {kv_chunk.room=} {self.forward_results=}")
                 batch, result = self.forward_results[kv_chunk.room]
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
@@ -1167,6 +1161,7 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                result=self.result,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -1176,6 +1171,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                result=self.result,
             )
 
     def poll(self) -> KVPoll:
