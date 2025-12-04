@@ -198,7 +198,7 @@ def safetensors_weights_iterator(
             streamer.stream_files(hf_weights_files)
             for name, tensor in streamer.get_tensors():
                 if to_cpu:
-                    yield name, tensor.clone().detach().cpu()
+                    yield name, tensor.clone().detach()
                 else:
                     yield name, tensor.to(device)
     else:
