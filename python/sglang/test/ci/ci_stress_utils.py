@@ -28,7 +28,7 @@ class StressTestRunner:
         test_name: str,
         base_url: str,
         num_prompts: int = 20000,
-        duration_minutes: int = 30,
+        duration_minutes: int = 5,
     ):
         """Initialize the stress test runner.
 
@@ -36,7 +36,7 @@ class StressTestRunner:
             test_name: Name of the test (used for reporting)
             base_url: Base URL for the server
             num_prompts: Number of prompts to send (default: 20000)
-            duration_minutes: Timeout in minutes (default: 30)
+            duration_minutes: Timeout in minutes (default: 5 for debugging)
         """
         self.test_name = test_name
         self.base_url = base_url
@@ -93,11 +93,11 @@ class StressTestRunner:
 
         return command
 
-    def _parse_metrics_from_output(self, stdout: str) -> Dict[str, float]:
-        """Parse benchmark metrics from bench_serving stdout.
+    def _parse_metrics_from_output(self, output: str) -> Dict[str, float]:
+        """Parse benchmark metrics from bench_serving output.
 
         Args:
-            stdout: The stdout from bench_serving
+            output: The stdout/stderr from bench_serving
 
         Returns:
             Dictionary containing parsed metrics
@@ -116,7 +116,7 @@ class StressTestRunner:
         }
 
         for key, pattern in patterns.items():
-            match = re.search(pattern, stdout)
+            match = re.search(pattern, output)
             if match:
                 metrics[key] = float(match.group(1))
 
@@ -232,8 +232,22 @@ class StressTestRunner:
 
             result = self.run_stress_test_command(command, timeout_minutes)
 
-            # Parse metrics from output
+            # Parse metrics from output (try both stdout and stderr)
             metrics = self._parse_metrics_from_output(result.stdout)
+            if not metrics and result.stderr:
+                # Sometimes metrics are in stderr, try that too
+                metrics = self._parse_metrics_from_output(result.stderr)
+
+            # Debug: print parsed metrics
+            print(f"\nParsed metrics: {metrics}")
+            if not metrics:
+                print("WARNING: No metrics were parsed from output!")
+                print(f"stdout length: {len(result.stdout)} chars")
+                print(f"stderr length: {len(result.stderr)} chars")
+                # Print a sample of stdout to debug
+                if result.stdout:
+                    print("Sample stdout (last 500 chars):")
+                    print(result.stdout[-500:])
 
             print(f"\nStress test completed successfully for {model_path}")
             self._add_success_to_report(
@@ -281,6 +295,12 @@ class StressTestRunner:
             )
         if metrics.get("median_ttft_ms"):
             self.full_report += f"- Median TTFT: {metrics['median_ttft_ms']:.2f}ms\n"
+
+        # If no metrics were parsed, add a note
+        if not metrics:
+            self.full_report += (
+                "- ⚠️ Metrics not available (check output file for details)\n"
+            )
 
         self.full_report += "- Status: **PASSED**\n\n"
 

@@ -22,7 +22,7 @@ class TestStressKimiK2(unittest.TestCase):
         cls.model = MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.num_prompts = int(os.environ.get("NUM_PROMPTS", "20000"))
-        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "30"))
+        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "5"))
 
         cls.runner = StressTestRunner(
             test_name="Kimi-K2-Thinking Stress Test",
