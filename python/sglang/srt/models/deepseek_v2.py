@@ -737,6 +737,7 @@ class DeepseekV2MoE(nn.Module):
                     )
 
         self.top_k = config.num_experts_per_tok
+        self._use_multi_stream = get_bool_env_var("USE_MULTI_STREAM", "0")
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO: we will support tp < ep in the future
@@ -984,9 +985,19 @@ class DeepseekV2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag:
-                shared_output = self._forward_shared_experts(hidden_states)
+            router_logits = self.gate(hidden_states)
+            if not self._fuse_shared_experts_inside_sbo:
+                if self._use_multi_stream:
+                    # prefetch and forward share experts on the same stream
+                    main_event = torch.npu.Event()
+                    main_event.record()
+                    with torch.npu.stream(self.alt_stream):
+                        self.alt_stream.wait_event(main_event)
+                        shared_output = self._forward_shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                else:
+                    shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1105,6 +1116,12 @@ class DeepseekV2MoE(nn.Module):
             topk_output=topk_output,
         )
 
+        if (
+            hidden_states.shape[0] > 0
+            and not self._fuse_shared_experts_inside_sbo
+            and self._use_multi_stream
+        ):
+            torch.npu.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
             if self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -1264,6 +1281,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
+        self.alt_stream = alt_stream
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
@@ -2989,7 +3007,13 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        if _is_cuda:
+            self.alt_stream = torch.cuda.Stream()
+        elif _is_npu:
+            self.alt_stream = torch.npu.Stream()
+        else:
+            None
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(
