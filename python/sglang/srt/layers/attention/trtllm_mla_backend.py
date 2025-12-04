@@ -259,7 +259,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         # Workspace allocation
-        self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        self.workspace_size = int(DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024 * 1.2)
         global global_zero_init_workspace_buffer
         if global_zero_init_workspace_buffer is None:
             global_zero_init_workspace_buffer = torch.zeros(
