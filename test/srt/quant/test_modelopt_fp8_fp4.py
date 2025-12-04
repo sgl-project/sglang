@@ -74,7 +74,7 @@ class MOTest(CustomTestCase):
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,
-            num_questions=200,
+            num_questions=1319,
             max_new_tokens=512,
             parallel=128,
             host="http://127.0.0.1",
@@ -113,15 +113,20 @@ class MOTest(CustomTestCase):
 
 LLAMA_FP8_MODEL = "nvidia/Llama-3.1-8B-Instruct-FP8"
 LLAMA_FP4_MODEL = "nvidia/Llama-3.1-8B-Instruct-FP4"
-# We only tested 200 questions, so the results have high variance.
-LLAMA_GSM8K_ACC_THRESHOLD = 0.63
-LLAMA_THROUGHPUT_THRESHOLD = 120
+# We only tested 1319 questions, so the results have high variance.
+LLAMA_GSM8K_ACC_THRESHOLD_FP8 = 0.74
+LLAMA_THROUGHPUT_THRESHOLD_FP8 = 70
+LLAMA_GSM8K_ACC_THRESHOLD_FP4 = 0.63
+LLAMA_THROUGHPUT_THRESHOLD_FP4 = 90  # For B100
 
 QWEN_FP8_MODEL = "nvidia/Qwen3-8B-FP8"
 QWEN_FP4_MODEL = "nvidia/Qwen3-8B-FP4"
-# We only tested 200 questions, so the results have high variance.
-QWEN_GSM8K_ACC_THRESHOLD = 0.88
-QWEN_THROUGHPUT_THRESHOLD = 120
+# We only tested 1319 questions, so the results have high variance.
+QWEN_GSM8K_ACC_THRESHOLD_FP8 = 0.87
+QWEN_THROUGHPUT_THRESHOLD_FP8 = 67
+
+QWEN_GSM8K_ACC_THRESHOLD_FP4 = 0.85
+QWEN_THROUGHPUT_THRESHOLD_FP4 = 90  # For B100
 
 
 @unittest.skipIf(
@@ -139,8 +144,8 @@ class TestMOLlamaFP8(MOTest):
     model = LLAMA_FP8_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
-    gsm8k_accuracy_threshold = LLAMA_GSM8K_ACC_THRESHOLD
-    throughput_threshold = LLAMA_THROUGHPUT_THRESHOLD
+    gsm8k_accuracy_threshold = LLAMA_GSM8K_ACC_THRESHOLD_FP8
+    throughput_threshold = LLAMA_THROUGHPUT_THRESHOLD_FP8
 
 
 @unittest.skipIf(
@@ -158,8 +163,8 @@ class TestMOQwenFP8(MOTest):
     model = QWEN_FP8_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
-    gsm8k_accuracy_threshold = QWEN_GSM8K_ACC_THRESHOLD
-    throughput_threshold = QWEN_THROUGHPUT_THRESHOLD
+    gsm8k_accuracy_threshold = QWEN_GSM8K_ACC_THRESHOLD_FP8
+    throughput_threshold = QWEN_THROUGHPUT_THRESHOLD_FP8
 
 
 @unittest.skipIf(
@@ -177,8 +182,8 @@ class TestMOLlamaFP4(MOTest):
     model = LLAMA_FP4_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
-    gsm8k_accuracy_threshold = LLAMA_GSM8K_ACC_THRESHOLD
-    throughput_threshold = LLAMA_THROUGHPUT_THRESHOLD
+    gsm8k_accuracy_threshold = LLAMA_GSM8K_ACC_THRESHOLD_FP4
+    throughput_threshold = LLAMA_THROUGHPUT_THRESHOLD_FP4
 
 
 @unittest.skipIf(
@@ -196,8 +201,8 @@ class TestMOQwenFP4(MOTest):
     model = QWEN_FP4_MODEL
     quantization = "modelopt"
     kv_cache_dtype = "fp8_e4m3"
-    gsm8k_accuracy_threshold = QWEN_GSM8K_ACC_THRESHOLD
-    throughput_threshold = QWEN_THROUGHPUT_THRESHOLD
+    gsm8k_accuracy_threshold = QWEN_GSM8K_ACC_THRESHOLD_FP4
+    throughput_threshold = QWEN_THROUGHPUT_THRESHOLD_FP4
 
 
 if __name__ == "__main__":
