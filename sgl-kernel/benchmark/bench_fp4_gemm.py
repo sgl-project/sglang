@@ -73,9 +73,19 @@ else:
         # x_vals = [64],
         x_log=False,
         line_arg="provider",
-        line_vals=["cutlass", "cudnn", "trtllm"],
-        line_names=["baseline cutlass fp4", "cudnn fp4", "trtllm fp4"],
-        styles=[("red", "solid"), ("blue", "solid"), ("green", "solid")],
+        line_vals=["cutlass", "cudnn", "trtllm", "auto"],
+        line_names=[
+            "baseline cutlass fp4",
+            "cudnn fp4",
+            "trtllm fp4",
+            "auto fp4 (cudnn/cutlass)",
+        ],
+        styles=[
+            ("red", "solid"),
+            ("blue", "solid"),
+            ("green", "solid"),
+            ("purple", "solid"),
+        ],
         ylabel="latency (ms)",
         plot_name="fp4_gemm_benchmark",
         args={},
@@ -118,6 +128,7 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
                 alpha,
                 dtype,
                 res_fi,
+                backend="cudnn",
             ),
             quantiles=quantiles,
         )
@@ -134,6 +145,19 @@ def benchmark(batch_size, provider, N, K, dtype, correctness, csv_file):
                 dtype,
                 res_fi,
                 backend="trtllm",
+            ),
+            quantiles=quantiles,
+        )
+    if provider == "auto":
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
+            lambda: mm_fp4(
+                a_fp4,
+                b_fp4.T,
+                a_scale_interleaved,
+                b_scale_interleaved.T,
+                alpha,
+                dtype,
+                res_fi,
             ),
             quantiles=quantiles,
         )
