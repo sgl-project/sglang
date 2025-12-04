@@ -60,9 +60,11 @@ def init_feature_buffer(device):
     except RuntimeError as e:
         _GPU_FEATURE_BUFFER = None
 
+
 def reset_buffer_offset():
     global _BUFFER_OFFSET
     _BUFFER_OFFSET = 0
+
 
 def is_feature_buffer_initialized():
     global _GPU_FEATURE_BUFFER

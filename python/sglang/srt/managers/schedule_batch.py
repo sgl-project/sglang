@@ -332,8 +332,8 @@ class MultimodalInputs:
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             from sglang.srt.managers.mm_utils import (
                 init_feature_buffer,
-                reset_buffer_offset,
                 is_feature_buffer_initialized,
+                reset_buffer_offset,
                 try_add_to_buffer,
             )
 
