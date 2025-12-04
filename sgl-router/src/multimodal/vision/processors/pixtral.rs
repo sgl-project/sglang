@@ -379,14 +379,16 @@ mod tests {
         let mut size = HashMap::new();
         size.insert("longest_edge".to_string(), 2048u32);
 
-        let mut config = PreProcessorConfig::default();
-        config.size = Some(size);
-        config.patch_size = Some(crate::multimodal::vision::preprocessor_config::PatchSize {
-            height: Some(14),
-            width: Some(14),
-        });
-        config.image_mean = Some(vec![0.5, 0.5, 0.5]);
-        config.image_std = Some(vec![0.5, 0.5, 0.5]);
+        let config = PreProcessorConfig {
+            size: Some(size),
+            patch_size: Some(crate::multimodal::vision::preprocessor_config::PatchSize {
+                height: Some(14),
+                width: Some(14),
+            }),
+            image_mean: Some(vec![0.5, 0.5, 0.5]),
+            image_std: Some(vec![0.5, 0.5, 0.5]),
+            ..Default::default()
+        };
 
         let processor = PixtralProcessor::from_preprocessor_config(&config);
 
