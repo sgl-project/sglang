@@ -49,10 +49,18 @@ jobs:
         NAMESPACE: ascend-sglang-single
         ASCEND_TEST_CASE_PATH: test/srt/ascend_k8s
         KUBE_JOB_TYPE: single
-        KUBE_JOB_NAME: ascend-sglang-single-test
+        KUBE_JOB_NAME: sglang-single
     steps:
       - name: Install system denpendencies
         run: |
+          # speed up by using infra cache services
+          CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+          sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
+          pip config set global.index-url http://${CACHING_URL}/pypi/simple
+          pip config set global.extra-index-url "https://pypi.tuna.tsinghua.edu.cn/simple"
+          pip config set global.trusted-host "${CACHING_URL} pypi.tuna.tsinghua.edu.cn"
+          apt-get update -y
+          apt install uuid-runtime -y
           pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple jinja2-cli
 
       - name: Install kubernetes
@@ -87,7 +95,7 @@ jobs:
           cd $ASCEND_TEST_CASE_PATH
           kubectl delete -f ./k8s_single.yaml --ignore-not-found=true || true
 
-          pod_name_prefix="${KUBE_JOB_NAME}-sglang-single-pod"
+          pod_name_prefix="${KUBE_JOB_NAME}"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
           while true; do
             if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
