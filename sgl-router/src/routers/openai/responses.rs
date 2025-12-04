@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use tracing::warn;
 
-use super::utils::event_types;
 use crate::{
     data_connector::{ResponseId, StoredResponse},
-    protocols::responses::{ResponseToolType, ResponsesRequest},
+    protocols::{
+        event_types::ResponseEvent,
+        responses::{ResponseToolType, ResponsesRequest},
+    },
 };
 
 // ============================================================================
@@ -203,9 +205,7 @@ pub(super) fn rewrite_streaming_block(
 
     let should_patch = matches!(
         event_type,
-        event_types::RESPONSE_CREATED
-            | event_types::RESPONSE_IN_PROGRESS
-            | event_types::RESPONSE_COMPLETED
+        ResponseEvent::CREATED | ResponseEvent::IN_PROGRESS | ResponseEvent::COMPLETED
     );
 
     if !should_patch {
