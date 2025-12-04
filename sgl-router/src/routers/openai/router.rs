@@ -1169,21 +1169,13 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         order: Option<&str>,
         after: Option<&str>,
     ) -> Response {
-        let mut query_params = std::collections::HashMap::new();
-        if let Some(l) = limit {
-            query_params.insert("limit".to_string(), l.to_string());
-        }
-        if let Some(o) = order {
-            query_params.insert("order".to_string(), o.to_string());
-        }
-        if let Some(a) = after {
-            query_params.insert("after".to_string(), a.to_string());
-        }
         super::conversations::list_conversation_items(
             &self.responses_components.conversation_storage,
             &self.responses_components.conversation_item_storage,
             conversation_id,
-            query_params,
+            limit,
+            order,
+            after,
         )
         .await
     }

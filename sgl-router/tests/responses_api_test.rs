@@ -1,7 +1,5 @@
 // Integration test for Responses API
 
-use std::collections::HashMap;
-
 use axum::http::StatusCode;
 use sgl_model_gateway::protocols::{
     common::{GenerationRequest, ToolChoice, ToolChoiceValue, UsageInfo},
@@ -1369,7 +1367,9 @@ async fn test_conversation_items_delete() {
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
         conv_id,
-        HashMap::new(),
+        None,
+        None,
+        None,
     )
     .await;
     let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
@@ -1393,7 +1393,9 @@ async fn test_conversation_items_delete() {
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
         conv_id,
-        HashMap::new(),
+        None,
+        None,
+        None,
     )
     .await;
     let list_bytes2 = axum::body::to_bytes(list_resp2.into_body(), usize::MAX)
@@ -1612,7 +1614,9 @@ async fn test_conversation_items_multi_conversation_sharing() {
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
         conv_a_id,
-        HashMap::new(),
+        None,
+        None,
+        None,
     )
     .await;
     let list_a_bytes = axum::body::to_bytes(list_a.into_body(), usize::MAX)
@@ -1625,7 +1629,9 @@ async fn test_conversation_items_multi_conversation_sharing() {
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
         conv_b_id,
-        HashMap::new(),
+        None,
+        None,
+        None,
     )
     .await;
     let list_b_bytes = axum::body::to_bytes(list_b.into_body(), usize::MAX)
@@ -1648,7 +1654,9 @@ async fn test_conversation_items_multi_conversation_sharing() {
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
         conv_a_id,
-        HashMap::new(),
+        None,
+        None,
+        None,
     )
     .await;
     let list_a2_bytes = axum::body::to_bytes(list_a2.into_body(), usize::MAX)
@@ -1662,7 +1670,9 @@ async fn test_conversation_items_multi_conversation_sharing() {
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
         conv_b_id,
-        HashMap::new(),
+        None,
+        None,
+        None,
     )
     .await;
     let list_b2_bytes = axum::body::to_bytes(list_b2.into_body(), usize::MAX)

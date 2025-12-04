@@ -1,6 +1,6 @@
 //! Conversation CRUD handlers - shared across routers
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     http::StatusCode,
@@ -17,6 +17,28 @@ use crate::data_connector::{
 };
 
 pub const MAX_METADATA_PROPERTIES: usize = 16;
+
+/// Helper to check conversation exists, returning appropriate error response if not
+async fn ensure_conversation_exists(
+    conversation_storage: &Arc<dyn ConversationStorage>,
+    conv_id: &ConversationId,
+) -> Result<Conversation, Response> {
+    match conversation_storage.get_conversation(conv_id).await {
+        Ok(Some(conv)) => Ok(conv),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Conversation not found"})),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": format!("Failed to get conversation: {}", e)
+            })),
+        )
+            .into_response()),
+    }
+}
 
 const SUPPORTED_ITEM_TYPES: &[&str] = &[
     "message",
@@ -241,27 +263,9 @@ pub async fn delete_conversation(
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    match conversation_storage
-        .get_conversation(&conversation_id)
-        .await
+    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
     {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Conversation not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to get conversation: {}", e)
-                })),
-            )
-                .into_response();
-        }
+        return response;
     }
 
     match conversation_storage
@@ -294,53 +298,27 @@ pub async fn list_conversation_items(
     conversation_storage: &Arc<dyn ConversationStorage>,
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &str,
-    query_params: HashMap<String, String>,
+    limit: Option<usize>,
+    order: Option<&str>,
+    after: Option<&str>,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    match conversation_storage
-        .get_conversation(&conversation_id)
-        .await
+    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
     {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Conversation not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to get conversation: {}", e)
-                })),
-            )
-                .into_response();
-        }
+        return response;
     }
 
-    let limit: usize = query_params
-        .get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
-
-    let after = query_params.get("after").map(|s| s.to_string());
-
-    let order = query_params
-        .get("order")
-        .and_then(|s| match s.as_str() {
-            "asc" => Some(SortOrder::Asc),
-            "desc" => Some(SortOrder::Desc),
-            _ => None,
-        })
-        .unwrap_or(SortOrder::Desc);
+    let limit = limit.unwrap_or(100);
+    let order = match order {
+        Some("asc") => SortOrder::Asc,
+        _ => SortOrder::Desc,
+    };
 
     let params = ListParams {
         limit,
         order,
-        after,
+        after: after.map(String::from),
     };
 
     match item_storage.list_items(&conversation_id, params).await {
@@ -387,27 +365,9 @@ pub async fn create_conversation_items(
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    match conversation_storage
-        .get_conversation(&conversation_id)
-        .await
+    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
     {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Conversation not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to get conversation: {}", e)
-                })),
-            )
-                .into_response();
-        }
+        return response;
     }
 
     let items_array = match body.get("items").and_then(|v| v.as_array()) {
@@ -634,27 +594,9 @@ pub async fn get_conversation_item(
     let conversation_id = ConversationId::from(conv_id);
     let item_id = ConversationItemId::from(item_id);
 
-    match conversation_storage
-        .get_conversation(&conversation_id)
-        .await
+    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
     {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Conversation not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to get conversation: {}", e)
-                })),
-            )
-                .into_response();
-        }
+        return response;
     }
 
     let is_linked = match item_storage
@@ -705,28 +647,11 @@ pub async fn delete_conversation_item(
     let conversation_id = ConversationId::from(conv_id);
     let item_id = ConversationItemId::from(item_id);
 
-    let conversation = match conversation_storage
-        .get_conversation(&conversation_id)
-        .await
-    {
-        Ok(Some(conv)) => conv,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Conversation not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to get conversation: {}", e)
-                })),
-            )
-                .into_response();
-        }
-    };
+    let conversation =
+        match ensure_conversation_exists(conversation_storage, &conversation_id).await {
+            Ok(conv) => conv,
+            Err(response) => return response,
+        };
 
     match item_storage.delete_item(&conversation_id, &item_id).await {
         Ok(_) => {
@@ -850,63 +775,32 @@ pub fn item_to_json(item: &ConversationItem) -> Value {
         obj.insert("role".to_string(), json!(role));
     }
 
-    match item.item_type.as_str() {
-        "mcp_call" => {
-            if let Some(content_obj) = item.content.as_object() {
-                if let Some(name) = content_obj.get("name") {
-                    obj.insert("name".to_string(), name.clone());
-                }
-                if let Some(arguments) = content_obj.get("arguments") {
-                    obj.insert("arguments".to_string(), arguments.clone());
-                }
-                if let Some(output) = content_obj.get("output") {
-                    obj.insert("output".to_string(), output.clone());
-                }
-                if let Some(server_label) = content_obj.get("server_label") {
-                    obj.insert("server_label".to_string(), server_label.clone());
-                }
-                if let Some(approval_request_id) = content_obj.get("approval_request_id") {
-                    obj.insert(
-                        "approval_request_id".to_string(),
-                        approval_request_id.clone(),
-                    );
-                }
-                if let Some(error) = content_obj.get("error") {
-                    obj.insert("error".to_string(), error.clone());
+    // Map item types to their expected fields
+    let fields: Option<&[&str]> = match item.item_type.as_str() {
+        "mcp_call" => Some(&[
+            "name",
+            "arguments",
+            "output",
+            "server_label",
+            "approval_request_id",
+            "error",
+        ]),
+        "mcp_list_tools" => Some(&["tools", "server_label"]),
+        "function_call" => Some(&["call_id", "name", "arguments", "output"]),
+        "function_call_output" => Some(&["call_id", "output"]),
+        _ => None,
+    };
+
+    if let Some(fields) = fields {
+        if let Some(content_obj) = item.content.as_object() {
+            for field in fields {
+                if let Some(value) = content_obj.get(*field) {
+                    obj.insert((*field).to_string(), value.clone());
                 }
             }
         }
-        "mcp_list_tools" => {
-            if let Some(content_obj) = item.content.as_object() {
-                if let Some(tools) = content_obj.get("tools") {
-                    obj.insert("tools".to_string(), tools.clone());
-                }
-                if let Some(server_label) = content_obj.get("server_label") {
-                    obj.insert("server_label".to_string(), server_label.clone());
-                }
-            }
-        }
-        "function_call" => {
-            if let Some(content_obj) = item.content.as_object() {
-                for field in ["call_id", "name", "arguments", "output"] {
-                    if let Some(value) = content_obj.get(field) {
-                        obj.insert(field.to_string(), value.clone());
-                    }
-                }
-            }
-        }
-        "function_call_output" => {
-            if let Some(content_obj) = item.content.as_object() {
-                for field in ["call_id", "output"] {
-                    if let Some(value) = content_obj.get(field) {
-                        obj.insert(field.to_string(), value.clone());
-                    }
-                }
-            }
-        }
-        _ => {
-            obj.insert("content".to_string(), item.content.clone());
-        }
+    } else {
+        obj.insert("content".to_string(), item.content.clone());
     }
 
     if let Some(status) = &item.status {
@@ -917,7 +811,7 @@ pub fn item_to_json(item: &ConversationItem) -> Value {
 }
 
 pub fn conversation_to_json(conversation: &Conversation) -> Value {
-    let mut response = json!({
+    let mut obj = json!({
         "id": conversation.id.0,
         "object": "conversation",
         "created_at": conversation.created_at.timestamp()
@@ -925,11 +819,9 @@ pub fn conversation_to_json(conversation: &Conversation) -> Value {
 
     if let Some(metadata) = &conversation.metadata {
         if !metadata.is_empty() {
-            if let Some(obj) = response.as_object_mut() {
-                obj.insert("metadata".to_string(), Value::Object(metadata.clone()));
-            }
+            obj["metadata"] = Value::Object(metadata.clone());
         }
     }
 
-    response
+    obj
 }
