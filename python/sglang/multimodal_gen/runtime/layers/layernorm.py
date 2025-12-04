@@ -10,11 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
-from sglang.multimodal_gen.runtime.layers.triton_ops import (
-    fuse_scale_shift_kernel,
-    norm_infer,
-    rms_norm_fn,
-)
+from sglang.multimodal_gen.runtime.layers.triton_ops import norm_infer, rms_norm_fn
 from sglang.multimodal_gen.runtime.utils.common import (
     get_bool_env_var,
     is_cpu,
@@ -30,8 +26,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 
-from sgl_kernel import fused_add_rmsnorm, rmsnorm
-from sgl_kernel import scale_residual_norm_scale_shit
+from sgl_kernel import fused_add_rmsnorm, rmsnorm, scale_residual_norm_scale_shit
 
 
 # Copied and adapted from sglang
@@ -313,11 +308,15 @@ class ScaleResidualNormScaleShift(CustomOp):
         scale: torch.Tensor,
     ):
         scale_residual_norm_scale_shit(
-            residual, x,
+            residual,
+            x,
             gate if isinstance(gate, torch.Tensor) else None,
-            self.norm.weight, self.norm.bias,
-            scale, shift,
-            self.eps, self.norm_type,
+            self.norm.weight,
+            self.norm.bias,
+            scale,
+            shift,
+            self.eps,
+            self.norm_type,
         )
 
     def forward_native(
@@ -343,11 +342,11 @@ class ScaleResidualNormScaleShift(CustomOp):
         else:
             residual_out = residual + x * gate
         # 2. normalize
-        if self.norm_type == "layer":   # LayerNorm
+        if self.norm_type == "layer":  # LayerNorm
             mean = residual_out.mean(dim=-1, keepdim=True)
             var = residual_out.var(dim=-1, unbiased=False, keepdim=True)
             normalized = (residual_out - mean) / torch.sqrt(var + self.eps)
-        elif self.norm_type == "rms":   # RMSNorm
+        elif self.norm_type == "rms":  # RMSNorm
             rms = residual_out.pow(2).mean(dim=-1, keepdim=True)
             normalized = residual_out / torch.sqrt(rms + self.eps)
         # 3. apply affine transform if given
@@ -363,7 +362,10 @@ class ScaleResidualNormScaleShift(CustomOp):
                 # (), (1) → (B, S, D)
                 scale = scale.expand(batch, seq_len, hidden_dim)
                 shift = shift.expand(batch, seq_len, hidden_dim)
-            elif scale.ndim == 2 and scale.shape in [(1, hidden_dim), (batch, hidden_dim)]:
+            elif scale.ndim == 2 and scale.shape in [
+                (1, hidden_dim),
+                (batch, hidden_dim),
+            ]:
                 # (B, D) or (1, D) → (B, S, 1, D)
                 scale = scale[:, None, :].expand(batch, seq_len, hidden_dim)
                 shift = shift[:, None, :].expand(batch, seq_len, hidden_dim)
@@ -382,7 +384,9 @@ class ScaleResidualNormScaleShift(CustomOp):
             frame_seqlen = normalized.shape[1] // num_frames
             normalized = (
                 normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                * (1.0 + scale) + shift).flatten(1, 2)
+                * (1.0 + scale)
+                + shift
+            ).flatten(1, 2)
         return normalized, residual_out
 
 

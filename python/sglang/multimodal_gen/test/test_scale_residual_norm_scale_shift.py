@@ -1,11 +1,12 @@
-
-from sglang.test.test_utils import CustomTestCase
-from sglang.multimodal_gen.runtime.layers.layernorm import ScaleResidualNormScaleShift
 import random
 import unittest
+from typing import Tuple
+
 import torch
 from torch import Tensor
-from typing import Tuple
+
+from sglang.multimodal_gen.runtime.layers.layernorm import ScaleResidualNormScaleShift
+from sglang.test.test_utils import CustomTestCase
 
 
 def is_float(value):
@@ -16,7 +17,9 @@ def is_float(value):
         return False
 
 
-def allclose_with_tolerance(x: Tensor, y: Tensor, atol: float, rtol: float, max_ratio=0.005) -> Tuple[bool, str]:
+def allclose_with_tolerance(
+    x: Tensor, y: Tensor, atol: float, rtol: float, max_ratio=0.005
+) -> Tuple[bool, str]:
     diff = torch.abs(x - y)
     th = atol + rtol * torch.abs(y)
 
@@ -25,6 +28,7 @@ def allclose_with_tolerance(x: Tensor, y: Tensor, atol: float, rtol: float, max_
     bad_ratio = bad_mask.float().mean().item()
 
     return bad_ratio <= max_ratio, f"{bad_ratio:.6f} > {max_ratio}"
+
 
 ################################################################################
 # Accuracy Test
@@ -42,8 +46,7 @@ class TestScaleResidualNormScaleShiftAccuracy(CustomTestCase):
     USE_BIAS = [False, True]
     NORM_TYPE = ["rms", "layer"]
     GATE_SHAPE = ["1", "1D", "B1D", "BF1D"]
-    SCALE_SHIFT_SHAPE = ["1.2", "[1]", "BD",
-                         "1D", "BSD", "B1D", "1SD", "11D", "BF1D"]
+    SCALE_SHIFT_SHAPE = ["1.2", "[1]", "BD", "1D", "BSD", "B1D", "1SD", "11D", "BF1D"]
     SEEDS = [0]
 
     args = [
@@ -78,7 +81,8 @@ class TestScaleResidualNormScaleShiftAccuracy(CustomTestCase):
         torch.set_default_device("cuda")
 
     def _run_fused_test(
-        self, **params,
+        self,
+        **params,
     ):
         dtype = params["dtype"]
         param_type = params["param_type"]
@@ -95,7 +99,11 @@ class TestScaleResidualNormScaleShiftAccuracy(CustomTestCase):
 
         torch.manual_seed(seed)
         layer = ScaleResidualNormScaleShift(
-            hidden_size, elementwise_affine=use_affine, bias=use_bias, dtype=param_type, norm_type=norm_type
+            hidden_size,
+            elementwise_affine=use_affine,
+            bias=use_bias,
+            dtype=param_type,
+            norm_type=norm_type,
         )
         if use_affine:
             w = torch.empty_like(layer.norm.weight)
@@ -154,19 +162,24 @@ class TestScaleResidualNormScaleShiftAccuracy(CustomTestCase):
 
         with torch.inference_mode():
             ref_out_mod, ref_out_resi = layer.forward_native(
-                residual, x, gate, shift, scale)
+                residual, x, gate, shift, scale
+            )
             out_mod, out_resi = layer(residual, x, gate, shift, scale)
 
         if dtype == torch.float32 and param_type == torch.float32:
-            self.assertTrue(*allclose_with_tolerance(
-                out_mod, ref_out_mod, atol=1e-6, rtol=1e-4))
-            self.assertTrue(*allclose_with_tolerance(
-                out_resi, ref_out_resi, atol=1e-6, rtol=1e-4))
+            self.assertTrue(
+                *allclose_with_tolerance(out_mod, ref_out_mod, atol=1e-6, rtol=1e-4)
+            )
+            self.assertTrue(
+                *allclose_with_tolerance(out_resi, ref_out_resi, atol=1e-6, rtol=1e-4)
+            )
         else:
-            self.assertTrue(*allclose_with_tolerance(
-                out_mod, ref_out_mod, atol=5e-2, rtol=1e-2))
-            self.assertTrue(*allclose_with_tolerance(
-                out_resi, ref_out_resi, atol=5e-2, rtol=1e-2))
+            self.assertTrue(
+                *allclose_with_tolerance(out_mod, ref_out_mod, atol=5e-2, rtol=1e-2)
+            )
+            self.assertTrue(
+                *allclose_with_tolerance(out_resi, ref_out_resi, atol=5e-2, rtol=1e-2)
+            )
 
     def test_fused(self):
         for params in self.gen_cases(num=300):
