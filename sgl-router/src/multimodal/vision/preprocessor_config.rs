@@ -6,9 +6,96 @@
 use std::collections::HashMap;
 
 use image::imageops::FilterType;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::transforms;
+
+/// Struct to represent patch_size as dict {"height": x, "width": y}
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PatchSize {
+    pub height: Option<u32>,
+    pub width: Option<u32>,
+}
+
+/// Custom deserializer for patch_size that handles both integer and dict formats.
+/// - Integer format: `"patch_size": 16` -> PatchSize { height: 16, width: 16 }
+/// - Dict format: `"patch_size": {"height": 16, "width": 16}` -> PatchSize { height: 16, width: 16 }
+fn deserialize_patch_size<'de, D>(deserializer: D) -> Result<Option<PatchSize>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use std::fmt;
+
+    use serde::de::{self, MapAccess, Visitor};
+
+    struct PatchSizeVisitor;
+
+    impl<'de> Visitor<'de> for PatchSizeVisitor {
+        type Value = Option<PatchSize>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an integer, a dict with height/width, or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let v = value as u32;
+            Ok(Some(PatchSize {
+                height: Some(v),
+                width: Some(v),
+            }))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            let v = value as u32;
+            Ok(Some(PatchSize {
+                height: Some(v),
+                width: Some(v),
+            }))
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut height = None;
+            let mut width = None;
+
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "height" => height = Some(map.next_value::<u32>()?),
+                    "width" => width = Some(map.next_value::<u32>()?),
+                    _ => {
+                        let _ = map.next_value::<de::IgnoredAny>()?;
+                    }
+                }
+            }
+
+            Ok(Some(PatchSize { height, width }))
+        }
+    }
+
+    deserializer.deserialize_any(PatchSizeVisitor)
+}
 
 /// HuggingFace preprocessor_config.json structure.
 ///
@@ -73,8 +160,9 @@ pub struct PreProcessorConfig {
     // Model-specific fields
     // =====================
     /// Vision encoder patch size (typically 14 or 16)
-    #[serde(default)]
-    pub patch_size: Option<usize>,
+    /// Can be an integer or a dict {"height": x, "width": y}
+    #[serde(default, deserialize_with = "deserialize_patch_size")]
+    pub patch_size: Option<PatchSize>,
 
     /// Qwen-VL: merge size for token reduction
     #[serde(default)]
@@ -149,6 +237,17 @@ impl PreProcessorConfig {
     /// Parse from JSON value.
     pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
         serde_json::from_value(value)
+    }
+
+    /// Get patch size as a simple usize.
+    ///
+    /// Returns the height value from PatchSize if available, falling back to provided default.
+    pub fn get_patch_size(&self, default: usize) -> usize {
+        self.patch_size
+            .as_ref()
+            .and_then(|p| p.height)
+            .map(|h| h as usize)
+            .unwrap_or(default)
     }
 
     /// Get image mean as fixed array, with fallback to CLIP defaults.
@@ -310,7 +409,7 @@ mod tests {
 
         assert_eq!(config.min_pixels, Some(200704));
         assert_eq!(config.max_pixels, Some(1003520));
-        assert_eq!(config.patch_size, Some(14));
+        assert_eq!(config.get_patch_size(0), 14);
         assert_eq!(config.merge_size, Some(2));
         assert!((config.get_rescale_factor() - 1.0 / 255.0).abs() < 1e-10);
     }
