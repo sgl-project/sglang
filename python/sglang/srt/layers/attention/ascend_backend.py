@@ -534,26 +534,31 @@ class AscendAttnBackend(AttentionBackend):
 
             else:
                 if layer.qk_head_dim <= 128:
-                    query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+                    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     attn_output = torch.empty(
-                        (query.shape[0], layer.tp_q_head_num * layer.v_head_dim),
-                        dtype=query.dtype,
-                        device=query.device,
+                        (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
+                        device=q.device,
+                        dtype=q.dtype,
+                    )
+                    q_len_offset = 0
+                    for q_len in forward_batch.seq_lens:
+                        attn_output[q_len_offset : q_len_offset + q_len] = (
+                            torch.ops.npu.npu_fused_infer_attention_score(
+                                q[None, q_len_offset : q_len_offset + q_len],
+                                k[None, q_len_offset : q_len_offset + q_len],
+                                v[None, q_len_offset : q_len_offset + q_len],
+                                num_heads=layer.tp_q_head_num,
+                                num_key_value_heads=layer.tp_k_head_num,
+                                input_layout="BSND",
+                                scale=layer.scaling,
+                                next_tokens=0,
+                            )[0]
+                        )
+                        q_len_offset += q_len
+                    attn_output = attn_output.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
                     )
 
-                    torch_npu._npu_flash_attention_qlens(
-                        query=query,
-                        key_cache=k_cache,
-                        value_cache=v_cache,
-                        mask=self.mask,
-                        block_table=self.forward_metadata.block_tables,
-                        seq_len=self.forward_metadata.extend_seq_lens_cpu_int,
-                        context_lens=self.forward_metadata.seq_lens_cpu_int,
-                        scale_value=layer.scaling,
-                        num_heads=layer.tp_q_head_num,
-                        num_kv_heads=layer.tp_k_head_num,
-                        out=attn_output,
-                    )
                 else:
                     if layer.qk_head_dim != layer.v_head_dim:
                         attn_output = q.new_empty(
