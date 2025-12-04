@@ -66,55 +66,6 @@ pub const PATCH_SIZE: usize = 14;
 /// Contains (pixel_values, attention_mask, (height, width), num_tokens).
 type SingleImageResult = (Array4<f32>, Array3<u32>, (u32, u32), usize);
 
-/// Cubic interpolation weight function (Keys bicubic kernel with a=-0.5).
-///
-/// This matches PyTorch's bicubic interpolation.
-#[inline]
-fn cubic_weight(x: f32) -> f32 {
-    let x = x.abs();
-    if x < 1.0 {
-        (1.5 * x - 2.5) * x * x + 1.0
-    } else if x < 2.0 {
-        ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0
-    } else {
-        0.0
-    }
-}
-
-/// Perform bicubic interpolation at a single point.
-///
-/// Uses a 4x4 kernel with Keys bicubic weights (a=-0.5) to match PyTorch.
-fn bicubic_interpolate(
-    tensor: &Array3<f32>,
-    c: usize,
-    src_y: f32,
-    src_x: f32,
-    h: usize,
-    w: usize,
-) -> f32 {
-    let y_int = src_y.floor() as i32;
-    let x_int = src_x.floor() as i32;
-    let y_frac = src_y - y_int as f32;
-    let x_frac = src_x - x_int as f32;
-
-    let mut result = 0.0f32;
-
-    // Sample 4x4 neighborhood
-    for dy in -1..=2 {
-        let y_idx = (y_int + dy).clamp(0, h as i32 - 1) as usize;
-        let y_weight = cubic_weight(y_frac - dy as f32);
-
-        for dx in -1..=2 {
-            let x_idx = (x_int + dx).clamp(0, w as i32 - 1) as usize;
-            let x_weight = cubic_weight(x_frac - dx as f32);
-
-            result += tensor[[c, y_idx, x_idx]] * y_weight * x_weight;
-        }
-    }
-
-    result
-}
-
 /// Phi4-Vision image processor.
 ///
 /// Implements Dynamic HD transform with aspect ratio matching.
@@ -350,31 +301,11 @@ impl Phi4VisionProcessor {
 
     /// Create global image by bicubic interpolation to base resolution.
     ///
-    /// Uses PyTorch-compatible bicubic interpolation with align_corners=False.
-    /// This matches torch.nn.functional.interpolate(mode='bicubic').
+    /// Uses the shared `bicubic_resize` which matches PyTorch's
+    /// `torch.nn.functional.interpolate(mode='bicubic', align_corners=False)`.
     fn create_global_image(&self, tensor: &Array3<f32>) -> Array3<f32> {
-        let (c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
         let target = self.base_resolution as usize;
-
-        let mut global = Array3::<f32>::zeros((c, target, target));
-
-        let scale_h = h as f32 / target as f32;
-        let scale_w = w as f32 / target as f32;
-
-        for ch in 0..c {
-            for y in 0..target {
-                for x in 0..target {
-                    // PyTorch align_corners=False: src = (dst + 0.5) * scale - 0.5
-                    let src_y = (y as f32 + 0.5) * scale_h - 0.5;
-                    let src_x = (x as f32 + 0.5) * scale_w - 0.5;
-
-                    let value = bicubic_interpolate(tensor, ch, src_y, src_x, h, w);
-                    global[[ch, y, x]] = value;
-                }
-            }
-        }
-
-        global
+        transforms::bicubic_resize(tensor, target, target)
     }
 
     /// Tile the HD image into crops of base_resolution x base_resolution.
