@@ -99,7 +99,6 @@ jobs:
           echo "Kubelete config file is generated: ${ASCEND_TEST_CASE_PATH}/k8s_single.yaml"
 
           echo "================clear resources=================="
-          cd $ASCEND_TEST_CASE_PATH
           kubectl delete -f ./k8s_single.yaml --ignore-not-found=true || true
 
           pod_name_prefix="${KUBE_JOB_NAME}"
