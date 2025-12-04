@@ -1,5 +1,6 @@
 """Utilities for running stress tests with bench_serving."""
 
+import json
 import os
 import re
 import subprocess
@@ -92,6 +93,88 @@ class StressTestRunner:
             command.extend(extra_args)
 
         return command
+
+    def _parse_metrics_from_jsonl(self, output_file: str) -> Dict[str, float]:
+        """Parse metrics from bench_serving JSONL output file.
+
+        Args:
+            output_file: Path to the output JSONL file
+
+        Returns:
+            Dictionary containing calculated metrics
+        """
+        import statistics
+
+        metrics = {}
+
+        if not os.path.exists(output_file):
+            print(f"Output file not found: {output_file}")
+            return metrics
+
+        try:
+            # Read all completed requests from JSONL
+            requests = []
+            with open(output_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            req = json.loads(line)
+                            if req.get("success"):
+                                requests.append(req)
+                        except json.JSONDecodeError:
+                            continue
+
+            if not requests:
+                print("No successful requests found in output file")
+                return metrics
+
+            # Calculate metrics from the requests
+            metrics["completed"] = len(requests)
+
+            # Duration: time from first to last request
+            start_times = [
+                r.get("start_time", 0) for r in requests if r.get("start_time")
+            ]
+            latencies = [r.get("latency", 0) for r in requests if r.get("latency")]
+
+            if start_times and latencies:
+                first_start = min(start_times)
+                last_completion = max(
+                    start_times[i] + latencies[i] for i in range(len(start_times))
+                )
+                duration = last_completion - first_start
+                metrics["duration"] = duration
+
+                # Throughput
+                if duration > 0:
+                    metrics["request_throughput"] = len(requests) / duration
+
+            # Output token throughput
+            output_lens = [
+                r.get("output_len", 0) for r in requests if r.get("output_len")
+            ]
+            if output_lens and metrics.get("duration"):
+                total_output_tokens = sum(output_lens)
+                metrics["output_throughput"] = total_output_tokens / metrics["duration"]
+
+            # TTFT metrics
+            ttfts = [
+                r.get("ttft", 0) * 1000 for r in requests if r.get("ttft")
+            ]  # Convert to ms
+            if ttfts:
+                metrics["mean_ttft_ms"] = statistics.mean(ttfts)
+                metrics["median_ttft_ms"] = statistics.median(ttfts)
+                if len(ttfts) > 1:
+                    sorted_ttfts = sorted(ttfts)
+                    p99_idx = int(len(sorted_ttfts) * 0.99)
+                    metrics["p99_ttft_ms"] = sorted_ttfts[p99_idx]
+
+            return metrics
+
+        except Exception as e:
+            print(f"Error parsing JSONL file: {e}")
+            return metrics
 
     def _parse_metrics_from_output(self, output: str) -> Dict[str, float]:
         """Parse benchmark metrics from bench_serving output.
@@ -232,22 +315,23 @@ class StressTestRunner:
 
             result = self.run_stress_test_command(command, timeout_minutes)
 
-            # Parse metrics from output (try both stdout and stderr)
-            metrics = self._parse_metrics_from_output(result.stdout)
-            if not metrics and result.stderr:
-                # Sometimes metrics are in stderr, try that too
-                metrics = self._parse_metrics_from_output(result.stderr)
+            # Try to parse metrics from JSONL file first (most reliable)
+            print(f"\nAttempting to parse metrics from JSONL file: {output_file}")
+            metrics = self._parse_metrics_from_jsonl(output_file)
+
+            # If JSONL parsing failed, try stdout/stderr as fallback
+            if not metrics:
+                print("JSONL parsing failed, trying stdout/stderr...")
+                metrics = self._parse_metrics_from_output(result.stdout)
+                if not metrics and result.stderr:
+                    metrics = self._parse_metrics_from_output(result.stderr)
 
             # Debug: print parsed metrics
             print(f"\nParsed metrics: {metrics}")
             if not metrics:
-                print("WARNING: No metrics were parsed from output!")
+                print("WARNING: No metrics were parsed!")
                 print(f"stdout length: {len(result.stdout)} chars")
                 print(f"stderr length: {len(result.stderr)} chars")
-                # Print a sample of stdout to debug
-                if result.stdout:
-                    print("Sample stdout (last 500 chars):")
-                    print(result.stdout[-500:])
 
             print(f"\nStress test completed successfully for {model_path}")
             self._add_success_to_report(
