@@ -1,4 +1,4 @@
-name: Release Docker Images Nightly (NPU)
+name: Release Docker PR Images Nightly (NPU)
 on:
   pull_request:
     branches:
