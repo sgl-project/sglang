@@ -303,6 +303,105 @@ void fused_rmsnorm_gated_kernel_impl(
 }  // anonymous namespace
 
 template <typename scalar_t>
+void layernorm_kernel_impl(
+    scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    float* __restrict__ buffer,
+    int64_t batch_size,
+    int64_t hidden_size,
+    int64_t input_strideN,
+    float eps = 1e-5) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int kVecSize = bVec::size();
+  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+    int tid = at::get_thread_num();
+    float* __restrict__ buffer_ptr = buffer + tid * hidden_size;
+
+    for (int64_t i = begin; i < end; ++i) {
+      scalar_t* __restrict__ input_ptr = input + i * input_strideN;
+      fVec sum_fvec = fVec(float(0));
+      float sum_val = float(0);
+      int64_t d;
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        bVec x_bvec = bVec::loadu(input_ptr + d);
+        fVec x_fvec0, x_fvec1;
+        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+
+        sum_fvec += x_fvec0;
+        sum_fvec += x_fvec1;
+
+        x_fvec0.store(buffer_ptr + d);
+        x_fvec1.store(buffer_ptr + d + fVec::size());
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float x_val = static_cast<float>(input_ptr[d]);
+        sum_val += x_val;
+        buffer_ptr[d] = x_val;
+      }
+
+      // Compute mean
+      sum_val += vec_reduce_sum(sum_fvec);
+      float mean = sum_val / hidden_size;
+      const fVec mean_fvec = fVec(mean);
+
+      // Second pass: compute variance
+      fVec var_sum_fvec = fVec(float(0));
+      float var_sum_val = float(0);
+
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
+        fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
+
+        fVec diff0 = x_fvec0 - mean_fvec;
+        fVec diff1 = x_fvec1 - mean_fvec;
+
+        var_sum_fvec += diff0 * diff0;
+        var_sum_fvec += diff1 * diff1;
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float diff = buffer_ptr[d] - mean;
+        var_sum_val += diff * diff;
+      }
+
+      // Compute normalization factor
+      var_sum_val += vec_reduce_sum(var_sum_fvec);
+      float variance = var_sum_val / hidden_size;
+      float rsqrt_var = float(1) / std::sqrt(variance + eps);
+      const fVec scale_fvec = fVec(rsqrt_var);
+
+      // Third pass: apply normalization
+#pragma GCC unroll 4
+      for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
+        fVec x_fvec0 = fVec::loadu(buffer_ptr + d);
+        fVec x_fvec1 = fVec::loadu(buffer_ptr + d + fVec::size());
+
+        bVec w_bvec = bVec::loadu(weight + d);
+        fVec w_fvec0, w_fvec1;
+        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+
+        x_fvec0 = (x_fvec0 - mean_fvec) * scale_fvec * w_fvec0;
+        x_fvec1 = (x_fvec1 - mean_fvec) * scale_fvec * w_fvec1;
+
+        bVec x_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+        x_bvec.store(input_ptr + d);
+      }
+#pragma GCC unroll 4
+      for (; d < hidden_size; ++d) {
+        float normalized = (buffer_ptr[d] - mean) * rsqrt_var;
+        float x_val = normalized * static_cast<float>(weight[d]);
+        input_ptr[d] = static_cast<scalar_t>(x_val);
+      }
+    }
+  });
+}  // anonymous namespace
+
+template <typename scalar_t>
 void fused_add_layernorm_kernel_impl(
     scalar_t* __restrict__ input,
     scalar_t* __restrict__ residual,
