@@ -88,6 +88,7 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
+        print(logits)
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
@@ -121,7 +122,7 @@ class Sampler(nn.Module):
             ):
                 logits[:] = torch.softmax(logits, dim=-1)
             probs = logits
-            # del logits
+            del logits
 
             if can_sample_directly_from_probs:
                 # when we don't need top-k, top-p, or min-p sampling, we can directly sample from the probs
