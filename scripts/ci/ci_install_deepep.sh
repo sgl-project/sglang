@@ -46,9 +46,6 @@ if [ ! -e "$LIB_PATH/libmlx5.so" ]; then
 fi
 apt-get update && apt-get install -y libfabric-dev
 
-# Install NVSHMEM
-pip install nvidia-nvshmem-cu12==3.4.5 --force-reinstall
-
 # Install DeepEP
 DEEPEP_DIR=/root/.cache/deepep
 rm -rf ${DEEPEP_DIR}
