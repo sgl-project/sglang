@@ -123,6 +123,7 @@ http-body-util = "0.1"
 portpicker = "0.1"
 tempfile = "3.8"
 lazy_static = "1.4"
+npyz = { version = "0.8", features = ["npz"] }  # For reading numpy .npz files in golden tests
 
 [[bench]]
 name = "request_processing"
