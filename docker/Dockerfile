@@ -236,6 +236,14 @@ RUN set -eux; \
       echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ; \
     fi && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
+<<<<<<< HEAD
+=======
+        git clone https://github.com/fzyzcjy/DeepEP.git && \
+        cd DeepEP && \
+        git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
+        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        cd .. ; \
+>>>>>>> 3c08e2de2cdf81c7d3c7c17c38ad269d33b6e168
       git clone https://github.com/fzyzcjy/DeepEP.git && \
       cd DeepEP && \
       git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
