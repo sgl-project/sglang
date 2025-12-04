@@ -141,7 +141,6 @@ class MTPDraftExtendCudaGraphRunner:
                     )
                 else:
                     assert self.require_attn_tp_gather
-                    assert False, "assume not reached"
                     self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                     self.global_num_tokens_for_logprob_gpu = torch.zeros(
                         (1,), dtype=torch.int32
@@ -446,7 +445,7 @@ class MTPDraftExtendCudaGraphRunner:
     def replay(self, forward_batch: ForwardBatch, init_state: bool = True):
         assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
-        
+
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
@@ -473,7 +472,7 @@ class MTPDraftExtendCudaGraphRunner:
         forward_batch.spec_info.num_tokens_for_logprob_per_batch = 1
         forward_batch.spec_info.positions = self.positions[:num_tokens]
         forward_batch.spec_info.extend_seq_lens_tensor = self.extend_seq_lens[:bs]
-        
+
         self.mtp_worker.draft_extend_attn_backend_list[self.step].init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=self.req_pool_indices,
@@ -518,13 +517,13 @@ class MTPMultiStepDraftExtendCudaGraphRunner:
         self.gpu_id = mtp_worker.gpu_id
         self.speculative_num_steps = mtp_worker.speculative_num_steps
         self.draft_extend_attn_backend_list = mtp_worker.draft_extend_attn_backend_list
-        
+
         self.runners = []
         self.cuda_graph_buffers = {}
         self.seq_len_fill_value = 1
         self.max_bs = 1
         self.offsets = [0]
-        
+
         self._init_and_capture()
 
     def _init_and_capture(self):
@@ -537,10 +536,10 @@ class MTPMultiStepDraftExtendCudaGraphRunner:
 
         # 1. Capture loop
         for step in range(self.speculative_num_steps):
-            if self.draft_extend_attn_backend_list[step]:                
+            if self.draft_extend_attn_backend_list[step]:
                 runner = MTPDraftExtendCudaGraphRunner(self.mtp_worker, step)
                 self.runners.append(runner)
-                
+
                 self.seq_len_fill_value = runner.seq_len_fill_value
                 self.max_bs = runner.max_bs
                 buffer_len_list.append(runner.max_num_token)
@@ -554,7 +553,7 @@ class MTPMultiStepDraftExtendCudaGraphRunner:
             self.seq_len_fill_value,
             dtype=torch.int32,
         )
-        
+
         with torch.device(self.device):
             # Sliced buffers
             self.cuda_graph_buffers['input_ids'] = torch.zeros((self.offsets[-1],), dtype=torch.int64)
@@ -600,7 +599,7 @@ class MTPMultiStepDraftExtendCudaGraphRunner:
 
     def get_runner(self, step):
         return self.runners[step]
-    
+
     def get_last_runner(self):
         return self.runners[-1] if self.runners else None
 
