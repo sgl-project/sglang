@@ -762,6 +762,7 @@ class MooncakeKVManager(CommonKVManager):
                 polls = []
                 dst_ranks_infos = []
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                assert kv_chunk.room in self.forward_results, f"kv_chunk.room {kv_chunk.room} not in forward_results"
                 batch, result = self.forward_results[kv_chunk.room]
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
@@ -896,6 +897,8 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
+                    if kv_chunk.room in self.forward_results:
+                        self.forward_results.pop(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
