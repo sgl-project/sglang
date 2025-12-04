@@ -7,6 +7,10 @@ Only logs operations on specified rank to avoid overhead.
 Usage in TP worker (automatically activated by environment variables):
     SGLANG_PROFILE_SHAPES=1 SGLANG_PROFILE_SHAPES_RANK=0 \\
     SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl python -m sglang.launch_server ...
+    
+Or with bench_one_batch_server (recommended):
+    SGLANG_PROFILE_SHAPES=1 SGLANG_PROFILE_SHAPES_RANK=0 \\
+    SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl python3 -m sglang.bench_one_batch_server ...
 """
 
 import atexit
@@ -18,6 +22,29 @@ from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
+
+# Try to import CUDA graph and torch.compile detection utilities
+try:
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+    _CAN_DETECT_CUDA_GRAPH = True
+except ImportError:
+    _CAN_DETECT_CUDA_GRAPH = False
+    def get_is_capture_mode():
+        return False
+    def is_in_piecewise_cuda_graph():
+        return False
+
+# Try to detect torch.compile mode
+def _is_torch_compile_mode():
+    """Detect if we're inside a torch.compile context."""
+    try:
+        # Check if torch._dynamo is active
+        if hasattr(torch, '_dynamo'):
+            return torch._dynamo.is_compiling() if hasattr(torch._dynamo, 'is_compiling') else False
+    except Exception:
+        pass
+    return False
 
 
 def get_current_rank() -> int:
@@ -71,17 +98,24 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
         if kwargs is None:
             kwargs = {}
         
-        # Extract input shapes before execution (if profiling)
+        # Skip shape logging during CUDA graph capture or torch.compile
+        should_skip_logging = False
+        if _CAN_DETECT_CUDA_GRAPH:
+            should_skip_logging = get_is_capture_mode() or is_in_piecewise_cuda_graph()
+        if not should_skip_logging:
+            should_skip_logging = _is_torch_compile_mode()
+        
+        # Extract input shapes before execution (if profiling and not skipping)
         input_shapes = None
         kwarg_shapes = None
-        if self.should_log and self._in_forward_pass:
+        if self.should_log and self._in_forward_pass and not should_skip_logging:
             input_shapes = self._extract_shapes(args)
             if kwargs:
                 kwarg_shapes = self._extract_shapes(kwargs)
         
         result = func(*args, **kwargs)
         
-        if self.should_log and self._in_forward_pass:
+        if self.should_log and self._in_forward_pass and not should_skip_logging:
             self._log_operation(func, input_shapes, kwarg_shapes, result)
         
         return result
@@ -155,7 +189,7 @@ class CompactRankAwareShapeLogger(TorchDispatchMode):
                     "total_operations": self.call_count,
                     "forward_passes": self._forward_pass_count,
                     "unique_operations": len(self.op_counts),
-                    "operation_counts": dict(sorted(self.op_counts.items(), key=lambda x: x[1], reverse=True)[:50]),
+                    "operation_counts": dict(sorted(self.op_counts.items(), key=lambda x: x[1], reverse=True)),
                 }
                 with open(summary_file, "w") as f:
                     json.dump(summary, f, indent=2)

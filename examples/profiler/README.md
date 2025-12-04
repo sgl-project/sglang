@@ -22,15 +22,46 @@ python profile_shapes.py \
 
 Enables profiling inside TP workers via environment variables. Profiles operations on a specific GPU rank.
 
+**Recommended: Using `bench_one_batch_server` (Cleanest Way)**
+
 ```bash
-# Profile GPU 0 with TP=8
 SGLANG_PROFILE_SHAPES=1 \
 SGLANG_PROFILE_SHAPES_RANK=0 \
-SGLANG_PROFILE_SHAPES_FILE=gpu0_shapes.jsonl \
+SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl \
+python3 -m sglang.bench_one_batch_server \
+  --model-path /data/DeepSeek-V3-0324/ \
+  --tp 8 \
+  --batch-size 1 \
+  --input-len 1024 \
+  --output-len 512 \
+  --show-report \
+  --trust-remote-code
+```
+
+**Alternative: Using `launch_server` with separate client**
+
+```bash
+# Terminal 1: Start server with profiling
+SGLANG_PROFILE_SHAPES=1 \
+SGLANG_PROFILE_SHAPES_RANK=0 \
+SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl \
 python -m sglang.launch_server \
   --model-path Qwen/Qwen2.5-14B-Instruct \
   --tp-size 8 \
   --port 30000
+
+# Terminal 2: Send requests  
+python -c "
+import openai
+client = openai.Client(base_url='http://localhost:30000/v1', api_key='none')
+for i in range(3):
+    response = client.chat.completions.create(
+        model='default',
+        messages=[{'role': 'user', 'content': f'Request {i+1}'}],
+        max_tokens=50
+    )
+    print(f'{i+1}: {response.choices[0].message.content}')
+"
 ```
 
 **Environment Variables:**
@@ -45,31 +76,7 @@ python -m sglang.launch_server \
 - ✅ Captures actual tensor operations in workers
 - ✅ Minimal overhead
 - ✅ No code modifications needed
-
-**Example with client:**
-```bash
-# Terminal 1: Start server with profiling
-SGLANG_PROFILE_SHAPES=1 SGLANG_PROFILE_SHAPES_RANK=0 \
-SGLANG_PROFILE_SHAPES_FILE=shapes.jsonl \
-python -m sglang.launch_server \
-  --model-path Qwen/Qwen2.5-14B-Instruct \
-  --tp-size 8
-
-# Terminal 2: Send a few requests  
-python -c "
-import openai
-client = openai.Client(base_url='http://localhost:30000/v1', api_key='none')
-for i in range(3):
-    response = client.chat.completions.create(
-        model='default',
-        messages=[{'role': 'user', 'content': f'Request {i+1}'}],
-        max_tokens=50
-    )
-    print(f'{i+1}: {response.choices[0].message.content}')
-"
-
-# Profiling output in shapes.jsonl tracks complete forward passes
-```
+- ✅ Automatically skips CUDA graph capture and torch.compile phases
 
 ## Which Mode to Use?
 
