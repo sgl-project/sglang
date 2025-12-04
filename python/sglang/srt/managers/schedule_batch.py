@@ -102,7 +102,6 @@ logger = logging.getLogger(__name__)
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 _BUFFER_SIZE_MB = 2048
-logger = logging.getLogger(__name__)
 
 USE_BUFFER_FOR_FEATURE = envs.SGLANG_ENABLE_MM_BUFFER.get()
 
