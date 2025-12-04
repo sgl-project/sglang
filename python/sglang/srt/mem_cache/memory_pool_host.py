@@ -666,7 +666,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 1,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             )
-        # Ascend-specific: Aligns with AscendMLAPagedTokenToKVPool layout
+        # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
         elif self.layout == "page_first_kv_split":
             base_dims = (
