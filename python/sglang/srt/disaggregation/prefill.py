@@ -373,7 +373,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch_result = None
             if batch:
                 # logger.info(f"run_batch")
-                with torch.cuda.nvtx.range("forward"):
+                with torch.cuda.nvtx.range(f"forward_{batch.batch_size()}"):
                     batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
                 self.notify_prefill_done(batch, batch_result)
