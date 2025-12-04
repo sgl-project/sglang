@@ -27,6 +27,7 @@ MODEL_SCORE_THRESHOLDS = {
     "meta-llama/Llama-3.1-70B-Instruct": 0.95,
     "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.64,
     "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": 0.84,  # MoE model from sanity_check.py - TP2 verified on MI300X
     "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.83,
     "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
     "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
@@ -56,6 +57,8 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP1 = remove_failing_models(
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2
 )
+# AMD-specific models verified on MI300X
+DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 += ",Qwen/Qwen3-30B-A3B-Thinking-2507"
 DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1 = remove_failing_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1
 )
