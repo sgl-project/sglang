@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -127,8 +128,8 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         # FIXME: remove dllm workarounds from flashinfer
-        self.is_dllm_model = model_runner.server_args.dllm_algorithm is not None
-        self.dllm_block_size = model_runner.server_args.dllm_block_size
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm_model = self.dllm_config is not None
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -662,7 +663,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens,
                 seq_lens.cpu(),  # may add a little overhead in capture stage
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_block_size,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=True,
                 encoder_lens=encoder_lens,
@@ -726,7 +727,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_block_size,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=True,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
