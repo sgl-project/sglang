@@ -100,6 +100,20 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap);
 
+// linear attention
+std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& g,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state,
+    bool output_final_state,
+    const at::Tensor& cu_seqlens,
+    bool head_first,
+    bool use_qk_l2norm_in_kernel,
+    double eps = 1e-5);
+
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
 
@@ -215,6 +229,32 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     int64_t kv_lora_rank,
     int64_t qk_rope_head_dim);
 
+// mamba causal conv1d
+at::Tensor causal_conv1d_weight_pack(const at::Tensor& weight);
+
+at::Tensor causal_conv1d_fwd_cpu(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<at::Tensor>& conv_states,
+    const std::optional<at::Tensor>& query_start_loc,
+    const std::optional<at::Tensor>& cache_indices,
+    const std::optional<at::Tensor>& has_initial_state,
+    bool silu_activation,
+    int64_t pad_slot_id,
+    bool is_vnni);
+
+at::Tensor causal_conv1d_update_cpu(
+    const at::Tensor& x,
+    const at::Tensor& conv_states,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens,
+    const std::optional<at::Tensor>& conv_state_indices,
+    int64_t pad_slot_id,
+    bool is_vnni);
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -235,6 +275,15 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
+
+// fused_qkvzba_split_reshape_cat_cpu
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_reshape_cat_cpu(
+    const at::Tensor& mixed_qkvz,
+    const at::Tensor& mixed_ba,
+    int64_t num_heads_qk,
+    int64_t num_heads_v,
+    int64_t head_qk,
+    int64_t head_v);
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
@@ -286,6 +335,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
+
+  // linear attn
+  m.def(
+      "chunk_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, "
+      "Tensor initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
+      "bool use_qk_l2norm_in_kernel, float eps=1e-5) -> (Tensor, Tensor)");
+  m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
 
   // weight prepack
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
@@ -353,6 +409,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "w2_scale, int[]? block_size, Tensor? a1_scale, Tensor? a2_scale, bool is_vnni) -> Tensor");
   m.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu);
 
+  // causal conv1d
+  m.def("causal_conv1d_weight_pack(Tensor weight) -> Tensor");
+  m.impl("causal_conv1d_weight_pack", torch::kCPU, &causal_conv1d_weight_pack);
+
+  m.def(
+      "causal_conv1d_fwd_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor? conv_states, Tensor? query_start_loc,"
+      "Tensor? cache_indices, Tensor? has_initial_state, bool silu_activation, int pad_slot_id, bool is_vnni) -> "
+      "Tensor");
+  m.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
+
+  m.def(
+      "causal_conv1d_update_cpu(Tensor x, Tensor conv_states, Tensor weight, Tensor? bias, bool silu_activation,"
+      "Tensor? cache_seqlens, Tensor? conv_state_indices, int pad_slot_id, bool is_vnni) -> Tensor");
+  m.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
   m.def("shm_allreduce(Tensor(a!) data, int reduce_op) -> ()");
@@ -368,6 +439,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // fused_qkvzba_split_reshape_cat_cpu
+  m.def(
+      "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
+      "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
