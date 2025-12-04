@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 import argparse
-import os
-import subprocess
 
 try:
     import mooncake
@@ -12,18 +10,6 @@ except ImportError:
     BENCH_TOOL_PATH = None
     print("Mooncake is not installed.")
     exit(0)
-
-
-def check_args(args) -> bool:
-    if not args.initiator and not args.target:
-        print("Please specify --initiator or --target")
-        return False
-
-    if args.initiator and args.mc_segment_id is None:
-        print("Please specify --mc-segment-id for initiator")
-        return False
-
-    return True
 
 
 def run_cmd(args):
@@ -46,6 +32,7 @@ def run_cmd(args):
     cmd += ["--auto_discovery"]
     print(f"Executing command: {' '.join(cmd)}")
     import subprocess
+
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
