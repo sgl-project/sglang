@@ -56,7 +56,8 @@ inline void unpack_B(
   const int K2 = K >> 1;
   const int ldb2 = ldb;  // ldb * 2 >> 1;
   const uint16_t* b_ptr = reinterpret_cast<const uint16_t*>(packed_B);
-  const __m512 vd = _mm512_set1_ps(scale);
+  const __m512 vexp = _mm512_castsi512_ps(_mm512_set1_epi32(kFP8_BIAS));
+  const __m512 vd = _mm512_mul_ps(_mm512_set1_ps(scale), vexp);
 
   constexpr int BLOCK_N = block_size_n();
   static_assert(BLOCK_N == 32);
@@ -74,8 +75,8 @@ inline void unpack_B(
     __m256i b8_0 = _mm512_extracti32x8_epi32(b8, 0);
     __m256i b8_1 = _mm512_extracti32x8_epi32(b8, 1);
 
-    __m512bh bf16_0 = CVT_FP8_TO_BF16(b8_0);
-    __m512bh bf16_1 = CVT_FP8_TO_BF16(b8_1);
+    __m512bh bf16_0 = CVT_FP8_TO_BF16_EXT(b8_0);
+    __m512bh bf16_1 = CVT_FP8_TO_BF16_EXT(b8_1);
 
     // Apply scale
     __m512 f0_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
@@ -147,6 +148,8 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
     // block quant scale
     __m512 vscale;
 
+    const __m512 vexp = _mm512_castsi512_ps(_mm512_set1_epi32(kFP8_BIAS));
+
     auto loadc = [&](auto i) {
       constexpr int col = i % COLS;
       if constexpr (has_bias) {
@@ -178,8 +181,8 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
           if constexpr (PREFETCH_SIZE_K > 0) {
             _mm_prefetch(b_ptr + (k + PREFETCH_SIZE_K) * ldb2 + col * 16, _MM_HINT_T0);
           }
-          vb[col + 0] = CVT_FP8_TO_BF16(_mm512_extracti32x8_epi32(b8, 0));
-          vb[col + 1] = CVT_FP8_TO_BF16(_mm512_extracti32x8_epi32(b8, 1));
+          vb[col + 0] = CVT_FP8_TO_BF16_EXT(_mm512_extracti32x8_epi32(b8, 0));
+          vb[col + 1] = CVT_FP8_TO_BF16_EXT(_mm512_extracti32x8_epi32(b8, 1));
         }
       }
       vsum[i] = _mm512_dpbf16_ps(vsum[i], va, vb[col]);
@@ -191,6 +194,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, has_bias, BLOCK_M, BL
       int kb_end = std::min(K >> 1, kb_start + BLOCK_K2);
       // 1. load scale vector
       vscale = _mm512_set1_ps(scale[kb]);
+      vscale = _mm512_mul_ps(vscale, vexp);
       if constexpr (PREFETCH_SIZE_KB > 0) {
         _mm_prefetch(scale + kb + PREFETCH_SIZE_KB, _MM_HINT_T0);
       }
