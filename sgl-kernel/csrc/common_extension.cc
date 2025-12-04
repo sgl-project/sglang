@@ -576,6 +576,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "stride_a, Tensor stride_b, Tensor stride_d, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> "
       "()");
   m.impl("es_fp8_blockwise_scaled_grouped_mm", &es_fp8_blockwise_scaled_grouped_mm);
+  m.def(
+      "es_sm100_mxfp8_blockscaled_grouped_mm(Tensor a, Tensor b, Tensor sfa, Tensor sfb, Tensor d, Tensor "
+      "problem_sizes, Tensor expert_offsets, Tensor blockscale_offsets) -> ()");
+  m.impl("es_sm100_mxfp8_blockscaled_grouped_mm", &es_sm100_mxfp8_blockscaled_grouped_mm);
+  m.def(
+      "es_sm100_mxfp8_blockscaled_grouped_quant(Tensor input, Tensor problem_sizes, Tensor expert_offsets, Tensor "
+      "blockscale_offsets, Tensor quant_output, Tensor scale_factor) -> () ");
+  m.impl("es_sm100_mxfp8_blockscaled_grouped_quant", &es_sm100_mxfp8_blockscaled_grouped_quant);
 
   /*
    * From fast-hadamard-transform
