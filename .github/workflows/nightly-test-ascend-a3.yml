@@ -68,7 +68,7 @@ jobs:
       test_config_name: ${{ matrix.test_config.name }}
       sglang_source_path: '/data/.cache/tests/sglang'
       test_case: ${{ matrix.test_config.test_case }}
-      nup_num: ${{ matrix.test_config.npu_num }}
+      npu_num: ${{ matrix.test_config.npu_num }}
 
 
 
