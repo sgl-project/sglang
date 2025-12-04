@@ -404,6 +404,13 @@ class GroupCoordinator:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
+        if _use_aiter:
+            from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce as AiterCustomAllreduce            
+            self._aiter_ca_comm = AiterCustomAllreduce(
+                group=self.cpu_group,
+                device=self.device,
+                max_size=512 * 1024 * 1024,  # Use the larger buffer size for vision models
+            )
 
     def __repr__(self):
         return (
@@ -757,9 +764,8 @@ class GroupCoordinator:
                 torch.distributed.all_gather_into_tensor(
                     output_tensor, input_, group=self.device_group
                 )
-        elif _use_aiter:
-            from aiter.dist.parallel_state import outplace_all_gather
-            output_tensor = outplace_all_gather(input_, group_name=self.unique_name)
+        elif _use_aiter and self._aiter_ca_comm is not None and not self._aiter_ca_comm.disabled:
+            output_tensor = self._aiter_ca_comm.custom_all_gather(input_)
         else:
             self.all_gather_into_tensor(output_tensor, input_)
 
