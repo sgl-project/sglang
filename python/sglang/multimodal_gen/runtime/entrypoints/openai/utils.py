@@ -11,7 +11,7 @@ import torchvision
 from einops import rearrange
 from fastapi import UploadFile
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     log_batch_completion,

@@ -20,7 +20,7 @@ class MockModelRunner:
         attention_arch = AttentionArch.MLA
         self.device = "cuda"
         self.dtype = torch.float16
-        self.is_hybrid = False
+        self.is_hybrid_swa = False
         context_len = 2048
         self.model_config = type(
             "ModelConfig",
