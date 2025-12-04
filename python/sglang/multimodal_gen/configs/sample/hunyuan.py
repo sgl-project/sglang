@@ -9,7 +9,7 @@ from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 @dataclass
 class HunyuanSamplingParams(SamplingParams):
-    num_inference_steps: int = 50
+    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
 
     num_frames: int = 125
     height: int = 720

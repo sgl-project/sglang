@@ -15,4 +15,4 @@ class QwenImageSamplingParams(SamplingParams):
     num_frames: int = 1
     # Denoising stage
     guidance_scale: float = 4.0
-    num_inference_steps: int = 50
+    num_inference_steps: int = 10  # Reduced from 50 for faster CI tests
