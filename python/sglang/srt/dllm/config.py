@@ -43,7 +43,7 @@ class DllmConfig:
         if server_args.dllm_algorithm_config is not None:
             try:
                 algorithm_config = json.loads(server_args.dllm_algorithm_config)
-            except Exception as e:
+            except json.JSONDecodeError as e:
                 raise RuntimeError(
                     f"Invalid algorithm config: {server_args.dllm_algorithm_config}. Load config failed: {e}"
                 )
