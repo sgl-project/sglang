@@ -29,6 +29,11 @@ import tqdm
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
+from sglang.srt.batch_overlap.two_batch_overlap import (
+    MaybeTboDeepEPDispatcher,
+    model_forward_maybe_tbo,
+)
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
@@ -134,9 +139,7 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -707,13 +710,21 @@ class DeepseekV2MoE(nn.Module):
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
-                assert (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
-                )
-                self.shared_experts_weight_block_size = (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                )
+                if (
+                    _use_aiter
+                    and config.quantization_config.get("quant_method")
+                    == "compressed-tensors"
+                ):
+                    # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    pass
+                else:
+                    assert (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    )
 
         self.top_k = config.num_experts_per_tok
 
@@ -952,6 +963,13 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         shared_output = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
+        sbo_overlap_dispatch_flag = (
+            sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
+        )
+        sbo_overlap_combine_flag = (
+            sbo_enabled_flag and SboFlags.enable_combine_shared_two_stream_overlap()
+        )
+
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
@@ -968,8 +986,52 @@ class DeepseekV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        # SBO is not yet implemented for NextN
-        if sbo_enabled_flag:
+        if sbo_overlap_dispatch_flag:
+            shared_output = None
+
+            def _deepep_dispatch_hook(dispatcher: BaseDispatcher):
+                nonlocal shared_output
+                shared_output = self._forward_shared_experts(hidden_states)
+                for handle in deepep_dispatch_hook_handle:
+                    handle.remove()
+
+            def _post_dispatch_hook(
+                dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
+            ):
+                combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
+                    compute_overlap_args(dispatch_output, self.alt_stream)
+                )
+                dispatcher.set_overlap_args(
+                    combine_overlap_args=combine_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                self.experts.set_overlap_args(
+                    down_gemm_overlap_args=down_gemm_overlap_args,
+                    meta_overlap_args=meta_overlap_args,
+                )
+                post_dispatch_hook_handle.remove()
+
+            def _post_combine_hook(
+                dispatcher: BaseDispatcher, hidden_states: torch.Tensor
+            ):
+                dispatcher.clear_overlap_args()
+                self.experts.clear_overlap_args()
+                post_combine_hook_handle.remove()
+
+            assert isinstance(self.experts.dispatcher, MaybeTboDeepEPDispatcher)
+            deepep_dispatch_hook_handle = (
+                self.experts.dispatcher.register_deepep_dispatch_hook(
+                    _deepep_dispatch_hook
+                )
+            )
+            post_dispatch_hook_handle = (
+                self.experts.dispatcher.register_post_dispatch_hook(_post_dispatch_hook)
+            )
+            post_combine_hook_handle = (
+                self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
+            )
+
+        elif sbo_overlap_combine_flag:
             shared_output = None
 
             def _post_dispatch_hook(
@@ -3643,9 +3705,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                )
+                w_vc = w_vc.contiguous().transpose(1, 2)
+                if _is_npu:
+                    w_vc = w_vc.contiguous()
+                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
