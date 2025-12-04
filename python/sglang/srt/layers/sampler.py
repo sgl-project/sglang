@@ -88,7 +88,6 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
-        print(logits)
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
