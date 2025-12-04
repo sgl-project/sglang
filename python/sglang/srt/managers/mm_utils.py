@@ -2,7 +2,7 @@
 Multi-modality utils
 """
 
-import hashlib
+import blake3
 import pickle
 from abc import abstractmethod
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
@@ -824,7 +824,7 @@ def get_multimodal_data_bounds(
 
 
 def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
+    hash_bytes = blake3.blake3(data).digest()[:8]
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
