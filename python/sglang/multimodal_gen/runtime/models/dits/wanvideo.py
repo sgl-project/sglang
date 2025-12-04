@@ -21,7 +21,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidual,
-    ScaleResidualLayerNormScaleShift,
+    ScaleResidualNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -294,13 +294,13 @@ class WanTransformerBlock(nn.Module):
             logger.error("QK Norm type not supported")
             raise Exception
         assert cross_attn_norm is True
-        self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        self.self_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             norm_type="layer",
             eps=eps,
             elementwise_affine=True,
+            bias=True,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 2. Cross-attention
@@ -322,13 +322,13 @@ class WanTransformerBlock(nn.Module):
                 eps=eps,
                 supported_attention_backends=supported_attention_backends,
             )
-        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        self.cross_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             norm_type="layer",
             eps=eps,
             elementwise_affine=False,
+            bias=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward
@@ -469,13 +469,13 @@ class WanTransformerBlock_VSA(nn.Module):
             logger.error("QK Norm type not supported")
             raise Exception
         assert cross_attn_norm is True
-        self.self_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        self.cross_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             norm_type="layer",
             eps=eps,
-            elementwise_affine=True,
+            elementwise_affine=False,
+            bias=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         if AttentionBackendEnum.VIDEO_SPARSE_ATTN in supported_attention_backends:
@@ -499,13 +499,13 @@ class WanTransformerBlock_VSA(nn.Module):
                 eps=eps,
                 supported_attention_backends=supported_attention_backends,
             )
-        self.cross_attn_residual_norm = ScaleResidualLayerNormScaleShift(
+        self.cross_attn_residual_norm = ScaleResidualNormScaleShift(
             dim,
             norm_type="layer",
             eps=eps,
             elementwise_affine=False,
+            bias=False,
             dtype=torch.float32,
-            compute_dtype=torch.float32,
         )
 
         # 3. Feed-forward
