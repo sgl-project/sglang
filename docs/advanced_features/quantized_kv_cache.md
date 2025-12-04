@@ -29,7 +29,7 @@ FP4 quantization is currently experimental.
 
 [OCP (Open Compute Project)](https://www.opencompute.org) specifies MXFP4 (Microscaling FP4), a 4-bit floating-point format:
 
-- **E2M1** (1 sign bit, 2 exponent bits, 1 mantissa bit): Uses block-based microscaling where tensors are divided into blocks of 32 consecutive elements, with each block sharing a single 8-bit exponential scaling factor
+- **E2M1** (1 sign bit, 2 exponent bits, 1 mantissa bit): Uses block-based microscaling where tensors are divided into blocks of consecutive elements, with each block sharing a single 8-bit exponential scaling factor. While OCP specifies blocks of 32 elements, SGLang's current implementation uses blocks of 16 elements for KV cache quantization.
 
 ## Usage
 
@@ -89,19 +89,65 @@ Where the outer keys in `scaling_factor` are tensor parallel ranks and inner key
 If scaling factors are not provided and not found in the checkpoint, it will default to 1.0, which may cause accuracy issues.
 ```
 
+```{tip}
+**FP4 (MXFP4)**: Unlike FP8, FP4 quantization handles scaling factors automatically on-the-fly during quantization and dequantization. No pre-quantized models or external scaling factor files are required—the block-based scaling factors are computed dynamically as needed.
+```
+
 ## Performance Considerations
 
 ### Memory Savings
 
 Quantized KV cache provides significant memory savings:
-- **BF16 → FP8**: 2x reduction (16 bits → 8 bits)
-- **BF16 → FP4**: 4x reduction (16 bits → 4 bits)
+- **BF16 → FP4**: Supports approximately 3.56× more tokens than BF16 (accounting for scaling factor overhead)
+
+```{note}
+FP4 and FP8 quantization require additional memory for block-based scaling factors, which reduces the effective memory savings compared to the raw bit-width reduction. FP4 with block size 16 supports approximately 1.78× more tokens than FP8, and approximately 3.56× more tokens than BF16. The relative token capacity between FP8 and BF16 can be derived from these ratios.
+```
 
 This enables longer context lengths or more concurrent requests within the same memory budget.
 
 ### Accuracy Impact
 
+#### FP8 Accuracy
+
 FP8 E4M3 quantization typically introduces minimal accuracy degradation. The impact depends on model architecture, sequence length, and quantization format (generally, E4M3 has better accuracy than E5M2).
+
+#### FP4 Accuracy
+
+FP4 (MXFP4) quantization provides significant memory savings with varying accuracy impact depending on model size and dataset complexity. Preliminary accuracy test results from [PR #10078](https://github.com/sgl-project/sglang/pull/10078) (MLA) and [PR #12612](https://github.com/sgl-project/sglang/pull/12612) (MHA) show:
+
+**Large Models (e.g., Qwen3-235B-A22B, DeepSeek-R1-0528)**
+
+On large-scale models, FP4 maintains accuracy close to FP8/BF16, especially on simpler datasets:
+
+| Model | Dataset | KV16 | KV8 (FP8 E4M3) | KV4 (FP4 E2M1) |
+|-------|---------|------|----------------|----------------|
+| Qwen3-235B-A22B | gsm8k | 0.9168 | 0.9181 | 0.9186 |
+| Qwen3-235B-A22B | aime25 | 0.7733 | 0.7333 | 0.6000 |
+| Qwen3-235B-A22B | gpqa_diamond | 0.7010 | 0.6899 | 0.6778 |
+| DeepSeek-R1-0528 | gsm8k | 0.9157 | 0.9154 | 0.9124 |
+| DeepSeek-R1-0528 | aime25 | 0.5067 | 0.4934 | 0.4000 |
+| DeepSeek-R1-0528 | gpqa_diamond | 0.7707 | 0.7697 | 0.7273 |
+
+**Smaller Models (e.g., GPT-OSS-120B)**
+
+On smaller models, FP4 shows more pronounced accuracy drops, particularly on challenging datasets:
+
+| Model | Dataset | KV16 | KV8 (FP8 E4M3) | KV4 (FP4 E2M1) |
+|-------|---------|------|----------------|----------------|
+| GPT-OSS-120B | gsm8k | 0.9161 | 0.9163 | 0.9152 |
+| GPT-OSS-120B | aime25 | 0.7533 | 0.7667 | 0.3533 |
+| GPT-OSS-120B | gpqa_diamond | 0.5081 | 0.5434 | 0.3202 |
+
+**Key Observations:**
+
+- **Simple datasets (e.g., gsm8k)**: FP4 maintains accuracy close to FP8/BF16 across model sizes
+- **Model size matters**: Large models (200B+ parameters) generally tolerate FP4 quantization better than smaller models
+- **Context length**: Accuracy degradation may be more pronounced in long-context scenarios, as the accumulation of the quantization error may become significant.
+
+```{tip}
+Evaluate FP4 accuracy on your specific model and workload. Large models on simpler tasks typically show minimal degradation, while smaller models or complex reasoning tasks may require FP8 or BF16 for acceptable accuracy.
+```
 
 ## Best Practices
 
