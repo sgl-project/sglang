@@ -39,12 +39,8 @@ class DmdDenoisingStage(DenoisingStage):
         pos_cond_kwargs,
         prompt_embeds,
     ):
-        logger.info("Performing 1-step warmup")
-        # Expand latents for I2V
-
-        noise_latents = latents.clone()
+        logger.info("Performing 1-step warmup for DMD denoising")
         latent_model_input = latents.to(target_dtype)
-
         if batch.image_latent is not None:
             latent_model_input = torch.cat(
                 [
@@ -81,7 +77,7 @@ class DmdDenoisingStage(DenoisingStage):
                 forward_batch=batch,
             ):
                 # Run transformer
-                pred_noise = self.transformer(
+                _ = self.transformer(
                     latent_model_input.permute(0, 2, 1, 3, 4),
                     prompt_embeds,
                     t_expand,
@@ -89,13 +85,6 @@ class DmdDenoisingStage(DenoisingStage):
                     **image_kwargs,
                     **pos_cond_kwargs,
                 ).permute(0, 2, 1, 3, 4)
-
-            _ = pred_noise_to_pred_video(
-                pred_noise=pred_noise.flatten(0, 1),
-                noise_input_latent=noise_latents.flatten(0, 1),
-                timestep=t_expand,
-                scheduler=self.scheduler,
-            ).unflatten(0, pred_noise.shape[:2])
         logger.info("Warmup done.")
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
@@ -165,7 +154,7 @@ class DmdDenoisingStage(DenoisingStage):
                 batch,
                 server_args,
                 latents,
-                timesteps,
+                timesteps[0:1],
                 target_dtype,
                 autocast_enabled,
                 image_kwargs,

@@ -65,35 +65,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
         except Exception:
             self.local_attn_size = -1
 
-    def _warmup(
-        self,
-        image_latent,
-        prompt_embeds,
-        t_zero,
-        image_kwargs,
-        pos_cond_kwargs,
-        target_dtype,
-        autocast_enabled,
-    ):
-        logger.info("Performing 1-step warmup (processing first frame)")
-        image_first_btchw = (
-            image_latent[:, :, :1, :, :].to(target_dtype).permute(0, 2, 1, 3, 4)
-        )
-        with torch.autocast(
-            device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
-        ):
-            _ = self.transformer(
-                image_first_btchw,
-                prompt_embeds,
-                t_zero,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=0,
-                **image_kwargs,
-                **pos_cond_kwargs,
-            )
-        logger.info("Warmup done.")
-
     def forward(
         self,
         batch: Req,
@@ -192,37 +163,24 @@ class CausalDMDDenoisingStage(DenoisingStage):
             )
             if independent_first_frame and input_frames >= 1:
                 # warm-up with the very first frame independently
-                if server_args.enable_warmup:
-                    self._warmup(
-                        image_latent,
+                image_first_btchw = (
+                    image_latent[:, :, :1, :, :].to(target_dtype).permute(0, 2, 1, 3, 4)
+                )
+                with torch.autocast(
+                    device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                ):
+                    _ = self.transformer(
+                        image_first_btchw,
                         prompt_embeds,
                         t_zero,
-                        image_kwargs,
-                        pos_cond_kwargs,
-                        target_dtype,
-                        autocast_enabled,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length,
+                        **image_kwargs,
+                        **pos_cond_kwargs,
                     )
-                else:
-                    image_first_btchw = (
-                        image_latent[:, :, :1, :, :]
-                        .to(target_dtype)
-                        .permute(0, 2, 1, 3, 4)
-                    )
-                    with torch.autocast(
-                        device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
-                    ):
-                        _ = self.transformer(
-                            image_first_btchw,
-                            prompt_embeds,
-                            t_zero,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length,
-                            **image_kwargs,
-                            **pos_cond_kwargs,
-                        )
                 current_start_frame += 1
-                remaining_frames = input_frames - 1
+                input_frames -= 1
             else:
                 remaining_frames = input_frames
 

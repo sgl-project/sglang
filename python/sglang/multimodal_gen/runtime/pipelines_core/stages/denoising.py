@@ -117,17 +117,20 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            full_graph = False
-            self.transformer = torch.compile(
-                self.transformer, mode="max-autotune", fullgraph=full_graph
-            )
-            self.transformer_2 = (
-                torch.compile(
-                    self.transformer_2, mode="max-autotune", fullgraph=full_graph
-                )
-                if transformer_2 is not None
-                else None
-            )
+            # full_graph = False
+            # self.transformer = torch.compile(
+            #     self.transformer, mode="max-autotune", fullgraph=full_graph
+            # )
+            # self.transformer_2 = (
+            #     torch.compile(
+            #         self.transformer_2, mode="max-autotune", fullgraph=full_graph
+            #     )
+            #     if transformer_2 is not None
+            #     else None
+            # )
+            self.torch_compile_module(self.transformer)
+            if transformer_2 is not None:
+                self.torch_compile_module(self.transformer_2)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -151,6 +154,26 @@ class DenoisingStage(PipelineStage):
 
         # misc
         self.profiler = None
+
+    def torch_compile_module(self, module):
+        """
+        Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
+        No-op if torch compile is disabled or the object has no forward.
+        """
+        if not self.server_args.enable_torch_compile or module is None:
+            return module
+        if not hasattr(module, "forward"):
+            return module
+        try:
+            import torch._inductor.config as _inductor_cfg
+
+            _inductor_cfg.reorder_for_compute_comm_overlap = True
+        except ImportError:
+            pass
+        mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
+        setattr(module, "forward", compiled_forward)
+        return module
 
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
@@ -314,10 +337,11 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
-                )
+            # if self.server_args.enable_torch_compile:
+            #     self.transformer = torch.compile(
+            #         self.transformer, mode="max-autotune", fullgraph=True
+            #     )
+            self.torch_compile_module(self.transformer)
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
@@ -1000,9 +1024,32 @@ class DenoisingStage(PipelineStage):
             The prepared kwargs.
         """
         extra_step_kwargs = {}
+        # for k, v in kwargs.items():
+        #     accepts = k in set(inspect.signature(func).parameters.keys())
+        #     if accepts:
+        accepted_params: set[str] = set()
+        # Try to inspect the callable directly
+        try:
+            accepted_params |= set(inspect.signature(func).parameters.keys())
+        except Exception:
+            pass
+        # If it's a module-like object, also try its forward
+        try:
+            forward_fn = getattr(func, "forward", None)
+            if callable(forward_fn):
+                accepted_params |= set(inspect.signature(forward_fn).parameters.keys())
+        except Exception:
+            pass
+        # Fallback: if still empty, conservatively pass through known optional keys only
+        if not accepted_params:
+            accepted_params = {
+                "encoder_hidden_states_image",
+                "mask_strategy",
+                "encoder_hidden_states_2",
+                "encoder_attention_mask",
+            }
         for k, v in kwargs.items():
-            accepts = k in set(inspect.signature(func).parameters.keys())
-            if accepts:
+            if k in accepted_params:
                 extra_step_kwargs[k] = v
         return extra_step_kwargs
 
