@@ -128,7 +128,7 @@ impl BasicWorkerBuilder {
     pub fn build(self) -> BasicWorker {
         use std::sync::{
             atomic::{AtomicBool, AtomicUsize},
-            Arc,
+            Arc, RwLock as StdRwLock,
         };
 
         use tokio::sync::RwLock;
@@ -187,6 +187,7 @@ impl BasicWorkerBuilder {
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
             grpc_client,
+            models_override: Arc::new(StdRwLock::new(None)),
         }
     }
 }

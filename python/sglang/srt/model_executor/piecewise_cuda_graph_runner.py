@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Union
 import torch
 import tqdm
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compile import install_torch_compiled, set_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
@@ -51,7 +52,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
-from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 logger = logging.getLogger(__name__)

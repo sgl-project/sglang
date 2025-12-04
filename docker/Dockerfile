@@ -7,10 +7,11 @@ ARG BRANCH_TYPE=remote
 ARG GRACE_BLACKWELL=0
 
 ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
+ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
 ARG SGL_KERNEL_VERSION=0.3.18.post2
-ARG SGL_VERSION=0.5.5.post3
+ARG SGL_VERSION=0.5.6
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
@@ -218,7 +219,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip uninstall -y torch torchaudio torchvision ; \
         python3 -m pip install torch==2.9.0 torchaudio==2.9.0 torchvision --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ; \
         python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-        python3 -m pip install nixl-cu13 ; \
     else \
         echo "No NCCL mapping for CUDA_VERSION=${CUDA_VERSION}" && exit 1 ; \
     fi \
@@ -226,20 +226,27 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Download NVSHMEM and DeepEP sources
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
+# TODO: move from Tom's branch to DeepEP hybrid-ep branch
 RUN set -eux; \
     if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-      pip install nvidia-nvshmem-cu12==${NVSHMEM_VERSION} ; \
+      pip install nvidia-nvshmem-cu12==3.3.20 ; \
     elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
       pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} ; \
     else \
       echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ; \
     fi && \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
-        git clone https://github.com/fzyzcjy/DeepEP.git && \
-        cd DeepEP && \
-        git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
-        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-        cd .. ; \
+      git clone https://github.com/fzyzcjy/DeepEP.git && \
+      cd DeepEP && \
+      git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
+    elif [ "$HOPPER_SBO" = "1" ]; then \
+      git clone https://github.com/deepseek-ai/DeepEP.git -b antgroup-opt && \
+      cd DeepEP && \
+      git checkout ${HOPPER_SBO_DEEPEP_COMMIT} && \
+      sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+      cd .. ; \
     else \
         curl --retry 3 --retry-delay 2 -fsSL -o ${DEEPEP_COMMIT}.zip \
             https://${GITHUB_ARTIFACTORY}/deepseek-ai/DeepEP/archive/${DEEPEP_COMMIT}.zip && \
@@ -272,15 +279,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
-# Install nvidia-cutlass-dsl for flashinfer_cutedsl (WideEP configs)
-# Using stable versions: 4.3.0 for CUDA 12, 4.3.1 for CUDA 13
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-        python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps; \
-    elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-        python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps; \
-    fi
-
 # Install essential Python packages
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
@@ -312,6 +310,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /root/.cargo /root/.rustup target dist ~/.cargo \
     && sed -i '/\.cargo\/env/d' /root/.profile /root/.bashrc 2>/dev/null || true
 
+# Install cutlass-dsl and nixl-cu13
+# TODO: Move cutlass-dsl to pyproject.toml after drivers on CI runners are updated
+RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+    python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps; \
+elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+    python3 -m pip install nixl-cu13 ; \
+    python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps; \
+fi
 
 # Install development tools
 RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
