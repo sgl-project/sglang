@@ -14,7 +14,6 @@ use axum::{
     Json,
 };
 use futures_util::{future::join_all, StreamExt};
-use once_cell::sync::Lazy;
 use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -31,13 +30,14 @@ use super::{
         ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
         McpLoopConfig,
     },
+    provider::ProviderRegistry,
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
     utils::{apply_provider_headers, extract_auth_header},
 };
 use crate::{
     app_context::AppContext,
-    core::{ModelCard, RuntimeType, Worker, WorkerRegistry},
+    core::{model_type::Endpoint, ModelCard, ProviderType, RuntimeType, Worker, WorkerRegistry},
     data_connector::{
         ConversationId, ConversationItemStorage, ConversationStorage, ListParams, ResponseId,
         ResponseStorage, SortOrder,
@@ -61,32 +61,6 @@ use crate::{
 // OpenAIRouter Struct
 // ============================================================================
 
-/// Fields specific to SGLang that should be stripped when forwarding to OpenAI-compatible endpoints
-static SGLANG_FIELDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
-    HashSet::from([
-        "request_id",
-        "priority",
-        "top_k",
-        "min_p",
-        "min_tokens",
-        "regex",
-        "ebnf",
-        "stop_token_ids",
-        "no_stop_trim",
-        "ignore_eos",
-        "continue_final_message",
-        "skip_special_tokens",
-        "lora_path",
-        "session_params",
-        "separate_reasoning",
-        "stream_reasoning",
-        "chat_template_kwargs",
-        "return_hidden_states",
-        "repetition_penalty",
-        "sampling_seed",
-    ])
-});
-
 /// Router for OpenAI backend
 ///
 /// This router manages connections to OpenAI-compatible API endpoints (OpenAI, xAI, etc.)
@@ -97,6 +71,8 @@ pub struct OpenAIRouter {
     client: reqwest::Client,
     /// Worker registry for model-based worker lookup
     worker_registry: Arc<WorkerRegistry>,
+    /// Provider registry for vendor-specific transformations
+    provider_registry: ProviderRegistry,
     /// Health status
     healthy: AtomicBool,
     /// Response storage for managing conversation history
@@ -146,12 +122,38 @@ impl OpenAIRouter {
         Ok(Self {
             client,
             worker_registry,
+            provider_registry: ProviderRegistry::new(),
             healthy: AtomicBool::new(true),
             response_storage: ctx.response_storage.clone(),
             conversation_storage: ctx.conversation_storage.clone(),
             conversation_item_storage: ctx.conversation_item_storage.clone(),
             mcp_manager,
         })
+    }
+
+    /// Get the provider for a worker and optional model.
+    ///
+    /// Priority:
+    /// 1. Worker's provider for the specific model (if worker knows about it)
+    /// 2. Infer from model name (ProviderType::from_model_name)
+    /// 3. Default provider (SGLang passthrough)
+    fn get_provider_for_worker<'a>(
+        &'a self,
+        worker: &dyn Worker,
+        model_id: Option<&str>,
+    ) -> &'a dyn super::provider::Provider {
+        // Try worker's provider for the model first
+        if let Some(model) = model_id {
+            if let Some(pt) = worker.provider_for_model(model) {
+                return self.provider_registry.get(pt);
+            }
+            // Fall back to model name inference
+            if let Some(pt) = ProviderType::from_model_name(model) {
+                return self.provider_registry.get(&pt);
+            }
+        }
+        // Default to SGLang passthrough
+        self.provider_registry.default_provider()
     }
 
     /// Refresh models for a single external worker by querying its /v1/models endpoint.
@@ -623,7 +625,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
-        _model_id: Option<&str>,
+        model_id: Option<&str>,
     ) -> Response {
         // Extract auth header for passthrough mode
         let auth_header = extract_auth_header(headers, &None);
@@ -648,13 +650,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                     .into_response();
             }
         };
-        if let Some(obj) = payload.as_object_mut() {
-            // Always remove SGLang-specific fields (unsupported by OpenAI)
-            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
-            // Remove logprobs if false (Gemini don't accept it)
-            if obj.get("logprobs").and_then(|v| v.as_bool()) == Some(false) {
-                obj.remove("logprobs");
-            }
+        // Apply provider-specific transformations
+        let provider = self.get_provider_for_worker(worker.as_ref(), model_id);
+        if let Err(e) = provider.transform_request(&mut payload, Endpoint::Chat) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Provider transform error: {}", e),
+            )
+                .into_response();
         }
 
         let url = format!("{}/v1/chat/completions", worker.url());
@@ -1019,50 +1022,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
             }
         };
 
-        // Remove SGLang-specific fields only
-        if let Some(obj) = payload.as_object_mut() {
-            // Remove SGLang-specific fields (not part of OpenAI API)
-            obj.retain(|k, _| !SGLANG_FIELDS.contains(&k.as_str()));
-            // XAI (Grok models) requires special handling of input items
-            // Check if model is a Grok model
-            let is_grok_model = obj
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(|m| m.starts_with("grok"))
-                .unwrap_or(false);
-
-            if is_grok_model {
-                // XAI doesn't support the OPENAI item type input: https://platform.openai.com/docs/api-reference/responses/create#responses-create-input-input-item-list-item
-                // To Achieve XAI compatibility, strip extra fields from input messages (id, status)
-                // XAI doesn't support output_text as type for content with role of assistant
-                // so normalize content types: output_text -> input_text
-                if let Some(input_arr) = obj.get_mut("input").and_then(Value::as_array_mut) {
-                    for item_obj in input_arr.iter_mut().filter_map(Value::as_object_mut) {
-                        // Remove fields not universally supported
-                        item_obj.remove("id");
-                        item_obj.remove("status");
-
-                        // Normalize content types to input_text (xAI compatibility)
-                        if let Some(content_arr) =
-                            item_obj.get_mut("content").and_then(Value::as_array_mut)
-                        {
-                            for content_obj in
-                                content_arr.iter_mut().filter_map(Value::as_object_mut)
-                            {
-                                // Change output_text to input_text
-                                if content_obj.get("type").and_then(Value::as_str)
-                                    == Some("output_text")
-                                {
-                                    content_obj.insert(
-                                        "type".to_string(),
-                                        Value::String("input_text".to_string()),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // Apply provider-specific transformations (handles SGLang fields, XAI/Grok, etc.)
+        let provider = self.get_provider_for_worker(worker.as_ref(), model_id);
+        if let Err(e) = provider.transform_request(&mut payload, Endpoint::Responses) {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Provider transform error: {}", e),
+            )
+                .into_response();
         }
 
         // Delegate to streaming or non-streaming handler
