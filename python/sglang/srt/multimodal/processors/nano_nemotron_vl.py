@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from sglang.srt.configs.nano_nemotron_vl import NemotronH_Nano_VL_V2_Config
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.multimodal.evs import EVSProcessor
@@ -42,7 +43,9 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
 
     def __init__(self, hf_config, server_args, _image_processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _image_processor, *args, **kwargs)
-        self.evs = EVSProcessor(hf_config, models=self.models)
+        self.evs = EVSProcessor(
+            hf_config, {NemotronH_Nano_VL_V2_Config: NemotronH_Nano_VL_V2}
+        )
         Image.MAX_IMAGE_PIXELS = None
         self.image_size = hf_config.image_size
         self.VIDEO_CONTEXT_TOKEN = hf_config.video_context_token
