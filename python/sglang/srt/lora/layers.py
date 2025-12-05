@@ -161,7 +161,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         base_output = self.base_layer.forward(input_.masked_fill(added_tokens_mask, 0))
 
         # Extra tokens - It will replace extra token embedding with self.new_embeddings_buffer's emb (Default is 0)
-        base_output = self.extra_token_embedding(input_, base_output)
+        # Only process extra tokens if we have new embeddings
+        if hasattr(self, 'new_embeddings_buffer') and self.new_embeddings_buffer is not None:
+            base_output = self.extra_token_embedding(input_, base_output)
 
         # Apply LoRA if configured
         if self.set_lora:
