@@ -134,9 +134,16 @@ def _compile_deep_gemm_one_type_all(
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
         memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
-        # If the memory budget is less than 10GB, set max_m to 4096 to avoid out of memory, which might cause hanging during warmup
-        # TODO: Change the magic numbers to something more reasonable
-        max_m = max(m_list) if memory_budget > 10 else 4096
+
+        # If the memory budget is less memory requirement, we need to reduce max_m to avoid out of memory, which might further cause hanging during warmup
+        max_m = max(m_list)
+        required_memory = _BaseWarmupExecutor.get_memory_requirement(
+            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+        )
+        if memory_budget < required_memory:
+            # TODO: Maybe compute the max_m based on the memory budget
+            max_m = 4096
+            m_list = [m for m in m_list if m <= max_m]
 
         # Need some methods to estimate needed memory for warmup
         executor = _BaseWarmupExecutor.create(
@@ -167,6 +174,26 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
         }[kernel_type](**kwargs)
+
+    @staticmethod
+    def get_memory_requirement(
+        kernel_type: DeepGemmKernelType, max_m: int, n: int, k: int, num_groups: int
+    ) -> int:
+        # Return the required memory space in GB for warmup executor
+        _GB = 1 << 30
+        if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16:
+            return (max_m * k + n * k + max_m * n * 2) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+            return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
+            return (
+                num_groups * max_m * k
+                + num_groups * n * k
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
+        else:
+            raise ValueError(f"Invalid kernel type: {kernel_type}")
 
     def execute(self, m):
         raise NotImplementedError
