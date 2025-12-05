@@ -14,7 +14,7 @@ Currently, the following models are supported:
 
 ## Installation
 
-> **Note**: Currently, MindSpore models are provided by an independent package `sgl-mindspore`. It is built upon current SGLang support for Ascend NPU Platform. Please first [install SGLang for Ascend NPU](./ascend_npu.md) and then install `sgl-mindspore`.
+> **Note**: Currently, MindSpore models are provided by an independent package `sgl-mindspore`. Support for MindSpore is built upon current SGLang support for Ascend NPU platform. Please first [install SGLang for Ascend NPU](./ascend_npu.md) and then install `sgl-mindspore`.
 
 ```shell
 git clone https://github.com/mindspore-lab/sgl-mindspore.git
