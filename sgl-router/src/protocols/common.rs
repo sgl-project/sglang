@@ -124,6 +124,10 @@ pub struct ImageUrl {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>, // "auto", "low", or "high"
 }
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct VideoUrl {
+    pub url: String,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct VideoUrl {
