@@ -1618,8 +1618,11 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     }
                 )
 
+            # Add hidden states if available and within bounds
             if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+                # Add bounds check to prevent index out of range errors
+                if i < len(recv_obj.output_hidden_states) and recv_obj.output_hidden_states[i] is not None:
+                    meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]

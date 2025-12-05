@@ -942,10 +942,16 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
 
+                # Add hidden states to list, similar to logprob handling
+                # Always add an entry (either hidden_states or None) to maintain index alignment with rids
                 if req.return_hidden_states:
                     if output_hidden_states is None:
-                        output_hidden_states = []
+                        output_hidden_states = [None] * (len(rids) - 1)
                     output_hidden_states.append(req.hidden_states)
+                else:
+                    # Add None placeholder to keep index aligned with rids list
+                    if output_hidden_states is not None:
+                        output_hidden_states.append(None)
 
             if (
                 req.finished()
