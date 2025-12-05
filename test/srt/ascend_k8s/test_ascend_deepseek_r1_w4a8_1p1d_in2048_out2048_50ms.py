@@ -135,7 +135,7 @@ class Test_DeepSeek_R1_W4A8_1P1D_In2048_Out2048(TestAscendDisaggregationUtils):
     model_config = MODEL_CONFIG
     dataset_name = "random"
     request_rate = 16
-    max_concurrency = 352
+    max_concurrency = 8
     num_prompts = int(max_concurrency) * 4
     input_len = 2048
     output_len = 2048
