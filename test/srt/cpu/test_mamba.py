@@ -1,8 +1,8 @@
 import unittest
 
 import torch
-from torch.nn.functional import softplus
 import torch.nn.functional as F
+from torch.nn.functional import softplus
 from utils import precision
 
 from sglang.test.test_utils import CustomTestCase
@@ -374,6 +374,7 @@ class TestMambaAttention(CustomTestCase):
         torch.testing.assert_close(
             last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
         )
+
 
 if __name__ == "__main__":
     unittest.main()

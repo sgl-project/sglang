@@ -1187,7 +1187,6 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
   return std::make_tuple(std::move(output), std::move(final_state));
 }
 
-
 // A_log: [v_num_heads]
 // dt_bias: [v_num_heads]
 // query: [seq_len, batch_size, num_heads, head_dim]
