@@ -3,6 +3,10 @@ from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.kl_test_utils import (
+    test_input_output_logprobs_match_decode_cache_hit_helper,
+    test_input_output_logprobs_match_prefill_cache_hit_helper,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -10,11 +14,15 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+
+ACC_THRESHOLDS = {QWEN3_NEXT_MODEL: {"kl_div": 0.015, "gsm8k": 0.93}}
+
 
 class TestQwen3Next(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = QWEN3_NEXT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -42,13 +50,33 @@ class TestQwen3Next(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreaterEqual(
+            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+
+    def test_input_output_logprobs_match_prefill_cache_hit(self):
+        test_input_output_logprobs_match_prefill_cache_hit_helper(
+            self.base_url,
+            ACC_THRESHOLDS,
+            self.model,
+            max_samples=48,
+            max_new_tokens=1024,
+        )
+
+    def test_input_output_logprobs_match_decode_cache_hit(self):
+        test_input_output_logprobs_match_decode_cache_hit_helper(
+            self.base_url,
+            ACC_THRESHOLDS,
+            self.model,
+            max_samples=48,
+            max_new_tokens=512,
+        )
 
 
 class TestQwen3NextMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = QWEN3_NEXT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -87,13 +115,33 @@ class TestQwen3NextMTP(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreaterEqual(
+            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+
+    def test_input_output_logprobs_match_prefill_cache_hit(self):
+        test_input_output_logprobs_match_prefill_cache_hit_helper(
+            self.base_url,
+            ACC_THRESHOLDS,
+            self.model,
+            max_samples=48,
+            max_new_tokens=1024,
+        )
+
+    def test_input_output_logprobs_match_decode_cache_hit(self):
+        test_input_output_logprobs_match_decode_cache_hit_helper(
+            self.base_url,
+            ACC_THRESHOLDS,
+            self.model,
+            max_samples=48,
+            max_new_tokens=512,
+        )
 
 
 class TestQwen3NextMTPTopk(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = QWEN3_NEXT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -132,14 +180,34 @@ class TestQwen3NextMTPTopk(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreaterEqual(
+            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+
+    def test_input_output_logprobs_match_prefill_cache_hit(self):
+        test_input_output_logprobs_match_prefill_cache_hit_helper(
+            self.base_url,
+            ACC_THRESHOLDS,
+            self.model,
+            max_samples=48,
+            max_new_tokens=1024,
+        )
+
+    def test_input_output_logprobs_match_decode_cache_hit(self):
+        test_input_output_logprobs_match_decode_cache_hit_helper(
+            self.base_url,
+            ACC_THRESHOLDS,
+            self.model,
+            max_samples=48,
+            max_new_tokens=512,
+        )
 
 
 class TestQwen3NextPiecewiseCudaGraph(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = QWEN3_NEXT_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -170,7 +238,9 @@ class TestQwen3NextPiecewiseCudaGraph(CustomTestCase):
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.93)
+        self.assertGreaterEqual(
+            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
 
 
 if __name__ == "__main__":
