@@ -31,10 +31,7 @@ except ImportError:
         "Please install it with: pip install sglang[checkpoint-engine]"
     )
 
-is_npu = is_npu()
-
-if is_npu:
-    import torch_npu
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +106,9 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
         """Get the UUID of current device."""
         # Get device UUID for current device
         try:
-            if is_npu:
+            if _is_npu:
                 from checkpoint_engine.device_utils import npu_generate_uuid
+
                 return f"NPU-{npu_generate_uuid()}"
             else:
                 device_id = torch.cuda.current_device()
@@ -120,10 +118,7 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
 
     def get_device_id(self) -> int:
         """Get the device ID."""
-        if is_npu:
-            return torch_npu.npu.current_device()
-        else:
-            return torch.cuda.current_device()
+        return torch.get_device_module().current_device()
 
     def get_model_loader(self) -> Callable:
         """Get the model weight loader function."""
@@ -142,14 +137,10 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         # Move parameters to device if needed for quantization processing
-                        if is_npu:
-                            target_device = torch.device(
-                                "npu", torch_npu.npu.current_device()
-                            )
-                        else:
-                            target_device = torch.device(
-                                "cuda", torch.cuda.current_device()
-                            )
+                        target_device = torch.device(
+                            "npu" if _is_npu else "cuda",
+                            torch.get_device_module().current_device(),
+                        )
                         with device_loading_context(module, target_device):
                             quant_method.process_weights_after_loading(module)
                 # Call model-specific post-loading hook if available
