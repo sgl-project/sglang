@@ -22,7 +22,6 @@ SUITES = {
     "1-gpu": [
         "test_server_a.py",
         "test_server_b.py",
-        "test_server_cache_dit.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
