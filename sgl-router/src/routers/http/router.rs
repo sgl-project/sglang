@@ -53,6 +53,7 @@ impl Router {
             None, // any model
             Some(WorkerType::Regular),
             Some(ConnectionMode::Http),
+            None,  // any runtime type
             false, // include all workers
         );
 
@@ -139,6 +140,7 @@ impl Router {
             effective_model_id,
             Some(WorkerType::Regular),
             Some(ConnectionMode::Http),
+            None,  // any runtime type
             false, // get all workers, we'll filter by is_available() next
         );
 

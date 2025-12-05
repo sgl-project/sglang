@@ -782,7 +782,7 @@ def _init_tokenizer_manager(
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
-) -> Tuple[TokenizerManager, TemplateManager, Dict]:
+) -> Tuple[TokenizerManager, TemplateManager, Dict, PortArgs]:
     """
     Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
     """

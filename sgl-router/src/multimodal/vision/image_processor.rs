@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use image::DynamicImage;
-use ndarray::Array4;
+use ndarray::{Array4, ArrayD};
 
 use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 
@@ -81,10 +81,13 @@ impl ModelSpecificValue {
 /// to construct `MultimodalInputs` for the model.
 #[derive(Debug, Clone)]
 pub struct PreprocessedImages {
-    /// Pixel values as [B, C, H, W] float32 tensor.
+    /// Pixel values as a dynamic-dimensional float32 tensor.
     ///
     /// This is the primary input to the vision encoder.
-    pub pixel_values: Array4<f32>,
+    /// Shape varies by model:
+    /// - Standard: [B, C, H, W] (4D)
+    /// - Phi3-Vision: [B, num_crops+1, C, H, W] (5D)
+    pub pixel_values: ArrayD<f32>,
 
     /// Number of image tokens per image in the batch.
     ///
@@ -107,9 +110,25 @@ pub struct PreprocessedImages {
 }
 
 impl PreprocessedImages {
-    /// Create a new PreprocessedImages with required fields.
+    /// Create a new PreprocessedImages with required fields (4D pixel values).
     pub fn new(
         pixel_values: Array4<f32>,
+        num_img_tokens: Vec<usize>,
+        image_sizes: Vec<(u32, u32)>,
+    ) -> Self {
+        Self {
+            pixel_values: pixel_values.into_dyn(),
+            num_img_tokens,
+            image_sizes,
+            model_specific: HashMap::new(),
+        }
+    }
+
+    /// Create a new PreprocessedImages with dynamic-dimensional pixel values.
+    ///
+    /// Use this for models like Phi3-Vision that have 5D tensors.
+    pub fn new_dynamic(
+        pixel_values: ArrayD<f32>,
         num_img_tokens: Vec<usize>,
         image_sizes: Vec<(u32, u32)>,
     ) -> Self {
@@ -133,18 +152,53 @@ impl PreprocessedImages {
     }
 
     /// Get the number of channels.
+    ///
+    /// For 4D tensors [B, C, H, W], returns shape[1].
+    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[2].
     pub fn channels(&self) -> usize {
-        self.pixel_values.shape()[1]
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[1],
+            5 => self.pixel_values.shape()[2],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
+        }
     }
 
     /// Get the height of processed images.
+    ///
+    /// For 4D tensors [B, C, H, W], returns shape[2].
+    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[3].
     pub fn height(&self) -> usize {
-        self.pixel_values.shape()[2]
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[2],
+            5 => self.pixel_values.shape()[3],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
+        }
     }
 
     /// Get the width of processed images.
+    ///
+    /// For 4D tensors [B, C, H, W], returns shape[3].
+    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[4].
     pub fn width(&self) -> usize {
-        self.pixel_values.shape()[3]
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[3],
+            5 => self.pixel_values.shape()[4],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
+        }
+    }
+
+    /// Get the number of dimensions of pixel_values.
+    pub fn ndim(&self) -> usize {
+        self.pixel_values.ndim()
     }
 
     /// Get total number of image tokens across all images.
@@ -258,6 +312,80 @@ impl Default for ImageProcessorRegistry {
     }
 }
 
+impl ImageProcessorRegistry {
+    /// Create a registry with all built-in processors registered.
+    ///
+    /// Currently registers:
+    /// - `llava-next` -> LlavaNextProcessor
+    /// - `llava` -> LlavaProcessor (also matches llava-1.5, etc.)
+    /// - `qwen2-vl` -> Qwen2VLProcessor
+    /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
+    /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
+    /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+
+        // Register LLaVA-NeXT first (more specific pattern)
+        registry.register(
+            "llava-next",
+            Box::new(super::processors::LlavaNextProcessor::new()),
+        );
+        registry.register(
+            "llava-v1.6",
+            Box::new(super::processors::LlavaNextProcessor::new()),
+        );
+
+        // Register standard LLaVA (matches llava-1.5, llava-v1.5, etc.)
+        registry.register("llava", Box::new(super::processors::LlavaProcessor::new()));
+
+        // Register Qwen3-VL first (more specific pattern - must match before qwen2)
+        registry.register(
+            "qwen3-vl",
+            Box::new(super::processors::Qwen3VLProcessor::new()),
+        );
+        registry.register(
+            "qwen3_vl",
+            Box::new(super::processors::Qwen3VLProcessor::new()),
+        );
+
+        // Register Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
+        registry.register(
+            "qwen2-vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+        registry.register(
+            "qwen2_vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+
+        // Register Qwen2.5-VL (uses identical preprocessing to Qwen2-VL)
+        registry.register(
+            "qwen2.5-vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+        registry.register(
+            "qwen2_5-vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+        registry.register(
+            "qwen2_5_vl",
+            Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+
+        // Register Phi3-Vision
+        registry.register(
+            "phi-3-vision",
+            Box::new(super::processors::Phi3VisionProcessor::new()),
+        );
+        registry.register(
+            "phi3-vision",
+            Box::new(super::processors::Phi3VisionProcessor::new()),
+        );
+
+        registry
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ndarray::Array4;
@@ -324,5 +452,37 @@ mod tests {
         let flat = images.pixel_values_flat();
 
         assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_registry_with_defaults() {
+        let registry = ImageProcessorRegistry::with_defaults();
+
+        // Should find LLaVA processor
+        assert!(registry.has_processor("llava-hf/llava-1.5-7b-hf"));
+        assert!(registry.has_processor("liuhaotian/llava-v1.5-7b"));
+
+        // Should find LLaVA-NeXT processor
+        assert!(registry.has_processor("llava-hf/llava-v1.6-mistral-7b-hf"));
+        assert!(registry.has_processor("lmms-lab/llava-next-interleave-qwen-7b"));
+
+        // Get the processor and check model name
+        let processor = registry.find("llava-hf/llava-1.5-7b-hf").unwrap();
+        assert_eq!(processor.model_name(), "llava");
+    }
+
+    #[test]
+    fn test_registry_find() {
+        let mut registry = ImageProcessorRegistry::new();
+
+        // Create a mock processor using LlavaProcessor
+        registry.register(
+            "test-model",
+            Box::new(crate::multimodal::vision::processors::LlavaProcessor::new()),
+        );
+
+        assert!(registry.has_processor("test-model-7b"));
+        assert!(registry.has_processor("TEST-MODEL"));
+        assert!(!registry.has_processor("other-model"));
     }
 }

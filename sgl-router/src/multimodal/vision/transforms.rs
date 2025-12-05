@@ -24,6 +24,9 @@ pub enum TransformError {
 
     #[error("Inconsistent tensor shapes in batch")]
     InconsistentShapes,
+
+    #[error("Shape error: {0}")]
+    ShapeError(String),
 }
 
 pub type Result<T> = std::result::Result<T, TransformError>;
@@ -248,6 +251,107 @@ pub fn mean_to_rgb(mean: &[f64; 3]) -> Rgb<u8> {
         (mean[1] * 255.0).round() as u8,
         (mean[2] * 255.0).round() as u8,
     ])
+}
+
+/// Cubic interpolation weight function (Keys bicubic kernel with a=-0.5).
+///
+/// This matches PyTorch's bicubic interpolation used in
+/// `torch.nn.functional.interpolate(mode='bicubic')`.
+#[inline]
+pub fn cubic_weight(x: f32) -> f32 {
+    let x = x.abs();
+    if x < 1.0 {
+        (1.5 * x - 2.5) * x * x + 1.0
+    } else if x < 2.0 {
+        ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0
+    } else {
+        0.0
+    }
+}
+
+/// Perform bicubic interpolation at a single point in a tensor.
+///
+/// Uses a 4x4 kernel with Keys bicubic weights (a=-0.5) to match PyTorch's
+/// `torch.nn.functional.interpolate(mode='bicubic')`.
+///
+/// # Arguments
+/// * `tensor` - Input tensor of shape [C, H, W]
+/// * `c` - Channel index
+/// * `src_y` - Source Y coordinate (can be fractional)
+/// * `src_x` - Source X coordinate (can be fractional)
+/// * `h` - Height of the tensor
+/// * `w` - Width of the tensor
+///
+/// # Returns
+/// The interpolated value at the specified position.
+pub fn bicubic_interpolate(
+    tensor: &Array3<f32>,
+    c: usize,
+    src_y: f32,
+    src_x: f32,
+    h: usize,
+    w: usize,
+) -> f32 {
+    let y_int = src_y.floor() as i32;
+    let x_int = src_x.floor() as i32;
+    let y_frac = src_y - y_int as f32;
+    let x_frac = src_x - x_int as f32;
+
+    let mut result = 0.0f32;
+
+    // Sample 4x4 neighborhood
+    for dy in -1..=2 {
+        let y_idx = (y_int + dy).clamp(0, h as i32 - 1) as usize;
+        let y_weight = cubic_weight(y_frac - dy as f32);
+
+        for dx in -1..=2 {
+            let x_idx = (x_int + dx).clamp(0, w as i32 - 1) as usize;
+            let x_weight = cubic_weight(x_frac - dx as f32);
+
+            result += tensor[[c, y_idx, x_idx]] * y_weight * x_weight;
+        }
+    }
+
+    result
+}
+
+/// Resize a tensor using bicubic interpolation.
+///
+/// This matches PyTorch's `torch.nn.functional.interpolate(mode='bicubic', align_corners=False)`.
+///
+/// # Arguments
+/// * `tensor` - Input tensor of shape [C, H, W]
+/// * `target_h` - Target height
+/// * `target_w` - Target width
+///
+/// # Returns
+/// Resized tensor of shape [C, target_h, target_w].
+pub fn bicubic_resize(tensor: &Array3<f32>, target_h: usize, target_w: usize) -> Array3<f32> {
+    let (c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
+
+    if h == target_h && w == target_w {
+        return tensor.clone();
+    }
+
+    let mut result = Array3::<f32>::zeros((c, target_h, target_w));
+
+    // PyTorch align_corners=False coordinate mapping
+    let scale_h = h as f32 / target_h as f32;
+    let scale_w = w as f32 / target_w as f32;
+
+    for ch in 0..c {
+        for y in 0..target_h {
+            for x in 0..target_w {
+                // PyTorch align_corners=False: src = (dst + 0.5) * scale - 0.5
+                let src_y = (y as f32 + 0.5) * scale_h - 0.5;
+                let src_x = (x as f32 + 0.5) * scale_w - 0.5;
+
+                result[[ch, y, x]] = bicubic_interpolate(tensor, ch, src_y, src_x, h, w);
+            }
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]

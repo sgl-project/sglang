@@ -22,7 +22,7 @@ To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
 | **Quantized weights ([INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8))** | 16 x A100/800 |
 | | 32 x L40S |
 | | Xeon 6980P CPU |
-| | 2 x Atlas 800I A3 |
+| | 4 x Atlas 800I A3 |
 | **Quantized weights ([W4A8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8))** | 8 x H20/100, 4 x H200 |
 | **Quantized weights ([AWQ](https://huggingface.co/QuixiAI/DeepSeek-R1-0528-AWQ))** | 8 x H100/800/20 |
 | | 8 x A100/A800 |
@@ -72,7 +72,7 @@ Detailed commands for reference:
 - [16 x A100 (INT8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
 - [32 x L40S (INT8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
 - [Xeon 6980P CPU](../platforms/cpu_server.md#example-running-deepseek-r1)
-- [2 x Atlas 800I A3 (INT8)](../platforms/ascend_npu.md#running-deepseek-v3)
+- [4 x Atlas 800I A3 (int8)](../platforms/ascend_npu_deepseek_example.md#running-deepseek-with-pd-disaggregation-on-4-x-atlas-800i-a3)
 
 ### Download Weights
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only) official guide to download the weights.

@@ -120,7 +120,8 @@ class ComponentLoader(ABC):
         self.device = device
 
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        raise NotImplementedError()
+        # offload by default
+        return True
 
     def target_device(self, should_offload):
         if should_offload:

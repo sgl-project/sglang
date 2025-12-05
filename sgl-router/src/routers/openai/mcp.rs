@@ -16,11 +16,11 @@ use serde_json::{json, to_value, Value};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use super::utils::event_types;
 use crate::{
     mcp,
-    protocols::responses::{
-        generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest,
+    protocols::{
+        event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
+        responses::{generate_id, ResponseInput, ResponseTool, ResponseToolType, ResponsesRequest},
     },
     routers::header_utils::apply_request_headers,
 };
@@ -76,7 +76,7 @@ impl ToolLoopState {
     ) {
         // Add function_call item to history
         let func_item = json!({
-            "type": event_types::ITEM_TYPE_FUNCTION_CALL,
+            "type": ItemType::FUNCTION_CALL,
             "call_id": call_id,
             "name": tool_name,
             "arguments": args_json_str
@@ -285,7 +285,7 @@ pub(super) fn prepare_mcp_payload_for_streaming(
                 arr.retain(|item| {
                     item.get("type")
                         .and_then(|v| v.as_str())
-                        .map(|s| s == event_types::ITEM_TYPE_FUNCTION)
+                        .map(|s| s == ItemType::FUNCTION)
                         .unwrap_or(false)
                 });
             }
@@ -297,7 +297,7 @@ pub(super) fn prepare_mcp_payload_for_streaming(
         for t in tools {
             let parameters = Value::Object((*t.input_schema).clone());
             let tool = serde_json::json!({
-                "type": event_types::ITEM_TYPE_FUNCTION,
+                "type": ItemType::FUNCTION,
                 "name": t.name,
                 "description": t.description,
                 "parameters": parameters
@@ -399,7 +399,7 @@ pub(super) fn send_mcp_list_tools_events(
 
     // Event 1: response.output_item.added with empty tools
     let event1_payload = json!({
-        "type": event_types::OUTPUT_ITEM_ADDED,
+        "type": OutputItemEvent::ADDED,
         "sequence_number": *sequence_number,
         "output_index": output_index,
         "item": tools_item_empty
@@ -407,7 +407,7 @@ pub(super) fn send_mcp_list_tools_events(
     *sequence_number += 1;
     let event1 = format!(
         "event: {}\ndata: {}\n\n",
-        event_types::OUTPUT_ITEM_ADDED,
+        OutputItemEvent::ADDED,
         event1_payload
     );
     if tx.send(Ok(Bytes::from(event1))).is_err() {
@@ -416,7 +416,7 @@ pub(super) fn send_mcp_list_tools_events(
 
     // Event 2: response.mcp_list_tools.in_progress
     let event2_payload = json!({
-        "type": event_types::MCP_LIST_TOOLS_IN_PROGRESS,
+        "type": McpEvent::LIST_TOOLS_IN_PROGRESS,
         "sequence_number": *sequence_number,
         "output_index": output_index,
         "item_id": item_id
@@ -424,7 +424,7 @@ pub(super) fn send_mcp_list_tools_events(
     *sequence_number += 1;
     let event2 = format!(
         "event: {}\ndata: {}\n\n",
-        event_types::MCP_LIST_TOOLS_IN_PROGRESS,
+        McpEvent::LIST_TOOLS_IN_PROGRESS,
         event2_payload
     );
     if tx.send(Ok(Bytes::from(event2))).is_err() {
@@ -433,7 +433,7 @@ pub(super) fn send_mcp_list_tools_events(
 
     // Event 3: response.mcp_list_tools.completed
     let event3_payload = json!({
-        "type": event_types::MCP_LIST_TOOLS_COMPLETED,
+        "type": McpEvent::LIST_TOOLS_COMPLETED,
         "sequence_number": *sequence_number,
         "output_index": output_index,
         "item_id": item_id
@@ -441,7 +441,7 @@ pub(super) fn send_mcp_list_tools_events(
     *sequence_number += 1;
     let event3 = format!(
         "event: {}\ndata: {}\n\n",
-        event_types::MCP_LIST_TOOLS_COMPLETED,
+        McpEvent::LIST_TOOLS_COMPLETED,
         event3_payload
     );
     if tx.send(Ok(Bytes::from(event3))).is_err() {
@@ -450,7 +450,7 @@ pub(super) fn send_mcp_list_tools_events(
 
     // Event 4: response.output_item.done with full tools list
     let event4_payload = json!({
-        "type": event_types::OUTPUT_ITEM_DONE,
+        "type": OutputItemEvent::DONE,
         "sequence_number": *sequence_number,
         "output_index": output_index,
         "item": tools_item_full
@@ -458,7 +458,7 @@ pub(super) fn send_mcp_list_tools_events(
     *sequence_number += 1;
     let event4 = format!(
         "event: {}\ndata: {}\n\n",
-        event_types::OUTPUT_ITEM_DONE,
+        OutputItemEvent::DONE,
         event4_payload
     );
     tx.send(Ok(Bytes::from(event4))).is_ok()
@@ -495,7 +495,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 
     // Event 1: response.mcp_call.completed
     let completed_payload = json!({
-        "type": event_types::MCP_CALL_COMPLETED,
+        "type": McpEvent::CALL_COMPLETED,
         "sequence_number": *sequence_number,
         "output_index": effective_output_index,
         "item_id": item_id
@@ -504,7 +504,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 
     let completed_event = format!(
         "event: {}\ndata: {}\n\n",
-        event_types::MCP_CALL_COMPLETED,
+        McpEvent::CALL_COMPLETED,
         completed_payload
     );
     if tx.send(Ok(Bytes::from(completed_event))).is_err() {
@@ -513,7 +513,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 
     // Event 2: response.output_item.done (with completed mcp_call)
     let done_payload = json!({
-        "type": event_types::OUTPUT_ITEM_DONE,
+        "type": OutputItemEvent::DONE,
         "sequence_number": *sequence_number,
         "output_index": effective_output_index,
         "item": mcp_call_item
@@ -522,7 +522,7 @@ pub(super) fn send_mcp_call_completion_events_with_error(
 
     let done_event = format!(
         "event: {}\ndata: {}\n\n",
-        event_types::OUTPUT_ITEM_DONE,
+        OutputItemEvent::DONE,
         done_payload
     );
     tx.send(Ok(Bytes::from(done_event))).is_ok()
@@ -541,7 +541,7 @@ pub(super) fn inject_mcp_metadata_streaming(
 ) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
         output_array.retain(|item| {
-            item.get("type").and_then(|t| t.as_str()) != Some(event_types::ITEM_TYPE_MCP_LIST_TOOLS)
+            item.get("type").and_then(|t| t.as_str()) != Some(ItemType::MCP_LIST_TOOLS)
         });
 
         let list_tools_item = build_mcp_list_tools_item(mcp, server_label);
@@ -782,9 +782,7 @@ pub(super) fn build_incomplete_response(
         let mut mcp_call_items = Vec::new();
         for item in output_array.iter() {
             let item_type = item.get("type").and_then(|t| t.as_str());
-            if item_type == Some(event_types::ITEM_TYPE_FUNCTION_TOOL_CALL)
-                || item_type == Some(event_types::ITEM_TYPE_FUNCTION_CALL)
-            {
+            if item_type.is_some_and(is_function_call_type) {
                 let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let args = item
                     .get("arguments")
@@ -870,7 +868,7 @@ pub(super) fn build_mcp_list_tools_item(mcp: &Arc<mcp::McpManager>, server_label
 
     json!({
         "id": generate_id("mcpl"),
-        "type": event_types::ITEM_TYPE_MCP_LIST_TOOLS,
+        "type": ItemType::MCP_LIST_TOOLS,
         "server_label": server_label,
         "tools": tools_json
     })
@@ -887,7 +885,7 @@ pub(super) fn build_mcp_call_item(
 ) -> Value {
     json!({
         "id": generate_id("mcp"),
-        "type": event_types::ITEM_TYPE_MCP_CALL,
+        "type": ItemType::MCP_CALL,
         "status": if success { "completed" } else { "failed" },
         "approval_request_id": Value::Null,
         "arguments": arguments,
@@ -906,7 +904,7 @@ pub(super) fn build_executed_mcp_call_items(
     let mut mcp_call_items = Vec::new();
 
     for item in conversation_history {
-        if item.get("type").and_then(|t| t.as_str()) == Some(event_types::ITEM_TYPE_FUNCTION_CALL) {
+        if item.get("type").and_then(|t| t.as_str()) == Some(ItemType::FUNCTION_CALL) {
             let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
             let tool_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = item
@@ -958,9 +956,7 @@ pub(super) fn extract_function_call(resp: &Value) -> Option<(String, String, Str
     for item in output {
         let obj = item.as_object()?;
         let t = obj.get("type")?.as_str()?;
-        if t == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
-            || t == event_types::ITEM_TYPE_FUNCTION_CALL
-        {
+        if is_function_call_type(t) {
             let call_id = obj
                 .get("call_id")
                 .and_then(|v| v.as_str())

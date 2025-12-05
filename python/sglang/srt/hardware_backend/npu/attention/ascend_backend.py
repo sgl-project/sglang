@@ -7,8 +7,10 @@ import torch
 import torch_npu
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+    is_mla_preprocess_enabled,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType

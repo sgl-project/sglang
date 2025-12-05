@@ -16,8 +16,10 @@ use std::{
 use serde_json::json;
 use sgl_model_gateway::{
     app_context::AppContext,
-    config::RouterConfig,
-    core::{LoadMonitor, WorkerRegistry},
+    config::{RouterConfig, RoutingMode},
+    core::{
+        BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
+    },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
@@ -110,6 +112,26 @@ pub async fn create_test_context(config: RouterConfig) -> Arc<AppContext> {
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
+
+    // Register external workers for OpenAI mode
+    if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
+        for url in worker_urls {
+            // Create a worker that supports common test models
+            let models = vec![
+                ModelCard::new("mock-model"),
+                ModelCard::new("gpt-4"),
+                ModelCard::new("gpt-3.5-turbo"),
+            ];
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(RuntimeType::External)
+                    .models(models)
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+    }
 
     // Initialize MCP manager with empty config
     use sgl_model_gateway::mcp::{McpConfig, McpManager};
@@ -221,6 +243,26 @@ pub async fn create_test_context_with_mcp_config(
         .workflow_engine
         .set(engine)
         .expect("WorkflowEngine should only be initialized once");
+
+    // Register external workers for OpenAI mode
+    if let RoutingMode::OpenAI { worker_urls, .. } = &config.mode {
+        for url in worker_urls {
+            // Create a worker that supports common test models
+            let models = vec![
+                ModelCard::new("mock-model"),
+                ModelCard::new("gpt-4"),
+                ModelCard::new("gpt-3.5-turbo"),
+            ];
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(RuntimeType::External)
+                    .models(models)
+                    .build(),
+            );
+            app_context.worker_registry.register(worker);
+        }
+    }
 
     // Initialize MCP manager from config file
     let mcp_config = McpConfig::from_file(mcp_config_path)
