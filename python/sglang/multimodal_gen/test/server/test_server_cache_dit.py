@@ -70,7 +70,9 @@ CACHE_DIT_DUAL_TRANSFORMER_CONFIG = {
 }
 
 
-def _apply_cache_dit_env(monkeypatch: pytest.MonkeyPatch, config: dict[str, str]) -> None:
+def _apply_cache_dit_env(
+    monkeypatch: pytest.MonkeyPatch, config: dict[str, str]
+) -> None:
     """Apply cache-dit env vars for a test case."""
     logger.info("Setting cache-dit environment variables:")
     for key, value in config.items():

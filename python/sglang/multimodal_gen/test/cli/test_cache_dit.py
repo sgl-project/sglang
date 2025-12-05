@@ -45,6 +45,7 @@ from typing import Optional
 @dataclass
 class TestConfig:
     """Test configuration with environment variables."""
+
     name: str
     env_vars: dict[str, str]
     description: str
@@ -283,35 +284,37 @@ def run_all_tests(
 
 def print_results(results: list[dict]):
     """Print test results as a markdown table."""
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("## cache-dit Test Results")
-    print("="*80 + "\n")
+    print("=" * 80 + "\n")
 
     print("| Config | Model | Duration (s) | Success | Verified |")
     print("|--------|-------|--------------|---------|----------|")
 
     for r in results:
-        duration_str = f"{r['duration']:.2f}" if r['duration'] else "N/A"
-        success_str = "Yes" if r['success'] else "No"
-        verified_str = "Yes" if r['verified'] else "No"
-        print(f"| {r['config']:<20} | {r['model']:<10} | {duration_str:<12} | {success_str:<7} | {verified_str:<8} |")
+        duration_str = f"{r['duration']:.2f}" if r["duration"] else "N/A"
+        success_str = "Yes" if r["success"] else "No"
+        verified_str = "Yes" if r["verified"] else "No"
+        print(
+            f"| {r['config']:<20} | {r['model']:<10} | {duration_str:<12} | {success_str:<7} | {verified_str:<8} |"
+        )
 
     print()
 
     # Summary
     total = len(results)
-    passed = sum(1 for r in results if r['success'] and r['verified'])
+    passed = sum(1 for r in results if r["success"] and r["verified"])
     print(f"**Summary**: {passed}/{total} tests passed")
 
     # Performance comparison
-    baseline = next((r for r in results if r['config'] == 'baseline'), None)
-    if baseline and baseline['duration']:
+    baseline = next((r for r in results if r["config"] == "baseline"), None)
+    if baseline and baseline["duration"]:
         print("\n### Speedup vs Baseline")
         print("| Config | Speedup |")
         print("|--------|---------|")
         for r in results:
-            if r['duration'] and r['config'] != 'baseline':
-                speedup = baseline['duration'] / r['duration']
+            if r["duration"] and r["config"] != "baseline":
+                speedup = baseline["duration"] / r["duration"]
                 print(f"| {r['config']:<20} | {speedup:.2f}x |")
 
 
@@ -423,7 +426,8 @@ def main():
             env_config = TestConfig(
                 name="env_config",
                 env_vars={
-                    k: v for k, v in os.environ.items()
+                    k: v
+                    for k, v in os.environ.items()
                     if k.startswith("SGLANG_CACHE_DIT_")
                 },
                 description="Configuration from environment variables",

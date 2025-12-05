@@ -483,13 +483,12 @@ TWO_GPU_CASES_B = [
     ),
 ]
 
+
 def _default_tolerances() -> ToleranceConfig:
     """Return permissive tolerances when perf_baselines.json is absent."""
     return ToleranceConfig(
         e2e=float(os.getenv("SGLANG_E2E_TOLERANCE", "0.0")),
-        denoise_stage=float(
-            os.getenv("SGLANG_STAGE_TIME_TOLERANCE", "0.0")
-        ),
+        denoise_stage=float(os.getenv("SGLANG_STAGE_TIME_TOLERANCE", "0.0")),
         non_denoise_stage=float(
             os.getenv("SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE", "0.0")
         ),
