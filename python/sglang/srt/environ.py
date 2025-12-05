@@ -192,6 +192,12 @@ class Envs:
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    # Controls the number of consecutive decode iterations before allowing a new prefill batch.
+    # When set to a positive integer N, the scheduler will skip prefill and run decode for N
+    # iterations before scheduling a new prefill batch. This helps reduce prefill-decode
+    # interference and can improve decode latency in high-throughput scenarios.
+    # Default: -1 (disabled, prefill is scheduled whenever possible)
+    SGLANG_PREFILL_INTERVAL = EnvInt(-1)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
