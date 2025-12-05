@@ -64,6 +64,9 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
     DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2
 )
 
+# AMD-specific models verified on MI300X with tp=2
+AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+
 NO_MOE_PADDING_MODELS = {"neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"}
 DISABLE_HF_XET_MODELS = {
     "Qwen/Qwen2-57B-A14B-Instruct",
@@ -129,6 +132,8 @@ class TestNightlyGsm8KEval(unittest.TestCase):
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP1), True, False),
             (parse_models(DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2), True, True),
+            # AMD-specific models verified on MI300X
+            (parse_models(AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2), False, True),
         ]
         cls.base_url = DEFAULT_URL_FOR_TEST
 
