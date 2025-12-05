@@ -45,7 +45,7 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
     },
-    routers::{router_manager::RouterManager, RouterTrait},
+    routers::{conversations, router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
 };
 
@@ -270,47 +270,32 @@ async fn v1_responses_list_input_items(
 
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    state
-        .router
-        .create_conversation(Some(&headers), &body)
-        .await
+    conversations::create_conversation(&state.context.conversation_storage, body).await
 }
 
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
 ) -> Response {
-    state
-        .router
-        .get_conversation(Some(&headers), &conversation_id)
-        .await
+    conversations::get_conversation(&state.context.conversation_storage, &conversation_id).await
 }
 
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    state
-        .router
-        .update_conversation(Some(&headers), &conversation_id, &body)
+    conversations::update_conversation(&state.context.conversation_storage, &conversation_id, body)
         .await
 }
 
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
 ) -> Response {
-    state
-        .router
-        .delete_conversation(Some(&headers), &conversation_id)
-        .await
+    conversations::delete_conversation(&state.context.conversation_storage, &conversation_id).await
 }
 
 #[derive(Deserialize, Default)]
@@ -323,23 +308,21 @@ struct ListItemsQuery {
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
     Query(ListItemsQuery {
         limit,
         order,
         after,
     }): Query<ListItemsQuery>,
 ) -> Response {
-    state
-        .router
-        .list_conversation_items(
-            Some(&headers),
-            &conversation_id,
-            limit,
-            order.as_deref(),
-            after.as_deref(),
-        )
-        .await
+    conversations::list_conversation_items(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        limit,
+        order.as_deref(),
+        after.as_deref(),
+    )
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -351,36 +334,43 @@ struct GetItemQuery {
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    state
-        .router
-        .create_conversation_items(Some(&headers), &conversation_id, &body)
-        .await
+    conversations::create_conversation_items(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        body,
+    )
+    .await
 }
 
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(String, String)>,
-    headers: http::HeaderMap,
     Query(query): Query<GetItemQuery>,
 ) -> Response {
-    state
-        .router
-        .get_conversation_item(Some(&headers), &conversation_id, &item_id, query.include)
-        .await
+    conversations::get_conversation_item(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        &item_id,
+        query.include,
+    )
+    .await
 }
 
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(String, String)>,
-    headers: http::HeaderMap,
 ) -> Response {
-    state
-        .router
-        .delete_conversation_item(Some(&headers), &conversation_id, &item_id)
-        .await
+    conversations::delete_conversation_item(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        &item_id,
+    )
+    .await
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
