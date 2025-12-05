@@ -91,13 +91,9 @@ def get_input_ids(tokenizer_path, max_tokens=3000, num_samples=NUM_SAMPLES):
 def compare_kl_divergence(
     input_logprobs, output_logprobs, ACC_THRESHOLDS, model_name, test_name
 ):
-    """
-    Compare the KL divergence between input and output log probabilities.
-    """
+    """Compare the KL divergence between input and output log probabilities."""
     kl_divs = []
-    for i, (input_logprob, output_logprob) in enumerate(
-        zip(input_logprobs, output_logprobs)
-    ):
+    for input_logprob, output_logprob in zip(input_logprobs, output_logprobs):
         input_logprob = np.array(input_logprob)
         output_logprob = np.array(output_logprob)
         logr = input_logprob - output_logprob
@@ -108,9 +104,64 @@ def compare_kl_divergence(
     avg_kl_div = sum(kl_divs) / len(kl_divs)
     print(f"avg_kl_div={avg_kl_div}")
     print(f"ACC_THRESHOLDS={ACC_THRESHOLDS[model_name]}")
-    assert (
-        avg_kl_div < ACC_THRESHOLDS[model_name]["kl_div"]
-    ), f"avg_kl_div={avg_kl_div} is greater than threshold={ACC_THRESHOLDS[model_name]['kl_div']} for {model_name} {test_name}"
+    assert avg_kl_div < ACC_THRESHOLDS[model_name]["kl_div"], (
+        f"avg_kl_div={avg_kl_div} > threshold={ACC_THRESHOLDS[model_name]['kl_div']} "
+        f"for {model_name} {test_name}"
+    )
+
+
+# Common request helpers
+def _flush_cache(base_url):
+    requests.post(base_url + "/flush_cache")
+
+
+def _generate(
+    base_url, input_ids, max_new_tokens, return_logprob=False, logprob_start_len=-1
+):
+    """Send generate request and return results."""
+    json_data = {
+        "input_ids": input_ids,
+        "sampling_params": {
+            "temperature": 1,
+            "max_new_tokens": max_new_tokens,
+            "ignore_eos": True,
+        },
+    }
+    if return_logprob:
+        json_data.update(
+            {
+                "return_logprob": True,
+                "return_text_in_logprobs": False,
+                "logprob_start_len": logprob_start_len,
+            }
+        )
+    response = requests.post(base_url + "/generate", json=json_data)
+    return response.json()
+
+
+def _get_input_logprobs(base_url, new_input_ids, output_logprobs):
+    """Run prefill to get input logprobs matching output logprobs."""
+    _flush_cache(base_url)
+    results = _generate(
+        base_url,
+        new_input_ids,
+        max_new_tokens=0,
+        return_logprob=True,
+        logprob_start_len=0,
+    )
+    assert len(results) == len(new_input_ids)
+
+    input_logprobs = []
+    for i, result in enumerate(results):
+        logprob = result["meta_info"]["input_token_logprobs"]
+        logprob = [x[0] for x in logprob][-len(output_logprobs[i]) :]
+        input_logprobs.append(logprob)
+    return input_logprobs
+
+
+def _extract_output_logprobs(result):
+    """Extract output logprobs from a result."""
+    return [x[0] for x in result["meta_info"]["output_token_logprobs"]]
 
 
 def test_input_output_logprobs_match_helper(
@@ -119,63 +170,21 @@ def test_input_output_logprobs_match_helper(
     input_ids = get_input_ids(tokenizer_path=model_name)
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
-    print("Running test_input_output_logprobs_match with ", len(input_ids), "prompts")
+    print(f"Running test_input_output_logprobs_match with {len(input_ids)} prompts")
 
     print("Flush Cache and Running generation to get output logprobs ...")
-    print(base_url)
-    requests.post(base_url + "/flush_cache")
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": 1,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": True,
-            },
-            "return_logprob": True,
-            "return_text_in_logprobs": False,
-            "logprob_start_len": -1,
-        },
-    )
-
-    results = response.json()
+    _flush_cache(base_url)
+    results = _generate(base_url, input_ids, max_new_tokens, return_logprob=True)
     assert len(results) == len(input_ids)
+
     new_input_ids = []
     output_logprobs = []
     for i, result in enumerate(results):
-        output_ids = result["output_ids"]
-        new_input_ids.append(input_ids[i] + output_ids)
-        output_logprob = result["meta_info"]["output_token_logprobs"]
-        output_logprob = [x[0] for x in output_logprob]
-        output_logprobs.append(output_logprob)
+        new_input_ids.append(input_ids[i] + result["output_ids"])
+        output_logprobs.append(_extract_output_logprobs(result))
 
     print("Running prefill to get input logprobs ...")
-    # Flush cache before running prefill
-    requests.post(base_url + "/flush_cache")
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "input_ids": new_input_ids,
-            "sampling_params": {
-                "temperature": 1,
-                "max_new_tokens": 0,
-                "ignore_eos": True,
-            },
-            "return_logprob": True,
-            "return_text_in_logprobs": False,
-            "logprob_start_len": 0,
-        },
-    )
-
-    new_results = response.json()
-    assert len(new_results) == len(new_input_ids)
-
-    input_logprobs = []
-    for i, result in enumerate(new_results):
-        input_logprob = result["meta_info"]["input_token_logprobs"]
-        input_logprob = [x[0] for x in input_logprob][-len(output_logprobs[i]) :]
-        input_logprobs.append(input_logprob)
+    input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
 
     compare_kl_divergence(
         input_logprobs,
@@ -189,98 +198,43 @@ def test_input_output_logprobs_match_helper(
 def test_input_output_logprobs_match_prefill_cache_hit_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
-    # query server info to make sure disable_radix_cache is False
     server_info = requests.get(base_url + "/get_server_info").json()
     if server_info["disable_radix_cache"]:
-        print(
-            "Radix cache is disabled, skipping test_input_output_logprobs_match_prefill_cache_hit test"
-        )
+        print("Radix cache is disabled, skipping test")
         return
 
     input_ids = get_input_ids(tokenizer_path=model_name)
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
     print(
-        "Running test_input_output_logprobs_match_prefill_cache_hit with ",
-        len(input_ids),
-        "prompts",
+        f"Running test_input_output_logprobs_match_prefill_cache_hit with {len(input_ids)} prompts"
     )
 
+    # Prefill to cache the input
     print("Flush Cache and Prefill to cache the input ...")
-    requests.post(base_url + "/flush_cache")
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": 1,
-                "max_new_tokens": 0,
-                "ignore_eos": True,
-            },
-        },
-    )
+    _flush_cache(base_url)
+    _generate(base_url, input_ids, max_new_tokens=0)
 
+    # Generate with cache hit
     print("Running generation to get output logprobs ...")
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": 1,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": True,
-            },
-            "return_logprob": True,
-            "return_text_in_logprobs": False,
-            "logprob_start_len": -1,
-        },
-    )
-
-    results = response.json()
+    results = _generate(base_url, input_ids, max_new_tokens, return_logprob=True)
     assert len(results) == len(input_ids)
+
     new_input_ids = []
     output_logprobs = []
     for i, result in enumerate(results):
-        output_ids = result["output_ids"]
-        cached_tokens = result["meta_info"]["cached_tokens"]
-        if cached_tokens == 0:
-            print(f"Prefill cache miss for prompt {i}, skipping this prompt")
+        if result["meta_info"]["cached_tokens"] == 0:
+            print(f"Prefill cache miss for prompt {i}, skipping")
             continue
-        new_input_ids.append(input_ids[i] + output_ids)
-        output_logprob = result["meta_info"]["output_token_logprobs"]
-        output_logprob = [x[0] for x in output_logprob]
-        output_logprobs.append(output_logprob)
+        new_input_ids.append(input_ids[i] + result["output_ids"])
+        output_logprobs.append(_extract_output_logprobs(result))
 
     assert len(new_input_ids) > 0.5 * len(
         input_ids
-    ), f"Too few prefill cache hits, {len(new_input_ids)=}, {len(input_ids)=}"
+    ), f"Too few prefill cache hits: {len(new_input_ids)}/{len(input_ids)}"
 
     print("Flush Cache and run prefill to get input logprobs ...")
-    # Flush cache before running prefill
-    requests.post(base_url + "/flush_cache")
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "input_ids": new_input_ids,
-            "sampling_params": {
-                "temperature": 1,
-                "max_new_tokens": 0,
-                "ignore_eos": True,
-            },
-            "return_logprob": True,
-            "return_text_in_logprobs": False,
-            "logprob_start_len": 0,
-        },
-    )
-
-    new_results = response.json()
-    assert len(new_results) == len(new_input_ids)
-
-    input_logprobs = []
-    for i, result in enumerate(new_results):
-        input_logprob = result["meta_info"]["input_token_logprobs"]
-        input_logprob = [x[0] for x in input_logprob][-len(output_logprobs[i]) :]
-        input_logprobs.append(input_logprob)
+    input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
 
     compare_kl_divergence(
         input_logprobs,
@@ -294,113 +248,56 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
 def test_input_output_logprobs_match_decode_cache_hit_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
-    # query server info to make sure disable_radix_cache is False
     server_info = requests.get(base_url + "/get_server_info").json()
     if server_info["disable_radix_cache"]:
-        print(
-            "Radix cache is disabled, skipping test_input_output_logprobs_match_decode_cache_hit test"
-        )
+        print("Radix cache is disabled, skipping test")
         return
 
     first_turn_input_ids = get_input_ids(tokenizer_path=model_name)
     if max_samples is not None:
         first_turn_input_ids = first_turn_input_ids[:max_samples]
     print(
-        "Running test_input_output_logprobs_match_decode_cache_hit with ",
-        len(first_turn_input_ids),
-        "prompts",
+        f"Running test_input_output_logprobs_match_decode_cache_hit with {len(first_turn_input_ids)} prompts"
     )
 
+    # First turn: Prefill + Decode to cache
     print("Flush Cache and First turn: Prefill + Decode to cache decode ...")
-    requests.post(base_url + "/flush_cache")
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "input_ids": first_turn_input_ids,
-            "sampling_params": {
-                "temperature": 1,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": True,
-            },
-            "return_logprob": True,
-            "return_text_in_logprobs": False,
-            "logprob_start_len": -1,
-        },
+    _flush_cache(base_url)
+    results = _generate(
+        base_url, first_turn_input_ids, max_new_tokens, return_logprob=True
     )
+    assert len(results) == len(first_turn_input_ids)
 
     tokenizer = get_tokenizer(tokenizer_name=model_name)
-    comma_token_id = tokenizer.encode(",")  # add comma to ensure cache hit
+    comma_token_id = tokenizer.encode(",")
 
-    results = response.json()
-    assert len(results) == len(first_turn_input_ids)
-    second_turn_input_ids = []
-    for i, result in enumerate(results):
-        output_ids = result["output_ids"]
-        second_turn_input_ids.append(
-            first_turn_input_ids[i] + output_ids + comma_token_id
-        )
+    second_turn_input_ids = [
+        first_turn_input_ids[i] + result["output_ids"] + comma_token_id
+        for i, result in enumerate(results)
+    ]
 
+    # Second turn: should hit decode cache
     print("Running generation to get output logprobs ...")
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "input_ids": second_turn_input_ids,
-            "sampling_params": {
-                "temperature": 1,
-                "max_new_tokens": max_new_tokens,
-                "ignore_eos": True,
-            },
-            "return_logprob": True,
-            "return_text_in_logprobs": False,
-            "logprob_start_len": -1,
-        },
+    results = _generate(
+        base_url, second_turn_input_ids, max_new_tokens, return_logprob=True
     )
-
-    results = response.json()
     assert len(results) == len(second_turn_input_ids)
+
     new_input_ids = []
     output_logprobs = []
     for i, result in enumerate(results):
-        output_ids = result["output_ids"]
-        cached_tokens = result["meta_info"]["cached_tokens"]
-        if cached_tokens <= len(first_turn_input_ids[i]) + 1:
-            print(f"Decode cache miss for prompt {i}, skipping this prompt")
+        if result["meta_info"]["cached_tokens"] <= len(first_turn_input_ids[i]) + 1:
+            print(f"Decode cache miss for prompt {i}, skipping")
             continue
-        new_input_ids.append(second_turn_input_ids[i] + output_ids)
-        output_logprob = result["meta_info"]["output_token_logprobs"]
-        output_logprob = [x[0] for x in output_logprob]
-        output_logprobs.append(output_logprob)
+        new_input_ids.append(second_turn_input_ids[i] + result["output_ids"])
+        output_logprobs.append(_extract_output_logprobs(result))
 
     assert len(new_input_ids) > 0.5 * len(
         second_turn_input_ids
-    ), f"Too few decode cache hits, {len(new_input_ids)=}, {len(second_turn_input_ids)=}"
+    ), f"Too few decode cache hits: {len(new_input_ids)}/{len(second_turn_input_ids)}"
 
     print("Flush Cache and run prefill to get input logprobs ...")
-    # Flush cache before running prefill
-    requests.post(base_url + "/flush_cache")
-    response = requests.post(
-        base_url + "/generate",
-        json={
-            "input_ids": new_input_ids,
-            "sampling_params": {
-                "temperature": 1,
-                "max_new_tokens": 0,
-                "ignore_eos": True,
-            },
-            "return_logprob": True,
-            "return_text_in_logprobs": False,
-            "logprob_start_len": 0,
-        },
-    )
-
-    new_results = response.json()
-    assert len(new_results) == len(new_input_ids)
-
-    input_logprobs = []
-    for i, result in enumerate(new_results):
-        input_logprob = result["meta_info"]["input_token_logprobs"]
-        input_logprob = [x[0] for x in input_logprob][-len(output_logprobs[i]) :]
-        input_logprobs.append(input_logprob)
+    input_logprobs = _get_input_logprobs(base_url, new_input_ids, output_logprobs)
 
     compare_kl_divergence(
         input_logprobs,
