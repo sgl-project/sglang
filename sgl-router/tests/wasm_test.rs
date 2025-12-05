@@ -777,7 +777,7 @@ async fn test_wasm_module_execution() {
 
     // Execute the module
     let result = wasm_manager
-        .execute_module_wit(module_uuid, attach_point, input)
+        .execute_module_interface(module_uuid, attach_point, input)
         .await;
 
     // Verify execution result

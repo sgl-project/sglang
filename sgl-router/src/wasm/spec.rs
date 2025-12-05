@@ -1,31 +1,31 @@
-//! WIT Bindings and Type Conversions
+//! WebAssembly Interface Bindings and Type Conversions
 //!
-//! Contains wasmtime component bindings generated from WIT definitions,
-//! and helper functions to convert between Axum HTTP types and WIT types.
+//! Contains wasmtime component bindings generated from interface definitions,
+//! and helper functions to convert between Axum HTTP types and interface types.
 
 use axum::http::{header, HeaderMap, HeaderValue};
 
 wasmtime::component::bindgen!({
-    path: "src/wasm/wit",
+    path: "src/wasm/interface",
     world: "sgl-router",
     imports: { default: async | trappable },
     exports: { default: async },
 });
 
-/// Build WIT headers from Axum HeaderMap
-pub fn build_wit_headers_from_axum_headers(
+/// Build WebAssembly headers from Axum HeaderMap
+pub fn build_wasm_headers_from_axum_headers(
     headers: &HeaderMap,
 ) -> Vec<sgl::router::middleware_types::Header> {
-    let mut wit_headers = Vec::new();
+    let mut wasm_headers = Vec::new();
     for (name, value) in headers.iter() {
         if let Ok(value_str) = value.to_str() {
-            wit_headers.push(sgl::router::middleware_types::Header {
+            wasm_headers.push(sgl::router::middleware_types::Header {
                 name: name.as_str().to_string(),
                 value: value_str.to_string(),
             });
         }
     }
-    wit_headers
+    wasm_headers
 }
 
 /// Apply ModifyAction header modifications to Axum HeaderMap

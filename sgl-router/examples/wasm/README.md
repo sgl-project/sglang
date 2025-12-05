@@ -1,6 +1,6 @@
 # WASM Guest Examples for sgl-router
 
-This directory contains example WASM middleware components demonstrating how to implement custom middleware for sgl-router using the WebAssembly Component Model (WIT).
+This directory contains example WASM middleware components demonstrating how to implement custom middleware for sgl-router using the WebAssembly Component Model.
 
 ## Examples Overview
 

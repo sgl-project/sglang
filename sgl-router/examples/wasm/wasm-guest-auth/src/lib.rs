@@ -7,7 +7,7 @@
 //! - API Key authentication
 
 wit_bindgen::generate!({
-    path: "../../../src/wasm/wit",
+    path: "../../../src/wasm/interface",
     world: "sgl-router",
 });
 

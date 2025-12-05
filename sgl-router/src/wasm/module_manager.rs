@@ -128,8 +128,8 @@ impl WasmModuleManager {
         &self.runtime
     }
 
-    /// Execute WASM module using WIT component model based on attach_point
-    pub async fn execute_module_wit(
+    /// Execute WASM module using WebAssembly component model based on attach_point
+    pub async fn execute_module_interface(
         &self,
         module_uuid: Uuid,
         attach_point: WasmModuleAttachPoint,
@@ -195,15 +195,15 @@ impl WasmModuleManager {
         result
     }
 
-    /// Execute WASM module using WIT component model (sync version)
-    pub fn execute_module_wit_sync(
+    /// Execute WASM module using WebAssembly component model (sync version)
+    pub fn execute_module_interface_sync(
         &self,
         module_uuid: Uuid,
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
     ) -> Result<WasmComponentOutput> {
         let handle = tokio::runtime::Handle::current();
-        handle.block_on(self.execute_module_wit(module_uuid, attach_point, input))
+        handle.block_on(self.execute_module_interface(module_uuid, attach_point, input))
     }
 
     /// Get current metrics
@@ -220,7 +220,7 @@ impl WasmModuleManager {
     /// Execute a WASM module for a given attach point
     /// Returns the Action if successful, or None if execution failed
     ///
-    /// This is a convenience method that wraps execute_module_wit and handles
+    /// This is a convenience method that wraps execute_module_interface and handles
     /// error logging automatically.
     pub async fn execute_module_for_attach_point(
         &self,
@@ -231,7 +231,7 @@ impl WasmModuleManager {
         use tracing::error;
 
         let action_result = self
-            .execute_module_wit(module.module_uuid, attach_point, input)
+            .execute_module_interface(module.module_uuid, attach_point, input)
             .await;
 
         match action_result {

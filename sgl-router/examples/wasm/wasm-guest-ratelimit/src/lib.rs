@@ -13,7 +13,7 @@
 //! implementing rate limiting at the host/router level with shared state.
 
 wit_bindgen::generate!({
-    path: "../../../src/wasm/wit",
+    path: "../../../src/wasm/interface",
     world: "sgl-router",
 });
 

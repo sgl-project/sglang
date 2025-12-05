@@ -23,12 +23,12 @@ src/wasm/
 ├── module_manager.rs   # Module lifecycle management (add/remove/list)
 ├── runtime.rs          # WASM execution engine and thread pool
 ├── route.rs            # HTTP API endpoints for module management
-├── spec.rs             # WIT bindings and type conversions
+├── spec.rs             # WASM interface types bindings and type conversions
 ├── types.rs            # Generic input/output types
 ├── errors.rs           # Error definitions
 ├── config.rs           # Runtime configuration
-└── wit/
-    └── spec.wit        # WebAssembly Interface Types (WIT) definitions
+└── interface/
+    └── spec.wit        # WebAssembly Interface Types definitions
 ```
 
 ### Execution Flow
@@ -41,7 +41,7 @@ src/wasm/
 3. For each module:
    a. Module manager retrieves pre-loaded WASM bytes
    b. Runtime executes component in isolated worker thread
-   c. Component processes request via WIT interface
+   c. Component processes request via WASM type interface
    d. Returns Action (Continue/Reject/Modify)
    ↓
 4. If Continue: proceed to next middleware/upstream
@@ -55,15 +55,15 @@ src/wasm/
 6. Return final response to client
 ```
 
-### WIT (WebAssembly Interface Types)
+### WebAssembly Interface Types
 
-The module uses the WebAssembly Component Model with WIT for type-safe communication between host and WASM components:
+The module uses the WebAssembly Component Model with WASM interface type for type-safe communication between host and WASM components:
 
 - **Request Processing**: `middleware-on-request::on-request(req: Request) -> Action`
 - **Response Processing**: `middleware-on-response::on-response(resp: Response) -> Action`
 - **Actions**: `Continue`, `Reject(status)`, or `Modify(modify-action)`
 
-See [`wit/spec.wit`](./wit/spec.wit) for the complete interface definition.
+See [`interface/spec.wit`](./interface/spec.wit) for the complete interface definition.
 
 ## Usage
 
@@ -202,13 +202,13 @@ wasm-tools component new target/wasm32-wasip2/release/my_module.wasm \
   -o my_module.component.wasm
 ```
 
-### WIT Interface
+### WASM Interface Type
 
-Define your component using the WIT interface from `wit/spec.wit`:
+Define your component using the WASM interface from `interface/spec.wit`:
 
 ```rust
 wit_bindgen::generate!({
-    path: "../../../src/wasm/wit",
+    path: "../../../src/wasm/interface",
     world: "sgl-router",
 });
 

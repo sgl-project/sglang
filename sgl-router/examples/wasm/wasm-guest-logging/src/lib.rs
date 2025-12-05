@@ -1,14 +1,14 @@
 //! WASM Guest Logging Example for sgl-router
 //!
 //! This example demonstrates logging and tracing middleware
-//! for sgl-router using the WebAssembly Component Model (WIT).
+//! for sgl-router using the WebAssembly Component Model.
 //!
 //! Features:
 //! - Request tracking and tracing headers
 //! - Response status code conversion
 
 wit_bindgen::generate!({
-    path: "../../../src/wasm/wit",
+    path: "../../../src/wasm/interface",
     world: "sgl-router",
 });
 

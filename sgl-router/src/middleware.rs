@@ -27,9 +27,9 @@ use crate::{
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
         spec::{
-            apply_modify_action_to_headers, build_wit_headers_from_axum_headers,
+            apply_modify_action_to_headers, build_wasm_headers_from_axum_headers,
             sgl::router::middleware_types::{
-                Action, Request as WitRequest, Response as WitResponse,
+                Action, Request as WasmRequest, Response as WasmResponse,
             },
         },
         types::WasmComponentInput,
@@ -627,13 +627,13 @@ pub async fn wasm_middleware(
     let mut modified_body = body_bytes;
 
     for module in modules_on_request {
-        // Build WIT request from collected data
-        let wit_headers = build_wit_headers_from_axum_headers(&headers);
-        let wit_request = WitRequest {
+        // Build WebAssembly request from collected data
+        let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
+        let wasm_request = WasmRequest {
             method: method.to_string(),
             path: uri.path().to_string(),
             query: uri.query().unwrap_or("").to_string(),
-            headers: wit_headers,
+            headers: wasm_headers,
             body: modified_body.clone(),
             request_id: request_id.clone(),
             now_epoch_ms: std::time::SystemTime::now()
@@ -651,7 +651,7 @@ pub async fn wasm_middleware(
             .execute_module_for_attach_point(
                 &module,
                 on_request_attach_point.clone(),
-                WasmComponentInput::MiddlewareRequest(wit_request),
+                WasmComponentInput::MiddlewareRequest(wasm_request),
             )
             .await
         {
@@ -721,11 +721,11 @@ pub async fn wasm_middleware(
 
     // Process each OnResponse module
     for module in modules_on_response {
-        // Build WIT response from collected data
-        let wit_headers = build_wit_headers_from_axum_headers(&headers);
-        let wit_response = WitResponse {
+        // Build WebAssembly response from collected data
+        let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
+        let wasm_response = WasmResponse {
             status: status.as_u16(),
-            headers: wit_headers,
+            headers: wasm_headers,
             body: body_bytes.clone(),
         };
 
@@ -734,7 +734,7 @@ pub async fn wasm_middleware(
             .execute_module_for_attach_point(
                 &module,
                 on_response_attach_point.clone(),
-                WasmComponentInput::MiddlewareResponse(wit_response),
+                WasmComponentInput::MiddlewareResponse(wasm_response),
             )
             .await
         {
