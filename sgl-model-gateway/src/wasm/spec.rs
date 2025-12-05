@@ -7,7 +7,7 @@ use axum::http::{header, HeaderMap, HeaderValue};
 
 wasmtime::component::bindgen!({
     path: "src/wasm/interface",
-    world: "sgl-router",
+    world: "sgl-model-gateway",
     imports: { default: async | trappable },
     exports: { default: async },
 });
@@ -15,11 +15,11 @@ wasmtime::component::bindgen!({
 /// Build WebAssembly headers from Axum HeaderMap
 pub fn build_wasm_headers_from_axum_headers(
     headers: &HeaderMap,
-) -> Vec<sgl::router::middleware_types::Header> {
+) -> Vec<sgl::model_gateway::middleware_types::Header> {
     let mut wasm_headers = Vec::new();
     for (name, value) in headers.iter() {
         if let Ok(value_str) = value.to_str() {
-            wasm_headers.push(sgl::router::middleware_types::Header {
+            wasm_headers.push(sgl::model_gateway::middleware_types::Header {
                 name: name.as_str().to_string(),
                 value: value_str.to_string(),
             });
@@ -31,7 +31,7 @@ pub fn build_wasm_headers_from_axum_headers(
 /// Apply ModifyAction header modifications to Axum HeaderMap
 pub fn apply_modify_action_to_headers(
     headers: &mut HeaderMap,
-    modify: &sgl::router::middleware_types::ModifyAction,
+    modify: &sgl::model_gateway::middleware_types::ModifyAction,
 ) {
     // Apply headers_set
     for header_mod in &modify.headers_set {
