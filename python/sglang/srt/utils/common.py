@@ -1840,7 +1840,7 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU) is available.")
 
 
 @lru_cache(maxsize=1)

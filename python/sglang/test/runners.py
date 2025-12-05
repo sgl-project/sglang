@@ -31,9 +31,14 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.utils import load_image
+from sglang.srt.utils import is_npu, load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+    init_npu_backend()
 
 DEFAULT_PROMPTS = [
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
@@ -72,6 +77,8 @@ def get_dtype_str(torch_dtype):
         return "float16"
     if torch_dtype is torch.float32:
         return "float32"
+    if torch_dtype is torch.bfloat16:
+        return "bfloat16"
     else:
         raise NotImplementedError()
 

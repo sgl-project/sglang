@@ -18,8 +18,9 @@ use std::{fs::File, io::Read, path::Path};
 
 use ndarray::{Array4, Array5};
 use sgl_model_gateway::multimodal::vision::{
-    image_processor::ModelSpecificValue, ImagePreProcessor, LlavaProcessor, Phi3VisionProcessor,
-    PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
+    image_processor::ModelSpecificValue, ImagePreProcessor, Llama4VisionProcessor, LlavaProcessor,
+    Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, PreProcessorConfig,
+    Qwen2VLProcessor, Qwen3VLProcessor,
 };
 
 /// Load a numpy .npz file and extract pixel_values
@@ -395,7 +396,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
 
     // Verify shapes match
     let expected_num_patches = grid_t * grid_h * grid_w;
-    let patch_size = config.patch_size.unwrap_or(14);
+    let patch_size = config.get_patch_size(14);
     let temporal_patch_size = config.temporal_patch_size.unwrap_or(2);
     let expected_patch_features = 3 * temporal_patch_size * patch_size * patch_size;
 
@@ -579,7 +580,7 @@ fn run_qwen3_vl_golden_test(image_name: &str) {
 
     // Verify shapes match (Qwen3-VL has patch_size=16)
     let expected_num_patches = grid_t * grid_h * grid_w;
-    let patch_size = config.patch_size.unwrap_or(16);
+    let patch_size = config.get_patch_size(16);
     let temporal_patch_size = config.temporal_patch_size.unwrap_or(2);
     let expected_patch_features = 3 * temporal_patch_size * patch_size * patch_size;
 
@@ -904,12 +905,10 @@ fn run_phi3_vision_golden_test(image_name: &str) {
     }
 
     // Allow tolerance for floating point and interpolation differences
-    // HuggingFace uses bicubic interpolation while we use bilinear with PyTorch-compatible
-    // coordinate mapping. The max difference is ~0.17 for large images due to interpolation
-    // method differences, which is acceptable since the normalized value range is [-1.8, 2.2].
+    // Using bicubic for global image and bilinear for HD resize to match HuggingFace.
     assert!(
-        pixel_diff < 0.2,
-        "Max pixel difference {} exceeds tolerance 0.2 for {}",
+        pixel_diff < 0.08,
+        "Max pixel difference {} exceeds tolerance 0.08 for {}",
         pixel_diff,
         image_name
     );
@@ -963,4 +962,640 @@ fn test_phi3_vision_golden_odd_dims() {
 #[test]
 fn test_phi3_vision_golden_grayscale() {
     run_phi3_vision_golden_test("grayscale");
+}
+
+// ============================================================================
+// Phi4-Vision tests
+// ============================================================================
+
+/// Load num_img_tokens from Phi4-Vision npz file
+fn load_phi4_num_img_tokens(path: &Path) -> Vec<usize> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("num_img_tokens")
+        .expect("Failed to read npz")
+        .expect("No num_img_tokens");
+
+    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
+    data.into_iter().map(|v| v as usize).collect()
+}
+
+/// Load image_sizes from Phi4-Vision npz file (2D tensor [batch, 2])
+fn load_phi4_image_sizes(path: &Path) -> Vec<(u32, u32)> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("image_sizes")
+        .expect("Failed to read npz")
+        .expect("No image_sizes");
+
+    let shape = reader.shape().to_vec();
+    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
+
+    // Reshape to pairs
+    let num_images = shape[0] as usize;
+    (0..num_images)
+        .map(|i| (data[i * 2] as u32, data[i * 2 + 1] as u32))
+        .collect()
+}
+
+/// Run a Phi4-Vision golden test for a specific image.
+///
+/// This test validates:
+/// 1. Output shape is [1, num_crops+1, 3, 448, 448] (note: 448 base resolution)
+/// 2. image_sizes matches HuggingFace output
+/// 3. num_img_tokens matches HuggingFace output
+/// 4. Pixel values match within tolerance
+///
+/// Key differences from Phi3-Vision:
+/// - Base resolution: 448 (vs 336)
+/// - Normalization: [0.5, 0.5, 0.5] (vs CLIP)
+/// - Default dynamic_hd: 36 (vs 16)
+fn run_phi4_vision_golden_test(image_name: &str) {
+    let golden_dir = Path::new("tests/fixtures/golden/phi4_vision");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{}.jpg", image_name));
+
+    if !golden_dir.exists() || !image_path.exists() {
+        eprintln!(
+            "Golden test fixtures for phi4_vision/{} not found, skipping test",
+            image_name
+        );
+        eprintln!("Run: python scripts/generate_vision_golden.py --model phi4_vision");
+        return;
+    }
+
+    let npz_path = golden_dir.join(format!("golden_{}.npz", image_name));
+    let config = load_config(&golden_dir.join("preprocessor_config.json"));
+
+    // Load golden values
+    let golden_pixels = load_golden_npz_5d(&npz_path);
+    let golden_image_sizes = load_phi4_image_sizes(&npz_path);
+    let golden_num_tokens = load_phi4_num_img_tokens(&npz_path);
+
+    // Process image with our Rust processor
+    let image = image::open(&image_path).expect("Failed to open image");
+    let processor = Phi4VisionProcessor::from_preprocessor_config(&config);
+    let result = processor
+        .preprocess(&[image], &config)
+        .expect("Processing failed");
+
+    // Check output shape
+    let rust_shape = result.pixel_values.shape();
+    let golden_shape = golden_pixels.shape();
+    println!(
+        "phi4_vision - {} image - Shape: golden={:?}, rust={:?}",
+        image_name, golden_shape, rust_shape
+    );
+    assert_eq!(
+        rust_shape, golden_shape,
+        "Shape mismatch for phi4_vision/{}",
+        image_name
+    );
+
+    // Check image_sizes
+    let rust_image_sizes: Vec<(u32, u32)> = match result.model_specific.get("image_sizes") {
+        Some(ModelSpecificValue::UintTensor { data, shape }) => {
+            let num_images = shape[0];
+            (0..num_images)
+                .map(|i| (data[i * 2], data[i * 2 + 1]))
+                .collect()
+        }
+        _ => panic!("Expected image_sizes in model_specific"),
+    };
+
+    println!(
+        "phi4_vision - {} image - Image sizes (h, w): golden={:?}, rust={:?}",
+        image_name, golden_image_sizes, rust_image_sizes
+    );
+    assert_eq!(
+        golden_image_sizes, rust_image_sizes,
+        "image_sizes mismatch for {}",
+        image_name
+    );
+
+    // Check num_img_tokens
+    println!(
+        "phi4_vision - {} image - Num tokens: golden={:?}, rust={:?}",
+        image_name, golden_num_tokens, result.num_img_tokens
+    );
+    assert_eq!(
+        golden_num_tokens, result.num_img_tokens,
+        "num_img_tokens mismatch for {}",
+        image_name
+    );
+
+    // Compare pixel values
+    let rust_pixels = result
+        .pixel_values
+        .clone()
+        .into_dimensionality::<ndarray::Ix5>()
+        .expect("Failed to convert to Ix5");
+
+    let pixel_diff = max_diff_5d(&golden_pixels, &rust_pixels);
+    println!(
+        "phi4_vision - {} image - Max pixel diff: {:.6}",
+        image_name, pixel_diff
+    );
+
+    // If there's a large difference, print detailed info
+    if pixel_diff > 0.1 {
+        let (max_diff, max_pos) =
+            find_max_diff_location_5d(&golden_pixels, &rust_pixels, image_name);
+        println!(
+            "phi4_vision - {} image - Max diff {:.4} at position {:?}",
+            image_name, max_diff, max_pos
+        );
+        let (b, t, c, h, w) = max_pos;
+        println!(
+            "  golden value: {:.4}, rust value: {:.4}",
+            golden_pixels[[b, t, c, h, w]],
+            rust_pixels[[b, t, c, h, w]]
+        );
+    }
+
+    // Allow tolerance for floating point and interpolation differences
+    // Using bilinear for HD resize and bicubic for global image to match HuggingFace.
+    assert!(
+        pixel_diff < 0.05,
+        "Max pixel difference {} exceeds tolerance 0.05 for {}",
+        pixel_diff,
+        image_name
+    );
+}
+
+#[test]
+fn test_phi4_vision_golden_square() {
+    run_phi4_vision_golden_test("square");
+}
+
+#[test]
+fn test_phi4_vision_golden_tall() {
+    run_phi4_vision_golden_test("tall");
+}
+
+#[test]
+fn test_phi4_vision_golden_wide() {
+    run_phi4_vision_golden_test("wide");
+}
+
+#[test]
+fn test_phi4_vision_golden_small() {
+    run_phi4_vision_golden_test("small");
+}
+
+#[test]
+fn test_phi4_vision_golden_tiny() {
+    run_phi4_vision_golden_test("tiny");
+}
+
+#[test]
+fn test_phi4_vision_golden_very_tall() {
+    run_phi4_vision_golden_test("very_tall");
+}
+
+#[test]
+fn test_phi4_vision_golden_very_wide() {
+    run_phi4_vision_golden_test("very_wide");
+}
+
+#[test]
+fn test_phi4_vision_golden_large() {
+    run_phi4_vision_golden_test("large");
+}
+
+#[test]
+fn test_phi4_vision_golden_odd_dims() {
+    run_phi4_vision_golden_test("odd_dims");
+}
+
+#[test]
+fn test_phi4_vision_golden_grayscale() {
+    run_phi4_vision_golden_test("grayscale");
+}
+
+// ============================================================================
+// LLaMA 4 Vision tests
+// ============================================================================
+
+/// Load aspect_ratios from npz file for LLaMA 4
+fn load_llama4_aspect_ratios(path: &Path) -> Vec<(u32, u32)> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("aspect_ratios")
+        .expect("Failed to read npz")
+        .expect("No aspect_ratios");
+
+    let shape = reader.shape().to_vec();
+
+    // Read data as i64 vec (numpy default for int)
+    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
+
+    // Convert to Vec<(u32, u32)>
+    let num_images = shape[0] as usize;
+    (0..num_images)
+        .map(|i| (data[i * 2] as u32, data[i * 2 + 1] as u32))
+        .collect()
+}
+
+/// Load pixel_values for LLaMA 4 Vision (3D: [num_tiles, C, H, W])
+fn load_llama4_pixels(path: &Path) -> (Vec<f32>, Vec<usize>) {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("pixel_values")
+        .expect("Failed to read npz")
+        .expect("No pixel_values");
+
+    let shape: Vec<usize> = reader.shape().iter().map(|&s| s as usize).collect();
+    let data: Vec<f32> = reader.into_vec().expect("Failed to read array");
+
+    (data, shape)
+}
+
+/// Run a LLaMA 4 Vision golden test for a specific image.
+///
+/// This test validates:
+/// 1. Output shape matches (batch, num_tiles, 3, 336, 336)
+/// 2. aspect_ratios match (h_tiles, w_tiles)
+/// 3. Pixel values match HuggingFace output
+/// 4. Token count is correct
+///
+/// LLaMA 4 Vision processing:
+/// - Tile size: 336x336
+/// - Max patches: 16 (default)
+/// - Normalization: [0.5, 0.5, 0.5] mean/std
+/// - Global tile added when num_tiles > 1
+fn run_llama4_vision_golden_test(image_name: &str) {
+    let golden_dir = Path::new("tests/fixtures/golden/llama4_vision");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{}.jpg", image_name));
+
+    if !golden_dir.exists() || !image_path.exists() {
+        eprintln!(
+            "Golden test fixtures for llama4_vision/{} not found, skipping test",
+            image_name
+        );
+        eprintln!("Run: python scripts/generate_vision_golden.py --model llama4_vision");
+        return;
+    }
+
+    let npz_path = golden_dir.join(format!("golden_{}.npz", image_name));
+    let config = load_config(&golden_dir.join("preprocessor_config.json"));
+
+    // Load golden values
+    let (golden_pixels, golden_shape) = load_llama4_pixels(&npz_path);
+    let golden_aspect_ratios = load_llama4_aspect_ratios(&npz_path);
+    let golden_num_tokens = load_golden_num_tokens(&npz_path);
+
+    // Process image with our Rust processor
+    let image = image::open(&image_path).expect("Failed to open image");
+    let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
+    let result = processor
+        .preprocess(&[image], &config)
+        .expect("Processing failed");
+
+    // Check aspect_ratios
+    let rust_aspect_ratios: Vec<(u32, u32)> = match result.model_specific.get("aspect_ratios") {
+        Some(ModelSpecificValue::UintTensor { data, shape }) => {
+            let num_images = shape[0];
+            (0..num_images)
+                .map(|i| (data[i * 2], data[i * 2 + 1]))
+                .collect()
+        }
+        _ => panic!("Expected aspect_ratios in model_specific"),
+    };
+
+    println!(
+        "llama4_vision - {} image - Aspect ratios: golden={:?}, rust={:?}",
+        image_name, golden_aspect_ratios, rust_aspect_ratios
+    );
+    assert_eq!(
+        golden_aspect_ratios, rust_aspect_ratios,
+        "aspect_ratios mismatch for {}",
+        image_name
+    );
+
+    // Check num_tokens
+    let rust_num_tokens = result.num_img_tokens[0];
+    println!(
+        "llama4_vision - {} image - Tokens: golden={}, rust={}",
+        image_name, golden_num_tokens, rust_num_tokens
+    );
+    assert_eq!(
+        golden_num_tokens, rust_num_tokens,
+        "num_tokens mismatch for {}",
+        image_name
+    );
+
+    // Check output shape - HuggingFace outputs (num_tiles, 3, 336, 336) without batch
+    // Our Rust outputs (batch, num_tiles, 3, 336, 336) with batch dimension
+    let rust_shape = result.pixel_values.shape();
+    println!(
+        "llama4_vision - {} image - Shape: golden={:?}, rust={:?}",
+        image_name, golden_shape, rust_shape
+    );
+
+    // HuggingFace returns without batch dim, we add batch=1
+    assert!(
+        rust_shape[0] == 1,
+        "Expected batch dim to be 1, got {}",
+        rust_shape[0]
+    );
+    assert!(
+        rust_shape[1] >= golden_shape[0],
+        "Expected at least {} tiles, got {}",
+        golden_shape[0],
+        rust_shape[1]
+    );
+
+    // Compare pixel values
+    let rust_pixels = result.pixel_values_flat();
+    let num_golden_elements: usize = golden_shape.iter().product();
+
+    // Find the max difference for the actual tiles (not padding)
+    let mut max_diff = 0.0f32;
+    for i in 0..num_golden_elements {
+        let diff = (rust_pixels[i] - golden_pixels[i]).abs();
+        max_diff = max_diff.max(diff);
+    }
+
+    println!(
+        "llama4_vision - {} image - Max pixel diff: {:.6}",
+        image_name, max_diff
+    );
+
+    // Allow tolerance for floating point and interpolation differences
+    // LLaMA 4 uses bfloat16 internally which may cause small differences
+    assert!(
+        max_diff < 0.03,
+        "Max pixel difference {} exceeds tolerance 0.03 for {}",
+        max_diff,
+        image_name
+    );
+}
+
+#[test]
+fn test_llama4_vision_golden_square() {
+    run_llama4_vision_golden_test("square");
+}
+
+#[test]
+fn test_llama4_vision_golden_tall() {
+    run_llama4_vision_golden_test("tall");
+}
+
+#[test]
+fn test_llama4_vision_golden_wide() {
+    run_llama4_vision_golden_test("wide");
+}
+
+#[test]
+fn test_llama4_vision_golden_small() {
+    run_llama4_vision_golden_test("small");
+}
+
+#[test]
+fn test_llama4_vision_golden_tiny() {
+    run_llama4_vision_golden_test("tiny");
+}
+
+#[test]
+fn test_llama4_vision_golden_very_tall() {
+    run_llama4_vision_golden_test("very_tall");
+}
+
+#[test]
+fn test_llama4_vision_golden_very_wide() {
+    run_llama4_vision_golden_test("very_wide");
+}
+
+#[test]
+fn test_llama4_vision_golden_large() {
+    run_llama4_vision_golden_test("large");
+}
+
+#[test]
+fn test_llama4_vision_golden_odd_dims() {
+    run_llama4_vision_golden_test("odd_dims");
+}
+
+#[test]
+fn test_llama4_vision_golden_grayscale() {
+    run_llama4_vision_golden_test("grayscale");
+}
+
+// ============================================================================
+// Pixtral/Mistral3 Vision tests
+// ============================================================================
+
+/// Load image_sizes from npz file for Pixtral
+fn load_pixtral_image_sizes(path: &Path) -> Vec<(usize, usize)> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
+
+    let reader = npz
+        .by_name("image_sizes")
+        .expect("Failed to read npz")
+        .expect("No image_sizes");
+
+    let shape = reader.shape().to_vec();
+
+    // Read data as i64 vec (numpy default for int)
+    let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
+
+    // Convert to Vec<(usize, usize)>
+    let num_images = shape[0] as usize;
+    (0..num_images)
+        .map(|i| (data[i * 2] as usize, data[i * 2 + 1] as usize))
+        .collect()
+}
+
+/// Run a Pixtral golden test for a specific image.
+///
+/// This test validates:
+/// 1. Output shape matches (batch, 3, H, W)
+/// 2. image_sizes match
+/// 3. Pixel values match HuggingFace output
+/// 4. Token count is correct
+///
+/// Pixtral processing:
+/// - Longest edge: 1024 (default)
+/// - Patch size: 16
+/// - Normalization: CLIP mean/std
+/// - No tiling - single output per image
+fn run_pixtral_golden_test(image_name: &str) {
+    let golden_dir = Path::new("tests/fixtures/golden/pixtral");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{}.jpg", image_name));
+
+    if !golden_dir.exists() || !image_path.exists() {
+        eprintln!(
+            "Golden test fixtures for pixtral/{} not found, skipping test",
+            image_name
+        );
+        eprintln!("Run: python scripts/generate_vision_golden.py --model pixtral");
+        return;
+    }
+
+    let npz_path = golden_dir.join(format!("golden_{}.npz", image_name));
+    let config = load_config(&golden_dir.join("preprocessor_config.json"));
+
+    // Load golden values
+    let golden_pixels = load_golden_npz(&npz_path);
+    let golden_shape: Vec<usize> = golden_pixels.shape().to_vec();
+    let golden_image_sizes = load_pixtral_image_sizes(&npz_path);
+    let golden_num_tokens = load_golden_num_tokens(&npz_path);
+
+    // Process image with our Rust processor
+    let image = image::open(&image_path).expect("Failed to open image");
+    let processor = PixtralProcessor::from_preprocessor_config(&config);
+    let result = processor
+        .preprocess(&[image], &config)
+        .expect("Processing failed");
+
+    // Check image_sizes from model_specific
+    let rust_image_sizes: Vec<(usize, usize)> = match result.model_specific.get("image_sizes") {
+        Some(ModelSpecificValue::IntTensor { data, shape }) => {
+            let num_images = shape[0];
+            (0..num_images)
+                .map(|i| (data[i * 2] as usize, data[i * 2 + 1] as usize))
+                .collect()
+        }
+        _ => panic!("Expected image_sizes in model_specific"),
+    };
+
+    println!(
+        "pixtral - {} image - Image sizes: golden={:?}, rust={:?}",
+        image_name, golden_image_sizes, rust_image_sizes
+    );
+    assert_eq!(
+        golden_image_sizes, rust_image_sizes,
+        "image_sizes mismatch for {}",
+        image_name
+    );
+
+    // Check num_tokens
+    let rust_num_tokens = result.num_img_tokens[0];
+    println!(
+        "pixtral - {} image - Tokens: golden={}, rust={}",
+        image_name, golden_num_tokens, rust_num_tokens
+    );
+    assert_eq!(
+        golden_num_tokens, rust_num_tokens,
+        "num_tokens mismatch for {}",
+        image_name
+    );
+
+    // Check output shape
+    let rust_shape = result.pixel_values.shape();
+    println!(
+        "pixtral - {} image - Shape: golden={:?}, rust={:?}",
+        image_name, golden_shape, rust_shape
+    );
+
+    // Pixtral outputs [batch, C, H, W] with padding to max size in batch
+    // Single image should match golden shape exactly
+    assert_eq!(rust_shape[0], 1, "Expected batch dim to be 1");
+    assert_eq!(rust_shape[1], golden_shape[1], "Channel mismatch");
+    assert!(
+        rust_shape[2] >= golden_shape[2],
+        "Height {} < golden height {}",
+        rust_shape[2],
+        golden_shape[2]
+    );
+    assert!(
+        rust_shape[3] >= golden_shape[3],
+        "Width {} < golden width {}",
+        rust_shape[3],
+        golden_shape[3]
+    );
+
+    // Compare pixel values - only compare the actual image region, not padding
+    let rust_pixels = result.pixel_values_flat();
+    let golden_pixels_flat: Vec<f32> = golden_pixels.iter().copied().collect();
+
+    // Calculate indices for the actual image region (not padding)
+    let h = golden_shape[2];
+    let w = golden_shape[3];
+    let rust_w = rust_shape[3];
+
+    let mut max_diff = 0.0f32;
+    for c in 0..3 {
+        for y in 0..h {
+            for x in 0..w {
+                let golden_idx = c * h * w + y * w + x;
+                let rust_idx = c * rust_shape[2] * rust_w + y * rust_w + x;
+                let diff = (rust_pixels[rust_idx] - golden_pixels_flat[golden_idx]).abs();
+                max_diff = max_diff.max(diff);
+            }
+        }
+    }
+
+    println!(
+        "pixtral - {} image - Max pixel diff: {:.6}",
+        image_name, max_diff
+    );
+
+    // Allow tolerance for bicubic interpolation differences between PIL and Rust image library
+    // Pixtral uses bicubic which has larger differences than bilinear
+    assert!(
+        max_diff < 0.06,
+        "Max pixel difference {} exceeds tolerance 0.06 for {}",
+        max_diff,
+        image_name
+    );
+}
+
+#[test]
+fn test_pixtral_golden_square() {
+    run_pixtral_golden_test("square");
+}
+
+#[test]
+fn test_pixtral_golden_tall() {
+    run_pixtral_golden_test("tall");
+}
+
+#[test]
+fn test_pixtral_golden_wide() {
+    run_pixtral_golden_test("wide");
+}
+
+#[test]
+fn test_pixtral_golden_small() {
+    run_pixtral_golden_test("small");
+}
+
+#[test]
+fn test_pixtral_golden_tiny() {
+    run_pixtral_golden_test("tiny");
+}
+
+#[test]
+fn test_pixtral_golden_very_tall() {
+    run_pixtral_golden_test("very_tall");
+}
+
+#[test]
+fn test_pixtral_golden_very_wide() {
+    run_pixtral_golden_test("very_wide");
+}
+
+#[test]
+fn test_pixtral_golden_large() {
+    run_pixtral_golden_test("large");
+}
+
+#[test]
+fn test_pixtral_golden_odd_dims() {
+    run_pixtral_golden_test("odd_dims");
+}
+
+#[test]
+fn test_pixtral_golden_grayscale() {
+    run_pixtral_golden_test("grayscale");
 }

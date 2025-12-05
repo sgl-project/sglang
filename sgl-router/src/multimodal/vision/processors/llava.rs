@@ -308,7 +308,7 @@ impl ImagePreProcessor for LlavaProcessor {
         config: &PreProcessorConfig,
     ) -> usize {
         // For LLaVA 1.5, token count is based on processed image size and patch size
-        let patch_size = config.patch_size.unwrap_or(self.patch_size as usize) as u32;
+        let patch_size = config.get_patch_size(self.patch_size as usize) as u32;
         let image_size = config
             .get_target_size()
             .map(|(h, _w)| h)

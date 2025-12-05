@@ -583,8 +583,10 @@ class ModelRunner:
             quantization_config := getattr(
                 self.model_config.hf_config, "quantization_config", None
             )
-        ) is not None and "weight_block_size" in quantization_config:
-            weight_block_size_n = quantization_config["weight_block_size"][0]
+        ) is not None and (
+            weight_block_size := quantization_config.get("weight_block_size", None)
+        ) is not None:
+            weight_block_size_n = weight_block_size[0]
 
             if self.tp_size % self.moe_ep_size != 0:
                 raise ValueError(

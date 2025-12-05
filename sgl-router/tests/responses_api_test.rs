@@ -14,7 +14,10 @@ use common::{
     mock_mcp_server::MockMCPServer,
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
-use sgl_model_gateway::{config::RouterConfig, routers::RouterFactory};
+use sgl_model_gateway::{
+    config::RouterConfig,
+    routers::{conversations, RouterFactory},
+};
 
 #[tokio::test]
 async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
@@ -234,11 +237,12 @@ async fn test_conversations_crud_basic() {
         .build_unchecked();
 
     let ctx = common::create_test_context(router_cfg).await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
-    let create_resp = router.create_conversation(None, &create_body).await;
+    let create_resp =
+        conversations::create_conversation(&ctx.conversation_storage, create_body.clone()).await;
     assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
@@ -249,7 +253,7 @@ async fn test_conversations_crud_basic() {
     assert_eq!(create_json["object"], "conversation");
 
     // Get
-    let get_resp = router.get_conversation(None, conv_id).await;
+    let get_resp = conversations::get_conversation(&ctx.conversation_storage, conv_id).await;
     assert_eq!(get_resp.status(), StatusCode::OK);
     let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
         .await
@@ -259,9 +263,9 @@ async fn test_conversations_crud_basic() {
 
     // Update (merge)
     let update_body = serde_json::json!({ "metadata": { "owner": "alice" } });
-    let upd_resp = router
-        .update_conversation(None, conv_id, &update_body)
-        .await;
+    let upd_resp =
+        conversations::update_conversation(&ctx.conversation_storage, conv_id, update_body.clone())
+            .await;
     assert_eq!(upd_resp.status(), StatusCode::OK);
     let upd_bytes = axum::body::to_bytes(upd_resp.into_body(), usize::MAX)
         .await
@@ -271,7 +275,7 @@ async fn test_conversations_crud_basic() {
     assert_eq!(upd_json["metadata"]["owner"], serde_json::json!("alice"));
 
     // Delete
-    let del_resp = router.delete_conversation(None, conv_id).await;
+    let del_resp = conversations::delete_conversation(&ctx.conversation_storage, conv_id).await;
     assert_eq!(del_resp.status(), StatusCode::OK);
     let del_bytes = axum::body::to_bytes(del_resp.into_body(), usize::MAX)
         .await
@@ -280,7 +284,7 @@ async fn test_conversations_crud_basic() {
     assert_eq!(del_json["deleted"], serde_json::json!(true));
 
     // Get again -> 404
-    let not_found = router.get_conversation(None, conv_id).await;
+    let not_found = conversations::get_conversation(&ctx.conversation_storage, conv_id).await;
     assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1236,11 +1240,12 @@ async fn test_conversation_items_create_and_get() {
         .build_unchecked();
 
     let ctx = common::create_test_context(router_cfg).await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_resp =
+        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
     assert_eq!(conv_resp.status(), StatusCode::OK);
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
@@ -1264,9 +1269,13 @@ async fn test_conversation_items_create_and_get() {
         ]
     });
 
-    let items_resp = router
-        .create_conversation_items(None, conv_id, &create_items)
-        .await;
+    let items_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        create_items,
+    )
+    .await;
     assert_eq!(items_resp.status(), StatusCode::OK);
     let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
         .await
@@ -1279,9 +1288,14 @@ async fn test_conversation_items_create_and_get() {
 
     // Get first item
     let item_id = items_json["data"][0]["id"].as_str().unwrap();
-    let get_resp = router
-        .get_conversation_item(None, conv_id, item_id, None)
-        .await;
+    let get_resp = conversations::get_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        item_id,
+        None,
+    )
+    .await;
     assert_eq!(get_resp.status(), StatusCode::OK);
     let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
         .await
@@ -1312,11 +1326,12 @@ async fn test_conversation_items_delete() {
         .build_unchecked();
 
     let ctx = common::create_test_context(router_cfg).await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_resp =
+        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1334,9 +1349,13 @@ async fn test_conversation_items_delete() {
         ]
     });
 
-    let items_resp = router
-        .create_conversation_items(None, conv_id, &create_items)
-        .await;
+    let items_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        create_items,
+    )
+    .await;
     let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1344,9 +1363,15 @@ async fn test_conversation_items_delete() {
     let item_id = items_json["data"][0]["id"].as_str().unwrap();
 
     // List items (should have 1)
-    let list_resp = router
-        .list_conversation_items(None, conv_id, None, None, None)
-        .await;
+    let list_resp = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        None,
+        None,
+        None,
+    )
+    .await;
     let list_bytes = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1354,15 +1379,25 @@ async fn test_conversation_items_delete() {
     assert_eq!(list_json["data"].as_array().unwrap().len(), 1);
 
     // Delete item
-    let del_resp = router
-        .delete_conversation_item(None, conv_id, item_id)
-        .await;
+    let del_resp = conversations::delete_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        item_id,
+    )
+    .await;
     assert_eq!(del_resp.status(), StatusCode::OK);
 
     // List items again (should have 0)
-    let list_resp2 = router
-        .list_conversation_items(None, conv_id, None, None, None)
-        .await;
+    let list_resp2 = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        None,
+        None,
+        None,
+    )
+    .await;
     let list_bytes2 = axum::body::to_bytes(list_resp2.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1370,9 +1405,14 @@ async fn test_conversation_items_delete() {
     assert_eq!(list_json2["data"].as_array().unwrap().len(), 0);
 
     // Item should NOT be gettable from this conversation after deletion (link removed)
-    let get_resp = router
-        .get_conversation_item(None, conv_id, item_id, None)
-        .await;
+    let get_resp = conversations::get_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        item_id,
+        None,
+    )
+    .await;
     assert_eq!(get_resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1394,11 +1434,12 @@ async fn test_conversation_items_max_limit() {
         .build_unchecked();
 
     let ctx = common::create_test_context(router_cfg).await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_resp =
+        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1416,9 +1457,13 @@ async fn test_conversation_items_max_limit() {
     }
     let create_items = serde_json::json!({ "items": items });
 
-    let items_resp = router
-        .create_conversation_items(None, conv_id, &create_items)
-        .await;
+    let items_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        create_items,
+    )
+    .await;
     assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
 
     let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
@@ -1446,11 +1491,12 @@ async fn test_conversation_items_unsupported_type() {
         .build_unchecked();
 
     let ctx = common::create_test_context(router_cfg).await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp = router.create_conversation(None, &create_conv).await;
+    let conv_resp =
+        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1467,9 +1513,13 @@ async fn test_conversation_items_unsupported_type() {
         ]
     });
 
-    let items_resp = router
-        .create_conversation_items(None, conv_id, &create_items)
-        .await;
+    let items_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_id,
+        create_items,
+    )
+    .await;
     assert_eq!(items_resp.status(), StatusCode::BAD_REQUEST);
 
     let items_bytes = axum::body::to_bytes(items_resp.into_body(), usize::MAX)
@@ -1497,21 +1547,19 @@ async fn test_conversation_items_multi_conversation_sharing() {
         .build_unchecked();
 
     let ctx = common::create_test_context(router_cfg).await;
-    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
-    let conv_a_resp = router
-        .create_conversation(None, &serde_json::json!({}))
-        .await;
+    let conv_a_resp =
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await;
     let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let conv_a_json: serde_json::Value = serde_json::from_slice(&conv_a_bytes).unwrap();
     let conv_a_id = conv_a_json["id"].as_str().unwrap();
 
-    let conv_b_resp = router
-        .create_conversation(None, &serde_json::json!({}))
-        .await;
+    let conv_b_resp =
+        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await;
     let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1529,9 +1577,13 @@ async fn test_conversation_items_multi_conversation_sharing() {
         ]
     });
 
-    let items_a_resp = router
-        .create_conversation_items(None, conv_a_id, &create_items)
-        .await;
+    let items_a_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_a_id,
+        create_items,
+    )
+    .await;
     let items_a_bytes = axum::body::to_bytes(items_a_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1548,24 +1600,40 @@ async fn test_conversation_items_multi_conversation_sharing() {
         ]
     });
 
-    let items_b_resp = router
-        .create_conversation_items(None, conv_b_id, &reference_items)
-        .await;
+    let items_b_resp = conversations::create_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_b_id,
+        reference_items,
+    )
+    .await;
     assert_eq!(items_b_resp.status(), StatusCode::OK);
 
     // Verify item appears in both conversations
-    let list_a = router
-        .list_conversation_items(None, conv_a_id, None, None, None)
-        .await;
+    let list_a = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_a_id,
+        None,
+        None,
+        None,
+    )
+    .await;
     let list_a_bytes = axum::body::to_bytes(list_a.into_body(), usize::MAX)
         .await
         .unwrap();
     let list_a_json: serde_json::Value = serde_json::from_slice(&list_a_bytes).unwrap();
     assert_eq!(list_a_json["data"].as_array().unwrap().len(), 1);
 
-    let list_b = router
-        .list_conversation_items(None, conv_b_id, None, None, None)
-        .await;
+    let list_b = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_b_id,
+        None,
+        None,
+        None,
+    )
+    .await;
     let list_b_bytes = axum::body::to_bytes(list_b.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1573,14 +1641,24 @@ async fn test_conversation_items_multi_conversation_sharing() {
     assert_eq!(list_b_json["data"].as_array().unwrap().len(), 1);
 
     // Delete from conversation A
-    router
-        .delete_conversation_item(None, conv_a_id, item_id)
-        .await;
+    conversations::delete_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_a_id,
+        item_id,
+    )
+    .await;
 
     // Should be removed from A
-    let list_a2 = router
-        .list_conversation_items(None, conv_a_id, None, None, None)
-        .await;
+    let list_a2 = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_a_id,
+        None,
+        None,
+        None,
+    )
+    .await;
     let list_a2_bytes = axum::body::to_bytes(list_a2.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1588,9 +1666,15 @@ async fn test_conversation_items_multi_conversation_sharing() {
     assert_eq!(list_a2_json["data"].as_array().unwrap().len(), 0);
 
     // Should still exist in B (soft delete)
-    let list_b2 = router
-        .list_conversation_items(None, conv_b_id, None, None, None)
-        .await;
+    let list_b2 = conversations::list_conversation_items(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_b_id,
+        None,
+        None,
+        None,
+    )
+    .await;
     let list_b2_bytes = axum::body::to_bytes(list_b2.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -1598,8 +1682,13 @@ async fn test_conversation_items_multi_conversation_sharing() {
     assert_eq!(list_b2_json["data"].as_array().unwrap().len(), 1);
 
     // Item should still be directly gettable
-    let get_resp = router
-        .get_conversation_item(None, conv_b_id, item_id, None)
-        .await;
+    let get_resp = conversations::get_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        conv_b_id,
+        item_id,
+        None,
+    )
+    .await;
     assert_eq!(get_resp.status(), StatusCode::OK);
 }

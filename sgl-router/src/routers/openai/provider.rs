@@ -225,6 +225,13 @@ impl ProviderRegistry {
             .unwrap_or(self.default_provider.as_ref())
     }
 
+    pub fn get_arc(&self, provider_type: &ProviderType) -> Arc<dyn Provider> {
+        self.providers
+            .get(provider_type)
+            .cloned()
+            .unwrap_or_else(|| Arc::clone(&self.default_provider))
+    }
+
     pub fn get_for_model(&self, model_name: &str) -> &dyn Provider {
         match ProviderType::from_model_name(model_name) {
             Some(pt) => self.get(&pt),
@@ -235,122 +242,8 @@ impl ProviderRegistry {
     pub fn default_provider(&self) -> &dyn Provider {
         self.default_provider.as_ref()
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn test_sglang_provider_passthrough() {
-        let provider = SGLangProvider;
-        let mut payload = json!({"regex": ".*", "top_k": 50});
-
-        provider
-            .transform_request(&mut payload, Endpoint::Chat)
-            .unwrap();
-
-        assert!(payload.get("regex").is_some());
-        assert!(payload.get("top_k").is_some());
-    }
-
-    #[test]
-    fn test_openai_provider_strips_sglang_fields() {
-        let provider = OpenAIProvider;
-        let mut payload = json!({"regex": ".*", "top_k": 50, "temperature": 0.7});
-
-        provider
-            .transform_request(&mut payload, Endpoint::Chat)
-            .unwrap();
-
-        assert!(payload.get("regex").is_none());
-        assert!(payload.get("top_k").is_none());
-        assert!(payload.get("temperature").is_some());
-    }
-
-    #[test]
-    fn test_xai_provider_transforms_responses_input() {
-        let provider = XAIProvider;
-        let mut payload = json!({
-            "input": [{
-                "id": "msg_123",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": "Hello"}]
-            }]
-        });
-
-        provider
-            .transform_request(&mut payload, Endpoint::Responses)
-            .unwrap();
-
-        let item = &payload["input"][0];
-        assert!(item.get("id").is_none());
-        assert!(item.get("status").is_none());
-        assert_eq!(item["content"][0]["type"], "input_text");
-    }
-
-    #[test]
-    fn test_gemini_provider_removes_false_logprobs() {
-        let provider = GeminiProvider;
-        let mut payload = json!({"logprobs": false});
-
-        provider
-            .transform_request(&mut payload, Endpoint::Chat)
-            .unwrap();
-
-        assert!(payload.get("logprobs").is_none());
-    }
-
-    #[test]
-    fn test_gemini_provider_keeps_true_logprobs() {
-        let provider = GeminiProvider;
-        let mut payload = json!({"logprobs": true});
-
-        provider
-            .transform_request(&mut payload, Endpoint::Chat)
-            .unwrap();
-
-        assert_eq!(payload.get("logprobs").unwrap(), true);
-    }
-
-    #[test]
-    fn test_provider_registry_lookup() {
-        let registry = ProviderRegistry::new();
-
-        assert_eq!(
-            registry.get(&ProviderType::OpenAI).provider_type(),
-            ProviderType::OpenAI
-        );
-        assert_eq!(
-            registry.get(&ProviderType::XAI).provider_type(),
-            ProviderType::XAI
-        );
-
-        let custom = ProviderType::Custom("unknown".to_string());
-        assert_eq!(registry.get(&custom).provider_type(), ProviderType::OpenAI);
-    }
-
-    #[test]
-    fn test_provider_registry_get_for_model() {
-        let registry = ProviderRegistry::new();
-
-        assert_eq!(
-            registry.get_for_model("gpt-4").provider_type(),
-            ProviderType::OpenAI
-        );
-        assert_eq!(
-            registry.get_for_model("grok-2").provider_type(),
-            ProviderType::XAI
-        );
-        assert_eq!(
-            registry.get_for_model("gemini-pro").provider_type(),
-            ProviderType::Gemini
-        );
-        assert_eq!(
-            registry.get_for_model("llama-3.1-8b").provider_type(),
-            ProviderType::OpenAI
-        );
+    pub fn default_provider_arc(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.default_provider)
     }
 }

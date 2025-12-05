@@ -576,7 +576,14 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    // Conversations API delegates
+    fn router_type(&self) -> &'static str {
+        "manager"
+    }
+
+    // ============================================================================
+    // Conversation API Methods - delegate to selected router
+    // ============================================================================
+
     async fn create_conversation(&self, headers: Option<&HeaderMap>, body: &Value) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
@@ -658,8 +665,8 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         conversation_id: &str,
         limit: Option<usize>,
-        order: Option<String>,
-        after: Option<String>,
+        order: Option<&str>,
+        after: Option<&str>,
     ) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
@@ -670,7 +677,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to list conversation items for '{}'",
+                    "No router available to list items for conversation '{}'",
                     conversation_id
                 ),
             )
@@ -693,7 +700,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to create conversation items for '{}'",
+                    "No router available to create items for conversation '{}'",
                     conversation_id
                 ),
             )
@@ -717,7 +724,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to get conversation item '{}' in '{}'",
+                    "No router available to get item '{}' from conversation '{}'",
                     item_id, conversation_id
                 ),
             )
@@ -740,16 +747,12 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to delete conversation item '{}' in '{}'",
+                    "No router available to delete item '{}' from conversation '{}'",
                     item_id, conversation_id
                 ),
             )
                 .into_response()
         }
-    }
-
-    fn router_type(&self) -> &'static str {
-        "manager"
     }
 }
 

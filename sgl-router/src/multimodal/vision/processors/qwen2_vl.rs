@@ -119,7 +119,7 @@ impl Qwen2VLProcessor {
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         Self {
             inner: QwenVLProcessorBase::new(QwenVLConfig {
-                patch_size: config.patch_size.unwrap_or(DEFAULT_PATCH_SIZE),
+                patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE),
                 merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
                 min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
                 max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
@@ -245,7 +245,9 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
-    use crate::multimodal::vision::image_processor::ModelSpecificValue;
+    use crate::multimodal::vision::{
+        image_processor::ModelSpecificValue, preprocessor_config::PatchSize,
+    };
 
     fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
@@ -363,7 +365,10 @@ mod tests {
             do_normalize: Some(true),
             image_mean: Some(CLIP_MEAN.to_vec()),
             image_std: Some(CLIP_STD.to_vec()),
-            patch_size: Some(14),
+            patch_size: Some(PatchSize {
+                height: Some(14),
+                width: Some(14),
+            }),
             merge_size: Some(2),
             min_pixels: Some(DEFAULT_MIN_PIXELS),
             max_pixels: Some(DEFAULT_MAX_PIXELS),
@@ -418,7 +423,10 @@ mod tests {
     #[test]
     fn test_qwen2_vl_from_config() {
         let config = PreProcessorConfig {
-            patch_size: Some(16),
+            patch_size: Some(PatchSize {
+                height: Some(16),
+                width: Some(16),
+            }),
             merge_size: Some(4),
             min_pixels: Some(100000),
             max_pixels: Some(500000),

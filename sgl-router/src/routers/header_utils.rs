@@ -1,4 +1,8 @@
-use axum::{body::Body, extract::Request, http::HeaderMap};
+use axum::{
+    body::Body,
+    extract::Request,
+    http::{HeaderMap, HeaderValue},
+};
 
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers
@@ -91,4 +95,90 @@ pub fn apply_request_headers(
     }
 
     request_builder
+}
+
+/// API provider types for provider-specific header handling
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiProvider {
+    Anthropic,
+    Xai,
+    OpenAi,
+    Gemini,
+    Generic,
+}
+
+impl ApiProvider {
+    /// Detect provider type from URL
+    pub fn from_url(url: &str) -> Self {
+        if url.contains("anthropic") {
+            ApiProvider::Anthropic
+        } else if url.contains("x.ai") {
+            ApiProvider::Xai
+        } else if url.contains("openai.com") {
+            ApiProvider::OpenAi
+        } else if url.contains("googleapis.com") {
+            ApiProvider::Gemini
+        } else {
+            ApiProvider::Generic
+        }
+    }
+}
+
+/// Apply provider-specific headers to request
+pub fn apply_provider_headers(
+    mut req: reqwest::RequestBuilder,
+    url: &str,
+    auth_header: Option<&HeaderValue>,
+) -> reqwest::RequestBuilder {
+    let provider = ApiProvider::from_url(url);
+
+    match provider {
+        ApiProvider::Anthropic => {
+            // Anthropic requires x-api-key instead of Authorization
+            // Extract Bearer token and use as x-api-key
+            if let Some(auth) = auth_header {
+                if let Ok(auth_str) = auth.to_str() {
+                    let api_key = auth_str.strip_prefix("Bearer ").unwrap_or(auth_str);
+                    req = req
+                        .header("x-api-key", api_key)
+                        .header("anthropic-version", "2023-06-01");
+                }
+            }
+        }
+        ApiProvider::Gemini | ApiProvider::Xai | ApiProvider::OpenAi | ApiProvider::Generic => {
+            // Standard OpenAI-compatible: use Authorization header as-is
+            if let Some(auth) = auth_header {
+                req = req.header("Authorization", auth);
+            }
+        }
+    }
+
+    req
+}
+
+/// Extract auth header with passthrough semantics.
+///
+/// Passthrough mode: User's Authorization header takes priority.
+/// Fallback: Worker's API key is used only if user didn't provide auth.
+///
+/// This enables use cases where:
+/// 1. Users send their own API keys (multi-tenant, BYOK)
+/// 2. Router has a default key for users who don't provide one
+pub fn extract_auth_header(
+    headers: Option<&HeaderMap>,
+    worker_api_key: &Option<String>,
+) -> Option<HeaderValue> {
+    // Passthrough: Try user's auth header first
+    let user_auth = headers.and_then(|h| {
+        h.get("authorization")
+            .or_else(|| h.get("Authorization"))
+            .cloned()
+    });
+
+    // Return user's auth if provided, otherwise use worker's API key
+    user_auth.or_else(|| {
+        worker_api_key
+            .as_ref()
+            .and_then(|k| HeaderValue::from_str(&format!("Bearer {}", k)).ok())
+    })
 }

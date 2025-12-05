@@ -101,6 +101,7 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 1024
+    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 125
@@ -392,6 +393,13 @@ class SamplingParams:
             type=int,
             default=SamplingParams.seed,
             help="Random seed for generation",
+        )
+        parser.add_argument(
+            "--generator-device",
+            type=str,
+            default=SamplingParams.generator_device,
+            choices=["cuda", "cpu"],
+            help="Device for random generator (cuda or cpu). Default: cuda",
         )
         parser.add_argument(
             "--num-frames",
