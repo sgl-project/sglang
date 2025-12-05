@@ -46,7 +46,7 @@ class TestFp8BlockwiseGemmBase(unittest.TestCase):
             data_path=None,
             num_questions=1319,
             max_new_tokens=512,
-            parallel=1319,
+            parallel=200,
             host=f"{parsed_url.scheme}://{parsed_url.hostname}",
             port=parsed_url.port,
         )
