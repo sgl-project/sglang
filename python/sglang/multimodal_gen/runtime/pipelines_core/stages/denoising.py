@@ -60,12 +60,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
-    CacheDitConfig,
-    enable_cache_on_dual_transformer,
-    enable_cache_on_transformer,
-    get_scm_mask,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
@@ -188,6 +182,12 @@ class DenoisingStage(PipelineStage):
             return
 
         from sglang.multimodal_gen.runtime.distributed import get_world_size
+        from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
+            CacheDitConfig,
+            enable_cache_on_dual_transformer,
+            enable_cache_on_transformer,
+            get_scm_mask,
+        )
 
         if get_world_size() > 1:
             logger.warning(
