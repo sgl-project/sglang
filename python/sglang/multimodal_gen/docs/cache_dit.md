@@ -178,5 +178,5 @@ the [cache-dit repository](https://github.com/vipshop/cache-dit) for supported m
 
 ## References
 
-- [cache-dit](https://github.com/vipshop/cache-dit)
+- [Cache-Dit](https://github.com/vipshop/cache-dit)
 - [SGLang Diffusion](../README.md)
