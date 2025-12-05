@@ -14,7 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_bool_env_var, get_available_gpu_memory
+from sglang.srt.utils import ceil_div, get_available_gpu_memory, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ def _compile_deep_gemm_one_type_all(
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
-        memory_budget = get_available_gpu_memory(device='cuda', gpu_id=0)
+        memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
         # If the memory budget is less than 10GB, set max_m to 4096 to avoid out of memory, which might cause hanging during warmup
         # TODO: Change the magic numbers to something more reasonable
         max_m = max(m_list) if memory_budget > 10 else 4096
