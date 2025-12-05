@@ -806,7 +806,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         # ---- 4. GDN ----
         recurrent_state = ssm_states[cache_indices]
-        core_attn_out_ret, last_recurrent_state_ret = chunk_gated_delta_rule(
+        core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
             q=query,
             k=key,
             v=value,
@@ -818,12 +818,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
             head_first=False,
             use_qk_l2norm_in_kernel=True,
         )
-        last_recurrent_state_ret = last_recurrent_state_ret.to(
-            ssm_states.dtype, copy=False
-        )
-        ssm_states[cache_indices] = last_recurrent_state_ret
+        last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+        ssm_states[cache_indices] = last_recurrent_state
 
-        return core_attn_out_ret
+        return core_attn_out
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
@@ -1093,7 +1091,7 @@ def causal_conv1d_gdn_with_output_fake(
     bias: torch.Tensor,
     activation: str,
     conv_states: torch.Tensor,
-    has_initial_state: torch.Tensor,
+    extend_prefix_lens: torch.Tensor,
     cache_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     g: torch.Tensor,
@@ -1115,7 +1113,7 @@ def causal_conv1d_gdn_with_output(
     bias: torch.Tensor,
     activation: str,
     conv_states: torch.Tensor,
-    has_initial_state: torch.Tensor,
+    extend_prefix_lens: torch.Tensor,
     cache_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     g: torch.Tensor,
@@ -1137,7 +1135,7 @@ def causal_conv1d_gdn_with_output(
             bias,
             activation,
             conv_states,
-            has_initial_state,
+            extend_prefix_lens,
             cache_indices,
             query_start_loc,
             g,
