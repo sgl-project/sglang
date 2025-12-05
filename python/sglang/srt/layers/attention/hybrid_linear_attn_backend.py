@@ -748,12 +748,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     head_k_dim,
                     head_v_dim,
                 )
-                actual_seq_len = mixed_qkv.shape[0]
-                num_value_heads = value_dim // attn_tp_size
-
-                core_attn_out1 = mixed_qkv.new_empty(
-                    (1, actual_seq_len, num_value_heads, head_v_dim)
-                )
         return core_attn_out
 
     def _causal_conv1d_gdn_core(

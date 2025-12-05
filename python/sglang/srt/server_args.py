@@ -905,7 +905,13 @@ class ServerArgs:
         Generate the list of batch sizes for piecewise CUDA graph capture
         based on piecewise_cuda_graph_max_tokens.
         """
-        capture_sizes = list(range(4, 33, 4))
+        capture_sizes = (
+            list(range(4, 33, 4))
+            + list(range(48, 257, 16))
+            + list(range(288, 513, 32))
+            + list(range(640, 4096 + 1, 128))
+            + list(range(4352, self.piecewise_cuda_graph_max_tokens + 1, 256))
+        )
 
         capture_sizes = [
             s for s in capture_sizes if s <= self.piecewise_cuda_graph_max_tokens
