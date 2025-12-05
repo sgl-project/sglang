@@ -347,7 +347,7 @@ jobs:
       (
         (inputs.target_stage == 'stage-a-test-1') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -387,7 +387,7 @@ jobs:
       (
         (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
@@ -434,7 +434,7 @@ jobs:
       (
         (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
@@ -481,7 +481,7 @@ jobs:
         (
           (inputs.target_stage == 'quantization-test') ||
           (
-            inputs.target_stage == '' &&
+            !inputs.target_stage &&
             (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
             ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
           )
@@ -516,7 +516,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-backend-1-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -558,7 +558,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-backend-2-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -599,7 +599,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -640,7 +640,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-h200') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -681,7 +681,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-h20') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -723,7 +723,7 @@ jobs:
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-1') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -792,7 +792,7 @@ jobs:
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-2') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -853,7 +853,7 @@ jobs:
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-3') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -908,7 +908,7 @@ jobs:
       (
         (inputs.target_stage == 'performance-test-2-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -975,7 +975,7 @@ jobs:
       (
         (inputs.target_stage == 'accuracy-test-1-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1015,7 +1015,7 @@ jobs:
       (
         (inputs.target_stage == 'accuracy-test-2-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1055,7 +1055,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-deepep-4-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1092,7 +1092,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-deepep-8-gpu') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1129,7 +1129,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu-b200') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1171,7 +1171,7 @@ jobs:
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
         (
-          inputs.target_stage == '' &&
+          !inputs.target_stage &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
