@@ -301,7 +301,6 @@ class NixlKVManager(CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
-        # Validate page_size matches between prefill and decode servers
         if decode_kv_args.page_size != self.kv_args.page_size:
             raise ValueError(
                 f"Page size mismatch: decode server has page_size={decode_kv_args.page_size}, "
