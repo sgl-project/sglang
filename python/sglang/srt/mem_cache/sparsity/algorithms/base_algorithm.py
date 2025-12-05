@@ -176,53 +176,154 @@ class BaseSparseAlgorithm(ABC):
         return torch.zeros_like(req_pool_indices, dtype=torch.bool)
 
 
-class FakeRandomSparseAlgorithm(BaseSparseAlgorithm):
+class PageMeanPoolingAlgorithm(BaseSparseAlgorithm):
     """
-    Fake random TOKEN_WISE sparse algorithm for testing.
-    Strategy: Keep recent N tokens + randomly select 80% from historical tokens.
+    Experimental: Page-wise sparse attention with mean pooling and TopK selection.
+
+    This is an example implementation demonstrating page-wise sparse attention where:
+    - Pages are represented by mean-pooled key vectors
+    - TopK pages are selected based on query-page similarity
+    - Recent pages are always included
     """
 
-    def __init__(self, config, device: torch.device, **kwargs):
+    PAGE_REPR_STORAGE_NAME = "page_repr"
+
+    def __init__(
+        self, config, device: torch.device, start_layer: int, end_layer: int, **kwargs
+    ):
         super().__init__(config, device, **kwargs)
-        self.min_sparse_prompt_len = 64
-        logger.info(f"FakeRandomSparseAlgorithm initialized, ")
+        self.sparse_ratio = 0.9
+        self.page_size = getattr(config, "page_size", 64)
+        self.num_recent_pages = 4
+        self.min_sparse_prompt_len = self.page_size * (self.num_recent_pages + 2)
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.num_heads = None
+        self.head_dim = None
 
     def get_sparse_mode(self) -> SparseMode:
-        return SparseMode.TOKEN_WISE
+        return SparseMode.PAGE_WISE
+
+    def get_representation_storage_shape(self, token_to_kv_pool) -> Dict[str, tuple]:
+        k_sample = token_to_kv_pool.get_key_buffer(self.start_layer)[0]
+        if k_sample.dim() == 2:
+            self.num_heads, self.head_dim = k_sample.shape
+        repr_dim = self.num_heads * self.head_dim
+        return {self.PAGE_REPR_STORAGE_NAME: ((repr_dim,), k_sample.dtype)}
 
     def should_construct_representations(
         self,
-        forward_batch: "ForwardBatch",
-        layer_id: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        repr_constructed: torch.Tensor,
-        prompt_lens: torch.Tensor,
+        forward_batch,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        repr_constructed,
+        prompt_lens,
     ) -> torch.Tensor:
-        """
-        Check if the representations pool should be constructed for the given requests.
-        Returns:
-            [bs] bool mask
-        """
-        return ~repr_constructed[req_pool_indices]
+        if not forward_batch.forward_mode.is_extend():
+            return torch.zeros_like(req_pool_indices, dtype=torch.bool)
+
+        return ~repr_constructed[req_pool_indices] & (
+            seq_lens >= prompt_lens[req_pool_indices]
+        )
 
     def construct_representations(
         self,
-        layer_id: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        construct_mask: torch.Tensor,
-        k_buffer: torch.Tensor,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        construct_mask,
+        k_buffer,
     ) -> torch.Tensor:
-        """
-        Construct representations for the given requests.
-        Returns:
-            [bs] bool success mask
-        """
-        return construct_mask.clone()
+        bs = req_pool_indices.shape[0]
+        device = k_buffer.device
+        success_mask = torch.zeros(bs, dtype=torch.bool, device=device)
 
-    def get_representation_storage_shape(self, token_to_kv_pool) -> Dict[str, tuple]:
-        return {}
+        if not construct_mask.any():
+            return success_mask
+
+        num_pages_per_req = seq_lens // self.page_size
+        max_pages = torch.max(num_pages_per_req[construct_mask])
+
+        if max_pages == 0:
+            return success_mask
+
+        valid_mask = construct_mask & (num_pages_per_req > 0)
+        if not valid_mask.any():
+            return success_mask
+
+        self._batch_update_pages(
+            layer_id=layer_id,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            valid_mask=valid_mask,
+            start_pages=torch.zeros_like(num_pages_per_req),
+            end_pages=num_pages_per_req,
+            k_buffer=k_buffer,
+            req_to_token=self.req_to_token_pool.req_to_token,
+        )
+
+        success_mask[valid_mask] = True
+        return success_mask
+
+    def should_update_represetations(
+        self,
+        forward_batch,
+        layer_id,
+        req_pool_indices,
+        is_decode,
+        repr_constructed,
+        decode_steps,
+    ) -> torch.Tensor:
+        if not is_decode:
+            return torch.zeros_like(req_pool_indices, dtype=torch.bool)
+
+        mask = repr_constructed[req_pool_indices] & (
+            decode_steps[req_pool_indices] >= self.page_size
+        )
+        return mask
+
+    def update_representations(
+        self,
+        layer_id,
+        req_pool_indices,
+        seq_lens,
+        update_mask,
+        k_buffer,
+        last_extracted_tokens,
+    ) -> torch.Tensor:
+        bs = req_pool_indices.shape[0]
+        device = k_buffer.device
+        success_mask = torch.zeros(bs, dtype=torch.bool, device=device)
+
+        if not update_mask.any():
+            return success_mask
+
+        last_extracted = last_extracted_tokens[req_pool_indices]
+        new_tokens = seq_lens - last_extracted
+        has_new_pages_mask = update_mask & (new_tokens >= self.page_size)
+
+        if not has_new_pages_mask.any():
+            return success_mask
+
+        start_pages = last_extracted // self.page_size
+        end_pages = seq_lens // self.page_size
+        valid_update_mask = has_new_pages_mask & (start_pages < end_pages)
+
+        if valid_update_mask.any():
+            self._batch_update_pages(
+                layer_id=layer_id,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                valid_mask=valid_update_mask,
+                start_pages=start_pages,
+                end_pages=end_pages,
+                k_buffer=k_buffer,
+                req_to_token=self.req_to_token_pool.req_to_token,
+            )
+            success_mask[valid_update_mask] = True
+
+        return success_mask
 
     def retrieve_topk(
         self,
@@ -233,32 +334,142 @@ class FakeRandomSparseAlgorithm(BaseSparseAlgorithm):
         attn_metadata: Optional[Any],
         **kwargs,
     ) -> tuple:
-        target_tokens = 8
-        seq_lens = attn_metadata.cache_seqlens_int32
-        bs = seq_lens.shape[0]
-        device = seq_lens.device
+        seq_lens = (
+            attn_metadata.cache_seqlens_int32 if attn_metadata is not None else None
+        )
+        bs, device = queries.shape[0], queries.device
+        queries = queries.view(bs, -1)
+        num_pages = (seq_lens + self.page_size - 1) // self.page_size
+        max_pages = max(
+            int(torch.max(num_pages).item()) if num_pages.numel() > 0 else 1, 1
+        )
 
         selected_indices = torch.full(
-            (bs, target_tokens), -1, dtype=torch.long, device=device
+            (bs, max_pages), -1, dtype=torch.int32, device=device
         )
         valid_lengths = torch.zeros(bs, dtype=torch.int32, device=device)
 
-        for i in range(bs):
-            if not sparse_mask[i]:
-                continue
+        effective_mask = sparse_mask & (num_pages > self.num_recent_pages)
+        if not effective_mask.any():
+            return selected_indices, valid_lengths
 
-            seq_len = int(seq_lens[i].item()) - 1
-            if seq_len <= target_tokens:
-                num_select = seq_len
-                indices = torch.arange(seq_len, device=device)
-                if seq_len < target_tokens:
-                    raise ValueError("Negative values in indices are not allowed.")
-            else:
-                num_select = target_tokens
-                indices = torch.randperm(seq_len, device=device)[:target_tokens]
-                indices = torch.sort(indices)[0]
+        storage = self.repr_pool.get_layer_storage(
+            layer_id, self.PAGE_REPR_STORAGE_NAME
+        )
+        repr_dim = storage.shape[1]
 
-            selected_indices[i, :num_select] = indices
-            valid_lengths[i] = num_select
+        if queries.shape[1] != repr_dim:
+            queries = (
+                queries.view(bs, self.num_heads, -1, self.head_dim)
+                .mean(dim=2)
+                .reshape(bs, -1)
+            )
+
+        page_indices = torch.arange(max_pages, device=device).unsqueeze(0)
+        page_starts = page_indices * self.page_size
+
+        first_tokens = self.req_to_token_pool.req_to_token[
+            req_pool_indices.unsqueeze(1).expand(bs, max_pages),
+            page_starts.clamp(0, self.req_to_token_pool.req_to_token.shape[1] - 1),
+        ]
+        phys_pages = (first_tokens // self.page_size).clamp(0, storage.shape[0] - 1)
+        page_reprs = storage[phys_pages].to(queries.dtype)
+
+        recent_start = (num_pages - self.num_recent_pages).clamp(min=0)
+        history_mask = page_indices < recent_start.unsqueeze(1)
+
+        scores = (queries.unsqueeze(1) @ page_reprs.transpose(1, 2)).squeeze(1)
+        scores = torch.where(history_mask, scores, float("-inf"))
+
+        num_select = (recent_start.float() * self.sparse_ratio).int().clamp(min=1)
+        max_select = int(num_select.max().item())
+
+        topk_indices = torch.topk(scores, k=max_select, dim=1, sorted=False)[1]
+        topk_mask = torch.arange(max_select, device=device).unsqueeze(
+            0
+        ) < num_select.unsqueeze(1)
+        topk_indices = torch.where(topk_mask, topk_indices, -1)
+
+        recent_indices = recent_start.unsqueeze(1) + torch.arange(
+            self.num_recent_pages, device=device
+        )
+        recent_indices = torch.where(
+            recent_indices < num_pages.unsqueeze(1), recent_indices, -1
+        )
+
+        combined = torch.cat([topk_indices, recent_indices], dim=1)
+        combined = torch.sort(combined, dim=1)[0]
+
+        valid_lengths[:] = torch.where(
+            effective_mask, (combined >= 0).sum(dim=1).int(), 0
+        )
+        selected_indices[:, : combined.shape[1]] = torch.where(
+            effective_mask.unsqueeze(1), combined, -1
+        )
 
         return selected_indices, valid_lengths
+
+    def _batch_update_pages(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        valid_mask: torch.Tensor,
+        start_pages: torch.Tensor,
+        end_pages: torch.Tensor,
+        k_buffer: torch.Tensor,
+        req_to_token: torch.Tensor,
+    ):
+        if not valid_mask.any():
+            return
+
+        device = k_buffer.device
+        storage = self.repr_pool.get_layer_storage(
+            layer_id, self.PAGE_REPR_STORAGE_NAME
+        )
+
+        valid_reqs = req_pool_indices[valid_mask]
+        valid_lens = seq_lens[valid_mask]
+        valid_starts = start_pages[valid_mask]
+        valid_ends = end_pages[valid_mask]
+        num_valid = valid_reqs.shape[0]
+
+        max_pages = int(torch.max(valid_ends - valid_starts))
+
+        page_offsets = torch.arange(max_pages, device=device).unsqueeze(0)
+        page_ids = valid_starts.unsqueeze(1) + page_offsets
+        page_mask = page_ids < valid_ends.unsqueeze(1)
+
+        token_starts = page_ids * self.page_size
+        token_ends = torch.clamp(
+            token_starts + self.page_size, max=valid_lens.unsqueeze(1)
+        )
+
+        token_offsets = torch.arange(self.page_size, device=device).view(1, 1, -1)
+        token_pos = token_starts.unsqueeze(2) + token_offsets
+        token_mask = (token_pos < token_ends.unsqueeze(2)) & page_mask.unsqueeze(2)
+
+        req_exp = valid_reqs.view(num_valid, 1, 1).expand(
+            num_valid, max_pages, self.page_size
+        )
+        token_pos_safe = torch.clamp(token_pos, 0, req_to_token.shape[1] - 1)
+        phys_tokens = req_to_token[req_exp, token_pos_safe]
+        phys_tokens_safe = torch.clamp(phys_tokens, 0, k_buffer.shape[0] - 1)
+
+        k_values = k_buffer[phys_tokens_safe] * token_mask.unsqueeze(-1).unsqueeze(-1)
+        token_counts = token_mask.sum(dim=2, keepdim=True).unsqueeze(-1).clamp(min=1)
+        page_reprs = (k_values.sum(dim=2) / token_counts).reshape(
+            num_valid, max_pages, -1
+        )
+
+        first_tokens = req_to_token[
+            valid_reqs.unsqueeze(1).expand(num_valid, max_pages),
+            torch.clamp(token_starts, 0, req_to_token.shape[1] - 1),
+        ]
+        phys_pages = first_tokens // self.page_size
+
+        valid_indices = page_mask.nonzero(as_tuple=False)
+        if valid_indices.numel() > 0:
+            storage[phys_pages[valid_indices[:, 0], valid_indices[:, 1]]] = page_reprs[
+                valid_indices[:, 0], valid_indices[:, 1]
+            ]

@@ -1,7 +1,6 @@
 from sglang.srt.mem_cache.sparsity.algorithms import (
     BaseSparseAlgorithm,
     DeepSeekNSAAlgorithm,
-    FakeRandomSparseAlgorithm,
     PageMeanPoolingAlgorithm,
     SparseMode,
 )
@@ -20,13 +19,11 @@ from sglang.srt.mem_cache.sparsity.factory import (
 __all__ = [
     "BaseSparseAlgorithm",
     "SparseMode",
-    "FakeRandomSparseAlgorithm",
     "PageMeanPoolingAlgorithm",
     "DeepSeekNSAAlgorithm",
     "BackendAdaptor",
     "FlashAttentionAdaptor",
     "RepresentationPool",
-    "RequestState",
     "SparseConfig",
     "SparseCoordinator",
     "create_sparse_coordinator",

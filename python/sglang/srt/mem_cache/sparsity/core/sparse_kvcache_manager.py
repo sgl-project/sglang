@@ -4,7 +4,6 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
-import nvtx
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController
@@ -18,8 +17,10 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+from sglang.srt.mem_cache.sparsity.ops.triton_kernel import (
+    invoke_nsa_sparse_diff_kernel,
+)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.mem_cache.sparsity.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
 
 if TYPE_CHECKING:
     pass
@@ -120,10 +121,10 @@ class SparseKVCacheManager:
 
         should_load_device_indices = self.req_states.should_load_device_indices[:bs]
         should_load_host_indices = self.req_states.should_load_host_indices[:bs]
-        
+
         # if layer_id == 0:
-        #     logger.info(f"[DEBUG] should_load_host_indices shape: {should_load_host_indices.shape}, head: {should_load_host_indices[:bs, :20]}") 
-        
+        #     logger.info(f"[DEBUG] should_load_host_indices shape: {should_load_host_indices.shape}, head: {should_load_host_indices[:bs, :20]}")
+
         # load cache from cpu
         self.host_mem_pool.load_to_device_per_layer(
             self.host_mem_pool.device_pool,
@@ -179,7 +180,9 @@ class SparseKVCacheManager:
         host_indices, req_pool_indices, seq_lens = (
             self.sparse_decode_ongoing_offload.pop(ack_list[0])
         )
-        self.req_states.full_host_indices[req_pool_indices, seq_lens] = host_indices.to(self.req_states.device)
+        self.req_states.full_host_indices[req_pool_indices, seq_lens] = host_indices.to(
+            self.req_states.device
+        )
 
     def offload_prefill_full_kv_cache(self, req):
         offloaded_len = len(req.origin_input_ids)

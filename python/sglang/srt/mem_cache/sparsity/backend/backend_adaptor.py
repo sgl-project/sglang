@@ -40,6 +40,54 @@ class BackendAdaptor(ABC):
         pass
 
 
+class NSABackendAdaptor(BackendAdaptor):
+    """Adaptor for NSA (Native Sparse Attention) backend."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        sparse_mode,
+        req_to_token_pool,
+        kvcache_manager,
+    ):
+        super().__init__(device, sparse_mode)
+        self.req_to_token_pool = req_to_token_pool
+        self.kvcache_manager = kvcache_manager
+
+    @nvtx.annotate("NSABackendAdaptor.adapt_for_attn_metadata", color="green")
+    def adapt_for_attn_metadata(
+        self,
+        selected_indices: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        sparse_mask: torch.Tensor,
+        current_metadata: Any,
+        forward_batch: "ForwardBatch",
+        req_to_token: torch.Tensor,
+        page_size: int,
+        layer_id: int,
+        **kwargs,
+    ) -> Optional[torch.Tensor]:
+        """Transform NSA topk indices to physical device indices."""
+        req_pool_indices = forward_batch.req_pool_indices
+        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+        page_table = self.req_to_token_pool.req_to_token[:, :max_seqlen_k]
+        transformed_indices = (
+            self.kvcache_manager.transfer_sparse_top_k_cache_v2(
+                req_pool_indices=req_pool_indices,
+                top_k_result=selected_indices,
+                out_cache_loc=forward_batch.out_cache_loc,
+                seq_lens=forward_batch.seq_lens,
+                sparse_mask=sparse_mask,
+                page_table=page_table,
+                layer_id=layer_id,
+                page_size=1,
+            )
+            .detach()
+            .clone()
+        ).to(torch.int32)
+        return transformed_indices
+
+
 class FlashAttentionAdaptor(BackendAdaptor):
     """Adaptor for FlashAttention backend."""
 
@@ -167,18 +215,6 @@ class FlashAttentionAdaptor(BackendAdaptor):
     ) -> Any:
         return current_metadata
 
-    def _logical_to_physical_pages(
-        self,
-        logical_page_ids: torch.Tensor,
-        req_pool_idx: int,
-        req_to_token: torch.Tensor,
-        page_size: int,
-    ) -> torch.Tensor:
-        page_starts = logical_page_ids * page_size
-        first_tokens = req_to_token[req_pool_idx, page_starts]
-        physical_page_ids = first_tokens // page_size
-        return physical_page_ids.to(dtype=torch.int32)
-
     def _logical_to_physical_pages_batch(
         self,
         logical_pages: torch.Tensor,
@@ -200,51 +236,3 @@ class FlashAttentionAdaptor(BackendAdaptor):
         )
 
         return physical_pages.to(torch.int32)
-
-
-class NSABackendAdaptor(BackendAdaptor):
-    """Adaptor for NSA (Native Sparse Attention) backend."""
-
-    def __init__(
-        self,
-        device: torch.device,
-        sparse_mode,
-        req_to_token_pool,
-        decode_offload_manager,
-    ):
-        super().__init__(device, sparse_mode)
-        self.req_to_token_pool = req_to_token_pool
-        self.decode_offload_manager = decode_offload_manager
-
-    @nvtx.annotate("NSABackendAdaptor.adapt_for_attn_metadata", color="green")
-    def adapt_for_attn_metadata(
-        self,
-        selected_indices: torch.Tensor,
-        valid_lengths: torch.Tensor,
-        sparse_mask: torch.Tensor,
-        current_metadata: Any,
-        forward_batch: "ForwardBatch",
-        req_to_token: torch.Tensor,
-        page_size: int,
-        layer_id: int,
-        **kwargs,
-    ) -> Optional[torch.Tensor]:
-        """Transform NSA topk indices to physical device indices."""
-        req_pool_indices = forward_batch.req_pool_indices
-        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
-        page_table = self.req_to_token_pool.req_to_token[
-            :, :max_seqlen_k
-        ]
-        transformed_indices = (
-            self.decode_offload_manager.transfer_sparse_top_k_cache_v2(
-                req_pool_indices=req_pool_indices,
-                top_k_result=selected_indices,
-                out_cache_loc=forward_batch.out_cache_loc,
-                seq_lens=forward_batch.seq_lens,
-                sparse_mask=sparse_mask,
-                page_table=page_table,
-                layer_id=layer_id,
-                page_size=1,
-            ).detach().clone()
-        ).to(torch.int32)
-        return transformed_indices

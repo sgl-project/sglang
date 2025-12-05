@@ -6,12 +6,12 @@ import nvtx
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
-    BaseSparseAlgorithm,
-)
+from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
 from sglang.srt.mem_cache.sparsity.core.representation_pool import RepresentationPool
-from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import SparseKVCacheManager
+from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
+    SparseKVCacheManager,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -277,17 +277,16 @@ class SparseCoordinator:
         forward_batch: "ForwardBatch",
     ) -> None:
         """Handle attention end."""
-        pass
-        # layer_id = layer.layer_id
-        # self._maybe_construct_representations(layer_id, forward_batch)
+        layer_id = layer.layer_id
+        self._maybe_construct_representations(layer_id, forward_batch)
 
-        # if (
-        #     layer_id == self.start_layer
-        #     and forward_batch.forward_mode.is_decode_or_idle()
-        # ):
-        #     self.states.decode_steps[forward_batch.req_pool_indices] += 1
+        if (
+            layer_id == self.start_layer
+            and forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            self.states.decode_steps[forward_batch.req_pool_indices] += 1
 
-        # self._maybe_incremental_update_representations(layer_id, forward_batch)
+        self._maybe_incremental_update_representations(layer_id, forward_batch)
 
     def _handle_sparse_retrieve(
         self,

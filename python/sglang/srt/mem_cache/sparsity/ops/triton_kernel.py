@@ -60,9 +60,9 @@ def nsa_sparse_diff_triton_kernel(
         should_load_host_indices_ptr + should_load_host_indices_stride * bid + offset,
         -1,
     )
-    
+
     sparse_mask_val = tl.load(sparse_mask_ptr + bid)
-    
+
     if sparse_mask_val == 0:
         page_table_ptr = page_table_ptr + page_table_stride * bid
         topk_indices_ptr = curr_top_k_result_ptr + curr_top_k_result_stride * bid
@@ -467,9 +467,7 @@ if __name__ == "__main__":
 
     # Initialize page_table: shape (bs, max_seqlen_k), maps logical positions to physical KV cache positions
     # page_table[i][j] represents the physical KV cache position for logical position j in batch i
-    page_table = torch.full(
-        (bs, max_seqlen_k), -1, dtype=torch.int64, device="cuda"
-    )
+    page_table = torch.full((bs, max_seqlen_k), -1, dtype=torch.int64, device="cuda")
     # Set page_table for batch 0: logical position i maps to physical position 9000+i
     for i in range(max_seqlen_k):
         page_table[0, i] = 9000 + i

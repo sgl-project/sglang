@@ -5,27 +5,27 @@ import torch
 
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
-    FakeRandomSparseAlgorithm,
+    PageMeanPoolingAlgorithm,
     SparseMode,
 )
 from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
-from sglang.srt.mem_cache.sparsity.algorithms.page_mean_pooling import PageMeanPoolingAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
     NSABackendAdaptor,
 )
-from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseConfig, SparseCoordinator
-
-from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import SparseKVCacheManager
+from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
+    SparseConfig,
+    SparseCoordinator,
+)
+from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import (
+    SparseKVCacheManager,
+)
 
 logger = logging.getLogger(__name__)
 
 _global_sparse_coordinator: Optional[SparseCoordinator] = None
 
 _ALGORITHM_REGISTRY = {
-    "fake_random_sparse": lambda config, device, **kw: FakeRandomSparseAlgorithm(
-        config, device, **kw
-    ),
     "page_mean_pooling": lambda config, device, start_layer, end_layer, **kw: PageMeanPoolingAlgorithm(
         config, device, start_layer, end_layer, **kw
     ),
