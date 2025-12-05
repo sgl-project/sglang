@@ -139,7 +139,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import broadcast_weight, default_weight_loader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -1176,18 +1176,12 @@ class ModelRunner:
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
-                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
-                    )
-                )
+                weight = torch.empty(1, dtype=target_dtype, device=self.device)
+                weight._fake = True
+                weight._original_shape = shape
+                weight._group = self._model_update_group[group_name]
+                weight._hook_func = broadcast_weight.__get__(weight, torch.Tensor)
                 weights.append((name, weight))
-            for handle in handles:
-                handle.wait()
 
             self.model.load_weights(weights)
             return True, "Succeeded to update parameter online."
