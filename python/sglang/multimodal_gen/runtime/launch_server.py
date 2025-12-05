@@ -66,7 +66,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_w,
                     result_pipes_from_slaves_r,
                 ),
-                name=f"sgl-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{i}",
                 daemon=True,
             )
         else:  # Slave workers
@@ -83,7 +83,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
                     task_pipes_to_slaves_r[i - 1],
                     result_pipes_from_slaves_w[i - 1],
                 ),
-                name=f"sgl-diffusionWorker-{i}",
+                name=f"sglang-diffusionWorker-{i}",
                 daemon=True,
             )
         scheduler_pipe_readers.append(reader)

@@ -54,6 +54,32 @@ def topk_softmax(
     )
 
 
+def topk_sigmoid(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Compute top-k sigmoid for MoE routing.
+
+    Args:
+        topk_weights: Output tensor for top-k weights [num_tokens, topk]
+        topk_ids: Output tensor for top-k expert indices [num_tokens, topk]
+        gating_output: Gating logits [num_tokens, num_experts]
+        renormalize: Whether to renormalize the top-k weights
+        correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
+    """
+    torch.ops.sgl_kernel.topk_sigmoid.default(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        correction_bias,
+    )
+
+
 def moe_sum_reduce(
     input_tensor,
     output_tensor,
@@ -106,6 +132,41 @@ def moe_fused_gate(
         topk_group,
         topk,
         num_fused_shared_experts,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    )
+
+
+def kimi_k2_moe_fused_gate(
+    input_tensor,
+    bias,
+    topk,
+    renormalize=True,
+    routed_scaling_factor=1.0,
+    apply_routed_scaling_factor_on_output=False,
+):
+    """
+    Simplified fused kernel for Kimi K2 model (num_expert_group=1).
+    This kernel removes the grouped topk logic since all experts belong to a single group.
+
+    Args:
+        input_tensor: Gating output tensor [num_tokens, num_experts]
+        bias: Correction bias tensor [num_experts]
+        topk: Number of experts to select per token
+        renormalize: Whether to renormalize the topk weights
+        routed_scaling_factor: Scaling factor for expert weights
+        apply_routed_scaling_factor_on_output: If true, apply scaling factor to output
+
+    Returns:
+        Tuple of (topk_weights, topk_ids)
+        - topk_weights: [num_tokens, topk] float32 tensor
+        - topk_ids: [num_tokens, topk] int32 tensor
+    """
+    return torch.ops.sgl_kernel.kimi_k2_moe_fused_gate.default(
+        input_tensor,
+        bias,
+        topk,
+        renormalize,
         routed_scaling_factor,
         apply_routed_scaling_factor_on_output,
     )
@@ -187,6 +248,42 @@ def apply_shuffle_mul_sum(
 ):
     torch.ops.sgl_kernel.apply_shuffle_mul_sum.default(
         input, output, permutation, factors
+    )
+
+
+def fused_qk_norm_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    base: float,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    factor: float,
+    low: float,
+    high: float,
+    attention_factor: float,
+) -> None:
+    torch.ops.sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
     )
 
 

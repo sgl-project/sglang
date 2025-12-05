@@ -1,4 +1,3 @@
-import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional, Set, Tuple
@@ -19,9 +18,6 @@ class LoRABatchInfo:
     # Number of segments. For triton backend, it is equal to batch size.
     num_segments: int
 
-    # Maximum segment length of current batch
-    max_len: int
-
     # Indice pointers of each segment in shape (num_segments + 1, )
     seg_indptr: torch.Tensor
 
@@ -34,6 +30,9 @@ class LoRABatchInfo:
     # scaling of each lora adapter, in shape (lora_num,)
     scalings: torch.Tensor
 
+    # Maximum segment length of current batch
+    max_len: Optional[int]
+
     # Lengths of each segments in shape (num_segments,)
     seg_lens: Optional[torch.Tensor]
 
@@ -44,16 +43,6 @@ class LoRABatchInfo:
 class LoRAType(Enum):
     LORA_A = 0
     LORA_B = 1
-
-
-def get_layer_id(name: str) -> int:
-    """
-    Extract integer id of layer from its name in string.
-    """
-    match = re.search(r"layers\.(\d+)\.", name)
-    if match is None:
-        return None
-    return int(match.group(1))
 
 
 def get_hidden_dim(

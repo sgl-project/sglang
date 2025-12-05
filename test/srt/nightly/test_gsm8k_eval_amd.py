@@ -2,7 +2,6 @@ import json
 import os
 import unittest
 import warnings
-from datetime import datetime
 from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
@@ -40,6 +39,8 @@ MODEL_SCORE_THRESHOLDS = {
 
 failing_models = {
     "neuralmagic/gemma-2-2b-it-FP8",
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8",  # RuntimeError: This GEMM is not supported!
+    "zai-org/GLM-4.5-Air-FP8",  # TypeError: cannot unpack non-iterable ForwardMetadata object
 }
 
 

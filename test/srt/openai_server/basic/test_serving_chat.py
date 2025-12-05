@@ -6,7 +6,6 @@ or
     python -m unittest discover -s tests -p "test_*unit.py" -v
 """
 
-import asyncio
 import json
 import unittest
 import uuid
@@ -21,6 +20,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.utils import get_or_create_event_loop
 
 
 class _MockTokenizerManager:
@@ -33,6 +33,11 @@ class _MockTokenizerManager:
             tool_call_parser="hermes",
             reasoning_parser=None,
         )
+        # Mock hf_config for _use_dpsk_v32_encoding check
+        mock_hf_config = Mock()
+        mock_hf_config.architectures = ["LlamaForCausalLM"]
+        self.server_args.get_hf_config.return_value = mock_hf_config
+
         self.chat_template_name: Optional[str] = "llama-3"
 
         # tokenizer stub
@@ -177,7 +182,7 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertNotIn("CUSTOM_STOP", result2.stop)
             self.assertEqual(conv_ins.stop_str, initial_stop_str)
 
-    async def test_unstreamed_tool_args_completion(self):
+    def test_unstreamed_tool_args_completion(self):
         """Test that remaining tool call arguments are sent when generation finishes."""
 
         # Mock FunctionCallParser with detector that has partial tool call data
@@ -213,23 +218,27 @@ class ServingChatTestCase(unittest.TestCase):
             parser=mock_parser,
             content=content,
             request=request,
-            finish_reason_type="stop",
             index=0,
         )
 
         # Should return a chunk with remaining arguments
         self.assertIsNotNone(result, "Should return chunk with remaining arguments")
-        self.assertIn('"arguments":', result, "Should contain arguments field")
-        self.assertIn(
-            ', "unit": "celsius"}', result, "Should contain remaining arguments"
-        )
+
+        # Parse the result to verify content
+        self.assertTrue(result.startswith("data: "))
+        chunk = json.loads(result[6:])
+        tool_calls = chunk["choices"][0]["delta"]["tool_calls"]
+        self.assertEqual(len(tool_calls), 1)
+        arguments = tool_calls[0]["function"]["arguments"]
+        self.assertIn(', "unit": "celsius"}', arguments)
+
         self.assertIn(
             '"finish_reason":null',
             result,
             "Should not include finish_reason in completion chunk",
         )
 
-    async def test_unstreamed_tool_args_no_completion_needed(self):
+    def test_unstreamed_tool_args_no_completion_needed(self):
         """Test that no completion chunk is sent when all arguments were already streamed."""
 
         # Mock FunctionCallParser with detector that has complete tool call data
@@ -262,14 +271,13 @@ class ServingChatTestCase(unittest.TestCase):
             parser=mock_parser,
             content=content,
             request=request,
-            finish_reason_type="stop",
             index=0,
         )
 
         # Should return None since no completion is needed
         self.assertIsNone(result, "Should return None when no completion is needed")
 
-    async def test_unstreamed_tool_args_no_parser_data(self):
+    def test_unstreamed_tool_args_no_parser_data(self):
         """Test that no completion chunk is sent when parser has no tool call data."""
 
         # Mock FunctionCallParser with empty detector
@@ -296,7 +304,6 @@ class ServingChatTestCase(unittest.TestCase):
             parser=mock_parser,
             content=content,
             request=request,
-            finish_reason_type="stop",
             index=0,
         )
 
@@ -389,7 +396,7 @@ class ServingChatTestCase(unittest.TestCase):
                     break
                 return line
 
-            loop = asyncio.get_event_loop()
+            loop = get_or_create_event_loop()
             line = loop.run_until_complete(collect_first_tool_chunk())
             self.assertIsNotNone(line)
             self.assertTrue(line.startswith("data: "))
@@ -564,7 +571,7 @@ class ServingChatTestCase(unittest.TestCase):
                     break
                 return line
 
-            loop = asyncio.get_event_loop()
+            loop = get_or_create_event_loop()
             line = loop.run_until_complete(collect_first_tool_chunk())
             self.assertIsNotNone(line)
             self.assertTrue(line.startswith("data: "))
@@ -572,6 +579,51 @@ class ServingChatTestCase(unittest.TestCase):
             payload = json.loads(line[len("data: ") :])
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:1")
+
+    def test_dpsk_v32_encoding_path(self):
+        """Test DeepSeek V3.2 encoding path detection and application."""
+        from sglang.srt.managers.template_manager import TemplateManager
+        from sglang.srt.server_args import PortArgs, ServerArgs
+
+        server_args = ServerArgs(model_path="deepseek-ai/DeepSeek-V3.2")
+        port_args = PortArgs.init_new(server_args)
+
+        # Use mocks for TokenizerManager components to avoid full initialization
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.TokenizerManager"
+        ) as MockTokenizerManager:
+            tokenizer_manager = MockTokenizerManager(server_args, port_args)
+            tokenizer_manager.server_args = server_args
+            tokenizer_manager.model_config = Mock()
+            tokenizer_manager.model_config.get_default_sampling_params.return_value = (
+                None
+            )
+
+            # Mock hf_config
+            mock_hf_config = Mock()
+            mock_hf_config.architectures = ["DeepseekV32ForCausalLM"]
+
+            tokenizer_manager.server_args.get_hf_config = Mock(
+                return_value=mock_hf_config
+            )
+
+            # Case 1: No chat template in tokenizer -> should use dpsk encoding
+            tokenizer_manager.tokenizer = Mock()
+            tokenizer_manager.tokenizer.chat_template = None
+
+            serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
+            self.assertTrue(serving_chat.use_dpsk_v32_encoding)
+
+            # Case 2: Chat template exists -> should NOT use dpsk encoding
+            tokenizer_manager.tokenizer.chat_template = "some template"
+            serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
+            self.assertFalse(serving_chat.use_dpsk_v32_encoding)
+
+            # Case 3: Not DeepSeek V3.2 architecture -> should NOT use dpsk encoding
+            tokenizer_manager.tokenizer.chat_template = None
+            mock_hf_config.architectures = ["LlamaForCausalLM"]
+            serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
+            self.assertFalse(serving_chat.use_dpsk_v32_encoding)
 
 
 if __name__ == "__main__":

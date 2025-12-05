@@ -148,7 +148,6 @@ class HunyuanVideoArchConfig(DiTArchConfig):
         }
     )
 
-    # Reverse mapping for saving checkpoints: custom -> hf
     reverse_param_names_mapping: dict = field(default_factory=lambda: {})
 
     patch_size: int = 2

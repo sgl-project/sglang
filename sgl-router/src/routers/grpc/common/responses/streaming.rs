@@ -14,6 +14,10 @@ use crate::{
     protocols::{
         chat::ChatCompletionStreamResponse,
         common::{Usage, UsageInfo},
+        event_types::{
+            ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
+            ResponseEvent,
+        },
         responses::{
             ResponseOutputItem, ResponseStatus, ResponsesRequest, ResponsesResponse, ResponsesUsage,
         },
@@ -159,7 +163,7 @@ impl ResponseStreamEventEmitter {
     pub fn emit_created(&mut self) -> serde_json::Value {
         self.has_emitted_created = true;
         json!({
-            "type": "response.created",
+            "type": ResponseEvent::CREATED,
             "sequence_number": self.next_sequence(),
             "response": {
                 "id": self.response_id,
@@ -175,7 +179,7 @@ impl ResponseStreamEventEmitter {
     pub fn emit_in_progress(&mut self) -> serde_json::Value {
         self.has_emitted_in_progress = true;
         json!({
-            "type": "response.in_progress",
+            "type": ResponseEvent::IN_PROGRESS,
             "sequence_number": self.next_sequence(),
             "response": {
                 "id": self.response_id,
@@ -193,7 +197,7 @@ impl ResponseStreamEventEmitter {
     ) -> serde_json::Value {
         self.has_emitted_content_part_added = true;
         json!({
-            "type": "response.content_part.added",
+            "type": ContentPartEvent::ADDED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -214,7 +218,7 @@ impl ResponseStreamEventEmitter {
     ) -> serde_json::Value {
         self.accumulated_text.push_str(delta);
         json!({
-            "type": "response.output_text.delta",
+            "type": OutputTextEvent::DELTA,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -230,7 +234,7 @@ impl ResponseStreamEventEmitter {
         content_index: usize,
     ) -> serde_json::Value {
         json!({
-            "type": "response.output_text.done",
+            "type": OutputTextEvent::DONE,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -246,7 +250,7 @@ impl ResponseStreamEventEmitter {
         content_index: usize,
     ) -> serde_json::Value {
         json!({
-            "type": "response.content_part.done",
+            "type": ContentPartEvent::DONE,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -336,7 +340,7 @@ impl ResponseStreamEventEmitter {
         }
 
         json!({
-            "type": "response.completed",
+            "type": ResponseEvent::COMPLETED,
             "sequence_number": self.next_sequence(),
             "response": response_obj
         })
@@ -359,7 +363,7 @@ impl ResponseStreamEventEmitter {
 
     pub fn emit_mcp_list_tools_in_progress(&mut self, output_index: usize) -> serde_json::Value {
         json!({
-            "type": "response.mcp_list_tools.in_progress",
+            "type": McpEvent::LIST_TOOLS_IN_PROGRESS,
             "sequence_number": self.next_sequence(),
             "output_index": output_index
         })
@@ -382,7 +386,7 @@ impl ResponseStreamEventEmitter {
             .collect();
 
         json!({
-            "type": "response.mcp_list_tools.completed",
+            "type": McpEvent::LIST_TOOLS_COMPLETED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "tools": tool_items
@@ -395,7 +399,7 @@ impl ResponseStreamEventEmitter {
         item_id: &str,
     ) -> serde_json::Value {
         json!({
-            "type": "response.mcp_call.in_progress",
+            "type": McpEvent::CALL_IN_PROGRESS,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id
@@ -415,7 +419,7 @@ impl ResponseStreamEventEmitter {
             .push_str(delta);
 
         json!({
-            "type": "response.mcp_call_arguments.delta",
+            "type": McpEvent::CALL_ARGUMENTS_DELTA,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -430,7 +434,7 @@ impl ResponseStreamEventEmitter {
         arguments: &str,
     ) -> serde_json::Value {
         json!({
-            "type": "response.mcp_call_arguments.done",
+            "type": McpEvent::CALL_ARGUMENTS_DONE,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -444,7 +448,7 @@ impl ResponseStreamEventEmitter {
         item_id: &str,
     ) -> serde_json::Value {
         json!({
-            "type": "response.mcp_call.completed",
+            "type": McpEvent::CALL_COMPLETED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id
@@ -458,7 +462,7 @@ impl ResponseStreamEventEmitter {
         error: &str,
     ) -> serde_json::Value {
         json!({
-            "type": "response.mcp_call.failed",
+            "type": McpEvent::CALL_FAILED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -477,7 +481,7 @@ impl ResponseStreamEventEmitter {
         delta: &str,
     ) -> serde_json::Value {
         json!({
-            "type": "response.function_call_arguments.delta",
+            "type": FunctionCallEvent::ARGUMENTS_DELTA,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -492,7 +496,7 @@ impl ResponseStreamEventEmitter {
         arguments: &str,
     ) -> serde_json::Value {
         json!({
-            "type": "response.function_call_arguments.done",
+            "type": FunctionCallEvent::ARGUMENTS_DONE,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item_id": item_id,
@@ -511,7 +515,7 @@ impl ResponseStreamEventEmitter {
         item: &serde_json::Value,
     ) -> serde_json::Value {
         json!({
-            "type": "response.output_item.added",
+            "type": OutputItemEvent::ADDED,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item": item
@@ -528,7 +532,7 @@ impl ResponseStreamEventEmitter {
         self.store_output_item_data(output_index, item.clone());
 
         json!({
-            "type": "response.output_item.done",
+            "type": OutputItemEvent::DONE,
             "sequence_number": self.next_sequence(),
             "output_index": output_index,
             "item": item

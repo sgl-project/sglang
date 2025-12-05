@@ -2,7 +2,7 @@
 mod tests {
     use std::fs;
 
-    use sglang_router_rs::{
+    use sgl_model_gateway::{
         protocols::chat::{ChatMessage, MessageContent},
         tokenizer::{chat_template::ChatTemplateParams, huggingface::HuggingFaceTokenizer},
     };
@@ -78,7 +78,7 @@ mod tests {
             .map(|msg| serde_json::to_value(msg).unwrap())
             .collect();
 
-        use sglang_router_rs::tokenizer::chat_template::ChatTemplateParams;
+        use sgl_model_gateway::tokenizer::chat_template::ChatTemplateParams;
         let params = ChatTemplateParams {
             add_generation_prompt: true,
             ..Default::default()

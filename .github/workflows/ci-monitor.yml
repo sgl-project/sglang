@@ -46,6 +46,15 @@ jobs:
           cd scripts/ci_monitor
           python ci_analyzer.py --token $GITHUB_TOKEN --limit ${{ inputs.limit || '1000' }} --output ci_analysis_$(date +%Y%m%d_%H%M%S).json
 
+      - name: Run Nightly Test Analysis
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          PYTHONUNBUFFERED: 1
+          PYTHONIOENCODING: utf-8
+        run: |
+          cd scripts/ci_monitor
+          python ci_analyzer.py --token $GITHUB_TOKEN --mode nightly --days 2 --output nightly_analysis_$(date +%Y%m%d_%H%M%S).json
+
       - name: Run Performance Analysis
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -61,6 +70,7 @@ jobs:
           name: ci-analysis-results-${{ github.run_number }}
           path: |
             scripts/ci_monitor/ci_analysis_*.json
+            scripts/ci_monitor/nightly_analysis_*.json
             scripts/ci_monitor/performance_tables_*
           retention-days: 30
 

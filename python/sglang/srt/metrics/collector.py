@@ -184,6 +184,8 @@ class SchedulerStats:
     num_running_reqs_offline_batch: int = 0
     cache_hit_rate: float = 0.0
 
+    max_total_num_tokens: int = 0
+
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
@@ -290,6 +292,13 @@ class SchedulerMetricsCollector:
         self.cache_hit_rate = Gauge(
             name="sglang:cache_hit_rate",
             documentation="The prefix cache hit rate.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.max_total_num_tokens = Gauge(
+            name="sglang:max_total_num_tokens",
+            documentation="Maximum total number of tokens in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -488,6 +497,11 @@ class SchedulerMetricsCollector:
             documentation="Number of grammar aborted requests.",
             labelnames=labels.keys(),
         )
+        self.num_grammar_timeout = Counter(
+            name="sglang:num_grammar_timeout_total",
+            documentation="Number of grammar timeouts.",
+            labelnames=labels.keys(),
+        )
         self.num_grammar_total = Counter(
             name="sglang:num_grammar_total",
             documentation="Number of the total grammar requests.",
@@ -635,6 +649,8 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
+        self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
@@ -683,25 +699,28 @@ class SchedulerMetricsCollector:
         self.last_log_time = time.perf_counter()
 
     def log_grammar_stats(self, grammar_stats) -> None:
-        # Duck-typed GrammarStats to avoid cross-package dependency
-        if getattr(grammar_stats, "compilation_time", None) is not None:
+        if grammar_stats.compilation_time is not None:
             self._log_histogram(
                 self.grammar_compilation_time, grammar_stats.compilation_time
             )
-        if getattr(grammar_stats, "schema_count", None) is not None:
+        if grammar_stats.schema_count is not None:
             self._log_histogram(self.grammar_schema_count, grammar_stats.schema_count)
-        if getattr(grammar_stats, "ebnf_size", None) is not None:
+        if grammar_stats.ebnf_size is not None:
             self._log_histogram(self.grammar_ebnf_size, grammar_stats.ebnf_size)
-        tree_times = getattr(grammar_stats, "tree_traversal_time", None)
+        tree_times = grammar_stats.tree_traversal_time
         if tree_times:
             max_time = max(tree_times)
             avg_time = sum(tree_times) / len(tree_times)
             self._log_histogram(self.grammar_tree_traversal_time_max, max_time)
             self._log_histogram(self.grammar_tree_traversal_time_avg, avg_time)
-        if getattr(grammar_stats, "is_cache_hit", False):
+        if grammar_stats.is_cache_hit:
             self.num_grammar_cache_hit.labels(**self.labels).inc(1)
-        if getattr(grammar_stats, "is_grammar_aborted", False):
+        if grammar_stats.is_grammar_aborted:
             self.num_grammar_aborted.labels(**self.labels).inc(1)
+        if grammar_stats.num_timeout > 0:
+            self.num_grammar_timeout.labels(**self.labels).inc(
+                grammar_stats.num_timeout
+            )
         self.num_grammar_total.labels(**self.labels).inc(1)
 
 

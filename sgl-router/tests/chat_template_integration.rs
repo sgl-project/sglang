@@ -1,4 +1,4 @@
-use sglang_router_rs::{
+use sgl_model_gateway::{
     protocols::{
         chat::{ChatMessage, MessageContent},
         common::{ContentPart, ImageUrl},
@@ -263,6 +263,77 @@ fn test_empty_messages_template() {
         .apply_chat_template(&messages, ChatTemplateParams::default())
         .unwrap();
     assert_eq!(result, "");
+}
+
+/// Test that tojson filter accepts ensure_ascii kwarg (HuggingFace compatibility)
+/// This is the fix for: "unknown keyword argument 'ensure_ascii'"
+#[test]
+fn test_tojson_with_ensure_ascii() {
+    // Template that uses tojson(ensure_ascii=False) like HuggingFace templates do
+    let template = r#"
+{%- for message in messages -%}
+{{ message.role }}: {{ message.content }}
+{%- if message.tool_calls is defined and message.tool_calls -%}
+Tools: {{ message.tool_calls|tojson(ensure_ascii=False) }}
+{%- endif -%}
+{% endfor -%}
+"#;
+
+    let processor = ChatTemplateProcessor::new(template.to_string());
+
+    let messages = [ChatMessage::User {
+        content: MessageContent::Text("Test with Unicode: 日本語".to_string()),
+        name: None,
+    }];
+
+    // Convert to JSON values
+    let json_messages: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|msg| serde_json::to_value(msg).unwrap())
+        .collect();
+
+    // This should NOT fail with "unknown keyword argument 'ensure_ascii'"
+    let result = processor
+        .apply_chat_template(&json_messages, ChatTemplateParams::default())
+        .unwrap();
+
+    assert!(result.contains("user: Test with Unicode: 日本語"));
+}
+
+/// Test tojson with all HuggingFace kwargs
+#[test]
+fn test_tojson_with_all_huggingface_kwargs() {
+    // Template using all the kwargs that HuggingFace's custom tojson accepts
+    let template = r#"
+{%- set data = {"z_key": 1, "a_key": 2, "m_key": 3} -%}
+Unsorted: {{ data|tojson }}
+Sorted: {{ data|tojson(sort_keys=True) }}
+Indented: {{ data|tojson(indent=2) }}
+All: {{ data|tojson(ensure_ascii=False, sort_keys=True, indent=2) }}
+"#;
+
+    let processor = ChatTemplateProcessor::new(template.to_string());
+    let messages: Vec<serde_json::Value> = vec![];
+
+    // This should NOT fail - all kwargs should be accepted
+    let result = processor
+        .apply_chat_template(&messages, ChatTemplateParams::default())
+        .unwrap();
+
+    // Verify sorted output contains keys in alphabetical order
+    assert!(result.contains("Sorted:"));
+    // The sorted output should have a_key before m_key before z_key
+    let sorted_line = result.lines().find(|l| l.starts_with("Sorted:")).unwrap();
+    let a_pos = sorted_line.find("a_key").unwrap();
+    let m_pos = sorted_line.find("m_key").unwrap();
+    let z_pos = sorted_line.find("z_key").unwrap();
+    assert!(a_pos < m_pos && m_pos < z_pos, "Keys should be sorted");
+
+    // Verify indented output is pretty-printed with newlines
+    assert!(
+        result.contains("Indented: {\n"),
+        "Indented JSON should be pretty-printed with newlines"
+    );
 }
 
 #[test]

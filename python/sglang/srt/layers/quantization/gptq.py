@@ -42,20 +42,20 @@ from sglang.srt.layers.quantization.utils import (
     replace_parameter,
     unpack_cols,
 )
+from sglang.srt.utils import is_cuda
+from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.token_dispatcher import (
-        StandardDispatchOutput,
         CombineInput,
+        StandardDispatchOutput,
     )
-
-from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import fused_marlin_moe, gptq_gemm, gptq_marlin_repack, gptq_shuffle
+    from sgl_kernel import gptq_gemm, gptq_marlin_repack, gptq_shuffle
 
 
 logger = logging.getLogger(__name__)
@@ -1059,13 +1059,13 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-
-        # Delay the import to avoid circular dependency
 
         assert (
             self.moe_runner_config.activation == "silu"
@@ -1099,21 +1099,21 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
 # Register fake implementations for torch.compile support
 if _is_cuda:
 
-    @torch.library.register_fake("sgl_kernel::gptq_gemm")
+    @register_fake_if_exists("sgl_kernel::gptq_gemm")
     def _(a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit):
         return a.new_empty((a.shape[0], b_q_weight.shape[-1]), dtype=a.dtype)
 
-    @torch.library.register_fake("sgl_kernel::gptq_marlin_repack")
+    @register_fake_if_exists("sgl_kernel::gptq_marlin_repack")
     def _(b_q_weight, perm, size_k, size_n, num_bits):
         return b_q_weight.new_empty(
             (size_k // 16, size_n * (num_bits // 2)), dtype=b_q_weight.dtype
         )
 
-    @torch.library.register_fake("sgl_kernel::gptq_shuffle")
+    @register_fake_if_exists("sgl_kernel::gptq_shuffle")
     def _(q_weight, q_perm, bit):
         return
 
-    @torch.library.register_fake("sgl_kernel::moe_wna16_marlin_gemm")
+    @register_fake_if_exists("sgl_kernel::moe_wna16_marlin_gemm")
     def _(
         a,
         c,

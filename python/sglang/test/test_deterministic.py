@@ -151,7 +151,10 @@ def send_single(
 
     if profile:
         run_profile(
-            base_url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
+            url=base_url,
+            num_steps=profile_steps,
+            activities=["CPU", "GPU"],
+            profile_by_stage=profile_by_stage,
         )
 
     response = requests.post(

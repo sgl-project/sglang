@@ -23,8 +23,10 @@ use crate::{
         chat::{
             ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
         },
-        common::{FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
-        responses::{ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage},
+        common::{CompletionTokensDetails, FunctionCallDelta, ToolCall, ToolCallDelta, Usage},
+        responses::{
+            OutputTokensDetails, ResponseStatus, ResponseUsage, ResponsesResponse, ResponsesUsage,
+        },
     },
     routers::grpc::{
         common::responses::streaming::{OutputItemType, ResponseStreamEventEmitter},
@@ -669,6 +671,7 @@ impl HarmonyStreamingProcessor {
         let mut matched_stop: Option<serde_json::Value> = None;
         let mut prompt_tokens: u32 = 0;
         let mut completion_tokens: u32 = 0;
+        let mut reasoning_token_count: u32 = 0;
 
         // Process stream
         let mut chunk_count = 0;
@@ -870,8 +873,9 @@ impl HarmonyStreamingProcessor {
                         .finalize(finish_reason.clone(), matched_stop.clone())
                         .map_err(|e| format!("Finalize error: {}", e))?;
 
-                    // Store finalized tool calls
+                    // Store finalized tool calls and reasoning token count
                     accumulated_tool_calls = final_output.commentary.clone();
+                    reasoning_token_count = final_output.reasoning_token_count;
 
                     // Complete all tool calls if we have commentary
                     if let Some(ref tool_calls) = accumulated_tool_calls {
@@ -1072,7 +1076,13 @@ impl HarmonyStreamingProcessor {
                         prompt_tokens,
                         completion_tokens,
                         total_tokens: prompt_tokens + completion_tokens,
-                        completion_tokens_details: None,
+                        completion_tokens_details: if reasoning_token_count > 0 {
+                            Some(CompletionTokensDetails {
+                                reasoning_tokens: Some(reasoning_token_count),
+                            })
+                        } else {
+                            None
+                        },
                     },
                     request_id: emitter.response_id.clone(),
                 });
@@ -1091,7 +1101,13 @@ impl HarmonyStreamingProcessor {
                         output_tokens: completion_tokens,
                         total_tokens: prompt_tokens + completion_tokens,
                         input_tokens_details: None,
-                        output_tokens_details: None,
+                        output_tokens_details: if reasoning_token_count > 0 {
+                            Some(OutputTokensDetails {
+                                reasoning_tokens: reasoning_token_count,
+                            })
+                        } else {
+                            None
+                        },
                     }))
                     .build(),
             ),
@@ -1099,7 +1115,13 @@ impl HarmonyStreamingProcessor {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
-                completion_tokens_details: None,
+                completion_tokens_details: if reasoning_token_count > 0 {
+                    Some(CompletionTokensDetails {
+                        reasoning_tokens: Some(reasoning_token_count),
+                    })
+                } else {
+                    None
+                },
             },
         })
     }

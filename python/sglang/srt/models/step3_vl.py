@@ -571,7 +571,6 @@ class Step3VisionAttention(nn.Module):
         self,
         dim: int,
         num_heads: int = 16,
-        qkv_backend="fa3",
         quant_config=None,
         prefix: str = "",
     ) -> None:
@@ -593,9 +592,7 @@ class Step3VisionAttention(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            rotary_embed="normal",
             proj_bias=True,
-            qkv_backend=qkv_backend,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )

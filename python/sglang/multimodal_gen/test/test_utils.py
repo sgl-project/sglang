@@ -1,5 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
+import base64
 import dataclasses
+import json
 import os
 import shlex
 import socket
@@ -7,14 +9,29 @@ import subprocess
 import sys
 import time
 import unittest
+from pathlib import Path
 from typing import Optional
 
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import (
+    RequestPerfRecord,
+    get_diffusion_perf_log_dir,
+)
 
 logger = init_logger(__name__)
+
+
+def is_image_url(image_path: str | Path | None) -> bool:
+    """Check if image_path is a URL."""
+    if image_path is None:
+        return False
+    return isinstance(image_path, str) and (
+        image_path.startswith("http://") or image_path.startswith("https://")
+    )
 
 
 def run_command(command) -> Optional[float]:
@@ -52,9 +69,35 @@ def probe_port(host="127.0.0.1", port=30010, timeout=2.0) -> bool:
             return False
 
 
+def is_in_ci() -> bool:
+    return get_bool_env_var("SGLANG_IS_IN_CI")
+
+
+def get_dynamic_server_port() -> int:
+    cuda_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    if not cuda_devices:
+        cuda_devices = "0"
+    try:
+        first_device_id = int(cuda_devices.split(",")[0].strip()[0])
+    except (ValueError, IndexError):
+        first_device_id = 0
+
+    if is_in_ci():
+        base_port = 10000 + first_device_id * 2000
+    else:
+        base_port = 20000 + first_device_id * 1000
+
+    return base_port + 1000
+
+
 def is_mp4(data):
     idx = data.find(b"ftyp")
     return 0 <= idx <= 32
+
+
+def is_jpeg(data: bytes) -> bool:
+    # JPEG files start with: FF D8 FF
+    return data.startswith(b"\xff\xd8\xff")
 
 
 def is_png(data):
@@ -75,6 +118,110 @@ def wait_for_port(host="127.0.0.1", port=30010, deadline=300.0, interval=0.5):
 def check_image_size(ut, image, width, height):
     # check image size
     ut.assertEqual(image.size, (width, height))
+
+
+def get_perf_log_dir() -> Path:
+    """Gets the performance log directory from the centralized sglang utility."""
+    log_dir_str = get_diffusion_perf_log_dir()
+    if not log_dir_str:
+        raise RuntimeError(
+            "Performance logging is disabled (SGLANG_PERF_LOG_DIR is empty), "
+            "but a test tried to access the log directory."
+        )
+    return Path(log_dir_str)
+
+
+def _ensure_log_path(log_dir: Path) -> Path:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "performance.log"
+
+
+def clear_perf_log(log_dir: Path) -> Path:
+    """Delete the perf log file so tests can watch for fresh entries."""
+    log_path = _ensure_log_path(log_dir)
+    if log_path.exists():
+        log_path.unlink()
+    logger.info("[server-test] Monitoring perf log at %s", log_path.as_posix())
+    return log_path
+
+
+def prepare_perf_log() -> tuple[Path, Path]:
+    """Convenience helper to resolve and clear the perf log in one call."""
+    log_dir = get_perf_log_dir()
+    log_path = clear_perf_log(log_dir)
+    return log_dir, log_path
+
+
+def read_perf_logs(log_path: Path) -> list[RequestPerfRecord]:
+    if not log_path.exists():
+        return []
+    records: list[RequestPerfRecord] = []
+    with log_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record_dict = json.loads(line)
+                records.append(RequestPerfRecord(**record_dict))
+            except json.JSONDecodeError:
+                continue
+    return records
+
+
+def wait_for_req_perf_record(
+    request_id: str,
+    prev_len: int,
+    log_path: Path,
+    timeout: float = 30.0,
+) -> tuple[RequestPerfRecord | None, int]:
+    """
+    the stage metrics of this request should be in the performance_log file with {request-id}
+    """
+    logger.info(f"Waiting for req perf record with request id: {request_id}")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        records = read_perf_logs(log_path)
+        if len(records) >= prev_len + 1:
+            # FIXME: unable to get rid from openai apis, this is a hack. we should compare rid
+            # potential error when there are multiple servers
+            return records[-1], len(records)
+
+        time.sleep(0.5)
+
+    if os.environ.get("SGLANG_GEN_BASELINE", "0") == "1":
+        records = read_perf_logs(log_path)
+        return None, len(records)
+
+    logger.error(f"record: {records}")
+    raise AssertionError(f"Timeout waiting for stage metrics for request {request_id} ")
+
+
+def validate_image(b64_json: str) -> None:
+    """Decode and validate that image is PNG or JPEG."""
+    image_bytes = base64.b64decode(b64_json)
+    assert is_png(image_bytes) or is_jpeg(image_bytes), "Image must be PNG or JPEG"
+
+
+def validate_video(b64_json: str) -> None:
+    """Decode and validate that video is a valid format."""
+    video_bytes = base64.b64decode(b64_json)
+    is_mp4 = (
+        video_bytes[:4] == b"\x00\x00\x00\x18" or video_bytes[:4] == b"\x00\x00\x00\x1c"
+    )
+    is_webm = video_bytes[:4] == b"\x1a\x45\xdf\xa3"
+    assert is_mp4 or is_webm, "Video must be MP4 or WebM"
+
+
+def validate_openai_video(video_bytes: bytes) -> None:
+    """Validate that video is MP4 or WebM by magic bytes."""
+    is_mp4 = (
+        video_bytes.startswith(b"\x00\x00\x00\x18")
+        or video_bytes.startswith(b"\x00\x00\x00\x1c")
+        or video_bytes[4:8] == b"ftyp"
+    )
+    is_webm = video_bytes.startswith(b"\x1a\x45\xdf\xa3")
+    assert is_mp4 or is_webm, "Video must be MP4 or WebM"
 
 
 @dataclasses.dataclass
@@ -247,8 +394,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_cfg_parallel(self):
         """cfg parallel"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_cfg_parallel",
             args="--num-gpus 2 --enable-cfg-parallel",
@@ -258,8 +403,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_usp(self):
         """usp"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_usp",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=2",
@@ -269,8 +412,6 @@ class TestGenerateBase(TestCLIBase):
 
     def test_mixed(self):
         """mixed"""
-        if self.data_type == DataType.IMAGE:
-            return
         self._run_test(
             name=f"{self.model_name()}_mixed",
             args="--num-gpus 4 --ulysses-degree=2 --ring-degree=1 --enable-cfg-parallel",

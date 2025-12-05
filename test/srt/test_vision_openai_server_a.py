@@ -6,7 +6,16 @@ python3 -m unittest test_vision_openai_server.TestOpenAIVisionServer.test_multi_
 
 import unittest
 
+import openai
 from test_vision_openai_server_common import *
+from test_vision_openai_server_common import (  # DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,; DEFAULT_URL_FOR_TEST,; IMAGE_MAN_IRONING_URL,; popen_launch_server,
+    AudioOpenAITestMixin,
+    CustomTestCase,
+    ImageOpenAITestMixin,
+    OmniOpenAITestMixin,
+    TestOpenAIMLLMServerBase,
+    VideoOpenAITestMixin,
+)
 
 
 class TestLlavaServer(ImageOpenAITestMixin):
@@ -136,6 +145,9 @@ class TestKimiVLServer(ImageOpenAITestMixin):
         pass
 
 
+@unittest.skip(
+    "Disabling this test to speed up CI. Prefer to test it within nightly test."
+)
 class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.1V-9B-Thinking"
     extra_args = [

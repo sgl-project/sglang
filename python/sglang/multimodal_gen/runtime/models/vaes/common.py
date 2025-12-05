@@ -10,6 +10,7 @@ from typing import Optional, cast
 import numpy as np
 import torch
 import torch.distributed as dist
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.models import VAEConfig
@@ -72,7 +73,7 @@ class ParallelTiledVAE(ABC):
     def _decode(self, *args, **kwargs) -> torch.Tensor:
         pass
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor) -> DiagonalGaussianDistribution:
         batch_size, num_channels, num_frames, height, width = x.shape
         latent_num_frames = (num_frames - 1) // self.temporal_compression_ratio + 1
 
