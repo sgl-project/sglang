@@ -1763,6 +1763,9 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
         )
 
+        if adder.budget_state() == AddReqResult.NO_TOKEN:
+            return None
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
