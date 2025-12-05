@@ -267,15 +267,15 @@ class SamplingParams:
                 if use_temporal_scaling_frames:
                     # Convert back to number of frames, ensuring num_frames-1 is a multiple of temporal_scale_factor
                     new_num_frames = (
-                                         new_latent_num_frames - 1
-                                     ) * temporal_scale_factor + 1
+                        new_latent_num_frames - 1
+                    ) * temporal_scale_factor + 1
                 else:  # stepvideo only
                     # Find the least common multiple of 3 and num_gpus
                     divisor = math.lcm(3, num_gpus)
                     # Round up to the nearest multiple of this LCM
                     new_latent_num_frames = (
-                                                (new_latent_num_frames + divisor - 1) // divisor
-                                            ) * divisor
+                        (new_latent_num_frames + divisor - 1) // divisor
+                    ) * divisor
                     # Convert back to actual frames using the StepVideo formula
                     new_num_frames = new_latent_num_frames // 3 * 17
 
@@ -593,13 +593,11 @@ class SamplingParams:
             # A field is considered user-modified if its value is different from
             # the default
             is_user_modified = user_value != default_value
-            print(f"{field_name=} {allow_override_protected=} {user_value=} {default_value=} {is_user_modified=} ")
             if is_user_modified and (
                 allow_override_protected or field_name not in subclass_defined_fields
             ):
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
-        print(f"{self=}")
         self.height_not_provided = user_params.height_not_provided
         self.width_not_provided = user_params.width_not_provided
         self.__post_init__()

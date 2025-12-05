@@ -10,10 +10,7 @@ from typing import cast
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen import DiffGenerator
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    SamplingParams,
-    generate_request_id,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
