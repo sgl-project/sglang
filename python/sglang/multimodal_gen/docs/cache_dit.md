@@ -1,6 +1,7 @@
 # cache-dit Acceleration
 
-SGLang integrates [cache-dit](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to **7.4x inference speedup** with minimal quality loss.
+SGLang integrates [cache-dit](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion
+Transformers (DiT), to achieve up to **7.4x inference speedup** with minimal quality loss.
 
 ## Overview
 
@@ -9,14 +10,6 @@ cache-dit uses intelligent caching strategies to skip redundant computation in t
 - **DBCache (Dual Block Cache)**: Dynamically decides when to cache transformer blocks based on residual differences
 - **TaylorSeer**: Uses Taylor expansion for calibration to optimize caching decisions
 - **SCM (Step Computation Masking)**: Step-level caching control for additional speedup
-
-## Prerequisites
-
-Install cache-dit:
-
-```bash
-pip install cache-dit
-```
 
 ## Basic Usage
 
@@ -34,22 +27,22 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 DBCache controls block-level caching behavior:
 
-| Parameter | Env Variable | Default | Description |
-|-----------|--------------|---------|-------------|
-| Fn | `SGLANG_CACHE_DIT_FN` | 1 | Number of first blocks to always compute |
-| Bn | `SGLANG_CACHE_DIT_BN` | 0 | Number of last blocks to always compute |
-| W | `SGLANG_CACHE_DIT_WARMUP` | 8 | Warmup steps before caching starts |
-| R | `SGLANG_CACHE_DIT_RDT` | 0.35 | Residual difference threshold |
-| MC | `SGLANG_CACHE_DIT_MC` | 3 | Maximum continuous cached steps |
+| Parameter | Env Variable              | Default | Description                              |
+|-----------|---------------------------|---------|------------------------------------------|
+| Fn        | `SGLANG_CACHE_DIT_FN`     | 1       | Number of first blocks to always compute |
+| Bn        | `SGLANG_CACHE_DIT_BN`     | 0       | Number of last blocks to always compute  |
+| W         | `SGLANG_CACHE_DIT_WARMUP` | 8       | Warmup steps before caching starts       |
+| R         | `SGLANG_CACHE_DIT_RDT`    | 0.35    | Residual difference threshold            |
+| MC        | `SGLANG_CACHE_DIT_MC`     | 3       | Maximum continuous cached steps          |
 
 ### TaylorSeer Configuration
 
 TaylorSeer improves caching accuracy using Taylor expansion:
 
-| Parameter | Env Variable | Default | Description |
-|-----------|--------------|---------|-------------|
-| Enable | `SGLANG_CACHE_DIT_TAYLORSEER` | true | Enable TaylorSeer calibrator |
-| Order | `SGLANG_CACHE_DIT_TS_ORDER` | 1 | Taylor expansion order (1 or 2) |
+| Parameter | Env Variable                  | Default | Description                     |
+|-----------|-------------------------------|---------|---------------------------------|
+| Enable    | `SGLANG_CACHE_DIT_TAYLORSEER` | true    | Enable TaylorSeer calibrator    |
+| Order     | `SGLANG_CACHE_DIT_TS_ORDER`   | 1       | Taylor expansion order (1 or 2) |
 
 ### Example with Custom Parameters
 
@@ -68,17 +61,18 @@ sglang generate --model-path black-forest-labs/FLUX.1-dev \
 
 ## SCM (Step Computation Masking)
 
-SCM provides step-level caching control for additional speedup. It decides which denoising steps to compute fully and which to use cached results.
+SCM provides step-level caching control for additional speedup. It decides which denoising steps to compute fully and
+which to use cached results.
 
 ### Presets
 
-| Preset | Compute Ratio | Speed | Quality |
-|--------|---------------|-------|---------|
-| `none` | 100% | Baseline | Best |
-| `slow` | ~75% | ~1.3x | High |
-| `medium` | ~50% | ~2x | Good |
-| `fast` | ~35% | ~3x | Acceptable |
-| `ultra` | ~25% | ~4x | Lower |
+| Preset   | Compute Ratio | Speed    | Quality    |
+|----------|---------------|----------|------------|
+| `none`   | 100%          | Baseline | Best       |
+| `slow`   | ~75%          | ~1.3x    | High       |
+| `medium` | ~50%          | ~2x      | Good       |
+| `fast`   | ~35%          | ~3x      | Acceptable |
+| `ultra`  | ~25%          | ~4x      | Lower      |
 
 ### Usage
 
@@ -103,41 +97,41 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 ### SCM Policy
 
-| Policy | Env Variable | Description |
-|--------|--------------|-------------|
+| Policy    | Env Variable                          | Description                                 |
+|-----------|---------------------------------------|---------------------------------------------|
 | `dynamic` | `SGLANG_CACHE_DIT_SCM_POLICY=dynamic` | Adaptive caching based on content (default) |
-| `static` | `SGLANG_CACHE_DIT_SCM_POLICY=static` | Fixed caching pattern |
+| `static`  | `SGLANG_CACHE_DIT_SCM_POLICY=static`  | Fixed caching pattern                       |
 
 ## Environment Variables
 
 All cache-dit parameters can be set via environment variables:
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `SGLANG_CACHE_DIT_ENABLED` | `false` | Enable cache-dit acceleration |
-| `SGLANG_CACHE_DIT_FN` | `1` | First N blocks to always compute |
-| `SGLANG_CACHE_DIT_BN` | `0` | Last N blocks to always compute |
-| `SGLANG_CACHE_DIT_WARMUP` | `8` | Warmup steps before caching |
-| `SGLANG_CACHE_DIT_RDT` | `0.35` | Residual difference threshold |
-| `SGLANG_CACHE_DIT_MC` | `3` | Max continuous cached steps |
-| `SGLANG_CACHE_DIT_TAYLORSEER` | `true` | Enable TaylorSeer calibrator |
-| `SGLANG_CACHE_DIT_TS_ORDER` | `1` | TaylorSeer order (1 or 2) |
-| `SGLANG_CACHE_DIT_SCM_PRESET` | `none` | SCM preset (none/slow/medium/fast/ultra) |
-| `SGLANG_CACHE_DIT_SCM_POLICY` | `dynamic` | SCM caching policy |
-| `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | not set | Custom SCM compute bins |
-| `SGLANG_CACHE_DIT_SCM_CACHE_BINS` | not set | Custom SCM cache bins |
+| Environment Variable                | Default   | Description                              |
+|-------------------------------------|-----------|------------------------------------------|
+| `SGLANG_CACHE_DIT_ENABLED`          | `false`   | Enable cache-dit acceleration            |
+| `SGLANG_CACHE_DIT_FN`               | `1`       | First N blocks to always compute         |
+| `SGLANG_CACHE_DIT_BN`               | `0`       | Last N blocks to always compute          |
+| `SGLANG_CACHE_DIT_WARMUP`           | `8`       | Warmup steps before caching              |
+| `SGLANG_CACHE_DIT_RDT`              | `0.35`    | Residual difference threshold            |
+| `SGLANG_CACHE_DIT_MC`               | `3`       | Max continuous cached steps              |
+| `SGLANG_CACHE_DIT_TAYLORSEER`       | `true`    | Enable TaylorSeer calibrator             |
+| `SGLANG_CACHE_DIT_TS_ORDER`         | `1`       | TaylorSeer order (1 or 2)                |
+| `SGLANG_CACHE_DIT_SCM_PRESET`       | `none`    | SCM preset (none/slow/medium/fast/ultra) |
+| `SGLANG_CACHE_DIT_SCM_POLICY`       | `dynamic` | SCM caching policy                       |
+| `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | not set   | Custom SCM compute bins                  |
+| `SGLANG_CACHE_DIT_SCM_CACHE_BINS`   | not set   | Custom SCM cache bins                    |
 
 ## Supported Models
 
 cache-dit supports DiT models registered in its BlockAdapterRegister:
 
-| Model Family | Example Models |
-|-------------|----------------|
-| Flux | FLUX.1-dev, FLUX.1-schnell, FLUX.2-dev |
-| Qwen | Qwen-Image |
-| Hunyuan | HunyuanDiT, HunyuanVideo |
-| Wan | Wan-Video, Wan2.1-T2V |
-| Others | CogVideoX, Mochi, PixArt, SD3, ... |
+| Model Family | Example Models              |
+|--------------|-----------------------------|
+| Wan          | Wan2.1, Wan2.2              |
+| Flux         | FLUX.1-dev, FLUX.2-dev      |
+| Z-Image      | Z-Image-Turbo               |
+| Qwen         | Qwen-Image, Qwen-Image-Edit |
+| Hunyuan      | HunyuanDiT, HunyuanVideo    |
 
 ## Performance Tips
 
@@ -149,7 +143,8 @@ cache-dit supports DiT models registered in its BlockAdapterRegister:
 
 ## Limitations
 
-- **Single GPU only**: Distributed support (TP/SP) is not yet validated; cache-dit will be automatically disabled when `world_size > 1`
+- **Single GPU only**: Distributed support (TP/SP) is not yet validated; cache-dit will be automatically disabled when
+  `world_size > 1`
 - **SCM minimum steps**: SCM requires >= 8 inference steps to be effective
 - **Model support**: Only models registered in cache-dit's BlockAdapterRegister are supported
 
@@ -173,7 +168,8 @@ This is expected behavior. cache-dit currently only supports single-GPU inferenc
 
 ### SCM disabled for low step count
 
-For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache acceleration still works.
+For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache
+acceleration still works.
 
 ### Model not supported
 
@@ -181,9 +177,10 @@ For models with < 8 inference steps (e.g., DMD distilled models), SCM will be au
 ValueError: <ModelClass> is not officially supported by cache-dit
 ```
 
-The model is not registered in cache-dit's BlockAdapterRegister. Check the [cache-dit repository](https://github.com/vipshop/cache-dit) for supported models.
+The model is not registered in cache-dit's BlockAdapterRegister. Check
+the [cache-dit repository](https://github.com/vipshop/cache-dit) for supported models.
 
 ## References
 
 - [cache-dit GitHub Repository](https://github.com/vipshop/cache-dit)
-- [SGLang Diffusion Documentation](../get_started/install.md)
+- [SGLang Diffusion Documentation](../README.md)
