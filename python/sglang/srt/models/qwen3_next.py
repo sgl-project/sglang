@@ -297,7 +297,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         ).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
         self.A_log._no_weight_decay = True
-
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
         if _is_cpu:
@@ -378,7 +377,7 @@ class Qwen3GatedDeltaNet(nn.Module):
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
         seq_len, _ = hidden_states.shape
-        if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
+        if seq_len < DUAL_STREAM_TOKEN_THRESHOLD and not _is_cpu:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -418,7 +417,11 @@ class Qwen3GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and is_cuda_graph:
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and is_cuda_graph
+            and not _is_cpu
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -447,11 +450,13 @@ class Qwen3GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
         # mixed_qkv = rearrange(mixed_qkv, "b l d -> b d l")
-
-        # 2. Convolution sequence transformation
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
+        if _is_cpu:
+            conv_weights = self.conv1d.weight
+        else:
+            # 2. Convolution sequence transformation
+            conv_weights = self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            )
 
         kwargs = {
             "mixed_qkv": mixed_qkv,

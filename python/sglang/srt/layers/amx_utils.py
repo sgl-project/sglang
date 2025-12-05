@@ -34,8 +34,17 @@ def dim_is_supported(weight):
     return is_oc_support and is_ic_support
 
 
+def dtype_is_supported(weight):
+    return weight.dtype in [
+        torch.float16,
+        torch.bfloat16,
+        torch.int8,
+        torch.float8_e4m3fn,
+    ]
+
+
 def is_dim_conv_weight(weight):
-    weight.dim() == 3 and weight.size(1) == 1
+    return weight.dim() == 3 and weight.size(1) == 1
 
 
 def _amx_process_weight_after_loading(
@@ -58,9 +67,12 @@ def _amx_process_weight_after_loading(
             weight_tensor = weight_tensor.transpose(*transpose_dims[i])
         is_conv_weight = is_dim_conv_weight(weight_tensor)
         # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
-        if (not dim_is_supported(weight_tensor)) and (not is_conv_weight):
+        if (
+            (not dim_is_supported(weight_tensor))
+            or not dtype_is_supported(weight_tensor)
+        ) and (not is_conv_weight):
             logger.warning(
-                f"Unsupported dimension for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} in {module}. "
+                f"Unsupported dimension or dtype for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} and dtype {weight_tensor.dtype} in {module}. "
                 f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
             )
             module.use_intel_amx_backend = False

@@ -463,7 +463,7 @@ class Gemma3RMSNorm(CustomOp):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
 
 
-class Qwen3NextRMSNormGated(nn.Module):
+class Qwen3NextRMSNormGated(CustomOp):
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -480,7 +480,7 @@ class Qwen3NextRMSNormGated(nn.Module):
         return hidden_states.to(input_dtype)
 
     def forward_cpu(self, hidden_states, gate=None):
-        out = torch.ops.sgl_kernel.qwen3_next_rmsnorm_gated_cpu(
+        out = torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
             hidden_states, self.weight, gate, self.variance_epsilon
         )
         return out

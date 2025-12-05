@@ -195,15 +195,19 @@ class MambaPool:
             ]
 
             if _is_cpu and _cpu_has_amx_support:
-                conv_state = conv_state.as_strided_(
-                    conv_state.size(),
-                    (
-                        conv_state.stride(0),
-                        conv_state.stride(1),
-                        1,
-                        conv_state.size(2),
-                    ),
-                )
+                conv_state_cpu = []
+                for conv_shape_t in conv_state:
+                    conv_shape_new = conv_shape_t.as_strided_(
+                        conv_shape_t.size(),
+                        (
+                            conv_shape_t.stride(0),
+                            conv_shape_t.stride(1),
+                            1,
+                            conv_shape_t.size(2),
+                        ),
+                    )
+                    conv_state_cpu.append(conv_shape_new)
+                conv_state = conv_state_cpu
             temporal_state = torch.zeros(
                 size=(num_mamba_layers, size + 1) + temporal_state_shape,
                 dtype=ssm_dtype,

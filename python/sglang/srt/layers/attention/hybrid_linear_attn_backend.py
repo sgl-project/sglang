@@ -4,18 +4,12 @@ import torch
 from einops import rearrange
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_update,
 )
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
-)
-from sglang.srt.layers.attention.fla.kda import (
-    chunk_kda,
-    fused_kda_gate,
-    fused_recurrent_kda,
 )
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
@@ -34,6 +28,15 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu
+
+if not is_cpu():
+    # fix import error on CPU device, no impacts when non-CPU path
+    from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
+    from sglang.srt.layers.attention.fla.kda import (
+        chunk_kda,
+        fused_kda_gate,
+        fused_recurrent_kda,
+    )
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -560,14 +563,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        mixed_qkv = causal_conv1d_update(
-            mixed_qkv,
-            conv_states,
-            conv_weights,
-            bias,
-            activation,
-            conv_state_indices=cache_indices,
-        )
+        if is_cpu() and cpu_has_amx_support():
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                conv_weights,
+                bias,
+                activation == "silu",
+                None,
+                cache_indices,
+                self.pad_slot_id,
+                True,
+            )
+        else:
+            mixed_qkv = causal_conv1d_update(
+                mixed_qkv,
+                conv_states,
+                conv_weights,
+                bias,
+                activation,
+                conv_state_indices=cache_indices,
+            )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -674,17 +690,31 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv.transpose(0, 1),
-                conv_weights,
-                bias,
-                activation=activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-            ).transpose(0, 1)[:seq_len]
+            if is_cpu() and cpu_has_amx_support():
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv.transpose(0, 1),
+                    conv_weights,
+                    bias,
+                    conv_states,
+                    query_start_loc,
+                    cache_indices,
+                    has_initial_states,
+                    activation == "silu",
+                    self.pad_slot_id,
+                    True,
+                ).transpose(0, 1)[:seq_len]
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv.transpose(0, 1),
+                    conv_weights,
+                    bias,
+                    activation=activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states,
+                    cache_indices=cache_indices,
+                    query_start_loc=query_start_loc,
+                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                ).transpose(0, 1)[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -702,7 +732,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query = query.view(1, actual_seq_len, num_heads, head_k_dim)
         key = key.view(1, actual_seq_len, num_heads, head_k_dim)
         value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
-
         g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
 
         if is_target_verify:
@@ -723,19 +752,35 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             recurrent_state = ssm_states[cache_indices]
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                cu_seqlens=query_start_loc,
-                head_first=False,
-                use_qk_l2norm_in_kernel=True,
-            )
-            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            if is_cpu() and cpu_has_amx_support():
+                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                    query=query,
+                    key=key,
+                    value=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+            else:
+                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=True,
+                    cu_seqlens=query_start_loc,
+                    head_first=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                last_recurrent_state = last_recurrent_state.to(
+                    ssm_states.dtype, copy=False
+                )
             ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out

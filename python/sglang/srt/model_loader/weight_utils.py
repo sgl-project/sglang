@@ -894,21 +894,25 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
-        if is_cpu() and loaded_weight.size(0) % tp_size != 0:
-            param.data, loaded_weight = narrow_padded_param_and_loaded_weight(
-                param.data,
+
+        if (
+            is_cpu()
+            and loaded_weight.size(0) % tp_size != 0
+            and loaded_weight.dim() == 1
+        ):
+            param_data = param.data  # view copy on param for uneven padding
+            param_data, loaded_weight = narrow_padded_param_and_loaded_weight(
+                param_data,
                 loaded_weight,
                 0,  # param_data_start
                 start_idx,
                 shard_axis,
                 shard_size,
             )
-            if loaded_weight.size(0) == 32:
-                print(loaded_weight)
+            return default_weight_loader(param_data, loaded_weight)
         else:
             loaded_weight = loaded_weight.narrow(shard_axis, start_idx, shard_size)
-
-        return default_weight_loader(param, loaded_weight)
+            return default_weight_loader(param, loaded_weight)
 
     return loader
 
