@@ -514,6 +514,8 @@ class PixtralHFTransformerBlock(nn.Module):
             dropout=0.0,
             use_context_forward=False,
             flatten_batch=False,
+            qkv_bias=False,
+            proj_bias=False,
             prefix=f"{prefix}.attention",
         )
 
