@@ -164,7 +164,7 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
 
     def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
-        """Enable cache-dit on the transformer(s) if configured (idempotent).
+        """Enable cache-dit on the transformers if configured (idempotent).
 
         This method should be called after the transformer is fully loaded
         and before torch.compile is applied.
@@ -172,8 +172,6 @@ class DenoisingStage(PipelineStage):
         For dual-transformer models (e.g., Wan2.2), this enables cache-dit on both
         transformers with (potentially) different configurations.
 
-        Args:
-            num_inference_steps: Number of inference steps for this batch.
         """
         if self._cache_dit_enabled:
             if self._cached_num_steps != num_inference_steps:

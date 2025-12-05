@@ -41,7 +41,6 @@ def get_scm_mask(
 
     Args:
         preset: Preset name ("none", "slow", "medium", "fast", "ultra").
-        num_inference_steps: Total number of inference steps.
         compute_bins: Custom compute bins (overrides preset).
         cache_bins: Custom cache bins (overrides preset).
 
@@ -123,20 +122,11 @@ def enable_cache_on_transformer(
     """Enable cache-dit on a transformer module.
 
     This function enables cache-dit acceleration using the BlockAdapterRegister
-    for pre-registered models. Only officially supported models can use this
-    function directly.
+    for pre-registered models
 
     Args:
-        transformer: The transformer module to enable caching on.
-        config: CacheDitConfig with caching parameters.
         model_name: Name of the model for logging purposes.
 
-    Returns:
-        The transformer module with cache-dit enabled.
-
-    Raises:
-        ImportError: If cache-dit is not installed.
-        ValueError: If num_inference_steps is not provided or model is not supported.
     """
     if not config.enabled:
         return transformer
@@ -220,25 +210,15 @@ def enable_cache_on_dual_transformer(
     secondary_config: CacheDitConfig,
     model_name: str = "wan2.2",
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
-    """Enable cache-dit on dual transformers (e.g., Wan2.2) using BlockAdapter.
+    """Enable cache-dit on dual transformers using BlockAdapter.
 
     For models with two transformers (high-noise expert and low-noise expert),
     cache-dit requires enabling cache on both simultaneously via BlockAdapter.
     This cannot be done by calling enable_cache separately on each transformer.
 
     Args:
-        transformer: Primary transformer module (high-noise expert).
-        transformer_2: Secondary transformer module (low-noise expert).
         primary_config: CacheDitConfig for primary transformer.
         secondary_config: CacheDitConfig for secondary transformer.
-        model_name: Name of the model for logging purposes.
-
-    Returns:
-        Tuple of (transformer, transformer_2) with cache-dit enabled.
-
-    Raises:
-        ImportError: If cache-dit is not installed.
-        ValueError: If num_inference_steps is not provided.
     """
     _supported_dual_transformer_models = [
         "wan2.2",  # Currently, only Wan2.2 will run into dual-transformer case
