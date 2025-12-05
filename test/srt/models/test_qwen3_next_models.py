@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
-ACC_THRESHOLDS = {QWEN3_NEXT_MODEL: {"kl_div": 0.015, "gsm8k": 0.93}}
+ACC_THRESHOLDS = {QWEN3_NEXT_MODEL: {"kl_div": 0.01, "gsm8k": 0.93}}
 
 
 class TestQwen3Next(CustomTestCase):
@@ -40,21 +40,21 @@ class TestQwen3Next(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    # def test_gsm8k(self):
-    #     args = SimpleNamespace(
-    #         num_shots=5,
-    #         data_path=None,
-    #         num_questions=200,
-    #         max_new_tokens=512,
-    #         parallel=128,
-    #         host="http://127.0.0.1",
-    #         port=int(self.base_url.split(":")[-1]),
-    #     )
-    #     metrics = run_eval(args)
-    #     print(f"{metrics=}")
-    #     self.assertGreaterEqual(
-    #         metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
-    #     )
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=200,
+            max_new_tokens=512,
+            parallel=128,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreaterEqual(
+            metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
 
     def test_input_output_logprobs_match_prefill_cache_hit(self):
         test_input_output_logprobs_match_prefill_cache_hit_helper(
@@ -62,7 +62,7 @@ class TestQwen3Next(CustomTestCase):
             ACC_THRESHOLDS,
             self.model,
             max_samples=48,
-            max_new_tokens=48,
+            max_new_tokens=512,
         )
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
@@ -71,7 +71,7 @@ class TestQwen3Next(CustomTestCase):
             ACC_THRESHOLDS,
             self.model,
             max_samples=48,
-            max_new_tokens=48,
+            max_new_tokens=512,
         )
 
 
@@ -127,7 +127,7 @@ class TestQwen3NextMTP(CustomTestCase):
             ACC_THRESHOLDS,
             self.model,
             max_samples=48,
-            max_new_tokens=1024,
+            max_new_tokens=512,
         )
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
@@ -192,7 +192,7 @@ class TestQwen3NextMTPTopk(CustomTestCase):
             ACC_THRESHOLDS,
             self.model,
             max_samples=48,
-            max_new_tokens=1024,
+            max_new_tokens=512,
         )
 
     def test_input_output_logprobs_match_decode_cache_hit(self):

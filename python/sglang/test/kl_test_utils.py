@@ -1,4 +1,6 @@
 import inspect
+import json
+import os
 
 import numpy as np
 import requests
@@ -10,6 +12,10 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 LONGBENCH_V2_DATASET = "THUDM/LongBench-v2"
 LONGBENCH_V2_SPLIT = "train"
 NUM_SAMPLES = 48  # Number of samples to use
+CACHE_DIR = os.path.join(os.path.dirname(__file__), ".longbench_cache")
+
+# In-memory cache for the current session
+_cached_input_ids = {}
 
 
 def format_longbench_v2_example(example):
@@ -20,7 +26,34 @@ def format_longbench_v2_example(example):
 
 
 def get_input_ids(tokenizer_path, max_tokens=3000, num_samples=NUM_SAMPLES):
-    """Get input_ids from LongBench V2 dataset using streaming (fast partial download)."""
+    """Get input_ids from LongBench V2 dataset with local caching."""
+    # Create cache key based on parameters
+    cache_key = f"{tokenizer_path}_{max_tokens}_{num_samples}"
+
+    # Check in-memory cache first (fastest)
+    if cache_key in _cached_input_ids:
+        print(
+            f"Using in-memory cached data ({len(_cached_input_ids[cache_key])} prompts)"
+        )
+        return _cached_input_ids[cache_key]
+
+    # Check local file cache
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    # Use a safe filename
+    safe_name = tokenizer_path.replace("/", "_").replace("\\", "_")
+    cache_file = os.path.join(
+        CACHE_DIR, f"input_ids_{safe_name}_{max_tokens}_{num_samples}.json"
+    )
+
+    if os.path.exists(cache_file):
+        print(f"Loading from local cache: {cache_file}")
+        with open(cache_file, "r") as f:
+            input_ids = json.load(f)
+        _cached_input_ids[cache_key] = input_ids
+        print(f"Loaded {len(input_ids)} prompts from cache")
+        return input_ids
+
+    # Download from HuggingFace using streaming
     try:
         from datasets import load_dataset
     except ImportError as exc:
@@ -30,8 +63,7 @@ def get_input_ids(tokenizer_path, max_tokens=3000, num_samples=NUM_SAMPLES):
 
     tokenizer = get_tokenizer(tokenizer_path)
 
-    print(f"Loading {num_samples} samples from LongBench V2 (streaming)...")
-    # Use streaming to avoid downloading entire dataset
+    print(f"Downloading {num_samples} samples from LongBench V2 (streaming)...")
     dataset = load_dataset(
         LONGBENCH_V2_DATASET, split=LONGBENCH_V2_SPLIT, streaming=True
     )
@@ -45,7 +77,14 @@ def get_input_ids(tokenizer_path, max_tokens=3000, num_samples=NUM_SAMPLES):
         # Truncate to max_tokens
         input_ids.append(tokens[:max_tokens])
 
-    print(f"Loaded {len(input_ids)} prompts (truncated to {max_tokens} tokens)")
+    # Save to local cache
+    with open(cache_file, "w") as f:
+        json.dump(input_ids, f)
+    print(f"Saved {len(input_ids)} prompts to cache: {cache_file}")
+
+    # Also cache in memory
+    _cached_input_ids[cache_key] = input_ids
+
     return input_ids
 
 
