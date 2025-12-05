@@ -787,12 +787,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
         original_weights = dict(model.named_parameters())
 
         # Record pre-quantization state (shape/stride) for torch.as_strided reset
-        assert hasattr(
-            model, "original_weights_rebuild_keys"
-        ), "original_weights_rebuild_keys attribute does not exist"
-        assert hasattr(
-            model, "recorded_loader"
-        ), "recorded_loader attribute does not exist"
 
         model.original_weights_rebuild_keys = {}
         for name, p in original_weights.items():
@@ -924,7 +918,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 ),
                 [],
             )
-            rows_per_shard = scale_param.data.shape[-1] // len(shard_names, 1)
+            rows_per_shard = scale_param.data.shape[-1] // max(len(shard_names), 1)
             if rows_per_shard * len(shard_names) != scale_param.data.shape[-1]:
                 logger.warning(
                     f"Scale param shape {scale_param.data.shape[-1]} not divisible by {len(shard_names)}"
