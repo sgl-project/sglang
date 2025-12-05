@@ -235,9 +235,6 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     rl_quant_profile: Optional[str] = None  # For flash_rl load format
-    flash_rl_model: Optional[str] = (
-        None  # Pre-quantized model for flash_rl initial load
-    )
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
