@@ -1,6 +1,6 @@
-# WASM Rate Limit Example for sgl-router
+# WASM Rate Limit Example for sgl-model-gateway
 
-This example demonstrates rate limiting middleware for sgl-router using the WebAssembly Component Model.
+This example demonstrates rate limiting middleware for sgl-model-gateway using the WebAssembly Component Model.
 
 ## Overview
 

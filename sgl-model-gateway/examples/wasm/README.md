@@ -1,6 +1,6 @@
-# WASM Guest Examples for sgl-router
+# WASM Guest Examples for sgl-model-gateway
 
-This directory contains example WASM middleware components demonstrating how to implement custom middleware for sgl-router using the WebAssembly Component Model.
+This directory contains example WASM middleware components demonstrating how to implement custom middleware for sgl-model-gateway using the WebAssembly Component Model.
 
 ## Examples Overview
 
@@ -56,7 +56,7 @@ All examples require:
 - Rust toolchain (latest stable)
 - `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
 - `wasm-tools`: `cargo install wasm-tools`
-- sgl-router running with WASM enabled (`--enable-wasm`)
+- sgl-model-gateway running with WASM enabled (`--enable-wasm`)
 
 ## Building All Examples
 

@@ -20,7 +20,7 @@ use crate::wasm::{
     config::WasmRuntimeConfig,
     errors::{Result, WasmError, WasmRuntimeError},
     module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
-    spec::SglRouter,
+    spec::SglModelGateway,
     types::{WasiState, WasmComponentInput, WasmComponentOutput},
 };
 
@@ -322,7 +322,7 @@ impl WasmThreadPool {
                 };
 
                 // Instantiate component (must use async instantiation when async support is enabled)
-                let bindings = SglRouter::instantiate_async(&mut store, &component, &linker)
+                let bindings = SglModelGateway::instantiate_async(&mut store, &component, &linker)
                     .await
                     .map_err(|e| {
                         WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
@@ -330,7 +330,7 @@ impl WasmThreadPool {
 
                 // Call on-request (async call when async support is enabled)
                 let action_result = bindings
-                    .sgl_router_middleware_on_request()
+                    .sgl_model_gateway_middleware_on_request()
                     .call_on_request(&mut store, &request)
                     .await
                     .map_err(|e| WasmError::from(WasmRuntimeError::CallFailed(e.to_string())))?;
@@ -350,7 +350,7 @@ impl WasmThreadPool {
                 };
 
                 // Instantiate component (must use async instantiation when async support is enabled)
-                let bindings = SglRouter::instantiate_async(&mut store, &component, &linker)
+                let bindings = SglModelGateway::instantiate_async(&mut store, &component, &linker)
                     .await
                     .map_err(|e| {
                         WasmError::from(WasmRuntimeError::InstanceCreateFailed(e.to_string()))
@@ -358,7 +358,7 @@ impl WasmThreadPool {
 
                 // Call on-response (async call when async support is enabled)
                 let action_result = bindings
-                    .sgl_router_middleware_on_response()
+                    .sgl_model_gateway_middleware_on_response()
                     .call_on_response(&mut store, &response)
                     .await
                     .map_err(|e| WasmError::from(WasmRuntimeError::CallFailed(e.to_string())))?;
