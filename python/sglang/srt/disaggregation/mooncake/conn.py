@@ -720,26 +720,24 @@ class MooncakeKVManager(CommonKVManager):
             result.copy_done,
         )
         copy_done.synchronize()
-        next_token_ids = result.next_token_ids.tolist()
-        from copy import deepcopy
 
         reqs = batch.reqs
 
-        for i, (req, next_token_id) in enumerate(zip(reqs, next_token_ids)):
-            if batch.spec_info is not None:
-                req.output_topk_p = batch.spec_info.topk_p[i]
-                req.output_topk_index = batch.spec_info.topk_index[i]
-                req.hidden_states_tensor = (
-                    batch.spec_info.hidden_states[i].cpu().clone()
-                )
-            else:
-                req.hidden_states_tensor = None
-            
-            req.output_ids.append(next_token_id)
-            # Call set_buf callback if available (faster than passing scheduler reference)
-            if self.set_buf_callback is not None:
-                self.set_buf_callback(req)
-
+        for i, req in enumerate(reqs):
+            if req.is_chunked <= 0:
+                if batch.spec_info is not None:
+                    req.output_topk_p = batch.spec_info.topk_p[i]
+                    req.output_topk_index = batch.spec_info.topk_index[i]
+                    req.hidden_states_tensor = (
+                        batch.spec_info.hidden_states[i].cpu().clone()
+                    )
+                else:
+                    req.hidden_states_tensor = None
+                
+                req.output_ids.append(next_token_ids[i].item())
+                # Call set_buf callback if available (faster than passing scheduler reference)
+                if self.set_buf_callback is not None:
+                    self.set_buf_callback(req)
 
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
@@ -748,7 +746,6 @@ class MooncakeKVManager(CommonKVManager):
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 with torch.cuda.nvtx.range("transfer"):
-
                     reqs_to_be_processed = (
                         self.transfer_infos[kv_chunk.room].values()
                         if kv_chunk.room in self.transfer_infos
