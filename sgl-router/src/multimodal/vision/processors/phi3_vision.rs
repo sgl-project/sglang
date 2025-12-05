@@ -135,7 +135,10 @@ impl Phi3VisionProcessor {
         let new_w = (scale * TILE_SIZE as f64) as u32;
         let new_h = (new_w as f64 / ratio) as u32;
 
-        // Resize using bilinear filter (matching HuggingFace's default)
+        // Resize using bilinear filter (matching torchvision's bilinear+antialias)
+        // HuggingFace uses torchvision.transforms.functional.resize with
+        // BILINEAR interpolation and antialias=True. PIL's BILINEAR includes
+        // implicit antialiasing that closely matches torchvision.
         let resized = img.resize_exact(new_w, new_h, FilterType::Triangle);
 
         // Pad height to multiple of 336
@@ -170,56 +173,12 @@ impl Phi3VisionProcessor {
         new_image
     }
 
-    /// Create global image by bilinear interpolation to 336x336.
+    /// Create global image by bicubic interpolation to 336x336.
     ///
-    /// Uses PyTorch-compatible coordinate mapping with align_corners=False:
-    /// `src = (dst + 0.5) * (src_size / dst_size) - 0.5`
+    /// Uses the shared `bicubic_resize` which matches PyTorch's
+    /// `torch.nn.functional.interpolate(mode='bicubic', align_corners=False)`.
     fn create_global_image(&self, tensor: &Array3<f32>) -> Array3<f32> {
-        // tensor is [C, H, W], we need to resize to [C, 336, 336]
-        let (_c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
-
-        if h == TILE_SIZE as usize && w == TILE_SIZE as usize {
-            return tensor.clone();
-        }
-
-        let mut result = Array3::<f32>::zeros((3, TILE_SIZE as usize, TILE_SIZE as usize));
-
-        // PyTorch align_corners=False coordinate mapping
-        let scale_h = h as f32 / TILE_SIZE as f32;
-        let scale_w = w as f32 / TILE_SIZE as f32;
-
-        for c in 0..3 {
-            for y in 0..TILE_SIZE as usize {
-                for x in 0..TILE_SIZE as usize {
-                    // PyTorch align_corners=False: src = (dst + 0.5) * scale - 0.5
-                    let src_y = ((y as f32 + 0.5) * scale_h - 0.5).max(0.0);
-                    let src_x = ((x as f32 + 0.5) * scale_w - 0.5).max(0.0);
-
-                    // Bilinear interpolation
-                    let y0 = src_y.floor() as usize;
-                    let x0 = src_x.floor() as usize;
-                    let y1 = (y0 + 1).min(h - 1);
-                    let x1 = (x0 + 1).min(w - 1);
-
-                    let fy = src_y - y0 as f32;
-                    let fx = src_x - x0 as f32;
-
-                    let v00 = tensor[[c, y0, x0]];
-                    let v01 = tensor[[c, y0, x1]];
-                    let v10 = tensor[[c, y1, x0]];
-                    let v11 = tensor[[c, y1, x1]];
-
-                    let value = v00 * (1.0 - fx) * (1.0 - fy)
-                        + v01 * fx * (1.0 - fy)
-                        + v10 * (1.0 - fx) * fy
-                        + v11 * fx * fy;
-
-                    result[[c, y, x]] = value;
-                }
-            }
-        }
-
-        result
+        transforms::bicubic_resize(tensor, TILE_SIZE as usize, TILE_SIZE as usize)
     }
 
     /// Reshape HD image into tiles.
