@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 
 
-class TestFp8BlockwiseGemmBase(unittest.TestCase):
+class Fp8BlockwiseGemmBase(unittest.TestCase):
     backend = None
 
     @classmethod
@@ -56,16 +56,16 @@ class TestFp8BlockwiseGemmBase(unittest.TestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.41)
 
 
-class TestFp8BlockwiseGemmTriton(TestFp8BlockwiseGemmBase):
+class TestFp8BlockwiseGemmTriton(Fp8BlockwiseGemmBase):
     backend = "triton"
 
 
-class TestFp8BlockwiseGemmDeepGemm(TestFp8BlockwiseGemmBase):
+class TestFp8BlockwiseGemmDeepGemm(Fp8BlockwiseGemmBase):
     backend = "deep_gemm"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFp8BlockwiseGemmFlashinferTrtllm(TestFp8BlockwiseGemmBase):
+class TestFp8BlockwiseGemmFlashinferTrtllm(Fp8BlockwiseGemmBase):
     backend = "flashinfer_trtllm"
 
 
