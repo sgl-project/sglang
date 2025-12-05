@@ -178,8 +178,8 @@ def _get_config_info(model_path: str) -> Optional[ConfigInfo]:
     model_name = get_model_short_name(model_path.lower())
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
     for registered_model_hf_id in all_model_hf_paths:
-        registered_model_name = get_model_short_name(registered_model_hf_id)
-        if registered_model_name.lower() in model_name:
+        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
+        if registered_model_name == model_name:
             logger.debug(
                 f"Resolved model name '{registered_model_hf_id}' from partial path match."
             )
