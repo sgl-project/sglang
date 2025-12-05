@@ -219,7 +219,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
 # TODO: move from Tom's branch to DeepEP hybrid-ep branch
 # We use the nvshmem version that ships with torch 2.9.1
-# For cu12, it's 3.4.5 and for cu13, it's 3.3.24
+# CU12 uses 3.3.20 and CU13 uses 3.3.24
 RUN set -eux; \
     if [ "$GRACE_BLACKWELL" = "1" ]; then \
       git clone https://github.com/fzyzcjy/DeepEP.git && \
