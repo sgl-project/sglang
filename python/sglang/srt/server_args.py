@@ -1388,9 +1388,9 @@ class ServerArgs:
 
             if self.page_size not in [32, 64]:
                 logger.warning(
-                    f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
+                    f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 32."
                 )
-                self.page_size = 64
+                self.page_size = 32
 
             if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "auto"]:
                 raise ValueError(
@@ -1409,9 +1409,9 @@ class ServerArgs:
 
             if self.page_size not in [16, 32, 64]:
                 logger.warning(
-                    f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {self.page_size} to 64."
+                    f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {self.page_size} to 16."
                 )
-                self.page_size = 64
+                self.page_size = 16
 
         if self.attention_backend == "fa3" and self.kv_cache_dtype == "fp8_e5m2":
             logger.warning(

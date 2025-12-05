@@ -74,6 +74,7 @@ class KVArgsRegisterInfo:
     decode_tp_size: int
     decode_tp_rank: int
     dst_kv_item_len: int
+    page_size: int
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -89,6 +90,7 @@ class KVArgsRegisterInfo:
             decode_tp_size=int(msg[8].decode("ascii")),
             decode_tp_rank=int(msg[9].decode("ascii")),
             dst_kv_item_len=int(msg[10].decode("ascii")),
+            page_size=int(msg[11].decode("ascii")),
         )
 
 
@@ -299,6 +301,13 @@ class NixlKVManager(CommonKVManager):
         if agent_name in self.decode_kv_args_table:
             logger.info(f"Peer {agent_name} was already registered, ignoring.")
             return
+        # Validate page_size matches between prefill and decode servers
+        if decode_kv_args.page_size != self.kv_args.page_size:
+            raise ValueError(
+                f"Page size mismatch: decode server has page_size={decode_kv_args.page_size}, "
+                f"but prefill server has page_size={self.kv_args.page_size}. "
+                f"Both servers must use the same --page-size value."
+            )
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
 
@@ -854,6 +863,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                        str(self.kv_mgr.kv_args.page_size).encode("ascii"),
                     ]
                 )
 
