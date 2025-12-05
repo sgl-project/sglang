@@ -1633,9 +1633,10 @@ class ServerArgs:
                     "Page first direct layout only support direct io backend"
                 )
 
-        if (self.enable_hierarchical_cache or self.disaggregation_decode_enable_offload_kvcache) and (
-           self.hicache_io_backend == "kernel"
-        ):
+        if (
+            self.enable_hierarchical_cache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ) and self.hicache_io_backend == "kernel":
             # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
             if self.decode_attention_backend is None:
                 if not self.use_mla_backend():
