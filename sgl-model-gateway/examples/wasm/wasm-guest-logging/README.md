@@ -1,6 +1,6 @@
-# WASM Logging Example for sgl-router
+# WASM Logging Example for sgl-model-gateway
 
-This example demonstrates logging and tracing middleware for sgl-router using the WebAssembly Component Model.
+This example demonstrates logging and tracing middleware for sgl-model-gateway using the WebAssembly Component Model.
 
 ## Overview
 

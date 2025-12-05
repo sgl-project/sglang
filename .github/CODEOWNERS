@@ -25,23 +25,23 @@
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
 /sgl-kernel @zhyncs @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
-/sgl-router @slin1237 @CatherineSue
-/sgl-router/benches @slin1237
-/sgl-router/bindings/python @CatherineSue @key4ng @slin1237
-/sgl-router/py_test @CatherineSue @key4ng
-/sgl-router/src/config @slin1237
-/sgl-router/src/core @slin1237
-/sgl-router/src/data_connector @key4ng
-/sgl-router/src/grpc_client @CatherineSue @slin1237
-/sgl-router/src/mcp @key4ng @slin1237
-/sgl-router/src/policies @slin1237 @ByronHsu
-/sgl-router/src/proto @CatherineSue @slin1237
-/sgl-router/src/protocols @CatherineSue @key4ng
-/sgl-router/src/reasoning_parser @CatherineSue
-/sgl-router/src/routers @CatherineSue @key4ng @slin1237
-/sgl-router/src/tokenizer @slin1237 @CatherineSue
-/sgl-router/src/tool_parser @slin1237 @CatherineSue
-/sgl-router/src/wasm @tonyluj
-/sgl-router/examples/wasm @tonyluj
+/sgl-model-gateway @slin1237 @CatherineSue
+/sgl-model-gateway/benches @slin1237
+/sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237
+/sgl-model-gateway/py_test @CatherineSue @key4ng
+/sgl-model-gateway/src/config @slin1237
+/sgl-model-gateway/src/core @slin1237
+/sgl-model-gateway/src/data_connector @key4ng
+/sgl-model-gateway/src/grpc_client @CatherineSue @slin1237
+/sgl-model-gateway/src/mcp @key4ng @slin1237
+/sgl-model-gateway/src/policies @slin1237 @ByronHsu
+/sgl-model-gateway/src/proto @CatherineSue @slin1237
+/sgl-model-gateway/src/protocols @CatherineSue @key4ng
+/sgl-model-gateway/src/reasoning_parser @CatherineSue
+/sgl-model-gateway/src/routers @CatherineSue @key4ng @slin1237
+/sgl-model-gateway/src/tokenizer @slin1237 @CatherineSue
+/sgl-model-gateway/src/tool_parser @slin1237 @CatherineSue
+/sgl-model-gateway/src/wasm @tonyluj
+/sgl-model-gateway/examples/wasm @tonyluj
 /test/srt/ascend @ping1jing2 @iforgetmyname
 /test/srt/test_modelopt* @Edwardf0t1
