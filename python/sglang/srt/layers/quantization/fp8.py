@@ -1284,7 +1284,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 routed_scaling_factor=(
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 ),
-                tile_tokens_dim=None,
                 routing_method_type=routing_method_type,
                 use_shuffled_weight=False,
             )
