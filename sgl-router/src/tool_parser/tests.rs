@@ -1,6 +1,7 @@
 use super::*;
+use crate::protocols::common::{Function, Tool};
 use crate::tool_parser::{
-    parsers::JsonParser,
+    parsers::{JsonParser, QwenCoderParser},
     partial_json::{compute_diff, find_common_prefix, is_complete_json, PartialJson},
     traits::ToolParser,
 };
@@ -595,5 +596,160 @@ mod stress_tests {
         for handle in handles {
             handle.await.unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod qwen_coder_tests {
+    use super::*;
+
+    fn create_test_tools() -> Vec<Tool> {
+        vec![Tool {
+            function: Function {
+                name: "get_weather".to_string(),
+                description: Some("Get weather information".to_string()),
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "units": {"type": "string"}
+                    }
+                })),
+            },
+        }]
+    }
+
+    #[tokio::test]
+    async fn test_qwen_coder_incremental_parameter_streaming() {
+        let mut parser = QwenCoderParser::new();
+        let tools = create_test_tools();
+
+        let chunks = vec![
+            "<tool_call>",
+            r#"<function=get_weather>"#,
+            r#"<parameter=city>Paris</parameter>"#,
+            r#"<parameter=units>metric</parameter>"#,
+            "</function></tool_call>",
+        ];
+
+        let mut all_calls = Vec::new();
+
+        // Process each chunk
+        for (i, chunk) in chunks.iter().enumerate() {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            println!("Chunk {}: {:?}", i, chunk);
+            println!("  Calls: {:?}", result.calls);
+            println!("  Normal text: {:?}", result.normal_text);
+
+            for call in &result.calls {
+                all_calls.push(call.clone());
+            }
+        }
+
+        // Verify the final result
+        // We should have:
+        // 1. Tool name call (from chunk 2)
+        // 2. First parameter call: {"city": "Paris"}
+        // 3. Second parameter call: , "units": "metric"
+        // Final result should be: {"city": "Paris", "units": "metric"}
+
+        assert!(!all_calls.is_empty(), "Should have at least one call");
+
+        // Check that we have the tool name
+        let name_call = all_calls.iter().find(|c| c.name.is_some());
+        assert!(name_call.is_some(), "Should have tool name call");
+        assert_eq!(name_call.unwrap().name.as_ref().unwrap(), "get_weather");
+
+        // Check parameter calls
+        let param_calls: Vec<_> = all_calls.iter().filter(|c| c.name.is_none()).collect();
+        assert!(!param_calls.is_empty(), "Should have parameter calls");
+
+        // Verify final arguments format
+        let final_args = &parser.streamed_args_for_tool[0];
+        println!("Final streamed args: {}", final_args);
+
+        // Should be valid JSON: {"city": "Paris", "units": "metric"}
+        let parsed: serde_json::Value = serde_json::from_str(final_args).unwrap();
+        assert_eq!(parsed["city"], "Paris");
+        assert_eq!(parsed["units"], "metric");
+    }
+
+    #[tokio::test]
+    async fn test_qwen_coder_incremental_parameter_streaming_with_partial_values() {
+        let mut parser = QwenCoderParser::new();
+        let tools = create_test_tools();
+
+        let chunks = vec![
+            "<tool_call>",
+            r#"<function=get_weather>"#,
+            r#"<parameter=city>Par"#,  // Partial value
+            r#"is</parameter>"#,       // Complete first parameter
+            r#"<parameter=units>met"#, // Partial value
+            r#"ric</parameter>"#,      // Complete second parameter
+            "</function></tool_call>",
+        ];
+
+        let mut all_calls = Vec::new();
+
+        // Process each chunk
+        for (i, chunk) in chunks.iter().enumerate() {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            println!("Chunk {}: {:?}", i, chunk);
+            println!("  Calls: {:?}", result.calls);
+
+            for call in &result.calls {
+                all_calls.push(call.clone());
+            }
+        }
+
+        // Verify incremental streaming worked
+        // Should have incremental updates for partial values
+        let param_calls: Vec<_> = all_calls.iter().filter(|c| c.name.is_none()).collect();
+
+        // Should have more calls due to incremental streaming
+        assert!(param_calls.len() >= 2, "Should have parameter calls including incremental updates");
+
+        // Verify final arguments
+        let final_args = &parser.streamed_args_for_tool[0];
+        let parsed: serde_json::Value = serde_json::from_str(final_args).unwrap();
+        assert_eq!(parsed["city"], "Paris");
+        assert_eq!(parsed["units"], "metric");
+    }
+
+    #[tokio::test]
+    async fn test_qwen_coder_nested_json_parameter() {
+        let mut parser = QwenCoderParser::new();
+        let tools = vec![Tool {
+            function: Function {
+                name: "test_function".to_string(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "nested": {"type": "object"}
+                    }
+                })),
+            },
+        }];
+
+        let chunks = vec![
+            "<tool_call>",
+            r#"<function=test_function>"#,
+            r#"<parameter=nested>{"key": "value"}</parameter>"#,
+            "</function></tool_call>",
+        ];
+
+        let mut all_calls = Vec::new();
+        for chunk in chunks {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            for call in result.calls {
+                all_calls.push(call);
+            }
+        }
+
+        // Verify nested JSON is parsed correctly
+        let final_args = &parser.streamed_args_for_tool[0];
+        let parsed: serde_json::Value = serde_json::from_str(final_args).unwrap();
+        assert_eq!(parsed["nested"]["key"], "value");
     }
 }
