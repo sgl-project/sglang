@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test_pd_routing {
     use serde_json::json;
-    use sglang_router_rs::{
+    use sgl_model_gateway::{
         app_context::AppContext,
         config::{PolicyConfig, RouterConfig, RoutingMode},
         core::{BasicWorkerBuilder, Worker, WorkerType},
@@ -38,7 +38,7 @@ mod test_pd_routing {
 
     #[test]
     fn test_worker_types() {
-        use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
+        use sgl_model_gateway::core::{BasicWorkerBuilder, Worker, WorkerType};
 
         let prefill_worker: Box<dyn Worker> = Box::new(
             BasicWorkerBuilder::new("http://prefill:8080")
@@ -214,7 +214,7 @@ mod test_pd_routing {
             let app_context = {
                 use std::sync::{Arc, OnceLock};
 
-                use sglang_router_rs::{
+                use sgl_model_gateway::{
                     core::{LoadMonitor, WorkerRegistry},
                     data_connector::{
                         MemoryConversationItemStorage, MemoryConversationStorage,
@@ -673,7 +673,7 @@ mod test_pd_routing {
 
     #[test]
     fn test_bootstrap_injection_with_benchmark_requests() {
-        use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
+        use sgl_model_gateway::core::{BasicWorkerBuilder, Worker, WorkerType};
 
         let mut benchmark_request = json!({
             "input_ids": vec![vec![1, 2, 3, 4]; 16], // Batch size 16
