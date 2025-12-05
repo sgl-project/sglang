@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 from enum import Enum, IntEnum, auto
 from typing import Any, List, Optional, Set, Union
 
@@ -36,7 +37,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
-
+_is_npu = is_npu()
 
 class AttentionArch(IntEnum):
     MLA = auto()
@@ -560,6 +561,16 @@ class ModelConfig:
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
 
+    def _find_quant_modelslim_config(self):
+        quant_config_file = Path(self.model_path, "quant_model_description.json")
+        if quant_config_file.is_file():
+            with open(quant_config_file) as f:
+                quant_cfg = json.load(f)
+        else:
+            quant_cfg = None
+                            
+        return quant_cfg
+
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
         """Parse ModelOpt quantization config and return the appropriate quant_method."""
         json_quant_configs = quant_config_dict["quantization"]
@@ -678,6 +689,9 @@ class ModelConfig:
 
         # Parse quantization method from the HF model config, if available.
         quant_cfg = self._parse_quant_hf_config()
+        if _is_npu:
+            quant_cfg = self._find_quant_modelslim_config()
+            self.quantization = 'modelslim'
 
         if quant_cfg is not None:
             quant_method = quant_cfg.get(
