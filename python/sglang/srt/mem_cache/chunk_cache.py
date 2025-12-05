@@ -78,7 +78,6 @@ class ChunkCache(BasePrefixCache):
             index_k_indices = self.req_to_token_pool.req_to_nsa_index_k[
                 req.req_pool_idx, :index_k_free_len
             ]
-
             self.req_to_token_pool.free(req.req_pool_idx)
             self.protected_size_ -= len(req.prefix_indices)
             self.token_to_kv_pool_allocator.free((kv_indices, index_k_indices))
@@ -108,8 +107,16 @@ class ChunkCache(BasePrefixCache):
         ]
         self.protected_size_ += len(kv_indices) - len(req.prefix_indices)
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
+
+        # For NSA: also save Index K indices for chunked prefill
+        if is_enable_hierarchical_nsa(self.token_to_kv_pool_allocator):
+            index_k_indices = self.req_to_token_pool.req_to_nsa_index_k[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
+            req.index_k_prefix_indices = index_k_indices.to(
+                dtype=torch.int32, copy=True
+            )
 
     def evict(self, num_tokens: int):
         pass

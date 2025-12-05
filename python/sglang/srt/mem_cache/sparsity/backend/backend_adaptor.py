@@ -72,7 +72,7 @@ class NSABackendAdaptor(BackendAdaptor):
         max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
         page_table = self.req_to_token_pool.req_to_token[:, :max_seqlen_k]
         transformed_indices = (
-            self.kvcache_manager.transfer_sparse_top_k_cache_v2(
+            self.kvcache_manager.transfer_sparse_top_k_cache(
                 req_pool_indices=req_pool_indices,
                 top_k_result=selected_indices,
                 out_cache_loc=forward_batch.out_cache_loc,

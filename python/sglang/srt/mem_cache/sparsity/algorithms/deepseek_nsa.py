@@ -52,6 +52,7 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithm):
             raise ValueError("Required: indexer, x, q_lora, positions, forward_batch")
 
         try:
+            # Using the nsa's original indexer to get the topk indices.
             topk_indices = indexer(
                 x=x,
                 q_lora=q_lora,

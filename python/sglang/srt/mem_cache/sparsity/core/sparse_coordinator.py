@@ -45,6 +45,8 @@ class RequestTrackers:
             max_pool_size, dtype=torch.int64, device=device
         )
 
+        # Trackers for hierarchical NSA
+        # TODO: Refactor and reduce memory usage
         self.full_host_indices = torch.full(
             (max_pool_size, max_context_len),
             -1,

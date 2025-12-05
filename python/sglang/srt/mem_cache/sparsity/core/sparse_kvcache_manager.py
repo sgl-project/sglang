@@ -89,7 +89,7 @@ class SparseKVCacheManager:
         )
         self.req_states = None
 
-    def transfer_sparse_top_k_cache_v2(
+    def transfer_sparse_top_k_cache(
         self,
         req_pool_indices,
         top_k_result,
@@ -122,9 +122,6 @@ class SparseKVCacheManager:
         should_load_device_indices = self.req_states.should_load_device_indices[:bs]
         should_load_host_indices = self.req_states.should_load_host_indices[:bs]
 
-        # if layer_id == 0:
-        #     logger.info(f"[DEBUG] should_load_host_indices shape: {should_load_host_indices.shape}, head: {should_load_host_indices[:bs, :20]}")
-
         # load cache from cpu
         self.host_mem_pool.load_to_device_per_layer(
             self.host_mem_pool.device_pool,
@@ -133,6 +130,7 @@ class SparseKVCacheManager:
             layer_id,
             "kernel",
         )
+        
         return self.req_states.curr_device_indices[:bs, :-1]
 
     def offload_sparse_decode_req_tokens(

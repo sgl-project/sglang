@@ -553,6 +553,8 @@ class Req:
         # Prefix info
         # The indices to kv cache for the shared prefix.
         self.prefix_indices: torch.Tensor = torch.empty((0,), dtype=torch.int64)
+        # For NSA: Index K prefix indices
+        self.index_k_prefix_indices: torch.Tensor = None
         # Number of tokens to run prefill.
         self.extend_input_len = 0
         # The relative logprob_start_len in an extend batch
@@ -943,6 +945,7 @@ class Req:
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        self.index_k_prefix_indices = None
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0

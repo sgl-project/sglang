@@ -254,8 +254,8 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             index_k_last_loc = torch.full_like(last_loc, -1)
 
         index_k_indices = self.index_k_allocator.alloc_extend(
-            torch.zeros_like(prefix_lens),
-            torch.zeros_like(prefix_lens_cpu),
+            prefix_lens,
+            prefix_lens_cpu,
             seq_lens,
             seq_lens_cpu,
             index_k_last_loc,
@@ -264,7 +264,6 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if index_k_indices is None:
             self.kv_allocator.free(kv_indices)
             return None
-
         return (kv_indices, index_k_indices)
 
     def alloc_decode(
@@ -298,9 +297,19 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if kv_indices.numel() == 0:
             return
 
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        index_k_before = self.index_k_allocator.available_size()
         self.kv_allocator.free(kv_indices)
         if index_k_indices is not None and index_k_indices.numel() > 0:
             self.index_k_allocator.free(index_k_indices)
+        index_k_after = self.index_k_allocator.available_size()
+
+        logger.info(
+            f"[INDEX_K_FREE] freed={index_k_after - index_k_before}, count={len(index_k_indices) if index_k_indices is not None else 0}"
+        )
 
     def available_size(self):
         """Return KV allocator's available size (for scheduler memory check)"""
