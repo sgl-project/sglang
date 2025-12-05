@@ -79,13 +79,15 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
-def get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
+def get_lock(
+    model_name_or_path: str, cache_dir: Optional[str] = None, suffix: str = ""
+):
     lock_dir = cache_dir or temp_dir
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
     model_name = model_name_or_path.replace("/", "-")
     hash_name = hashlib.sha256(model_name.encode()).hexdigest()
     # add hash to avoid conflict with old users' lock files
-    lock_file_name = hash_name + model_name + ".lock"
+    lock_file_name = hash_name + model_name + suffix + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
@@ -309,8 +311,22 @@ def find_local_hf_snapshot_dir(
         except Exception as e:
             logger.warning("Failed to find local snapshot in default HF cache: %s", e)
 
-    # Check for incomplete files and clean up if found
-    if found_local_snapshot_dir:
+    # if local snapshot exists, validate it contains at least one weight file
+    # matching allow_patterns before skipping download.
+    if found_local_snapshot_dir is None:
+        return None
+
+    # Use file lock to prevent multiple processes (TP ranks) from
+    # validating and cleaning up the same model cache simultaneously.
+    # This prevents race conditions where multiple ranks detect corruption
+    # and try to delete the same files at the same time.
+    with get_lock(model_name_or_path, cache_dir, suffix="-validation"):
+        # Re-check if snapshot dir still exists after acquiring lock
+        # (another process may have already cleaned it up)
+        if not os.path.isdir(found_local_snapshot_dir):
+            return None
+
+        # Check for incomplete files and clean up if found
         repo_folder = os.path.abspath(
             os.path.join(found_local_snapshot_dir, "..", "..")
         )
@@ -334,91 +350,90 @@ def find_local_hf_snapshot_dir(
             )
             return None
 
-    # if local snapshot exists, validate it contains at least one weight file
-    # matching allow_patterns before skipping download.
-    if found_local_snapshot_dir is None:
-        return None
-
-    local_weight_files: List[str] = []
-    try:
-        for pattern in allow_patterns:
-            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
-            for f in matched_files:
-                # os.path.exists returns False for broken symlinks.
-                if not os.path.exists(f):
-                    continue
-                local_weight_files.append(f)
-    except Exception as e:
-        logger.warning(
-            "Failed to scan local snapshot %s with patterns %s: %s",
-            found_local_snapshot_dir,
-            allow_patterns,
-            e,
-        )
-        local_weight_files = []
-
-    # Validate sharded models and check for corruption
-    if local_weight_files:
-        is_valid, error_msg, corrupted_files = _validate_sharded_model(
-            found_local_snapshot_dir, local_weight_files
-        )
-        if not is_valid:
-            if corrupted_files:
-                # Selective cleanup: only remove corrupted files
-                log_info_on_rank0(
-                    logger,
-                    f"Found {len(corrupted_files)} corrupted file(s) for "
-                    f"{model_name_or_path}: {error_msg}. "
-                    "Will selectively clean and re-download only these files.",
+        local_weight_files: List[str] = []
+        try:
+            for pattern in allow_patterns:
+                matched_files = glob.glob(
+                    os.path.join(found_local_snapshot_dir, pattern)
                 )
-                _cleanup_corrupted_files_selective(model_name_or_path, corrupted_files)
-                return None
-            else:
-                # Cannot selectively clean (e.g., missing shards) - remove entire cache
-                log_info_on_rank0(
-                    logger,
-                    f"Validation failed for {model_name_or_path}: {error_msg}. "
-                    "Will remove entire cache and re-download.",
-                )
-                _cleanup_corrupted_model_cache(
-                    model_name_or_path, found_local_snapshot_dir, error_msg
-                )
-                return None
+                for f in matched_files:
+                    # os.path.exists returns False for broken symlinks.
+                    if not os.path.exists(f):
+                        continue
+                    local_weight_files.append(f)
+        except Exception as e:
+            logger.warning(
+                "Failed to scan local snapshot %s with patterns %s: %s",
+                found_local_snapshot_dir,
+                allow_patterns,
+                e,
+            )
+            local_weight_files = []
 
-        # Also validate single (non-sharded) safetensors files
-        for f in local_weight_files:
-            base_name = os.path.basename(f)
-            # Check if this is a single model file (not sharded)
-            # Include adapter_model.safetensors for LoRA adapters
-            if base_name in [
-                "model.safetensors",
-                "pytorch_model.safetensors",
-                "adapter_model.safetensors",
-            ]:
-                if not _validate_safetensors_file(f):
+        # Validate sharded models and check for corruption
+        if local_weight_files:
+            is_valid, error_msg, corrupted_files = _validate_sharded_model(
+                found_local_snapshot_dir, local_weight_files
+            )
+            if not is_valid:
+                if corrupted_files:
+                    # Selective cleanup: only remove corrupted files
                     log_info_on_rank0(
                         logger,
-                        f"Corrupted model file {base_name} for {model_name_or_path}. "
-                        "Will selectively clean and re-download this file.",
+                        f"Found {len(corrupted_files)} corrupted file(s) for "
+                        f"{model_name_or_path}: {error_msg}. "
+                        "Will selectively clean and re-download only these files.",
                     )
-                    # Selective cleanup for single file
-                    _cleanup_corrupted_files_selective(model_name_or_path, [f])
+                    _cleanup_corrupted_files_selective(
+                        model_name_or_path, corrupted_files
+                    )
+                    return None
+                else:
+                    # Cannot selectively clean (e.g., missing shards) - remove entire cache
+                    log_info_on_rank0(
+                        logger,
+                        f"Validation failed for {model_name_or_path}: {error_msg}. "
+                        "Will remove entire cache and re-download.",
+                    )
+                    _cleanup_corrupted_model_cache(
+                        model_name_or_path, found_local_snapshot_dir, error_msg
+                    )
                     return None
 
-    if len(local_weight_files) > 0:
-        log_info_on_rank0(
-            logger,
-            f"Found local HF snapshot for {model_name_or_path} at "
-            f"{found_local_snapshot_dir}; skipping download.",
-        )
-        return found_local_snapshot_dir
-    else:
-        log_info_on_rank0(
-            logger,
-            f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
-            f"{allow_patterns}; will attempt download.",
-        )
-    return None
+            # Also validate single (non-sharded) safetensors files
+            for f in local_weight_files:
+                base_name = os.path.basename(f)
+                # Check if this is a single model file (not sharded)
+                # Include adapter_model.safetensors for LoRA adapters
+                if base_name in [
+                    "model.safetensors",
+                    "pytorch_model.safetensors",
+                    "adapter_model.safetensors",
+                ]:
+                    if not _validate_safetensors_file(f):
+                        log_info_on_rank0(
+                            logger,
+                            f"Corrupted model file {base_name} for {model_name_or_path}. "
+                            "Will selectively clean and re-download this file.",
+                        )
+                        # Selective cleanup for single file
+                        _cleanup_corrupted_files_selective(model_name_or_path, [f])
+                        return None
+
+        if len(local_weight_files) > 0:
+            log_info_on_rank0(
+                logger,
+                f"Found local HF snapshot for {model_name_or_path} at "
+                f"{found_local_snapshot_dir}; skipping download.",
+            )
+            return found_local_snapshot_dir
+        else:
+            log_info_on_rank0(
+                logger,
+                f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
+                f"{allow_patterns}; will attempt download.",
+            )
+            return None
 
 
 def download_weights_from_hf(

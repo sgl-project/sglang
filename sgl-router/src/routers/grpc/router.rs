@@ -142,8 +142,9 @@ impl GrpcRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        // Choose Harmony pipeline if model indicates Harmony
-        let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
+        // Choose Harmony pipeline if workers indicate Harmony (checks architectures, hf_model_type)
+        let is_harmony =
+            HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
 
         debug!(
             "Processing chat completion request for model: {:?}, using_harmony={}",
@@ -203,8 +204,9 @@ impl GrpcRouter {
             return error_response;
         }
 
-        // Choose implementation based on Harmony model detection
-        let is_harmony = HarmonyDetector::is_harmony_model(&body.model);
+        // Choose implementation based on Harmony model detection (checks worker metadata)
+        let is_harmony =
+            HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
 
         if is_harmony {
             debug!(

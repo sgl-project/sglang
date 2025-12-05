@@ -9,7 +9,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde_json::Value;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -148,113 +147,5 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Check if this is a PD router
     fn is_pd_mode(&self) -> bool {
         self.router_type() == "pd"
-    }
-
-    /// Create a new conversation
-    async fn create_conversation(&self, _headers: Option<&HeaderMap>, _body: &Value) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations not supported by this router",
-        )
-            .into_response()
-    }
-
-    /// Get a conversation by ID
-    async fn get_conversation(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations not supported by this router",
-        )
-            .into_response()
-    }
-
-    /// Update a conversation
-    async fn update_conversation(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _body: &Value,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations not supported by this router",
-        )
-            .into_response()
-    }
-
-    /// Delete a conversation
-    async fn delete_conversation(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations not supported by this router",
-        )
-            .into_response()
-    }
-
-    /// List items in a conversation
-    async fn list_conversation_items(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _limit: Option<usize>,
-        _order: Option<&str>,
-        _after: Option<&str>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations not supported by this router",
-        )
-            .into_response()
-    }
-
-    /// Create items in a conversation
-    async fn create_conversation_items(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _body: &Value,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations not supported by this router",
-        )
-            .into_response()
-    }
-
-    /// Get a specific item from a conversation
-    async fn get_conversation_item(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _item_id: &str,
-        _include: Option<Vec<String>>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations not supported by this router",
-        )
-            .into_response()
-    }
-
-    /// Delete an item from a conversation
-    async fn delete_conversation_item(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _item_id: &str,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations not supported by this router",
-        )
-            .into_response()
     }
 }
