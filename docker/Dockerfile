@@ -20,7 +20,6 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.5.3
-ARG NVSHMEM_VERSION=3.4.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -304,12 +303,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-nvshmem-cu12==3.3.20 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cutlass-dsl==4.3.0 --force-reinstall --no-deps ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
     python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-nvshmem-cu13==${NVSHMEM_VERSION} --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 ; \
     python3 -m pip install nvidia-cutlass-dsl==4.3.1 --force-reinstall --no-deps ; \
 fi
