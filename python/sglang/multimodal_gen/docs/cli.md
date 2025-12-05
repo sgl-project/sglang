@@ -176,6 +176,7 @@ SAMPLING_ARGS=(
   --output-file-name "A curious raccoon.mp4"
 )
 
+# Users can set `SGLANG_CACHE_DIT_ENABLED` env as `true` to enable cache acceleration.
 SGLANG_CACHE_DIT_ENABLED=true sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 ```
 

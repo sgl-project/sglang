@@ -41,10 +41,10 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
-    SGLANG_CACHE_DIT_WARMUP: int = 8
-    SGLANG_CACHE_DIT_RDT: float = 0.35
+    SGLANG_CACHE_DIT_WARMUP: int = 4
+    SGLANG_CACHE_DIT_RDT: float = 0.24
     SGLANG_CACHE_DIT_MC: int = 3
-    SGLANG_CACHE_DIT_TAYLORSEER: bool = True
+    SGLANG_CACHE_DIT_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_TS_ORDER: int = 1
     SGLANG_CACHE_DIT_SCM_PRESET: str = "none"
     SGLANG_CACHE_DIT_SCM_COMPUTE_BINS: str | None = None
@@ -53,10 +53,10 @@ if TYPE_CHECKING:
     # cache-dit env vars (secondary transformer, e.g., Wan2.2 low-noise expert)
     SGLANG_CACHE_DIT_SECONDARY_FN: int = 1
     SGLANG_CACHE_DIT_SECONDARY_BN: int = 0
-    SGLANG_CACHE_DIT_SECONDARY_WARMUP: int = 8
-    SGLANG_CACHE_DIT_SECONDARY_RDT: float = 0.35
+    SGLANG_CACHE_DIT_SECONDARY_WARMUP: int = 4
+    SGLANG_CACHE_DIT_SECONDARY_RDT: float = 0.24
     SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
-    SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = True
+    SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
 
 
@@ -316,14 +316,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Number of last blocks to always compute (DBCache B parameter)
     "SGLANG_CACHE_DIT_BN": lambda: int(os.getenv("SGLANG_CACHE_DIT_BN", "0")),
     # Warmup steps before caching (DBCache W parameter)
-    "SGLANG_CACHE_DIT_WARMUP": lambda: int(os.getenv("SGLANG_CACHE_DIT_WARMUP", "8")),
+    "SGLANG_CACHE_DIT_WARMUP": lambda: int(os.getenv("SGLANG_CACHE_DIT_WARMUP", "4")),
     # Residual difference threshold (DBCache R parameter)
-    "SGLANG_CACHE_DIT_RDT": lambda: float(os.getenv("SGLANG_CACHE_DIT_RDT", "0.35")),
+    "SGLANG_CACHE_DIT_RDT": lambda: float(os.getenv("SGLANG_CACHE_DIT_RDT", "0.24")),
     # Maximum continuous cached steps (DBCache MC parameter)
     "SGLANG_CACHE_DIT_MC": lambda: int(os.getenv("SGLANG_CACHE_DIT_MC", "3")),
     # Enable TaylorSeer calibrator
     "SGLANG_CACHE_DIT_TAYLORSEER": lambda: get_bool_env_var(
-        "SGLANG_CACHE_DIT_TAYLORSEER", default="true"
+        "SGLANG_CACHE_DIT_TAYLORSEER", default="false"
     ),
     # TaylorSeer order (1 or 2)
     "SGLANG_CACHE_DIT_TS_ORDER": lambda: int(
@@ -351,33 +351,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If not set, they inherit from the primary transformer settings
     # Number of first blocks to always compute for secondary transformer
     "SGLANG_CACHE_DIT_SECONDARY_FN": lambda: int(
-        os.getenv("SGLANG_CACHE_DIT_SECONDARY_FN", os.getenv("SGLANG_CACHE_DIT_FN", "1"))
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_FN", os.getenv("SGLANG_CACHE_DIT_FN", "1")
+        )
     ),
     # Number of last blocks to always compute for secondary transformer
     "SGLANG_CACHE_DIT_SECONDARY_BN": lambda: int(
-        os.getenv("SGLANG_CACHE_DIT_SECONDARY_BN", os.getenv("SGLANG_CACHE_DIT_BN", "0"))
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_BN", os.getenv("SGLANG_CACHE_DIT_BN", "0")
+        )
     ),
     # Warmup steps before caching for secondary transformer
     "SGLANG_CACHE_DIT_SECONDARY_WARMUP": lambda: int(
         os.getenv(
             "SGLANG_CACHE_DIT_SECONDARY_WARMUP",
-            os.getenv("SGLANG_CACHE_DIT_WARMUP", "8"),
+            os.getenv("SGLANG_CACHE_DIT_WARMUP", "4"),
         )
     ),
     # Residual difference threshold for secondary transformer
     "SGLANG_CACHE_DIT_SECONDARY_RDT": lambda: float(
         os.getenv(
-            "SGLANG_CACHE_DIT_SECONDARY_RDT", os.getenv("SGLANG_CACHE_DIT_RDT", "0.35")
+            "SGLANG_CACHE_DIT_SECONDARY_RDT", os.getenv("SGLANG_CACHE_DIT_RDT", "0.24")
         )
     ),
     # Maximum continuous cached steps for secondary transformer
     "SGLANG_CACHE_DIT_SECONDARY_MC": lambda: int(
-        os.getenv("SGLANG_CACHE_DIT_SECONDARY_MC", os.getenv("SGLANG_CACHE_DIT_MC", "3"))
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_MC", os.getenv("SGLANG_CACHE_DIT_MC", "3")
+        )
     ),
     # Enable TaylorSeer for secondary transformer
     "SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER": lambda: get_bool_env_var(
         "SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER",
-        default=os.getenv("SGLANG_CACHE_DIT_TAYLORSEER", "true"),
+        default=os.getenv("SGLANG_CACHE_DIT_TAYLORSEER", "false"),
     ),
     # TaylorSeer order for secondary transformer
     "SGLANG_CACHE_DIT_SECONDARY_TS_ORDER": lambda: int(
