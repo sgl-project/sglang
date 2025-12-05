@@ -80,12 +80,27 @@ TRITON_MOE_MODELS = {
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistralai/Mistral-7B-Instruct-v0.3",
 }
+# AMD-specific models that need special launch config (matching sanity_check.py)
+AMD_SPECIAL_CONFIG_MODELS = {
+    "Qwen/Qwen3-30B-A3B-Thinking-2507",
+}
 
 
 def popen_launch_server_wrapper(base_url, model, is_tp2):
     other_args = ["--log-level-http", "warning", "--trust-remote-code"]
     if is_tp2:
         other_args.extend(["--tp", "2"])
+
+    # Use same config as sanity_check.py for AMD-specific models (scaled for tp=2)
+    # Original tp=8: chunked-prefill-size=130172, max-running-requests=128
+    # Scaled tp=2:   chunked-prefill-size=32543,  max-running-requests=32
+    if model in AMD_SPECIAL_CONFIG_MODELS:
+        other_args.extend([
+            "--chunked-prefill-size", "32543",
+            "--max-running-requests", "32",
+            "--mem-fraction-static", "0.85",
+            "--attention-backend", "aiter",
+        ])
 
     process = popen_launch_server(
         model,
@@ -156,7 +171,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         "1" if model in DISABLE_HF_XET_MODELS else "0"
                     )
                     os.environ["SGLANG_USE_AITER"] = (
-                        "0" if model in TRITON_MOE_MODELS else "1"
+                        "0" if model in TRITON_MOE_MODELS or model in AMD_SPECIAL_CONFIG_MODELS else "1"
                     )
 
                     process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
