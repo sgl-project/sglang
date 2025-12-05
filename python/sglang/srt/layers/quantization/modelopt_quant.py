@@ -782,7 +782,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                         else 1.0
                     ),
                     use_routing_scales_on_input=use_routing_scales_on_input,
-                    tile_tokens_dim=None,
                     routing_method_type=routing_method_type,
                 )
 
