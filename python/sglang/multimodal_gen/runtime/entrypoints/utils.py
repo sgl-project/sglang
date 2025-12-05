@@ -9,11 +9,6 @@ diffusion models.
 """
 
 import dataclasses
-import logging
-
-# Suppress verbose logging from imageio, which is triggered when saving images.
-logging.getLogger("imageio").setLevel(logging.WARNING)
-logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
