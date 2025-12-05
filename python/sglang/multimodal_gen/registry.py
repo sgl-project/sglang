@@ -425,9 +425,9 @@ def _register_configs():
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
     )
     register_configs(
-        model_name="stable-diffusion-3-medium",
         sampling_param_cls=StableDiffusion3SamplingParams,
         pipeline_config_cls=StableDiffusion3PipelineConfig,
+        hf_model_paths=["stabilityai/stable-diffusion-3-medium-diffusers"],
     )
 
 
