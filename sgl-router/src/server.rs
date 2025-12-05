@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, patch},
     serve, Json, Router,
 };
 use serde::Deserialize;
@@ -117,6 +117,32 @@ async fn health(_state: State<Arc<AppState>>) -> Response {
 
 async fn health_generate(State(state): State<Arc<AppState>>, req: Request) -> Response {
     state.router.health_generate(req).await
+}
+
+#[derive(Deserialize)]
+struct SetHealthRequest {
+    healthy: bool,
+}
+
+async fn set_worker_health(
+    State(state): State<Arc<AppState>>,
+    Path(url): Path<String>,
+    Json(health_request): Json<SetHealthRequest>,
+) -> Response {
+    if let Some(worker) = state.context.worker_registry.get_by_url(&url) {
+        info!("set worker {:?} health  from {:?} to {:?}, worker type: {:?}",
+            worker.url(),
+            worker.is_healthy(),
+            health_request.healthy,
+            worker.worker_type()
+        );
+        worker.set_healthy(health_request.healthy);
+        (StatusCode::OK, Json(json!({"ok": "Worker's status is updated"}))).into_response()
+    } else {
+        info!("worker {:?} is not found", url);
+        (StatusCode::NOT_FOUND, Json(json!({"error": "Worker not found"}))).into_response()
+    }
+
 }
 
 async fn engine_metrics(State(state): State<Arc<AppState>>) -> Response {
@@ -679,6 +705,7 @@ pub fn build_app(
         .route("/workers", get(list_workers_rest))
         .route("/workers/{url}", get(get_worker))
         .route("/workers/{url}", delete(delete_worker))
+        .route("/workers/{url}/health", patch(set_worker_health))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
