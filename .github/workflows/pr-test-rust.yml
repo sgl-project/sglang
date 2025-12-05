@@ -115,6 +115,13 @@ jobs:
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
 
+      - name: Generate vision golden fixtures
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers pillow numpy scipy
+          cd sgl-router/
+          python scripts/generate_vision_golden.py
+
       - name: Run Rust tests
         timeout-minutes: 20
         run: |
