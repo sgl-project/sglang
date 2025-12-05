@@ -725,6 +725,8 @@ class MooncakeKVManager(CommonKVManager):
 
         for i, req in enumerate(reqs):
             if req.is_chunked <= 0:
+                if len(req.output_ids) > 0:
+                    continue
                 if batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
@@ -874,10 +876,13 @@ class MooncakeKVManager(CommonKVManager):
                                 if len(polls) == req.required_dst_info_num:
                                     status = KVPoll.Success if all(polls) else KVPoll.Failed
                                     self.update_status(req.room, status)
+
                                     for endpoint, dst_port, room in dst_ranks_infos:
                                         self.sync_status_to_decode_endpoint(
                                             endpoint, dst_port, room, status, local_rank
                                         )
+                                    if self.attn_tp_rank == 0:
+                                            logger.info(f"sent_success to {req.room=}")
                         else:
                             # Dummy request means the decode instance is not used, so its status can be marked as success directly
                             # Dummy request does not need to sync status to decode endpoint
@@ -1058,6 +1063,8 @@ class MooncakeKVManager(CommonKVManager):
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
         self.forward_results[bootstrap_room] = result
+        if self.attn_tp_rank == 0:
+            logger.info(f"send req to transfer queue: {bootstrap_room=}")
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(

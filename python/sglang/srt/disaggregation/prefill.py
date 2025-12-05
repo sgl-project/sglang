@@ -398,9 +398,11 @@ class SchedulerDisaggregationPrefillMixin:
     def notify_prefill_done(self: Scheduler,batch: ScheduleBatch,result: GenerationBatchResult) -> None:
         for i, req in enumerate(batch.reqs):
             if hasattr(req.disagg_kv_sender, "result"):
-                # assert req.disagg_kv_sender.result is None
-                req.disagg_kv_sender.result = (batch.copy(), result)
-                self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
+                if req.disagg_kv_sender.result is None:
+                    req.disagg_kv_sender.result = (batch.copy(), result)
+                    self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
+                else:
+                    assert req.rid == self.chunked_req.rid
             else:
                 continue
                 
