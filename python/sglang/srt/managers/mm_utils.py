@@ -2,11 +2,11 @@
 Multi-modality utils
 """
 
-import blake3
 import pickle
 from abc import abstractmethod
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
+import blake3
 import numpy as np
 import torch
 from torch import nn
@@ -20,7 +20,12 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.multimodal_cache import MultiModalCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.utils import (
+    flatten_nested_list,
+    is_cuda_alike,
+    is_npu,
+    print_warning_once,
+)
 from sglang.utils import logger
 
 _is_npu = is_npu()
@@ -295,6 +300,7 @@ def get_embedding_hash(embedding_items: List[MultimodalDataItem]) -> int:
     hash_list = [item.hash for item in embedding_items]
     return hash(tuple(hash_list))
 
+
 def get_embedding_hash_list(embedding_items: List[MultimodalDataItem]) -> int:
     hash_list = [item.hash for item in embedding_items]
     return hash_list
@@ -401,7 +407,6 @@ def _get_chunked_prefill_embedding(
                         "embedding size."
                     )
 
-
             embedding_per_req_chunk, start_idx, end_idx = get_embedding_chunk(
                 embedding=embedding_per_req,
                 extend_prefix_len=prefix_length[i],
@@ -421,18 +426,26 @@ def _get_chunked_prefill_embedding(
             embedding_list.append(embedding_per_req)
             if embedding_per_req is None:
                 embedding_items_uncached.append(embedding_items[i])
-                embedding_items_feature_num.append(embedding_items[i].image_grid_thw.shape[0])
+                embedding_items_feature_num.append(
+                    embedding_items[i].image_grid_thw.shape[0]
+                )
                 embedding_items_hash_list_uncached.append(embedding_items_hash_list[i])
-                
+
         if None in embedding_list:
             embeddings = data_embedding_func(embedding_items_uncached)
             embeddings_merged = []
             embeddings_idx = 0
             for feature_num in embedding_items_feature_num:
-                embeddings_merged.append(torch.cat(embeddings[embeddings_idx:embeddings_idx+feature_num], dim=0))
+                embeddings_merged.append(
+                    torch.cat(
+                        embeddings[embeddings_idx : embeddings_idx + feature_num], dim=0
+                    )
+                )
                 embeddings_idx += feature_num
 
-            for embedding_items_hash, embedding_per_req in zip(embedding_items_hash_list_uncached, embeddings_merged):
+            for embedding_items_hash, embedding_per_req in zip(
+                embedding_items_hash_list_uncached, embeddings_merged
+            ):
                 if not embedding_cache.put(embedding_items_hash, embedding_per_req):
                     print_warning_once(
                         "Multimodal embedding cache is full. This typically occurs when a single "
@@ -545,7 +558,9 @@ def get_embedding_and_mask(
         torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
-    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger, expected_token_count)
+    embedding = _adjust_embedding_length(
+        embedding, special_multimodal_mask, logger, expected_token_count
+    )
     return embedding, special_multimodal_mask
 
 
@@ -842,7 +857,7 @@ def tensor_hash(tensor_list) -> int:
                 x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
             ]
             tensor = torch.concat(tensor_list)
-    if tensor.is_cuda:
+    if is_cuda_alike():
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
 

@@ -631,9 +631,9 @@ def run_dp_sharded_mrope_vision_model(
     out_embeddings = tuple(
         embed for embed in original_order_embeddings if embed is not None
     )
-    assert len(out_embeddings) == len(original_order_embeddings), (
-        "Found unassigned embeddings"
-    )
+    assert len(out_embeddings) == len(
+        original_order_embeddings
+    ), "Found unassigned embeddings"
     return out_embeddings
 
 
