@@ -4,6 +4,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=2, suite="nightly-1-gpu", nightly=True)
+
 from sglang.srt.layers import dp_attention as _dp_attn
 
 # Patch DP-attention globals before importing backends
@@ -104,7 +108,7 @@ class MockModelRunner:
         self.config = {**DEFAULT_CONFIG, **(config or {})}
         self.dtype = self.config["dtype"]
         self.kv_cache_dtype = self.config["kv_cache_dtype"]
-        self.is_hybrid = False
+        self.is_hybrid_swa = False
 
         # Model configuration
         attention_arch = AttentionArch.MLA
@@ -244,12 +248,15 @@ class TestNSAIndexer(CustomTestCase):
         # Move indexer to CUDA device
         indexer = indexer.to(device=self.device)
 
-        # Convert linear layer weights to bfloat16 (but preserve LayerNorm's float32)
+        # Convert linear layer weights to bfloat16 (but preserve LayerNorm's float32
+        # and weights_proj's float32 - it uses params_dtype=torch.float32 in production)
         # Need to recursively convert LinearBase submodules (like ReplicatedLinear)
         for name, module in indexer.named_modules():
             # Check for LinearBase (parent of ReplicatedLinear) but exclude LayerNorm
+            # Also exclude weights_proj which uses float32 params in production
             if isinstance(module, LinearBase) and not isinstance(module, LayerNorm):
-                module.to(dtype=self.dtype)
+                if "weights_proj" not in name:
+                    module.to(dtype=self.dtype)
 
         return indexer
 
