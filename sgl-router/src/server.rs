@@ -26,6 +26,7 @@ use crate::{
         worker_to_info,
         workflow::{
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
+            create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
             create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
             WorkflowEngine,
         },
@@ -47,6 +48,7 @@ use crate::{
     },
     routers::{conversations, router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
 };
 
 #[derive(Clone)]
@@ -645,6 +647,10 @@ pub fn build_app(
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::wasm_middleware,
         ));
 
     let public_routes = Router::new()
@@ -660,6 +666,9 @@ pub fn build_app(
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/wasm", post(add_wasm_module))
+        .route("/wasm/{module_uuid}", delete(remove_wasm_module))
+        .route("/wasm", get(list_wasm_modules))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
@@ -753,6 +762,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     engine.register_workflow(create_external_worker_registration_workflow());
     engine.register_workflow(create_worker_removal_workflow());
     engine.register_workflow(create_mcp_registration_workflow());
+    engine.register_workflow(create_wasm_module_registration_workflow());
+    engine.register_workflow(create_wasm_module_removal_workflow());
     app_context
         .workflow_engine
         .set(engine)

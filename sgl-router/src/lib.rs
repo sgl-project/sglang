@@ -18,3 +18,4 @@ pub mod service_discovery;
 pub mod tokenizer;
 pub mod tool_parser;
 pub mod version;
+pub mod wasm;
