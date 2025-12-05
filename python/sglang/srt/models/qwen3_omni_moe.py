@@ -31,7 +31,6 @@ from sglang.srt.configs.qwen3_omni import (
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
