@@ -3307,13 +3307,13 @@ class ServerArgs:
             "--dllm-algorithm",
             type=str,
             default=ServerArgs.dllm_algorithm,
-            help="The diffusion LLM algorithm.",
+            help="The diffusion LLM algorithm, such as LowConfidence.",
         )
         parser.add_argument(
             "--dllm-algorithm-config",
             type=str,
             default=ServerArgs.dllm_algorithm_config,
-            help="The config of diffusion LLM algorithm, including block size, threshold, etc.",
+            help="The diffusion LLM algorithm configurations. Must be a YAML file.",
         )
 
         # Double Sparsity
