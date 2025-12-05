@@ -856,11 +856,8 @@ class MooncakeKVManager(CommonKVManager):
                 waiting_req_bytes = self.server_socket.recv_multipart()
                 room = waiting_req_bytes[0].decode("ascii")
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
-                print("ON PREFILL THREAD!")
                 if room == "None":
-                    print("HERE!")
                     register_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    # Validate page_size matches between prefill and decode servers
                     if register_info.page_size != self.kv_args.page_size:
                         raise ValueError(
                             f"Page size mismatch: decode server has page_size={register_info.page_size}, "
@@ -1216,7 +1213,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             dst_page_size = str(self.kv_mgr.kv_args.page_size).encode("ascii")
-            print("ON REGISTER KV ARGS!")
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             with lock:
                 sock.send_multipart(
@@ -1234,7 +1230,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_page_size,
                     ]
                 )
-            print("ON REGISTER KV ARGS DONE!")
 
     def init(
         self,
