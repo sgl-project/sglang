@@ -2,12 +2,7 @@
 
 ## Introduction
 
-MindSpore is a high-performance AI framework optimized for Ascend NPUs. This doc guides users to run MindSpore models in SGLang.
-
-## Requirements
-
-MindSpore currently only supports Ascend NPU devices. Users need to first install Ascend CANN software packages.
-The CANN software packages can be downloaded from the [Ascend Official Website](https://www.hiascend.com). The recommended version is 8.3.RC1.
+MindSpore is a high-performance AI framework optimized for Ascend NPUs. This documentation guides users to run MindSpore models in SGLang.
 
 ## Supported Models
 
@@ -19,31 +14,17 @@ Currently, the following models are supported:
 
 ## Installation
 
-> **Note**: Currently, MindSpore models are provided by an independent package `sgl-mindspore`, which needs to be installed separately.
+> **Note**: Currently, MindSpore models are provided by an independent package `sgl-mindspore`. It is built upon current SGLang support for Ascend NPU Platform. Please first [install SGLang for Ascend NPU](./ascend_npu.md) and then install `sgl-mindspore`.
 
 ```shell
-git clone https://github.com/chz34/sgl-mindspore.git
+git clone https://github.com/mindspore-lab/sgl-mindspore.git
 cd sgl-mindspore
 pip install -e .
 ```
 
-You will need to install the following packages.
-
-```shell
-pip install "mindspore==2.7.1"
-pip install "torch==2.8"
-pip install "torch_npu==2.8"
-pip install triton_ascend
-```
-
-```shell
-cp python/pyproject_other.toml python/pyproject.toml
-pip install -e "python[all_npu]"
-```
-
 ## Run Model
 
-Current SGLang-MindSpore supports Qwen3 and DeepSeek V3/R1 models. This doc uses Qwen3-8B as an example.
+Current SGLang-MindSpore supports Qwen3 (both dense and MoE) and DeepSeek V3/R1 models.
 
 ### Offline infer
 
@@ -54,12 +35,12 @@ import sglang as sgl
 
 # Initialize the engine with MindSpore backend
 llm = sgl.Engine(
-    model_path="/path/to/your/model",  # Local model path
-    device="npu",                      # Use NPU device
-    model_impl="mindspore",            # MindSpore implementation
-    attention_backend="ascend",        # Attention backend
-    tp_size=1,                         # Tensor parallelism size
-    dp_size=1                          # Data parallelism size
+    model_path="/path/to/your/model",
+    device="npu",
+    model_impl="mindspore",
+    attention_backend="ascend",
+    tp_size=1,
+    dp_size=1
 )
 
 # Generate text
@@ -69,7 +50,7 @@ prompts = [
     "The future of AI is"
 ]
 
-sampling_params = {"temperature": 0.01, "top_p": 0.9}
+sampling_params = {"temperature": 0, "top_p": 0.9}
 outputs = llm.generate(prompts, sampling_params)
 
 for prompt, output in zip(prompts, outputs):
