@@ -1,4 +1,3 @@
-import json
 from typing import Any
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -42,11 +41,14 @@ class DllmConfig:
         algorithm_config = {}
         if server_args.dllm_algorithm_config is not None:
             try:
-                algorithm_config = json.loads(server_args.dllm_algorithm_config)
-            except json.JSONDecodeError as e:
-                raise RuntimeError(
-                    f"Invalid algorithm config: {server_args.dllm_algorithm_config}. Load config failed: {e}"
+                import yaml
+            except ImportError:
+                raise ImportError(
+                    "Please install PyYAML to use YAML config files. "
+                    "`pip install pyyaml`"
                 )
+            with open(server_args.dllm_algorithm_config, "r") as f:
+                algorithm_config = yaml.safe_load(f)
 
             # Parse common algorithm configurations
             block_size = algorithm_config.get("block_size", block_size)
