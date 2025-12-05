@@ -132,7 +132,7 @@ def handle_rerun_stage(
     if not stage_name:
         print("Error: No stage name provided")
         comment.create_reaction("confused")
-        comment.create_comment(
+        pr.create_issue_comment(
             f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
             f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
         )
@@ -165,7 +165,7 @@ def handle_rerun_stage(
 
     if stage_name not in valid_stages:
         comment.create_reaction("confused")
-        comment.create_comment(
+        pr.create_issue_comment(
             f"❌ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
             f"Currently supported stages:\n"
             + "\n".join(f"- `{s}`" for s in valid_stages)
@@ -199,7 +199,7 @@ def handle_rerun_stage(
             print(f"Successfully triggered workflow for stage '{stage_name}'")
             if react_on_success:
                 comment.create_reaction("+1")
-                comment.create_comment(
+                pr.create_issue_comment(
                     f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
@@ -211,7 +211,7 @@ def handle_rerun_stage(
     except Exception as e:
         print(f"Error triggering workflow_dispatch: {e}")
         comment.create_reaction("confused")
-        comment.create_comment(
+        pr.create_issue_comment(
             f"❌ Failed to trigger workflow: {str(e)}\n\n"
             f"Please check the logs or contact maintainers."
         )
