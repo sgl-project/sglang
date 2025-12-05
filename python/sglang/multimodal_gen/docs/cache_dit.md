@@ -128,7 +128,7 @@ All Cache-DiT parameters can be set via the following environment variables:
 
 ## Supported Models
 
-Cache-DiT supports DiT models:
+SGLang Diffusion x Cache-DiT supports almost all models originally supported in SGLang Diffusion:
 
 | Model Family | Example Models              |
 |--------------|-----------------------------|
@@ -136,7 +136,7 @@ Cache-DiT supports DiT models:
 | Flux         | FLUX.1-dev, FLUX.2-dev      |
 | Z-Image      | Z-Image-Turbo               |
 | Qwen         | Qwen-Image, Qwen-Image-Edit |
-| Hunyuan      | HunyuanDiT, HunyuanVideo    |
+| Hunyuan      | HunyuanVideo                |
 
 ## Performance Tips
 
@@ -167,15 +167,6 @@ This is expected behavior. Cache-DiT currently only supports single-GPU inferenc
 
 For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache
 acceleration still works.
-
-### Model not supported
-
-```
-ValueError: <ModelClass> is not officially supported by cache-dit
-```
-
-The model is not registered in cache-dit's BlockAdapterRegister. Check
-the [cache-dit repository](https://github.com/vipshop/cache-dit) for supported models.
 
 ## References
 
