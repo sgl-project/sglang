@@ -20,10 +20,12 @@ import os
 import tempfile
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
+import numpy as np
 import torch
 from huggingface_hub import snapshot_download
+from numba import njit
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -390,6 +392,313 @@ def get_context_length(config):
 
 # A fast LLaMA tokenizer with the pre-processed `tokenizer.json` file.
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
+# Parallel tokenizer related constants
+_SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN = int(
+    os.environ.get("SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN", 256)
+)
+_SGLANG_MAX_PARALLEL_TOKENIZER_CHUNK_SIZE = int(
+    os.environ.get("SGLANG_MAX_PARALLEL_TOKENIZER_CHUNK_SIZE", 4096)
+)
+
+
+@njit(cache=True)
+def compute_hash_array_fixed(arr, actual_len, length, base, mod):
+    h = 0
+    power = 1
+    output_len = actual_len - length + 1
+    hash_vals = np.full(output_len, -1, dtype=np.int64)
+
+    for i in range(length):
+        h = (h * base + arr[i]) % mod
+        if i < length - 1:
+            power = (power * base) % mod
+    hash_vals[0] = h
+
+    for i in range(length, actual_len):
+        h = ((h - arr[i - length] * power) * base + arr[i]) % mod
+        if h < 0:
+            h += mod
+        hash_vals[i - length + 1] = h
+
+    return hash_vals
+
+
+@njit(cache=True)
+def check_lcs_fixed(arr1, len1, arr2, len2, length, base, mod):
+    if length == 0:
+        return -1, -1
+
+    hashes1 = compute_hash_array_fixed(arr1, len1, length, base, mod)
+    hashes2 = compute_hash_array_fixed(arr2, len2, length, base, mod)
+
+    for j in range(len2 - length + 1):
+        h2 = hashes2[j]
+        for i in range(len1 - length + 1):
+            if h2 == hashes1[i]:
+                match = True
+                for k in range(length):
+                    if arr1[i + k] != arr2[j + k]:
+                        match = False
+                        break
+                if match:
+                    return i, j
+    return -1, -1
+
+
+def lcs_solver(arr1, arr2):
+    base = 911
+    mod = 10**9 + 7
+
+    arr1_buf = np.zeros(_SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN, dtype=np.int64)
+    arr2_buf = np.zeros(_SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN, dtype=np.int64)
+    len1, len2 = len(arr1), len(arr2)
+    arr1_buf[:len1] = arr1
+    arr2_buf[:len2] = arr2
+
+    left, right = 0, min(len1, len2)
+    best_i, best_j, best_len = -1, -1, 0
+
+    while left <= right:
+        mid = (left + right) // 2
+        i, j = check_lcs_fixed(arr1_buf, len1, arr2_buf, len2, mid, base, mod)
+        if i != -1:
+            best_i, best_j, best_len = i, j, mid
+            left = mid + 1
+        else:
+            right = mid - 1
+
+    return [best_i, best_j], best_len
+
+
+class ParallelTokenizer:
+    """Parallel tokenizer wrapper over a HF PreTrainedTokenizer.
+
+    - Splits long texts into chunks, tokenizes in parallel, then merges.
+    - Return values only include input_ids (and token_type_ids when available).
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        chunk_size: Optional[int] = None,
+        overlap_length: Optional[int] = None,
+    ):
+        """Initialize the ParallelTokenizer."""
+        self.tokenizer_ = tokenizer
+        self.chunk_size = chunk_size or _SGLANG_MAX_PARALLEL_TOKENIZER_CHUNK_SIZE
+        self.overlap_length = (
+            overlap_length or _SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN
+        )
+        # warmup for numba
+        self.encode("Hello, world!" * self.chunk_size)
+
+    def __getattr__(self, name):
+        """Delegate attribute access to the wrapped tokenizer if not found in this class."""
+        return getattr(self.tokenizer_, name)
+
+    def _split_text_into_chunks(self, text: str) -> Tuple[List[str], List[str]]:
+        """Split text into overlapping chunks and return (chunks, overlap_texts).
+
+        - Text overlap is taken as the last self.overlap_length characters of each chunk.
+        - The token-level overlap bound is computed later by encoding these overlap_texts
+          with add_special_tokens=False.
+        """
+        if len(text) <= self.chunk_size:
+            return [text], []
+
+        split_text: List[str] = []
+        for i in range(0, len(text), self.chunk_size):
+            chunk = text[i : i + self.chunk_size + self.overlap_length]
+            split_text.append(chunk)
+        if len(split_text) > 1 and len(split_text[-1]) <= self.overlap_length:
+            split_text = split_text[:-1]
+
+        overlap_texts: List[str] = []
+        for i in range(len(split_text) - 1):
+            prev_chunk = split_text[i]
+            overlap_texts.append(
+                prev_chunk[-self.overlap_length :] if self.overlap_length > 0 else ""
+            )
+
+        return split_text, overlap_texts
+
+    def apply_chat_template(self, *args, **kwargs):
+        do_tokenize = kwargs.get("tokenize", True)
+        if do_tokenize:
+            kwargs["tokenize"] = False
+        chat_text = self.tokenizer_.apply_chat_template(*args, **kwargs)
+        if do_tokenize:
+            return self.encode(chat_text)
+        else:
+            return chat_text
+
+    def __call__(self, *args, **kwargs):
+        return self._tokenize_parallel(*args, **kwargs)
+
+    def encode(self, text: Union[str, List[str]], **kwargs):
+        """Encode text with parallel processing for long texts."""
+        results = self._tokenize_parallel(text, **kwargs)
+        return results["input_ids"]
+
+    def _tokenize_parallel(self, text: Union[str, List[str]], **kwargs):
+        """Tokenize and return a dict compatible with HF tokenizer output."""
+        # Batch inputs: split each text into chunks, batch encode chunks and overlaps, then merge per text
+        if isinstance(text, list):
+            num_texts = len(text)
+            if num_texts > 8:
+                # fallback to hf tokenization for large batch
+                return self.tokenizer_(text, **kwargs)
+
+            flat_chunks: List[str] = []
+            chunk_spans: List[tuple[int, int]] = []  # (text_idx, chunk_idx)
+            flat_overlap_texts: List[str] = []
+            overlap_spans: List[tuple[int, int]] = []  # (text_idx, pair_idx)
+            for ti, t in enumerate(text):
+                chunks, overlaps = self._split_text_into_chunks(t)
+                for ci, ch in enumerate(chunks):
+                    flat_chunks.append(ch)
+                    chunk_spans.append((ti, ci))
+                for pi, ov in enumerate(overlaps):
+                    flat_overlap_texts.append(ov)
+                    overlap_spans.append((ti, pi))
+
+            if not flat_chunks:
+                return {"input_ids": [[] for _ in range(num_texts)]}
+
+            encoded_chunks = self.tokenizer_(flat_chunks, **kwargs)
+            chunk_ids_list: List[List[int]] = encoded_chunks["input_ids"]
+            chunk_type_list = encoded_chunks.get("token_type_ids")
+
+            # Encode overlap texts to get per-pair token overlap lengths
+            per_text_ov_lens: List[List[int]] = [[] for _ in range(num_texts)]
+            if flat_overlap_texts:
+                ov_encoded = self.tokenizer_(
+                    flat_overlap_texts, add_special_tokens=False
+                )
+                ov_ids_list: List[List[int]] = ov_encoded["input_ids"]
+                for idx, (ti, pi) in enumerate(overlap_spans):
+                    per_text_ov_lens[ti].append(len(ov_ids_list[idx]))
+
+            # group per text
+            per_text_ids_lists: List[List[List[int]]] = [[] for _ in range(num_texts)]
+            per_text_type_lists: Optional[List[Optional[List[List[int]]]]] = (
+                [[] for _ in range(num_texts)] if chunk_type_list is not None else None
+            )
+            for enc_i, (ti, _ci) in enumerate(chunk_spans):
+                per_text_ids_lists[ti].append(chunk_ids_list[enc_i])
+                if per_text_type_lists is not None:
+                    per_text_type_lists[ti].append(chunk_type_list[enc_i])
+
+            final_input_ids: List[List[int]] = []
+            final_token_type_ids: Optional[List[List[int]]] = (
+                [] if per_text_type_lists is not None else None
+            )
+
+            for ti in range(num_texts):
+                ids_lists = per_text_ids_lists[ti]
+                type_lists = (
+                    per_text_type_lists[ti] if per_text_type_lists is not None else None
+                )
+                ov_lens = per_text_ov_lens[ti]
+
+                if len(ids_lists) == 1:
+                    merged_ids = ids_lists[0]
+                    merged_types = type_lists[0] if type_lists is not None else None
+                else:
+                    merged_ids, merged_types = self._merge_results(
+                        ids_lists, ov_lens, type_lists
+                    )
+                    if merged_ids is None:
+                        encoded = self.tokenizer_(text[ti], **kwargs)
+                        merged_ids = encoded["input_ids"]
+                        merged_types = encoded.get("token_type_ids")
+
+                # each chunk's special tokens should be handled by LCS
+                final_input_ids.append(merged_ids)
+                if final_token_type_ids is not None:
+                    if merged_types is not None:
+                        final_token_type_ids.append(merged_types)
+                    else:
+                        final_token_type_ids = None
+
+            result: Dict[str, Any] = {"input_ids": final_input_ids}
+            if final_token_type_ids is not None:
+                result["token_type_ids"] = final_token_type_ids
+            return result
+
+        # Split text into overlapping chunks and collect overlap texts
+        split_text, overlap_texts = self._split_text_into_chunks(text)
+
+        # Batch encode chunks
+        encoded = self.tokenizer_(split_text, **kwargs)
+        ids_lists = encoded["input_ids"]
+        type_lists = encoded.get("token_type_ids")
+
+        # Encode overlap texts for dynamic token overlap bounds
+        ov_lens: List[int] = []
+        if overlap_texts:
+            ov_encoded = self.tokenizer_(overlap_texts, add_special_tokens=False)
+            ov_ids_list: List[List[int]] = ov_encoded["input_ids"]
+            ov_lens = [len(x) for x in ov_ids_list]
+
+        merged_ids, merged_types = self._merge_results(ids_lists, ov_lens, type_lists)
+        if merged_ids is None:
+            logger.warning(
+                f"[ParallelTokenizer] Failed to merge results, fallback to hf tokenization"
+            )
+            return self.tokenizer_(text, **kwargs)
+
+        if merged_types is not None:
+            return {"input_ids": merged_ids, "token_type_ids": merged_types}
+        else:
+            return {"input_ids": merged_ids}
+
+    def _merge_results(
+        self, token_ids_lists, overlap_token_lens, token_type_ids_lists=None
+    ):
+        """Merge tokenized chunks using LCS algorithm to handle overlaps.
+        If token_type_ids_lists is provided, it will be merged with the same
+        boundaries derived from input_ids.
+        """
+        merged_ids = []
+        merged_types = [] if token_type_ids_lists is not None else None
+        if not token_ids_lists:
+            return merged_ids, merged_types
+        start_idx = 0
+
+        for idx, cur_ids in enumerate(token_ids_lists):
+            if idx < len(token_ids_lists) - 1:
+                nxt_ids = token_ids_lists[idx + 1]
+                cur_overlap_len = (
+                    overlap_token_lens[idx] if idx < len(overlap_token_lens) else 0
+                )
+                if cur_overlap_len > _SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN:
+                    logger.warning(
+                        f"[ParallelTokenizer] Overlap length {cur_overlap_len} is greater than the maximum allowed {_SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN}, fallback to hf tokenization"
+                    )
+                    return None, None
+                lcs_start_list, lcs_len = lcs_solver(
+                    cur_ids[-cur_overlap_len:],
+                    nxt_ids[:cur_overlap_len],
+                )
+                if lcs_len <= 0:
+                    # this should not happen
+                    logger.warning(
+                        f"[ParallelTokenizer] Failed to merge results, fallback to hf tokenization"
+                    )
+                    return None, None
+                end_idx = len(cur_ids) - cur_overlap_len + lcs_start_list[0] + lcs_len
+                merged_ids.extend(cur_ids[start_idx:end_idx])
+                if merged_types is not None:
+                    cur_types = token_type_ids_lists[idx]
+                    merged_types.extend(cur_types[start_idx:end_idx])
+                start_idx = lcs_start_list[1] + lcs_len
+            else:
+                merged_ids.extend(cur_ids[start_idx:])
+                if merged_types is not None:
+                    cur_types = token_type_ids_lists[idx]
+                    merged_types.extend(cur_types[start_idx:])
+        return merged_ids, merged_types
 
 
 # Filter warnings like: https://github.com/sgl-project/sglang/issues/8082
@@ -433,6 +742,9 @@ def get_tokenizer(
         client = create_remote_connector(tokenizer_name)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
+
+    # Do not pass custom flags to HF APIs
+    enable_parallel_tokenizer = kwargs.pop("enable_parallel_tokenizer", False)
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -479,6 +791,8 @@ def get_tokenizer(
         )
 
     attach_additional_stop_token_ids(tokenizer)
+    if enable_parallel_tokenizer:
+        tokenizer = ParallelTokenizer(tokenizer)
     return tokenizer
 
 

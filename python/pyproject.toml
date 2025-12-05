@@ -38,6 +38,7 @@ dependencies = [
   "msgspec",
   "ninja",
   "numpy",
+  "numba>=0.60",
   "nvidia-cutlass-dsl==4.2.1",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
