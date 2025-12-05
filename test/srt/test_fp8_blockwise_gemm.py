@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-MODEL_PATH = "Qwen/Qwen3-0.6B-FP8"
+MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 
 
 class TestFp8BlockwiseGemmBase(unittest.TestCase):
