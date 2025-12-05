@@ -29,7 +29,7 @@ suites = {
         TestFile("models/test_qwen_models.py", 90),
         TestFile("models/test_reward_models.py", 103),
         TestFile("models/test_transformers_models.py", 245),
-        TestFile("models/test_vlm_models.py", 232),
+        TestFile("models/test_vlm_models.py", 270),
         TestFile("openai_server/basic/test_openai_embedding.py", 70),
         TestFile("openai_server/basic/test_openai_server.py", 184),
         TestFile("openai_server/basic/test_protocol.py", 3),
