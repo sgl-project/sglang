@@ -231,8 +231,7 @@ logger = logging.getLogger(__name__)
 
 def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
     return (
-        get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN")
-        and quant_config is not None
+        quant_config is not None
         and quant_config.get_name() == "modelopt_fp4"
         and get_moe_a2a_backend().is_deepep()
     )
