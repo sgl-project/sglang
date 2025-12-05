@@ -24,12 +24,14 @@ import logging
 import multiprocessing as multiprocessing
 import os
 import pickle
+import signal
 import sys
 import threading
 from functools import partialmethod
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Union
 
+import psutil
 import setproctitle
 import zmq
 import zmq.asyncio
@@ -47,7 +49,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import get_zmq_socket, kill_process_tree
+from sglang.srt.utils import (
+    configure_logger,
+    get_zmq_socket,
+    kill_itself_when_parent_died,
+    kill_process_tree,
+)
 from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
@@ -75,14 +82,14 @@ class SocketMapping:
         socket = get_zmq_socket(self._zmq_context, zmq.PUSH, ipc_name, False)
         self._mapping[ipc_name] = socket
 
-    def send_output(self, ipc_name: str, output: Any):
+    def send_output(self, ipc_name: str, output: Any, is_tokenizer: bool = False):
         if ipc_name is None:
             # Some unhandled cases
             logger.warning(f"IPC name is None, output type={type(output)}, skipping...")
             return
 
         if ipc_name not in self._mapping:
-            self._register_ipc_mapping(ipc_name, is_tokenizer=False)
+            self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
         self._mapping[ipc_name].send_pyobj(output)
 
 
@@ -294,7 +301,9 @@ class MultiHttpWorkerDetokenizerMixin:
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
 
-    def multi_http_worker_event_loop(self: DetokenizerManager):
+    def multi_http_worker_event_loop(
+        self: DetokenizerManager, detokenizer_worker_num: int
+    ):
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
@@ -303,14 +312,21 @@ class MultiHttpWorkerDetokenizerMixin:
             if output is None:
                 continue
 
-            assert isinstance(
-                recv_obj, BaseBatchReq
-            ), "for multi-http-worker, recv_obj must be BaseBatchReq"
-
-            # Send data using the corresponding socket
-            for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                new_output = _handle_output_by_index(output, i)
-                self.socket_mapping.send_output(ipc_name, new_output)
+            # Fix: Handle multi-detokenizer worker case correctly
+            # When detokenizer_worker_num > 1, use socket_mapping to manage connections
+            # Send to corresponding tokenizer worker based on http_worker_ipc info
+            if isinstance(recv_obj, BaseBatchReq):
+                # Batch request: send corresponding output to each HTTP worker
+                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                    new_output = _handle_output_by_index(output, i)
+                    self.socket_mapping.send_output(
+                        ipc_name, new_output, is_tokenizer=True
+                    )
+            elif isinstance(recv_obj, BaseReq):
+                # Single request: send to corresponding tokenizer worker
+                self.socket_mapping.send_output(
+                    recv_obj.http_worker_ipc, output, is_tokenizer=True
+                )
 
 
 class MultiTokenizerRouter:
@@ -370,7 +386,7 @@ class MultiTokenizerRouter:
 
         for i, ipc_name in enumerate(ipc_names):
             new_recv_obj = _handle_output_by_index(recv_obj, i)
-            self.socket_mapping.send_output(ipc_name, new_recv_obj)
+            self.socket_mapping.send_output(ipc_name, new_recv_obj, is_tokenizer=False)
 
 
 class TokenizerWorker(TokenizerManager):
@@ -413,6 +429,83 @@ class TokenizerWorker(TokenizerManager):
             raise ValueError(f"Unknown req type: {type(req)}")
 
 
+class MultiDetokenizerRouter:
+    """A router to receive requests from Scheduler and route to DetokenizerManager"""
+
+    def __init__(self, ipc_name_list: List[str], port_args: PortArgs):
+        self.ipc_name_list = ipc_name_list
+        self.socket_mapping = SocketMapping()
+        self.worker_id_to_ipc_mapping = {}
+        context = zmq.Context()
+        self.recv_from_scheduler = get_zmq_socket(
+            context, zmq.PULL, port_args.detokenizer_ipc_name, True
+        )
+        self.ipc_name_index = 0
+        self.detokenizer_worker_num = len(ipc_name_list)
+
+    def event_loop(self):
+        while True:
+            recv_obj = self.recv_from_scheduler.recv_pyobj()
+
+            # Fix: Use consistent routing based on http_worker_ipc to avoid response mismatch
+            # This is especially important in PD disaggregation mode where multiple processes
+            # are involved in routing and state consistency is critical
+            # Use consistent routing based on http_worker_ipc
+            if isinstance(recv_obj, BaseReq):
+                # Single request: use http_worker_ipc for consistent routing
+                assert (
+                    recv_obj.http_worker_ipc is not None
+                ), f"Single req {recv_obj.rid=} has no http_worker_ipc!"
+                worker_index = (
+                    hash(recv_obj.http_worker_ipc) % self.detokenizer_worker_num
+                )
+                detokenizer_worker_ipc = self.ipc_name_list[worker_index]
+            elif isinstance(recv_obj, BaseBatchReq):
+                # Batch request: use first http_worker_ipc for consistent routing
+                assert (
+                    recv_obj.http_worker_ipcs is not None
+                    and recv_obj.http_worker_ipcs[0] is not None
+                ), f"Batch req {recv_obj.rids=} has no http_worker_ipcs!"
+                worker_index = (
+                    hash(recv_obj.http_worker_ipcs[0]) % self.detokenizer_worker_num
+                )
+                detokenizer_worker_ipc = self.ipc_name_list[worker_index]
+            else:
+                # Unknown request type: use round-robin
+                logger.warning(
+                    f"[WARNING] Unknown request type {type(recv_obj)}, using round-robin"
+                )
+                detokenizer_worker_ipc = self.ipc_name_list[self.ipc_name_index]
+                self.ipc_name_index = (
+                    self.ipc_name_index + 1
+                ) % self.detokenizer_worker_num
+
+            # Send to selected detokenizer worker
+            self.socket_mapping.send_output(
+                detokenizer_worker_ipc, recv_obj, is_tokenizer=False
+            )
+
+
+def run_multi_detokenizer_router_process(
+    ipc_name_list: List[str],
+    server_args: ServerArgs,
+    port_args: PortArgs,
+):
+    kill_itself_when_parent_died()
+    setproctitle.setproctitle("sglang::detokenizer/router")
+    configure_logger(server_args)
+    parent_process = psutil.Process().parent()
+
+    try:
+        router = MultiDetokenizerRouter(ipc_name_list, port_args)
+        router.event_loop()
+    except Exception:
+        router.socket_mapping.clear_all_sockets()
+        traceback = get_exception_traceback()
+        logger.error(f"DetokenizerRouter hit an exception: {traceback}")
+        parent_process.send_signal(signal.SIGQUIT)
+
+
 async def print_exception_wrapper(func):
     """
     Sometimes an asyncio function does not print exception.
@@ -429,6 +522,16 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
+
+
+def get_worker_ids_from_req_rids(rids):
+    if isinstance(rids, list):
+        worker_ids = [int(rid.split("_")[0]) for rid in rids]
+    elif isinstance(rids, str):
+        worker_ids = [int(rids.split("_")[0])]
+    else:
+        worker_ids = []
+    return worker_ids
 
 
 def get_main_process_id() -> int:
