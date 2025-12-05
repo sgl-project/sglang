@@ -492,7 +492,10 @@ class DenoisingStage(PipelineStage):
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(batch.num_inference_steps)
 
-            if self.server_args.enable_torch_compile and not self.transformer_compiled_func:
+            if (
+                self.server_args.enable_torch_compile
+                and not self.transformer_compiled_func
+            ):
                 self.transformer_compiled_func = torch.compile(
                     self.transformer, mode="max-autotune", fullgraph=self.full_graph
                 )
@@ -834,10 +837,7 @@ class DenoisingStage(PipelineStage):
     ):
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
-            if (
-                server_args.enable_torch_compile
-                and not self.transformer_compiled_func
-            ):
+            if server_args.enable_torch_compile and not self.transformer_compiled_func:
                 current_model = self.transformer_compiled_func
             else:
                 current_model = self.transformer
@@ -858,10 +858,7 @@ class DenoisingStage(PipelineStage):
                 current_model = self.transformer_2_compiled_func
             else:
                 current_model = self.transformer_2
-            if (
-                server_args.enable_torch_compile
-                and not self.transformer_compiled_func
-            ):
+            if server_args.enable_torch_compile and not self.transformer_compiled_func:
                 model_to_offload = self.transformer_compiled_func
             else:
                 model_to_offload = self.transformer
