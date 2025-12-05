@@ -1,3 +1,10 @@
+from typing import TYPE_CHECKING, List, Optional
+
+import torch
+
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.hardware_backend.npu.quantization.utils import _NPULinearMethodBase
+
 class NPU_W4A4DynamicLinearMethodImpl:
     """Linear method for NPU W4A4_DYNAMIC."""
 
