@@ -171,7 +171,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                         "1" if model in DISABLE_HF_XET_MODELS else "0"
                     )
                     os.environ["SGLANG_USE_AITER"] = (
-                        "0" if model in TRITON_MOE_MODELS or model in AMD_SPECIAL_CONFIG_MODELS else "1"
+                        "0" if model in TRITON_MOE_MODELS else "1"
                     )
 
                     process = popen_launch_server_wrapper(self.base_url, model, is_tp2)
