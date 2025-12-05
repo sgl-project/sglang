@@ -8,8 +8,10 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Optional
 
+import os
 import torch
 import triton
+import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -56,6 +58,199 @@ class ForwardMetadata:
 
 global_workspace_buffer = None
 
+
+@triton.jit
+def batch_prefill_attention_kernel(
+    Q_ptr, K_ptr, V_ptr, O_ptr,
+    qo_indptr_ptr, kv_indptr_ptr, kv_indices_ptr,
+    softmax_scale,
+    num_q_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    v_head_dim: tl.constexpr,
+    num_groups: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_VDMODEL: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    q_start = tl.load(qo_indptr_ptr + pid_b)
+    q_end = tl.load(qo_indptr_ptr + pid_b + 1)
+    kv_start = tl.load(kv_indptr_ptr + pid_b)
+    kv_end = tl.load(kv_indptr_ptr + pid_b + 1)
+
+    seq_len_q = q_end - q_start
+    seq_len_kv = kv_end - kv_start
+
+    if seq_len_q <= 0 or seq_len_kv <= 0:
+        return
+
+    group_idx = pid_h // num_kv_heads
+    kv_head_idx = pid_h % num_kv_heads
+
+    q_block_start = pid_m * BLOCK_M
+    q_offsets = q_block_start + tl.arange(0, BLOCK_M)
+    q_mask = q_offsets < seq_len_q
+
+    d_offsets = tl.arange(0, BLOCK_DMODEL)
+    d_mask = d_offsets < head_dim
+
+    vd_offsets = tl.arange(0, BLOCK_VDMODEL)
+    vd_mask = vd_offsets < v_head_dim
+
+    q_ptrs = Q_ptr + (q_start + q_offsets[:, None]) * num_q_heads * head_dim + pid_h * head_dim + d_offsets[None, :]
+    q = tl.load(q_ptrs, mask=q_mask[:, None] & d_mask[None, :], other=0.0)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_VDMODEL], dtype=tl.float32)
+    l_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+    m_max = tl.full([BLOCK_M], value=float('-inf'), dtype=tl.float32)
+
+    num_kv_blocks = tl.cdiv(seq_len_kv, BLOCK_N)
+
+    for block_n in range(num_kv_blocks):
+        kv_block_start = block_n * BLOCK_N
+        kv_offsets = kv_block_start + tl.arange(0, BLOCK_N)
+        kv_mask = kv_offsets < seq_len_kv
+
+        kv_idx_ptrs = kv_indices_ptr + kv_start + kv_offsets
+        kv_indices_block = tl.load(kv_idx_ptrs, mask=kv_mask, other=0)
+
+        k_ptrs = K_ptr + kv_indices_block[:, None] * num_kv_heads * head_dim + kv_head_idx * head_dim + d_offsets[None, :]
+        k = tl.load(k_ptrs, mask=kv_mask[:, None] & d_mask[None, :], other=0.0)
+
+        v_ptrs = V_ptr + kv_indices_block[:, None] * num_kv_heads * v_head_dim + kv_head_idx * v_head_dim + vd_offsets[None, :]
+        v = tl.load(v_ptrs, mask=kv_mask[:, None] & vd_mask[None, :], other=0.0)
+
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for d in range(0, head_dim, BLOCK_DMODEL):
+            d_end = min(d + BLOCK_DMODEL, head_dim)
+            d_size = d_end - d
+            d_range = tl.arange(0, BLOCK_DMODEL)
+            d_valid = d_range < d_size
+
+            q_slice = tl.load(
+                Q_ptr
+                + (q_start + q_offsets[:, None]) * num_q_heads * head_dim
+                + pid_h * head_dim
+                + (d + d_range)[None, :],
+                mask=q_mask[:, None] & d_valid[None, :],
+                other=0.0,
+            )
+            k_slice = tl.load(
+                K_ptr
+                + kv_indices_block[:, None] * num_kv_heads * head_dim
+                + kv_head_idx * head_dim
+                + (d + d_range)[None, :],
+                mask=kv_mask[:, None] & d_valid[None, :],
+                other=0.0,
+            )
+
+            qk += tl.dot(q_slice, tl.trans(k_slice))
+
+        qk = qk.to(tl.float32) * softmax_scale
+
+        q_offsets_rel = q_offsets
+        kv_offsets_rel = kv_offsets
+        causal_mask = (q_offsets_rel[:, None] + (seq_len_kv - seq_len_q)) >= kv_offsets_rel[None, :]
+        qk = tl.where(causal_mask & q_mask[:, None] & kv_mask[None, :], qk, float('-inf'))
+
+        m_new = tl.maximum(m_max, tl.max(qk, axis=1))
+        alpha = tl.exp(m_max - m_new)
+
+        acc = acc * alpha[:, None]
+        l_sum = l_sum * alpha
+
+        p = tl.exp(qk - m_new[:, None])
+        l_sum += tl.sum(p, axis=1)
+
+        pv = tl.dot(p.to(v.dtype), v)
+        acc += pv.to(tl.float32)
+
+        m_max = m_new
+
+    acc = acc / l_sum[:, None]
+
+    o_ptrs = O_ptr + (q_start + q_offsets[:, None]) * num_q_heads * v_head_dim + pid_h * v_head_dim + vd_offsets[None, :]
+    tl.store(o_ptrs, acc.to(O_ptr.dtype.element_ty), mask=q_mask[:, None] & vd_mask[None, :])
+
+
+def triton_new_batch_prefill_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    v_head_dim: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Batched prefill attention using a single Triton launch.
+
+    This maps the batch dimension to the Triton grid instead of
+    launching one kernel per batch on the host side, reducing
+    kernel-launch overhead for large batches.
+    """
+    batch_size = qo_indptr.numel() - 1
+    total_q_tokens = q.size(0)
+
+    output = torch.zeros(
+        total_q_tokens,
+        num_q_heads,
+        v_head_dim,
+        dtype=q.dtype,
+        device=q.device,
+    )
+
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_DMODEL = min(128, triton.next_power_of_2(head_dim))
+    BLOCK_VDMODEL = min(128, triton.next_power_of_2(v_head_dim))
+
+    # Compute max query length across the batch so we can launch a
+    # single kernel and rely on masking for shorter sequences.
+    if batch_size == 0:
+        return output
+    q_lengths = (qo_indptr[1:] - qo_indptr[:-1]).to(torch.int32)
+    max_q_len = int(q_lengths.max().item())
+    if max_q_len <= 0:
+        return output
+
+    num_blocks_m = triton.cdiv(max_q_len, BLOCK_M)
+    num_groups = num_q_heads // num_kv_heads
+
+    # Grid layout: (query blocks, heads, batch)
+    grid = (num_blocks_m, num_q_heads, batch_size)
+
+    batch_prefill_attention_kernel[grid](
+        q,
+        k_cache,
+        v_cache,
+        output,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        softmax_scale,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        num_groups=num_groups,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_VDMODEL=BLOCK_VDMODEL,
+    )
+
+    return output
+
+
 _AITER_PARTITION_SIZE_ROCM = 256
 
 
@@ -82,7 +277,12 @@ class AiterAttnBackend(AttentionBackend):
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
         self.head_dim = model_runner.model_config.head_dim
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        # For NSA models, use the first available full attention layer
+        if hasattr(model_runner.token_to_kv_pool, 'full_attention_layer_id_mapping'):
+            first_full_attn_layer = min(model_runner.token_to_kv_pool.full_attention_layer_id_mapping.keys())
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(first_full_attn_layer).shape[-1]
+        else:
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
         self.num_kv_head = model_runner.model_config.get_num_kv_heads(
             get_attention_tp_size()
         )
@@ -764,23 +964,103 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
+            # Explicitly choose backend:
+            # 0) If USE_TRITON_NEW=1, use new Triton kernel
+            # 1) aiter.mha_batch_prefill_func for the well-supported 128-head-dim case
+            # 2) aiter.flash_attn_varlen_func for generic multiples-of-8 head dims
+            # 3) Triton extend_attention_fwd as a final fallback
+            use_triton_new = os.getenv("USE_TRITON_NEW", "0").lower() in ("1", "true", "yes")
+            use_aiter_batch_prefill = (
+                layer.head_dim == 128 and layer.v_head_dim == 128
+            )
+            use_flash_varlen = (
+                not use_aiter_batch_prefill
+                and layer.head_dim % 8 == 0
+                and layer.v_head_dim % 8 == 0
+            )
+            use_flash_varlen = False
+
+            q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
+            if use_triton_new:
+                # print("⚠️ use triton attention")
+                o_new = triton_new_batch_prefill_attention(
+                    q_3d,
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.kv_indices,
+                    layer.tp_q_head_num,
+                    layer.tp_k_head_num,
+                    layer.head_dim,
+                    layer.v_head_dim,
+                    layer.scaling,
+                )
+                return o_new.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+
+            if use_aiter_batch_prefill:
+                o = mha_batch_prefill_func(
+                    q_3d,
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    self.forward_metadata.kv_indices,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+            if use_flash_varlen:
+                kv_indptr = self.forward_metadata.kv_indptr[:bs0]
+                kv_indices = self.forward_metadata.kv_indices
+                k_all = k_cache.index_select(0, kv_indices)
+                v_all = v_cache.index_select(0, kv_indices)
+                o = flash_attn_varlen_func(
+                    q=q_3d,
+                    k=k_all,
+                    v=v_all,
+                    cu_seqlens_q=self.qo_indptr[:bs0],
+                    cu_seqlens_k=kv_indptr,
+                    max_seqlen_q=self.forward_metadata.max_q_len,
+                    max_seqlen_k=self.forward_metadata.max_kv_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            
+            
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+            self.extend_attention_fwd(
+                q_3d,
+                k.contiguous()
+                if k is not None
+                else k_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v.contiguous()
+                if v is not None
+                else v_cache.view(-1, layer.tp_k_head_num, layer.v_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                k_cache.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v_cache.view(-1, layer.tp_k_head_num, layer.v_head_dim),
                 self.qo_indptr[:bs0],
                 self.forward_metadata.kv_indptr[:bs0],
                 self.forward_metadata.kv_indices,
+                None,
+                True,  # causal
+                None,
                 self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
+                layer.scaling,
+                0.0,  # logits_soft_cap
+                -1,  # sliding_window_size
             )
-
-            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+            return o
 
     def forward_decode(
         self,
