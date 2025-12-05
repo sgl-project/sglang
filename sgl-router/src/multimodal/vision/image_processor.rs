@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use image::DynamicImage;
-use ndarray::Array4;
+use ndarray::{Array4, ArrayD};
 
 use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 
@@ -81,10 +81,13 @@ impl ModelSpecificValue {
 /// to construct `MultimodalInputs` for the model.
 #[derive(Debug, Clone)]
 pub struct PreprocessedImages {
-    /// Pixel values as [B, C, H, W] float32 tensor.
+    /// Pixel values as a dynamic-dimensional float32 tensor.
     ///
     /// This is the primary input to the vision encoder.
-    pub pixel_values: Array4<f32>,
+    /// Shape varies by model:
+    /// - Standard: [B, C, H, W] (4D)
+    /// - Phi3-Vision: [B, num_crops+1, C, H, W] (5D)
+    pub pixel_values: ArrayD<f32>,
 
     /// Number of image tokens per image in the batch.
     ///
@@ -107,9 +110,25 @@ pub struct PreprocessedImages {
 }
 
 impl PreprocessedImages {
-    /// Create a new PreprocessedImages with required fields.
+    /// Create a new PreprocessedImages with required fields (4D pixel values).
     pub fn new(
         pixel_values: Array4<f32>,
+        num_img_tokens: Vec<usize>,
+        image_sizes: Vec<(u32, u32)>,
+    ) -> Self {
+        Self {
+            pixel_values: pixel_values.into_dyn(),
+            num_img_tokens,
+            image_sizes,
+            model_specific: HashMap::new(),
+        }
+    }
+
+    /// Create a new PreprocessedImages with dynamic-dimensional pixel values.
+    ///
+    /// Use this for models like Phi3-Vision that have 5D tensors.
+    pub fn new_dynamic(
+        pixel_values: ArrayD<f32>,
         num_img_tokens: Vec<usize>,
         image_sizes: Vec<(u32, u32)>,
     ) -> Self {
@@ -133,18 +152,53 @@ impl PreprocessedImages {
     }
 
     /// Get the number of channels.
+    ///
+    /// For 4D tensors [B, C, H, W], returns shape[1].
+    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[2].
     pub fn channels(&self) -> usize {
-        self.pixel_values.shape()[1]
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[1],
+            5 => self.pixel_values.shape()[2],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
+        }
     }
 
     /// Get the height of processed images.
+    ///
+    /// For 4D tensors [B, C, H, W], returns shape[2].
+    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[3].
     pub fn height(&self) -> usize {
-        self.pixel_values.shape()[2]
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[2],
+            5 => self.pixel_values.shape()[3],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
+        }
     }
 
     /// Get the width of processed images.
+    ///
+    /// For 4D tensors [B, C, H, W], returns shape[3].
+    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[4].
     pub fn width(&self) -> usize {
-        self.pixel_values.shape()[3]
+        match self.pixel_values.ndim() {
+            4 => self.pixel_values.shape()[3],
+            5 => self.pixel_values.shape()[4],
+            ndim => panic!(
+                "Unsupported pixel_values dimension: {}, expected 4 or 5",
+                ndim
+            ),
+        }
+    }
+
+    /// Get the number of dimensions of pixel_values.
+    pub fn ndim(&self) -> usize {
+        self.pixel_values.ndim()
     }
 
     /// Get total number of image tokens across all images.
@@ -267,6 +321,7 @@ impl ImageProcessorRegistry {
     /// - `qwen2-vl` -> Qwen2VLProcessor
     /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
     /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
+    /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
 
@@ -315,6 +370,16 @@ impl ImageProcessorRegistry {
         registry.register(
             "qwen2_5_vl",
             Box::new(super::processors::Qwen2VLProcessor::new()),
+        );
+
+        // Register Phi3-Vision
+        registry.register(
+            "phi-3-vision",
+            Box::new(super::processors::Phi3VisionProcessor::new()),
+        );
+        registry.register(
+            "phi3-vision",
+            Box::new(super::processors::Phi3VisionProcessor::new()),
         );
 
         registry

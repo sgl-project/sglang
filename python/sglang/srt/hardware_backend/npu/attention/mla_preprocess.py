@@ -1,23 +1,19 @@
+from functools import lru_cache
+from typing import TYPE_CHECKING, Optional
+
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.utils import get_bool_env_var, is_npu
+from sglang.srt.hardware_backend.npu.utils import npu_format_cast
+from sglang.srt.utils import get_bool_env_var
 
-_is_npu = is_npu()
-_ENABLE_MLA_PREPROCESS_FLAG = get_bool_env_var("SGLANG_NPU_USE_MLAPO")
-_NPU_FORMAT_NZ = 29
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
+@lru_cache(maxsize=1)
 def is_mla_preprocess_enabled() -> bool:
-    return _is_npu and _ENABLE_MLA_PREPROCESS_FLAG
-
-
-if is_mla_preprocess_enabled():
-    import sgl_kernel_npu  # noqa: F401
-    import torch_npu
-
-    torch.npu.config.allow_internal_format = True
-    torch.npu.set_compile_mode(jit_compile=False)
+    return get_bool_env_var("SGLANG_NPU_USE_MLAPO")
 
 
 def round_up(val: int, align: int) -> int:
@@ -66,6 +62,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         num_local_heads,
         qk_nope_head_dim,
         qk_rope_head_dim,
+        quant_config: Optional["QuantizationConfig"] = None,
     ):
         super().__init__()
         self.qkv_a_proj = fused_qkv_a_proj_with_mqa
@@ -75,6 +72,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         self.w_kc = w_kc.contiguous()
         self.rotary_emb = rotary_emb
         self.layer_id = layer_id
+        self.quant_config = quant_config
         self.has_preprocess_weights = False
         self.dtype = None
 
@@ -124,9 +122,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             .unsqueeze(0)
             .contiguous()
         )
-        self.qkv_a_proj_weight_nz = torch_npu.npu_format_cast(
-            fused_qkv_a_proj_with_mqa_weight_nz, _NPU_FORMAT_NZ
-        )
+        self.qkv_a_proj_weight_nz = npu_format_cast(fused_qkv_a_proj_with_mqa_weight_nz)
 
         # matmul_0 deq_scale [2112]
         fused_qkv_a_proj_with_mqa_deq_scale_q = self.qkv_a_proj.deq_scale.data[
@@ -198,9 +194,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         q_b_proj_weight_nz = (
             transdata(q_b_proj_weight, block_size=(16, 32)).unsqueeze(0).contiguous()
         )
-        self.q_b_proj_weight_nz = torch_npu.npu_format_cast(
-            q_b_proj_weight_nz, _NPU_FORMAT_NZ
-        )
+        self.q_b_proj_weight_nz = npu_format_cast(q_b_proj_weight_nz)
 
         # matmul_1 deq_scale [num_head * 192]
         q_b_proj_deq_scale = self.q_b_proj.deq_scale.data.clone()
@@ -280,7 +274,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         q_pe = q_pe.view(-1, self.num_local_heads, 1, self.qk_rope_head_dim)
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
         sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin)  # (B,N,S,D)
+        q_pe = torch.ops.npu.npu_interleave_rope(q_pe, cos, sin)  # (B,N,S,D)
         q_pe = q_pe.view(cos.shape[0], self.num_local_heads, self.qk_rope_head_dim)
 
         latent_cache = latent_cache.view(
@@ -300,7 +294,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             1,
             forward_batch.attn_backend.qk_rope_head_dim,
         )
-        k_rope, k_nope, _, _ = torch_npu.npu_kv_rmsnorm_rope_cache(
+        k_rope, k_nope, _, _ = torch.ops.npu.npu_kv_rmsnorm_rope_cache(
             latent_cache,
             self.kv_a_layernorm.weight,
             cos,
@@ -378,10 +372,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
+        assert self.quant_config and self.quant_config.get_name() == "modelslim"
+        # route by `qkv_a_proj` quant type as MTP layers can be unquantized
         _is_w8a8 = (
-            hasattr(self.qkv_a_proj.quant_method, "quantization_config")
-            and self.qkv_a_proj.quant_method.quantization_config.get_name()
-            == "w8a8_int8"
+            hasattr(self.qkv_a_proj.quant_method, "quant_config")
+            and self.qkv_a_proj.quant_method.quant_config.get_name() == "modelslim"
         )
         if _is_w8a8:
             return self.forward_mlapo(
