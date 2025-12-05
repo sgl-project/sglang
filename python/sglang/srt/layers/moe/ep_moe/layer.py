@@ -318,6 +318,9 @@ class DeepEPMoE(FusedMoE):
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
 
+        from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+            npu_fused_moe_without_routing_weights_bf16,
+        )
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
@@ -386,33 +389,6 @@ class DeepEPMoE(FusedMoE):
             raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
 
         return hidden_states
-
-
-def npu_fused_moe_without_routing_weights_bf16(
-    layer, hidden_states, group_list_type, group_list, output_dtype
-):
-    # gmm1: gate_up_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[layer.w13_weight.permute(0, 2, 1)],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )[0]
-    hidden_states = torch_npu.npu_swiglu(hidden_states)
-    # gmm2: down_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[layer.w2_weight.permute(0, 2, 1)],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )[0]
-    return hidden_states
 
 
 class NpuFuseEPMoE(DeepEPMoE):

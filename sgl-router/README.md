@@ -263,6 +263,7 @@ servers:
   - name: "filesystem"
     command: "npx"
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    protocol: "stdio"
     required: false
 
   - name: "github"
@@ -298,7 +299,7 @@ inventory:
 - `command` + `args`: For STDIO transport (local process execution)
 - `url`: For SSE or Streamable transports (HTTP/HTTPS endpoints)
 - `token`: Optional authentication token for HTTP-based transports
-- `protocol`: Protocol type (`"sse"` or `"streamable"`; STDIO is inferred from `command`)
+- `protocol`: Protocol type (`"sse"`, `"streamable"`, or `"stdio"`)
 - `required`: If `true`, router fails to start if server is unreachable (default: `false`)
 - `envs`: Environment variables for STDIO processes (optional)
 - `proxy`: Per-server proxy override (set to `null` to bypass global proxy)
