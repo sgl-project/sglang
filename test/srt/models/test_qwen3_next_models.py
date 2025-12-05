@@ -32,7 +32,7 @@ class TestQwen3Next(CustomTestCase):
                 "--tp-size",
                 "4",
                 "--chunked-prefill-size",
-                "16",
+                "2048",
             ],
         )
 

@@ -1,61 +1,51 @@
 import inspect
-import os
-import tarfile
-import urllib.request
 
 import numpy as np
-import pandas as pd
 import requests
 
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-MMLU_DATA_URL = "https://people.eecs.berkeley.edu/~hendrycks/data.tar"
-MMLU_DATA_DIR = os.path.join(os.path.dirname(__file__), "mmlu_data")
+# LongBench V2 dataset configuration
+# Reference: https://github.com/THUDM/LongBench
+LONGBENCH_V2_DATASET = "THUDM/LongBench-v2"
+LONGBENCH_V2_SPLIT = "train"
+NUM_SAMPLES = 48  # Number of samples to use
 
 
-def download_and_extract_mmlu_data():
-    """Download and extract MMLU dataset if not already present."""
-    data_dir = os.path.join(MMLU_DATA_DIR, "data")
-    if os.path.exists(data_dir):
-        return data_dir
-
-    os.makedirs(MMLU_DATA_DIR, exist_ok=True)
-    tar_path = os.path.join(MMLU_DATA_DIR, "data.tar")
-
-    if not os.path.exists(tar_path):
-        print(f"Downloading MMLU dataset from {MMLU_DATA_URL}...")
-        urllib.request.urlretrieve(MMLU_DATA_URL, tar_path)
-
-    print(f"Extracting MMLU dataset to {MMLU_DATA_DIR}...")
-    with tarfile.open(tar_path, "r") as tar:
-        tar.extractall(MMLU_DATA_DIR)
-
-    return data_dir
+def format_longbench_v2_example(example):
+    """Format a LongBench V2 example into a single text string (context + question only)."""
+    context = example.get("context", "")
+    question = example.get("question", "")
+    return f"{context} {question}"
 
 
-def load_questions_from_mmlu(data_dir, tokenizer):
-    """Load questions from MMLU dataset and tokenize them."""
-    test_dir = os.path.join(data_dir, "test")
-    input_ids = []
-    for filename in sorted(os.listdir(test_dir)):
-        if filename.endswith("_test.csv"):
-            df = pd.read_csv(os.path.join(test_dir, filename), header=None)
-            for i in range(df.shape[0]):
-                question = df.iloc[i, 0]  # First column is the question
-                answer = df.iloc[i, 1]  # Second column is the answer
-                to_encode = str(question) + " " + str(answer)
-                # print(f"{i}: {to_encode}")
-                tokens = tokenizer.encode(to_encode)
-                input_ids.append(tokens)
-    return input_ids
+def get_input_ids(tokenizer_path, max_tokens=3000, num_samples=NUM_SAMPLES):
+    """Get input_ids from LongBench V2 dataset using streaming (fast partial download)."""
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "Please install the 'datasets' package: pip install datasets"
+        ) from exc
 
-
-def get_input_ids(tokenizer_path):
-    """Get input_ids from MMLU dataset."""
-    data_dir = download_and_extract_mmlu_data()
     tokenizer = get_tokenizer(tokenizer_path)
-    input_ids = load_questions_from_mmlu(data_dir, tokenizer)
-    input_ids = input_ids[::10]  # Sample every 10th prompt
+
+    print(f"Loading {num_samples} samples from LongBench V2 (streaming)...")
+    # Use streaming to avoid downloading entire dataset
+    dataset = load_dataset(
+        LONGBENCH_V2_DATASET, split=LONGBENCH_V2_SPLIT, streaming=True
+    )
+
+    input_ids = []
+    for i, example in enumerate(dataset):
+        if len(input_ids) >= num_samples:
+            break
+        text = format_longbench_v2_example(example)
+        tokens = tokenizer.encode(text)
+        # Truncate to max_tokens
+        input_ids.append(tokens[:max_tokens])
+
+    print(f"Loaded {len(input_ids)} prompts (truncated to {max_tokens} tokens)")
     return input_ids
 
 
