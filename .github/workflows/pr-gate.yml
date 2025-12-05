@@ -5,10 +5,10 @@ on:
         description: "Whether the PR must have the run-ci label"
         type: boolean
         default: true
-      rate-limit-hours:
-        description: "Rate limit window size in hours; 0 disables rate limiting"
+      cool-down-minutes:
+        description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
         type: number
-        default: 2
+        default: 120
 
 jobs:
   pr-gate:
@@ -41,7 +41,7 @@ jobs:
           echo "PR Draft: ${{ steps.pr.outputs.draft }}"
           echo "PR User: ${{ steps.pr.outputs.user }}"
           echo "Require run-ci: ${{ inputs.require-run-ci }}"
-          echo "Rate limit hours: ${{ inputs.rate-limit-hours }}"
+          echo "Cool down minutes: ${{ inputs.cool-down-minutes }}"
           echo "==================="
 
       - name: Block draft PR
@@ -60,12 +60,12 @@ jobs:
           fi
 
       - name: Enforce rate limit for low-permission actors (optional)
-        if: github.event_name == 'pull_request' && inputs.rate-limit-hours > 0
+        if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const DEFAULT_HOURS = Number("${{ inputs.rate-limit-hours }}");
+            const DEFAULT_MINUTES = Number("${{ inputs.cool-down-minutes }}");
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
@@ -96,7 +96,7 @@ jobs:
               return;
             }
 
-            let effectiveCooldownMinutes = DEFAULT_HOURS * 60;
+            let effectiveCooldownMinutes = DEFAULT_MINUTES;
             let perUserCooldownMinutes = null;
 
             try {

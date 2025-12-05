@@ -1,7 +1,7 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx942 -t v0.5.5.post3-rocm630-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.5.post3-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.5.post3 --build-arg GPU_ARCH=gfx950 -t v0.5.5.post3-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx942 -t v0.5.6-rocm630-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx950 -t v0.5.6-rocm700-mi35x -f rocm.Dockerfile .
 
 
 # Default base images
@@ -22,7 +22,6 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.4"
 ENV NO_DEPS_FLAG=""
-ENV AITER_MXFP4_MOE_SF="0"
 
 # ===============================
 # Base image 942 and args
@@ -34,7 +33,6 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.7.post1"
 ENV NO_DEPS_FLAG=""
-ENV AITER_MXFP4_MOE_SF="0"
 
 # ===============================
 # Base image 950 and args
@@ -42,11 +40,10 @@ FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
-ENV BUILD_AITER_ALL="1"
+ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.7.post1"
+ENV AITER_COMMIT="v0.1.7.post2"
 ENV NO_DEPS_FLAG=""
-ENV AITER_MXFP4_MOE_SF="1"
 # ===============================
 # Chosen arch and args
 FROM ${GPU_ARCH}
@@ -107,8 +104,7 @@ RUN git clone ${AITER_REPO} \
  && git checkout ${AITER_COMMIT} \
  && git submodule update --init --recursive
 RUN cd aiter \
-     && if [ "$GPU_ARCH" = "gfx950" ]; then export AITER_MXFP4_MOE_SF=1; fi \
-     && echo "[AITER] GPU_ARCH=${GPU_ARCH} AITER_MXFP4_MOE_SF=${AITER_MXFP4_MOE_SF:-unset}" \
+     && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
@@ -299,7 +295,6 @@ RUN python3 -m pip install --no-cache-dir \
 
 # -----------------------
 # Performance environment variable.
-RUN echo "AITER_MXFP4_MOE_SF=${AITER_MXFP4_MOE_SF}" >> /etc/environment
 
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1

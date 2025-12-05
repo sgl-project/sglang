@@ -162,7 +162,7 @@ python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-7b-o
 Download an image:
 
 ```bash
-curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/test/lang/example_image.png?raw=true
+curl -o example_image.png -L https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true
 ```
 
 Send a request:

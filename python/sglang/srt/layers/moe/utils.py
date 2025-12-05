@@ -24,6 +24,7 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    ASCEND_FUSEEP = "ascend_fuseep"
 
     @classmethod
     def _missing_(cls, value):
@@ -42,6 +43,9 @@ class MoeA2ABackend(Enum):
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
+
+    def is_ascend_fuseep(self):
+        return self == MoeA2ABackend.ASCEND_FUSEEP
 
 
 class MoeRunnerBackend(Enum):
@@ -124,6 +128,7 @@ IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
 DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
+MOE_QUANTIZATION: Optional[str] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -136,6 +141,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global IS_SBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
+    global MOE_QUANTIZATION
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -152,6 +158,7 @@ def initialize_moe_config(server_args: ServerArgs):
     DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER = (
         server_args.disable_flashinfer_cutlass_moe_fp4_allgather
     )
+    MOE_QUANTIZATION = server_args.quantization
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -231,6 +238,7 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         not DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
+        and MOE_QUANTIZATION == "modelopt_fp4"
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
 

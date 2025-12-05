@@ -269,6 +269,14 @@ impl RouterManager {
         let mut best_router = None;
         let mut best_score = 0.0;
 
+        let num_regular_workers = self
+            .worker_registry
+            .get_all()
+            .iter()
+            .filter(|w| matches!(w.worker_type(), WorkerType::Regular))
+            .count();
+        let num_pd_workers = self.worker_registry.get_all().len() - num_regular_workers;
+
         for router in candidate_routers {
             let mut score = 1.0;
 
@@ -284,7 +292,9 @@ impl RouterManager {
             // - Average worker cost vs max_cost
             // - Current load and health status
 
-            if score > best_score {
+            let valid_router = (router.is_pd_mode() && num_pd_workers > 0)
+                || (!router.is_pd_mode() && num_regular_workers > 0);
+            if score > best_score && valid_router {
                 best_score = score;
                 best_router = Some(router);
             }
@@ -324,26 +334,54 @@ impl RouterTrait for RouterManager {
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        let models = self.worker_registry.get_models();
+        let model_names = self.worker_registry.get_models();
 
-        if models.is_empty() {
+        if model_names.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
         } else {
+            // Convert model names to OpenAI-compatible model objects
+            let models: Vec<Value> = model_names
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "id": name,
+                        "object": "model",
+                        "owned_by": "local"
+                    })
+                })
+                .collect();
+
             (
                 StatusCode::OK,
-                serde_json::json!({ "models": models }).to_string(),
+                serde_json::json!({
+                    "object": "list",
+                    "data": models
+                })
+                .to_string(),
             )
                 .into_response()
         }
     }
 
-    async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        // TODO: Extract model from request and route to appropriate router
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Model info endpoint not yet implemented in RouterManager",
-        )
-            .into_response()
+    async fn get_model_info(&self, req: Request<Body>) -> Response {
+        // Route to default router or first available router
+        let router_id = {
+            let default_router = self.default_router.read().unwrap();
+            default_router.clone()
+        };
+
+        let router = if let Some(id) = router_id {
+            self.routers.get(&id).map(|r| r.clone())
+        } else {
+            // If no default, use first available router
+            self.routers.iter().next().map(|r| r.value().clone())
+        };
+
+        if let Some(router) = router {
+            router.get_model_info(req).await
+        } else {
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
+        }
     }
 
     async fn route_generate(
@@ -423,33 +461,6 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "responses api not yet implemented in inference gateway mode",
-        )
-            .into_response()
-    }
-
-    async fn list_response_input_items(
-        &self,
-        headers: Option<&HeaderMap>,
-        response_id: &str,
-    ) -> Response {
-        // Delegate to the default router (typically http-regular)
-        // Response storage is shared across all routers via AppContext
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router.list_response_input_items(headers, response_id).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                "No router available to list response input items",
-            )
-                .into_response()
-        }
-    }
-
     async fn get_response(
         &self,
         headers: Option<&HeaderMap>,
@@ -481,6 +492,33 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn delete_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "responses api not yet implemented in inference gateway mode",
+        )
+            .into_response()
+    }
+
+    async fn list_response_input_items(
+        &self,
+        headers: Option<&HeaderMap>,
+        response_id: &str,
+    ) -> Response {
+        // Delegate to the default router (typically http-regular)
+        // Response storage is shared across all routers via AppContext
+        let router = self.select_router_for_request(headers, None);
+        if let Some(router) = router {
+            router.list_response_input_items(headers, response_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                "No router available to list response input items",
+            )
+                .into_response()
+        }
+    }
+
     async fn route_embeddings(
         &self,
         headers: Option<&HeaderMap>,
@@ -491,6 +529,25 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router.route_embeddings(headers, body, model_id).await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
+    async fn route_classify(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ClassifyRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        let router = self.select_router_for_request(headers, model_id);
+
+        if let Some(router) = router {
+            router.route_classify(headers, body, model_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -519,30 +576,14 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn route_classify(
-        &self,
-        headers: Option<&HeaderMap>,
-        body: &ClassifyRequest,
-        model_id: Option<&str>,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, model_id);
-
-        if let Some(router) = router {
-            router.route_classify(headers, body, model_id).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
-        }
-    }
-
     fn router_type(&self) -> &'static str {
         "manager"
     }
 
-    // Conversations API delegates
+    // ============================================================================
+    // Conversation API Methods - delegate to selected router
+    // ============================================================================
+
     async fn create_conversation(&self, headers: Option<&HeaderMap>, body: &Value) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
@@ -624,8 +665,8 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         conversation_id: &str,
         limit: Option<usize>,
-        order: Option<String>,
-        after: Option<String>,
+        order: Option<&str>,
+        after: Option<&str>,
     ) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
@@ -636,7 +677,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to list conversation items for '{}'",
+                    "No router available to list items for conversation '{}'",
                     conversation_id
                 ),
             )
@@ -659,7 +700,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to create conversation items for '{}'",
+                    "No router available to create items for conversation '{}'",
                     conversation_id
                 ),
             )
@@ -683,7 +724,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to get conversation item '{}' in '{}'",
+                    "No router available to get item '{}' from conversation '{}'",
                     item_id, conversation_id
                 ),
             )
@@ -706,7 +747,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to delete conversation item '{}' in '{}'",
+                    "No router available to delete item '{}' from conversation '{}'",
                     item_id, conversation_id
                 ),
             )

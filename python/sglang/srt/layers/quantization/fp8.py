@@ -10,35 +10,12 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
-from sglang.srt.distributed import get_tp_group
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
-)
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
-
-try:
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        apply_fp8_marlin_linear,
-        prepare_fp8_layer_for_marlin,
-    )
-
-    MARLIN_FP8_AVAILABLE = True
-except ImportError:
-    MARLIN_FP8_AVAILABLE = False
-
-    def dummy_func(*args, **kwargs):
-        raise ImportError(
-            "marlin FP8 requires some operators from vllm. Please install vllm."
-        )
-
-    apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
-
-
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -67,8 +44,13 @@ from sglang.srt.layers.quantization.fp8_utils import (
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
     normalize_e4m3fn_to_e4m3fnuz,
+    requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
@@ -106,13 +88,11 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
 _is_fp8_fnuz = is_fp8_fnuz()
-
-_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT")
+_use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_hip and (_use_aiter or _use_hip_int4):
+if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
@@ -176,7 +156,12 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignored_layers", "modules_to_not_convert"], None
+        )
+        if ignored_layers:
+            # hacking ministral
+            ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
@@ -228,7 +213,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # For GPUs that lack FP8 hardware support, we can leverage the Marlin
         # kernel for fast weight-only FP8 quantization
         self.use_marlin = False
-        if _is_cuda and MARLIN_FP8_AVAILABLE:
+        if _is_cuda:
             force_marlin = get_bool_env_var("SGLANG_FORCE_FP8_MARLIN")
             auto_enable = can_auto_enable_marlin_fp8()
             self.use_marlin = force_marlin or auto_enable
@@ -317,6 +302,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     output_dim=0,
                     weight_loader=weight_loader,
                 )
+                scale.format_ue8m0 = False
                 scale[:] = torch.finfo(torch.float32).min
                 layer.register_parameter("weight_scale_inv", scale)
             else:
@@ -366,7 +352,34 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 return
             else:
+                # For fp8 linear weights run with deepgemm, the weights and scales need be requantized to ue8m0
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    deepgemm_w8a8_block_fp8_linear_with_fallback,
+                )
+                from sglang.srt.model_loader.utils import (
+                    should_deepgemm_weight_requant_ue8m0,
+                )
+
+                if (
+                    should_deepgemm_weight_requant_ue8m0(
+                        weight_block_size=getattr(
+                            self.quant_config, "weight_block_size", None
+                        ),
+                    )
+                    and (
+                        self.w8a8_block_fp8_linear
+                        is deepgemm_w8a8_block_fp8_linear_with_fallback
+                    )
+                    and (not layer.weight_scale_inv.format_ue8m0)
+                ):
+                    requant_weight_ue8m0_inplace(
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        self.quant_config.weight_block_size,
+                    )
+                    layer.weight_scale_inv.format_ue8m0 = True
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+
             layer.weight.data = weight.data
             layer.weight_scale_inv.data = weight_scale.data
         else:
@@ -754,8 +767,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     w2_weight_scale, requires_grad=False
                 )
                 layer.w2_input_scale = None
-
-            if _use_aiter:
+                if _use_aiter:
+                    # add this section for MI300
+                    # Pre-shuffle weights
+                    layer.w13_weight.data = shuffle_weight(
+                        layer.w13_weight.contiguous(), (16, 16)
+                    )
+                    layer.w2_weight.data = shuffle_weight(
+                        layer.w2_weight.contiguous(), (16, 16)
+                    )
+            elif _use_aiter:
                 # Pre-shuffle weights
                 layer.w13_weight.data = shuffle_weight(
                     layer.w13_weight.contiguous(), (16, 16)
@@ -763,13 +784,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.data = shuffle_weight(
                     layer.w2_weight.contiguous(), (16, 16)
                 )
-
-            if _is_cpu:
+            elif _is_cpu:
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+            else:
+                # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
+                from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
+                from sglang.srt.model_loader.utils import (
+                    should_deepgemm_weight_requant_ue8m0,
+                )
 
+                if (
+                    should_deepgemm_weight_requant_ue8m0(
+                        weight_block_size=getattr(
+                            self.quant_config, "weight_block_size", None
+                        ),
+                    )
+                    and get_moe_runner_backend().is_deep_gemm()
+                ):
+                    assert isinstance(
+                        layer, DeepEPMoE
+                    ), "DeepGemm MoE is only supported with DeepEPMoE"
+                    weight_block_size = self.quant_config.weight_block_size
+                    requant_weight_ue8m0_inplace(
+                        layer.w13_weight, layer.w13_weight_scale_inv, weight_block_size
+                    )
+                    requant_weight_ue8m0_inplace(
+                        layer.w2_weight, layer.w2_weight_scale_inv, weight_block_size
+                    )
             return
 
         # If checkpoint is fp16 or bfloat16, quantize in place.
@@ -966,10 +1010,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
 
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.utils import (
-            get_moe_a2a_backend,
-            get_moe_runner_backend,
-        )
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
