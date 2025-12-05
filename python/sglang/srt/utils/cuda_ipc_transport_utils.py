@@ -8,21 +8,15 @@ from typing import Tuple
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_float_env_var, get_int_env_var
 
 logger = logging.getLogger(__name__)
 
-MM_FEATURE_CACHE_SIZE = (
-    4 * 1024 * 1024 * 1024
-    if not get_int_env_var("SGLANG_MM_FEATURE_CACHE_MB")
-    else get_int_env_var("SGLANG_MM_FEATURE_CACHE_MB") * 1024 * 1024
-)
+MM_FEATURE_CACHE_SIZE = envs.SGLANG_MM_FEATURE_CACHE_MB.get() * 1024 * 1024
 
 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL = (
-    0.05
-    if not get_float_env_var("SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC")
-    else get_float_env_var("SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC")
+    envs.SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC.get()
 )
 
 SHM_LOCK_FILE = "/tmp/shm_wr_lock.lock"
