@@ -3244,6 +3244,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
         get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
 
+        # Persistent cache for incremental weight loading (q_a_proj + kv_a_proj_with_mqa fusion)
+        # This allows load_weights to be called multiple times with partial weights
+        self._cached_a_proj = {} if self.fuse_qkv_a_proj else None
+
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
@@ -3624,7 +3628,8 @@ class DeepseekV2ForCausalLM(nn.Module):
         fuse_qkv_a_proj = hasattr(self.config, "q_lora_rank") and (
             self.config.q_lora_rank is not None
         )
-        cached_a_proj = {} if fuse_qkv_a_proj else None
+        # Use persistent cache to support incremental weight loading across multiple calls
+        cached_a_proj = self._cached_a_proj if fuse_qkv_a_proj else None
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
