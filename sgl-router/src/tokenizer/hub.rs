@@ -1,5 +1,4 @@
 use std::{
-    env,
     path::{Path, PathBuf},
 };
 
@@ -12,8 +11,6 @@ const IGNORED: [&str; 5] = [
     "README.md",
     "USE_POLICY.md",
 ];
-
-const HF_TOKEN_ENV_VAR: &str = "HF_TOKEN";
 
 /// Checks if a file is a model weight file
 fn is_weight_file(filename: &str) -> bool {
@@ -56,10 +53,8 @@ fn is_chat_template_file(filename: &str) -> bool {
 /// Returns the directory containing the downloaded tokenizer files
 pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
     let model_id = model_id.as_ref();
-    let token = env::var(HF_TOKEN_ENV_VAR).ok();
-    let api = ApiBuilder::new()
+    let api = ApiBuilder::from_env()
         .with_progress(true)
-        .with_token(token)
         .build()?;
     let model_name = model_id.display().to_string();
 
@@ -152,10 +147,8 @@ pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::R
 /// If ignore_weights is true, model weight files will be skipped
 pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Result<PathBuf> {
     let name = name.as_ref();
-    let token = env::var(HF_TOKEN_ENV_VAR).ok();
-    let api = ApiBuilder::new()
+    let api = ApiBuilder::from_env()
         .with_progress(true)
-        .with_token(token)
         .build()?;
     let model_name = name.display().to_string();
 
