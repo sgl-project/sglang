@@ -5,7 +5,7 @@ Transformers (DiT), to achieve up to **7.4x inference speedup** with minimal qua
 
 ## Overview
 
-Cache-DiT uses intelligent caching strategies to skip redundant computation in the denoising loop:
+**Cache-DiT** uses intelligent caching strategies to skip redundant computation in the denoising loop:
 
 - **DBCache (Dual Block Cache)**: Dynamically decides when to cache transformer blocks based on residual differences
 - **TaylorSeer**: Uses Taylor expansion for calibration to optimize caching decisions
@@ -13,7 +13,7 @@ Cache-DiT uses intelligent caching strategies to skip redundant computation in t
 
 ## Basic Usage
 
-Enable Cache-DiT by exporting the environment variable and using `sglang generate`:
+Enable Cache-DiT by exporting the environment variable and using `sglang generate` or `sglang serve` :
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true \
@@ -59,12 +59,14 @@ sglang generate --model-path black-forest-labs/FLUX.1-dev \
     --prompt "A curious raccoon in a forest"
 ```
 
-## SCM (Step Computation Masking)
+### SCM (Step Computation Masking)
 
 SCM provides step-level caching control for additional speedup. It decides which denoising steps to compute fully and
 which to use cached results.
 
-### Presets
+#### SCM Presets
+
+SCM is configured with presets, defined as:
 
 | Preset   | Compute Ratio | Speed    | Quality    |
 |----------|---------------|----------|------------|
@@ -74,7 +76,7 @@ which to use cached results.
 | `fast`   | ~35%          | ~3x      | Acceptable |
 | `ultra`  | ~25%          | ~4x      | Lower      |
 
-### Usage
+#### Usage
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true \
@@ -83,7 +85,7 @@ sglang generate --model-path Qwen/Qwen-Image \
     --prompt "A futuristic cityscape at sunset"
 ```
 
-### Custom SCM Bins
+#### Custom SCM Bins
 
 For fine-grained control over which steps to compute vs cache:
 
@@ -95,7 +97,7 @@ sglang generate --model-path Qwen/Qwen-Image \
     --prompt "A futuristic cityscape at sunset"
 ```
 
-### SCM Policy
+#### SCM Policy
 
 | Policy    | Env Variable                          | Description                                 |
 |-----------|---------------------------------------|---------------------------------------------|
@@ -104,7 +106,7 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 ## Environment Variables
 
-All Cache-DiT parameters can be set via environment variables:
+All Cache-DiT parameters can be set via the following environment variables:
 
 | Environment Variable                | Default   | Description                              |
 |-------------------------------------|-----------|------------------------------------------|
@@ -123,7 +125,7 @@ All Cache-DiT parameters can be set via environment variables:
 
 ## Supported Models
 
-Cache-DiT supports DiT models registered in its BlockAdapterRegister:
+Cache-DiT supports DiT models:
 
 | Model Family | Example Models              |
 |--------------|-----------------------------|
