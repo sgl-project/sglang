@@ -195,12 +195,20 @@ def safetensors_weights_iterator(
 
     if use_runai_model_streamer:
         with SafetensorsStreamer() as streamer:
-            streamer.stream_files(hf_weights_files)
-            for name, tensor in streamer.get_tensors():
-                if to_cpu:
-                    yield name, tensor.clone().detach()
-                else:
-                    yield name, tensor.to(device)
+            # Stream and yield tensors one file at a time (streamer can't handle concurrent requests)
+            for st_file in tqdm(
+                hf_weights_files,
+                desc="Loading safetensors using Runai Model Streamer",
+                disable=not enable_tqdm,
+                bar_format=_BAR_FORMAT,
+            ):
+                streamer.stream_file(st_file)
+                # Must yield immediately after streaming each file
+                for name, tensor in streamer.get_tensors():
+                    if to_cpu:
+                        yield name, tensor.clone().detach()
+                    else:
+                        yield name, tensor.to(device)
     else:
         for st_file in tqdm(
             hf_weights_files,
