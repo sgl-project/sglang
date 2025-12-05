@@ -515,8 +515,12 @@ class MambaRadixCache(BasePrefixCache):
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(
+        match_result = self.match_prefix(
             RadixKey(page_aligned_token_ids, req.extra_key)
+        )
+        (new_indices, new_last_node) = (
+            match_result.device_indices,
+            match_result.last_device_node,
         )
 
         if not mamba_exist:

@@ -14,7 +14,7 @@ from typing import Optional
 
 from PIL import Image
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
@@ -23,6 +23,15 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 )
 
 logger = init_logger(__name__)
+
+
+def is_image_url(image_path: str | Path | None) -> bool:
+    """Check if image_path is a URL."""
+    if image_path is None:
+        return False
+    return isinstance(image_path, str) and (
+        image_path.startswith("http://") or image_path.startswith("https://")
+    )
 
 
 def run_command(command) -> Optional[float]:
