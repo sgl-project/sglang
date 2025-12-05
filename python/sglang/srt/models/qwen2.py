@@ -621,9 +621,6 @@ class Qwen2ForCausalLM(nn.Module):
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
-                logger.info(
-                    f"[Qwen2 Load] {name}: param.shape={tuple(param.shape)}, loaded_weight.shape={tuple(loaded_weight.shape)}, shard_id={shard_id}"
-                )
                 weight_loader(param, loaded_weight, shard_id)
                 updated_params.add(name)
                 break
@@ -636,9 +633,6 @@ class Qwen2ForCausalLM(nn.Module):
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
-                    )
-                    logger.info(
-                        f"[Qwen2 Load] {name}: param.shape={tuple(param.shape)}, loaded_weight.shape={tuple(loaded_weight.shape)}"
                     )
                     weight_loader(param, loaded_weight)
                     updated_params.add(name)
