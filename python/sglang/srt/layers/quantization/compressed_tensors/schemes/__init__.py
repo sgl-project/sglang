@@ -6,6 +6,7 @@ from .compressed_tensors_w8a8_int8 import CompressedTensorsW8A8Int8
 from .compressed_tensors_w8a16_fp8 import CompressedTensorsW8A16Fp8
 from .compressed_tensors_wNa16 import WNA16_SUPPORTED_BITS, CompressedTensorsWNA16
 from .compressed_tensors_w4a16_nvfp4 import CompressedTensorsW4A16Fp4
+from .compressed_tensors_w4a4_nvfp4 import CompressedTensorsW4A4Fp4
 
 __all__ = [
     "CompressedTensorsScheme",
@@ -15,4 +16,5 @@ __all__ = [
     "CompressedTensorsWNA16",
     "WNA16_SUPPORTED_BITS",
     "CompressedTensorsW4A16Fp4",
+    "CompressedTensorsW4A4Fp4",
 ]

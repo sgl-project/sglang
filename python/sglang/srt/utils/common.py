@@ -351,6 +351,10 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
+def cutlass_fp4_supported() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0) and torch.version.cuda >= "12.8"
+
+
 def is_nvidia_cublas_cu12_version_ge_12_9():
     """
     temporary fix for issue #11272
