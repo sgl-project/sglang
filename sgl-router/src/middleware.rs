@@ -21,7 +21,20 @@ use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
-use crate::{metrics::RouterMetrics, server::AppState};
+use crate::{
+    metrics::RouterMetrics,
+    server::AppState,
+    wasm::{
+        module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
+        spec::{
+            apply_modify_action_to_headers, build_wasm_headers_from_axum_headers,
+            sgl::router::middleware_types::{
+                Action, Request as WasmRequest, Response as WasmResponse,
+            },
+        },
+        types::WasmComponentInput,
+    },
+};
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -222,7 +235,7 @@ impl<B> OnRequest<B> for RequestLogger {
 
         // Log the request start
         info!(
-            target: "sglang_router_rs::request",
+            target: "sgl_model_gateway::request",
             "started processing request"
         );
     }
@@ -254,17 +267,17 @@ impl<B> OnResponse<B> for ResponseLogger {
         let _enter = span.enter();
         if status.is_server_error() {
             error!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "request failed with server error"
             );
         } else if status.is_client_error() {
             warn!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "request failed with client error"
             );
         } else {
             info!(
-                target: "sglang_router_rs::response",
+                target: "sgl_model_gateway::response",
                 "finished processing request"
             );
         }
@@ -303,7 +316,7 @@ pub struct RequestLogEntry {
 pub fn log_request(entry: RequestLogEntry) {
     if entry.status >= 500 {
         tracing::error!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,
@@ -316,7 +329,7 @@ pub fn log_request(entry: RequestLogEntry) {
         );
     } else if entry.status >= 400 {
         tracing::warn!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,
@@ -328,7 +341,7 @@ pub fn log_request(entry: RequestLogEntry) {
         );
     } else {
         tracing::info!(
-            target: "sglang_router_rs::http",
+            target: "sgl_model_gateway::http",
             request_id = %entry.request_id,
             method = %entry.method,
             uri = %entry.uri,
@@ -553,4 +566,220 @@ pub async fn concurrency_limit_middleware(
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
     }
+}
+
+pub async fn wasm_middleware(
+    State(app_state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // Check if WASM is enabled
+    if !app_state.context.router_config.enable_wasm {
+        return Ok(next.run(request).await);
+    }
+
+    // Get WASM manager
+    let wasm_manager = match &app_state.context.wasm_manager {
+        Some(manager) => manager,
+        None => {
+            return Ok(next.run(request).await);
+        }
+    };
+
+    // Get request ID from extensions or generate one
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| generate_request_id(request.uri().path()));
+
+    // ===== OnRequest Phase =====
+    let on_request_attach_point =
+        WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest);
+
+    let modules_on_request =
+        match wasm_manager.get_modules_by_attach_point(on_request_attach_point.clone()) {
+            Ok(modules) => modules,
+            Err(e) => {
+                error!("Failed to get WASM modules for OnRequest: {}", e);
+                return Ok(next.run(request).await);
+            }
+        };
+
+    // Extract request body once before processing modules
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let mut headers = request.headers().clone();
+    let body_bytes = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(e) => {
+            error!("Failed to read request body: {}", e);
+            // Create a minimal request with empty body for error recovery
+            let error_request = Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap_or_else(|_| Request::new(Body::empty()));
+            return Ok(next.run(error_request).await);
+        }
+    };
+
+    // Process each OnRequest module
+    let mut modified_body = body_bytes;
+
+    for module in modules_on_request {
+        // Build WebAssembly request from collected data
+        let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
+        let wasm_request = WasmRequest {
+            method: method.to_string(),
+            path: uri.path().to_string(),
+            query: uri.query().unwrap_or("").to_string(),
+            headers: wasm_headers,
+            body: modified_body.clone(),
+            request_id: request_id.clone(),
+            now_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_else(|_| {
+                    // Fallback to 0 if system time is before UNIX_EPOCH
+                    // This should never happen in practice, but provides a safe fallback
+                    Duration::from_millis(0)
+                })
+                .as_millis() as u64,
+        };
+
+        // Execute WASM component
+        let action = match wasm_manager
+            .execute_module_for_attach_point(
+                &module,
+                on_request_attach_point.clone(),
+                WasmComponentInput::MiddlewareRequest(wasm_request),
+            )
+            .await
+        {
+            Some(action) => action,
+            None => continue, // Continue to next module on error
+        };
+
+        // Process action
+        match action {
+            Action::Continue => {
+                // Continue to next module or request processing
+            }
+            Action::Reject(status) => {
+                // Immediately reject the request
+                return Err(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST));
+            }
+            Action::Modify(modify) => {
+                // Apply modifications to headers and body
+                apply_modify_action_to_headers(&mut headers, &modify);
+                // Apply body_replace
+                if let Some(body_bytes) = modify.body_replace {
+                    modified_body = body_bytes;
+                }
+            }
+        }
+    }
+
+    // Reconstruct request with modifications
+    let mut final_request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::from(modified_body))
+        .unwrap_or_else(|_| Request::new(Body::empty()));
+    *final_request.headers_mut() = headers;
+
+    // Continue with request processing
+    let response = next.run(final_request).await;
+
+    // ===== OnResponse Phase =====
+    let on_response_attach_point =
+        WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnResponse);
+
+    let modules_on_response =
+        match wasm_manager.get_modules_by_attach_point(on_response_attach_point.clone()) {
+            Ok(modules) => modules,
+            Err(e) => {
+                error!("Failed to get WASM modules for OnResponse: {}", e);
+                return Ok(response);
+            }
+        };
+
+    // Extract response data once before processing modules
+    let mut status = response.status();
+    let mut headers = response.headers().clone();
+    let mut body_bytes = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(e) => {
+            error!("Failed to read response body: {}", e);
+            // Create a minimal response with empty body for error recovery
+            let error_response = Response::builder()
+                .status(status)
+                .body(Body::empty())
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+            return Ok(error_response);
+        }
+    };
+
+    // Process each OnResponse module
+    for module in modules_on_response {
+        // Build WebAssembly response from collected data
+        let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
+        let wasm_response = WasmResponse {
+            status: status.as_u16(),
+            headers: wasm_headers,
+            body: body_bytes.clone(),
+        };
+
+        // Execute WASM component
+        let action = match wasm_manager
+            .execute_module_for_attach_point(
+                &module,
+                on_response_attach_point.clone(),
+                WasmComponentInput::MiddlewareResponse(wasm_response),
+            )
+            .await
+        {
+            Some(action) => action,
+            None => continue, // Continue to next module on error
+        };
+
+        // Process action - apply modifications incrementally
+        match action {
+            Action::Continue => {
+                // Continue to next module
+            }
+            Action::Reject(status_code) => {
+                // Override response status
+                status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
+                // Return immediately with current state
+                let final_response = Response::builder()
+                    .status(status)
+                    .body(Body::from(body_bytes))
+                    .unwrap_or_else(|_| Response::new(Body::empty()));
+                let mut final_response = final_response;
+                *final_response.headers_mut() = headers;
+                return Ok(final_response);
+            }
+            Action::Modify(modify) => {
+                // Apply status modification
+                if let Some(new_status) = modify.status {
+                    status = StatusCode::from_u16(new_status).unwrap_or(status);
+                }
+                // Apply headers modifications
+                apply_modify_action_to_headers(&mut headers, &modify);
+                // Apply body_replace
+                if let Some(new_body) = modify.body_replace {
+                    body_bytes = new_body;
+                }
+            }
+        }
+    }
+
+    // Reconstruct final response with all modifications
+    let final_response = Response::builder()
+        .status(status)
+        .body(Body::from(body_bytes))
+        .unwrap_or_else(|_| Response::new(Body::empty()));
+    let mut final_response = final_response;
+    *final_response.headers_mut() = headers;
+    Ok(final_response)
 }

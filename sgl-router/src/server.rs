@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -24,8 +25,10 @@ use crate::{
     core::{
         worker_to_info,
         workflow::{
-            create_mcp_registration_workflow, create_worker_registration_workflow,
-            create_worker_removal_workflow, LoggingSubscriber, WorkflowEngine,
+            create_external_worker_registration_workflow, create_mcp_registration_workflow,
+            create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
+            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
+            WorkflowEngine,
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
@@ -43,8 +46,9 @@ use crate::{
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerErrorResponse, WorkerInfo},
     },
-    routers::{router_manager::RouterManager, RouterTrait},
+    routers::{conversations, router_manager::RouterManager, RouterTrait},
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
 };
 
 #[derive(Clone)]
@@ -268,47 +272,32 @@ async fn v1_responses_list_input_items(
 
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
-    headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    state
-        .router
-        .create_conversation(Some(&headers), &body)
-        .await
+    conversations::create_conversation(&state.context.conversation_storage, body).await
 }
 
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
 ) -> Response {
-    state
-        .router
-        .get_conversation(Some(&headers), &conversation_id)
-        .await
+    conversations::get_conversation(&state.context.conversation_storage, &conversation_id).await
 }
 
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    state
-        .router
-        .update_conversation(Some(&headers), &conversation_id, &body)
+    conversations::update_conversation(&state.context.conversation_storage, &conversation_id, body)
         .await
 }
 
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
 ) -> Response {
-    state
-        .router
-        .delete_conversation(Some(&headers), &conversation_id)
-        .await
+    conversations::delete_conversation(&state.context.conversation_storage, &conversation_id).await
 }
 
 #[derive(Deserialize, Default)]
@@ -326,12 +315,16 @@ async fn v1_conversations_list_items(
         order,
         after,
     }): Query<ListItemsQuery>,
-    headers: http::HeaderMap,
 ) -> Response {
-    state
-        .router
-        .list_conversation_items(Some(&headers), &conversation_id, limit, order, after)
-        .await
+    conversations::list_conversation_items(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        limit,
+        order.as_deref(),
+        after.as_deref(),
+    )
+    .await
 }
 
 #[derive(Deserialize, Default)]
@@ -343,36 +336,43 @@ struct GetItemQuery {
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
-    headers: http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    state
-        .router
-        .create_conversation_items(Some(&headers), &conversation_id, &body)
-        .await
+    conversations::create_conversation_items(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        body,
+    )
+    .await
 }
 
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(String, String)>,
     Query(query): Query<GetItemQuery>,
-    headers: http::HeaderMap,
 ) -> Response {
-    state
-        .router
-        .get_conversation_item(Some(&headers), &conversation_id, &item_id, query.include)
-        .await
+    conversations::get_conversation_item(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        &item_id,
+        query.include,
+    )
+    .await
 }
 
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(String, String)>,
-    headers: http::HeaderMap,
 ) -> Response {
-    state
-        .router
-        .delete_conversation_item(Some(&headers), &conversation_id, &item_id)
-        .await
+    conversations::delete_conversation_item(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        &conversation_id,
+        &item_id,
+    )
+    .await
 }
 
 async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Response {
@@ -544,7 +544,7 @@ async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>)
             tool_parser: None,
             chat_template: None,
             bootstrap_port: None,
-            metadata: std::collections::HashMap::new(),
+            metadata: HashMap::new(),
             job_status: Some(status),
         };
         return Json(worker_info).into_response();
@@ -647,6 +647,10 @@ pub fn build_app(
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            middleware::wasm_middleware,
         ));
 
     let public_routes = Router::new()
@@ -662,6 +666,9 @@ pub fn build_app(
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
+        .route("/wasm", post(add_wasm_module))
+        .route("/wasm/{module_uuid}", delete(remove_wasm_module))
+        .route("/wasm", get(list_wasm_modules))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_config.clone(),
             middleware::auth_middleware,
@@ -752,8 +759,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await;
 
     engine.register_workflow(create_worker_registration_workflow(&config.router_config));
+    engine.register_workflow(create_external_worker_registration_workflow());
     engine.register_workflow(create_worker_removal_workflow());
     engine.register_workflow(create_mcp_registration_workflow());
+    engine.register_workflow(create_wasm_module_registration_workflow());
+    engine.register_workflow(create_wasm_module_removal_workflow());
     app_context
         .workflow_engine
         .set(engine)

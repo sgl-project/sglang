@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use sglang_router_rs::{
+use sgl_model_gateway::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
@@ -345,6 +345,9 @@ struct CliArgs {
 
     #[arg(long)]
     mcp_config_path: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    enable_wasm: bool,
 }
 
 enum OracleConnectSource {
@@ -637,6 +640,7 @@ impl CliArgs {
             .dp_aware(self.dp_aware)
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
+            .enable_wasm(self.enable_wasm)
             .igw(self.enable_igw);
 
         builder.build()
@@ -691,8 +695,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", version::get_version_string());
             return Ok(());
         }
-        if arg == "-v" {
-            println!("{}", version::get_short_version_string());
+        if arg == "--version-verbose" {
+            println!("{}", version::get_verbose_version_string());
             return Ok(());
         }
     }

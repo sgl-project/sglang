@@ -334,26 +334,54 @@ impl RouterTrait for RouterManager {
     }
 
     async fn get_models(&self, _req: Request<Body>) -> Response {
-        let models = self.worker_registry.get_models();
+        let model_names = self.worker_registry.get_models();
 
-        if models.is_empty() {
+        if model_names.is_empty() {
             (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
         } else {
+            // Convert model names to OpenAI-compatible model objects
+            let models: Vec<Value> = model_names
+                .iter()
+                .map(|name| {
+                    serde_json::json!({
+                        "id": name,
+                        "object": "model",
+                        "owned_by": "local"
+                    })
+                })
+                .collect();
+
             (
                 StatusCode::OK,
-                serde_json::json!({ "models": models }).to_string(),
+                serde_json::json!({
+                    "object": "list",
+                    "data": models
+                })
+                .to_string(),
             )
                 .into_response()
         }
     }
 
-    async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        // TODO: Extract model from request and route to appropriate router
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Model info endpoint not yet implemented in RouterManager",
-        )
-            .into_response()
+    async fn get_model_info(&self, req: Request<Body>) -> Response {
+        // Route to default router or first available router
+        let router_id = {
+            let default_router = self.default_router.read().unwrap();
+            default_router.clone()
+        };
+
+        let router = if let Some(id) = router_id {
+            self.routers.get(&id).map(|r| r.clone())
+        } else {
+            // If no default, use first available router
+            self.routers.iter().next().map(|r| r.value().clone())
+        };
+
+        if let Some(router) = router {
+            router.get_model_info(req).await
+        } else {
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
+        }
     }
 
     async fn route_generate(
@@ -543,178 +571,6 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 "No router available for rerank request",
-            )
-                .into_response()
-        }
-    }
-
-    // Conversations API delegates
-    async fn create_conversation(&self, headers: Option<&HeaderMap>, body: &Value) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router.create_conversation(headers, body).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                "No router available to create conversation",
-            )
-                .into_response()
-        }
-    }
-
-    async fn get_conversation(
-        &self,
-        headers: Option<&HeaderMap>,
-        conversation_id: &str,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router.get_conversation(headers, conversation_id).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "No router available to get conversation '{}'",
-                    conversation_id
-                ),
-            )
-                .into_response()
-        }
-    }
-
-    async fn update_conversation(
-        &self,
-        headers: Option<&HeaderMap>,
-        conversation_id: &str,
-        body: &Value,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router
-                .update_conversation(headers, conversation_id, body)
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "No router available to update conversation '{}'",
-                    conversation_id
-                ),
-            )
-                .into_response()
-        }
-    }
-
-    async fn delete_conversation(
-        &self,
-        headers: Option<&HeaderMap>,
-        conversation_id: &str,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router.delete_conversation(headers, conversation_id).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "No router available to delete conversation '{}'",
-                    conversation_id
-                ),
-            )
-                .into_response()
-        }
-    }
-
-    async fn list_conversation_items(
-        &self,
-        headers: Option<&HeaderMap>,
-        conversation_id: &str,
-        limit: Option<usize>,
-        order: Option<String>,
-        after: Option<String>,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router
-                .list_conversation_items(headers, conversation_id, limit, order, after)
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "No router available to list conversation items for '{}'",
-                    conversation_id
-                ),
-            )
-                .into_response()
-        }
-    }
-
-    async fn create_conversation_items(
-        &self,
-        headers: Option<&HeaderMap>,
-        conversation_id: &str,
-        body: &Value,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router
-                .create_conversation_items(headers, conversation_id, body)
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "No router available to create conversation items for '{}'",
-                    conversation_id
-                ),
-            )
-                .into_response()
-        }
-    }
-
-    async fn get_conversation_item(
-        &self,
-        headers: Option<&HeaderMap>,
-        conversation_id: &str,
-        item_id: &str,
-        include: Option<Vec<String>>,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router
-                .get_conversation_item(headers, conversation_id, item_id, include)
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "No router available to get conversation item '{}' in '{}'",
-                    item_id, conversation_id
-                ),
-            )
-                .into_response()
-        }
-    }
-
-    async fn delete_conversation_item(
-        &self,
-        headers: Option<&HeaderMap>,
-        conversation_id: &str,
-        item_id: &str,
-    ) -> Response {
-        let router = self.select_router_for_request(headers, None);
-        if let Some(router) = router {
-            router
-                .delete_conversation_item(headers, conversation_id, item_id)
-                .await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "No router available to delete conversation item '{}' in '{}'",
-                    item_id, conversation_id
-                ),
             )
                 .into_response()
         }
