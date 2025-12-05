@@ -659,7 +659,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         req.start_send_idx = end_idx
         state_indices = None
-        if last_chunk:
+        if last_chunk and self.pp_group.is_last_rank:
             self.disagg_metadata_buffers.set_buf(req)
 
             # Prepare extra pool indices for hybrid models
@@ -743,3 +743,77 @@ class SchedulerDisaggregationPrefillMixin:
                 src=self.attn_tp_group.ranks[0],
             )
         return data
+
+    def process_batch_result_pp_disagg_prefill(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ) -> None:
+        """
+        Split sending kv and processing batch result for PP disaggregation prefill
+        Adapted from process_batch_result_disagg_prefill
+        """
+        next_token_ids = result.next_token_ids.tolist()
+
+        for i, (req, next_token_id) in enumerate(
+            zip(batch.reqs, next_token_ids, strict=True)
+        ):
+            if req.is_chunked <= 0:
+                if not self.pp_group.is_last_rank:
+                    req.output_ids.append(next_token_id)
+                req.add_latency(RequestStage.PREFILL_FORWARD)
+                trace_slice(RequestStage.PREFILL_FORWARD, req.rid, auto_next_anon=True)
+                if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
+                    req.output_topk_p = batch.spec_info.topk_p[i]
+                    req.output_topk_index = batch.spec_info.topk_index[i]
+                    req.hidden_states_tensor = (
+                        batch.spec_info.hidden_states[i].cpu().clone()
+                    )
+                else:
+                    req.hidden_states_tensor = None
+
+                req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
+
+                if req.grammar is not None:
+                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    try:
+                        req.grammar.accept_token(next_token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        error_message = f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        release_kv_cache(req, self.tree_cache)
+                        prepare_abort(
+                            req,
+                            error_message,
+                            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                        )
+                    req.grammar.finished = req.finished()
+            else:
+                # being chunked reqs' prefill is not finished
+                req.is_chunked -= 1
+                trace_slice(
+                    RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
+                )
+
+        self.maybe_send_health_check_signal()
+
+    def send_kv_chunk_pp_disagg_prefill(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        """
+        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
+        """
+        if self.pp_group.is_last_rank:
+            output_ids = result.next_token_ids.tolist()
+
+        for i, req in enumerate(batch.reqs):
+            req: Req
+            if req.is_chunked <= 0:
+                if self.pp_group.is_last_rank:
+                    req.output_ids.append(output_ids[i])
+                self.tree_cache.cache_unfinished_req(req)
+                self.disagg_prefill_inflight_queue.append(req)
+                self.send_kv_chunk(req, last_chunk=True)
