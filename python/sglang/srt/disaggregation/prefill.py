@@ -395,14 +395,19 @@ class SchedulerDisaggregationPrefillMixin:
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
     
-    def notify_prefill_done(self: Scheduler,batch: ScheduleBatch,result: GenerationBatchResult) -> None:
+    def notify_prefill_done(self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult) -> None:
         for i, req in enumerate(batch.reqs):
             if hasattr(req.disagg_kv_sender, "result"):
                 if req.disagg_kv_sender.result is None:
                     req.disagg_kv_sender.result = (batch.copy(), result)
                     self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
-                # else:
-                #     assert req.rid == self.chunked_req.rid
+                else:
+                    # 检查chunked_req是否存在，如果不存在说明这是最后一个chunk
+                    if self.chunked_req is not None:
+                        assert req.rid == self.chunked_req.rid
+                    else:
+                        # 最后一个chunk的情况，直接发送
+                        self.send_kv_chunk(req, last_chunk=True)
             else:
                 continue
                 
