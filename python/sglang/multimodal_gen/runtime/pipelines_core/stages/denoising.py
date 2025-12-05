@@ -297,6 +297,30 @@ class DenoisingStage(PipelineStage):
 
         return reserved_frames_mask_sp, z_sp
 
+    def _handle_boundary_ratio(
+        self,
+        server_args,
+        batch,
+    ):
+        """
+        (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
+        """
+        boundary_ratio = server_args.pipeline_config.dit_config.boundary_ratio
+        if batch.boundary_ratio is not None:
+            logger.info(
+                "Overriding boundary ratio from %s to %s",
+                boundary_ratio,
+                batch.boundary_ratio,
+            )
+            boundary_ratio = batch.boundary_ratio
+
+        if boundary_ratio is not None:
+            boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+        else:
+            boundary_timestep = None
+
+        return boundary_timestep
+
     def _prepare_denoising_loop(self, batch: Req, server_args: ServerArgs):
         """
         Prepare all necessary invariant variables for the denoising loop.
@@ -362,20 +386,7 @@ class DenoisingStage(PipelineStage):
             assert neg_prompt_embeds is not None
             # Removed Tensor truthiness assert to avoid GPU sync
 
-        # (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
-        boundary_ratio = server_args.pipeline_config.dit_config.boundary_ratio
-        if batch.boundary_ratio is not None:
-            logger.info(
-                "Overriding boundary ratio from %s to %s",
-                boundary_ratio,
-                batch.boundary_ratio,
-            )
-            boundary_ratio = batch.boundary_ratio
-
-        if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
-        else:
-            boundary_timestep = None
+        boundary_timestep = self._handle_boundary_ratio(server_args, batch)
 
         # specifically for Wan2_2_TI2V_5B_Config, not applicable for FastWan2_2_TI2V_5B_Config
         should_preprocess_for_wan_ti2v = (
