@@ -140,8 +140,12 @@ def _compile_deep_gemm_one_type_all(
         required_memory = _BaseWarmupExecutor.get_memory_requirement(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
+        logger.info(f"Required memory for warmup: {required_memory}GB")
         if memory_budget < required_memory:
             # TODO: Maybe compute the max_m based on the memory budget
+            logger.warning(
+                f"Available memory {memory_budget}GB is less than required memory {required_memory}GB for warmup, reducing max_m to 4096 to avoid out of memory"
+            )
             max_m = 4096
             m_list = [m for m in m_list if m <= max_m]
 
