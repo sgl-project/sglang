@@ -306,8 +306,8 @@ class Scheduler(
         # Init moe config
         self.init_moe_config()
 
-        # Init FP8 GEMM config
-        self.init_fp8_gemm_config()
+        # Init GEMM config (FP8 GEMM, etc.)
+        self.init_gemm_config()
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -967,9 +967,10 @@ class Scheduler(
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 
-    def init_fp8_gemm_config(self):
-        # Initialize FP8 GEMM backend configuration
-        # This is needed for FP8 quantization which can be used independently of MoE
+    def init_gemm_config(self):
+        # Initialize GEMM-related configuration (currently FP8 Blockwise GEMM backend).
+        # Other GEMM backends (e.g. FP4, BF16, etc.) can be added here in the future.
+        # This is needed for FP8 quantization.
         initialize_fp8_gemm_config(self.server_args)
 
     @DynamicGradMode()
