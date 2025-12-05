@@ -1,19 +1,13 @@
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.triton_ops import (
+from sglang.srt.lora.triton_ops import (  # ############################; ########cuda lora###########
+    embedding_extra_tokens_modified,
+    embedding_lora_a_fwd,
     gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
-    #############################
-    #########cuda lora###########
-    #############################
-    embedding_lora_a_fwd,
-    embedding_extra_tokens_modified,
-    #############################
-    #############################
-    #############################
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,13 +28,13 @@ class TritonLoRABackend(BaseLoRABackend):
     #########cuda lora###########
     #############################
     def run_lora_a_embedding(
-        self, 
+        self,
         input_ids: torch.Tensor,
         weights: torch.Tensor,
         vocab_size: int,
         extra_embeddings: torch.Tensor = None,
-        *args, 
-        **kwargs
+        *args,
+        **kwargs,
     ) -> torch.Tensor:
         """Run LoRA A embedding lookup using Triton kernel."""
         return embedding_lora_a_fwd(
@@ -50,7 +44,7 @@ class TritonLoRABackend(BaseLoRABackend):
             vocab_size=vocab_size,
             extra_embeddings=extra_embeddings,
         )
-    
+
     def run_extra_token_embedding(
         self,
         input_ids: torch.Tensor,
@@ -68,10 +62,11 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info=self.batch_info,
             vocab_size=vocab_size,
         )
+
     #############################
     #############################
     #############################
-    
+
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:

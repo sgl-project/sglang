@@ -22,6 +22,10 @@ import torch
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
@@ -39,10 +43,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
-
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
-
-
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
-        self.lora_added_tokens_size: Optional[int] = None 
+        self.lora_added_tokens_size: Optional[int] = None
 
         # Store eviction policy from server args
         self.eviction_policy = server_args.lora_eviction_policy
@@ -249,8 +249,8 @@ class LoRAManager:
             lora_adapters=self.loras,
             lora_modules=self.lora_modules,
             lora_refs=self.lora_refs.copy(),  # copy snapshot of current lora_refs to avoid mutation during the batch preparation.
-            lora_embed_tokens_module=self.embed_tokens_module, #merge into embedding or lora module
-            lora_lm_head_module=self.lm_head_module, #merge into embedding or lora module
+            lora_embed_tokens_module=self.embed_tokens_module,  # merge into embedding or lora module
+            lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
 
         # set up batch info shared by all lora modules
@@ -306,11 +306,13 @@ class LoRAManager:
         # Update embedding layer if present - gotta merge (refer to PR codebase)
         if self.embed_tokens_module is not None:
             self.embed_tokens_module.set_lora_info(
-                self.memory_pool.get_embedding_tensor("added_tokens", LoRAType.LORA_A), #choose name: "added_tokens"
+                self.memory_pool.get_embedding_tensor(
+                    "added_tokens", LoRAType.LORA_A
+                ),  # choose name: "added_tokens"
                 self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_A),
                 self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_B),
             )
-        
+
         # Update lm_head layer if present
         if self.lm_head_module is not None:
             self.lm_head_module.set_lora_info(
@@ -411,14 +413,18 @@ class LoRAManager:
                 [x.r for x in self.configs.values()],
                 default=0,
             )
-        
+
         # Auto-infer self.lora_added_vocab_size from loaded LoRA configs
         # This happens automatically without requiring user input
         # if self.lora_added_vocab_size is None:
         if self.lora_added_tokens_size is None:
             inferred_extra_vocab_size = next(
-                (x.lora_added_tokens_size for x in self.configs.values() if x.lora_added_tokens_size > 0),
-                0
+                (
+                    x.lora_added_tokens_size
+                    for x in self.configs.values()
+                    if x.lora_added_tokens_size > 0
+                ),
+                0,
             )
             if inferred_extra_vocab_size > 0:
                 logger.info(
@@ -452,7 +458,7 @@ class LoRAManager:
             target_modules=self.target_modules,
             base_model=self.base_model,
             eviction_policy=self.eviction_policy,
-            lora_added_tokens_size = self.lora_added_tokens_size
+            lora_added_tokens_size=self.lora_added_tokens_size,
         )
 
     def set_lora_module(self, module_name, module):
@@ -482,16 +488,20 @@ class LoRAManager:
 
             # Handle embed_tokens
             if "embed_tokens" in module_name and "embed_tokens" in self.target_modules:
-                if isinstance(module, VocabParallelEmbedding) and not isinstance(module, BaseLayerWithLoRA):
+                if isinstance(module, VocabParallelEmbedding) and not isinstance(
+                    module, BaseLayerWithLoRA
+                ):
                     lora_module = self.set_lora_module(module_name, module)
-                    self.embed_tokens_module = lora_module 
+                    self.embed_tokens_module = lora_module
                     continue
-            
+
             # Handle lm_head
             if "lm_head" in module_name and "lm_head" in self.target_modules:
-                if isinstance(module, ParallelLMHead) and not isinstance(module, BaseLayerWithLoRA):
+                if isinstance(module, ParallelLMHead) and not isinstance(
+                    module, BaseLayerWithLoRA
+                ):
                     lora_module = self.set_lora_module(module_name, module)
-                    self.lm_head_module = lora_module 
+                    self.lm_head_module = lora_module
                     continue
 
             # The module should be converted if it is included in target_names

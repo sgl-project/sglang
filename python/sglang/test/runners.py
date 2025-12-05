@@ -427,14 +427,18 @@ class HFRunner:
 
             if lora_paths is not None and lora_paths[i] is not None:
                 from peft import PeftConfig, PeftModel
+
                 from sglang.srt.lora.lora_config import LoRAConfig
 
                 peft_config = PeftConfig.from_pretrained(lora_paths[i])
                 lora_config = LoRAConfig(lora_paths[i])
-                if "embed_tokens" in peft_config.target_modules and lora_config.lora_added_tokens_size > 0:
+                if (
+                    "embed_tokens" in peft_config.target_modules
+                    and lora_config.lora_added_tokens_size > 0
+                ):
                     new_tokenizer = get_tokenizer(lora_paths[i])
                     base_model.resize_token_embeddings(len(new_tokenizer))
-                    tokenizer = new_tokenizer 
+                    tokenizer = new_tokenizer
 
                 model = PeftModel.from_pretrained(
                     base_model,

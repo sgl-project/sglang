@@ -46,7 +46,11 @@ class LoRAType(Enum):
 
 
 def get_hidden_dim(
-    module_name: str, config: AutoConfig, base_model: torch.nn.Module, layer_idx: int, lora_added_vocab_size: int = 0
+    module_name: str,
+    config: AutoConfig,
+    base_model: torch.nn.Module,
+    layer_idx: int,
+    lora_added_vocab_size: int = 0,
 ) -> Tuple[int]:
     """
     Given a module_name (might be a stacked name), return the hidden dims of modules' input and output.
@@ -143,6 +147,7 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
     raise ValueError(
         f"Cannot find target module name for {full_module_name} in {target_modules}"
     )
+
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
 ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj"]

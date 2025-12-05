@@ -1,7 +1,8 @@
-import torch
-from torch import nn
-import torch.nn.functional as F
 from typing import Optional
+
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -15,7 +16,10 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo
 
@@ -49,7 +53,7 @@ class BaseLayerWithLoRA(nn.Module):
 class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
     """
     Vocab parallel embedding layer with LoRA support (simplified for TP=1, no extra tokens).
-    
+
     For embedding layers: output = base_embedding(x) + lora_B @ lora_A[x]
     where lora_A[x] is direct embedding lookup from lora_A weights.
     """
@@ -66,7 +70,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
     def set_lora_info(
         self,
-        new_embeddings_buffer: Optional[torch.Tensor],  # For extra tokens 
+        new_embeddings_buffer: Optional[torch.Tensor],  # For extra tokens
         embedding_A_buffer: torch.Tensor,
         embedding_B_buffer: torch.Tensor,
     ):
@@ -86,7 +90,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
         # Efficient embedding lookup for LoRA A (cannot call run_lora_a_sgemm since needing index lookup)
         lora_a_output = self.run_lora_a_embedding(input_, batch_info)
-        
+
         # Apply LoRA B weights using backend
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
@@ -95,38 +99,43 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
-
     def run_lora_a_embedding(
         self, input_: torch.Tensor, batch_info: LoRABatchInfo
     ) -> torch.Tensor:
         """
         Apply LoRA A weights using efficient embedding lookup with CUDA graph support.
         Maps tokens to their corresponding LoRA adapters internally.
-        It also includes added/extra token processing. 
+        It also includes added/extra token processing.
         """
         lora_a_output = self.lora_backend.run_lora_a_embedding(
             input_ids=input_,
             weights=self.embedding_A_buffer,
             vocab_size=self.vocab_size,
-            extra_embeddings=self.new_embeddings_buffer if hasattr(self, 'new_embeddings_buffer') and self.new_embeddings_buffer is not None else None,
+            extra_embeddings=(
+                self.new_embeddings_buffer
+                if hasattr(self, "new_embeddings_buffer")
+                and self.new_embeddings_buffer is not None
+                else None
+            ),
         )
 
-        return lora_a_output 
+        return lora_a_output
 
-    
-    def extra_token_embedding(self, input_: torch.Tensor, base_output: torch.Tensor) -> torch.Tensor:
+    def extra_token_embedding(
+        self, input_: torch.Tensor, base_output: torch.Tensor
+    ) -> torch.Tensor:
         """
         Process extra tokens (tokens >= vocab_size) by looking up their embeddings
         from the new_embeddings_buffer and replacing them in base_output.
-        
+
         Args:
             input_: (s,) token IDs
             base_output: (s, embed_dim) base embedding output to be modified in-place
-            
+
         Returns:
             base_output: (s, embed_dim) modified output with extra token embeddings
         """
-        
+
         output_base_output = self.lora_backend.run_extra_token_embedding(
             input_ids=input_,
             output=base_output,
@@ -134,25 +143,24 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             vocab_size=self.vocab_size,
         )
 
-        return output_base_output 
-    
+        return output_base_output
 
     def forward(self, input_: torch.Tensor):
         """
         Forward pass with LoRA support and CUDA graph compatibility.
-        
+
         Extra tokens (tokens >= vocab_size) are now handled efficiently
         in the backend's run_lora_a_embedding method.
         """
         batch_info = self.lora_backend.batch_info
-        
+
         # Get base embedding output
         # For tokens >= vocab_size, base_layer will clamp or handle them
         # We mask them to 0 to avoid out-of-bounds access
         added_tokens_mask = input_ > self.vocab_size - 1
         base_output = self.base_layer.forward(input_.masked_fill(added_tokens_mask, 0))
 
-        # Extra tokens - It will replace extra token embedding with self.new_embeddings_buffer's emb (Default is 0)  
+        # Extra tokens - It will replace extra token embedding with self.new_embeddings_buffer's emb (Default is 0)
         base_output = self.extra_token_embedding(input_, base_output)
 
         # Apply LoRA if configured
@@ -164,7 +172,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
             output = base_output
 
         return output
-
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
@@ -178,14 +185,11 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         # For TP>1, Need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
         return B
 
-        
-
-        
 
 class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     """
     Parallel LM Head layer with LoRA support (simplified for TP=1).
-    
+
     The LM head computes logits = hidden_states @ (W + B @ A)^T
     """
 
@@ -214,7 +218,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     ) -> torch.Tensor:
         """
         Apply LoRA to LM head layer.
-        
+
         For LM head: output = hidden @ (W + B @ A)^T
                            = hidden @ W^T + hidden @ A^T @ B^T
                            = base_output + (hidden @ A^T) @ B^T
@@ -223,28 +227,26 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
             hidden_states, self.lm_head_A_buffer
         )
-        
+
         # Apply lora_B^T: lora_a_output @ B^T
         lora_output = self.lora_backend.run_lora_b_sgemm(
             x=lora_a_output,
             weights=self.lm_head_B_buffer,
             base_output=base_output,
         )
-        
+
         return lora_output
 
     def forward(self, hidden_states: torch.Tensor):
         # Apply base linear transformation
         base_output = F.linear(
-            hidden_states, 
-            self.weight, 
-            bias=getattr(self.base_layer, 'bias', None)
+            hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
         )
-        
+
         # Apply LoRA if set
         if self.set_lora:
             base_output = self.apply_lora(base_output, hidden_states)
-        
+
         return base_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
@@ -421,7 +423,7 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
             output_offset_cpu=self.output_offset_cpu,
             max_qkv_out_dim=self.max_qkv_out_dim,
         )
-        
+
         return lora_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):

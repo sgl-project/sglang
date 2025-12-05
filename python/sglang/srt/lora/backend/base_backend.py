@@ -18,7 +18,7 @@ class BaseLoRABackend:
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
-    
+
     #############################
     #########cuda lora###########
     #############################
@@ -32,14 +32,14 @@ class BaseLoRABackend:
         **kwargs,
     ) -> torch.Tensor:
         """Run LoRA A embedding lookup with CUDA graph support.
-        
+
         Args:
             input_ids: token IDs with shape (s,), where s is the sum of all sequence lengths
             weights: LoRA A embedding weights with shape (num_loras, rank, vocab_size)
             vocab_size: base vocabulary size (tokens >= vocab_size are extra tokens)
             extra_embeddings: extra token embeddings with shape (num_loras, num_extra_tokens, rank)
             Only needed if there are added tokens beyond base vocabulary.
-        
+
         Returns:
             result with shape (s, rank)
         """
@@ -56,17 +56,18 @@ class BaseLoRABackend:
     ) -> torch.Tensor:
         """
         Apply extra token embeddings to output in-place.
-        
+
         Args:
             input_ids: (s,) token IDs
             output: (s, embed_dim) output tensor to be modified
             extra_embeddings: (num_loras, num_extra_tokens, embed_dim) extra embeddings
             vocab_size: base vocabulary size
-        
+
         Returns:
             output: modified output tensor
         """
         raise NotImplementedError
+
     #############################
     #############################
     #############################

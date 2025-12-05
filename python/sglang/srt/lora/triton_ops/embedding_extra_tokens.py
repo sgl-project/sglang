@@ -4,6 +4,7 @@
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -37,34 +38,34 @@ def _embedding_extra_tokens_kernel(
     """
     batch_id = tl.program_id(axis=1)
     token_idx = tl.program_id(axis=0)
-    
+
     w_index = tl.load(weight_indices + batch_id)
     seg_start = tl.load(seg_indptr + batch_id)
     seg_len = tl.load(seg_lens + batch_id)
-    
+
     # Check if this token is within the segment
     if token_idx >= seg_len:
         return
-    
+
     # Load the token ID
     token_id = tl.load(input_ids + seg_start + token_idx)
-    
+
     # Check if this is an extra token
     is_extra_token = token_id >= vocab_size
-    
+
     if not is_extra_token:
         return  # Skip non-extra tokens
-    
+
     # Calculate extra token ID
     extra_token_id = token_id - vocab_size
-    
+
     # Process in chunks of BLOCK_EMBED dimensions
     num_blocks = tl.cdiv(embed_dim, BLOCK_EMBED)
-    
+
     for block_id in range(num_blocks):
         embed_offset = tl.arange(0, BLOCK_EMBED) + block_id * BLOCK_EMBED
         embed_mask = embed_offset < embed_dim
-        
+
         # Load from extra embeddings
         # extra_embeddings shape: (num_loras, num_extra_tokens, embed_dim)
         extra_emb_ptr = (
@@ -74,7 +75,7 @@ def _embedding_extra_tokens_kernel(
             + embed_offset * extra_emb_stride_2
         )
         emb_values = tl.load(extra_emb_ptr, mask=embed_mask, other=0.0)
-        
+
         # Write to output (overwrite the position)
         output_ptr = (
             output
@@ -93,14 +94,14 @@ def embedding_extra_tokens_modified(
 ) -> torch.Tensor:
     """
     Forward pass for extra token embedding lookup (in-place operation).
-    
+
     Args:
         input_ids: (s,) token IDs
         output: (s, embed_dim) output tensor to be modified in-place
         extra_embeddings: (num_loras, num_extra_tokens, embed_dim) extra token embeddings
         batch_info: LoRABatchInfo containing batch information
         vocab_size: base vocabulary size
-        
+
     Returns:
         output: (s, embed_dim) modified output tensor
     """
@@ -110,26 +111,26 @@ def embedding_extra_tokens_modified(
     assert len(input_ids.shape) == 1
     assert len(output.shape) == 2
     assert len(extra_embeddings.shape) == 3
-    
+
     S = input_ids.shape[0]
     embed_dim = output.shape[1]
     num_loras = extra_embeddings.shape[0]
-    
+
     # Block size for embedding dimension
     BLOCK_EMBED = 128
-    
+
     extra_emb_stride = (
         extra_embeddings.stride(0),
         extra_embeddings.stride(1),
         extra_embeddings.stride(2),
     )
-    
+
     # Grid: one program per token in each batch segment
     grid = (
         batch_info.max_len,
         batch_info.bs,
     )
-    
+
     _embedding_extra_tokens_kernel[grid](
         input_ids,
         output,
@@ -147,8 +148,10 @@ def embedding_extra_tokens_modified(
         batch_info.weight_indices,
         BLOCK_EMBED,
     )
-    
+
     return output
+
+
 #############################
 #############################
 #############################

@@ -54,14 +54,14 @@ class LoRAConfig:
             weights_dir = snapshot_download(self.path, allow_patterns=["*.json"])
         else:
             weights_dir = self.path
-        
+
         # Construct the path to added_tokens.json
         added_tokens_path = os.path.join(weights_dir, "added_tokens.json")
-        
+
         # Return None if the file doesn't exist (optional for standard LoRA adapters)
         if not os.path.exists(added_tokens_path):
             return None
-        
+
         # Load and return the added tokens
         try:
             with open(added_tokens_path, "r") as f:
@@ -69,6 +69,7 @@ class LoRAConfig:
         except json.JSONDecodeError as e:
             # Log warning but don't crash if JSON is malformed
             import logging
+
             logger = logging.getLogger(__name__)
             logger.warning(f"Failed to parse added_tokens.json: {e}")
             return None
