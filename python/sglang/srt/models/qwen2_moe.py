@@ -71,11 +71,20 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, make_layers
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    make_layers,
+    use_intel_amx_backend,
+)
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -189,7 +198,16 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
         else:
             self.shared_expert = None
-        self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
+        if _is_cpu and _is_cpu_amx_available:
+            self.shared_expert_gate = ReplicatedLinear(
+                config.hidden_size,
+                1,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("shared_expert_gate", prefix),
+            )
+        else:
+            self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         if get_moe_a2a_backend().is_deepep():
             # TODO: we will support tp < ep in the future
@@ -211,9 +229,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if self.shared_expert is not None:
             shared_output = self.shared_expert(hidden_states)
             if self.shared_expert_gate is not None:
-                shared_output = (
-                    F.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-                )
+                if use_intel_amx_backend(self.shared_expert_gate):
+                    shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
+                        hidden_states,
+                        self.shared_expert_gate.weight,
+                        self.shared_expert_gate.bias,
+                        True,
+                        shared_output,
+                    )
+                else:
+                    shared_output = (
+                        F.sigmoid(self.shared_expert_gate(hidden_states))
+                        * shared_output
+                    )
+
         return shared_output
 
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):

@@ -7,12 +7,15 @@
 //! - Multi-turn tool execution loops
 //! - SSE (Server-Sent Events) streaming
 
+mod context;
 pub mod conversations;
 pub mod mcp;
+pub mod provider;
 mod responses;
 mod router;
 mod streaming;
 mod utils;
 
-// Re-export the main router type for external use
+// Re-export the main types for external use
+pub use provider::{Provider, ProviderError, ProviderRegistry};
 pub use router::OpenAIRouter;

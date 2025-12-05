@@ -123,6 +123,15 @@ pub struct ModelCard {
     #[serde(default = "default_model_type")]
     pub model_type: ModelType,
 
+    /// HuggingFace model type string (e.g., "llama", "qwen2", "gpt-oss")
+    /// This is different from `model_type` which is capability bitflags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hf_model_type: Option<String>,
+
+    /// Model architectures from HuggingFace config (e.g., ["LlamaForCausalLM"])
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub architectures: Vec<String>,
+
     /// Provider hint for API transformations.
     /// `None` means native/passthrough (no transformation needed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +181,8 @@ impl ModelCard {
             display_name: None,
             aliases: Vec::new(),
             model_type: ModelType::LLM,
+            hf_model_type: None,
+            architectures: Vec::new(),
             provider: None,
             context_length: None,
             tokenizer_path: None,
@@ -205,6 +216,18 @@ impl ModelCard {
     /// Set the model type (capabilities)
     pub fn with_model_type(mut self, model_type: ModelType) -> Self {
         self.model_type = model_type;
+        self
+    }
+
+    /// Set the HuggingFace model type string
+    pub fn with_hf_model_type(mut self, hf_model_type: impl Into<String>) -> Self {
+        self.hf_model_type = Some(hf_model_type.into());
+        self
+    }
+
+    /// Set the model architectures
+    pub fn with_architectures(mut self, architectures: Vec<String>) -> Self {
+        self.architectures = architectures;
         self
     }
 

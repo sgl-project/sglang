@@ -718,6 +718,10 @@ class RouterArgs:
         if not selector_list:
             return {}
 
+        # Support `- --selector\n- a=b c=d` case
+        if len(selector_list) == 1 and (" " in selector_list[0]):
+            selector_list = selector_list[0].split(" ")
+
         selector = {}
         for item in selector_list:
             if "=" in item:

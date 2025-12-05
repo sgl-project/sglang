@@ -7,8 +7,10 @@ import torch
 import torch_npu
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+    is_mla_preprocess_enabled,
+)
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_preprocess_enabled
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
@@ -105,9 +107,11 @@ class AscendAttnMaskBuilder:
             )
         else:
             mask_value = torch.finfo(torch.float32).min if dtype == torch.float16 else 1
-        attn_mask = torch.zeros(
-            size=(max_seq_len, max_seq_len), dtype=dtype
-        ).masked_fill_(mask_flag, mask_value)
+        attn_mask = (
+            torch.zeros(size=(max_seq_len, max_seq_len))
+            .masked_fill_(mask_flag, mask_value)
+            .to(dtype)
+        )
         return attn_mask
 
     @staticmethod

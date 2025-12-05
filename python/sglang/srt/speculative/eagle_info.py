@@ -38,9 +38,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_npu, next_power_of_2
-
-_is_npu = is_npu()
+from sglang.srt.utils import is_cuda, next_power_of_2
 
 if is_cuda():
     from sgl_kernel import (
@@ -77,22 +75,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
     @classmethod
     def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
-        if not _is_npu:
-            device = "cuda"
-        else:
-            device = "npu"
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device=device),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
-            positions=torch.empty((0,), dtype=torch.int64, device=device),
+            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
+            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
             retrive_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device=device
+                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
             retrive_cum_len=None,
             topk=topk,
@@ -282,7 +276,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, accept_length = verify_tree_greedy_func(

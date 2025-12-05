@@ -9,7 +9,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use serde_json::Value;
 
 use crate::protocols::{
     chat::ChatCompletionRequest,
@@ -21,11 +20,12 @@ use crate::protocols::{
     responses::{ResponsesGetParams, ResponsesRequest},
 };
 
+pub mod conversations;
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
-pub mod openai; // New refactored OpenAI router module
+pub mod openai;
 pub mod router_manager;
 
 pub use factory::RouterFactory;
@@ -140,112 +140,6 @@ pub trait RouterTrait: Send + Sync + Debug {
         body: &RerankRequest,
         model_id: Option<&str>,
     ) -> Response;
-
-    // Conversations API
-    async fn create_conversation(&self, _headers: Option<&HeaderMap>, _body: &Value) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations create endpoint not implemented",
-        )
-            .into_response()
-    }
-
-    async fn get_conversation(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations get endpoint not implemented",
-        )
-            .into_response()
-    }
-
-    async fn update_conversation(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _body: &Value,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations update endpoint not implemented",
-        )
-            .into_response()
-    }
-
-    async fn delete_conversation(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversations delete endpoint not implemented",
-        )
-            .into_response()
-    }
-
-    /// List items for a conversation
-    async fn list_conversation_items(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _limit: Option<usize>,
-        _order: Option<String>,
-        _after: Option<String>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversation items list endpoint not implemented",
-        )
-            .into_response()
-    }
-
-    /// Create items in a conversation
-    async fn create_conversation_items(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _body: &Value,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversation items create endpoint not implemented",
-        )
-            .into_response()
-    }
-
-    /// Get a single conversation item
-    /// The `include` parameter is accepted but not yet implemented
-    async fn get_conversation_item(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _item_id: &str,
-        _include: Option<Vec<String>>,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversation item get endpoint not implemented",
-        )
-            .into_response()
-    }
-
-    /// Delete a conversation item
-    async fn delete_conversation_item(
-        &self,
-        _headers: Option<&HeaderMap>,
-        _conversation_id: &str,
-        _item_id: &str,
-    ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Conversation item delete endpoint not implemented",
-        )
-            .into_response()
-    }
 
     /// Get router type name
     fn router_type(&self) -> &'static str;

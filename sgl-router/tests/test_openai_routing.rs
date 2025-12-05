@@ -96,7 +96,9 @@ fn create_minimal_completion_request() -> CompletionRequest {
 #[tokio::test]
 async fn test_openai_router_creation() {
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec!["https://api.openai.com".to_string()], &ctx).await;
+    // Register an external worker before creating the router
+    common::test_app::register_external_worker(&ctx, "https://api.openai.com", None);
+    let router = OpenAIRouter::new(&ctx).await;
 
     assert!(router.is_ok(), "Router creation should succeed");
 
@@ -109,9 +111,8 @@ async fn test_openai_router_creation() {
 #[tokio::test]
 async fn test_openai_router_server_info() {
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec!["https://api.openai.com".to_string()], &ctx)
-        .await
-        .unwrap();
+    common::test_app::register_external_worker(&ctx, "https://api.openai.com", None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -135,9 +136,8 @@ async fn test_openai_router_models() {
     // Use mock server for deterministic models response
     let mock_server = MockOpenAIServer::new().await;
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec![mock_server.base_url()], &ctx)
-        .await
-        .unwrap();
+    common::test_app::register_external_worker(&ctx, &mock_server.base_url(), None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -209,7 +209,8 @@ async fn test_openai_router_responses_with_mock() {
     let base_url = format!("http://{}", addr);
 
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec![base_url], &ctx).await.unwrap();
+    common::test_app::register_external_worker(&ctx, &base_url, Some(vec!["gpt-4o-mini"]));
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     // Get storage from context (router uses this, not a separate storage)
     let storage = ctx.response_storage.clone();
@@ -473,7 +474,8 @@ async fn test_openai_router_responses_streaming_with_mock() {
     let base_url = format!("http://{}", addr);
 
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec![base_url], &ctx).await.unwrap();
+    common::test_app::register_external_worker(&ctx, &base_url, Some(vec!["gpt-5-nano"]));
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     // Get storage from context and seed a previous response
     let storage = ctx.response_storage.clone();
@@ -598,9 +600,8 @@ async fn test_router_factory_openai_mode() {
 #[tokio::test]
 async fn test_unsupported_endpoints() {
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec!["https://api.openai.com".to_string()], &ctx)
-        .await
-        .unwrap();
+    common::test_app::register_external_worker(&ctx, "https://api.openai.com", None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     let generate_request = GenerateRequest {
         text: Some("Hello world".to_string()),
@@ -658,8 +659,9 @@ async fn test_openai_router_chat_completion_with_mock() {
     let base_url = mock_server.base_url();
 
     let ctx = common::test_app::create_test_app_context().await;
-    // Create router pointing to mock server
-    let router = OpenAIRouter::new(vec![base_url], &ctx).await.unwrap();
+    // Register the mock server worker and create router
+    common::test_app::register_external_worker(&ctx, &base_url, None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     // Create a minimal chat completion request
     let mut chat_request = create_minimal_chat_request();
@@ -693,8 +695,9 @@ async fn test_openai_e2e_with_server() {
     let base_url = mock_server.base_url();
 
     let ctx = common::test_app::create_test_app_context().await;
-    // Create router
-    let router = OpenAIRouter::new(vec![base_url], &ctx).await.unwrap();
+    // Register the mock server worker and create router
+    common::test_app::register_external_worker(&ctx, &base_url, None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     // Create Axum app with chat completions endpoint
     let app = Router::new().route(
@@ -758,7 +761,8 @@ async fn test_openai_router_chat_streaming_with_mock() {
     let mock_server = MockOpenAIServer::new().await;
     let base_url = mock_server.base_url();
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec![base_url], &ctx).await.unwrap();
+    common::test_app::register_external_worker(&ctx, &base_url, None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     // Build a streaming chat request
     let val = json!({
@@ -797,9 +801,8 @@ async fn test_openai_router_chat_streaming_with_mock() {
 #[tokio::test]
 async fn test_openai_router_circuit_breaker() {
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec!["http://invalid-url-that-will-fail".to_string()], &ctx)
-        .await
-        .unwrap();
+    common::test_app::register_external_worker(&ctx, "http://invalid-url-that-will-fail", None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     let chat_request = create_minimal_chat_request();
 
@@ -814,19 +817,19 @@ async fn test_openai_router_circuit_breaker() {
     }
 }
 
-/// Test that Authorization header is forwarded in /v1/models
+/// Test that /v1/models returns models from registered workers' ModelCards
+///
+/// With the new worker-based design, models are returned from the WorkerRegistry
+/// and don't require calling external APIs. Auth headers are used for routing
+/// requests to workers, not for the models endpoint.
 #[tokio::test]
-async fn test_openai_router_models_auth_forwarding() {
-    // Start a mock server that requires Authorization
-    let expected_auth = "Bearer test-token".to_string();
-    let mock_server = MockOpenAIServer::new_with_auth(Some(expected_auth.clone())).await;
+async fn test_openai_router_models_from_registry() {
     let ctx = common::test_app::create_test_app_context().await;
-    let router = OpenAIRouter::new(vec![mock_server.base_url()], &ctx)
-        .await
-        .unwrap();
+    // Register a worker with the default model
+    common::test_app::register_external_worker(&ctx, "https://api.example.com", None);
+    let router = OpenAIRouter::new(&ctx).await.unwrap();
 
-    // 1) Without auth header -> expect 200 with empty model list
-    // (multi-endpoint aggregation silently skips failed endpoints)
+    // Get models - should return the registered model
     let req = Request::builder()
         .method(Method::GET)
         .uri("/models")
@@ -840,24 +843,11 @@ async fn test_openai_router_models_auth_forwarding() {
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
     let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
     assert_eq!(models["object"], "list");
-    assert_eq!(models["data"].as_array().unwrap().len(), 0); // Empty when auth fails
 
-    // 2) With auth header -> expect 200
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri("/models")
-        .header("Authorization", expected_auth)
-        .body(Body::empty())
-        .unwrap();
-
-    let response = router.get_models(req).await;
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let (_, body) = response.into_parts();
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
-    let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
-    assert_eq!(models["object"], "list");
+    // Should have the default model (gpt-3.5-turbo)
+    let data = models["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["id"], "gpt-3.5-turbo");
 }
 
 #[test]

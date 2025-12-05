@@ -13,6 +13,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcherConfig,
     CombineInput,
     CombineInputFormat,
+    DispatcherBaseHooks,
     DispatchOutput,
     DispatchOutputFormat,
 )
@@ -26,6 +27,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
+    is_blackwell,
     is_hip,
     is_npu,
     load_json_config,
@@ -56,6 +58,13 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+class DeepEPPDispatchHooks(DispatcherBaseHooks):
+
+    def __call__(self, dispatcher: BaseDispatcher):
+        for hook_fun in self.hook_dict.values():
+            hook_fun(dispatcher)
 
 
 class DeepEPNormalDispatchOutput(NamedTuple):
@@ -660,11 +669,30 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         buffer = self._get_buffer()
         overlap_args = self.overlap_args
+        meta_overlap_args = self.meta_overlap_args
 
         ctx = nullcontext()
         if overlap_args is not None:
             overlap_args.stream.wait_event(overlap_args.wait_event)
             ctx = torch.cuda.stream(overlap_args.stream)
+
+            if is_blackwell():
+                overlap_args_dict = dict(
+                    overlap=overlap_args.overlap,
+                    src_signals=overlap_args.signal,
+                    src_signal_expect_value=overlap_args.threshold,
+                )
+            else:
+                overlap_args_dict = dict(
+                    overlap=overlap_args.overlap,
+                    packed_recv_count=self.packed_recv_count,
+                    comp_signal=overlap_args.signal,
+                    block_m=meta_overlap_args["block_m"],
+                    threshold=meta_overlap_args["threshold"],
+                    num_sms=overlap_args.num_sms,
+                )
+        else:
+            overlap_args_dict = {}
 
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(
@@ -674,15 +702,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 handle=self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **(
-                    dict(
-                        overlap=overlap_args.overlap,
-                        src_signals=overlap_args.signal,
-                        src_signal_expect_value=overlap_args.threshold,
-                    )
-                    if overlap_args is not None
-                    else {}
-                ),
+                **overlap_args_dict,
             )
 
         self.packed_recv_count = self.handle = None
@@ -749,6 +769,7 @@ class DeepEPDispatcher(BaseDispatcher):
             )
 
         self._stage = _Stage.INITIAL
+        self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
     def dispatch(
         self,
@@ -756,6 +777,8 @@ class DeepEPDispatcher(BaseDispatcher):
         topk_output: TopKOutput,
     ) -> DispatchOutput:
         self.dispatch_a(hidden_states, topk_output)
+        if self._deepep_dispatch_hooks is not None:
+            self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
         return ret
 
@@ -844,3 +867,6 @@ class DeepEPDispatcher(BaseDispatcher):
             self._low_latency_dispatcher.clear_overlap_args()
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.clear_overlap_args()
+
+    def register_deepep_dispatch_hook(self, hook):
+        return self._deepep_dispatch_hooks.register_hook(hook)
