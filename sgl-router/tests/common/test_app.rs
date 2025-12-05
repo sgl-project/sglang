@@ -5,7 +5,9 @@ use reqwest::Client;
 use sgl_model_gateway::{
     app_context::AppContext,
     config::RouterConfig,
-    core::{LoadMonitor, WorkerRegistry},
+    core::{
+        BasicWorkerBuilder, LoadMonitor, ModelCard, RuntimeType, Worker, WorkerRegistry, WorkerType,
+    },
     data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     },
@@ -208,4 +210,51 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
             .build()
             .unwrap(),
     )
+}
+
+/// Register an external worker (OpenAI-compatible API endpoint) in the test AppContext.
+///
+/// This is used by tests that need to test the OpenAI router, which expects
+/// workers to be registered in the WorkerRegistry before routing requests.
+///
+/// # Arguments
+/// * `ctx` - The AppContext to register the worker in
+/// * `url` - The base URL of the external API endpoint
+/// * `models` - Optional list of model IDs this worker supports. If empty, uses "gpt-3.5-turbo" as default.
+#[allow(dead_code)]
+pub fn register_external_worker(ctx: &Arc<AppContext>, url: &str, models: Option<Vec<&str>>) {
+    let model_list: Vec<ModelCard> = models
+        .unwrap_or_else(|| vec!["gpt-3.5-turbo"])
+        .into_iter()
+        .map(ModelCard::new)
+        .collect();
+
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::External)
+            .models(model_list)
+            .build(),
+    );
+
+    ctx.worker_registry.register(worker);
+}
+
+/// Register an external worker with a custom model card that has aliases.
+///
+/// # Arguments
+/// * `ctx` - The AppContext to register the worker in
+/// * `url` - The base URL of the external API endpoint
+/// * `model_card` - A fully configured ModelCard with aliases, provider, etc.
+#[allow(dead_code)]
+pub fn register_external_worker_with_card(ctx: &Arc<AppContext>, url: &str, model_card: ModelCard) {
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::External)
+            .model(model_card)
+            .build(),
+    );
+
+    ctx.worker_registry.register(worker);
 }
