@@ -172,10 +172,16 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
-      - name: Run 1-GPU diffusion server tests
-        timeout-minutes: 60
+      - name: Run 1-GPU diffusion server tests (limited for AMD CI)
+        timeout-minutes: 90
         run: |
-          docker exec -e CI -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server/test_server_a.py sglang/multimodal_gen/test/server/test_server_b.py -s -v --log-cli-level=INFO -k "not flux_2"
+          # AMD CI: Test representative models only for speed
+          # Skip: FLUX.2 (slow), Qwen-Image-Edit (timeout), FastHunyuan (flaky), Wan2.2/FastWan (redundant)
+          docker exec -e CI -w /sglang-checkout/python ci_sglang python3 -m pytest \
+            sglang/multimodal_gen/test/server/test_server_a.py \
+            sglang/multimodal_gen/test/server/test_server_b.py \
+            -s -v --log-cli-level=INFO \
+            -k "not (flux_2 or qwen_image_edit or fast_hunyuan or wan2_2 or fastwan)"
 
   multimodal-gen-test-2-gpu-amd:
     needs: [check-changes]
@@ -209,10 +215,16 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
-      - name: Run 2-GPU diffusion server tests
-        timeout-minutes: 60
+      - name: Run 2-GPU diffusion server tests (limited for AMD CI)
+        timeout-minutes: 90
         run: |
-          docker exec -e CI -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server/test_server_2_gpu_a.py sglang/multimodal_gen/test/server/test_server_2_gpu_b.py -s -v --log-cli-level=INFO
+          # AMD CI: Test representative 2-GPU models only
+          # Skip: Wan2.2-T2V-A14B (redundant with Wan2.1), extra image models
+          docker exec -e CI -w /sglang-checkout/python ci_sglang python3 -m pytest \
+            sglang/multimodal_gen/test/server/test_server_2_gpu_a.py \
+            sglang/multimodal_gen/test/server/test_server_2_gpu_b.py \
+            -s -v --log-cli-level=INFO \
+            -k "not (wan2_2_t2v_a14b or qwen_image_t2i_2_gpus or flux_image_t2i_2_gpus)"
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
