@@ -94,10 +94,7 @@ diffusion = [
   "st_attn ==0.0.7",
   "vsa==0.0.4",
   "yunchang==0.6.3.post1",
-<<<<<<< HEAD
   "runai_model_streamer",
-=======
->>>>>>> 032e46822 (improve cache-dit support)
   "cache-dit>=1.1.4"
 ]
 
