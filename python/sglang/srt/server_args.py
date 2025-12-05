@@ -2115,7 +2115,7 @@ class ServerArgs:
             default=ServerArgs.model_loader_extra_config,
         )
         parser.add_argument(
-            "--quant-profile-path",
+            "--rl-quant-profile",
             type=str,
             default=ServerArgs.rl_quant_profile,
             help="Path to the FlashRL quantization profile. Required when using --load-format flash_rl.",
