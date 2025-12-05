@@ -834,22 +834,34 @@ class DenoisingStage(PipelineStage):
     ):
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
-            if server_args.enable_torch_compile and not self.transformer_compiled_func:
+            if (
+                server_args.enable_torch_compile
+                and not self.transformer_compiled_func
+            ):
                 current_model = self.transformer_compiled_func
             else:
                 current_model = self.transformer
-            if server_args.enable_torch_compile and not self.transformer_2_compiled_func:
+            if (
+                server_args.enable_torch_compile
+                and not self.transformer_2_compiled_func
+            ):
                 model_to_offload = self.transformer_2_compiled_func
             else:
                 model_to_offload = self.transformer_2
             current_guidance_scale = batch.guidance_scale
         else:
             # Low-noise stage
-            if server_args.enable_torch_compile and not self.transformer_2_compiled_func:
+            if (
+                server_args.enable_torch_compile
+                and not self.transformer_2_compiled_func
+            ):
                 current_model = self.transformer_2_compiled_func
             else:
                 current_model = self.transformer_2
-            if server_args.enable_torch_compile and not self.transformer_compiled_func:
+            if (
+                server_args.enable_torch_compile
+                and not self.transformer_compiled_func
+            ):
                 model_to_offload = self.transformer_compiled_func
             else:
                 model_to_offload = self.transformer
