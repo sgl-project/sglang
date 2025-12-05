@@ -1,28 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from collections.abc import Callable
 
 import torch
+from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-)
-
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-    apply_fp4_marlin_linear,
-    prepare_fp4_layer_for_marlin,
-)
+from sglang.srt.layers.attention.flashinfer_ops import flashinfer_scaled_fp4_mm
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.srt.utils import is_flashinfer_available, cutlass_fp4_supported
-import logging
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsScheme,
+)
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
-from sgl_kernel import scaled_fp4_quant, cutlass_scaled_fp4_mm
-from sglang.srt.layers.attention.flashinfer_ops import flashinfer_scaled_fp4_mm
+from sglang.srt.utils import cutlass_fp4_supported, is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 

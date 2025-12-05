@@ -5,18 +5,17 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.quantization.compressed_tensors.schemes import (
-    CompressedTensorsScheme,
-)
-
-from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-    apply_fp4_marlin_linear,
-    prepare_fp4_layer_for_marlin,
-)
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
+)
+from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsScheme,
+)
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
+    prepare_fp4_layer_for_marlin,
 )
 
 __all__ = ["CompressedTensorsW4A16Fp4"]

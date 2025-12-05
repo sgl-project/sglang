@@ -30,12 +30,12 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_moe im
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsScheme,
+    CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A16Fp4,
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
-    CompressedTensorsW4A16Fp4,
-    CompressedTensorsW4A4Fp4,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     find_matched_target,
@@ -379,7 +379,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # All conditions satisfied.
         return True
 
-    def _is_fp4a4_nvfp4(self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs):
+    def _is_fp4a4_nvfp4(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ):
         if weight_quant is None or input_quant is None:
             return False
 
@@ -418,7 +420,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         is_static = not weight_quant.dynamic
 
         return is_channel_group and input_quant_none and is_symmetric and is_static
-    
+
     def _is_fp4a16_nvfp4(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ):
@@ -475,7 +477,6 @@ class CompressedTensorsConfig(QuantizationConfig):
                         " Running CompressedTensorsW4A16Fp4."
                     )
                     return CompressedTensorsW4A16Fp4(has_input_global_scale=True)
-
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
                 is_fp8_w8a8_supported = self._check_scheme_supported(

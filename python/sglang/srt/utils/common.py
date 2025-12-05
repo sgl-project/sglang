@@ -352,7 +352,11 @@ def is_flashinfer_available():
 
 
 def cutlass_fp4_supported() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (10, 0) and torch.version.cuda >= "12.8"
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() >= (10, 0)
+        and torch.version.cuda >= "12.8"
+    )
 
 
 def is_nvidia_cublas_cu12_version_ge_12_9():
