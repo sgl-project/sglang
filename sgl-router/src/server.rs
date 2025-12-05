@@ -25,10 +25,8 @@ use crate::{
     core::{
         worker_to_info,
         workflow::{
-            create_mcp_registration_workflow, create_wasm_module_registration_workflow,
-            create_wasm_module_removal_workflow, create_worker_registration_workflow,
-            create_worker_removal_workflow, LoggingSubscriber, WorkflowEngine,
             create_external_worker_registration_workflow, create_mcp_registration_workflow,
+            create_wasm_module_registration_workflow, create_wasm_module_removal_workflow,
             create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
             WorkflowEngine,
         },

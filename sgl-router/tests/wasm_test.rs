@@ -15,7 +15,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use sglang_router_rs::{
+use sgl_model_gateway::{
     app_context::AppContext,
     config::RouterConfig,
     core::workflow::{
@@ -49,7 +49,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let client = reqwest::Client::new();
 
     // Initialize registries
-    use sglang_router_rs::{
+    use sgl_model_gateway::{
         core::{LoadMonitor, WorkerRegistry},
         data_connector::{
             MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -103,8 +103,8 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
 
     // Initialize JobQueue after AppContext is created
     let weak_context = Arc::downgrade(&app_context);
-    let job_queue = sglang_router_rs::core::JobQueue::new(
-        sglang_router_rs::core::JobQueueConfig::default(),
+    let job_queue = sgl_model_gateway::core::JobQueue::new(
+        sgl_model_gateway::core::JobQueueConfig::default(),
         weak_context,
     );
     app_context
@@ -113,7 +113,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         .expect("JobQueue should only be initialized once");
 
     // Initialize WorkflowEngine and register workflows
-    use sglang_router_rs::core::workflow::{
+    use sgl_model_gateway::core::workflow::{
         create_worker_registration_workflow, create_worker_removal_workflow, WorkflowEngine,
     };
     let engine = Arc::new(WorkflowEngine::new());
@@ -127,7 +127,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
         .expect("WorkflowEngine should only be initialized once");
 
     // Initialize MCP manager with empty config
-    use sglang_router_rs::mcp::{McpConfig, McpManager};
+    use sgl_model_gateway::mcp::{McpConfig, McpManager};
     let empty_config = McpConfig {
         servers: vec![],
         pool: Default::default(),
@@ -199,7 +199,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
 
     let app = build_app(
         app_state,
-        sglang_router_rs::middleware::AuthConfig { api_key: None },
+        sgl_model_gateway::middleware::AuthConfig { api_key: None },
         256 * 1024 * 1024,
         request_id_headers,
         vec![], // cors_allowed_origins
@@ -223,7 +223,7 @@ async fn test_wasm_api_add_module() {
             file_path: wasm_file_path.clone(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -249,7 +249,7 @@ async fn test_wasm_api_add_module() {
     let module_result = &response_json.modules[0].add_result;
 
     // Print error for debugging
-    if let Some(sglang_router_rs::wasm::module::WasmModuleAddResult::Error(err)) = module_result {
+    if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Error(err)) = module_result {
         eprintln!("Module registration failed: {}", err);
     }
 
@@ -270,7 +270,7 @@ async fn test_wasm_api_add_module() {
         let modules = wasm_manager.get_modules().expect("Failed to get modules");
         assert!(!modules.is_empty(), "Module should be registered");
 
-        if let Some(sglang_router_rs::wasm::module::WasmModuleAddResult::Success(uuid)) =
+        if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Success(uuid)) =
             module_result
         {
             let module = wasm_manager
@@ -291,7 +291,7 @@ async fn test_wasm_api_add_module_invalid_file() {
             file_path: "/nonexistent/path/to/module.component.wasm".to_string(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -323,7 +323,7 @@ async fn test_wasm_api_add_module_invalid_file() {
     assert!(module_result.is_some());
 
     // Verify it's an error result
-    if let Some(sglang_router_rs::wasm::module::WasmModuleAddResult::Error(_)) = module_result {
+    if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Error(_)) = module_result {
         // Expected error
     } else {
         panic!("Expected error result for invalid file path");
@@ -346,7 +346,7 @@ async fn test_wasm_api_add_module_invalid_wasm() {
             file_path: invalid_wasm_path.to_str().unwrap().to_string(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -378,7 +378,7 @@ async fn test_wasm_api_add_module_invalid_wasm() {
     assert!(module_result.is_some());
 
     // Verify it's an error result
-    if let Some(sglang_router_rs::wasm::module::WasmModuleAddResult::Error(_)) = module_result {
+    if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Error(_)) = module_result {
         // Expected error
     } else {
         panic!("Expected error result for invalid WASM file");
@@ -397,7 +397,7 @@ async fn test_wasm_api_list_modules() {
             file_path: wasm_file_path.clone(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -465,7 +465,7 @@ async fn test_wasm_api_remove_module() {
             file_path: wasm_file_path.clone(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -496,7 +496,7 @@ async fn test_wasm_api_remove_module() {
 
     // Get the module UUID
     let module_uuid =
-        if let Some(sglang_router_rs::wasm::module::WasmModuleAddResult::Success(uuid)) =
+        if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Success(uuid)) =
             &response_json.modules[0].add_result
         {
             *uuid
@@ -591,7 +591,7 @@ async fn test_wasm_module_duplicate_sha256() {
             file_path: wasm_file_path.clone(),
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -622,7 +622,7 @@ async fn test_wasm_module_duplicate_sha256() {
             file_path: wasm_file_path.clone(), // Same file
             module_type: WasmModuleType::Middleware,
             attach_points: vec![WasmModuleAttachPoint::Middleware(
-                sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+                sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
             )],
             add_result: None,
         }],
@@ -654,7 +654,8 @@ async fn test_wasm_module_duplicate_sha256() {
     assert!(module_result.is_some());
 
     // Verify it's an error result (duplicate)
-    if let Some(sglang_router_rs::wasm::module::WasmModuleAddResult::Error(err_msg)) = module_result
+    if let Some(sgl_model_gateway::wasm::module::WasmModuleAddResult::Error(err_msg)) =
+        module_result
     {
         assert!(
             err_msg.contains("duplicate")
@@ -683,7 +684,7 @@ async fn test_wasm_module_execution() {
         .expect("Workflow engine should be initialized");
 
     // Create workflow context for registration
-    use sglang_router_rs::core::workflow::{
+    use sgl_model_gateway::core::workflow::{
         steps::WasmModuleConfigRequest, WorkflowContext, WorkflowId, WorkflowInstanceId,
     };
 
@@ -692,7 +693,7 @@ async fn test_wasm_module_execution() {
         file_path: wasm_file_path.clone(),
         module_type: WasmModuleType::Middleware,
         attach_points: vec![WasmModuleAttachPoint::Middleware(
-            sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+            sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
         )],
         add_result: None,
     };
@@ -726,14 +727,14 @@ async fn test_wasm_module_execution() {
             .expect("Failed to get workflow status");
 
         match state.status {
-            sglang_router_rs::core::workflow::WorkflowStatus::Completed => {
+            sgl_model_gateway::core::workflow::WorkflowStatus::Completed => {
                 // Extract module UUID from context
                 if let Some(uuid_arc) = state.context.get::<Uuid>("module_uuid") {
                     module_uuid = Some(*uuid_arc.as_ref());
                 }
                 break;
             }
-            sglang_router_rs::core::workflow::WorkflowStatus::Failed => {
+            sgl_model_gateway::core::workflow::WorkflowStatus::Failed => {
                 panic!("Workflow failed: {:?}", state);
             }
             _ => {
@@ -754,7 +755,7 @@ async fn test_wasm_module_execution() {
     let (initial_total, initial_success, initial_failed, _, _) = wasm_manager.get_metrics();
 
     // Execute the module
-    use sglang_router_rs::wasm::{
+    use sgl_model_gateway::wasm::{
         spec::sgl::router::middleware_types,
         types::{WasmComponentInput, WasmComponentOutput},
     };
@@ -771,7 +772,7 @@ async fn test_wasm_module_execution() {
 
     let input = WasmComponentInput::MiddlewareRequest(request);
     let attach_point = WasmModuleAttachPoint::Middleware(
-        sglang_router_rs::wasm::module::MiddlewareAttachPoint::OnRequest,
+        sgl_model_gateway::wasm::module::MiddlewareAttachPoint::OnRequest,
     );
 
     // Execute the module
