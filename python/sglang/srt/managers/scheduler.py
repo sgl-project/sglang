@@ -2011,7 +2011,9 @@ class Scheduler(
                     ).Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+
+                        with torch.cuda.nvtx.range("copy_to_cpu"):git a
+                            batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
                     else:
                         batch_result.future_indices = future_indices
 
@@ -2095,7 +2097,8 @@ class Scheduler(
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+            with torch.cuda.nvtx.range("copy_to_cpu"):
+                batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
     def process_batch_result(
         self,
