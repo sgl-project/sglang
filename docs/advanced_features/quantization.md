@@ -191,7 +191,7 @@ python3 -m sglang.launch_server \
 
 #### Using [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer)
 
-Nvidia Model Optimizer (ModelOpt) provides advanced quantization techniques optimized for NVIDIA hardware. SGLang includes a streamlined workflow for quantizing models with ModelOpt and automatically exporting them for deployment.
+NVIDIA Model Optimizer (ModelOpt) provides advanced quantization techniques optimized for NVIDIA hardware. SGLang includes a streamlined workflow for quantizing models with ModelOpt and automatically exporting them for deployment.
 
 ##### Installation
 
