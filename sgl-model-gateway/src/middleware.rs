@@ -28,7 +28,7 @@ use crate::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
         spec::{
             apply_modify_action_to_headers, build_wasm_headers_from_axum_headers,
-            sgl::router::middleware_types::{
+            sgl::model_gateway::middleware_types::{
                 Action, Request as WasmRequest, Response as WasmResponse,
             },
         },

@@ -756,7 +756,7 @@ async fn test_wasm_module_execution() {
 
     // Execute the module
     use sgl_model_gateway::wasm::{
-        spec::sgl::router::middleware_types,
+        spec::sgl::model_gateway::middleware_types,
         types::{WasmComponentInput, WasmComponentOutput},
     };
 

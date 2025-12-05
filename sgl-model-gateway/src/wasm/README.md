@@ -1,10 +1,10 @@
-# WebAssembly (WASM) Extensibility for sgl-router
+# WebAssembly (WASM) Extensibility for sgl-model-gateway
 
-This module provides WebAssembly-based extensibility for sgl-router, enabling dynamic, safe, and portable middleware execution without requiring router restarts or recompilation.
+This module provides WebAssembly-based extensibility for sgl-model-gateway, enabling dynamic, safe, and portable middleware execution without requiring router restarts or recompilation.
 
 ## Overview
 
-The WASM module allows you to extend sgl-router functionality by deploying WebAssembly components that can:
+The WASM module allows you to extend sgl-model-gateway functionality by deploying WebAssembly components that can:
 
 - **Intercept requests/responses** at various lifecycle points (OnRequest, OnResponse)
 - **Modify HTTP headers and bodies** before/after processing
@@ -68,7 +68,7 @@ See [`interface/`](./interface/) for the complete interface definition.
 
 ### Prerequisites
 
-- sgl-router compiled with WASM support
+- sgl-model-gateway compiled with WASM support
 - Rust toolchain (for building WASM components)
 - `wasm32-wasip2` target: `rustup target add wasm32-wasip2`
 - `wasm-tools`: `cargo install wasm-tools`
@@ -78,7 +78,7 @@ See [`interface/`](./interface/) for the complete interface definition.
 Enable WASM support when starting the router:
 
 ```bash
-./sgl-router --enable-wasm --worker-urls=http://0.0.0.0:30000 --port=3000
+./sgl-model-gateway --enable-wasm --worker-urls=http://0.0.0.0:30000 --port=3000
 ```
 
 ### Deploying a WASM Module
@@ -208,11 +208,11 @@ Define your component using the WASM interface from `interface/spec.*`:
 ```rust
 wit_bindgen::generate!({
     path: "../../../src/wasm/interface",
-    world: "sgl-router",
+    world: "sgl-model-gateway",
 });
 
-use exports::sgl::router::middleware_on_request::Guest as OnRequestGuest;
-use sgl::router::middleware_types::{Request, Action};
+use exports::sgl::model_gateway::middleware_on_request::Guest as OnRequestGuest;
+use sgl::model_gateway::middleware_types::{Request, Action};
 
 struct Middleware;
 
