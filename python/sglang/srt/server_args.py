@@ -271,6 +271,7 @@ class ServerArgs:
     chunked_prefill_size: Optional[int] = None
     max_prefill_tokens: int = 16384
     schedule_policy: str = "fcfs"
+    schedule_dp_policy: Optional[str] = None
     enable_priority_scheduling: bool = False
     abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
@@ -2344,6 +2345,13 @@ class ServerArgs:
             help="The scheduling policy of the requests.",
         )
         parser.add_argument(
+            "--schedule-dp-policy",
+            type=str,
+            default=ServerArgs.schedule_dp_policy,
+            choices=["decrease_idle"],
+            help="The scheduling policy of the requests when dp-size > 1.",
+        )
+        parser.add_argument(
             "--enable-priority-scheduling",
             action="store_true",
             default=ServerArgs.enable_priority_scheduling,
@@ -4077,6 +4085,17 @@ class ServerArgs:
                 "fcfs",
                 "lof",
             ], f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{self.schedule_policy}' is not supported."
+
+        if self.schedule_dp_policy is not None:
+            assert (
+                self.schedule_policy == "fcfs"
+            ), f"To use schedule_dp_policy scheduling, schedule_policy must be 'fcfs'. '{self.schedule_policy}' is not supported."
+            assert (
+                self.enable_dp_attention == True
+            ), f"To use schedule_dp_policy scheduling, enable_dp_attention must be enable."
+            assert (
+                self.disaggregation_mode == "null"
+            ), f"To use schedule_dp_policy scheduling, disaggregation_mode must be null."
 
         # Check multi-item scoring
         if self.multi_item_scoring_delimiter is not None:

@@ -208,6 +208,49 @@ class EmbeddingBatchResult:
     embeddings: torch.Tensor
 
 
+class ScheduleDecisionMaker:
+    def __init__(self, dp_size, attn_tp_size, tp_worker, max_running_requests):
+        self.dp_size = dp_size
+        self.attn_tp_size = attn_tp_size
+        self.global_batch_size = torch.empty(
+            (self.dp_size, self.attn_tp_size, 1),
+            dtype=torch.int64,
+            device="cpu",
+        )
+        self.cpu_group = tp_worker.get_tp_group().cpu_group
+        self.max_running_requests = max_running_requests
+        self.stable_count = 0
+        self.max_stable_count = 30
+
+    def get_schedule_info(self, running_batch):
+        local_batch_size = torch.tensor(
+            [
+                running_batch.batch_size(),
+            ],
+            device="cpu",
+            dtype=torch.int64,
+        )
+        torch.distributed.all_gather_into_tensor(
+            self.global_batch_size.flatten(),
+            local_batch_size,
+            group=self.cpu_group,
+        )
+        tp0_info = self.global_batch_size[:, 0, :]
+        return tp0_info
+
+    def get_schedule_decision(self, running_batch):
+        tp0_info = self.get_schedule_info(running_batch)
+        if (
+            int(tp0_info[:, 0].min().item()) < self.max_running_requests
+            and int(tp0_info[:, 0].max().item()) == self.max_running_requests
+        ):
+            self.stable_count += 1
+            if self.stable_count < self.max_stable_count:
+                return False
+        self.stable_count = 0
+        return True
+
+
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
@@ -243,6 +286,7 @@ class Scheduler(
         self.pp_size = server_args.pp_size
         self.dp_size = server_args.dp_size
         self.schedule_policy = server_args.schedule_policy
+        self.schedule_dp_policy = server_args.schedule_dp_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
@@ -488,6 +532,13 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
         )
+        if self.schedule_dp_policy == "decrease_idle":
+            self.schedule_decision_maker = ScheduleDecisionMaker(
+                self.dp_size,
+                self.attn_tp_size,
+                self.tp_worker,
+                self.max_running_requests,
+            )
         # Enable preemption for priority scheduling.
         self.try_preemption = self.enable_priority_scheduling
         self.init_new_token_ratio = min(
@@ -1713,6 +1764,14 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        if (
+            self.schedule_dp_policy == "decrease_idle"
+            and not self.schedule_decision_maker.get_schedule_decision(
+                self.running_batch
+            )
+        ):
+            # Decrease prefill idle as much as possible during high dp load.
+            return None
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
             self.move_ready_grammar_requests()
