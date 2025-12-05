@@ -17,7 +17,7 @@ from typing import Any
 
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import align_to
+from sglang.multimodal_gen.utils import StoreBoolean, align_to
 
 logger = init_logger(__name__)
 
@@ -101,6 +101,7 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 1024
+    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 125
@@ -136,6 +137,10 @@ class SamplingParams:
     return_frames: bool = False
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
+    # if True, allow user params to override subclass-defined protected fields
+    override_protected_fields: bool = False
+    # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
+    adjust_frames: bool = True
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -394,6 +399,13 @@ class SamplingParams:
             help="Random seed for generation",
         )
         parser.add_argument(
+            "--generator-device",
+            type=str,
+            default=SamplingParams.generator_device,
+            choices=["cuda", "cpu"],
+            help="Device for random generator (cuda or cpu). Default: cuda",
+        )
+        parser.add_argument(
             "--num-frames",
             type=int,
             default=SamplingParams.num_frames,
@@ -509,6 +521,25 @@ class SamplingParams:
             default=SamplingParams.return_trajectory_decoded,
             help="Whether to return the decoded trajectory",
         )
+        parser.add_argument(
+            "--override-protected-fields",
+            action="store_true",
+            default=SamplingParams.override_protected_fields,
+            help=(
+                "If set, allow user params to override fields defined in subclasses "
+                "(protected by default)."
+            ),
+        )
+        parser.add_argument(
+            "--adjust-frames",
+            action=StoreBoolean,
+            default=SamplingParams.adjust_frames,
+            help=(
+                "Enable/disable adjusting num_frames to evenly split latent frames across GPUs "
+                "and satisfy model temporal constraints. Default: true. "
+                "Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
+            ),
+        )
         return parser
 
     @classmethod
@@ -535,7 +566,7 @@ class SamplingParams:
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
 
-    def _merge_with_user_params(self, user_params):
+    def _merge_with_user_params(self, user_params: "SamplingParams"):
         """
         Merges parameters from a user-provided SamplingParams object.
 
@@ -550,6 +581,11 @@ class SamplingParams:
 
         # user is not allowed to modify any param defined in the SamplingParams subclass
         subclass_defined_fields = set(type(self).__annotations__.keys())
+
+        # global switch: if True, allow overriding protected fields
+        allow_override_protected = bool(
+            user_params.override_protected_fields or self.override_protected_fields
+        )
 
         # Compare against current instance to avoid constructing a default instance
         default_params = SamplingParams()
@@ -567,7 +603,9 @@ class SamplingParams:
                 if field_name != "output_file_name"
                 else user_params.output_file_path is not None
             )
-            if is_user_modified and field_name not in subclass_defined_fields:
+            if is_user_modified and (
+                allow_override_protected or field_name not in subclass_defined_fields
+            ):
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
 
