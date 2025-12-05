@@ -24,7 +24,7 @@ from collections import deque
 from concurrent import futures
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
 import psutil
 import setproctitle
@@ -33,6 +33,9 @@ import zmq
 from torch.cuda import Stream as CudaStream
 from torch.cuda import StreamContext as CudaStreamContext
 from torch.distributed import barrier
+from sglang.srt.distributed.device_communicators.shm_broadcast import (
+                MessageQueue,
+            )
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
@@ -169,6 +172,7 @@ from sglang.srt.utils import (
     configure_gc_logger,
     configure_logger,
     disable_request_logging,
+    distribute_requests_via_mq,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -355,6 +359,9 @@ class Scheduler(
         self.attn_tp_cpu_group = self.tp_worker.get_attention_tp_cpu_group()
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+
+        # Init MessageQueue for TP communication (replaces broadcast_pyobj)
+        self.init_message_queues()
 
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
@@ -598,6 +605,86 @@ class Scheduler(
             )
         else:
             self.draft_worker = None
+
+    def init_message_queues(self):
+        """
+        Initialize MessageQueue for TP communication.
+        
+        Replaces broadcast_pyobj with zero-copy shared memory communication.
+        Uses sglang's MessageQueue (adapted from vLLM) for efficient IPC.
+        Only initialized when tp_size > 1.
+        """
+        self.tp_mq = None
+        self.attn_tp_mq = None
+        self.is_tp_mq_writer = False
+        self.is_attn_tp_mq_writer = False
+        
+        # Initialize MessageQueue for TP group using the convenient API
+        if self.tp_size > 1:
+            writer_rank = 0  # First rank in TP group is always the writer
+            max_chunk_bytes = 2 * 1024 * 1024 * 1024  # 2 GB per chunk
+            max_chunks = 8  # Support up to 8 pending messages
+            
+            try:
+                # Use create_from_process_group - handles all the setup automatically
+                self.tp_mq = MessageQueue.create_from_process_group(
+                    pg=self.tp_cpu_group,  # Use CPU group (Gloo backend)
+                    max_chunk_bytes=max_chunk_bytes,
+                    max_chunks=max_chunks,
+                    writer_rank=writer_rank,
+                )
+                
+                # Track writer status for logging
+                self.is_tp_mq_writer = (self.tp_rank == writer_rank)
+                
+                if self.is_tp_mq_writer:
+                    logger.info(
+                        f"TP Rank {self.tp_rank}: Created MessageQueue as writer "
+                        f"(world_size={self.tp_size}, max_chunk={max_chunk_bytes / 1024**3:.1f}GB)"
+                    )
+                else:
+                    logger.info(
+                        f"TP Rank {self.tp_rank}: Connected to MessageQueue as reader"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to create MessageQueue for TP group: {e}. "
+                    "Falling back to broadcast_pyobj."
+                )
+                self.tp_mq = None
+        if self.server_args.enable_dp_attention and self.attn_tp_size > 1:
+            writer_rank = 0  # First rank in attention TP group is the writer
+            max_chunk_bytes = 2 * 1024 * 1024 * 1024  # 2 GB per chunk
+            max_chunks = 8
+            
+            try:
+                # Use create_from_process_group for attention TP group
+                self.attn_tp_mq = MessageQueue.create_from_process_group(
+                    pg=self.attn_tp_cpu_group,  # Use attention CPU group
+                    max_chunk_bytes=max_chunk_bytes,
+                    max_chunks=max_chunks,
+                    writer_rank=writer_rank,
+                )
+                
+                # Track writer status
+                self.is_attn_tp_mq_writer = (self.attn_tp_rank == writer_rank)
+                
+                if self.is_attn_tp_mq_writer:
+                    logger.info(
+                        f"Attention TP Rank {self.attn_tp_rank}: "
+                        f"Created MessageQueue as writer (world_size={self.attn_tp_size})"
+                    )
+                else:
+                    logger.info(
+                        f"Attention TP Rank {self.attn_tp_rank}: "
+                        "Connected to MessageQueue as reader"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to create MessageQueue for Attention TP group: {e}. "
+                    "Falling back to broadcast_pyobj."
+                )
+                self.attn_tp_mq = None
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -1100,28 +1187,62 @@ class Scheduler(
                 work_reqs = None
                 control_reqs = None
 
+            # Distribute work_reqs via MessageQueue or broadcast_pyobj
             if self.attn_tp_size != 1:
-                work_reqs = broadcast_pyobj(
-                    work_reqs,
-                    self.attn_tp_group.rank,
-                    self.attn_tp_cpu_group,
-                    src=self.attn_tp_group.ranks[0],
-                )
+                if self.attn_tp_mq is not None:
+                    # Use MessageQueue (zero-copy shared memory)
+                    work_reqs = distribute_requests_via_mq(
+                        work_reqs,
+                        self.attn_tp_mq,
+                        self.attn_tp_rank,
+                        self.attn_tp_group.ranks[0],
+                    )
+                else:
+                    # Fallback to broadcast_pyobj (Gloo)
+                    work_reqs = broadcast_pyobj(
+                        work_reqs,
+                        self.attn_tp_group.rank,
+                        self.attn_tp_cpu_group,
+                        src=self.attn_tp_group.ranks[0],
+                    )
+            
+            # Distribute control_reqs via MessageQueue or broadcast_pyobj
             if self.tp_size != 1:
-                control_reqs = broadcast_pyobj(
-                    control_reqs,
+                if self.tp_mq is not None:
+                    # Use MessageQueue (zero-copy shared memory)
+                    control_reqs = distribute_requests_via_mq(
+                        control_reqs,
+                        self.tp_mq,
+                        self.tp_rank,
+                        self.tp_group.ranks[0],
+                    )
+                else:
+                    # Fallback to broadcast_pyobj (Gloo)
+                    control_reqs = broadcast_pyobj(
+                        control_reqs,
+                        self.tp_group.rank,
+                        self.tp_cpu_group,
+                        src=self.tp_group.ranks[0],
+                    )
+            recv_reqs = work_reqs + control_reqs
+        elif self.tp_size != 1:
+            # Distribute all requests via MessageQueue or broadcast_pyobj
+            if self.tp_mq is not None:
+                # Use MessageQueue (zero-copy shared memory)
+                recv_reqs = distribute_requests_via_mq(
+                    recv_reqs,
+                    self.tp_mq,
+                    self.tp_rank,
+                    self.tp_group.ranks[0],
+                )
+            else:
+                # Fallback to broadcast_pyobj (Gloo)
+                recv_reqs = broadcast_pyobj(
+                    recv_reqs,
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
                 )
-            recv_reqs = work_reqs + control_reqs
-        elif self.tp_size != 1:
-            recv_reqs = broadcast_pyobj(
-                recv_reqs,
-                self.tp_group.rank,
-                self.tp_cpu_group,
-                src=self.tp_group.ranks[0],
-            )
 
         if self.enable_trace:
             for req in recv_reqs:
