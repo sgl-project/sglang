@@ -72,6 +72,9 @@ pub struct RouterConfig {
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
     pub mcp_config: Option<crate::mcp::McpConfig>,
+    /// Enable WASM support
+    #[serde(default)]
+    pub enable_wasm: bool,
 }
 
 /// Tokenizer cache configuration
@@ -502,6 +505,7 @@ impl Default for RouterConfig {
             client_identity: None,
             ca_certificates: vec![],
             mcp_config: None,
+            enable_wasm: false,
         }
     }
 }
