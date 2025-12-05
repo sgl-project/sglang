@@ -1,11 +1,11 @@
-# cache-dit Acceleration
+# Cache-DiT Acceleration
 
-SGLang integrates [cache-dit](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion
 Transformers (DiT), to achieve up to **7.4x inference speedup** with minimal quality loss.
 
 ## Overview
 
-cache-dit uses intelligent caching strategies to skip redundant computation in the denoising loop:
+Cache-DiT uses intelligent caching strategies to skip redundant computation in the denoising loop:
 
 - **DBCache (Dual Block Cache)**: Dynamically decides when to cache transformer blocks based on residual differences
 - **TaylorSeer**: Uses Taylor expansion for calibration to optimize caching decisions
@@ -13,7 +13,7 @@ cache-dit uses intelligent caching strategies to skip redundant computation in t
 
 ## Basic Usage
 
-Enable cache-dit by exporting the environment variable and using `sglang generate`:
+Enable Cache-DiT by exporting the environment variable and using `sglang generate`:
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true \
@@ -104,11 +104,11 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 ## Environment Variables
 
-All cache-dit parameters can be set via environment variables:
+All Cache-DiT parameters can be set via environment variables:
 
 | Environment Variable                | Default   | Description                              |
 |-------------------------------------|-----------|------------------------------------------|
-| `SGLANG_CACHE_DIT_ENABLED`          | `false`   | Enable cache-dit acceleration            |
+| `SGLANG_CACHE_DIT_ENABLED`          | `false`   | Enable Cache-DiT acceleration            |
 | `SGLANG_CACHE_DIT_FN`               | `1`       | First N blocks to always compute         |
 | `SGLANG_CACHE_DIT_BN`               | `0`       | Last N blocks to always compute          |
 | `SGLANG_CACHE_DIT_WARMUP`           | `8`       | Warmup steps before caching              |
@@ -123,7 +123,7 @@ All cache-dit parameters can be set via environment variables:
 
 ## Supported Models
 
-cache-dit supports DiT models registered in its BlockAdapterRegister:
+Cache-DiT supports DiT models registered in its BlockAdapterRegister:
 
 | Model Family | Example Models              |
 |--------------|-----------------------------|
@@ -143,20 +143,12 @@ cache-dit supports DiT models registered in its BlockAdapterRegister:
 
 ## Limitations
 
-- **Single GPU only**: Distributed support (TP/SP) is not yet validated; cache-dit will be automatically disabled when
+- **Single GPU only**: Distributed support (TP/SP) is not yet validated; Cache-DiT will be automatically disabled when
   `world_size > 1`
 - **SCM minimum steps**: SCM requires >= 8 inference steps to be effective
-- **Model support**: Only models registered in cache-dit's BlockAdapterRegister are supported
+- **Model support**: Only models registered in Cache-DiT's BlockAdapterRegister are supported
 
 ## Troubleshooting
-
-### cache-dit not installed
-
-```
-WARNING: cache-dit is not installed. Please install it with: pip install cache-dit
-```
-
-**Solution**: Install cache-dit with `pip install cache-dit`
 
 ### Distributed environment warning
 
@@ -164,7 +156,7 @@ WARNING: cache-dit is not installed. Please install it with: pip install cache-d
 WARNING: cache-dit is disabled in distributed environment (world_size=N)
 ```
 
-This is expected behavior. cache-dit currently only supports single-GPU inference.
+This is expected behavior. Cache-DiT currently only supports single-GPU inference.
 
 ### SCM disabled for low step count
 
