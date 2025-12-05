@@ -11,7 +11,8 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 # Reference: https://github.com/THUDM/LongBench
 LONGBENCH_V2_DATASET = "THUDM/LongBench-v2"
 LONGBENCH_V2_SPLIT = "train"
-NUM_SAMPLES = 48  # Number of samples to use
+DEFAULT_NUM_SAMPLES = 48  # Number of samples to use
+DEFAULT_PROMPT_TOKENS = 3000  # Maximum number of tokens to use
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".longbench_cache")
 
 # In-memory cache for the current session
@@ -25,10 +26,14 @@ def format_longbench_v2_example(example):
     return f"{context} {question}"
 
 
-def get_input_ids(tokenizer_path, max_tokens=3000, num_samples=NUM_SAMPLES):
+def get_input_ids(
+    tokenizer_path, max_prompt_tokens=DEFAULT_PROMPT_TOKENS, num_samples=None
+):
     """Get input_ids from LongBench V2 dataset with local caching."""
     # Create cache key based on parameters
-    cache_key = f"{tokenizer_path}_{max_tokens}_{num_samples}"
+    if num_samples is None:
+        num_samples = DEFAULT_NUM_SAMPLES
+    cache_key = f"{tokenizer_path}_{max_prompt_tokens}_{num_samples}"
 
     # Check in-memory cache first (fastest)
     if cache_key in _cached_input_ids:
@@ -42,7 +47,7 @@ def get_input_ids(tokenizer_path, max_tokens=3000, num_samples=NUM_SAMPLES):
     # Use a safe filename
     safe_name = tokenizer_path.replace("/", "_").replace("\\", "_")
     cache_file = os.path.join(
-        CACHE_DIR, f"input_ids_{safe_name}_{max_tokens}_{num_samples}.json"
+        CACHE_DIR, f"input_ids_{safe_name}_{max_prompt_tokens}_{num_samples}.json"
     )
 
     if os.path.exists(cache_file):
@@ -75,7 +80,7 @@ def get_input_ids(tokenizer_path, max_tokens=3000, num_samples=NUM_SAMPLES):
         text = format_longbench_v2_example(example)
         tokens = tokenizer.encode(text)
         # Truncate to max_tokens
-        input_ids.append(tokens[:max_tokens])
+        input_ids.append(tokens[:max_prompt_tokens])
 
     # Save to local cache
     with open(cache_file, "w") as f:
@@ -167,7 +172,10 @@ def _extract_output_logprobs(result):
 def test_input_output_logprobs_match_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=16000
 ):
-    input_ids = get_input_ids(tokenizer_path=model_name)
+    num_samples = DEFAULT_NUM_SAMPLES
+    if max_samples is not None and max_samples > num_samples:
+        num_samples = max_samples
+    input_ids = get_input_ids(tokenizer_path=model_name, num_samples=num_samples)
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
     print(f"Running test_input_output_logprobs_match with {len(input_ids)} prompts")
@@ -203,7 +211,10 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
         print("Radix cache is disabled, skipping test")
         return
 
-    input_ids = get_input_ids(tokenizer_path=model_name)
+    num_samples = DEFAULT_NUM_SAMPLES
+    if max_samples is not None and max_samples > num_samples:
+        num_samples = max_samples
+    input_ids = get_input_ids(tokenizer_path=model_name, num_samples=num_samples)
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
     print(
@@ -253,7 +264,12 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         print("Radix cache is disabled, skipping test")
         return
 
-    first_turn_input_ids = get_input_ids(tokenizer_path=model_name)
+    num_samples = DEFAULT_NUM_SAMPLES
+    if max_samples is not None and max_samples > num_samples:
+        num_samples = max_samples
+    first_turn_input_ids = get_input_ids(
+        tokenizer_path=model_name, num_samples=num_samples
+    )
     if max_samples is not None:
         first_turn_input_ids = first_turn_input_ids[:max_samples]
     print(
