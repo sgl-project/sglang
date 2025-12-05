@@ -99,6 +99,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
             old_output_ids, new_output_ids, next_state
         )
 
+    def is_terminated(self):
+        return self.grammar.is_terminated()
+
 
 class ReasonerGrammarBackend(BaseGrammarBackend):
     def __init__(self, grammar_backend: BaseGrammarBackend, think_end_id):
