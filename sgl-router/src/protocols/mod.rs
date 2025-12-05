@@ -7,6 +7,7 @@ pub mod classify;
 pub mod common;
 pub mod completion;
 pub mod embedding;
+pub mod event_types;
 pub mod generate;
 pub mod rerank;
 pub mod responses;

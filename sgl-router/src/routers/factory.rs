@@ -56,9 +56,7 @@ impl RouterFactory {
                     )
                     .await
                 }
-                RoutingMode::OpenAI { worker_urls } => {
-                    Self::create_openai_router(worker_urls.clone(), ctx).await
-                }
+                RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
             },
         }
     }
@@ -119,16 +117,12 @@ impl RouterFactory {
     }
 
     /// Create an OpenAI router
-    async fn create_openai_router(
-        worker_urls: Vec<String>,
-        ctx: &Arc<AppContext>,
-    ) -> Result<Box<dyn RouterTrait>, String> {
-        if worker_urls.is_empty() {
-            return Err("OpenAI mode requires at least one worker URL".to_string());
-        }
-
-        let router = OpenAIRouter::new(worker_urls, ctx).await?;
-
+    ///
+    /// Workers should be registered via the external worker registration workflow
+    /// before using this router. The workflow discovers models from the provided
+    /// endpoints and creates external workers in the registry.
+    async fn create_openai_router(ctx: &Arc<AppContext>) -> Result<Box<dyn RouterTrait>, String> {
+        let router = OpenAIRouter::new(ctx).await?;
         Ok(Box::new(router))
     }
 }
