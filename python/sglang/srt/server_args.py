@@ -135,7 +135,7 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
-MM_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
+ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -257,10 +257,10 @@ class ServerArgs:
     checkpoint_engine_wait_weights_before_ready: bool = False
 
     # Encode prefill disaggregation
-    mm_only: bool = False
+    encoder_only: bool = False
     language_only: bool = False
-    mm_transfer_backend: str = MM_TRANSFER_BACKEND_CHOICES[0]
-    encode_urls: List[str] = dataclasses.field(default_factory=list)
+    encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
+    encoder_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Quantization and data type
     dtype: str = "auto"
@@ -666,8 +666,8 @@ class ServerArgs:
         # Handle PD disaggregation.
         self._handle_pd_disaggregation()
 
-        # Handle E disaggregation.
-        self._handle_e_disaggregation()
+        # Handle Encoder disaggregation.
+        self._handle_encoder_disaggregation()
 
         # Validate tokenizer settings.
         self._handle_tokenizer_batching()
@@ -1865,27 +1865,27 @@ class ServerArgs:
             ):
                 self.load_format = "auto"
 
-    def _handle_e_disaggregation(self):
-        if self.enable_prefix_mm_cache and not self.mm_only:
+    def _handle_encoder_disaggregation(self):
+        if self.enable_prefix_mm_cache and not self.encoder_only:
             raise ValueError(
-                "--enable-prefix-mm-cache requires --mm-only to be enabled"
+                "--enable-prefix-mm-cache requires --encoder-only to be enabled"
             )
-        if self.mm_only and self.language_only:
-            raise ValueError("Cannot set --mm-only and --language-only together")
-        if self.mm_only and not self.disaggregation_mode == "null":
+        if self.encoder_only and self.language_only:
+            raise ValueError("Cannot set --encoder-only and --language-only together")
+        if self.encoder_only and not self.disaggregation_mode == "null":
             raise ValueError(
-                "Cannot set --mm-only and --disaggregation-mode prefill/decode together"
+                "Cannot set --encoder-only and --disaggregation-mode prefill/decode together"
             )
         if (
             self.language_only
-            and self.mm_transfer_backend == "zmq_to_scheduler"
+            and self.encoder_transfer_backend == "zmq_to_scheduler"
             and self.pp_size > 1
         ):
             raise ValueError("zmq_to_scheduler not support pp_size > 1")
 
-        if self.language_only and len(self.encode_urls) == 0:
+        if self.language_only and len(self.encoder_urls) == 0:
             raise ValueError(
-                "--language-only need to specify at least one --encode-urls"
+                "requires at least one encoder urls to be set via --encoder-urls"
             )
 
     def _handle_pd_disaggregation(self):
@@ -2275,9 +2275,9 @@ class ServerArgs:
 
         # Encode prefill disaggregation
         parser.add_argument(
-            "--mm-only",
+            "--encoder-only",
             action="store_true",
-            help="For VLM, launch encode server only for multimodal part.",
+            help="For MLLM with an encoder, launch an encoder-only server",
         )
         parser.add_argument(
             "--language-only",
@@ -2285,18 +2285,18 @@ class ServerArgs:
             help="For VLM, load weights for the language model only.",
         )
         parser.add_argument(
-            "--mm-transfer-backend",
+            "--encoder-transfer-backend",
             type=str,
-            default=ServerArgs.mm_transfer_backend,
-            choices=MM_TRANSFER_BACKEND_CHOICES,
-            help="The backend for encoder disaggregation transfer. Default is zmq.",
+            default=ServerArgs.encoder_transfer_backend,
+            choices=ENCODER_TRANSFER_BACKEND_CHOICES,
+            help="The backend for encoder disaggregation transfer. Default is zmq_to_scheduler.",
         )
         parser.add_argument(
-            "--encode-urls",
+            "--encoder-urls",
             nargs="+",
             type=str,
             default=[],
-            help="List of encode urls for encoder disaggregation",
+            help="List of encoder server urls.",
         )
 
         # Quantization and data type

@@ -235,7 +235,7 @@ class BaseMultimodalProcessor(ABC):
     def spatial_merge_size(self):
         return self.hf_config.vision_config.spatial_merge_size
 
-    def get_input_ids(self, prompt, img_grid_thw):
+    def build_input_ids(self, prompt, img_grid_thw):
         """
         Use prompt and img_grid_thw to build input_ids
         """
@@ -255,11 +255,7 @@ class BaseMultimodalProcessor(ABC):
         img_start_indices = list(
             filter(lambda i: prompt[i + 1] == img_token_id, range(len(prompt) - 1))
         )
-        if len(img_start_indices) != img_grid_thw.shape[0]:
-            logger.info(f"{len(prompt)} {prompt}")
-            logger.info(
-                f"Check img_start_indices: {img_start_indices} and img_grid_thw: {img_grid_thw.shape}"
-            )
+
         for cur_img_idx, img_start_idx in enumerate(img_start_indices):
             assert cur_idx <= img_start_idx
             # include img_start_id
@@ -276,7 +272,7 @@ class BaseMultimodalProcessor(ABC):
         return input_ids, offsets
 
     def get_mm_data(self, prompt, embeddings, img_grid_thw):
-        input_ids, offsets = self.get_input_ids(prompt, img_grid_thw)
+        input_ids, offsets = self.build_input_ids(prompt, img_grid_thw)
         mm_items = [
             MultimodalDataItem(
                 modality=Modality.IMAGE,

@@ -544,7 +544,7 @@ class Scheduler(
 
         if (
             self.server_args.language_only
-            and self.server_args.mm_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
             self.mm_receiver = MMReceiver(
                 server_args,
@@ -1190,7 +1190,7 @@ class Scheduler(
         # Process MM requests under E disaggregation
         if (
             self.server_args.language_only
-            and self.server_args.mm_transfer_backend == "zmq_to_scheduler"
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
             recv_reqs = self.mm_receiver.process_waiting_requests(recv_reqs)
 

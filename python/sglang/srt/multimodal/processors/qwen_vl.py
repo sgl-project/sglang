@@ -260,7 +260,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         ).build(_processor)
 
     def get_mm_data(self, prompt, embeddings, img_grid_thw):
-        input_ids, offsets = self.get_input_ids(prompt, img_grid_thw)
+        input_ids, offsets = self.build_input_ids(prompt, img_grid_thw)
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
             spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
             image_token_id=self.mm_tokens.image_token_id,

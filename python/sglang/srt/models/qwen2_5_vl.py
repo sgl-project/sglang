@@ -477,7 +477,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
-        if not self.config.mm_only:
+        if not self.config.encoder_only:
             self.model = Qwen2Model(
                 config,
                 quant_config,
@@ -676,7 +676,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                     continue
                 # Skip loading visual/language model weights
                 if (
-                    self.config.mm_only or self.config.language_only
+                    self.config.encoder_only or self.config.language_only
                 ) and name not in params_dict:
                     continue
                 param = params_dict[name]

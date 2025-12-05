@@ -100,7 +100,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
-        mm_only: bool = False,
+        encoder_only: bool = False,
         language_only: bool = False,
     ) -> None:
         # Parse args
@@ -218,7 +218,7 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
-        self.hf_config.mm_only = mm_only
+        self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
 
         # matryoshka embeddings
@@ -252,7 +252,7 @@ class ModelConfig:
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=server_args.decrypted_config_file,
             language_only=server_args.language_only,
-            mm_only=server_args.mm_only,
+            encoder_only=server_args.encoder_only,
             **kwargs,
         )
 

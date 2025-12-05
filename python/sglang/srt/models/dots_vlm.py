@@ -50,7 +50,7 @@ class DotsVLMForCausalLM(nn.Module):
         self.video_token_id = config.video_span_id
         self.pp_group = get_pp_group()
 
-        if not config.mm_only:
+        if not config.encoder_only:
             self.language_model = DeepseekV2ForCausalLM(
                 config.language_config, quant_config
             )
@@ -117,7 +117,7 @@ class DotsVLMForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
 
         # Load language model weights
-        if not self.config.mm_only and language_weights:
+        if not self.config.encoder_only and language_weights:
             self.language_model.load_weights(language_weights)
 
     @classmethod

@@ -617,12 +617,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             self.config: Qwen3VLConfig = config  # for qwen3-vl
         else:
             self.config = config.text_config  # for qwen3-omni
-            if hasattr(config, "mm_only"):
-                self.config.mm_only = config.mm_only
-            if hasattr(config, "language_only"):
-                self.config.language_only = config.language_only
+            self.config.encoder_only = getattr(config, "encoder_only", False)
+            self.config.language_only = getattr(config, "language_only", False)
 
-        if not hasattr(config, "mm_only") or not config.mm_only:
+        if not hasattr(config, "encoder_only") or not config.encoder_only:
             self.model = language_model_cls(
                 config=self.config,
                 quant_config=quant_config,
@@ -782,7 +780,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     continue
                 # Skip loading visual/language model weights
                 if (
-                    self.config.mm_only or self.config.language_only
+                    self.config.encoder_only or self.config.language_only
                 ) and name not in params_dict:
                     continue
                 param = params_dict[name]
@@ -801,7 +799,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         continue
                     # Skip loading visual/language model weights
                     if (
-                        self.config.mm_only or self.config.language_only
+                        self.config.encoder_only or self.config.language_only
                     ) and name not in params_dict:
                         continue
                     param = params_dict[name]

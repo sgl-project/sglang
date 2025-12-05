@@ -217,11 +217,11 @@ class MMReceiver:
         tp_rank=None,
     ):
         self.context = zmq.asyncio.Context(20)
-        self.mm_transfer_backend = server_args.mm_transfer_backend
-        self.encode_urls = server_args.encode_urls
+        self.encoder_transfer_backend = server_args.encoder_transfer_backend
+        self.encode_urls = server_args.encoder_urls
         self.encode_idx = list(range(len(self.encode_urls)))
         self.host = server_args.host
-        if self.mm_transfer_backend == "mooncake":
+        if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = MooncakeTransferEngine(
                 hostname=get_local_ip_auto(),
@@ -229,7 +229,7 @@ class MMReceiver:
                 ib_device=server_args.disaggregation_ib_device,
             )
             self.embeddings_buffer = dict()
-        elif self.mm_transfer_backend == "zmq_to_scheduler":
+        elif self.encoder_transfer_backend == "zmq_to_scheduler":
             self.pp_rank = pp_rank
             self.tp_rank = tp_rank
             self.tp_size = server_args.tp_size
@@ -530,7 +530,7 @@ class MMReceiver:
 
             recv_obj: EmbeddingData = pickle.loads(parts[0])
             logger.info(f"{recv_obj = }")
-            if self.mm_transfer_backend == "zmq_to_tokenizer":
+            if self.encoder_transfer_backend == "zmq_to_tokenizer":
                 buffer = parts[1].buffer if hasattr(parts[1], "buffer") else parts[1]
                 recv_obj.embedding = torch.frombuffer(
                     buffer, dtype=recv_obj.dtype
@@ -541,11 +541,11 @@ class MMReceiver:
             else:
                 recv_embedding_data.add(recv_obj)
 
-        if self.mm_transfer_backend == "mooncake":
+        if self.encoder_transfer_backend == "mooncake":
             recv_embedding = self.embeddings_buffer[req_id]
             del self.embeddings_buffer[req_id]
             self.embeddings_engine.deregister(recv_embedding.data_ptr())
-        elif self.mm_transfer_backend == "zmq_to_tokenizer":
+        elif self.encoder_transfer_backend == "zmq_to_tokenizer":
             recv_embedding = recv_embedding_data.get_embedding(is_concat=True)
 
         img_grid_thw = recv_embedding_data.get_img_grid()
