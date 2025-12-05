@@ -31,13 +31,12 @@ class TestAscendMlaHicache(CustomTestCase):
         cls.url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.common_args = [
             "--trust-remote-code",
-            "--disable-cuda-graph",
             "--mem-fraction-static",
             0.8,
             "--attention-backend",
             "ascend",
             "--quantization",
-            "w8a8_int8",
+            "modelslim",
             "--tp-size",
             4,
             "--enable-hierarchical-cache",
