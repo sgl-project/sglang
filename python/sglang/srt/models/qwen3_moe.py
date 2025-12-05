@@ -81,6 +81,8 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
+    from aiter.rotary_embedding import AiterFusedSetKVBufferArg
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -270,7 +272,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     def op_output(self, state):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
-
 class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
@@ -367,6 +368,7 @@ class Qwen3MoeAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.alt_stream = alt_stream
+        self.aiter_enable_fused_set_kv_buffer = False
 
     def _apply_qk_norm(
         self, q: torch.Tensor, k: torch.Tensor
@@ -419,6 +421,17 @@ class Qwen3MoeAttention(nn.Module):
             and "aiter_rope_fused_qknorm" in self.rope_scaling
         ):
             assert self.k_norm.variance_epsilon == self.q_norm.variance_epsilon
+            layer_id = self.attn.layer_id
+            aiter_fused_set_kv_buffer_arg = AiterFusedSetKVBufferArg(
+                kv_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id),
+                cache_loc = forward_batch.out_cache_loc,
+                k_scale = self.attn.k_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
+                v_scale = self.attn.v_scale_float if forward_batch.forward_mode.is_extend() else 1.0,
+            )
+            if aiter_fused_set_kv_buffer_arg.k_scale is None:
+                aiter_fused_set_kv_buffer_arg.k_scale = 1.0
+            if aiter_fused_set_kv_buffer_arg.v_scale is None:
+                aiter_fused_set_kv_buffer_arg.v_scale = 1.0
             q, k, v = self.rotary_emb(
                 qkv,
                 self.q_norm.weight,
@@ -427,7 +440,9 @@ class Qwen3MoeAttention(nn.Module):
                 self.num_heads,
                 self.num_kv_heads,
                 self.k_norm.variance_epsilon,
+                fused_set_kv_buffer_arg=aiter_fused_set_kv_buffer_arg,
             )
+            self.aiter_enable_fused_set_kv_buffer = True
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q, k = self._apply_qk_norm(q, k)
@@ -458,7 +473,7 @@ class Qwen3MoeAttention(nn.Module):
             save_kv_cache=not (
                 enable_fused_set_kv_buffer(forward_batch)
                 and self.compatible_with_fused_kv_buffer
-            ),
+            ) and not self.aiter_enable_fused_set_kv_buffer,
         )
         output, _ = self.o_proj(attn_output)
         return output
