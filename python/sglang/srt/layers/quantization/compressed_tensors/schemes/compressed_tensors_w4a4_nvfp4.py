@@ -21,7 +21,8 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.utils import is_flashinfer_available, cutlass_fp4_supported
 import logging
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
-from sgl_kernel import scaled_fp4_quant, cutlass_scaled_fp4_mm, flashinfer_scaled_fp4_mm
+from sgl_kernel import scaled_fp4_quant, cutlass_scaled_fp4_mm
+from sglang.srt.layers.attention.flashinfer_ops import flashinfer_scaled_fp4_mm
 
 logger = logging.getLogger(__name__)
 
