@@ -881,8 +881,8 @@ class MooncakeKVManager(CommonKVManager):
                                         self.sync_status_to_decode_endpoint(
                                             endpoint, dst_port, room, status, local_rank
                                         )
-                                    if self.attn_tp_rank == 0:
-                                            logger.info(f"sent_success to {req.room=}")
+                                    # if self.attn_tp_rank == 0:
+                                    #         gitf"sent_success to {req.room=}")
                         else:
                             # Dummy request means the decode instance is not used, so its status can be marked as success directly
                             # Dummy request does not need to sync status to decode endpoint
@@ -1063,8 +1063,8 @@ class MooncakeKVManager(CommonKVManager):
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
         self.forward_results[bootstrap_room] = result
-        if self.attn_tp_rank == 0:
-            logger.info(f"send req to transfer queue: {bootstrap_room=}")
+        # if self.attn_tp_rank == 0:
+        #     logger.info(f"send req to transfer queue: {bootstrap_room=}")
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
