@@ -58,7 +58,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.18.post2",
+  "sgl-kernel==0.3.18.post3",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
