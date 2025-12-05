@@ -164,10 +164,10 @@ class MMEncoder:
 
         if self.rank == 0:
             logger.info(
-                f"Using transfer backend: {self.server_args.mm_transfer_backend}"
+                f"Using transfer backend: {self.server_args.encoder_transfer_backend}"
             )
 
-            if self.server_args.mm_transfer_backend == "mooncake":
+            if self.server_args.encoder_transfer_backend == "mooncake":
                 self.local_ip = get_local_ip_auto()
 
                 self.engine = MooncakeTransferEngine(
@@ -236,7 +236,7 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
-        if self.server_args.mm_transfer_backend == "mooncake":
+        if self.server_args.encoder_transfer_backend == "mooncake":
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
             self.engine.transfer_sync(
                 session_id, embedding.data_ptr(), buffer_address, embedding.nbytes
@@ -260,7 +260,7 @@ class MMEncoder:
             False,
         )
 
-        if self.server_args.mm_transfer_backend == "mooncake":
+        if self.server_args.encoder_transfer_backend == "mooncake":
             socket.send_multipart([pickle.dumps(mm_data)])
         else:
             new_mm_data = mm_data.copy_without_embedding()
@@ -449,7 +449,7 @@ async def handle_encode_request(request: dict):
         num_parts=request["num_parts"],
         part_idx=request["part_idx"],
     )
-    if encoder.server_args.mm_transfer_backend == "mooncake":
+    if encoder.server_args.encoder_transfer_backend == "mooncake":
         del request["mm_items"]
         request.update(
             {
@@ -459,7 +459,7 @@ async def handle_encode_request(request: dict):
             }
         )
         return ORJSONResponse(content=request)
-    elif encoder.server_args.mm_transfer_backend == "zmq_to_scheduler":
+    elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
         logger.info(f"{request['embedding_port'] = }")
         if request["embedding_port"] is None:
             await encoder.send_with_url(
@@ -479,7 +479,7 @@ async def handle_encode_request(request: dict):
             await asyncio.gather(*tasks)
             encoder.embedding_to_send.pop(request["req_id"], None)
         return ORJSONResponse(content=None)
-    elif encoder.server_args.mm_transfer_backend == "zmq_to_tokenizer":
+    elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
         await encoder.send(
             req_id=request["req_id"],
             prefill_host=request["prefill_host"],
