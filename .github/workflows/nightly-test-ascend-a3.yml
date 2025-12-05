@@ -70,62 +70,57 @@ jobs:
       matrix:
         test_config:
           - name: test_ascend_qwen3_8b_in1000_out300_bs8
+            os: linux-aarch64-a3-4
             test_case: test/srt/ascend_k8s/test_ascend_qwen3_8b_in1000_out300_bs8.py
-            npu_num: 4
           - name: test_ascend_qwen3_8b_in1000_out300_bs16
+            os: linux-aarch64-a3-4
             test_case: test/srt/ascend_k8s/test_ascend_qwen3_8b_in1000_out300_bs16.py
-            npu_num: 4
-          - name: test_ascend_Qwen3_32B_in1024_out300_bs16
-            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in1024_out300_bs16.py
-            npu_num: 4
-          - name: test_ascend_Qwen3_32B_in1024_out300_bs32
-            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in1024_out300_bs32.py
-            npu_num: 4
-          - name: test_ascend_Qwen3_32B_in2048_out2048_bs78
-            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in2048_out2048_bs78.py
-            npu_num: 4
-          - name: test_ascend_Qwen3_32B_in3500_out1500_bs78
-            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in3500_out1500_bs78.py
-            npu_num: 4
-          - name: test_ascend_Qwen3_32B_in6144_out1500_bs16
-            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in6144_out1500_bs16.py
-            npu_num: 4
-          - name: test_ascend_Qwen3_32B_in6144_out1500_bs32
-            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in6144_out1500_bs32.py
-            npu_num: 4
-          - name: test_ascend_QWQ3_32B_in6144_out1500_bs8
-            test_case: test/srt/ascend_k8s/test_ascend_QWQ3_32B_in6144_out1500_bs8.py
-            npu_num: 4
           - name: test_ascend_QWQ3_32B_in6144_out1500_bs16
+            os: linux-aarch64-a3-4
             test_case: test/srt/ascend_k8s/test_ascend_QWQ3_32B_in6144_out1500_bs16.py
-            npu_num: 4
-          - name: test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs8
-            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs8.py
-            npu_num: 4
+          - name: test_ascend_QWQ3_32B_in6144_out1500_bs8
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_QWQ3_32B_in6144_out1500_bs8.py
+          - name: test_ascend_Qwen3_32B_in1024_out300_bs16
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in1024_out300_bs16.py
+          - name: test_ascend_Qwen3_32B_in1024_out300_bs32
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in1024_out300_bs32.py
+          - name: test_ascend_Qwen3_32B_in2048_out2048_bs78
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in2048_out2048_bs78.py
+          - name: test_ascend_Qwen3_32B_in3500_out1500_bs78
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in3500_out1500_bs78.py
+          - name: test_ascend_Qwen3_32B_in6144_out1500_bs16
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in6144_out1500_bs16.py
+          - name: test_ascend_Qwen3_32B_in6144_out1500_bs32
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_32B_in6144_out1500_bs32.py
           - name: test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs16
+            os: linux-aarch64-a3-4
             test_case: test/srt/ascend_k8s/test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs16.py
-            npu_num: 4
           - name: test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs32
+            os: linux-aarch64-a3-4
             test_case: test/srt/ascend_k8s/test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs32.py
-            npu_num: 4
+          - name: test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs8
+            os: linux-aarch64-a3-4
+            test_case: test/srt/ascend_k8s/test_ascend_Qwen3_Next_80B_A3B_in1000_out300_bs8.py
           - name: test_ascend_Qwen3_235B_in2048_out2048_bs78
+            os: linux-aarch64-a3-16
             test_case: test/srt/ascend_k8s/test_ascend_Qwen3_235B_in2048_out2048_bs78.py
-            npu_num: 16
           - name: test_ascend_qwen3_coder_480b_a35b_instruct_w8a8_quarot_in16k_out10k
+            os: linux-aarch64-a3-16
             test_case: test/srt/ascend_k8s/test_ascend_qwen3_coder_480b_a35b_instruct_w8a8_quarot_in16k_out10k.py
-            npu_num: 16
           - name: test_ascend_deepseek_r1_w4a8_single_in3500_out1500
+            os: linux-aarch64-a3-16
             test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
-            npu_num: 16
     uses: ./.github/workflows/nightly-test-ascend-single-node.yml
     with:
-      soc_version: a3
-      runner: linux-amd64-cpu-0
+      runner:  ${{ matrix.test_config.os }}
       image: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3'
       test_config_name: ${{ matrix.test_config.name }}
-      sglang_source_path: '/data/.cache/tests/sglang'
       test_case: ${{ matrix.test_config.test_case }}
-      npu_num: ${{ matrix.test_config.npu_num }}
-
-
 
