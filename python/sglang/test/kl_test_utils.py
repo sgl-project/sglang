@@ -1,5 +1,7 @@
 import inspect
 import os
+import tarfile
+import urllib.request
 
 import numpy as np
 import pandas as pd
@@ -7,29 +9,54 @@ import requests
 
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-NUMERICS_DATASET = "TODO"
+MMLU_DATA_URL = "https://people.eecs.berkeley.edu/~hendrycks/data.tar"
+MMLU_DATA_DIR = os.path.join(os.path.dirname(__file__), "mmlu_data")
 
 
-def load_prompts_from_parquet(directory):
-    tokens = []
-    for filename in os.listdir(directory):
-        if filename.endswith(".parquet"):
-            file_path = os.path.join(directory, filename)
-            try:
-                df = pd.read_parquet(file_path)
-                if "tokens" in df.columns:
-                    tokens.extend(df["tokens"].tolist())
-            except Exception as e:
-                print(f"[ERROR] Failed to read {filename}: {str(e)}")
-    return tokens
+def download_and_extract_mmlu_data():
+    """Download and extract MMLU dataset if not already present."""
+    data_dir = os.path.join(MMLU_DATA_DIR, "data")
+    if os.path.exists(data_dir):
+        return data_dir
+
+    os.makedirs(MMLU_DATA_DIR, exist_ok=True)
+    tar_path = os.path.join(MMLU_DATA_DIR, "data.tar")
+
+    if not os.path.exists(tar_path):
+        print(f"Downloading MMLU dataset from {MMLU_DATA_URL}...")
+        urllib.request.urlretrieve(MMLU_DATA_URL, tar_path)
+
+    print(f"Extracting MMLU dataset to {MMLU_DATA_DIR}...")
+    with tarfile.open(tar_path, "r") as tar:
+        tar.extractall(MMLU_DATA_DIR)
+
+    return data_dir
 
 
-def get_input_ids_and_disallowed_tokens():
-    input_ids = load_prompts_from_parquet(NUMERICS_DATASET)
-    input_ids = [x.tolist() for x in input_ids]
-    input_ids = input_ids[::10]
-    disallowed_tokens = [0, 2]
-    return input_ids, disallowed_tokens
+def load_questions_from_mmlu(data_dir, tokenizer):
+    """Load questions from MMLU dataset and tokenize them."""
+    test_dir = os.path.join(data_dir, "test")
+    input_ids = []
+    for filename in sorted(os.listdir(test_dir)):
+        if filename.endswith("_test.csv"):
+            df = pd.read_csv(os.path.join(test_dir, filename), header=None)
+            for i in range(df.shape[0]):
+                question = df.iloc[i, 0]  # First column is the question
+                answer = df.iloc[i, 1]  # Second column is the answer
+                to_encode = str(question) + " " + str(answer)
+                # print(f"{i}: {to_encode}")
+                tokens = tokenizer.encode(to_encode)
+                input_ids.append(tokens)
+    return input_ids
+
+
+def get_input_ids(tokenizer_path):
+    """Get input_ids from MMLU dataset."""
+    data_dir = download_and_extract_mmlu_data()
+    tokenizer = get_tokenizer(tokenizer_path)
+    input_ids = load_questions_from_mmlu(data_dir, tokenizer)
+    input_ids = input_ids[::10]  # Sample every 10th prompt
+    return input_ids
 
 
 def compare_kl_divergence(
@@ -60,7 +87,7 @@ def compare_kl_divergence(
 def test_input_output_logprobs_match_helper(
     base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=16000
 ):
-    input_ids, disallowed_tokens = get_input_ids_and_disallowed_tokens()
+    input_ids = get_input_ids(tokenizer_path=model_name)
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
     print("Running test_input_output_logprobs_match with ", len(input_ids), "prompts")
@@ -75,8 +102,7 @@ def test_input_output_logprobs_match_helper(
             "sampling_params": {
                 "temperature": 1,
                 "max_new_tokens": max_new_tokens,
-                "disallowed_token_ranges": ",".join(map(str, disallowed_tokens)),
-                # "ignore_eos": True,
+                "ignore_eos": True,
             },
             "return_logprob": True,
             "return_text_in_logprobs": False,
@@ -90,9 +116,6 @@ def test_input_output_logprobs_match_helper(
     output_logprobs = []
     for i, result in enumerate(results):
         output_ids = result["output_ids"]
-        # disallow tokens should not be in the output
-        for disallowed_token in disallowed_tokens:
-            assert disallowed_token not in output_ids
         new_input_ids.append(input_ids[i] + output_ids)
         output_logprob = result["meta_info"]["output_token_logprobs"]
         output_logprob = [x[0] for x in output_logprob]
@@ -108,7 +131,7 @@ def test_input_output_logprobs_match_helper(
             "sampling_params": {
                 "temperature": 1,
                 "max_new_tokens": 0,
-                # "ignore_eos": True,
+                "ignore_eos": True,
             },
             "return_logprob": True,
             "return_text_in_logprobs": False,
@@ -145,7 +168,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
         )
         return
 
-    input_ids, disallowed_tokens = get_input_ids_and_disallowed_tokens()
+    input_ids = get_input_ids(tokenizer_path=model_name)
     if max_samples is not None:
         input_ids = input_ids[:max_samples]
     print(
@@ -163,6 +186,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
             "sampling_params": {
                 "temperature": 1,
                 "max_new_tokens": 0,
+                "ignore_eos": True,
             },
         },
     )
@@ -175,7 +199,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
             "sampling_params": {
                 "temperature": 1,
                 "max_new_tokens": max_new_tokens,
-                "disallowed_token_ranges": ",".join(map(str, disallowed_tokens)),
+                "ignore_eos": True,
             },
             "return_logprob": True,
             "return_text_in_logprobs": False,
@@ -189,9 +213,6 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
     output_logprobs = []
     for i, result in enumerate(results):
         output_ids = result["output_ids"]
-        # disallow tokens should not be in the output
-        for disallowed_token in disallowed_tokens:
-            assert disallowed_token not in output_ids
         cached_tokens = result["meta_info"]["cached_tokens"]
         if cached_tokens == 0:
             print(f"Prefill cache miss for prompt {i}, skipping this prompt")
@@ -215,7 +236,7 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
             "sampling_params": {
                 "temperature": 1,
                 "max_new_tokens": 0,
-                # "ignore_eos": True,
+                "ignore_eos": True,
             },
             "return_logprob": True,
             "return_text_in_logprobs": False,
@@ -252,7 +273,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         )
         return
 
-    first_turn_input_ids, disallowed_tokens = get_input_ids_and_disallowed_tokens()
+    first_turn_input_ids = get_input_ids(tokenizer_path=model_name)
     if max_samples is not None:
         first_turn_input_ids = first_turn_input_ids[:max_samples]
     print(
@@ -270,7 +291,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
             "sampling_params": {
                 "temperature": 1,
                 "max_new_tokens": max_new_tokens,
-                "disallowed_token_ranges": ",".join(map(str, disallowed_tokens)),
+                "ignore_eos": True,
             },
             "return_logprob": True,
             "return_text_in_logprobs": False,
@@ -278,7 +299,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
         },
     )
 
-    tokenizer = get_tokenizer("/data/datasets/tokenizers/model/v6/v6.xtok.json")
+    tokenizer = get_tokenizer(tokenizer_name=model_name)
     comma_token_id = tokenizer.encode(",")  # add comma to ensure cache hit
 
     results = response.json()
@@ -286,9 +307,6 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     second_turn_input_ids = []
     for i, result in enumerate(results):
         output_ids = result["output_ids"]
-        # disallow tokens should not be in the output
-        for disallowed_token in disallowed_tokens:
-            assert disallowed_token not in output_ids
         second_turn_input_ids.append(
             first_turn_input_ids[i] + output_ids + comma_token_id
         )
@@ -301,7 +319,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
             "sampling_params": {
                 "temperature": 1,
                 "max_new_tokens": max_new_tokens,
-                "disallowed_token_ranges": ",".join(map(str, disallowed_tokens)),
+                "ignore_eos": True,
             },
             "return_logprob": True,
             "return_text_in_logprobs": False,
@@ -315,9 +333,6 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
     output_logprobs = []
     for i, result in enumerate(results):
         output_ids = result["output_ids"]
-        # disallow tokens should not be in the output
-        for disallowed_token in disallowed_tokens:
-            assert disallowed_token not in output_ids
         cached_tokens = result["meta_info"]["cached_tokens"]
         if cached_tokens <= len(first_turn_input_ids[i]) + 1:
             print(f"Decode cache miss for prompt {i}, skipping this prompt")
@@ -341,6 +356,7 @@ def test_input_output_logprobs_match_decode_cache_hit_helper(
             "sampling_params": {
                 "temperature": 1,
                 "max_new_tokens": 0,
+                "ignore_eos": True,
             },
             "return_logprob": True,
             "return_text_in_logprobs": False,
