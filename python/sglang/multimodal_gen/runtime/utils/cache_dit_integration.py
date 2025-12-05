@@ -119,7 +119,7 @@ def enable_cache_on_transformer(
     config: CacheDitConfig,
     model_name: str = "transformer",
 ) -> torch.nn.Module:
-    """Enable cache-dit on a transformer module.
+    """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
 
     This function enables cache-dit acceleration using the BlockAdapterRegister
     for pre-registered models
