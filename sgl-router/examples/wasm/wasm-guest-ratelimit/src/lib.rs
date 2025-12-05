@@ -1,7 +1,7 @@
 //! WASM Guest Rate Limit Example for sgl-router
 //!
 //! This example demonstrates rate limiting middleware
-//! for sgl-router using the WebAssembly Component Model (WIT).
+//! for sgl-router using the WebAssembly Component Model.
 //!
 //! Features:
 //! - Rate limiting based on API Key or IP address

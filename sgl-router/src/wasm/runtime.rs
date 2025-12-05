@@ -93,7 +93,7 @@ impl WasmRuntime {
         (current_workers, max_recommended)
     }
 
-    /// Execute WASM component using WIT interface based on attach_point
+    /// Execute WASM component using WASM interface based on attach_point
     pub async fn execute_component_async(
         &self,
         wasm_bytes: Vec<u8>,

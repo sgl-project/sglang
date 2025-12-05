@@ -27,8 +27,7 @@ src/wasm/
 ├── types.rs            # Generic input/output types
 ├── errors.rs           # Error definitions
 ├── config.rs           # Runtime configuration
-└── interface/
-    └── spec.wit        # WebAssembly Interface Types definitions
+└── interface/          # WebAssembly Interface Types definitions
 ```
 
 ### Execution Flow
@@ -63,7 +62,7 @@ The module uses the WebAssembly Component Model with WASM interface type for typ
 - **Response Processing**: `middleware-on-response::on-response(resp: Response) -> Action`
 - **Actions**: `Continue`, `Reject(status)`, or `Modify(modify-action)`
 
-See [`interface/spec.wit`](./interface/spec.wit) for the complete interface definition.
+See [`interface/`](./interface/) for the complete interface definition.
 
 ## Usage
 
@@ -204,7 +203,7 @@ wasm-tools component new target/wasm32-wasip2/release/my_module.wasm \
 
 ### WASM Interface Type
 
-Define your component using the WASM interface from `interface/spec.wit`:
+Define your component using the WASM interface from `interface/spec.*`:
 
 ```rust
 wit_bindgen::generate!({

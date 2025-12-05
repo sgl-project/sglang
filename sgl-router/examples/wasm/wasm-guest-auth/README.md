@@ -1,6 +1,6 @@
 # WASM Auth Example for sgl-router
 
-This example demonstrates API key authentication middleware for sgl-router using the WebAssembly Component Model (WIT).
+This example demonstrates API key authentication middleware for sgl-router using the WebAssembly Component Model.
 
 ## Overview
 

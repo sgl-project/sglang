@@ -1,6 +1,6 @@
 //! WebAssembly (WASM) module support for sgl-router
 //!
-//! This module provides WASM component execution capabilities using the WebAssembly Component Model (WIT).
+//! This module provides WASM component execution capabilities using the WebAssembly Component Model.
 //! It supports middleware execution at various attach points (OnRequest, OnResponse) with async support.
 
 pub mod config;
