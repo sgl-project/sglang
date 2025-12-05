@@ -65,7 +65,9 @@ DEFAULT_MODEL_NAME_FOR_NIGHTLY_EVAL_FP8_TP2 = remove_failing_models(
 )
 
 # AMD-specific models verified on MI300X with tp=2
-AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = "Qwen/Qwen3-30B-A3B-Thinking-2507"
+AMD_MODEL_NAME_FOR_NIGHTLY_EVAL_TP2 = remove_failing_models(
+    "Qwen/Qwen3-30B-A3B-Thinking-2507"
+)
 
 NO_MOE_PADDING_MODELS = {"neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8"}
 DISABLE_HF_XET_MODELS = {
