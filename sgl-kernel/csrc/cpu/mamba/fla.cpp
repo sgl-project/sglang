@@ -977,8 +977,10 @@ template <typename scalar_t>
 void fused_gdn_gating_kernel_impl(
     float* __restrict__ A_log,
     const scalar_t* __restrict__ a,
+    const scalar_t* __restrict__ b,
     const scalar_t* __restrict__ dt_bias,
     float* __restrict__ out,
+    scalar_t* __restrict__ beta,
     int64_t batch,
     int64_t num_heads) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -986,6 +988,7 @@ void fused_gdn_gating_kernel_impl(
   constexpr int vec_size = bVec::size();
   constexpr int fvec_size = fVec::size();
   const fVec neg_one(-1.0f);
+  const fVec one(1.0f);
   at::parallel_for(0, batch, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       int64_t j = 0;
@@ -994,18 +997,25 @@ void fused_gdn_gating_kernel_impl(
         fVec A_log_vec1 = fVec::loadu(A_log + j + fvec_size);
         bVec dt_bias_vec = bVec::loadu(dt_bias + j);
         bVec a_bvec = bVec::loadu(a + i * num_heads + j);
-        fVec a0, a1, dt_bias_vec0, dt_bias_vec1;
+        bVec b_bvec = bVec::loadu(b + i * num_heads + j);
+        fVec a0, a1, dt_bias_vec0, dt_bias_vec1, b0, b1;
         std::tie(a0, a1) = at::vec::convert_to_float(a_bvec);
+        std::tie(b0, b1) = at::vec::convert_to_float(b_bvec);
         std::tie(dt_bias_vec0, dt_bias_vec1) = at::vec::convert_to_float(dt_bias_vec);
 
         fVec g0 = neg_one * A_log_vec0.exp_u20() * softplus(a0 + dt_bias_vec0);
         fVec g1 = neg_one * A_log_vec1.exp_u20() * softplus(a1 + dt_bias_vec1);
+        fVec beta0 = one / (one + (neg_one * b0).exp_u20());
+        fVec beta1 = one / (one + (neg_one * b1).exp_u20());
 
         g0.store(out + i * num_heads + j);
         g1.store(out + i * num_heads + j + fvec_size);
+        bVec beta_vec = at::vec::convert_from_float<scalar_t>(beta0, beta1);
+        beta_vec.store(beta + i * num_heads + j);
       }
       for (; j < num_heads; ++j) {
         out[i * num_heads + j] = -std::exp(A_log[j]) * softplus(float(a[i * num_heads + j]) + float(dt_bias[j]));
+        beta[i * num_heads + j] = 1 / (1 + std::exp(-b[i * num_heads + j]));
       }
     }
   });
@@ -1297,27 +1307,35 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
 
 // A_log: [num_v_heads]
 // a: [batch, num_v_heads]
+// b: [batch, num_v_heads]
 // dt_bias: [num_v_heads]
 // -A_log.float().exp() * F.softplus(a.float() + dt_bias)
-at::Tensor fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& dt_bias) {
-  RECORD_FUNCTION("sgl-kernel::fused_gdn_gating_cpu", std::vector<c10::IValue>({A_log, a, dt_bias}));
+std::tuple<at::Tensor, at::Tensor>
+fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b, const at::Tensor& dt_bias) {
+  RECORD_FUNCTION("sgl-kernel::fused_gdn_gating_cpu", std::vector<c10::IValue>({A_log, a, b, dt_bias}));
   CHECK_DIM(1, A_log);
   CHECK_DIM(2, a);
+  CHECK_DIM(2, b);
   CHECK_DIM(1, dt_bias);
   CHECK_CONTIGUOUS(a);
   CHECK_EQ(A_log.size(0), a.size(1));
   CHECK_EQ(A_log.size(0), dt_bias.size(0));
   int batch = a.size(0);
   int num_heads = a.size(1);
-  at::Tensor out = at::empty_like(a, a.options().dtype(at::kFloat));
+  CHECK_EQ(b.size(0), batch);
+  CHECK_EQ(b.size(1), num_heads);
+  at::Tensor out = at::empty({1, batch, num_heads}, a.options().dtype(at::kFloat));
+  at::Tensor beta = at::empty({1, batch, num_heads}, b.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(a.scalar_type(), "fused_gdn_gating_kernel", [&] {
     fused_gdn_gating_kernel_impl<scalar_t>(
         A_log.data_ptr<float>(),
         a.data_ptr<scalar_t>(),
+        b.data_ptr<scalar_t>(),
         dt_bias.data_ptr<scalar_t>(),
         out.data_ptr<float>(),
+        beta.data_ptr<scalar_t>(),
         batch,
         num_heads);
   });
-  return out;
+  return std::make_tuple(out, beta);
 }

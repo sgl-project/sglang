@@ -226,8 +226,10 @@ def sigmoid_gating_delta_rule_update(
     )
 
 
-def torch_gdn_gating(A_log, a, dt_bias):
-    return -A_log.float().exp() * softplus(a.float() + dt_bias)
+def torch_gdn_gating(A_log, a, b, dt_bias):
+    return -A_log.float().exp() * softplus(a.float() + dt_bias).unsqueeze(
+        0
+    ), b.sigmoid().unsqueeze(0)
 
 
 class TestMambaAttention(CustomTestCase):
@@ -291,12 +293,17 @@ class TestMambaAttention(CustomTestCase):
         for dim in dims:
             A_log = torch.rand(dim)
             a = torch.rand(1024, dim, dtype=torch.bfloat16)
+            b = torch.rand(1024, dim, dtype=torch.bfloat16)
             dt_bias = torch.rand(dim, dtype=torch.bfloat16)
 
-            g = torch_gdn_gating(A_log, a, dt_bias)
-            g_sgl = torch.ops.sgl_kernel.fused_gdn_gating_cpu(A_log, a, dt_bias)
+            g, beta = torch_gdn_gating(A_log, a, b, dt_bias)
+            g_sgl, beta_sgl = torch.ops.sgl_kernel.fused_gdn_gating_cpu(
+                A_log, a, b, dt_bias
+            )
             atol = rtol = precision[g.dtype]
+            atol2 = rtol2 = precision[beta.dtype]
             torch.testing.assert_close(g, g_sgl, atol=atol, rtol=rtol)
+            torch.testing.assert_close(beta, beta_sgl, atol=atol2, rtol=rtol2)
 
     def test_fused_sigmoid_gating_delta_rule_update(self):
         batch_size = 1

@@ -300,7 +300,8 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     double softplus_beta = 1.0,
     double softplus_threshold = 20.0);
 // fused_gdn_gating
-at::Tensor fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& dt_bias);
+std::tuple<at::Tensor, at::Tensor>
+fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b, const at::Tensor& dt_bias);
 
 // fused_qkvzba_split_reshape_cat_cpu
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_reshape_cat_cpu(
@@ -478,7 +479,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "use_qk_l2norm_in_kernel, float softplus_beta=1.0, float softplus_threshold=20.0) -> Tensor");
   m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
   // fused_gdn_gating
-  m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor dt_bias) -> Tensor");
+  m.def("fused_gdn_gating_cpu(Tensor A_log, Tensor a, Tensor b, Tensor dt_bias) -> (Tensor, Tensor)");
   m.impl("fused_gdn_gating_cpu", torch::kCPU, &fused_gdn_gating_cpu);
   // fused_qkvzba_split_reshape_cat_cpu
   m.def(
