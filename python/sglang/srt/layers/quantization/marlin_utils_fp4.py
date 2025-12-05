@@ -224,7 +224,7 @@ def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     # WORKSPACE
     device = layer.w13_weight.device
     param_dtype = layer.params_dtype
-    layer.workspace = marlin_make_workspace_new(device, 4)
+    layer.workspace = marlin_make_workspace(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     # WEIGHT
@@ -242,7 +242,7 @@ def prepare_moe_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         for i in range(e):
             qweight = weight[i].view(torch.int32).T.contiguous()
 
-            marlin_qweight = ops.gptq_marlin_repack(
+            marlin_qweight = gptq_marlin_repack(
                 b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=4
             )
             tensor_list.append(marlin_qweight)
@@ -337,7 +337,7 @@ def rand_marlin_weight_nvfp4_like(weight, group_size):
         * scales.repeat_interleave(group_size, 1).to(weight.dtype)
     )
 
-    marlin_qweight = ops.gptq_marlin_repack(
+    marlin_qweight = gptq_marlin_repack(
         b_q_weight=fp4_weight.view(torch.int32).T.contiguous(),
         perm=torch.empty(0, dtype=torch.int, device=device),
         size_k=size_k,
@@ -386,7 +386,7 @@ def rand_marlin_weight_mxfp4_like(weight, group_size):
     ).view(size_n, size_k)
     weight_ref = weight_ref * scales.repeat_interleave(group_size, 1).to(weight.dtype)
 
-    marlin_qweight = ops.gptq_marlin_repack(
+    marlin_qweight = gptq_marlin_repack(
         b_q_weight=fp4_weight.view(torch.int32).T.contiguous(),
         perm=torch.empty(0, dtype=torch.int, device=device),
         size_k=size_k,
