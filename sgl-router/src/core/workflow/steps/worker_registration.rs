@@ -53,7 +53,17 @@ struct ServerInfo {
     max_prefill_tokens: Option<usize>,
     max_running_requests: Option<usize>,
     max_num_reqs: Option<usize>,
+}
+
+/// Model information returned from /model_info endpoint
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ModelInfo {
+    model_path: Option<String>,
+    tokenizer_path: Option<String>,
+    is_generation: Option<bool>,
+    /// HuggingFace model type string (e.g., "llama", "qwen2", "gpt_oss")
     model_type: Option<String>,
+    /// Model architectures from HuggingFace config (e.g., ["LlamaForCausalLM"])
     architectures: Option<Vec<String>>,
 }
 
@@ -71,7 +81,7 @@ fn parse_server_info(json: Value) -> Result<ServerInfo, String> {
 /// Get server info from /get_server_info endpoint
 async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerInfo, String> {
     let base_url = url.trim_end_matches('/');
-    let server_info_url = format!("{}/get_server_info", base_url);
+    let server_info_url = format!("{}/server_info", base_url);
 
     let mut req = HTTP_CLIENT.get(&server_info_url);
     if let Some(key) = api_key {
@@ -97,6 +107,35 @@ async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerInfo,
         .map_err(|e| format!("Failed to parse response from {}: {}", server_info_url, e))?;
 
     parse_server_info(json)
+}
+
+/// Get model info from /model_info endpoint
+async fn get_model_info(url: &str, api_key: Option<&str>) -> Result<ModelInfo, String> {
+    let base_url = url.trim_end_matches('/');
+    let model_info_url = format!("{}/model_info", base_url);
+
+    let mut req = HTTP_CLIENT.get(&model_info_url);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to {}: {}", model_info_url, e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Server returned status {} from {}",
+            response.status(),
+            model_info_url
+        ));
+    }
+
+    response
+        .json::<ModelInfo>()
+        .await
+        .map_err(|e| format!("Failed to parse response from {}: {}", model_info_url, e))
 }
 
 /// Get DP info for a worker URL
@@ -321,33 +360,37 @@ impl StepExecutor for DiscoverMetadataStep {
 
         let (discovered_labels, detected_runtime) = match connection_mode.as_ref() {
             ConnectionMode::Http => {
-                match get_server_info(&config.url, config.api_key.as_deref()).await {
-                    Ok(server_info) => {
-                        let mut labels = HashMap::new();
-                        if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
-                            labels.insert("model_path".to_string(), model_path);
-                        }
-                        if let Some(served_model_name) =
-                            server_info.served_model_name.filter(|s| !s.is_empty())
-                        {
-                            labels.insert("served_model_name".to_string(), served_model_name);
-                        }
-                        // Extract model_type if present
-                        if let Some(model_type) = server_info.model_type.filter(|s| !s.is_empty()) {
-                            labels.insert("model_type".to_string(), model_type);
-                        }
-                        // Extract architectures if present (serialize to JSON)
-                        if let Some(architectures) =
-                            server_info.architectures.filter(|a| !a.is_empty())
-                        {
-                            if let Ok(json_str) = serde_json::to_string(&architectures) {
-                                labels.insert("architectures".to_string(), json_str);
-                            }
-                        }
-                        Ok((labels, None))
+                let mut labels = HashMap::new();
+
+                // Fetch from /get_server_info for server-related metadata
+                if let Ok(server_info) =
+                    get_server_info(&config.url, config.api_key.as_deref()).await
+                {
+                    if let Some(model_path) = server_info.model_path.filter(|s| !s.is_empty()) {
+                        labels.insert("model_path".to_string(), model_path);
                     }
-                    Err(e) => Err(e),
+                    if let Some(served_model_name) =
+                        server_info.served_model_name.filter(|s| !s.is_empty())
+                    {
+                        labels.insert("served_model_name".to_string(), served_model_name);
+                    }
                 }
+
+                // Fetch from /model_info for model-related metadata (model_type, architectures)
+                if let Ok(model_info) = get_model_info(&config.url, config.api_key.as_deref()).await
+                {
+                    if let Some(model_type) = model_info.model_type.filter(|s| !s.is_empty()) {
+                        labels.insert("model_type".to_string(), model_type);
+                    }
+                    if let Some(architectures) = model_info.architectures.filter(|a| !a.is_empty())
+                    {
+                        if let Ok(json_str) = serde_json::to_string(&architectures) {
+                            labels.insert("architectures".to_string(), json_str);
+                        }
+                    }
+                }
+
+                Ok((labels, None))
             }
             ConnectionMode::Grpc { .. } => {
                 let runtime_type = config.runtime.as_deref();
