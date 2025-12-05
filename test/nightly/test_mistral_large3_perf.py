@@ -6,7 +6,7 @@ from nightly_utils import NightlyBenchmarkRunner
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-register_cuda_ci(est_time=600, suite="nightly-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=600, suite="nightly-8-gpu-b200", nightly=True)
 
 MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
 PROFILE_DIR = "performance_profiles_mistral_large3"
