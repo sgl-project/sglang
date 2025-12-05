@@ -79,7 +79,7 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 - `/rerun-failed-ci`: Reruns the failed or flaky tests from the most recent commit.
 - `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
 
-If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash_command_handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/13498#issuecomment-3547552157).
+If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
 To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
 
@@ -135,6 +135,6 @@ Follow these steps:
 
 If you want to contribute but don’t have a specific idea in mind, pick issues labeled [“good first issue” or “help wanted”](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase. Also check out this [code walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
 
-If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://slack.sglang.ai).
+If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://slack.sglang.io).
 
 Thank you for your interest in SGLang. Happy coding!

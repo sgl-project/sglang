@@ -21,11 +21,12 @@ use crate::protocols::{
     responses::{ResponsesGetParams, ResponsesRequest},
 };
 
+pub mod conversations;
 pub mod factory;
 pub mod grpc;
 pub mod header_utils;
 pub mod http;
-pub mod openai; // New refactored OpenAI router module
+pub mod openai;
 pub mod router_manager;
 
 pub use factory::RouterFactory;
@@ -141,15 +142,24 @@ pub trait RouterTrait: Send + Sync + Debug {
         model_id: Option<&str>,
     ) -> Response;
 
-    // Conversations API
+    /// Get router type name
+    fn router_type(&self) -> &'static str;
+
+    /// Check if this is a PD router
+    fn is_pd_mode(&self) -> bool {
+        self.router_type() == "pd"
+    }
+
+    /// Create a new conversation
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, _body: &Value) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            "Conversations create endpoint not implemented",
+            "Conversations not supported by this router",
         )
             .into_response()
     }
 
+    /// Get a conversation by ID
     async fn get_conversation(
         &self,
         _headers: Option<&HeaderMap>,
@@ -157,11 +167,12 @@ pub trait RouterTrait: Send + Sync + Debug {
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            "Conversations get endpoint not implemented",
+            "Conversations not supported by this router",
         )
             .into_response()
     }
 
+    /// Update a conversation
     async fn update_conversation(
         &self,
         _headers: Option<&HeaderMap>,
@@ -170,11 +181,12 @@ pub trait RouterTrait: Send + Sync + Debug {
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            "Conversations update endpoint not implemented",
+            "Conversations not supported by this router",
         )
             .into_response()
     }
 
+    /// Delete a conversation
     async fn delete_conversation(
         &self,
         _headers: Option<&HeaderMap>,
@@ -182,23 +194,23 @@ pub trait RouterTrait: Send + Sync + Debug {
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            "Conversations delete endpoint not implemented",
+            "Conversations not supported by this router",
         )
             .into_response()
     }
 
-    /// List items for a conversation
+    /// List items in a conversation
     async fn list_conversation_items(
         &self,
         _headers: Option<&HeaderMap>,
         _conversation_id: &str,
         _limit: Option<usize>,
-        _order: Option<String>,
-        _after: Option<String>,
+        _order: Option<&str>,
+        _after: Option<&str>,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            "Conversation items list endpoint not implemented",
+            "Conversations not supported by this router",
         )
             .into_response()
     }
@@ -212,13 +224,12 @@ pub trait RouterTrait: Send + Sync + Debug {
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            "Conversation items create endpoint not implemented",
+            "Conversations not supported by this router",
         )
             .into_response()
     }
 
-    /// Get a single conversation item
-    /// The `include` parameter is accepted but not yet implemented
+    /// Get a specific item from a conversation
     async fn get_conversation_item(
         &self,
         _headers: Option<&HeaderMap>,
@@ -228,12 +239,12 @@ pub trait RouterTrait: Send + Sync + Debug {
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            "Conversation item get endpoint not implemented",
+            "Conversations not supported by this router",
         )
             .into_response()
     }
 
-    /// Delete a conversation item
+    /// Delete an item from a conversation
     async fn delete_conversation_item(
         &self,
         _headers: Option<&HeaderMap>,
@@ -242,16 +253,8 @@ pub trait RouterTrait: Send + Sync + Debug {
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
-            "Conversation item delete endpoint not implemented",
+            "Conversations not supported by this router",
         )
             .into_response()
-    }
-
-    /// Get router type name
-    fn router_type(&self) -> &'static str;
-
-    /// Check if this is a PD router
-    fn is_pd_mode(&self) -> bool {
-        self.router_type() == "pd"
     }
 }

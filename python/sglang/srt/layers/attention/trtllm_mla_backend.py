@@ -24,7 +24,6 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda, is_flashinfer_available, is_float4_e2m1fn_x2
-from sglang.srt.utils.common import cached_triton_kernel
 
 if is_flashinfer_available():
     import flashinfer
@@ -51,7 +50,6 @@ DEFAULT_WORKSPACE_SIZE_MB = 128  # Memory workspace size in MB
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK_SIZE"]))
 @triton.jit
 def pad_draft_extend_query_kernel(
     q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
@@ -125,7 +123,6 @@ def pad_draft_extend_query_kernel(
     )
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["BLOCK_SIZE"]))
 @triton.jit
 def unpad_draft_extend_output_kernel(
     raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)
@@ -805,6 +802,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         k_rope: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
@@ -845,6 +843,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             # For FP8 path, we already have the query and rope parts merged because of the quantize_and_rope_for_fp8 function
             query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # Apply llama 4 scaling if provided
+        if llama_4_scaling is not None:
+            query = query.to(self.q_data_type) * llama_4_scaling
+            query = query.to(self.data_type)
 
         # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
         if query.dim() == 3:
@@ -906,6 +909,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         k_rope: Optional[torch.Tensor] = None,
         cos_sin_cache: Optional[torch.Tensor] = None,
         is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         if (
@@ -957,6 +961,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q = _concat_mla_absorb_q_general(q_nope, q_rope_reshaped)
 
         q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # Apply llama 4 scaling if provided
+        if llama_4_scaling is not None:
+            q = q.to(self.q_data_type) * llama_4_scaling
+            q = q.to(self.data_type)
 
         if (
             forward_batch.forward_mode.is_target_verify()
