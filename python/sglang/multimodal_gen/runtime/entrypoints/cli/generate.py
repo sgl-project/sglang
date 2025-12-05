@@ -89,8 +89,7 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
 
 def generate_cmd(args: argparse.Namespace):
     """The entry point for the generate command."""
-    # FIXME(mick): do not hard code
-    args.request_id = generate_request_id()
+    args.request_id = "mocked_fake_id_for_offline_generate"
 
     # Auto-enable stage logging if dump path is provided
     if args.perf_dump_path:
