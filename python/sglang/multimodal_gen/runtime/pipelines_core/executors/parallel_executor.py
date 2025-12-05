@@ -1,10 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import os
 from typing import List
 
 import torch
-import torch.profiler
 
 from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -54,7 +52,7 @@ class ParallelExecutor(PipelineExecutor):
                 src=self.worker.cfg_group.ranks[0],
             )
 
-    def run_all_stages(
+    def _execute(
         self,
         stages: List[PipelineStage],
         batch: Req,
@@ -100,38 +98,12 @@ class ParallelExecutor(PipelineExecutor):
     ) -> Req:
         rank = get_classifier_free_guidance_rank()
 
-        do_full_stages_profile = bool(
-            getattr(batch, "profile", False) and getattr(batch, "full_stages", False)
-        )
-
-        if do_full_stages_profile:
-            try:
-                os.makedirs("./logs", exist_ok=True)
-            except Exception:
-                pass
-            activities = [torch.profiler.ProfilerActivity.CPU]
-            if torch.cuda.is_available():
-                activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-            with torch.profiler.profile(
-                activities=activities,
-                record_shapes=True,
-                with_stack=True,
-            ) as prof:
-                batch = self.run_all_stages(stages, batch, server_args)
-            if rank == 0:
-                try:
-                    os.makedirs("./logs", exist_ok=True)
-                except Exception:
-                    pass
-                request_id = getattr(batch, "request_id", "full_stages")
-                world_rank = get_world_rank()
-                trace_path = os.path.abspath(
-                    f"./logs/{request_id}-global-rank{world_rank}.trace.json.gz"
-                )
-                logger.info("Saving stages profiler trace to: %s", trace_path)
-                prof.export_chrome_trace(trace_path)
+        if batch.profile and batch.full_stages:
+            world_rank = get_world_rank()
         else:
-            batch = self.run_all_stages(stages, batch, server_args)
+            world_rank = 0
+
+        with self.profile_execution(batch, check_rank=rank, dump_rank=world_rank):
+            batch = self._execute(stages, batch, server_args)
 
         return batch

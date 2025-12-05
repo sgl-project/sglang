@@ -7,7 +7,6 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
-import os
 import time
 import weakref
 from collections.abc import Iterable
@@ -15,7 +14,6 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-import torch.profiler
 from einops import rearrange
 from tqdm.auto import tqdm
 
@@ -45,6 +43,9 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
+    SGLDiffusionProfiler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -575,70 +576,32 @@ class DenoisingStage(PipelineStage):
 
     def start_profile(self, batch: Req):
 
-        if (not batch.profile) or bool(getattr(batch, "full_stages", False)):
+        if (not batch.profile) or batch.full_stages:
             return
 
-        logger.info("Starting Profiler...")
-        # Build activities dynamically to avoid CUDA hangs when CUDA is unavailable
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
+        self._profile_full = batch.full_denoise
+        request_id = batch.request_id if batch.request_id else "profile_trace"
 
-        self._profile_full = bool(getattr(batch, "full_denoise", False))
-        try:
-            os.makedirs("./logs", exist_ok=True)
-        except Exception:
-            pass
-        if self._profile_full:
-            self.profiler = torch.profiler.profile(
-                activities=activities,
-                record_shapes=True,
-                with_stack=True,
-            )
-        else:
-            self.profiler = torch.profiler.profile(
-                activities=activities,
-                schedule=torch.profiler.schedule(
-                    skip_first=0,
-                    wait=0,
-                    warmup=1,
-                    active=batch.num_profiled_timesteps,
-                    repeat=5,
-                ),
-                on_trace_ready=lambda _: torch.profiler.tensorboard_trace_handler(
-                    f"./logs"
-                ),
-                record_shapes=True,
-                with_stack=True,
-            )
+        self.profiler = SGLDiffusionProfiler(
+            request_id=request_id,
+            rank=0,  # We control export manually
+            full_profile=self._profile_full,
+            num_steps=batch.num_profiled_timesteps,
+        )
         self.profiler.start()
 
     def step_profile(self):
         if self.profiler:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            # Only step when using scheduled profiling
             if not getattr(self, "_profile_full", False):
                 self.profiler.step()
 
     def stop_profile(self, batch: Req):
         try:
             if self.profiler:
-                logger.info("Stopping Profiler...")
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                self.profiler.stop()
-                request_id = batch.request_id if batch.request_id else "profile_trace"
-                log_dir = f"./logs"
-                os.makedirs(log_dir, exist_ok=True)
-
                 rank = get_world_rank()
-                trace_path = os.path.abspath(
-                    os.path.join(log_dir, f"{request_id}-rank{rank}.trace.json.gz")
-                )
-                logger.info(f"Saving profiler traces to: {trace_path}")
-                self.profiler.export_chrome_trace(trace_path)
+                self.profiler.stop(export_trace=True, dump_rank=rank)
                 torch.distributed.barrier()
+                self.profiler = None
         except Exception as e:
             logger.error(f"{e}")
 
