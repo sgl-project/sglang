@@ -400,7 +400,7 @@ class SchedulerDisaggregationPrefillMixin:
             if hasattr(req.disagg_kv_sender, "result"):
                 # assert req.disagg_kv_sender.result is None
                 req.disagg_kv_sender.result = (batch.copy(), result)
-                self.send_kv_chunk(req, last_chunk=req.disagg_kv_sender.result is None)
+                self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
             else:
                 continue
                 
