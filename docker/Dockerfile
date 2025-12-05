@@ -434,20 +434,21 @@ WORKDIR /sgl-workspace/sglang
 ########## Runtime Image ##############################
 ########################################################
 #
-# PURPOSE: Lightweight production runtime environment
+# PURPOSE: Production runtime environment with JIT support
 #
 # This stage creates a production-ready image containing:
 # - Pre-compiled SGLang and DeepEP components
-# - Essential runtime dependencies only (no build tools)
+# - Full CUDA toolchain for JIT compilation (DeepGEMM, Triton, FlashInfer)
 # - Optimized for inference workloads and deployment
-# - Significantly smaller than the framework image
+# - Smaller than framework (no dev tools like vim, tmux, nsight, etc.)
 #
 # Use this stage when you need:
 # - Production deployment of SGLang
-# - Minimal runtime footprint without build tools
+# - JIT compilation support for FP8/microscaling kernels
 # - Ready-to-run inference server environment
 #
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu24.04 AS runtime
+# Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH
@@ -461,7 +462,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin" \
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
-# Install ONLY runtime dependencies (no build tools)
+# Install runtime dependencies (devel base provides gcc/g++/build tools)
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     apt-get update && apt-get install -y --no-install-recommends \
     # Python runtime
@@ -471,16 +472,13 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     python3.12-full \
     python3.12-dev \
     wget \
-    # Minimal C compiler for Triton JIT
-    gcc \
-    libc6-dev \
     # Core system utilities
     tzdata \
     ca-certificates \
     netcat-openbsd \
     curl \
     git \
-    # Runtime libraries (no -dev packages)
+    # Runtime libraries
     libopenmpi3 \
     libnuma1 \
     libibverbs1 \
@@ -505,9 +503,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     rdma-core \
     infiniband-diags \
     perftest \
-    # Build tools needed for FlashInfer JIT compilation
+    # Build tools for JIT compilation
     ninja-build \
-    g++ \
     # NCCL packages needed for pynccl_allocator JIT compilation (-lnccl)
     libnccl2 \
     libnccl-dev \
@@ -536,17 +533,6 @@ COPY --from=framework /usr/local/lib/python3.12/dist-packages /usr/local/lib/pyt
 
 # Copy SGLang workspace
 COPY --from=framework /sgl-workspace /sgl-workspace
-
-# Copy in CUDA bits
-COPY --from=framework /usr/local/cuda/bin/nvcc /usr/local/cuda/bin/nvcc
-COPY --from=framework /usr/local/cuda/bin/cudafe++ /usr/local/cuda/bin/cudafe++
-COPY --from=framework /usr/local/cuda/bin/ptxas /usr/local/cuda/bin/ptxas
-COPY --from=framework /usr/local/cuda/bin/fatbinary /usr/local/cuda/bin/fatbinary
-COPY --from=framework /usr/local/cuda/include/ /usr/local/cuda/include/
-COPY --from=framework /usr/local/cuda/nvvm /usr/local/cuda/nvvm
-COPY --from=framework /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/
-RUN ln -s /usr/local/cuda/lib64/libcublas.so.12 /usr/local/cuda/lib64/libcublas.so
-RUN ln -s /usr/local/cuda/lib64/libcublasLt.so.12 /usr/local/cuda/lib64/libcublasLt.so
 
 # Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
 RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
