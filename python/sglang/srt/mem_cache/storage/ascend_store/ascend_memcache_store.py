@@ -64,7 +64,7 @@ class AscendMemCacheStore(HiCacheStorage):
             self.warmup()
             logger.info("Ascend MemCache warmup successfully.")
 
-            self.is_device_sdma = self._check_device_sdma()
+            self.is_device_rdma = self._check_device_rdma()
         except ValueError as e:
             logger.error("Init Ascend MemCache failed: %s", e)
             raise e
@@ -74,7 +74,7 @@ class AscendMemCacheStore(HiCacheStorage):
             )
             raise e
 
-    def _check_device_sdma(self):
+    def _check_device_rdma(self):
         config_path = os.environ.get("MMC_LOCAL_CONFIG_PATH")
         if not config_path:
             logger.error("MMC_LOCAL_CONFIG_PATH is not set")
@@ -98,7 +98,7 @@ class AscendMemCacheStore(HiCacheStorage):
                     protocol_value = parts[1].strip()
                 break
 
-        if protocol_value == "device_sdma":
+        if protocol_value == "device_rdma":
             return True
         return False
 
@@ -112,7 +112,7 @@ class AscendMemCacheStore(HiCacheStorage):
         assert self.store.get(warmup_key) == warmup_value
 
     def register_mem_pool_device(self, mem_pool_device: KVCache):
-        if not self.is_device_sdma:
+        if not self.is_device_rdma:
             return
 
         super().register_mem_pool_device(mem_pool_device)
@@ -142,9 +142,9 @@ class AscendMemCacheStore(HiCacheStorage):
                     buffer.numel() * buffer.element_size(),
                 )
             if ret_code:
-                logger.error(f"failed to register buffer, error code: {ret_code}")
+                logger.error(f"failed to register kv buffer for device rdma, error code: {ret_code}")
             else:
-                logger.info(f"register_mem_pool_device register success: {ret_code=}")
+                logger.info(f"register kv buffer for device rdma success: {ret_code=}")
         except TypeError as err:
             logger.error("Failed to register buffer to Ascend MemCache Store: %s", err)
             raise TypeError("Ascend MemCache Store Register Buffer Error.") from err
@@ -210,13 +210,13 @@ class AscendMemCacheStore(HiCacheStorage):
             exist_result[idx] = 1 if put_result[i] == 0 else 0
 
         if logger.isEnabledFor(logging.DEBUG):
-            total_pages = len(new_src_locations) * len(new_src_locations[0])
+            layers_per_key = len(new_src_locations[0])
             total_size = sum(chain.from_iterable(new_src_sizes))
             logger.debug(
                 f"batch put finished, origin keys is {len(keys)}, "
-                f"success is {put_result.count(0)}, "
                 f"non exist keys is {len(new_keys)}, "
-                f"copy_total_pages={total_pages}, "
+                f"success is {put_result.count(0)}, "
+                f"layers per key is {layers_per_key}, "
                 f"copy_total_size={total_size}, "
                 f"duration {(end - start) * 1000:.3f}ms, "
                 f"speed {float(total_size) / 1024 / 1024 / 1024 / (end - start):.3f}GB/s"
@@ -253,12 +253,12 @@ class AscendMemCacheStore(HiCacheStorage):
         end = time.time()
 
         if logger.isEnabledFor(logging.DEBUG):
-            total_pages = len(target_locations) * len(target_locations[0])
+            layers_per_key = len(target_locations[0])
             total_size = sum(chain.from_iterable(target_sizes))
             logger.debug(
                 f"batch get finished, origin keys is {len(keys)}, "
                 f"success is {get_result.count(0)}, "
-                f"copy_total_pages={total_pages}, "
+                f"layers per key is {layers_per_key}, "
                 f"copy_total_size={total_size}, "
                 f"duration {(end - start) * 1000:.3f}ms, "
                 f"speed {float(total_size) / 1024 / 1024 / 1024 / (end - start):.3f}GB/s"
