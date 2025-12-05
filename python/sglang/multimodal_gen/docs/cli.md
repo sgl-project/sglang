@@ -176,8 +176,13 @@ SAMPLING_ARGS=(
   --output-file-name "A curious raccoon.mp4"
 )
 
-# Users can set `SGLANG_CACHE_DIT_ENABLED` env as `true` to enable cache acceleration.
+sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+
+# Or, users can set `SGLANG_CACHE_DIT_ENABLED` env as `true` to enable cache acceleration
 SGLANG_CACHE_DIT_ENABLED=true sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 ```
 
 Once the generation task has finished, the server will shut down automatically.
+
+> [!NOTE]
+> The HTTP server-related arguments are ignored in this subcommand.

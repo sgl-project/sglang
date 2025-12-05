@@ -17,3 +17,4 @@ See [cache-dit documentation](cache_dit.md) for details.*
 | `SGLANG_CACHE_DIT_SCM_POLICY`       | SCM caching policy: `dynamic` (adaptive) or `static` (fixed pattern)                                               | `dynamic`     |
 | `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | Custom SCM compute bins (comma-separated, e.g., "8,3,3,2,2")                                                       | Not set       |
 | `SGLANG_CACHE_DIT_SCM_CACHE_BINS`   | Custom SCM cache bins (comma-separated, e.g., "1,2,2,2,3")                                                         | Not set       |
+
