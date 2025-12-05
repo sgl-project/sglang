@@ -1,6 +1,6 @@
 //! Harmony model detection
 
-use crate::core::Worker;
+use crate::core::{Worker, WorkerRegistry};
 
 /// Harmony model detector
 ///
@@ -50,5 +50,28 @@ impl HarmonyDetector {
             .as_bytes()
             .windows(7) // "gpt-oss".len()
             .any(|window| window.eq_ignore_ascii_case(b"gpt-oss"))
+    }
+
+    /// Check if any worker for the given model is a Harmony/GPT-OSS worker.
+    ///
+    /// This method looks up workers from the registry by model name and checks
+    /// if any of them are Harmony workers based on their metadata (architectures,
+    /// hf_model_type).
+    ///
+    /// Falls back to string-based detection if no workers are registered for
+    /// the model (e.g., during startup before workers are discovered).
+    pub fn is_harmony_model_in_registry(registry: &WorkerRegistry, model_name: &str) -> bool {
+        // Get workers for this model
+        let workers = registry.get_by_model_fast(model_name);
+
+        if workers.is_empty() {
+            // No workers found - fall back to string-based detection
+            return Self::is_harmony_model(model_name);
+        }
+
+        // Check if any worker is a Harmony worker
+        workers
+            .iter()
+            .any(|worker| Self::is_harmony_worker(worker.as_ref()))
     }
 }

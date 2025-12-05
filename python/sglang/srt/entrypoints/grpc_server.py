@@ -22,6 +22,7 @@ from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 
 import sglang
+from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.grpc import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from sglang.srt.grpc.grpc_request_manager import GrpcRequestManager
@@ -719,7 +720,10 @@ async def serve_grpc(
         server_args=server_args,
     )
 
-    # Update model info from scheduler info
+    # Load model config to get HF config info (same as TokenizerManager does)
+    model_config = ModelConfig.from_server_args(server_args)
+
+    # Update model info from scheduler info and model config
     if model_info is None:
         model_info = {
             "model_name": server_args.model_path,
@@ -728,8 +732,8 @@ async def serve_grpc(
             ),
             "vocab_size": scheduler_info.get("vocab_size", 128256),
             "supports_vision": scheduler_info.get("supports_vision", False),
-            "model_type": scheduler_info.get("model_type"),
-            "architectures": scheduler_info.get("architectures"),
+            "model_type": getattr(model_config.hf_config, "model_type", None),
+            "architectures": getattr(model_config.hf_config, "architectures", None),
             "max_req_input_len": scheduler_info.get("max_req_input_len", 8192),
             "eos_token_ids": scheduler_info.get("eos_token_ids", []),
             "pad_token_id": scheduler_info.get("pad_token_id", 0),

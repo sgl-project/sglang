@@ -2664,12 +2664,6 @@ def run_scheduler_process(
                 "status": "ready",
                 "max_total_num_tokens": scheduler.max_total_num_tokens,
                 "max_req_input_len": scheduler.max_req_input_len,
-                "model_type": getattr(
-                    scheduler.model_config.hf_config, "model_type", None
-                ),
-                "architectures": getattr(
-                    scheduler.model_config.hf_config, "architectures", None
-                ),
             }
         )
 
