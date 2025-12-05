@@ -1,10 +1,18 @@
 import os
 import unittest
+from types import SimpleNamespace
 
 from nightly_utils import NightlyBenchmarkRunner
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
+from sglang.test.run_eval import run_eval
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    _parse_int_list_env,
+    popen_launch_server,
+)
 
 register_cuda_ci(est_time=600, suite="nightly-8-gpu-b200", nightly=True)
 
@@ -61,6 +69,36 @@ class TestNightlyMistralLarge3Performance(unittest.TestCase):
             raise AssertionError(
                 f"Benchmark failed for {self.model}. Check the logs for details."
             )
+
+    def test_accuracy_mgsm(self):
+        """Run MGSM accuracy evaluation for Mistral Large 3."""
+        process = popen_launch_server(
+            model=self.model,
+            base_url=self.base_url,
+            other_args=self.other_args,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        )
+
+        try:
+            args = SimpleNamespace(
+                base_url=self.base_url,
+                model=self.model,
+                eval_name="mgsm_en",
+                num_examples=None,
+                num_threads=1024,
+            )
+            metrics = run_eval(args)
+            print(f"MGSM accuracy for {self.model}: {metrics['score']}")
+
+            # Placeholder threshold - adjust after first successful run
+            expected_threshold = 0.90
+            self.assertGreaterEqual(
+                metrics["score"],
+                expected_threshold,
+                f"MGSM accuracy {metrics['score']} below threshold {expected_threshold}",
+            )
+        finally:
+            kill_process_tree(process.pid)
 
 
 if __name__ == "__main__":
