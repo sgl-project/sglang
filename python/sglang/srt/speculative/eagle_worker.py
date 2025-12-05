@@ -733,7 +733,10 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        if self.target_worker.model_runner.hybrid_gdn_config is not None:
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.mamba2_config is not None
+        ):
             accepted_length = (
                 torch.tensor(
                     res.accept_length_per_req_cpu,
