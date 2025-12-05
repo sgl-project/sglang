@@ -31,10 +31,16 @@ use super::{
         send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
-    utils::{event_types, FunctionCallInProgress, OutputIndexMapper, StreamAction},
+    utils::{FunctionCallInProgress, OutputIndexMapper, StreamAction},
 };
 use crate::{
-    protocols::responses::{ResponseToolType, ResponsesRequest},
+    protocols::{
+        event_types::{
+            is_function_call_type, is_response_event, FunctionCallEvent, ItemType, McpEvent,
+            OutputItemEvent, ResponseEvent,
+        },
+        responses::{ResponseToolType, ResponsesRequest},
+    },
     routers::header_utils::{apply_request_headers, preserve_response_headers},
 };
 
@@ -161,19 +167,19 @@ impl StreamingResponseAccumulator {
             .unwrap_or_default();
 
         match event_type.as_str() {
-            event_types::RESPONSE_CREATED => {
+            ResponseEvent::CREATED => {
                 if self.initial_response.is_none() {
                     if let Some(response) = parsed.get("response") {
                         self.initial_response = Some(response.clone());
                     }
                 }
             }
-            event_types::RESPONSE_COMPLETED => {
+            ResponseEvent::COMPLETED => {
                 if let Some(response) = parsed.get("response") {
                     self.completed_response = Some(response.clone());
                 }
             }
-            event_types::OUTPUT_ITEM_DONE => {
+            OutputItemEvent::DONE => {
                 if let (Some(index), Some(item)) = (
                     parsed
                         .get("output_index")
@@ -292,7 +298,7 @@ impl StreamingToolHandler {
             .unwrap_or_default();
 
         match event_type.as_str() {
-            event_types::RESPONSE_CREATED => {
+            ResponseEvent::CREATED => {
                 if self.original_response_id.is_none() {
                     if let Some(response_obj) = parsed.get("response").and_then(|v| v.as_object()) {
                         if let Some(id) = response_obj.get("id").and_then(|v| v.as_str()) {
@@ -302,8 +308,8 @@ impl StreamingToolHandler {
                 }
                 StreamAction::Forward
             }
-            event_types::RESPONSE_COMPLETED => StreamAction::Forward,
-            event_types::OUTPUT_ITEM_ADDED => {
+            ResponseEvent::COMPLETED => StreamAction::Forward,
+            OutputItemEvent::ADDED => {
                 if let Some(idx) = parsed.get("output_index").and_then(|v| v.as_u64()) {
                     self.ensure_output_index(idx as usize);
                 }
@@ -311,9 +317,7 @@ impl StreamingToolHandler {
                 // Check if this is a function_call item being added
                 if let Some(item) = parsed.get("item") {
                     if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                        if item_type == event_types::ITEM_TYPE_FUNCTION_CALL
-                            || item_type == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
-                        {
+                        if is_function_call_type(item_type) {
                             match parsed.get("output_index").and_then(|v| v.as_u64()) {
                                 Some(idx) => {
                                     let output_index = idx as usize;
@@ -343,7 +347,7 @@ impl StreamingToolHandler {
                 }
                 StreamAction::Forward
             }
-            event_types::FUNCTION_CALL_ARGUMENTS_DELTA => {
+            FunctionCallEvent::ARGUMENTS_DELTA => {
                 // Accumulate arguments for the function call
                 if let Some(output_index) = parsed
                     .get("output_index")
@@ -371,7 +375,7 @@ impl StreamingToolHandler {
                 }
                 StreamAction::Forward
             }
-            event_types::FUNCTION_CALL_ARGUMENTS_DONE => {
+            FunctionCallEvent::ARGUMENTS_DONE => {
                 // Function call arguments complete - check if ready to execute
                 if let Some(output_index) = parsed
                     .get("output_index")
@@ -396,8 +400,8 @@ impl StreamingToolHandler {
                     StreamAction::Forward
                 }
             }
-            event_types::OUTPUT_ITEM_DELTA => self.process_output_delta(&parsed),
-            event_types::OUTPUT_ITEM_DONE => {
+            OutputItemEvent::DELTA => self.process_output_delta(&parsed),
+            OutputItemEvent::DONE => {
                 // Check if we have complete function calls ready to execute
                 if let Some(output_index) = parsed
                     .get("output_index")
@@ -435,9 +439,7 @@ impl StreamingToolHandler {
         // Check if this is a function call delta
         let item_type = delta.get("type").and_then(|v| v.as_str());
 
-        if item_type == Some(event_types::ITEM_TYPE_FUNCTION_TOOL_CALL)
-            || item_type == Some(event_types::ITEM_TYPE_FUNCTION_CALL)
-        {
+        if item_type.is_some_and(is_function_call_type) {
             self.in_function_call = true;
 
             // Get or create function call for this output index
@@ -561,12 +563,7 @@ pub(super) fn apply_event_transformations_inplace(
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    let should_patch = matches!(
-        event_type.as_str(),
-        event_types::RESPONSE_CREATED
-            | event_types::RESPONSE_IN_PROGRESS
-            | event_types::RESPONSE_COMPLETED
-    );
+    let should_patch = is_response_event(event_type.as_str());
 
     if should_patch {
         if let Some(response_obj) = parsed_data
@@ -622,13 +619,11 @@ pub(super) fn apply_event_transformations_inplace(
 
     // 2. Apply transform_streaming_event logic (function_call → mcp_call)
     match event_type.as_str() {
-        event_types::OUTPUT_ITEM_ADDED | event_types::OUTPUT_ITEM_DONE => {
+        OutputItemEvent::ADDED | OutputItemEvent::DONE => {
             if let Some(item) = parsed_data.get_mut("item") {
                 if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
-                    if item_type == event_types::ITEM_TYPE_FUNCTION_CALL
-                        || item_type == event_types::ITEM_TYPE_FUNCTION_TOOL_CALL
-                    {
-                        item["type"] = json!(event_types::ITEM_TYPE_MCP_CALL);
+                    if is_function_call_type(item_type) {
+                        item["type"] = json!(ItemType::MCP_CALL);
                         item["server_label"] = json!(ctx.server_label);
 
                         // Transform ID from fc_* to mcp_*
@@ -644,8 +639,8 @@ pub(super) fn apply_event_transformations_inplace(
                 }
             }
         }
-        event_types::FUNCTION_CALL_ARGUMENTS_DONE => {
-            parsed_data["type"] = json!(event_types::MCP_CALL_ARGUMENTS_DONE);
+        FunctionCallEvent::ARGUMENTS_DONE => {
+            parsed_data["type"] = json!(McpEvent::CALL_ARGUMENTS_DONE);
 
             // Transform item_id from fc_* to mcp_*
             if let Some(item_id) = parsed_data.get("item_id").and_then(|v| v.as_str()) {
@@ -691,7 +686,7 @@ pub(super) fn forward_streaming_event(
     sequence_number: &mut u64,
 ) -> bool {
     // Skip individual function_call_arguments.delta events - we'll send them as one
-    if event_name == Some(event_types::FUNCTION_CALL_ARGUMENTS_DELTA) {
+    if event_name == Some(FunctionCallEvent::ARGUMENTS_DELTA) {
         return true;
     }
 
@@ -709,14 +704,14 @@ pub(super) fn forward_streaming_event(
         .or_else(|| parsed_data.get("type").and_then(|v| v.as_str()))
         .unwrap_or("");
 
-    if event_type == event_types::RESPONSE_COMPLETED {
+    if event_type == ResponseEvent::COMPLETED {
         return true;
     }
 
     // Check if this is function_call_arguments.done - need to send buffered args first
     let mut mapped_output_index: Option<usize> = None;
 
-    if event_name == Some(event_types::FUNCTION_CALL_ARGUMENTS_DONE) {
+    if event_name == Some(FunctionCallEvent::ARGUMENTS_DONE) {
         if let Some(output_index) = parsed_data
             .get("output_index")
             .and_then(|v| v.as_u64())
@@ -754,7 +749,7 @@ pub(super) fn forward_streaming_event(
 
                 // Emit a synthetic MCP arguments delta event before the done event
                 let mut delta_event = json!({
-                    "type": event_types::MCP_CALL_ARGUMENTS_DELTA,
+                    "type": McpEvent::CALL_ARGUMENTS_DELTA,
                     "sequence_number": *sequence_number,
                     "output_index": assigned_index,
                     "item_id": mcp_item_id,
@@ -776,7 +771,7 @@ pub(super) fn forward_streaming_event(
 
                 let delta_block = format!(
                     "event: {}\ndata: {}\n\n",
-                    event_types::MCP_CALL_ARGUMENTS_DELTA,
+                    McpEvent::CALL_ARGUMENTS_DELTA,
                     delta_event
                 );
                 if tx.send(Ok(Bytes::from(delta_block))).is_err() {
@@ -835,16 +830,10 @@ pub(super) fn forward_streaming_event(
     let mut final_block = String::new();
     if let Some(evt) = event_name {
         // Update event name for function_call_arguments events
-        if evt == event_types::FUNCTION_CALL_ARGUMENTS_DELTA {
-            final_block.push_str(&format!(
-                "event: {}\n",
-                event_types::MCP_CALL_ARGUMENTS_DELTA
-            ));
-        } else if evt == event_types::FUNCTION_CALL_ARGUMENTS_DONE {
-            final_block.push_str(&format!(
-                "event: {}\n",
-                event_types::MCP_CALL_ARGUMENTS_DONE
-            ));
+        if evt == FunctionCallEvent::ARGUMENTS_DELTA {
+            final_block.push_str(&format!("event: {}\n", McpEvent::CALL_ARGUMENTS_DELTA));
+        } else if evt == FunctionCallEvent::ARGUMENTS_DONE {
+            final_block.push_str(&format!("event: {}\n", McpEvent::CALL_ARGUMENTS_DONE));
         } else {
             final_block.push_str(&format!("event: {}\n", evt));
         }
@@ -857,16 +846,16 @@ pub(super) fn forward_streaming_event(
     }
 
     // After sending output_item.added for mcp_call, inject mcp_call.in_progress event
-    if event_name == Some(event_types::OUTPUT_ITEM_ADDED) {
+    if event_name == Some(OutputItemEvent::ADDED) {
         if let Some(item) = parsed_data.get("item") {
-            if item.get("type").and_then(|v| v.as_str()) == Some(event_types::ITEM_TYPE_MCP_CALL) {
+            if item.get("type").and_then(|v| v.as_str()) == Some(ItemType::MCP_CALL) {
                 // Already transformed to mcp_call
                 if let (Some(item_id), Some(output_index)) = (
                     item.get("id").and_then(|v| v.as_str()),
                     parsed_data.get("output_index").and_then(|v| v.as_u64()),
                 ) {
                     let in_progress_event = json!({
-                        "type": event_types::MCP_CALL_IN_PROGRESS,
+                        "type": McpEvent::CALL_IN_PROGRESS,
                         "sequence_number": *sequence_number,
                         "output_index": output_index,
                         "item_id": item_id
@@ -874,7 +863,7 @@ pub(super) fn forward_streaming_event(
                     *sequence_number += 1;
                     let in_progress_block = format!(
                         "event: {}\ndata: {}\n\n",
-                        event_types::MCP_CALL_IN_PROGRESS,
+                        McpEvent::CALL_IN_PROGRESS,
                         in_progress_event
                     );
                     if tx.send(Ok(Bytes::from(in_progress_block))).is_err() {
@@ -928,7 +917,7 @@ pub(super) fn send_final_response_event(
     }
 
     let completed_payload = json!({
-        "type": event_types::RESPONSE_COMPLETED,
+        "type": ResponseEvent::COMPLETED,
         "sequence_number": *sequence_number,
         "response": final_response
     });
@@ -936,7 +925,7 @@ pub(super) fn send_final_response_event(
 
     let completed_event = format!(
         "event: {}\ndata: {}\n\n",
-        event_types::RESPONSE_COMPLETED,
+        ResponseEvent::COMPLETED,
         completed_payload
     );
     tx.send(Ok(Bytes::from(completed_event))).is_ok()
@@ -1241,8 +1230,8 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                         {
                                             matches!(
                                                 parsed.get("type").and_then(|v| v.as_str()),
-                                                Some(event_types::RESPONSE_CREATED)
-                                                    | Some(event_types::RESPONSE_IN_PROGRESS)
+                                                Some(ResponseEvent::CREATED)
+                                                    | Some(ResponseEvent::IN_PROGRESS)
                                             )
                                         } else {
                                             false
@@ -1273,7 +1262,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                             serde_json::from_str::<Value>(data.as_ref())
                                         {
                                             if parsed.get("type").and_then(|v| v.as_str())
-                                                == Some(event_types::RESPONSE_IN_PROGRESS)
+                                                == Some(ResponseEvent::IN_PROGRESS)
                                             {
                                                 seen_in_progress = true;
                                                 if !mcp_list_tools_sent {
