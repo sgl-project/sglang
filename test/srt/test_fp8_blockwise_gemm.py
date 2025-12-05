@@ -42,7 +42,7 @@ class TestFp8BlockwiseGemmBase(unittest.TestCase):
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
-            num_shots=5,
+            num_shots=8,
             data_path=None,
             num_questions=1319,
             max_new_tokens=512,
