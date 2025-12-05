@@ -138,7 +138,7 @@ class SamplingParams:
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
     # if True, allow user params to override subclass-defined protected fields
-    override_protected_fields: bool = False
+    no_override_protected_fields: bool = True
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
 
@@ -289,15 +289,6 @@ class SamplingParams:
 
         self._set_output_file_name()
         self.log(server_args=server_args)
-
-    def update(self, source_dict: dict[str, Any]) -> None:
-        for key, value in source_dict.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-            else:
-                logger.exception("%s has no attribute %s", type(self).__name__, key)
-
-        self.__post_init__()
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
@@ -522,12 +513,11 @@ class SamplingParams:
             help="Whether to return the decoded trajectory",
         )
         parser.add_argument(
-            "--override-protected-fields",
+            "--no-override-protected-fields",
             action="store_true",
-            default=SamplingParams.override_protected_fields,
+            default=SamplingParams.no_override_protected_fields,
             help=(
-                "If set, allow user params to override fields defined in subclasses "
-                "(protected by default)."
+                "If set, disallow user params to override fields defined in subclasses."
             ),
         )
         parser.add_argument(
@@ -583,7 +573,7 @@ class SamplingParams:
         subclass_defined_fields = set(type(self).__annotations__.keys())
 
         # global switch: if True, allow overriding protected fields
-        allow_override_protected = user_params.override_protected_fields
+        allow_override_protected = not user_params.no_override_protected_fields
 
         for field in dataclasses.fields(user_params):
             field_name = field.name
