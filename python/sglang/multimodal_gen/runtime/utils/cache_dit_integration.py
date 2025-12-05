@@ -15,37 +15,16 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# Lazy import cache-dit to avoid hard dependency
-try:
-    import cache_dit
-    from cache_dit import (
-        BlockAdapter,
-        DBCacheConfig,
-        ForwardPattern,
-        ParamsModifier,
-        TaylorSeerCalibratorConfig,
-        steps_mask,
-    )
-    from cache_dit.caching.block_adapters import BlockAdapterRegister
-
-    CACHE_DIT_AVAILABLE = True
-except ImportError:
-    cache_dit = None
-    BlockAdapter = None
-    DBCacheConfig = None
-    ForwardPattern = None
-    ParamsModifier = None
-    TaylorSeerCalibratorConfig = None
-    BlockAdapterRegister = None
-    steps_mask = None
-
-    CACHE_DIT_AVAILABLE = False
-
-
-def is_cache_dit_available() -> bool:
-    """Check if cache-dit is installed and available."""
-    global CACHE_DIT_AVAILABLE
-    return CACHE_DIT_AVAILABLE
+import cache_dit
+from cache_dit import (
+    BlockAdapter,
+    DBCacheConfig,
+    ForwardPattern,
+    ParamsModifier,
+    TaylorSeerCalibratorConfig,
+    steps_mask,
+)
+from cache_dit.caching.block_adapters import BlockAdapterRegister
 
 
 def get_scm_mask(
@@ -69,10 +48,6 @@ def get_scm_mask(
     Returns:
         SCM mask list (1=compute, 0=cache), or None if disabled.
     """
-    if not is_cache_dit_available():
-        logger.warning("cache-dit not available, SCM disabled.")
-        return None
-
     if preset == "none" and not (compute_bins and cache_bins):
         return None
 
@@ -165,11 +140,6 @@ def enable_cache_on_transformer(
     """
     if not config.enabled:
         return transformer
-
-    if not is_cache_dit_available():
-        raise ImportError(
-            "cache-dit is not installed. Please install it with: pip install cache-dit"
-        )
 
     if config.num_inference_steps is None:
         raise ValueError(
@@ -281,11 +251,6 @@ def enable_cache_on_dual_transformer(
 
     if not primary_config.enabled:
         return transformer, transformer_2
-
-    if not is_cache_dit_available():
-        raise ImportError(
-            "cache-dit is not installed. Please install it with: pip install cache-dit"
-        )
 
     if primary_config.num_inference_steps is None:
         raise ValueError(
@@ -418,9 +383,6 @@ def get_cache_summary(transformer: torch.nn.Module) -> dict:
     Returns:
         A dictionary containing cache statistics, or empty dict if not available.
     """
-    if not is_cache_dit_available():
-        return {}
-
     try:
         stats_list = cache_dit.summary(transformer)
         if not stats_list:
@@ -444,5 +406,4 @@ def set_compile_configs_for_cache_dit():
 
     Call this before torch.compile if cache-dit is enabled.
     """
-    if is_cache_dit_available():
-        cache_dit.set_compile_configs()
+    cache_dit.set_compile_configs()

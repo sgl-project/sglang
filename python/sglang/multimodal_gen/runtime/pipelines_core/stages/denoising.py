@@ -65,7 +65,6 @@ from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
     enable_cache_on_dual_transformer,
     enable_cache_on_transformer,
     get_scm_mask,
-    is_cache_dit_available,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -199,12 +198,6 @@ class DenoisingStage(PipelineStage):
                 "cache-dit is disabled in distributed environment (world_size=%d). "
                 "Distributed support will be added in a future version.",
                 get_world_size(),
-            )
-            return
-        # Check if cache-dit is available
-        if not is_cache_dit_available():
-            logger.warning(
-                "cache-dit is not installed. Please install it with: pip install cache-dit"
             )
             return
         # === Parse SCM configuration from envs ===
