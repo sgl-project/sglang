@@ -19,9 +19,6 @@ class BaseLoRABackend:
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
 
-    #############################
-    #########cuda lora###########
-    #############################
     def run_lora_a_embedding(
         self,
         input_ids: torch.Tensor,
@@ -67,10 +64,6 @@ class BaseLoRABackend:
             output: modified output tensor
         """
         raise NotImplementedError
-
-    #############################
-    #############################
-    #############################
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs

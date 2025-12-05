@@ -1,7 +1,7 @@
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
-from sglang.srt.lora.triton_ops import (  # ############################; ########cuda lora###########
+from sglang.srt.lora.triton_ops import (
     embedding_extra_tokens_modified,
     embedding_lora_a_fwd,
     gate_up_lora_b_fwd,
@@ -24,9 +24,6 @@ class TritonLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch, device)
 
-    #############################
-    #########cuda lora###########
-    #############################
     def run_lora_a_embedding(
         self,
         input_ids: torch.Tensor,
@@ -62,10 +59,6 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info=self.batch_info,
             vocab_size=vocab_size,
         )
-
-    #############################
-    #############################
-    #############################
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
