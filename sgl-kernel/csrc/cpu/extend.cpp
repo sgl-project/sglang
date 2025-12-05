@@ -105,6 +105,9 @@ void extend_attention_kernel_impl(
     bool is_prefix_skipped) {
   using Vec = at::vec::Vectorized<float>;
 
+  // make sure that `last_col` index is always positive
+  static_assert(BLOCK_M <= BLOCK_N);
+
   // strides
   const int o_strideM = num_heads * head_size_v;
   const int o_strideH = head_size_v;
@@ -135,7 +138,7 @@ void extend_attention_kernel_impl(
     float* __restrict__ v_prime = s_i + BLOCK_M * BLOCK_N;
 
     // s_delta2: [BLOCK_M, BLOCK_N]; copy of s_delta in scalar_t
-    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(v_prime + BLOCK_N * head_size_v);
+    scalar_t* __restrict__ s_delta2 = reinterpret_cast<scalar_t*>(v_prime + BLOCK_M * head_size_v);
 
     // Btmp: [BLOCK_N, max(head_size, head_size_v)]
     scalar_t* __restrict__ Btmp = s_delta2 + BLOCK_M * BLOCK_N;
@@ -164,7 +167,7 @@ void extend_attention_kernel_impl(
       }
 
       // offset and size in MB
-      int m = mb * BLOCK_N;
+      int m = mb * BLOCK_M;
       int m_size = std::min(BLOCK_M, seq_len_extend - m);
 
       if (m_size <= 0) {
