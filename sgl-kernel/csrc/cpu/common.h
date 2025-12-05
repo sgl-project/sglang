@@ -22,6 +22,29 @@ namespace {
     }                                            \
   }()
 
+#define AT_DISPATCH_BOOL2(BOOL_V1, BOOL_NAME1, BOOL_V2, BOOL_NAME2, ...) \
+  [&] {                                                                  \
+    if (BOOL_V1) {                                                       \
+      constexpr bool BOOL_NAME1 = true;                                  \
+      if (BOOL_V2) {                                                     \
+        constexpr bool BOOL_NAME2 = true;                                \
+        return __VA_ARGS__();                                            \
+      } else {                                                           \
+        constexpr bool BOOL_NAME2 = false;                               \
+        return __VA_ARGS__();                                            \
+      }                                                                  \
+    } else {                                                             \
+      constexpr bool BOOL_NAME1 = false;                                 \
+      if (BOOL_V2) {                                                     \
+        constexpr bool BOOL_NAME2 = true;                                \
+        return __VA_ARGS__();                                            \
+      } else {                                                           \
+        constexpr bool BOOL_NAME2 = false;                               \
+        return __VA_ARGS__();                                            \
+      }                                                                  \
+    }                                                                    \
+  }()
+
 // dispatch: bfloat16, float16, int8_t, fp8_e4m3
 #define CPU_DISPATCH_PACKED_TYPES(TYPE, ...)                     \
   [&] {                                                          \
@@ -115,6 +138,7 @@ static inline void CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const at::I
     CHECK_INPUT(tensor);
   }
 }
+#define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
 
 // [NB] Parallel Routines
 //
@@ -331,5 +355,11 @@ struct Unroll<1> {
     f(std::integral_constant<int, 0>{}, args...);
   }
 };
+
+// conditional data ptr for optional tensor
+template <typename T>
+inline T* conditional_data_ptr(const std::optional<at::Tensor>& opt) {
+  return opt.has_value() ? opt.value().data_ptr<T>() : nullptr;
+}
 
 }  // anonymous namespace
