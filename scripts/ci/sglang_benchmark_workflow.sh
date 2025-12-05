@@ -16,6 +16,7 @@ if [[ "${TYPE}" == "launch" ]]; then
     echo
     echo "========== LAUNCHING SERVER ========"
     if [[ "${model_name}" == "Qwen3-VL-235B" ]]; then
+        export SGLANG_USE_AITER=1
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
