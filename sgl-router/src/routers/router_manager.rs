@@ -363,13 +363,25 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        // TODO: Extract model from request and route to appropriate router
-        (
-            StatusCode::NOT_IMPLEMENTED,
-            "Model info endpoint not yet implemented in RouterManager",
-        )
-            .into_response()
+    async fn get_model_info(&self, req: Request<Body>) -> Response {
+        // Route to default router or first available router
+        let router_id = {
+            let default_router = self.default_router.read().unwrap();
+            default_router.clone()
+        };
+
+        let router = if let Some(id) = router_id {
+            self.routers.get(&id).map(|r| r.clone())
+        } else {
+            // If no default, use first available router
+            self.routers.iter().next().map(|r| r.value().clone())
+        };
+
+        if let Some(router) = router {
+            router.get_model_info(req).await
+        } else {
+            (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
+        }
     }
 
     async fn route_generate(
@@ -564,7 +576,14 @@ impl RouterTrait for RouterManager {
         }
     }
 
-    // Conversations API delegates
+    fn router_type(&self) -> &'static str {
+        "manager"
+    }
+
+    // ============================================================================
+    // Conversation API Methods - delegate to selected router
+    // ============================================================================
+
     async fn create_conversation(&self, headers: Option<&HeaderMap>, body: &Value) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
@@ -646,8 +665,8 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         conversation_id: &str,
         limit: Option<usize>,
-        order: Option<String>,
-        after: Option<String>,
+        order: Option<&str>,
+        after: Option<&str>,
     ) -> Response {
         let router = self.select_router_for_request(headers, None);
         if let Some(router) = router {
@@ -658,7 +677,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to list conversation items for '{}'",
+                    "No router available to list items for conversation '{}'",
                     conversation_id
                 ),
             )
@@ -681,7 +700,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to create conversation items for '{}'",
+                    "No router available to create items for conversation '{}'",
                     conversation_id
                 ),
             )
@@ -705,7 +724,7 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to get conversation item '{}' in '{}'",
+                    "No router available to get item '{}' from conversation '{}'",
                     item_id, conversation_id
                 ),
             )
@@ -728,16 +747,12 @@ impl RouterTrait for RouterManager {
             (
                 StatusCode::NOT_FOUND,
                 format!(
-                    "No router available to delete conversation item '{}' in '{}'",
+                    "No router available to delete item '{}' from conversation '{}'",
                     item_id, conversation_id
                 ),
             )
                 .into_response()
         }
-    }
-
-    fn router_type(&self) -> &'static str {
-        "manager"
     }
 }
 

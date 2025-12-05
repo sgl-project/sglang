@@ -56,6 +56,21 @@ MODELS = {
         "processor_class": "Phi3VImageProcessor",
         "description": "Dynamic HD transform with 336x336 tiles",
     },
+    "phi4_vision": {
+        "model_id": "microsoft/Phi-4-multimodal-instruct",
+        "processor_class": "Phi4MMImageProcessor",
+        "description": "Dynamic HD transform with 448x448 tiles and SiGLIP encoder",
+    },
+    "llama4_vision": {
+        "model_id": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        "processor_class": "Llama4ImageProcessorFast",
+        "description": "Tile-based processing with 336x336 tiles and global tile",
+    },
+    "pixtral": {
+        "model_id": "mistralai/Pixtral-12B-2409",
+        "processor_class": "PixtralImageProcessor",
+        "description": "Dynamic resolution with CLIP normalization and bicubic resize",
+    },
 }
 
 # Default test images
@@ -419,6 +434,182 @@ def generate_golden_phi3_vision(image_path: str, output_dir: str) -> dict:
     return result
 
 
+def generate_golden_phi4_vision(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for Phi4-Vision (Phi-4-multimodal).
+
+    Phi4-Vision uses Dynamic HD transform similar to Phi3 but with:
+    - Base resolution: 448 (vs 336 in Phi3)
+    - Normalization: [0.5, 0.5, 0.5] mean/std (vs CLIP in Phi3)
+    - Default dynamic_hd: 36 (vs 16 num_crops in Phi3)
+    - Uses SiGLIP vision encoder (vs CLIP in Phi3)
+    - Has per-crop attention masks
+
+    Token count formula:
+    256 + 1 + mask_sum + mask_col0_sum + 16
+
+    Note: Phi4 uses 'input_image_embeds' key instead of 'pixel_values'
+    """
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(
+        "microsoft/Phi-4-multimodal-instruct", trust_remote_code=True
+    )
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image using the image processor directly
+    outputs = processor.image_processor(images=image, return_tensors="np")
+
+    # Phi4 uses 'input_image_embeds' instead of 'pixel_values'
+    pixel_values = outputs.get("input_image_embeds")
+    pixel_attention_mask = outputs.get("image_attention_mask")
+    image_sizes = outputs.get("image_sizes")
+    num_img_tokens = outputs.get("num_img_tokens")
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": processor.image_processor.to_dict(),
+    }
+
+    if pixel_attention_mask is not None:
+        result["pixel_attention_mask"] = np.array(pixel_attention_mask)
+
+    if image_sizes is not None:
+        result["image_sizes"] = np.array(image_sizes)
+
+    if num_img_tokens is not None:
+        result["num_img_tokens"] = np.array(num_img_tokens)
+
+    # Add debug info
+    result["config_info"] = {
+        "dynamic_hd": getattr(processor.image_processor, "dynamic_hd", 36),
+        "base_resolution": 448,
+    }
+
+    return result
+
+
+def generate_golden_llama4_vision(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for LLaMA 4 Vision.
+
+    LLaMA 4 Vision uses tile-based processing:
+    1. Find supported resolutions based on max_patches (default 16)
+    2. Get best fit resolution for the image (minimize upscaling)
+    3. Resize preserving aspect ratio
+    4. Pad with black (0) to target dimensions
+    5. Normalize with [0.5, 0.5, 0.5] mean/std
+    6. Split into tiles of 336x336
+    7. If multiple tiles, add global tile at the end
+
+    Output:
+    - pixel_values: [1, num_tiles, 3, 336, 336]
+    - aspect_ratios: [1, 2] with [h_tiles, w_tiles]
+
+    Token count: num_tiles * (336 / 14)² = num_tiles * 576
+    """
+    from transformers.models.llama4 import Llama4ImageProcessorFast
+
+    processor = Llama4ImageProcessorFast()
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image - Llama4 only supports PyTorch tensors
+    outputs = processor(images=image, return_tensors="pt")
+    # Convert to numpy (need to convert from bfloat16 to float32 first)
+    pixel_values = outputs["pixel_values"].float().numpy()
+    aspect_ratios = outputs.get("aspect_ratios")
+    if aspect_ratios is not None:
+        aspect_ratios = aspect_ratios.numpy()
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": processor.to_dict(),
+    }
+
+    if aspect_ratios is not None:
+        result["aspect_ratios"] = aspect_ratios
+
+    # Calculate num_tokens from aspect_ratios
+    if aspect_ratios is not None:
+        h_tiles = int(aspect_ratios[0][0])
+        w_tiles = int(aspect_ratios[0][1])
+        num_tiles = h_tiles * w_tiles
+        # Add 1 for global tile if num_tiles > 1
+        total_tiles = num_tiles + 1 if num_tiles > 1 else num_tiles
+        tokens_per_tile = (336 // 14) ** 2  # 576
+        num_tokens = total_tiles * tokens_per_tile
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "tile_size": 336,
+        "max_patches": processor.max_patches,
+        "resize_to_max_canvas": processor.resize_to_max_canvas,
+    }
+
+    return result
+
+
+def generate_golden_pixtral(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for Pixtral/Mistral3 Vision.
+
+    Pixtral uses dynamic resolution processing:
+    1. If image exceeds longest_edge (default 1024), scale down proportionally
+    2. Resize to dimensions that are multiples of patch_size (default 16)
+    3. Use bicubic interpolation for resize
+    4. Normalize with CLIP mean/std
+
+    Output:
+    - pixel_values: [1, 3, H, W] where H, W are multiples of patch_size
+    - image_sizes: [(H, W)]
+
+    Token count: (H / patch_size) * (W / patch_size)
+    """
+    from transformers import PixtralImageProcessor
+
+    processor = PixtralImageProcessor.from_pretrained("mistral-community/pixtral-12b")
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image
+    outputs = processor(images=image, return_tensors="np")
+    pixel_values = outputs["pixel_values"]
+    image_sizes = outputs.get("image_sizes")
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": processor.to_dict(),
+    }
+
+    if image_sizes is not None:
+        result["image_sizes"] = np.array(image_sizes)
+
+    # Calculate num_tokens from image_sizes
+    if image_sizes is not None:
+        h, w = image_sizes[0]
+        patch_size = getattr(processor, "patch_size", {"height": 16, "width": 16})
+        if isinstance(patch_size, dict):
+            patch_h = patch_size.get("height", 16)
+            patch_w = patch_size.get("width", 16)
+        else:
+            patch_h = patch_w = patch_size
+        num_tokens = (h // patch_h) * (w // patch_w)
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "longest_edge": processor.size.get("longest_edge", 1024),
+        "patch_size": processor.patch_size,
+        "image_mean": processor.image_mean,
+        "image_std": processor.image_std,
+    }
+
+    return result
+
+
 def generate_for_model(model_key: str, image_paths: list, output_dir: str):
     """Generate golden outputs for a specific model."""
     print(f"\nGenerating golden outputs for {model_key}...")
@@ -430,6 +621,9 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
         "qwen2_vl": generate_golden_qwen2_vl,
         "qwen3_vl": generate_golden_qwen3_vl,
         "phi3_vision": generate_golden_phi3_vision,
+        "phi4_vision": generate_golden_phi4_vision,
+        "llama4_vision": generate_golden_llama4_vision,
+        "pixtral": generate_golden_pixtral,
     }.get(model_key)
 
     if generator_fn is None:
