@@ -44,7 +44,8 @@ if [[ "${TYPE}" == "launch" ]]; then
             --max-prefill-tokens 32768 \
             --cuda-graph-max-bs 256 \
             --page-size 64 \
-            --attention-backend triton &
+            --attention-backend triton \
+            --max-running-requests 128 &
         sglang_pid=$!
     else
         echo "Unknown model_name: ${model_name}"

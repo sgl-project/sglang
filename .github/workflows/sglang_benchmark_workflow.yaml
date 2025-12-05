@@ -35,7 +35,7 @@ jobs:
         run: |
           docker login -u rocmshared -p ${{ secrets.DOCKER_PASSWORD }}
           for i in {1..3}; do
-            docker pull ${{ github.event.inputs.image }} && break || {
+            docker pull ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125' }} && break || {
               echo "docker pull failed, retrying ($i/3)..."
               sleep 5
             }
@@ -44,7 +44,7 @@ jobs:
       - name: Generate Dockerfile
         run: |
           cat <<'EOF' > Dockerfile.mod
-          FROM rocm/ali-private:ubuntu22.04_rocm7.0.1_sglang_128a20_20251119
+          FROM ${{ github.event.inputs.image || 'rocm/ali-private:ubuntu22.04_rocm7.0.1.42_vllm_e858fc9_sglang_890fc1c_aiter_1b3efa9_torch2.8.0_20251125' }}
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
