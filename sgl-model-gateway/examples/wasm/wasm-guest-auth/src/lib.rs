@@ -1,14 +1,14 @@
-//! WASM Guest Auth Example for sgl-router
+//! WASM Guest Auth Example for sgl-model-gateway
 //!
 //! This example demonstrates API key authentication middleware
-//! for sgl-router using the WebAssembly Component Model.
+//! for sgl-model-gateway using the WebAssembly Component Model.
 //!
 //! Features:
 //! - API Key authentication
 
 wit_bindgen::generate!({
     path: "../../../src/wasm/interface",
-    world: "sgl-router",
+    world: "sgl-model-gateway",
 });
 
 use exports::sgl::router::{
