@@ -44,7 +44,9 @@ TaylorSeer improves caching accuracy using Taylor expansion:
 | Enable    | `SGLANG_CACHE_DIT_TAYLORSEER` | true    | Enable TaylorSeer calibrator    |
 | Order     | `SGLANG_CACHE_DIT_TS_ORDER`   | 1       | Taylor expansion order (1 or 2) |
 
-### Example with Custom Parameters
+### Combined Configuration Example
+
+DBCache and TaylorSeer are complementary strategies that work together, you can configure both sets of parameters simultaneously:
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true \
@@ -66,7 +68,7 @@ which to use cached results.
 
 #### SCM Presets
 
-SCM is configured with presets, defined as:
+SCM is configured with presets:
 
 | Preset   | Compute Ratio | Speed    | Quality    |
 |----------|---------------|----------|------------|
@@ -76,7 +78,7 @@ SCM is configured with presets, defined as:
 | `fast`   | ~35%          | ~3x      | Acceptable |
 | `ultra`  | ~25%          | ~4x      | Lower      |
 
-#### Usage
+##### Usage
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true \
@@ -176,5 +178,5 @@ the [cache-dit repository](https://github.com/vipshop/cache-dit) for supported m
 
 ## References
 
-- [cache-dit GitHub Repository](https://github.com/vipshop/cache-dit)
-- [SGLang Diffusion Documentation](../README.md)
+- [cache-dit](https://github.com/vipshop/cache-dit)
+- [SGLang Diffusion](../README.md)
