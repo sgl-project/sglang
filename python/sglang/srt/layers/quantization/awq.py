@@ -893,7 +893,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
             x = dispatch_output.hidden_states
             topk_output = dispatch_output.topk_output
             topk_weights, topk_ids, _ = topk_output
-            return torch.ops.sgl_kernel.fused_experts_cpu(
+            output = torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_qweight,
                 layer.w2_qweight,
@@ -906,11 +906,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
                 layer.w13_qzeros,
                 layer.w2_qzeros,
                 None,  # block_size
-                None,  # a1_scale
-                None,  # a2_scale
                 True,  # is_vnni
             )
-
+            return StandardCombineInput(hidden_states=output)
         # The input must currently be float16
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
