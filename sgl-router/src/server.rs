@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -27,6 +28,9 @@ use crate::{
             create_mcp_registration_workflow, create_wasm_module_registration_workflow,
             create_wasm_module_removal_workflow, create_worker_registration_workflow,
             create_worker_removal_workflow, LoggingSubscriber, WorkflowEngine,
+            create_external_worker_registration_workflow, create_mcp_registration_workflow,
+            create_worker_registration_workflow, create_worker_removal_workflow, LoggingSubscriber,
+            WorkflowEngine,
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
@@ -323,16 +327,22 @@ struct ListItemsQuery {
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<String>,
+    headers: http::HeaderMap,
     Query(ListItemsQuery {
         limit,
         order,
         after,
     }): Query<ListItemsQuery>,
-    headers: http::HeaderMap,
 ) -> Response {
     state
         .router
-        .list_conversation_items(Some(&headers), &conversation_id, limit, order, after)
+        .list_conversation_items(
+            Some(&headers),
+            &conversation_id,
+            limit,
+            order.as_deref(),
+            after.as_deref(),
+        )
         .await
 }
 
@@ -357,8 +367,8 @@ async fn v1_conversations_create_items(
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(String, String)>,
-    Query(query): Query<GetItemQuery>,
     headers: http::HeaderMap,
+    Query(query): Query<GetItemQuery>,
 ) -> Response {
     state
         .router
@@ -546,7 +556,7 @@ async fn get_worker(State(state): State<Arc<AppState>>, Path(url): Path<String>)
             tool_parser: None,
             chat_template: None,
             bootstrap_port: None,
-            metadata: std::collections::HashMap::new(),
+            metadata: HashMap::new(),
             job_status: Some(status),
         };
         return Json(worker_info).into_response();
@@ -761,6 +771,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .await;
 
     engine.register_workflow(create_worker_registration_workflow(&config.router_config));
+    engine.register_workflow(create_external_worker_registration_workflow());
     engine.register_workflow(create_worker_removal_workflow());
     engine.register_workflow(create_mcp_registration_workflow());
     engine.register_workflow(create_wasm_module_registration_workflow());

@@ -18,5 +18,7 @@ pub use steps::{
     create_mcp_registration_workflow, create_wasm_module_registration_workflow,
     create_wasm_module_removal_workflow, create_worker_registration_workflow,
     create_worker_removal_workflow,
+    create_external_worker_registration_workflow, create_mcp_registration_workflow,
+    create_worker_registration_workflow, create_worker_removal_workflow,
 };
 pub use types::*;
