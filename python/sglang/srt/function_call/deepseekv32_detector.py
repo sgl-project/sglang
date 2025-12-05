@@ -111,9 +111,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """Check if the text contains a deepseek v32 format tool call."""
         return self.bot_token in text or self.bot_token_simple in text
 
-    def _parse_parameters_from_xml(
-        self, invoke_content: str, use_simple_format: bool = False
-    ) -> dict:
+    def _parse_parameters_from_xml(self, invoke_content: str) -> dict:
         """
         Parse parameters from either XML-like format or JSON format to dict.
 
@@ -165,19 +163,17 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        # Try DSML format first
-        use_simple_format = False
-        idx = text.find(self.bot_token)
-        if idx == -1:
-            # Try simplified format
-            idx = text.find(self.bot_token_simple)
-            use_simple_format = True
+        # Find the start of function_calls tag (supports both DSML and simple format)
+        # Use flexible pattern that matches both formats
+        function_calls_start_pattern = r"<(｜DSML｜)?function_calls>"
+        start_match = re.search(function_calls_start_pattern, text)
 
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if not use_simple_format and self.bot_token not in text:
-            if self.bot_token_simple not in text:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-            use_simple_format = True
+        if not start_match:
+            # No function_calls tag found, return normal text
+            return StreamingParseResult(normal_text=text.strip(), calls=[])
+
+        idx = start_match.start()
+        normal_text = text[:idx].strip()
 
         calls = []
         try:
@@ -210,7 +206,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
             )
 
             for start_dsml, func_name, invoke_content, end_dsml in invoke_matches:
-                # Parse parameters from XML format (no longer need use_simple_format)
+                # Parse parameters from XML format
                 func_args = self._parse_parameters_from_xml(invoke_content)
                 # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": func_args}
@@ -232,22 +228,27 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call (DSML or simplified format)
-        has_tool_call_dsml = (
-            self.bot_token in current_text or "<｜DSML｜invoke" in current_text
+        # Check if we have a tool call (supports mixed DSML and simple format)
+        has_tool_call = (
+            self.bot_token in current_text
+            or self.bot_token_simple in current_text
+            or "<｜DSML｜invoke" in current_text
+            or "<invoke" in current_text
         )
-        has_tool_call_simple = (
-            self.bot_token_simple in current_text or "<invoke" in current_text
+
+        # Check if buffer contains any relevant markers (supports mixed format)
+        relevant_markers = [
+            "｜DSML｜",
+            "<｜",
+            "</｜",
+            "<function_calls",
+            "<invoke",
+            "</invoke",
+            "</function_calls",
+        ]
+        potentially_has_tags = any(
+            marker in current_text for marker in relevant_markers
         )
-        has_tool_call = has_tool_call_dsml or has_tool_call_simple
-
-        # Check if buffer contains any DSML markers or ends with potential tag prefix
-        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
-        potentially_dsml = any(marker in current_text for marker in dsml_markers)
-
-        # Check for simplified format markers
-        simple_markers = ["<function_calls", "<invoke", "</invoke", "</function_calls"]
-        potentially_simple = any(marker in current_text for marker in simple_markers)
 
         # Check if text might be starting a tag or contains partial tags
         stripped_text = current_text.rstrip()
@@ -284,12 +285,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         ends_with_prefix = True
                         break
 
-        if (
-            not has_tool_call
-            and not potentially_dsml
-            and not potentially_simple
-            and not ends_with_prefix
-        ):
+        if not has_tool_call and not potentially_has_tags and not ends_with_prefix:
             self._buffer = ""
             for e_token in [
                 self.eot_token,
@@ -306,9 +302,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         all_calls: list[ToolCallItem] = []
         try:
-            # Determine which format to use
-            use_simple_format = has_tool_call_simple and not has_tool_call_dsml
-
             # Loop to handle multiple consecutive invoke blocks
             while True:
                 # Use flexible pattern that supports mixed DSML tags
@@ -338,7 +331,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
 
-                # Parse current parameters from XML/JSON (no longer need use_simple_format)
+                # Parse current parameters from XML/JSON
                 current_params = self._parse_parameters_from_xml(invoke_content)
                 current_args_json = json.dumps(current_params, ensure_ascii=False)
 
