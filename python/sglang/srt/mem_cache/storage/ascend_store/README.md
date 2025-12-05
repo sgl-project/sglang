@@ -13,30 +13,34 @@ Related documentation:
 
 ### 1. Download open source codes and install MemCache
 ```
-# download codes of memcache
+# download codes of MemCache
 git clone https://gitcode.com/Ascend/memcache.git
 
 # build install package
 cd memcache
 bash script/build_and_pack_run.sh
 
-# install memcache
+# install MetaService
 cd output
 bash memcache_hybrid-1.0.0_linux_aarch64.run
+
+# install LocalService
+pip3 install memcache/wheel/memcache_hybrid-1.0.0-cp311-cp311-linux_aarch64.whl
 ```
 
 ### 2. Download open source codes and install MemFabric
 ```
-# download codes of memfabric
+# download codes of MemFabric
 git clone https://gitcode.com/Ascend/memfabric_hybrid.git
 
 # build install package
 cd memfabric_hybrid
 bash script/build_and_pack_run.sh
 
-# install memfabric
+# install MemFabric
 cd output
 bash memfabric_hybrid-1.0.0_linux_aarch64.run
+pip3 install memfabric_hybrid/wheel/memfabric_hybrid-1.0.0-cp311-cp311-linux_aarch64.whl
 ```
 
 The default installation path is `/usr/local/`, and you can modify the installation path by `--install-path=${your path}`.
@@ -58,11 +62,11 @@ export MMC_META_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-meta.co
 /usr/local/memcache_hybrid/latest/aarch64-linux/bin/mmc_meta_service
 ```
 1). The MMC_META_CONFIG_PATH environment variable specifies the configuration file of MetaService.
-You need modify the configuration file content.
+You need modify the configuration file content.<br>
 For more detailed introduction of configuration items, please refer to [MemCache Configs](https://gitcode.com/Ascend/memcache/blob/master/doc/memcached_config.md).<br>
 2). MetaService supports certificate-based secure communication.
 However, you can disable certificate verification by setting xxx.xxx.tls.enable to false to achieve better performance, which may be accompanied by security risks.<br>
-3). meta-service can also be launched via python method, For details, refer to
+3). MetaService can also be launched via python method, For details, refer to
 https://gitcode.com/Ascend/memcache/blob/develop/README.md
 
 
@@ -92,9 +96,9 @@ python3 -m sglang.launch_server \
     --hicache-storage-backend memcache &
 ```
 1). The MMC_LOCAL_CONFIG_PATH environment variable specifies the configuration file of LocaService.
-You need modify the configuration file content.
+You need modify the configuration file content.<br>
 For more detailed introduction of configuration items, please refer to [MemCache Configs](https://gitcode.com/Ascend/memcache/blob/master/doc/memcached_config.md).<br>
 <br>
-2). The local-service is integrated into the tp worker process.
-Local-service communication supports certificate-based secure authentication.
+2). LocalService is integrated into the tp worker process.
+LocalService communication supports certificate-based secure authentication.
 However, you can disable certificate verification by setting xxx.xxx.tls.enable to false to achieve better performance, which may be accompanied by security risks.
