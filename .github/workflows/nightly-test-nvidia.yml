@@ -420,6 +420,13 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
+      - name: Pre-download Mistral-Large-3 model
+        timeout-minutes: 120
+        run: |
+          echo "Pre-downloading Mistral-Large-3 model to ensure cache is complete..."
+          python3 -c "from huggingface_hub import snapshot_download; snapshot_download('mistralai/Mistral-Large-3-675B-Instruct-2512')"
+          echo "Download complete."
+
       - name: Run Mistral-Large-3 nightly performance test
         timeout-minutes: 180
         env:
