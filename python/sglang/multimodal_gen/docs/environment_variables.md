@@ -1,7 +1,7 @@
 ## Cache-DiT Acceleration
 
-*These variables configure cache-dit caching acceleration for Diffusion Transformer (DiT) models.
-See [cache-dit documentation](cache_dit.md) for details.*
+These variables configure cache-dit caching acceleration for Diffusion Transformer (DiT) models.
+See [cache-dit documentation](cache_dit.md) for details.
 
 | Environment Variable                | Description                                                                                                        | Default Value |
 |-------------------------------------|--------------------------------------------------------------------------------------------------------------------|---------------|
