@@ -182,10 +182,11 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     elif [ "$USE_LATEST_SGLANG" = "1" ]; then \
         git clone --depth=1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     else \
-        git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
+        git clone --depth=1 --branch ishan/dnm-fi https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
     && rm -rf /tmp/local_src
 
+ARG FLASHINFER_CUTEDSL_MOE_103_HASH=40bc6e1c9f321c6b0829df7bb85615a4d5e6a477
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
     && cd sglang \
@@ -210,10 +211,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     fi \
     && python3 -m pip install -e "python[${BUILD_TYPE}]" --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-    && if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
-        python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+    && if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        pip uninstall flashinfer -y && \
+        cd /sgl-workspace && \
+        git clone https://github.com/flashinfer-ai/flashinfer.git --recursive && \
+        cd flashinfer && \
+        git checkout ${FLASHINFER_CUTEDSL_MOE_103_HASH} && \
+        python3 -m pip install -v . && \
+        cd .. ;\
     fi \
-    && FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+        if [ "$INSTALL_FLASHINFER_JIT_CACHE" = "1" ]; then \
+            python3 -m pip install flashinfer-jit-cache==${FLASHINFER_VERSION} --index-url https://flashinfer.ai/whl/cu${CUINDEX} ; \
+        fi ; \
+        FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin ; \
+    fi
+
+WORKDIR /sgl-workspace
 
 # DeepEP
 # We use Tom's DeepEP fork for GB200 for now; the 1fd57b0276311d035d16176bb0076426166e52f3 commit is https://github.com/fzyzcjy/DeepEP/tree/gb200_blog_part_2
