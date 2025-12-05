@@ -295,6 +295,7 @@ class NGRAMWorker:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
+        accept_lens = None
 
         if model_worker_batch.forward_mode.is_target_verify():
             batch_result = self.target_worker.forward_batch_generation(
@@ -308,6 +309,8 @@ class NGRAMWorker:
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, logits_output, self.page_size
             )
+            # Store accept_lens for per-request metrics
+            accept_lens = verify_input.accept_length
             if batch.return_logprob:
                 self.add_logprob_values(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)
@@ -328,4 +331,5 @@ class NGRAMWorker:
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
+            accept_lens=accept_lens,
         )

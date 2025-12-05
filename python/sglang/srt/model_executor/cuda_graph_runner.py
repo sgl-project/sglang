@@ -28,6 +28,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -60,7 +61,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -329,6 +329,7 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
+            cache_loc_dtype=self._cache_loc_dtype(),
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()

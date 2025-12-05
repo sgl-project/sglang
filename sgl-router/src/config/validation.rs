@@ -261,11 +261,12 @@ impl ConfigValidator {
         }
 
         if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
-            if tokens_per_second <= 0 {
+            // Allow 0 for pure concurrency limiting (semaphore behavior)
+            if tokens_per_second < 0 {
                 return Err(ConfigError::InvalidValue {
                     field: "rate_limit_tokens_per_second".to_string(),
                     value: tokens_per_second.to_string(),
-                    reason: "Must be > 0 when specified".to_string(),
+                    reason: "Must be >= 0 when specified".to_string(),
                 });
             }
         }
