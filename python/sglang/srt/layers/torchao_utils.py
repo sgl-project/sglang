@@ -3,13 +3,12 @@ Common utilities for torchao.
 """
 
 import logging
-import os
-import pwd
 from typing import Callable, Optional
 
 import torch
 
 logger = logging.getLogger(__name__)
+
 
 def proj_filter(
     module: torch.nn.Module,
