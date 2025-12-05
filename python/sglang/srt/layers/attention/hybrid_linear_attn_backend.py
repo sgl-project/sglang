@@ -1093,94 +1093,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         ].to(conv_states.dtype, copy=False)
 
 
-def causal_conv1d_fn_with_output_fake(
-    x: torch.Tensor,
-    conv_weights: torch.Tensor,
-    bias: torch.Tensor,
-    activation: str,
-    conv_states: torch.Tensor,
-    has_initial_state: torch.Tensor,
-    cache_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    mixed_qkv_output: torch.Tensor,
-) -> None:
-    return
-
-
-def causal_conv1d_fn_with_output(
-    x: torch.Tensor,
-    conv_weights: torch.Tensor,
-    bias: torch.Tensor,
-    activation: str,
-    conv_states: torch.Tensor,
-    has_initial_state: torch.Tensor,
-    cache_indices: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    mixed_qkv_output: torch.Tensor,
-) -> None:
-
-    x = causal_conv1d_fn(
-        x,
-        conv_weights,
-        bias,
-        activation=activation,
-        conv_states=conv_states,
-        has_initial_state=has_initial_state,
-        cache_indices=cache_indices,
-        query_start_loc=query_start_loc,
-    )
-    mixed_qkv_output.copy_(x)
-    return
-
-
-def gdn_with_output(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    core_attn_out: torch.Tensor,
-    ssm_states: torch.Tensor,
-    cache_indices: torch.Tensor,
-) -> None:
-    recurrent_state = ssm_states[cache_indices]
-    core_attn_out_ret, last_recurrent_state_ret = chunk_gated_delta_rule(
-        q=query,
-        k=key,
-        v=value,
-        g=g,
-        beta=beta,
-        initial_state=recurrent_state,
-        output_final_state=True,
-        cu_seqlens=query_start_loc,
-        head_first=False,
-        use_qk_l2norm_in_kernel=True,
-    )
-    last_recurrent_state_ret = last_recurrent_state_ret.to(ssm_states.dtype, copy=False)
-    ssm_states[cache_indices] = last_recurrent_state_ret
-    assert (
-        core_attn_out.numel() == core_attn_out_ret.numel()
-    ), f"Output tensor element mismatch: {core_attn_out.numel()} != {core_attn_out_ret.numel()}"
-
-    core_attn_out.view(core_attn_out_ret.shape).copy_(core_attn_out_ret)
-    return
-
-
-def gdn_with_output_fake(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    core_attn_out: torch.Tensor,
-    ssm_states: torch.Tensor,
-    cache_indices: torch.Tensor,
-) -> None:
-    return
-
-
 def causal_conv1d_gdn_with_output_fake(
     mixed_qkv_t: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -1249,20 +1161,6 @@ def causal_conv1d_gdn_with_output(
     core_attn_out.view_as(core_attn_out_ret).copy_(core_attn_out_ret)
     return
 
-
-direct_register_custom_op(
-    op_name="gdn_with_output",
-    op_func=gdn_with_output,
-    mutates_args=["core_attn_out", "ssm_states"],
-    fake_impl=gdn_with_output_fake,
-)
-
-direct_register_custom_op(
-    op_name="causal_conv1d_fn_with_output",
-    op_func=causal_conv1d_fn_with_output,
-    mutates_args=["mixed_qkv_output"],
-    fake_impl=causal_conv1d_fn_with_output_fake,
-)
 
 direct_register_custom_op(
     op_name="causal_conv1d_gdn_with_output",
