@@ -23,13 +23,13 @@ impl WorkflowStateStore {
 
     /// Save workflow state
     ///
-    /// # Warning
+    /// # Note
     ///
-    /// This emits a warning if the workflow context contains unserializable data,
+    /// This emits a debug log if the workflow context contains unserializable data,
     /// which would be lost if state persistence is later implemented.
     pub fn save(&self, state: WorkflowState) -> WorkflowResult<()> {
         if state.context.has_unserializable_data() {
-            tracing::warn!(
+            tracing::debug!(
                 instance_id = %state.instance_id,
                 data_count = state.context.data_len(),
                 "Saving workflow state with {} unserializable context entries. \
