@@ -5,7 +5,6 @@ from typing import Any, Iterable, Optional, Set, Tuple
 import torch
 from torch import nn
 
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import divide, get_pp_group
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -56,8 +55,6 @@ _is_npu = is_npu()
 
 import triton
 import triton.language as tl
-
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 
 
 @triton.jit
@@ -1029,23 +1026,3 @@ class Qwen3NextForCausalLM(nn.Module):
 
 
 EntryClass = Qwen3NextForCausalLM
-
-
-def gdn_with_output(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    context = get_forward_context()
-    forward_batch = context.forward_batch
-    attention_layers = context.attention_layers
-    attention_layer = attention_layers[layer_id]
-
-    ret = attention_layer._forward(hidden_states, forward_batch)
-
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
-    return

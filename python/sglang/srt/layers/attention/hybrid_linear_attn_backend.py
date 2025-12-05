@@ -3,6 +3,7 @@ from typing import Optional, Union
 import torch
 from einops import rearrange
 
+from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
@@ -632,6 +633,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
+
+        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
+
         if is_target_verify:
             assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
             intermediate_state_cache = mamba_cache_params.intermediate_ssm
@@ -643,10 +647,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 dtype=torch.bool,
                 device=forward_batch.input_ids.device,
             )
-        else:
-            has_initial_states = forward_batch.extend_prefix_lens > 0
-
-        if is_target_verify:
             batch_size = seq_len // forward_batch.spec_info.draft_token_num
             draft_token_num = forward_batch.spec_info.draft_token_num
             mixed_qkv_reshaped = mixed_qkv.view(
@@ -665,41 +665,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
-        else:
-            mixed_qkv_output = torch.empty_like(mixed_qkv).transpose(0, 1)
-            torch.ops.sglang.causal_conv1d_fn_with_output(
-                mixed_qkv.transpose(0, 1),
-                conv_weights,
-                bias,
-                activation=activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                mixed_qkv_output=mixed_qkv_output,
+
+            key_split_dim = key_dim // attn_tp_size
+            value_split_dim = value_dim // attn_tp_size
+
+            query, key, value = torch.split(
+                mixed_qkv,
+                [key_split_dim, key_split_dim, value_split_dim],
+                dim=-1,
             )
-            mixed_qkv = mixed_qkv_output.transpose(0, 1)
 
-        key_split_dim = key_dim // attn_tp_size
-        value_split_dim = value_dim // attn_tp_size
+            actual_seq_len = query.shape[0]
+            num_heads = query.shape[1] // head_k_dim
+            num_value_heads = value.shape[1] // head_v_dim
 
-        query, key, value = torch.split(
-            mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
-            dim=-1,
-        )
-
-        actual_seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
-        num_value_heads = value.shape[1] // head_v_dim
-
-        query = query.view(1, actual_seq_len, num_heads, head_k_dim)
-        key = key.view(1, actual_seq_len, num_heads, head_k_dim)
-        value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
-
-        g, beta = fused_gdn_gating(A_log, a, b, dt_bias)
-
-        if is_target_verify:
+            query = query.view(1, actual_seq_len, num_heads, head_k_dim)
+            key = key.view(1, actual_seq_len, num_heads, head_k_dim)
+            value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
@@ -716,20 +698,138 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
             )
         else:
-            core_attn_out = torch.empty_like(value)
-            torch.ops.sglang.gdn_with_output(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                query_start_loc,
-                core_attn_out,
-                ssm_states,
-                cache_indices,
-            )
+            if (
+                forward_batch.forward_mode.is_extend()
+                and get_forward_context() is not None
+            ):
+                actual_seq_len = mixed_qkv.shape[0]
+                num_value_heads = value_dim // attn_tp_size // head_v_dim
 
+                core_attn_out = mixed_qkv.new_empty(
+                    (1, actual_seq_len, num_value_heads, head_v_dim)
+                )
+
+                torch.ops.sglang.causal_conv1d_gdn_with_output(
+                    mixed_qkv.transpose(0, 1),
+                    conv_weights,
+                    bias,
+                    activation,
+                    conv_states,
+                    forward_batch.extend_prefix_lens,
+                    cache_indices,
+                    query_start_loc,
+                    g,
+                    beta,
+                    ssm_states,
+                    key_dim,
+                    value_dim,
+                    attn_tp_size,
+                    head_k_dim,
+                    head_v_dim,
+                    core_attn_out,
+                )
+
+            else:
+                core_attn_out = self._causal_conv1d_gdn_core(
+                    mixed_qkv.transpose(0, 1),
+                    conv_weights,
+                    bias,
+                    activation,
+                    conv_states,
+                    forward_batch.extend_prefix_lens,
+                    cache_indices,
+                    query_start_loc,
+                    g,
+                    beta,
+                    ssm_states,
+                    key_dim,
+                    value_dim,
+                    attn_tp_size,
+                    head_k_dim,
+                    head_v_dim,
+                )
+                actual_seq_len = mixed_qkv.shape[0]
+                num_value_heads = value_dim // attn_tp_size
+
+                core_attn_out1 = mixed_qkv.new_empty(
+                    (1, actual_seq_len, num_value_heads, head_v_dim)
+                )
         return core_attn_out
+
+    def _causal_conv1d_gdn_core(
+        self,
+        mixed_qkv_t: torch.Tensor,
+        conv_weights: torch.Tensor,
+        bias: torch.Tensor,
+        activation: str,
+        conv_states: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+        key_dim: int,
+        value_dim: int,
+        attn_tp_size: int,
+        head_k_dim: int,
+        head_v_dim: int,
+    ):
+        has_initial_state = extend_prefix_lens > 0
+
+        # ---- 1. conv ----
+        x_conv = causal_conv1d_fn(
+            mixed_qkv_t,
+            conv_weights,
+            bias,
+            activation=activation,
+            conv_states=conv_states,
+            has_initial_state=has_initial_state,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+        )
+
+        mixed_qkv = x_conv.transpose(0, 1)  # [seq, *, dim]
+
+        # ---- 2. split ----
+        key_split_dim = key_dim // attn_tp_size
+        value_split_dim = value_dim // attn_tp_size
+
+        query, key, value = torch.split(
+            mixed_qkv,
+            [key_split_dim, key_split_dim, value_split_dim],
+            dim=-1,
+        )
+
+        # ---- 3. reshape ----
+        seq_len = query.shape[0]
+        num_heads = query.shape[1] // head_k_dim
+        num_value_heads = value.shape[1] // head_v_dim
+
+        query = query.view(1, seq_len, num_heads, head_k_dim)
+        key = key.view(1, seq_len, num_heads, head_k_dim)
+        value = value.view(1, seq_len, num_value_heads, head_v_dim)
+
+        # ---- 4. GDN ----
+        recurrent_state = ssm_states[cache_indices]
+        core_attn_out_ret, last_recurrent_state_ret = chunk_gated_delta_rule(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=True,
+            cu_seqlens=query_start_loc,
+            head_first=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        last_recurrent_state_ret = last_recurrent_state_ret.to(
+            ssm_states.dtype, copy=False
+        )
+        ssm_states[cache_indices] = last_recurrent_state_ret
+
+        return core_attn_out_ret
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
@@ -1081,6 +1181,75 @@ def gdn_with_output_fake(
     return
 
 
+def causal_conv1d_gdn_with_output_fake(
+    mixed_qkv_t: torch.Tensor,
+    conv_weights: torch.Tensor,
+    bias: torch.Tensor,
+    activation: str,
+    conv_states: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_states: torch.Tensor,
+    key_dim: int,
+    value_dim: int,
+    attn_tp_size: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    core_attn_out: torch.Tensor,
+) -> None:
+    return
+
+
+def causal_conv1d_gdn_with_output(
+    mixed_qkv_t: torch.Tensor,
+    conv_weights: torch.Tensor,
+    bias: torch.Tensor,
+    activation: str,
+    conv_states: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_states: torch.Tensor,
+    key_dim: int,
+    value_dim: int,
+    attn_tp_size: int,
+    head_k_dim: int,
+    head_v_dim: int,
+    core_attn_out: torch.Tensor,
+) -> None:
+    context = get_forward_context()
+    forward_batch = context.forward_batch
+    core_attn_out_ret = ret = (
+        forward_batch.attn_backend.linear_attn_backend._causal_conv1d_gdn_core(
+            mixed_qkv_t,
+            conv_weights,
+            bias,
+            activation,
+            conv_states,
+            has_initial_state,
+            cache_indices,
+            query_start_loc,
+            g,
+            beta,
+            ssm_states,
+            key_dim,
+            value_dim,
+            attn_tp_size,
+            head_k_dim,
+            head_v_dim,
+        )
+    )
+
+    assert core_attn_out.numel() == core_attn_out_ret.numel()
+    core_attn_out.view_as(core_attn_out_ret).copy_(core_attn_out_ret)
+    return
+
+
 direct_register_custom_op(
     op_name="gdn_with_output",
     op_func=gdn_with_output,
@@ -1093,4 +1262,11 @@ direct_register_custom_op(
     op_func=causal_conv1d_fn_with_output,
     mutates_args=["mixed_qkv_output"],
     fake_impl=causal_conv1d_fn_with_output_fake,
+)
+
+direct_register_custom_op(
+    op_name="causal_conv1d_gdn_with_output",
+    op_func=causal_conv1d_gdn_with_output,
+    mutates_args=["core_attn_out"],
+    fake_impl=causal_conv1d_gdn_with_output_fake,
 )
