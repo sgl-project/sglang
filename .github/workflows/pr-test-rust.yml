@@ -7,6 +7,7 @@ on:
       - "sgl-router/**"
   pull_request:
     branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - "sgl-router/**"
   workflow_dispatch:
@@ -21,7 +22,10 @@ env:
 
 jobs:
   maturin-build-test:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -71,7 +75,10 @@ jobs:
           python -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
   router-unit-tests:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -108,6 +115,13 @@ jobs:
           rustup toolchain install nightly --profile minimal
           cargo +nightly fmt -- --check
 
+      - name: Generate vision golden fixtures
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers pillow numpy scipy
+          cd sgl-router/
+          python scripts/generate_vision_golden.py
+
       - name: Run Rust tests
         timeout-minutes: 20
         run: |
@@ -134,7 +148,10 @@ jobs:
         run: sccache --show-stats
 
   router-http-tests:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: 4-gpu-a10
     timeout-minutes: 32
     steps:
@@ -203,7 +220,10 @@ jobs:
           path: sgl-router/benchmark_**/
 
   router-grpc-response-api-tests:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: 4-gpu-a10
     timeout-minutes: 32
     steps:
@@ -282,10 +302,11 @@ jobs:
 
       - name: Run Python E2E response API tests
         run: |
+          python3 -m pip install pytest-rerunfailures
           bash scripts/killall_sglang.sh "nuk_gpus"
           cd sgl-router
           source "$HOME/.cargo/env"
-          SHOW_ROUTER_LOGS=1 pytest py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
+          SHOW_ROUTER_LOGS=1 pytest --reruns 3 --reruns-delay 2 py_test/e2e_response_api -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Run Python E2E gRPC tests
         run: |

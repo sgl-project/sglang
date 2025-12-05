@@ -2,18 +2,19 @@
 
 ## Introduction
 
-SGLang support run MindSpore framework models, this doc guide users to run mindspore models with SGLang.
+MindSpore is a high-performance AI framework optimized for Ascend NPUs. This doc guides users to run MindSpore models in SGLang.
 
 ## Requirements
 
-MindSpore with SGLang current only support Ascend Npu device, users need first install Ascend CANN software packages.
-The CANN software packages can download from the [Ascend Official Websites](https://www.hiascend.com). The version depends on the MindSpore version [MindSpore Installation](https://www.mindspore.cn/install)
+MindSpore currently only supports Ascend NPU devices. Users need to first install Ascend CANN software packages.
+The CANN software packages can be downloaded from the [Ascend Official Website](https://www.hiascend.com). The recommended version is 8.3.RC1.
 
 ## Supported Models
 
 Currently, the following models are supported:
 
-- **Qwen3**: Dense models supported. MoE models coming soon.
+- **Qwen3**: Dense and MoE models
+- **DeepSeek V3/R1**
 - *More models coming soon...*
 
 ## Installation
@@ -26,22 +27,23 @@ cd sgl-mindspore
 pip install -e .
 ```
 
-You will need to install the following packages, due to the support of tensor conversion through `dlpack` on 3rd devices, the minimum version of  `PyTorch` is 2.7.1
+You will need to install the following packages.
 
 ```shell
-pip install mindspore
-pip install "torch>=2.7.1"
-pip install "torch_npu>=2.7.1"
+pip install "mindspore==2.7.1"
+pip install "torch==2.8"
+pip install "torch_npu==2.8"
 pip install triton_ascend
 ```
 
 ```shell
+cp python/pyproject_other.toml python/pyproject.toml
 pip install -e "python[all_npu]"
 ```
 
 ## Run Model
 
-Current SGLang-MindSpore support Qwen3 dense model, this doc uses Qwen3-8B as example.
+Current SGLang-MindSpore supports Qwen3 and DeepSeek V3/R1 models. This doc uses Qwen3-8B as an example.
 
 ### Offline infer
 
