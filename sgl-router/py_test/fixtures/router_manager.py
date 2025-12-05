@@ -79,6 +79,8 @@ class RouterManager:
                 "api_key": "--api-key",
                 # Health/monitoring
                 "worker_startup_check_interval": "--worker-startup-check-interval",
+                # Loads/monitoring
+                "worker_load_check_interval": "--worker-load-check-interval",
                 # Cache-aware tuning
                 "cache_threshold": "--cache-threshold",
                 "balance_abs_threshold": "--balance-abs-threshold",

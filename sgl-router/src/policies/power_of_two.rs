@@ -8,7 +8,7 @@ use std::{
 use rand::Rng;
 use tracing::info;
 
-use super::{get_healthy_worker_indices, LoadBalancingPolicy};
+use super::{get_healthy_worker_indices, DPLoadManager, LoadBalancingPolicy};
 use crate::{core::Worker, metrics::RouterMetrics};
 
 /// Power-of-two choices policy
@@ -19,12 +19,14 @@ use crate::{core::Worker, metrics::RouterMetrics};
 pub struct PowerOfTwoPolicy {
     /// Cached load information from external monitoring
     cached_loads: RwLock<HashMap<String, isize>>,
+    dp_load_manager: DPLoadManager,
 }
 
 impl PowerOfTwoPolicy {
     pub fn new() -> Self {
         Self {
             cached_loads: RwLock::new(HashMap::new()),
+            dp_load_manager: DPLoadManager::new(),
         }
     }
 
@@ -110,6 +112,18 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
+        self.dp_load_manager.update_dp_loads(loads);
+    }
+
+    fn get_lowest_dp_load(&self, worker: &dyn Worker) -> Option<isize> {
+        self.dp_load_manager.get_lowest_dp_load(worker)
+    }
+
+    fn load_increment(&self, worker: &dyn Worker, dp_rank: isize, tokens: isize) {
+        self.dp_load_manager.load_increment(worker, dp_rank, tokens);
     }
 }
 

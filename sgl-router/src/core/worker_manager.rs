@@ -135,7 +135,7 @@ impl WorkerManager {
         url: &str,
         api_key: Option<&str>,
         client: &reqwest::Client,
-    ) -> Option<isize> {
+    ) -> Option<HashMap<isize, isize>> {
         let load_url = format!("{}/get_load", url);
         let mut request = client.get(&load_url);
 
@@ -150,14 +150,21 @@ impl WorkerManager {
                         // The /get_load endpoint returns an array of load info objects (one per DP rank)
                         // Each object has: {dp_rank, num_reqs, num_waiting_reqs, num_tokens}
                         if let Some(array) = json.as_array() {
-                            let total_tokens: i64 = array
-                                .iter()
-                                .filter_map(|entry| {
-                                    entry.get("num_tokens").and_then(|v| v.as_i64())
-                                })
-                                .sum();
-                            debug!("Worker {} load (total tokens): {}", url, total_tokens);
-                            Some(total_tokens as isize)
+                            let mut rank_tokens = HashMap::new();
+                            for entry in array {
+                                let dp_rank = entry
+                                    .get("dp_rank")
+                                    .and_then(|v| v.as_i64())
+                                    .map(|rank| rank as isize);
+                                let num_tokens = entry
+                                    .get("num_tokens")
+                                    .and_then(|v| v.as_i64())
+                                    .map(|rank| rank as isize);
+                                if let (Some(rank), Some(tokens)) = (dp_rank, num_tokens) {
+                                    rank_tokens.insert(rank, tokens);
+                                }
+                            }
+                            Some(rank_tokens)
                         } else {
                             warn!(
                                 "Invalid load response from {}: expected array, got {:?}",
@@ -208,18 +215,20 @@ impl WorkerManager {
             let client = client.clone();
 
             tasks.push(async move {
-                let load = if is_http {
+                let dp_rank_loads = if is_http {
                     Self::get_worker_load(&url, api_key.as_deref(), &client)
                         .await
-                        .unwrap_or(-1)
+                        .unwrap_or(HashMap::new())
                 } else {
-                    -1
+                    HashMap::new()
                 };
+                let load = dp_rank_loads.values().sum();
 
                 WorkerLoadInfo {
                     worker: url,
                     worker_type,
                     load,
+                    dp_rank_loads,
                 }
             });
         }
@@ -407,19 +416,23 @@ impl LoadMonitor {
 
         loop {
             interval_timer.tick().await;
-
             let power_of_two_policies = policy_registry.get_all_power_of_two_policies();
 
-            if power_of_two_policies.is_empty() {
+            if power_of_two_policies.is_empty()
+                && !policy_registry.is_dp_minimum_tokens_scheduler_enabled()
+            {
                 debug!("No PowerOfTwo policies found, skipping load fetch");
                 continue;
             }
 
+            let all_policies = policy_registry.get_all_policies();
             let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
 
             let mut loads = HashMap::new();
+            let mut dp_rank_loads = HashMap::new();
             for load_info in result.loads {
-                loads.insert(load_info.worker, load_info.load);
+                loads.insert(load_info.worker.clone(), load_info.load);
+                dp_rank_loads.insert(load_info.worker, load_info.dp_rank_loads);
             }
 
             if !loads.is_empty() {
@@ -430,6 +443,9 @@ impl LoadMonitor {
                 );
                 for policy in &power_of_two_policies {
                     policy.update_loads(&loads);
+                }
+                for policy in &all_policies {
+                    policy.update_dp_loads(&dp_rank_loads)
                 }
                 let _ = tx.send(loads);
             } else {
