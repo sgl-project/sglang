@@ -166,7 +166,8 @@ class DmdDenoisingStage(DenoisingStage):
                                 video_raw_latent_shape,
                                 dtype=pred_video.dtype,
                                 generator=batch.generator[0],
-                            ).to(self.device)
+                                device=self.device,
+                            )
                             latents = self.scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),

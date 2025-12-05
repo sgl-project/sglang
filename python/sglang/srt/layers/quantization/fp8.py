@@ -156,7 +156,12 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = "fp8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
+        ignored_layers = cls.get_from_keys_or(
+            config, ["ignored_layers", "modules_to_not_convert"], None
+        )
+        if ignored_layers:
+            # hacking ministral
+            ignored_layers = [layer.replace("model.", "") for layer in ignored_layers]
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
@@ -786,7 +791,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             else:
                 # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
-                from sglang.srt.layers.moe import get_moe_runner_backend
                 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
                 from sglang.srt.model_loader.utils import (
                     should_deepgemm_weight_requant_ue8m0,
@@ -1006,10 +1010,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     ):
 
         from sglang.srt.layers import deep_gemm_wrapper
-        from sglang.srt.layers.moe.utils import (
-            get_moe_a2a_backend,
-            get_moe_runner_backend,
-        )
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()

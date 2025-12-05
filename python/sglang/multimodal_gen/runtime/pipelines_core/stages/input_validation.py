@@ -53,9 +53,19 @@ class InputValidationStage(PipelineStage):
         assert seed is not None
         seeds = [seed + i for i in range(num_videos_per_prompt)]
         batch.seeds = seeds
-        # Peiyuan: using GPU seed will cause A100 and H100 to generate different results...
-        # FIXME: the generator's in latent preparation stage seems to be different from seeds
-        batch.generator = [torch.Generator("cpu").manual_seed(seed) for seed in seeds]
+
+        # Create generators based on generator_device parameter
+        # Note: This will overwrite any existing batch.generator
+        generator_device = batch.generator_device
+
+        if generator_device == "cpu":
+            device_str = "cpu"
+        else:
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+
+        batch.generator = [
+            torch.Generator(device_str).manual_seed(seed) for seed in seeds
+        ]
 
     def preprocess_condition_image(
         self,
