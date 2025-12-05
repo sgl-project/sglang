@@ -100,28 +100,9 @@ async fn ensure_conversation_exists(
     }
 }
 
-async fn get_or_error<T>(
-    result: Result<Option<T>, impl std::fmt::Display>,
-    not_found_msg: &str,
-    error_prefix: &str,
-) -> Result<T, Response> {
-    match result {
-        Ok(Some(item)) => Ok(item),
-        Ok(None) => Err(not_found(not_found_msg)),
-        Err(e) => Err(internal_error(format!("{error_prefix}: {e}"))),
-    }
-}
-
 // ============================================================================
 // Metadata Operations
 // ============================================================================
-
-/// Metadata patch operation
-#[derive(Debug)]
-enum MetadataPatch {
-    Set(String, Value),
-    Delete(String),
-}
 
 fn validate_metadata(value: &Value) -> Result<Option<serde_json::Map<String, Value>>, String> {
     match value.get("metadata") {
@@ -143,35 +124,18 @@ fn apply_metadata_patches(
     current: Option<serde_json::Map<String, Value>>,
     body: &Value,
 ) -> Result<Option<serde_json::Map<String, Value>>, String> {
-    let metadata_val = match body.get("metadata") {
-        Some(v) => v,
+    let patch_map = match body.get("metadata") {
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err("metadata must be an object".to_string()),
         None => return Ok(current),
     };
 
-    let patch_map = metadata_val
-        .as_object()
-        .ok_or_else(|| "metadata must be an object".to_string())?;
-
-    let patches: Vec<MetadataPatch> = patch_map
-        .iter()
-        .map(|(k, v)| {
-            if v.is_null() {
-                MetadataPatch::Delete(k.clone())
-            } else {
-                MetadataPatch::Set(k.clone(), v.clone())
-            }
-        })
-        .collect();
-
     let mut result = current.unwrap_or_default();
-    for patch in patches {
-        match patch {
-            MetadataPatch::Set(k, v) => {
-                result.insert(k, v);
-            }
-            MetadataPatch::Delete(k) => {
-                result.remove(&k);
-            }
+    for (k, v) in patch_map {
+        if v.is_null() {
+            result.remove(k);
+        } else {
+            result.insert(k.clone(), v.clone());
         }
     }
 
@@ -228,13 +192,7 @@ pub async fn update_conversation(
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    let current = match get_or_error(
-        storage.get_conversation(&conversation_id).await,
-        "Conversation not found",
-        "Failed to get conversation",
-    )
-    .await
-    {
+    let current = match ensure_conversation_exists(storage, &conversation_id).await {
         Ok(c) => c,
         Err(response) => return response,
     };
@@ -451,12 +409,15 @@ async fn process_item_reference(
 
     let item_id = ConversationItemId::from(ref_id);
 
-    let existing_item = get_or_error(
-        item_storage.get_item(&item_id).await,
-        &format!("Referenced item '{ref_id}' not found"),
-        "Failed to get referenced item",
-    )
-    .await?;
+    let existing_item = match item_storage.get_item(&item_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
+        Err(e) => {
+            return Err(internal_error(format!(
+                "Failed to get referenced item: {e}"
+            )))
+        }
+    };
 
     if let Err(e) = item_storage
         .link_item(conversation_id, &existing_item.id, added_at)
