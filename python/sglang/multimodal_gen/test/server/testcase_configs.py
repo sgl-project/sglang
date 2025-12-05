@@ -212,6 +212,19 @@ class PerformanceSummary:
         )
 
 
+T2I_sampling_params = DiffusionSamplingParams(
+    prompt="A futuristic cityscape at sunset with flying cars",
+    output_size="1024x1024",
+)
+T2V_sampling_params = DiffusionSamplingParams(
+    prompt="A curious racoon", output_size="848x480", seconds=1
+)
+TI2V_sampling_params = DiffusionSamplingParams(
+    output_size="832x1104",
+    prompt="Add dynamic motion to the scene",
+    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+)
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES_A: list[DiffusionTestCase] = [
@@ -224,10 +237,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_text=1,
             warmup_edit=0,
         ),
-        DiffusionSamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            output_size="1024x1024",
-        ),
+        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_image_t2i",
@@ -237,10 +247,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_text=1,
             warmup_edit=0,
         ),
-        DiffusionSamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            output_size="1024x1024",
-        ),
+        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_image_t2i",
@@ -250,10 +257,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_text=1,
             warmup_edit=0,
         ),
-        DiffusionSamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            output_size="1024x1024",
-        ),
+        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "zimage_image_t2i",
@@ -294,10 +298,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        DiffusionSamplingParams(
-            prompt="A curious raccoon",
-            output_size="848x480",
-        ),
+        T2V_sampling_params,
     ),
     # NOTE(mick): flaky
     # DiffusionTestCase(
@@ -332,10 +333,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        DiffusionSamplingParams(
-            prompt="A curious raccoon",
-            output_size="720x480",
-        ),
+        T2V_sampling_params,
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
@@ -347,11 +345,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        DiffusionSamplingParams(
-            output_size="832x1104",
-            prompt="Add dynamic motion to the scene",
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        ),
+        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "fastwan2_2_ti2v_5b",
@@ -362,11 +356,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        DiffusionSamplingParams(
-            output_size="832x1104",
-            prompt="Add dynamic motion to the scene",
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        ),
+        TI2V_sampling_params,
     ),
 ]
 
@@ -396,10 +386,7 @@ TWO_GPU_CASES_A = [
             custom_validator="video",
             num_gpus=2,
         ),
-        DiffusionSamplingParams(
-            prompt="A curious raccoon",
-            output_size="720x480",
-        ),
+        T2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_1_t2v_14b_2gpu",
@@ -411,10 +398,7 @@ TWO_GPU_CASES_A = [
             num_gpus=2,
             custom_validator="video",
         ),
-        DiffusionSamplingParams(
-            prompt="A curious raccoon",
-            output_size="720x480",
-        ),
+        T2V_sampling_params,
     ),
 ]
 
@@ -429,11 +413,7 @@ TWO_GPU_CASES_B = [
             custom_validator="video",
             num_gpus=2,
         ),
-        DiffusionSamplingParams(
-            output_size="832x1104",
-            prompt="Add dynamic motion to the scene",
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        ),
+        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_720P_2gpu",
@@ -445,11 +425,7 @@ TWO_GPU_CASES_B = [
             custom_validator="video",
             num_gpus=2,
         ),
-        DiffusionSamplingParams(
-            prompt="Add dynamic motion to the scene",
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-            output_size="832x1104",
-        ),
+        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "qwen_image_t2i_2_gpus",
@@ -460,10 +436,7 @@ TWO_GPU_CASES_B = [
             warmup_edit=0,
             num_gpus=2,
         ),
-        DiffusionSamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            output_size="1024x1024",
-        ),
+        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_image_t2i_2_gpus",
@@ -473,10 +446,7 @@ TWO_GPU_CASES_B = [
             warmup_text=1,
             warmup_edit=0,
         ),
-        DiffusionSamplingParams(
-            prompt="A futuristic cityscape at sunset with flying cars",
-            output_size="1024x1024",
-        ),
+        T2I_sampling_params,
     ),
 ]
 
