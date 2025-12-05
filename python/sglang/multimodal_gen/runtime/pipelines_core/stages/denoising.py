@@ -109,6 +109,8 @@ class DenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        self.transformer_compiled_func = None
+        self.transformer_2_compiled_func = None
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -119,10 +121,10 @@ class DenoisingStage(PipelineStage):
         # torch compile
         if self.server_args.enable_torch_compile:
             full_graph = False
-            self.transformer = torch.compile(
+            self.transformer_compiled_func = torch.compile(
                 self.transformer, mode="max-autotune", fullgraph=full_graph
             )
-            self.transformer_2 = (
+            self.transformer_2_compiled_func = (
                 torch.compile(
                     self.transformer_2, mode="max-autotune", fullgraph=full_graph
                 )
@@ -490,7 +492,7 @@ class DenoisingStage(PipelineStage):
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(batch.num_inference_steps)
 
-            if self.server_args.enable_torch_compile:
+            if self.server_args.enable_torch_compile and not self.transformer_compiled_func:
                 self.transformer = torch.compile(
                     self.transformer, mode="max-autotune", fullgraph=True
                 )
@@ -583,7 +585,7 @@ class DenoisingStage(PipelineStage):
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
+            self.transformer_compiled_func if server_args.enable_torch_compile else self.transformer.forward,
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
@@ -592,7 +594,7 @@ class DenoisingStage(PipelineStage):
         )
 
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer.forward,
+            self.transformer_compiled_func if server_args.enable_torch_compile else self.transformer.forward,
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
@@ -607,7 +609,7 @@ class DenoisingStage(PipelineStage):
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
-                self.transformer.forward,
+                self.transformer_compiled_func if server_args.enable_torch_compile else self.transformer.forward,
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
