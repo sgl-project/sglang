@@ -8,7 +8,6 @@ from torch import nn
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import divide, get_pp_group
-from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -59,7 +58,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.utils import direct_register_custom_op
 
 
 @triton.jit
@@ -373,22 +371,6 @@ class Qwen3GatedDeltaNet(nn.Module):
         return projected_states_qkvz, projected_states_ba
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        output = torch.empty_like(hidden_states)
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
-            torch.ops.sglang.gdn_with_output(
-                hidden_states,
-                output,
-                self.layer_id,
-            )
-            return output
-        else:
-            return self._forward(hidden_states, forward_batch)
-
-    def _forward(
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -839,14 +821,13 @@ class Qwen3NextModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states, residual = layer(
-                    layer_id=i,
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                )
+            hidden_states, residual = layer(
+                layer_id=i,
+                positions=positions,
+                hidden_states=hidden_states,
+                residual=residual,
+                forward_batch=forward_batch,
+            )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
@@ -1068,19 +1049,3 @@ def gdn_with_output(
 
     output.view(ret.shape).copy_(ret)
     return
-
-
-def gdn_with_output_fake(
-    hidden_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_id: int,
-) -> None:
-    return
-
-
-direct_register_custom_op(
-    op_name="gdn_with_output",
-    op_func=gdn_with_output,
-    mutates_args=["output"],
-    fake_impl=gdn_with_output_fake,
-)

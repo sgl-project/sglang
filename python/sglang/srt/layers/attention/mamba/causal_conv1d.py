@@ -127,3 +127,21 @@ def causal_conv1d_update(
     if unsqueeze:
         x = x.squeeze(-1)
     return x
+
+
+import torch
+
+
+@torch.library.register_fake("sgl_kernel::causal_conv1d_fwd")
+def _fake_causal_conv1d_fwd(
+    x,
+    weight,
+    bias_,
+    conv_states,
+    query_start_loc,
+    cache_indices,
+    has_initial_state,
+    silu_activation,
+    pad_slot_id,
+):
+    return None

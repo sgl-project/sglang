@@ -12,7 +12,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.utils import device_context, is_npu
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
@@ -161,7 +161,7 @@ def _layer_norm_fwd(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     grid = (M, ngroups)
-    with device_context(x.device):
+    with torch.cuda.device(x.device):
         _layer_norm_fwd_1pass_kernel[grid](
             x,
             out,
