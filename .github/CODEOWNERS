@@ -41,5 +41,7 @@
 /sgl-router/src/routers @CatherineSue @key4ng @slin1237
 /sgl-router/src/tokenizer @slin1237 @CatherineSue
 /sgl-router/src/tool_parser @slin1237 @CatherineSue
+/sgl-router/src/wasm @tonyluj
+/sgl-router/examples/wasm @tonyluj
 /test/srt/ascend @ping1jing2 @iforgetmyname
 /test/srt/test_modelopt* @Edwardf0t1

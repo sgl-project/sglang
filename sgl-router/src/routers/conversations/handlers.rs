@@ -16,29 +16,12 @@ use crate::data_connector::{
     ConversationStorage, ListParams, NewConversation, NewConversationItem, SortOrder,
 };
 
-pub const MAX_METADATA_PROPERTIES: usize = 16;
+// ============================================================================
+// Constants
+// ============================================================================
 
-/// Helper to check conversation exists, returning appropriate error response if not
-async fn ensure_conversation_exists(
-    conversation_storage: &Arc<dyn ConversationStorage>,
-    conv_id: &ConversationId,
-) -> Result<Conversation, Response> {
-    match conversation_storage.get_conversation(conv_id).await {
-        Ok(Some(conv)) => Ok(conv),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Conversation not found"})),
-        )
-            .into_response()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("Failed to get conversation: {}", e)
-            })),
-        )
-            .into_response()),
-    }
-}
+pub const MAX_METADATA_PROPERTIES: usize = 16;
+const MAX_ITEMS_PER_REQUEST: usize = 20;
 
 const SUPPORTED_ITEM_TYPES: &[&str] = &[
     "message",
@@ -70,171 +53,156 @@ const IMPLEMENTED_ITEM_TYPES: &[&str] = &[
     "item_reference",
 ];
 
-pub async fn create_conversation(
-    conversation_storage: &Arc<dyn ConversationStorage>,
-    body: Value,
-) -> Response {
-    let metadata = match body.get("metadata") {
+// ============================================================================
+// Error Response Helpers
+// ============================================================================
+
+fn bad_request(message: impl Into<String>) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": message.into()})),
+    )
+        .into_response()
+}
+
+fn not_found(message: impl Into<String>) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": message.into()})),
+    )
+        .into_response()
+}
+
+fn internal_error(message: impl Into<String>) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": message.into()})),
+    )
+        .into_response()
+}
+
+fn bad_request_structured(error_obj: Value) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({"error": error_obj}))).into_response()
+}
+
+// ============================================================================
+// Storage Helpers
+// ============================================================================
+
+async fn ensure_conversation_exists(
+    storage: &Arc<dyn ConversationStorage>,
+    conv_id: &ConversationId,
+) -> Result<Conversation, Response> {
+    match storage.get_conversation(conv_id).await {
+        Ok(Some(conv)) => Ok(conv),
+        Ok(None) => Err(not_found("Conversation not found")),
+        Err(e) => Err(internal_error(format!("Failed to get conversation: {e}"))),
+    }
+}
+
+// ============================================================================
+// Metadata Operations
+// ============================================================================
+
+fn validate_metadata(value: &Value) -> Result<Option<serde_json::Map<String, Value>>, String> {
+    match value.get("metadata") {
         Some(Value::Object(map)) => {
             if map.len() > MAX_METADATA_PROPERTIES {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error":
-                            format!(
-                                "metadata cannot have more than {} properties",
-                                MAX_METADATA_PROPERTIES
-                            )
-                    })),
-                )
-                    .into_response();
+                Err(format!(
+                    "metadata cannot have more than {MAX_METADATA_PROPERTIES} properties"
+                ))
+            } else {
+                Ok(Some(map.clone()))
             }
-            Some(map.clone())
         }
-        Some(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "metadata must be an object"})),
-            )
-                .into_response();
+        Some(_) => Err("metadata must be an object".to_string()),
+        None => Ok(None),
+    }
+}
+
+fn apply_metadata_patches(
+    current: Option<serde_json::Map<String, Value>>,
+    body: &Value,
+) -> Result<Option<serde_json::Map<String, Value>>, String> {
+    let patch_map = match body.get("metadata") {
+        Some(Value::Object(map)) => map,
+        Some(_) => return Err("metadata must be an object".to_string()),
+        None => return Ok(current),
+    };
+
+    let mut result = current.unwrap_or_default();
+    for (k, v) in patch_map {
+        if v.is_null() {
+            result.remove(k);
+        } else {
+            result.insert(k.clone(), v.clone());
         }
-        None => None,
+    }
+
+    if result.len() > MAX_METADATA_PROPERTIES {
+        return Err(format!(
+            "metadata cannot have more than {MAX_METADATA_PROPERTIES} properties"
+        ));
+    }
+
+    Ok(if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    })
+}
+
+// ============================================================================
+// Conversation CRUD Handlers
+// ============================================================================
+
+pub async fn create_conversation(storage: &Arc<dyn ConversationStorage>, body: Value) -> Response {
+    let metadata = match validate_metadata(&body) {
+        Ok(m) => m,
+        Err(msg) => return bad_request(msg),
     };
 
     let new_conv = NewConversation { id: None, metadata };
 
-    match conversation_storage.create_conversation(new_conv).await {
+    match storage.create_conversation(new_conv).await {
         Ok(conversation) => {
             info!(conversation_id = %conversation.id.0, "Created conversation");
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("Failed to create conversation: {}", e)
-            })),
-        )
-            .into_response(),
+        Err(e) => internal_error(format!("Failed to create conversation: {e}")),
     }
 }
 
-pub async fn get_conversation(
-    conversation_storage: &Arc<dyn ConversationStorage>,
-    conv_id: &str,
-) -> Response {
+pub async fn get_conversation(storage: &Arc<dyn ConversationStorage>, conv_id: &str) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    match conversation_storage
-        .get_conversation(&conversation_id)
-        .await
-    {
+    match storage.get_conversation(&conversation_id).await {
         Ok(Some(conversation)) => {
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Conversation not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("Failed to get conversation: {}", e)
-            })),
-        )
-            .into_response(),
+        Ok(None) => not_found("Conversation not found"),
+        Err(e) => internal_error(format!("Failed to get conversation: {e}")),
     }
 }
 
 pub async fn update_conversation(
-    conversation_storage: &Arc<dyn ConversationStorage>,
+    storage: &Arc<dyn ConversationStorage>,
     conv_id: &str,
     body: Value,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    let current_meta = match conversation_storage
-        .get_conversation(&conversation_id)
-        .await
-    {
-        Ok(Some(meta)) => meta,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "Conversation not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to get conversation: {}", e)
-                })),
-            )
-                .into_response();
-        }
+    let current = match ensure_conversation_exists(storage, &conversation_id).await {
+        Ok(c) => c,
+        Err(response) => return response,
     };
 
-    #[derive(Debug)]
-    enum Patch {
-        Set(String, Value),
-        Delete(String),
-    }
-
-    let mut patches: Vec<Patch> = Vec::new();
-
-    if let Some(metadata_val) = body.get("metadata") {
-        if let Some(map) = metadata_val.as_object() {
-            for (k, v) in map {
-                if v.is_null() {
-                    patches.push(Patch::Delete(k.clone()));
-                } else {
-                    patches.push(Patch::Set(k.clone(), v.clone()));
-                }
-            }
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "metadata must be an object"})),
-            )
-                .into_response();
-        }
-    }
-
-    let mut new_metadata = current_meta.metadata.clone().unwrap_or_default();
-    for patch in patches {
-        match patch {
-            Patch::Set(k, v) => {
-                new_metadata.insert(k, v);
-            }
-            Patch::Delete(k) => {
-                new_metadata.remove(&k);
-            }
-        }
-    }
-
-    if new_metadata.len() > MAX_METADATA_PROPERTIES {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error":
-                    format!(
-                        "metadata cannot have more than {} properties",
-                        MAX_METADATA_PROPERTIES
-                    )
-            })),
-        )
-            .into_response();
-    }
-
-    let final_metadata = if new_metadata.is_empty() {
-        None
-    } else {
-        Some(new_metadata)
+    let final_metadata = match apply_metadata_patches(current.metadata.clone(), &body) {
+        Ok(m) => m,
+        Err(msg) => return bad_request(msg),
     };
 
-    match conversation_storage
+    match storage
         .update_conversation(&conversation_id, final_metadata)
         .await
     {
@@ -242,36 +210,22 @@ pub async fn update_conversation(
             info!(conversation_id = %conversation_id.0, "Updated conversation");
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Conversation not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("Failed to update conversation: {}", e)
-            })),
-        )
-            .into_response(),
+        Ok(None) => not_found("Conversation not found"),
+        Err(e) => internal_error(format!("Failed to update conversation: {e}")),
     }
 }
 
 pub async fn delete_conversation(
-    conversation_storage: &Arc<dyn ConversationStorage>,
+    storage: &Arc<dyn ConversationStorage>,
     conv_id: &str,
 ) -> Response {
     let conversation_id = ConversationId::from(conv_id);
 
-    if let Err(response) = ensure_conversation_exists(conversation_storage, &conversation_id).await
-    {
+    if let Err(response) = ensure_conversation_exists(storage, &conversation_id).await {
         return response;
     }
 
-    match conversation_storage
-        .delete_conversation(&conversation_id)
-        .await
-    {
+    match storage.delete_conversation(&conversation_id).await {
         Ok(_) => {
             info!(conversation_id = %conversation_id.0, "Deleted conversation");
             (
@@ -284,15 +238,13 @@ pub async fn delete_conversation(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("Failed to delete conversation: {}", e)
-            })),
-        )
-            .into_response(),
+        Err(e) => internal_error(format!("Failed to delete conversation: {e}")),
     }
 }
+
+// ============================================================================
+// Conversation Item Handlers
+// ============================================================================
 
 pub async fn list_conversation_items(
     conversation_storage: &Arc<dyn ConversationStorage>,
@@ -334,26 +286,19 @@ pub async fn list_conversation_items(
                 })
                 .collect();
 
-            let has_more = items.len() == limit;
-            let last_id = items.last().map(|item| item.id.0.clone());
-
             (
                 StatusCode::OK,
                 Json(json!({
                     "object": "list",
                     "data": item_values,
-                    "has_more": has_more,
+                    "has_more": items.len() == limit,
                     "first_id": items.first().map(|item| &item.id.0),
-                    "last_id": last_id,
+                    "last_id": items.last().map(|item| &item.id.0),
                 })),
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to list items: {}", e) })),
-        )
-            .into_response(),
+        Err(e) => internal_error(format!("Failed to list items: {e}")),
     }
 }
 
@@ -372,21 +317,13 @@ pub async fn create_conversation_items(
 
     let items_array = match body.get("items").and_then(|v| v.as_array()) {
         Some(arr) => arr,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "Missing or invalid 'items' field"})),
-            )
-                .into_response();
-        }
+        None => return bad_request("Missing or invalid 'items' field"),
     };
 
-    if items_array.len() > 20 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Cannot add more than 20 items at a time"})),
-        )
-            .into_response();
+    if items_array.len() > MAX_ITEMS_PER_REQUEST {
+        return bad_request(format!(
+            "Cannot add more than {MAX_ITEMS_PER_REQUEST} items at a time"
+        ));
     }
 
     let mut created_items = Vec::new();
@@ -394,184 +331,22 @@ pub async fn create_conversation_items(
     let added_at = Utc::now();
 
     for item_val in items_array {
-        let item_type = item_val
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("message");
-
-        if item_type == "item_reference" {
-            let ref_id = match item_val.get("id").and_then(|v| v.as_str()) {
-                Some(id) => id,
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": "item_reference requires 'id' field"})),
-                    )
-                        .into_response();
+        match process_item(item_storage, &conversation_id, item_val, added_at).await {
+            Ok((item_json, warning)) => {
+                created_items.push(item_json);
+                if let Some(w) = warning {
+                    warnings.push(w);
                 }
-            };
-
-            let existing_item_id = ConversationItemId::from(ref_id);
-
-            let existing_item = match item_storage.get_item(&existing_item_id).await {
-                Ok(Some(item)) => item,
-                Ok(None) => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(json!({
-                            "error": format!("Referenced item '{}' not found", ref_id)
-                        })),
-                    )
-                        .into_response();
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({
-                            "error": format!("Failed to get referenced item: {}", e)
-                        })),
-                    )
-                        .into_response();
-                }
-            };
-
-            if let Err(e) = item_storage
-                .link_item(&conversation_id, &existing_item.id, added_at)
-                .await
-            {
-                warn!("Failed to link item {}: {}", existing_item.id.0, e);
             }
-
-            created_items.push(item_to_json(&existing_item));
-            continue;
+            Err(response) => return response,
         }
-
-        let user_provided_id = item_val.get("id").and_then(|v| v.as_str());
-
-        let item = if let Some(id_str) = user_provided_id {
-            let item_id = ConversationItemId::from(id_str);
-
-            let is_already_linked = match item_storage
-                .is_item_linked(&conversation_id, &item_id)
-                .await
-            {
-                Ok(linked) => linked,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({
-                            "error": format!("Failed to check item link: {}", e)
-                        })),
-                    )
-                        .into_response();
-                }
-            };
-
-            if is_already_linked {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": {
-                            "message": "Item already in conversation",
-                            "type": "invalid_request_error",
-                            "param": "items",
-                            "code": "item_already_in_conversation"
-                        }
-                    })),
-                )
-                    .into_response();
-            }
-
-            let existing_item = match item_storage.get_item(&item_id).await {
-                Ok(Some(item)) => item,
-                Ok(None) => {
-                    let (new_item, warning) = match parse_item_from_value(item_val) {
-                        Ok((mut item, warn)) => {
-                            item.id = Some(item_id.clone());
-                            (item, warn)
-                        }
-                        Err(e) => {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(json!({ "error": format!("Invalid item: {}", e) })),
-                            )
-                                .into_response();
-                        }
-                    };
-
-                    if let Some(w) = warning {
-                        warnings.push(w);
-                    }
-
-                    match item_storage.create_item(new_item).await {
-                        Ok(item) => item,
-                        Err(e) => {
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({ "error": format!("Failed to create item: {}", e) })),
-                            )
-                                .into_response();
-                        }
-                    }
-                }
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({
-                            "error": format!("Failed to check item existence: {}", e)
-                        })),
-                    )
-                        .into_response();
-                }
-            };
-
-            existing_item
-        } else {
-            let (new_item, warning) = match parse_item_from_value(item_val) {
-                Ok((item, warn)) => (item, warn),
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({ "error": format!("Invalid item: {}", e) })),
-                    )
-                        .into_response();
-                }
-            };
-
-            if let Some(w) = warning {
-                warnings.push(w);
-            }
-
-            match item_storage.create_item(new_item).await {
-                Ok(item) => item,
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "error": format!("Failed to create item: {}", e) })),
-                    )
-                        .into_response();
-                }
-            }
-        };
-
-        if let Err(e) = item_storage
-            .link_item(&conversation_id, &item.id, added_at)
-            .await
-        {
-            warn!("Failed to link item {}: {}", item.id.0, e);
-        }
-
-        created_items.push(item_to_json(&item));
     }
-
-    let first_id = created_items.first().and_then(|v| v.get("id"));
-    let last_id = created_items.last().and_then(|v| v.get("id"));
 
     let mut response = json!({
         "object": "list",
         "data": created_items,
-        "first_id": first_id,
-        "last_id": last_id,
+        "first_id": created_items.first().and_then(|v| v.get("id")),
+        "last_id": created_items.last().and_then(|v| v.get("id")),
         "has_more": false
     });
 
@@ -582,6 +357,136 @@ pub async fn create_conversation_items(
     }
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+/// Process a single item for creation/linking
+async fn process_item(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: &ConversationId,
+    item_val: &Value,
+    added_at: chrono::DateTime<Utc>,
+) -> Result<(Value, Option<String>), Response> {
+    let item_type = item_val
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("message");
+
+    // Handle item_reference specially - just link existing item
+    if item_type == "item_reference" {
+        return process_item_reference(item_storage, conversation_id, item_val, added_at).await;
+    }
+
+    let user_provided_id = item_val.get("id").and_then(|v| v.as_str());
+
+    let (item, warning) = if let Some(id_str) = user_provided_id {
+        process_item_with_id(item_storage, conversation_id, item_val, id_str).await?
+    } else {
+        process_new_item(item_storage, item_val).await?
+    };
+
+    // Link item to conversation
+    if let Err(e) = item_storage
+        .link_item(conversation_id, &item.id, added_at)
+        .await
+    {
+        warn!("Failed to link item {}: {}", item.id.0, e);
+    }
+
+    Ok((item_to_json(&item), warning))
+}
+
+/// Process an item_reference - link an existing item to the conversation
+async fn process_item_reference(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: &ConversationId,
+    item_val: &Value,
+    added_at: chrono::DateTime<Utc>,
+) -> Result<(Value, Option<String>), Response> {
+    let ref_id = item_val
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| bad_request("item_reference requires 'id' field"))?;
+
+    let item_id = ConversationItemId::from(ref_id);
+
+    let existing_item = match item_storage.get_item(&item_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return Err(not_found(format!("Referenced item '{ref_id}' not found"))),
+        Err(e) => {
+            return Err(internal_error(format!(
+                "Failed to get referenced item: {e}"
+            )))
+        }
+    };
+
+    if let Err(e) = item_storage
+        .link_item(conversation_id, &existing_item.id, added_at)
+        .await
+    {
+        warn!("Failed to link item {}: {}", existing_item.id.0, e);
+    }
+
+    Ok((item_to_json(&existing_item), None))
+}
+
+/// Process an item with a user-provided ID
+async fn process_item_with_id(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    conversation_id: &ConversationId,
+    item_val: &Value,
+    id_str: &str,
+) -> Result<(ConversationItem, Option<String>), Response> {
+    let item_id = ConversationItemId::from(id_str);
+
+    // Check if already linked
+    let is_linked = item_storage
+        .is_item_linked(conversation_id, &item_id)
+        .await
+        .map_err(|e| internal_error(format!("Failed to check item link: {e}")))?;
+
+    if is_linked {
+        return Err(bad_request_structured(json!({
+            "message": "Item already in conversation",
+            "type": "invalid_request_error",
+            "param": "items",
+            "code": "item_already_in_conversation"
+        })));
+    }
+
+    // Check if item exists globally
+    match item_storage.get_item(&item_id).await {
+        Ok(Some(existing)) => Ok((existing, None)),
+        Ok(None) => {
+            // Create new item with the provided ID
+            let (mut new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
+            new_item.id = Some(item_id);
+
+            let created = item_storage
+                .create_item(new_item)
+                .await
+                .map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+
+            Ok((created, warning))
+        }
+        Err(e) => Err(internal_error(format!(
+            "Failed to check item existence: {e}"
+        ))),
+    }
+}
+
+/// Process a new item without a user-provided ID
+async fn process_new_item(
+    item_storage: &Arc<dyn ConversationItemStorage>,
+    item_val: &Value,
+) -> Result<(ConversationItem, Option<String>), Response> {
+    let (new_item, warning) = parse_item_from_value(item_val).map_err(bad_request)?;
+
+    let created = item_storage
+        .create_item(new_item)
+        .await
+        .map_err(|e| internal_error(format!("Failed to create item: {e}")))?;
+
+    Ok((created, warning))
 }
 
 pub async fn get_conversation_item(
@@ -604,37 +509,17 @@ pub async fn get_conversation_item(
         .await
     {
         Ok(linked) => linked,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to check item link: {}", e)
-                })),
-            )
-                .into_response();
-        }
+        Err(e) => return internal_error(format!("Failed to check item link: {e}")),
     };
 
     if !is_linked {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Item not found in this conversation"})),
-        )
-            .into_response();
+        return not_found("Item not found in this conversation");
     }
 
     match item_storage.get_item(&item_id).await {
         Ok(Some(item)) => (StatusCode::OK, Json(item_to_json(&item))).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "Item not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to get item: {}", e) })),
-        )
-            .into_response(),
+        Ok(None) => not_found("Item not found"),
+        Err(e) => internal_error(format!("Failed to get item: {e}")),
     }
 }
 
@@ -662,13 +547,13 @@ pub async fn delete_conversation_item(
             );
             (StatusCode::OK, Json(conversation_to_json(&conversation))).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": format!("Failed to delete item: {}", e) })),
-        )
-            .into_response(),
+        Err(e) => internal_error(format!("Failed to delete item: {e}")),
     }
 }
+
+// ============================================================================
+// Item Creation Helper
+// ============================================================================
 
 pub async fn create_and_link_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
@@ -682,13 +567,13 @@ pub async fn create_and_link_item(
     let created = item_storage
         .create_item(new_item)
         .await
-        .map_err(|e| format!("Failed to create item: {}", e))?;
+        .map_err(|e| format!("Failed to create item: {e}"))?;
 
     if let Some(conv_id) = conv_id_opt {
         item_storage
             .link_item(conv_id, &created.id, Utc::now())
             .await
-            .map_err(|e| format!("Failed to link item: {}", e))?;
+            .map_err(|e| format!("Failed to link item: {e}"))?;
 
         debug!(
             conversation_id = %conv_id.0,
@@ -706,6 +591,10 @@ pub async fn create_and_link_item(
 
     Ok(())
 }
+
+// ============================================================================
+// Parsing and Serialization
+// ============================================================================
 
 fn parse_item_from_value(
     item_val: &Value,
@@ -737,15 +626,16 @@ fn parse_item_from_value(
         .get("role")
         .and_then(|v| v.as_str())
         .map(String::from);
+
+    if item_type == "message" && role.is_none() {
+        return Err("Message items require 'role' field".to_string());
+    }
+
     let status = item_val
         .get("status")
         .and_then(|v| v.as_str())
         .map(String::from)
         .or_else(|| Some("completed".to_string()));
-
-    if item_type == "message" && role.is_none() {
-        return Err("Message items require 'role' field".to_string());
-    }
 
     let content = if item_type == "message" || item_type == "reasoning" {
         item_val.get("content").cloned().unwrap_or(json!([]))
@@ -766,6 +656,24 @@ fn parse_item_from_value(
     ))
 }
 
+/// Field mappings for item types that store data in content
+const ITEM_TYPE_FIELDS: &[(&str, &[&str])] = &[
+    (
+        "mcp_call",
+        &[
+            "name",
+            "arguments",
+            "output",
+            "server_label",
+            "approval_request_id",
+            "error",
+        ],
+    ),
+    ("mcp_list_tools", &["tools", "server_label"]),
+    ("function_call", &["call_id", "name", "arguments", "output"]),
+    ("function_call_output", &["call_id", "output"]),
+];
+
 pub fn item_to_json(item: &ConversationItem) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("id".to_string(), json!(item.id.0));
@@ -775,23 +683,14 @@ pub fn item_to_json(item: &ConversationItem) -> Value {
         obj.insert("role".to_string(), json!(role));
     }
 
-    // Map item types to their expected fields
-    let fields: Option<&[&str]> = match item.item_type.as_str() {
-        "mcp_call" => Some(&[
-            "name",
-            "arguments",
-            "output",
-            "server_label",
-            "approval_request_id",
-            "error",
-        ]),
-        "mcp_list_tools" => Some(&["tools", "server_label"]),
-        "function_call" => Some(&["call_id", "name", "arguments", "output"]),
-        "function_call_output" => Some(&["call_id", "output"]),
-        _ => None,
-    };
+    // Find field mappings for this item type
+    let fields = ITEM_TYPE_FIELDS
+        .iter()
+        .find(|(t, _)| *t == item.item_type)
+        .map(|(_, fields)| *fields);
 
     if let Some(fields) = fields {
+        // Extract specific fields from content
         if let Some(content_obj) = item.content.as_object() {
             for field in fields {
                 if let Some(value) = content_obj.get(*field) {
@@ -800,6 +699,7 @@ pub fn item_to_json(item: &ConversationItem) -> Value {
             }
         }
     } else {
+        // Default: include content as-is
         obj.insert("content".to_string(), item.content.clone());
     }
 

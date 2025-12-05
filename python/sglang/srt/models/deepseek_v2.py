@@ -658,7 +658,9 @@ class DeepseekV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
-            routing_method_type=RoutingMethodType.DeepSeekV3,
+            routing_method_type=getattr(
+                config, "routing_method_type", RoutingMethodType.DeepSeekV3
+            ),
             prefix=add_prefix("experts", prefix),
         )
 
@@ -3180,6 +3182,7 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(nn.Module):
     # for quark model load
     packed_modules_mapping = {}
+    model_cls = DeepseekV2Model
 
     def __init__(
         self,
@@ -3188,7 +3191,6 @@ class DeepseekV2ForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-
         # for quark model load
         # Fuse q_a_proj and kv_a_proj_with_mqa along output dimension when q_lora_rank is not None
         self.fuse_qkv_a_proj = (
@@ -3206,7 +3208,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.use_nsa = is_deepseek_nsa(config)
-        self.model = DeepseekV2Model(
+        self.model = self.model_cls(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         if self.pp_group.is_last_rank:
@@ -3400,16 +3402,22 @@ class DeepseekV2ForCausalLM(nn.Module):
                     selected_quant_config, "weight_block_size", None
                 )
                 if weight_block_size is not None:
-                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
+                        self_attn.kv_b_proj, "weight_scale"
+                    )
+                    weight_scale = (
+                        self_attn.kv_b_proj.weight_scale
+                        if hasattr(self_attn.kv_b_proj, "weight_scale")
+                        else self_attn.kv_b_proj.weight_scale_inv
+                    )
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,
-                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                            weight_scale=weight_scale,
                             input_scale=None,
                         )
                     else:
                         weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
 
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
                     if (
