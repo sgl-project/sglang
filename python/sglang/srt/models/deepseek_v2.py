@@ -3225,9 +3225,9 @@ class DeepseekV2Model(nn.Module):
             )
         self.layers_to_capture = []
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_ep = True
+            self.enable_a2a_moe = True
         else:
-            self.enable_ep = False
+            self.enable_a2a_moe = False
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -3291,7 +3291,7 @@ class DeepseekV2Model(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    if i <= 3 or not self.enable_ep:
+                    if i <= 3 or not self.enable_a2a_moe:
                         aux_hidden_states.append(hidden_states + residual)
                     else:
                         aux_hidden_state = tensor_model_parallel_all_gather(
