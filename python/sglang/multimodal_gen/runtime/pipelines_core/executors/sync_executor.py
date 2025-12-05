@@ -9,7 +9,6 @@ from typing import List
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
     Timer,
-    logger,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
@@ -21,6 +20,20 @@ class SyncExecutor(PipelineExecutor):
     A simple synchronous executor that runs stages sequentially.
     """
 
+    def run_all_stages(
+        self,
+        stages: List[PipelineStage],
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """
+        Execute all pipeline stages sequentially.
+        """
+        for stage in stages:
+            with Timer(stage.__class__.__name__):
+                batch = stage(batch, server_args)
+        return batch
+
     def execute(
         self,
         stages: List[PipelineStage],
@@ -30,10 +43,8 @@ class SyncExecutor(PipelineExecutor):
         """
         Execute the pipeline stages sequentially.
         """
-        logger.info("Running pipeline stages sequentially with SyncExecutor.")
 
-        for stage in stages:
-            with Timer(stage.__class__.__name__):
-                batch = stage(batch, server_args)
+        with self.profile_execution(batch, check_rank=0, dump_rank=0):
+            batch = self.run_all_stages(stages, batch, server_args)
 
         return batch
