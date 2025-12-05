@@ -166,7 +166,13 @@ impl ModelInfo {
                     serde_json::Value::Bool(true) => {
                         labels.insert(key, "true".to_string());
                     }
-                    // Skip empty strings, zeros, false, nulls, arrays, objects
+                    // Insert non-empty arrays as JSON strings (for architectures, etc.)
+                    serde_json::Value::Array(arr) if !arr.is_empty() => {
+                        if let Ok(json_str) = serde_json::to_string(&arr) {
+                            labels.insert(key, json_str);
+                        }
+                    }
+                    // Skip empty strings, zeros, false, nulls, empty arrays, objects
                     _ => {}
                 }
             }

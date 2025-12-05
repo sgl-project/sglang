@@ -1278,6 +1278,18 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+        elif model_arch in [
+            "NemotronHForCausalLM",
+            "FalconH1ForCausalLM",
+            "JetNemotronForCausalLM",
+            "JetVLMForConditionalGeneration",
+        ]:
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
+                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -1710,9 +1722,13 @@ class ServerArgs:
                     self.speculative_draft_model_path = self.model_path
                     self.speculative_draft_model_revision = self.revision
                 else:
-                    logger.warning(
-                        "DeepSeek MTP does not require setting speculative_draft_model_path."
-                    )
+                    if model_arch not in [
+                        "MistralLarge3ForCausalLM",
+                        "PixtralForConditionalGeneration",
+                    ]:
+                        logger.warning(
+                            "DeepSeek MTP does not require setting speculative_draft_model_path."
+                        )
 
             if self.speculative_num_steps is None:
                 assert (
@@ -2781,7 +2797,7 @@ class ServerArgs:
         parser.add_argument(
             "--preferred-sampling-params",
             type=str,
-            help="json-formatted sampling settings that will be returned in /get_model_info",
+            help="json-formatted sampling settings that will be returned in /model_info",
         )
 
         # LoRA
