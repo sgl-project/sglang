@@ -76,13 +76,15 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 The usage of function calling and reasoning parser is the same as DeepSeek V3.1. Please refer to [Reasoning Parser](https://docs.sglang.io/advanced_features/separate_reasoning.html) and [Tool Parser](https://docs.sglang.io/advanced_features/tool_parser.html) documents.
 
 To launch `DeepSeek-V3.2-Exp` with function calling and reasoning parser:
+> Note: It is recommended to specify the chat-template, ensuring that you are within the sglang's root directory.
 ```bash
 python3 -m sglang.launch_server \
-  --model-path deepseek-ai/DeepSeek-V3.2 \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
   --trust-remote-code \
   --tp-size 8 --dp-size 8 --enable-dp-attention \
   --tool-call-parser deepseekv31 \
-  --reasoning-parser deepseek-v3
+  --reasoning-parser deepseek-v3 \
+  --chat-template ./examples/chat_template/tool_chat_template_deepseekv32.jinja
 ```
 
 To launch `DeepSeek-V3.2` with function calling and reasoning parser:
@@ -183,7 +185,7 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198
 
 The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in official tech report.
 ```bash
-Repeat: 8, mean: **0**.797
+Repeat: 8, mean: 0.797
 Scores: ['0.808', '0.798', '0.808', '0.798', '0.783', '0.788', '0.803', '0.793']
 ```
 
@@ -217,7 +219,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp
 
 **For `DeepSeek-V3.2` and `DeepSeek-V3.2-Speciale`**:
 
-Hardcode the thinking mode to be `thinking` in (`_apply_jinja_template`)[https://github.com/sgl-project/sglang/blob/7c38eca1e4a704bf09fe6b52ea040a41d3cfc55d/python/sglang/srt/entrypoints/openai/serving_chat.py#L286`], then launch the server as usual:
+Hardcode the thinking mode to be `thinking` in `_apply_jinja_template` function [here](https://github.com/sgl-project/sglang/blob/7c38eca1e4a704bf09fe6b52ea040a41d3cfc55d/python/sglang/srt/entrypoints/openai/serving_chat.py#L286), then launch the server as usual:
 ```
 python3 -m sglang.launch_server   --model-path deepseek-ai/DeepSeek-V3.2   --trust-remote-code   --tp-size 8 --dp-size 8 --enable-dp-attention   --tool-call-parser deepseekv32   --reasoning-parser deepseek-v3
 ```
