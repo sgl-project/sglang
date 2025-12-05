@@ -111,6 +111,7 @@ class DenoisingStage(PipelineStage):
         self.transformer_2 = transformer_2
         self.transformer_compiled_func = None
         self.transformer_2_compiled_func = None
+        self.full_graph = False
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -120,13 +121,12 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            full_graph = False
             self.transformer_compiled_func = torch.compile(
-                self.transformer, mode="max-autotune", fullgraph=full_graph
+                self.transformer, mode="max-autotune", fullgraph=self.full_graph
             )
             self.transformer_2_compiled_func = (
                 torch.compile(
-                    self.transformer_2, mode="max-autotune", fullgraph=full_graph
+                    self.transformer_2, mode="max-autotune", fullgraph=self.full_graph
                 )
                 if transformer_2 is not None
                 else None
