@@ -101,7 +101,7 @@ class CacheDitConfig:
     # cached steps limit, otherwise, we should use a lower threshold here like 0.12.
     residual_diff_threshold: float = 0.24
     max_continuous_cached_steps: int = 3
-    # TaylorSeer is not sutiable for few steps distilled models, so, we choose
+    # TaylorSeer is not suitable for few steps distilled models, so, we choose
     # to disable it by default. Reference:
     # - From Reusing to Forecasting: Accelerating Diffusion Models with TaylorSeers,
     #   https://arxiv.org/pdf/2503.06923
@@ -372,38 +372,3 @@ def enable_cache_on_dual_transformer(
         )
 
     return transformer, transformer_2
-
-
-def get_cache_summary(transformer: torch.nn.Module) -> dict:
-    """Get cache statistics from a cache-dit enabled transformer.
-
-    Args:
-        transformer: The transformer module with cache-dit enabled.
-
-    Returns:
-        A dictionary containing cache statistics, or empty dict if not available.
-    """
-    try:
-        stats_list = cache_dit.summary(transformer)
-        if not stats_list:
-            return {}
-
-        # Handle both single stats and list of stats
-        stats = stats_list[0] if isinstance(stats_list, list) else stats_list
-
-        return {
-            "cache_options": getattr(stats, "cache_options", None),
-            "cached_steps": getattr(stats, "cached_steps", None),
-            "pruned_ratio": getattr(stats, "pruned_ratio", None),
-        }
-    except Exception as e:
-        logger.warning("Failed to get cache-dit summary: %s", e)
-        return {}
-
-
-def set_compile_configs_for_cache_dit():
-    """Set torch.compile configurations compatible with cache-dit.
-
-    Call this before torch.compile if cache-dit is enabled.
-    """
-    cache_dit.set_compile_configs()

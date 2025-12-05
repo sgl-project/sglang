@@ -166,17 +166,15 @@ class DenoisingStage(PipelineStage):
     def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
         """Enable cache-dit on the transformer(s) if configured (idempotent).
 
-        This method should be called AFTER the transformer is fully loaded
-        and BEFORE torch.compile is applied.
+        This method should be called after the transformer is fully loaded
+        and before torch.compile is applied.
 
         For dual-transformer models (e.g., Wan2.2), this enables cache-dit on both
-        transformer (high-noise expert) and transformer_2 (low-noise expert) with
-        potentially different configurations.
+        transformers with (potentially) different configurations.
 
         Args:
             num_inference_steps: Number of inference steps for this batch.
         """
-        # Idempotent check: already enabled
         if self._cache_dit_enabled:
             if self._cached_num_steps != num_inference_steps:
                 logger.warning(
@@ -187,7 +185,7 @@ class DenoisingStage(PipelineStage):
                     self._cached_num_steps,
                 )
             return
-        # Check if cache-dit is enabled in config
+        # check if cache-dit is enabled in config
         if not envs.SGLANG_CACHE_DIT_ENABLED:
             return
 
@@ -207,7 +205,7 @@ class DenoisingStage(PipelineStage):
         scm_cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
         scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
 
-        # Parse custom bins if provided (both must be set together)
+        # parse custom bins if provided (both must be set together)
         scm_compute_bins = None
         scm_cache_bins = None
         if scm_compute_bins_str and scm_cache_bins_str:
@@ -229,7 +227,7 @@ class DenoisingStage(PipelineStage):
                 scm_preset,
             )
 
-        # Generate SCM mask using cache-dit's steps_mask()
+        # generate SCM mask using cache-dit's steps_mask()
         # cache-dit handles step count validation and scaling internally
         steps_computation_mask = get_scm_mask(
             preset=scm_preset,
@@ -238,7 +236,7 @@ class DenoisingStage(PipelineStage):
             cache_bins=scm_cache_bins,
         )
 
-        # Build config for primary transformer (high-noise expert)
+        # build config for primary transformer (high-noise expert)
         primary_config = CacheDitConfig(
             enabled=True,
             Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
@@ -254,10 +252,10 @@ class DenoisingStage(PipelineStage):
             steps_computation_policy=scm_policy,
         )
 
-        # Check if we have dual transformers (e.g., Wan2.2)
         if self.transformer_2 is not None:
-            # Build config for secondary transformer (low-noise expert)
-            # Uses secondary parameters which inherit from primary if not explicitly set
+            # dual transformer
+            # build config for secondary transformer (low-noise expert)
+            # uses secondary parameters which inherit from primary if not explicitly set
             secondary_config = CacheDitConfig(
                 enabled=True,
                 Fn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_FN,
@@ -273,8 +271,8 @@ class DenoisingStage(PipelineStage):
                 steps_computation_policy=scm_policy,
             )
 
-            # For dual transformers, must use BlockAdapter to enable cache on both
-            # simultaneously. Cannot call enable_cache separately on each transformer.
+            # for dual transformers, must use BlockAdapter to enable cache on both simultaneously.
+            # Don't call enable_cache separately on each transformer.
             self.transformer, self.transformer_2 = enable_cache_on_dual_transformer(
                 self.transformer,
                 self.transformer_2,
@@ -287,7 +285,7 @@ class DenoisingStage(PipelineStage):
                 num_inference_steps,
             )
         else:
-            # Single transformer case - use standard enable_cache
+            # single transformer
             self.transformer = enable_cache_on_transformer(
                 self.transformer,
                 primary_config,
@@ -467,7 +465,7 @@ class DenoisingStage(PipelineStage):
                 server_args.model_paths["transformer"], server_args
             )
 
-            # Enable cache-dit BEFORE torch.compile (delayed mounting)
+            # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(batch.num_inference_steps)
 
             if self.server_args.enable_torch_compile:
@@ -478,7 +476,6 @@ class DenoisingStage(PipelineStage):
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
         else:
-            # If already loaded, still try to enable cache-dit once (idempotent)
             self._maybe_enable_cache_dit(batch.num_inference_steps)
 
         # Prepare extra step kwargs for scheduler
@@ -1089,9 +1086,6 @@ class DenoisingStage(PipelineStage):
         """
         Prepare extra kwargs for the scheduler step / denoise step.
 
-        Handles wrapped functions (e.g., by cache-dit) by extracting
-        the original function signature.
-
         Args:
             func: The function to prepare kwargs for.
             kwargs: The kwargs to prepare.
@@ -1099,33 +1093,11 @@ class DenoisingStage(PipelineStage):
         Returns:
             The prepared kwargs.
         """
-        import functools
-
-        # Try to get the original function signature if func is wrapped
-        target_func = func
-
-        # Handle functools.partial (used by cache-dit)
-        # func.args[0] is the transformer instance
-        # NOTE: This relies on cache-dit's internal attribute `_original_forward`.
-        # This is a known coupling - cache-dit exposes this attribute as part of its
-        # public API for unwrapping. If cache-dit changes this interface, update here.
-        # See: https://github.com/vipshop/cache-dit
-        if isinstance(func, functools.partial) and func.args:
-            transformer_instance = func.args[0]
-            if hasattr(transformer_instance, "_original_forward"):
-                target_func = transformer_instance._original_forward
-
-        # Handle functools.wraps
-        while hasattr(target_func, "__wrapped__"):
-            target_func = target_func.__wrapped__
-
-        sig = inspect.signature(target_func)
-        params = sig.parameters
         extra_step_kwargs = {}
         for k, v in kwargs.items():
-            if k in params:
+            accepts = k in set(inspect.signature(func).parameters.keys())
+            if accepts:
                 extra_step_kwargs[k] = v
-
         return extra_step_kwargs
 
     def progress_bar(
