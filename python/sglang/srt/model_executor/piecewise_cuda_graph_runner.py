@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import bisect
 import gc
+import inspect
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import tqdm
@@ -238,9 +239,34 @@ class PiecewiseCudaGraphRunner:
                     (self.max_num_tokens, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
                 )
-                self.mrope_positions = torch.zeros(
-                    (3, self.max_num_tokens), dtype=torch.int64
-                )
+            self.mrope_positions = torch.zeros(
+                (3, self.max_num_tokens), dtype=torch.int64
+            )
+
+            # PP proxy tensors buffer (for pipeline parallelism)
+            if self.pp_size > 1:
+                hidden_size = self.model_runner.model_config.hidden_size
+                dtype = self.model_runner.model_config.dtype
+                # Note: piecewise captures with bs=1, but we need buffer for PP proxy tensors
+                # The buffer size is 1 since we capture with batch_size=1
+                self.pp_proxy_tensors_buffer = {
+                    "hidden_states": torch.zeros(
+                        (1, hidden_size), dtype=dtype, device=self.device
+                    ),
+                    "residual": torch.zeros(
+                        (1, hidden_size), dtype=dtype, device=self.device
+                    ),
+                }
+            else:
+                self.pp_proxy_tensors_buffer = None
+
+        # Cache whether model.forward supports pp_proxy_tensors parameter
+        # This avoids expensive inspect.signature() calls in the hot path
+        self.model_supports_pp_proxy_tensors = (
+            self.pp_size > 1
+            and "pp_proxy_tensors"
+            in inspect.signature(self.model_runner.model.forward).parameters
+        )
 
         self.attention_layers = self.model_runner.attention_layers
 
@@ -415,6 +441,13 @@ class PiecewiseCudaGraphRunner:
 
         global_dp_buffer_len = None
 
+        # Pipeline parallelism: create PP proxy tensors if needed
+        pp_proxy_tensors = None
+        if self.pp_size > 1:
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:bs] for k, v in self.pp_proxy_tensors_buffer.items()}
+            )
+
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
@@ -482,6 +515,13 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
+            # Add PP proxy tensors if PP is enabled and model supports it
+            # Use cached check to avoid expensive inspect.signature() in hot path
+            if self.model_supports_pp_proxy_tensors and pp_proxy_tensors is not None:
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                )
+
             with set_forward_context(
                 forward_batch, self.attention_layers, self.quant_config
             ):
@@ -503,6 +543,7 @@ class PiecewiseCudaGraphRunner:
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
         **kwargs,
     ):
         num_tokens = len(forward_batch.input_ids)
@@ -605,7 +646,29 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph(), disable_ca_comm(self.model_runner.tp_group):
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-            static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            # Extract pp_proxy_tensors from kwargs if present (avoid in-place modification)
+            pp_proxy_tensors = kwargs.get("pp_proxy_tensors", None)
+            forward_kwargs = kwargs.copy()
+            if "pp_proxy_tensors" in forward_kwargs:
+                del forward_kwargs["pp_proxy_tensors"]
+
+            static_forward_batch = self.replay_prepare(
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors, **kwargs
+            )
+
+            # Prepare PP proxy tensors for forward if needed
+            # Use cached check to avoid expensive inspect.signature() in hot path
+            if self.model_supports_pp_proxy_tensors and pp_proxy_tensors is not None:
+                # Copy PP proxy tensors to buffer if needed
+                bs = forward_batch.batch_size
+                for key, buf in self.pp_proxy_tensors_buffer.items():
+                    if key in pp_proxy_tensors.tensors:
+                        src = pp_proxy_tensors.tensors[key]
+                        buf[:bs].copy_(src[:bs])
+                forward_kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v[:bs] for k, v in self.pp_proxy_tensors_buffer.items()}
+                )
+
             # Replay
             with set_forward_context(
                 static_forward_batch, self.attention_layers, self.quant_config
@@ -615,7 +678,7 @@ class PiecewiseCudaGraphRunner:
                         static_forward_batch.input_ids,
                         static_forward_batch.positions,
                         static_forward_batch,
-                        **kwargs,
+                        **forward_kwargs,
                     )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
@@ -631,10 +694,11 @@ class PiecewiseCudaGraphRunner:
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output
                 else:
+                    # Handle PPProxyTensors output
                     assert isinstance(output, PPProxyTensors)
-                    # TODO(Yuwei): support PP Support
-                    raise NotImplementedError(
-                        "PPProxyTensors is not supported in PiecewiseCudaGraphRunner yet."
+                    bs = forward_batch.batch_size
+                    return PPProxyTensors(
+                        {k: v[:bs] for k, v in output.tensors.items()}
                     )
 
     def get_spec_info(self, num_tokens: int):
