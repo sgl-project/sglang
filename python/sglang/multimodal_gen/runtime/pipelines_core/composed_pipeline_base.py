@@ -157,12 +157,32 @@ class ComposedPipelineBase(ABC):
         self.modules[module_name] = module
 
     def _load_config(self) -> dict[str, Any]:
+        original_model_path = self.model_path
         model_path = maybe_download_model(self.model_path)
         self.model_path = model_path
         # server_args.downloaded_model_path = model_path
         logger.info("Model path: %s", model_path)
-        config = verify_model_config_and_directory(model_path)
-        return cast(dict[str, Any], config)
+        try:
+            config = verify_model_config_and_directory(model_path)
+            return cast(dict[str, Any], config)
+        except ValueError as e:
+            # If validation fails (e.g., missing directories), the cache may be corrupted
+            # Try to re-download from HuggingFace Hub
+            logger.warning(
+                "Model validation failed: %s. Cache may be incomplete, attempting re-download...", 
+                str(e)
+            )
+            # Force re-download from the original model path (HF repo ID)
+            from huggingface_hub import snapshot_download
+            model_path = snapshot_download(
+                repo_id=original_model_path,
+                ignore_patterns=["*.onnx", "*.msgpack"],
+                local_files_only=False,  # Force network download
+            )
+            self.model_path = model_path
+            logger.info("Re-downloaded model to: %s", model_path)
+            config = verify_model_config_and_directory(model_path)
+            return cast(dict[str, Any], config)
 
     @property
     def required_config_modules(self) -> list[str]:
