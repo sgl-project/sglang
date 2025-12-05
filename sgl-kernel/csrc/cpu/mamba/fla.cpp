@@ -1013,6 +1013,19 @@ void fused_gdn_gating_kernel_impl(
 
 }  // anonymous namespace
 
+template <bool is_last_dim_contiguous>
+inline void
+CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const int64_t& dim, const at::IntArrayRef& sizes, at::ScalarType st) {
+  TORCH_CHECK(tensor.sizes() == sizes, "Input tensor shape mismatch: expected ", sizes, ", got ", tensor.sizes());
+  TORCH_CHECK(tensor.dtype() == st, "Input tensor dtype mismatch");
+  CHECK_DIM(dim, tensor);
+  if (is_last_dim_contiguous) {
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(tensor);
+  } else {
+    CHECK_CONTIGUOUS(tensor);
+  }
+}
+
 // query: [B, T, HK, EK]
 // key: [B, T, HK, EK]
 // value: [B, T, HV, EV]
