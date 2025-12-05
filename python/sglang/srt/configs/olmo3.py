@@ -17,7 +17,6 @@
 import enum
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
@@ -90,7 +89,6 @@ class Olmo3Config(PretrainedConfig):
         self.use_cache = use_cache
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
-        rope_config_validation(self)
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
 
