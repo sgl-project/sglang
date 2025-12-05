@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.fla.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd,
 )
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
-from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
+from sglang.srt.layers.attention.fla.l2norm import fused_l2norm_qk, l2norm_fwd
 from sglang.srt.layers.attention.fla.solve_tril import solve_tril
 from sglang.srt.layers.attention.fla.utils import (
     SUPPRESS_LEVEL,
@@ -21,6 +21,9 @@ from sglang.srt.layers.attention.fla.utils import (
     input_guard,
 )
 from sglang.srt.layers.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 def chunk_gated_delta_rule_fwd(
@@ -94,8 +97,11 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         k_orig = k
 
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q)
-            k = l2norm_fwd(k)
+            if _is_hip:
+                q, k = fused_l2norm_qk(q, k)
+            else:
+                q = l2norm_fwd(q)
+                k = l2norm_fwd(k)
 
         g, o, A, final_state, w, h, v_new = chunk_gated_delta_rule_fwd(
             q=q,
