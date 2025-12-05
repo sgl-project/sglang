@@ -64,7 +64,6 @@ from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
     enable_cache_on_transformer,
-    get_cache_summary,
     get_scm_mask,
     is_cache_dit_available,
 )
@@ -220,7 +219,9 @@ class DenoisingStage(PipelineStage):
         scm_cache_bins = None
         if scm_compute_bins_str and scm_cache_bins_str:
             try:
-                scm_compute_bins = [int(x.strip()) for x in scm_compute_bins_str.split(",")]
+                scm_compute_bins = [
+                    int(x.strip()) for x in scm_compute_bins_str.split(",")
+                ]
                 scm_cache_bins = [int(x.strip()) for x in scm_cache_bins_str.split(",")]
             except ValueError as e:
                 logger.warning("Failed to parse SCM bins: %s. SCM disabled.", e)
@@ -1122,7 +1123,7 @@ class DenoisingStage(PipelineStage):
                 target_func = transformer_instance._original_forward
 
         # Handle functools.wraps
-        while hasattr(target_func, '__wrapped__'):
+        while hasattr(target_func, "__wrapped__"):
             target_func = target_func.__wrapped__
 
         sig = inspect.signature(target_func)

@@ -44,7 +44,7 @@ For PRs that impact **latency**, **throughput**, or **memory usage**, you **shou
     ...
     ```
 
-    
+
 4. **Paste**: paste the table into the PR description
 
 ## 3. CI-Based Change Protection
