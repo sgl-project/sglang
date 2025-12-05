@@ -218,7 +218,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         cd flashinfer && \
         git checkout ${FLASHINFER_CUTEDSL_MOE_103_HASH} && \
         python3 -m pip install -v . && \
-        FLASHINFER_CUBIN_DOWNLOAD_THREADS=${BUILD_AND_DOWNLOAD_PARALLEL} FLASHINFER_LOGGING_LEVEL=warning python3 -m flashinfer --download-cubin && \
         cd .. ;\
     fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
