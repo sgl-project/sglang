@@ -17,7 +17,7 @@ from typing import Any
 
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.utils import align_to, StoreBoolean
+from sglang.multimodal_gen.utils import StoreBoolean, align_to
 
 logger = init_logger(__name__)
 
@@ -137,9 +137,9 @@ class SamplingParams:
     return_frames: bool = False
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
-    # If True, allow user params to override subclass-defined protected fields
+    # if True, allow user params to override subclass-defined protected fields
     override_protected_fields: bool = False
-    # Whether to adjust num_frames for multi-GPU friendly splitting (default: True)
+    # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
 
     def _set_output_file_ext(self):
@@ -566,7 +566,7 @@ class SamplingParams:
     def output_file_path(self):
         return os.path.join(self.output_path, self.output_file_name)
 
-    def _merge_with_user_params(self, user_params):
+    def _merge_with_user_params(self, user_params: "SamplingParams"):
         """
         Merges parameters from a user-provided SamplingParams object.
 
@@ -582,10 +582,9 @@ class SamplingParams:
         # user is not allowed to modify any param defined in the SamplingParams subclass
         subclass_defined_fields = set(type(self).__annotations__.keys())
 
-        # Global switch: if True, allow overriding protected fields
+        # global switch: if True, allow overriding protected fields
         allow_override_protected = bool(
-            getattr(user_params, "override_protected_fields", False)
-            or getattr(self, "override_protected_fields", False)
+            user_params.override_protected_fields or self.override_protected_fields
         )
 
         # Compare against current instance to avoid constructing a default instance
@@ -604,7 +603,9 @@ class SamplingParams:
                 if field_name != "output_file_name"
                 else user_params.output_file_path is not None
             )
-            if is_user_modified and (allow_override_protected or field_name not in subclass_defined_fields):
+            if is_user_modified and (
+                allow_override_protected or field_name not in subclass_defined_fields
+            ):
                 if hasattr(self, field_name):
                     setattr(self, field_name, user_value)
 

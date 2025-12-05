@@ -8,8 +8,8 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
-import logging
 import dataclasses
+import logging
 
 # Suppress verbose logging from imageio, which is triggered when saving images.
 logging.getLogger("imageio").setLevel(logging.WARNING)
@@ -24,7 +24,6 @@ from sglang.multimodal_gen.utils import shallow_asdict
 logger = init_logger(__name__)
 
 
- 
 def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
