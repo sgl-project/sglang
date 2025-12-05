@@ -194,6 +194,68 @@ impl QwenVLProcessorBase {
         Ok((h_bar, w_bar))
     }
 
+    /// Smart resize with explicit min/max pixel bounds.
+    ///
+    /// This allows callers to override the processor's default bounds with
+    /// values from a PreProcessorConfig. If min_pixels or max_pixels is None,
+    /// falls back to the processor's defaults.
+    pub fn smart_resize_with_bounds(
+        &self,
+        height: usize,
+        width: usize,
+        min_pixels: Option<usize>,
+        max_pixels: Option<usize>,
+    ) -> Result<(usize, usize), TransformError> {
+        let factor = self.get_factor();
+        let min_px = min_pixels.unwrap_or(self.config.min_pixels);
+        let max_px = max_pixels.unwrap_or(self.config.max_pixels);
+
+        // Validate minimum dimensions
+        if height < factor || width < factor {
+            return Err(TransformError::InvalidShape {
+                expected: format!("dimensions >= {} (patch_size * merge_size)", factor),
+                actual: vec![height, width],
+            });
+        }
+
+        // Validate aspect ratio
+        let max_dim = height.max(width) as f64;
+        let min_dim = height.min(width) as f64;
+        let aspect_ratio = max_dim / min_dim;
+        if aspect_ratio > 200.0 {
+            return Err(TransformError::InvalidShape {
+                expected: "aspect ratio < 200:1".to_string(),
+                actual: vec![height, width],
+            });
+        }
+
+        // Round to nearest factor multiple using Python-compatible rounding
+        let mut h_bar = round_half_to_even(height as f64 / factor as f64) as usize * factor;
+        let mut w_bar = round_half_to_even(width as f64 / factor as f64) as usize * factor;
+
+        // Ensure minimum size
+        h_bar = h_bar.max(factor);
+        w_bar = w_bar.max(factor);
+
+        // Scale down if exceeding max_pixels
+        if h_bar * w_bar > max_px {
+            let beta = ((height * width) as f64 / max_px as f64).sqrt();
+            h_bar = ((height as f64 / beta / factor as f64).floor() as usize) * factor;
+            w_bar = ((width as f64 / beta / factor as f64).floor() as usize) * factor;
+            // Ensure minimum size after scaling down
+            h_bar = h_bar.max(factor);
+            w_bar = w_bar.max(factor);
+        }
+        // Scale up if below min_pixels
+        else if h_bar * w_bar < min_px {
+            let beta = (min_px as f64 / (height * width) as f64).sqrt();
+            h_bar = ((height as f64 * beta / factor as f64).ceil() as usize) * factor;
+            w_bar = ((width as f64 * beta / factor as f64).ceil() as usize) * factor;
+        }
+
+        Ok((h_bar, w_bar))
+    }
+
     /// Calculate the grid dimensions (T, H, W) for an image.
     ///
     /// For single images, T=1. For video, T = num_frames / temporal_patch_size.
@@ -350,10 +412,16 @@ impl ImagePreProcessor for QwenVLProcessorBase {
         let image_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
 
         // First pass: calculate target dimensions for each image
+        // Use config's min/max pixels if provided, otherwise use processor defaults
         let mut target_sizes = Vec::with_capacity(images.len());
         for image in images {
             let (w, h) = image.dimensions();
-            let (new_h, new_w) = self.smart_resize(h as usize, w as usize)?;
+            let (new_h, new_w) = self.smart_resize_with_bounds(
+                h as usize,
+                w as usize,
+                config.min_pixels,
+                config.max_pixels,
+            )?;
             target_sizes.push((new_h, new_w));
         }
 
@@ -362,8 +430,29 @@ impl ImagePreProcessor for QwenVLProcessorBase {
         let max_width = target_sizes.iter().map(|(_, w)| *w).max().unwrap_or(0);
 
         // Process each image with uniform max dimensions
-        let mean = config.get_image_mean();
-        let std = config.get_image_std();
+        // Use processor's default mean/std if config doesn't specify them
+        let mean = config
+            .image_mean
+            .as_ref()
+            .and_then(|v| {
+                if v.len() >= 3 {
+                    Some([v[0], v[1], v[2]])
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(self.config.mean);
+        let std = config
+            .image_std
+            .as_ref()
+            .and_then(|v| {
+                if v.len() >= 3 {
+                    Some([v[0], v[1], v[2]])
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(self.config.std);
         let filter = pil_to_filter(config.resampling);
 
         let mut tensors = Vec::with_capacity(images.len());

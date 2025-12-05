@@ -322,6 +322,9 @@ impl ImageProcessorRegistry {
     /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
     /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
+    /// - `phi-4` -> Phi4VisionProcessor (HD transform with 448x448 tiles)
+    /// - `llama-4` -> Llama4VisionProcessor (tile-based with global tile)
+    /// - `pixtral` / `mistral` -> PixtralProcessor (CLIP-based dynamic resolution)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
 
@@ -372,6 +375,16 @@ impl ImageProcessorRegistry {
             Box::new(super::processors::Qwen2VLProcessor::new()),
         );
 
+        // Register Phi4-Vision first (more specific than phi3)
+        registry.register(
+            "phi-4",
+            Box::new(super::processors::Phi4VisionProcessor::new()),
+        );
+        registry.register(
+            "phi4",
+            Box::new(super::processors::Phi4VisionProcessor::new()),
+        );
+
         // Register Phi3-Vision
         registry.register(
             "phi-3-vision",
@@ -380,6 +393,30 @@ impl ImageProcessorRegistry {
         registry.register(
             "phi3-vision",
             Box::new(super::processors::Phi3VisionProcessor::new()),
+        );
+
+        // Register LLaMA 4 Vision
+        registry.register(
+            "llama-4",
+            Box::new(super::processors::Llama4VisionProcessor::new()),
+        );
+        registry.register(
+            "llama4",
+            Box::new(super::processors::Llama4VisionProcessor::new()),
+        );
+        registry.register(
+            "llama_4",
+            Box::new(super::processors::Llama4VisionProcessor::new()),
+        );
+
+        // Register Pixtral/Mistral3 Vision
+        registry.register(
+            "pixtral",
+            Box::new(super::processors::PixtralProcessor::new()),
+        );
+        registry.register(
+            "mistral-small-3",
+            Box::new(super::processors::PixtralProcessor::new()),
         );
 
         registry
@@ -466,9 +503,38 @@ mod tests {
         assert!(registry.has_processor("llava-hf/llava-v1.6-mistral-7b-hf"));
         assert!(registry.has_processor("lmms-lab/llava-next-interleave-qwen-7b"));
 
+        // Should find Phi4 processor
+        assert!(registry.has_processor("microsoft/phi-4-vision"));
+        assert!(registry.has_processor("phi4-7b"));
+
+        // Should find Phi3 processor
+        assert!(registry.has_processor("microsoft/phi-3-vision-128k-instruct"));
+
+        // Should find Qwen processors
+        assert!(registry.has_processor("Qwen/Qwen2-VL-7B-Instruct"));
+        assert!(registry.has_processor("Qwen/Qwen2.5-VL-7B-Instruct"));
+        assert!(registry.has_processor("Qwen/Qwen3-VL-7B-Instruct"));
+
+        // Should find LLaMA 4 Vision processor
+        assert!(registry.has_processor("meta-llama/Llama-4-Scout-17B"));
+        assert!(registry.has_processor("llama4-vision"));
+
+        // Should find Pixtral/Mistral3 processor
+        assert!(registry.has_processor("mistralai/Pixtral-12B-2409"));
+        assert!(registry.has_processor("mistral-small-3"));
+
         // Get the processor and check model name
         let processor = registry.find("llava-hf/llava-1.5-7b-hf").unwrap();
         assert_eq!(processor.model_name(), "llava");
+
+        let phi4 = registry.find("microsoft/phi-4-vision").unwrap();
+        assert_eq!(phi4.model_name(), "phi4-vision");
+
+        let llama4 = registry.find("llama4-vision").unwrap();
+        assert_eq!(llama4.model_name(), "llama4-vision");
+
+        let pixtral = registry.find("pixtral-12b").unwrap();
+        assert_eq!(pixtral.model_name(), "pixtral");
     }
 
     #[test]

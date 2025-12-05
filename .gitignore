@@ -242,6 +242,7 @@ Cargo.lock
 
 # Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
 sgl-router/tests/fixtures/golden/
+sgl-router/tests/fixtures/golden_pipeline/
 
 lmms-eval
 

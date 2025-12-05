@@ -35,11 +35,11 @@ pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 /// CLIP normalization std values used by Qwen2-VL models.
 pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
-/// Default minimum pixels (256 * 28 * 28 = 200,704)
-pub const DEFAULT_MIN_PIXELS: usize = 256 * 28 * 28;
+/// Default minimum pixels (4 * 28 * 28 = 3,136) - matches SGLang/HuggingFace
+pub const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
 
-/// Default maximum pixels (1280 * 28 * 28 = 1,003,520)
-pub const DEFAULT_MAX_PIXELS: usize = 1280 * 28 * 28;
+/// Default maximum pixels (16384 * 28 * 28 = 12,845,056) - matches SGLang/HuggingFace
+pub const DEFAULT_MAX_PIXELS: usize = 16384 * 28 * 28;
 
 /// Default patch size
 pub const DEFAULT_PATCH_SIZE: usize = 14;

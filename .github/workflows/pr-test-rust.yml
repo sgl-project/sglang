@@ -250,6 +250,18 @@ jobs:
         run: |
           sudo --preserve-env=PATH bash scripts/ci/ci_install_dependency.sh
 
+      - name: Generate pipeline golden outputs
+        run: |
+          cd sgl-router
+          python3 scripts/generate_pipeline_golden.py
+
+      - name: Run Pipeline Golden Tests
+        run: |
+          cd sgl-router
+          source "$HOME/.cargo/env"
+          export RUSTC_WRAPPER=sccache
+          cargo test --test pipeline_golden_tests -- --ignored
+
       - name: Setup Oracle Instant Client
         run: |
           sudo apt-get install -y unzip
