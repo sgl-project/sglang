@@ -71,12 +71,13 @@ inline void pack_vnni_Nx32(
     bool convert_v) {
   __m512i vinputs[16];
   int n = 0;
+  const __m512 vexp = _mm512_castsi512_ps(_mm512_set1_epi32(kFP8_BIAS));
   for (; n < N; ++n) {
     index_t index = ind[n];
-    __m512 scale = _mm512_set1_ps(src_scale[index]);
+    const __m512 scale = _mm512_mul_ps(_mm512_set1_ps(src_scale[index]), vexp);
     __m512i s8 = _mm512_loadu_si512(src + ind[n] * ld_src);
     __m256i s8_0 = _mm512_extracti32x8_epi32(s8, 0);
-    __m512bh bf16_0 = CVT_FP8_TO_BF16(s8_0);
+    __m512bh bf16_0 = CVT_FP8_TO_BF16_EXT(s8_0);
     __m512 f_lo = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 0));
     __m512 f_hi = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32((__m512i)bf16_0, 1));
     f_lo = _mm512_mul_ps(f_lo, scale);
