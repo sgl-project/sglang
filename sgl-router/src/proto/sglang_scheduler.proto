@@ -427,6 +427,7 @@ message GetModelInfoResponse {
   int32 pad_token_id = 12;
   int32 bos_token_id = 13;
   int32 max_req_input_len = 14;
+  repeated string architectures = 15;
 }
 
 // Get server information
