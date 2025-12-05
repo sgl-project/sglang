@@ -31,8 +31,8 @@ DBCache controls block-level caching behavior:
 |-----------|---------------------------|---------|------------------------------------------|
 | Fn        | `SGLANG_CACHE_DIT_FN`     | 1       | Number of first blocks to always compute |
 | Bn        | `SGLANG_CACHE_DIT_BN`     | 0       | Number of last blocks to always compute  |
-| W         | `SGLANG_CACHE_DIT_WARMUP` | 8       | Warmup steps before caching starts       |
-| R         | `SGLANG_CACHE_DIT_RDT`    | 0.35    | Residual difference threshold            |
+| W         | `SGLANG_CACHE_DIT_WARMUP` | 4       | Warmup steps before caching starts       |
+| R         | `SGLANG_CACHE_DIT_RDT`    | 0.24    | Residual difference threshold            |
 | MC        | `SGLANG_CACHE_DIT_MC`     | 3       | Maximum continuous cached steps          |
 
 ### TaylorSeer Configuration
@@ -41,12 +41,13 @@ TaylorSeer improves caching accuracy using Taylor expansion:
 
 | Parameter | Env Variable                  | Default | Description                     |
 |-----------|-------------------------------|---------|---------------------------------|
-| Enable    | `SGLANG_CACHE_DIT_TAYLORSEER` | true    | Enable TaylorSeer calibrator    |
+| Enable    | `SGLANG_CACHE_DIT_TAYLORSEER` | false   | Enable TaylorSeer calibrator    |
 | Order     | `SGLANG_CACHE_DIT_TS_ORDER`   | 1       | Taylor expansion order (1 or 2) |
 
 ### Combined Configuration Example
 
-DBCache and TaylorSeer are complementary strategies that work together, you can configure both sets of parameters simultaneously:
+DBCache and TaylorSeer are complementary strategies that work together, you can configure both sets of parameters
+simultaneously:
 
 ```bash
 SGLANG_CACHE_DIT_ENABLED=true \
@@ -110,20 +111,20 @@ sglang generate --model-path Qwen/Qwen-Image \
 
 All Cache-DiT parameters can be set via the following environment variables:
 
-| Environment Variable                | Default   | Description                              |
-|-------------------------------------|-----------|------------------------------------------|
-| `SGLANG_CACHE_DIT_ENABLED`          | `false`   | Enable Cache-DiT acceleration            |
-| `SGLANG_CACHE_DIT_FN`               | `1`       | First N blocks to always compute         |
-| `SGLANG_CACHE_DIT_BN`               | `0`       | Last N blocks to always compute          |
-| `SGLANG_CACHE_DIT_WARMUP`           | `8`       | Warmup steps before caching              |
-| `SGLANG_CACHE_DIT_RDT`              | `0.35`    | Residual difference threshold            |
-| `SGLANG_CACHE_DIT_MC`               | `3`       | Max continuous cached steps              |
-| `SGLANG_CACHE_DIT_TAYLORSEER`       | `true`    | Enable TaylorSeer calibrator             |
-| `SGLANG_CACHE_DIT_TS_ORDER`         | `1`       | TaylorSeer order (1 or 2)                |
-| `SGLANG_CACHE_DIT_SCM_PRESET`       | `none`    | SCM preset (none/slow/medium/fast/ultra) |
-| `SGLANG_CACHE_DIT_SCM_POLICY`       | `dynamic` | SCM caching policy                       |
-| `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | not set   | Custom SCM compute bins                  |
-| `SGLANG_CACHE_DIT_SCM_CACHE_BINS`   | not set   | Custom SCM cache bins                    |
+| Environment Variable                | Default | Description                              |
+|-------------------------------------|---------|------------------------------------------|
+| `SGLANG_CACHE_DIT_ENABLED`          | false   | Enable Cache-DiT acceleration            |
+| `SGLANG_CACHE_DIT_FN`               | 1       | First N blocks to always compute         |
+| `SGLANG_CACHE_DIT_BN`               | 0       | Last N blocks to always compute          |
+| `SGLANG_CACHE_DIT_WARMUP`           | 4       | Warmup steps before caching              |
+| `SGLANG_CACHE_DIT_RDT`              | 0.24    | Residual difference threshold            |
+| `SGLANG_CACHE_DIT_MC`               | 3       | Max continuous cached steps              |
+| `SGLANG_CACHE_DIT_TAYLORSEER`       | false   | Enable TaylorSeer calibrator             |
+| `SGLANG_CACHE_DIT_TS_ORDER`         | 1       | TaylorSeer order (1 or 2)                |
+| `SGLANG_CACHE_DIT_SCM_PRESET`       | none    | SCM preset (none/slow/medium/fast/ultra) |
+| `SGLANG_CACHE_DIT_SCM_POLICY`       | dynamic | SCM caching policy                       |
+| `SGLANG_CACHE_DIT_SCM_COMPUTE_BINS` | not set | Custom SCM compute bins                  |
+| `SGLANG_CACHE_DIT_SCM_CACHE_BINS`   | not set | Custom SCM cache bins                    |
 
 ## Supported Models
 
