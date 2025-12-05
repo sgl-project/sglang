@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
@@ -109,173 +108,109 @@ def _load_benchmark_file(file_path: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-def compare_benchmarks(file_paths: List[str], output_format: str = "markdown"):
+def compare_benchmarks(
+    baseline_path: str, new_path: str, output_format: str = "markdown"
+):
     """
-    Compares benchmark JSON files and prints a report.
-    First file is baseline, others are compared against it.
+    Compares two benchmark JSON files and prints a report.
     """
-    if len(file_paths) < 2:
-        print("Error: Need at least 2 files to compare.")
-        return
-
     try:
-        data_list = [_load_benchmark_file(f) for f in file_paths]
+        base_data = _load_benchmark_file(baseline_path)
+        new_data = _load_benchmark_file(new_path)
     except Exception as e:
         print(f"Error loading benchmark files: {e}")
         return
 
-    base_data = data_list[0]
-    others_data = data_list[1:]
-
-    # Use filenames as labels if multiple comparisons, else just "New"
-    other_labels = [os.path.basename(p) for p in file_paths[1:]]
-
-    # --- E2E Summary ---
     base_e2e = base_data.get("total_duration_ms", 0)
+    new_e2e = new_data.get("total_duration_ms", 0)
 
-    # --- Stage Breakdown Pre-calculation ---
+    diff_ms, diff_pct = calculate_diff(base_e2e, new_e2e)
+
+    if diff_pct < -2.0:
+        status = "✅"
+    elif diff_pct > 2.0:
+        status = "❌"
+    else:
+        status = ""
+
+    # --- Stage Breakdown ---
     base_durations, base_order, base_counts = consolidate_steps(
         base_data.get("steps", [])
     )
+    new_durations, new_order, new_counts = consolidate_steps(new_data.get("steps", []))
 
-    others_processed = []
-    for d in others_data:
-        dur, order, counts = consolidate_steps(d.get("steps", []))
-        others_processed.append((dur, order, counts))
-
-    # Merge orders: Start with last New order (likely most updated), then others, then Base
-    combined_order = []
-    # Collect all unique stages maintaining order from newest to baseline
-    for _, order, _ in reversed(others_processed):
-        for name in order:
-            if name not in combined_order:
-                combined_order.append(name)
+    # Merge orders: Start with New order (execution order), append any missing from Base
+    combined_order = list(new_order)
     for name in base_order:
         if name not in combined_order:
             combined_order.append(name)
 
+    stage_rows = []
+    for stage in combined_order:
+        b_val = base_durations.get(stage, 0.0)
+        n_val = new_durations.get(stage, 0.0)
+        b_count = base_counts.get(stage, 1)
+        n_count = new_counts.get(stage, 1)
+
+        s_diff, s_pct = calculate_diff(b_val, n_val)
+
+        # Format count string if aggregated
+        count_str = ""
+        if stage == "Denoising Loop":
+            count_str = (
+                f" ({n_count} steps)"
+                if n_count == b_count
+                else f" ({b_count}->{n_count} steps)"
+            )
+
+        # filter noise: show if diff is > 0.5ms OR if it's a major stage (like Denoising Loop)
+        # always show Denoising Loop or stages with significant duration/diff
+        stage_rows.append((stage + count_str, b_val, n_val, s_diff, s_pct))
+
     if output_format == "markdown":
         print("### Performance Comparison Report\n")
 
-        # --- MODE 1: Single Comparison (Detailed) ---
-        if len(others_data) == 1:
-            new_data = others_data[0]
-            new_e2e = new_data.get("total_duration_ms", 0)
-            diff_ms, diff_pct = calculate_diff(base_e2e, new_e2e)
-
-            if diff_pct < -2.0:
-                status = "✅"
-            elif diff_pct > 2.0:
-                status = "❌"
-            else:
-                status = ""
-
-            print("#### 1. High-level Summary")
-            print("| Metric | Baseline | New | Diff | Status |")
-            print("| :--- | :--- | :--- | :--- | :--- |")
-            print(
-                f"| **E2E Latency** | {base_e2e:.2f} ms | {new_e2e:.2f} ms | **{diff_ms:+.2f} ms ({diff_pct:+.1f}%)** | {status} |"
-            )
-            print(
-                f"| **Throughput** | {1000 / base_e2e if base_e2e else 0:.2f} req/s | {1000 / new_e2e if new_e2e else 0:.2f} req/s | - | - |"
-            )
-            print("\n")
-
-            print("#### 2. Stage Breakdown")
-            print(
-                "| Stage Name | Baseline (ms) | New (ms) | Diff (ms) | Diff (%) | Status |"
-            )
-            print("| :--- | :--- | :--- | :--- | :--- | :--- |")
-
-            new_durations, _, new_counts = others_processed[0]
-
-            for stage in combined_order:
-                b_val = base_durations.get(stage, 0.0)
-                n_val = new_durations.get(stage, 0.0)
-                b_count = base_counts.get(stage, 1)
-                n_count = new_counts.get(stage, 1)
-
-                s_diff, s_pct = calculate_diff(b_val, n_val)
-
-                count_str = ""
-                if stage == "Denoising Loop":
-                    count_str = (
-                        f" ({n_count} steps)"
-                        if n_count == b_count
-                        else f" ({b_count}->{n_count} steps)"
-                    )
-
-                status_emoji = get_perf_status_emoji(b_val, n_val)
-                print(
-                    f"| {stage}{count_str} | {b_val:.2f} | {n_val:.2f} | {s_diff:+.2f} | {s_pct:+.1f}% | {status_emoji} |"
-                )
-
-        # --- MODE 2: Multi Comparison (Compact) ---
-        else:
-            print("#### 1. High-level Summary")
-            # Header
-            header = "| Metric | Baseline | " + " | ".join(other_labels) + " |"
-            sep = "| :--- | :--- | " + " | ".join([":---"] * len(other_labels)) + " |"
-            print(header)
-            print(sep)
-
-            # E2E Row
-            row_e2e = f"| **E2E Latency** | {base_e2e:.2f} ms |"
-            for i, d in enumerate(others_data):
-                val = d.get("total_duration_ms", 0)
-                diff_ms, diff_pct = calculate_diff(base_e2e, val)
-
-                if diff_pct < -2.0:
-                    status = "✅"
-                elif diff_pct > 2.0:
-                    status = "❌"
-                else:
-                    status = ""  # or ⚪️
-
-                row_e2e += f" {val:.2f} ms ({diff_pct:+.1f}%) {status} |"
-            print(row_e2e)
-            print("\n")
-
-            print("#### 2. Stage Breakdown")
-            # Header: Stage | Baseline | Label1 | Label2 ...
-            header = "| Stage Name | Baseline | " + " | ".join(other_labels) + " |"
-            sep = "| :--- | :--- | " + " | ".join([":---"] * len(other_labels)) + " |"
-            print(header)
-            print(sep)
-
-            for stage in combined_order:
-                b_val = base_durations.get(stage, 0.0)
-                row_str = f"| {stage} | {b_val:.2f} |"
-
-                for i, (n_durations, _, n_counts) in enumerate(others_processed):
-                    n_val = n_durations.get(stage, 0.0)
-                    _, s_pct = calculate_diff(b_val, n_val)
-                    status_emoji = get_perf_status_emoji(b_val, n_val)
-
-                    row_str += f" {n_val:.2f} ({s_pct:+.1f}%) {status_emoji} |"
-                print(row_str)
-
+        # Summary Table
+        print("#### 1. High-level Summary")
+        print("| Metric | Baseline | New | Diff | Status |")
+        print("| :--- | :--- | :--- | :--- | :--- |")
+        print(
+            f"| **E2E Latency** | {base_e2e:.2f} ms | {new_e2e:.2f} ms | **{diff_ms:+.2f} ms ({diff_pct:+.1f}%)** | {status} |"
+        )
+        print(
+            f"| **Throughput** | {1000 / base_e2e if base_e2e else 0:.2f} req/s | {1000 / new_e2e if new_e2e else 0:.2f} req/s | - | - |"
+        )
         print("\n")
+
+        # Detailed Breakdown
+        print("#### 2. Stage Breakdown")
+        print(
+            "| Stage Name | Baseline (ms) | New (ms) | Diff (ms) | Diff (%) | Status |"
+        )
+        print("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for name, b, n, d, p in stage_rows:
+            name_str = name
+            status_emoji = get_perf_status_emoji(b, n)
+            print(
+                f"| {name_str} | {b:.2f} | {n:.2f} | {d:+.2f} | {p:+.1f}% | {status_emoji} |"
+            )
+        print("\n")
+
         # Metadata
         print("<details>")
         print("<summary>Metadata</summary>\n")
         print(f"- Baseline Commit: `{base_data.get('commit_hash', 'N/A')}`")
-        for i, d in enumerate(others_data):
-            label = "New" if len(others_data) == 1 else other_labels[i]
-            print(f"- {label} Commit: `{d.get('commit_hash', 'N/A')}`")
+        print(f"- New Commit: `{new_data.get('commit_hash', 'N/A')}`")
         print(f"- Timestamp: {datetime.now().isoformat()}")
         print("</details>")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compare sglang-diffusion performance JSON files."
+        description="Compare two sglang-diffusion performance JSON files."
     )
-    parser.add_argument(
-        "files",
-        nargs="+",
-        help="List of JSON files. First is baseline, others are compared against it.",
-    )
+    parser.add_argument("baseline", help="Path to the baseline JSON file")
+    parser.add_argument("new", help="Path to the new JSON file")
     args = parser.parse_args()
 
-    compare_benchmarks(args.files)
+    compare_benchmarks(args.baseline, args.new)
