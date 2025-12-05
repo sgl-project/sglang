@@ -5,7 +5,7 @@
 //!
 //! Workflow order:
 //! 1. DetectConnectionMode - Probe HTTP and gRPC to determine connection mode
-//! 2. DiscoverMetadata - Fetch metadata from /get_server_info or gRPC
+//! 2. DiscoverMetadata - Fetch metadata from /server_info or gRPC
 //! 3. DiscoverDPInfo - Fetch DP (Data Parallel) information (only for DP-aware workers)
 //! 4. CreateWorker - Build worker object(s) with merged config + metadata
 //! 5. RegisterWorker - Register worker(s) in registry
@@ -39,7 +39,7 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .expect("Failed to create HTTP client")
 });
 
-/// Server information returned from /get_server_info endpoint
+/// Server information returned from /server_info endpoint
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ServerInfo {
     #[serde(alias = "model")]
@@ -78,7 +78,7 @@ fn parse_server_info(json: Value) -> Result<ServerInfo, String> {
     serde_json::from_value(json).map_err(|e| format!("Failed to parse server info: {}", e))
 }
 
-/// Get server info from /get_server_info endpoint
+/// Get server info from /server_info endpoint
 async fn get_server_info(url: &str, api_key: Option<&str>) -> Result<ServerInfo, String> {
     let base_url = url.trim_end_matches('/');
     let server_info_url = format!("{}/server_info", base_url);
@@ -362,7 +362,7 @@ impl StepExecutor for DiscoverMetadataStep {
             ConnectionMode::Http => {
                 let mut labels = HashMap::new();
 
-                // Fetch from /get_server_info for server-related metadata
+                // Fetch from /server_info for server-related metadata
                 if let Ok(server_info) =
                     get_server_info(&config.url, config.api_key.as_deref()).await
                 {
