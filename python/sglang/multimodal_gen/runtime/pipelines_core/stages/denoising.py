@@ -493,8 +493,8 @@ class DenoisingStage(PipelineStage):
             self._maybe_enable_cache_dit(batch.num_inference_steps)
 
             if self.server_args.enable_torch_compile and not self.transformer_compiled_func:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
+                self.transformer_compiled_func = torch.compile(
+                    self.transformer, mode="max-autotune", fullgraph=self.full_graph
                 )
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
@@ -585,7 +585,7 @@ class DenoisingStage(PipelineStage):
         )
 
         image_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer_compiled_func if server_args.enable_torch_compile else self.transformer.forward,
+            self.transformer.forward,
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
@@ -594,7 +594,7 @@ class DenoisingStage(PipelineStage):
         )
 
         pos_cond_kwargs = self.prepare_extra_func_kwargs(
-            self.transformer_compiled_func if server_args.enable_torch_compile else self.transformer.forward,
+            self.transformer.forward,
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
@@ -609,7 +609,7 @@ class DenoisingStage(PipelineStage):
 
         if batch.do_classifier_free_guidance:
             neg_cond_kwargs = self.prepare_extra_func_kwargs(
-                self.transformer_compiled_func if server_args.enable_torch_compile else self.transformer.forward,
+                self.transformer.forward,
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
@@ -834,13 +834,25 @@ class DenoisingStage(PipelineStage):
     ):
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
-            current_model = self.transformer
-            model_to_offload = self.transformer_2
+            if server_args.enable_torch_compile and not self.transformer_compiled_func:
+                current_model = self.transformer_compiled_func
+            else:
+                current_model = self.transformer
+            if server_args.enable_torch_compile and not self.transformer_2_compiled_func:
+                model_to_offload = self.transformer_2_compiled_func
+            else:
+                model_to_offload = self.transformer_2
             current_guidance_scale = batch.guidance_scale
         else:
             # Low-noise stage
-            current_model = self.transformer_2
-            model_to_offload = self.transformer
+            if server_args.enable_torch_compile and not self.transformer_2_compiled_func:
+                current_model = self.transformer_2_compiled_func
+            else:
+                current_model = self.transformer_2
+            if server_args.enable_torch_compile and not self.transformer_compiled_func:
+                model_to_offload = self.transformer_compiled_func
+            else:
+                model_to_offload = self.transformer
             current_guidance_scale = batch.guidance_scale_2
 
         self._manage_device_placement(current_model, model_to_offload, server_args)
