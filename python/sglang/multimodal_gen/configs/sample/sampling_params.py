@@ -101,6 +101,7 @@ class SamplingParams:
     # Batch info
     num_outputs_per_prompt: int = 1
     seed: int = 1024
+    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Original dimensions (before VAE scaling)
     num_frames: int = 125
@@ -299,14 +300,7 @@ class SamplingParams:
         from sglang.multimodal_gen.registry import get_model_info
 
         model_info = get_model_info(model_path)
-        if model_info is not None:
-            sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
-        else:
-            logger.warning(
-                "Couldn't find an optimal sampling param for %s. Using the default sampling param.",
-                model_path,
-            )
-            sampling_params = cls(**kwargs)
+        sampling_params: SamplingParams = model_info.sampling_param_cls(**kwargs)
         return sampling_params
 
     @staticmethod
@@ -399,6 +393,13 @@ class SamplingParams:
             type=int,
             default=SamplingParams.seed,
             help="Random seed for generation",
+        )
+        parser.add_argument(
+            "--generator-device",
+            type=str,
+            default=SamplingParams.generator_device,
+            choices=["cuda", "cpu"],
+            help="Device for random generator (cuda or cpu). Default: cuda",
         )
         parser.add_argument(
             "--num-frames",

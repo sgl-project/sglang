@@ -53,9 +53,19 @@ class InputValidationStage(PipelineStage):
         assert seed is not None
         seeds = [seed + i for i in range(num_videos_per_prompt)]
         batch.seeds = seeds
-        # Peiyuan: using GPU seed will cause A100 and H100 to generate different results...
-        # FIXME: the generator's in latent preparation stage seems to be different from seeds
-        batch.generator = [torch.Generator("cpu").manual_seed(seed) for seed in seeds]
+
+        # Create generators based on generator_device parameter
+        # Note: This will overwrite any existing batch.generator
+        generator_device = batch.generator_device
+
+        if generator_device == "cpu":
+            device_str = "cpu"
+        else:
+            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+
+        batch.generator = [
+            torch.Generator(device_str).manual_seed(seed) for seed in seeds
+        ]
 
     def preprocess_condition_image(
         self,
@@ -93,8 +103,8 @@ class InputValidationStage(PipelineStage):
 
             # adjust output image size
             calculated_width, calculated_height = calculated_size
-            width = calculated_width if batch.width_not_provided else batch.width
-            height = calculated_height if batch.height_not_provided else batch.height
+            width = batch.width or calculated_width
+            height = batch.height or calculated_height
             multiple_of = (
                 server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
             )
@@ -182,16 +192,6 @@ class InputValidationStage(PipelineStage):
                 "`negative_prompt_embeds` must be provided"
             )
 
-        # Validate height and width
-        if batch.height is None or batch.width is None:
-            raise ValueError(
-                "Height and width must be provided. Please set `height` and `width`."
-            )
-        if batch.height % 8 != 0 or batch.width % 8 != 0:
-            raise ValueError(
-                f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
-            )
-
         # Validate number of inference steps
         if batch.num_inference_steps <= 0:
             raise ValueError(
@@ -234,8 +234,7 @@ class InputValidationStage(PipelineStage):
             lambda _: V.string_or_list_strings(batch.prompt)
             or V.list_not_empty(batch.prompt_embeds),
         )
-        result.add_check("height", batch.height, V.positive_int)
-        result.add_check("width", batch.width, V.positive_int)
+
         result.add_check(
             "num_inference_steps", batch.num_inference_steps, V.positive_int
         )
@@ -249,6 +248,13 @@ class InputValidationStage(PipelineStage):
     def verify_output(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify input validation stage outputs."""
         result = VerificationResult()
+        result.add_check("height", batch.height, V.positive_int)
+        result.add_check("width", batch.width, V.positive_int)
+        # Validate height and width
+        if batch.height % 8 != 0 or batch.width % 8 != 0:
+            raise ValueError(
+                f"Height and width must be divisible by 8 but are {batch.height} and {batch.width}."
+            )
         result.add_check("seeds", batch.seeds, V.list_not_empty)
         result.add_check("generator", batch.generator, V.generator_or_list_generators)
         return result

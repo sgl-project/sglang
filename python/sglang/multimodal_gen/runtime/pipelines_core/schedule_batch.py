@@ -88,6 +88,7 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
+    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
