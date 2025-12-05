@@ -331,16 +331,21 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
 
+                # Don't pre-allocate arrays until we actually complete a tool call
+                # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
+
                 # Parse current parameters from XML/JSON
                 current_params = self._parse_parameters_from_xml(invoke_content)
                 current_args_json = json.dumps(current_params, ensure_ascii=False)
 
                 # Check if tool call is complete (has closing tag)
                 if is_tool_end:
-                    # Only emit the tool call when it's complete
+                    # Only emit the tool call when it's complete (saw </｜DSML｜invoke>)
+                    # This ensures each function returns at most once
                     calls_for_this_invoke: list[ToolCallItem] = []
 
                     # Check if invoke_content is empty or whitespace only
+                    # If so, skip this tool call entirely (it's likely incomplete or malformed)
                     if not invoke_content.strip():
                         # Remove the incomplete tool call from buffer
                         self._buffer = current_text[invoke_match.end() :]
@@ -357,6 +362,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     )
 
                     # Send parameters as complete JSON
+                    # Always send parameters, even if empty, to maintain consistency
                     calls_for_this_invoke.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -382,7 +388,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
                     # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]
-                    current_text = self._buffer
+                    current_text = self._buffer  # Update for next iteration
 
                     # Add calls for this invoke to all_calls
                     all_calls.extend(calls_for_this_invoke)
@@ -392,10 +398,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self._last_arguments = ""
                     self.current_tool_name_sent = False
 
+                    # Don't pre-allocate arrays for the next tool
+                    # Only allocate when we actually complete a tool call
+                    # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
+
                     # Continue loop to check for more invoke blocks
                     continue
                 else:
                     # Tool call not complete yet, don't return anything
+                    # Wait for more chunks until we see </｜DSML｜invoke>
                     break
 
             # No more invoke blocks found

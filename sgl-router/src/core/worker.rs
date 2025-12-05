@@ -2,7 +2,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, LazyLock,
+        Arc, LazyLock, RwLock as StdRwLock,
     },
     time::{Duration, Instant},
 };
@@ -260,6 +260,18 @@ pub trait Worker: Send + Sync + fmt::Debug {
         &self.metadata().models
     }
 
+    /// Set models for this worker (for lazy discovery).
+    /// Default implementation does nothing - only BasicWorker supports this.
+    fn set_models(&self, _models: Vec<ModelCard>) {
+        // Default: no-op. BasicWorker overrides this.
+    }
+
+    /// Check if models have been discovered for this worker.
+    /// Returns true if models were set via set_models() or if metadata has models.
+    fn has_models_discovered(&self) -> bool {
+        !self.metadata().models.is_empty()
+    }
+
     /// Get or create a gRPC client for this worker
     /// Returns None for HTTP workers, Some(client) for gRPC workers
     async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>>;
@@ -485,6 +497,10 @@ pub struct BasicWorker {
     pub circuit_breaker: CircuitBreaker,
     /// Lazily initialized gRPC client for gRPC workers
     pub grpc_client: Arc<RwLock<Option<Arc<GrpcClient>>>>,
+    /// Runtime-mutable models override (for lazy discovery)
+    /// When set, overrides metadata.models for routing decisions.
+    /// Uses std::sync::RwLock for synchronous access in supports_model().
+    pub models_override: Arc<StdRwLock<Option<Vec<ModelCard>>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -620,6 +636,40 @@ impl Worker for BasicWorker {
 
     fn circuit_breaker(&self) -> &CircuitBreaker {
         &self.circuit_breaker
+    }
+
+    fn supports_model(&self, model_id: &str) -> bool {
+        // Check models_override first (for lazy discovery)
+        if let Ok(guard) = self.models_override.read() {
+            if let Some(ref models) = *guard {
+                // Models were discovered - check if this model is supported
+                return models.iter().any(|m| m.matches(model_id));
+            }
+        }
+        // Fall back to metadata.models (empty = wildcard = supports nothing until discovery)
+        self.metadata.supports_model(model_id)
+    }
+
+    fn set_models(&self, models: Vec<ModelCard>) {
+        if let Ok(mut guard) = self.models_override.write() {
+            tracing::debug!(
+                "Setting {} models for worker {} via lazy discovery",
+                models.len(),
+                self.metadata.url
+            );
+            *guard = Some(models);
+        }
+    }
+
+    fn has_models_discovered(&self) -> bool {
+        // Check if models_override has been set
+        if let Ok(guard) = self.models_override.read() {
+            if guard.is_some() {
+                return true;
+            }
+        }
+        // Fall back to checking metadata.models
+        !self.metadata.models.is_empty()
     }
 
     async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>> {
