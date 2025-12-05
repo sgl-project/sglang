@@ -77,6 +77,21 @@ impl ChatResponseProcessingStage {
             })?
             .clone();
 
+        // Get tokenizer in real time
+        let model_id = ctx.input.model_id.as_deref().unwrap();
+        let tokenizer = ctx
+            .components
+            .tokenizer_registry
+            .get(model_id)
+            .ok_or_else(|| {
+                error!(
+                    function = "ChatPreparationStage::prepare_chat",
+                    model = model_id,
+                    "Tokenizer not found for model"
+                );
+                error::internal_error(format!("Tokenizer not found for model: {}", model_id))
+            })?;
+
         if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
@@ -84,6 +99,7 @@ impl ChatResponseProcessingStage {
                     execution_result,
                     ctx.chat_request_arc(), // Cheap Arc clone (8 bytes)
                     dispatch,
+                    tokenizer,
                 ),
             ));
         }
@@ -107,6 +123,7 @@ impl ChatResponseProcessingStage {
                 execution_result,
                 chat_request,
                 dispatch,
+                tokenizer,
                 stop_decoder,
                 request_logprobs,
             )

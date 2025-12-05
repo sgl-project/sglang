@@ -75,6 +75,22 @@ impl GenerateResponseProcessingStage {
             })?
             .clone();
 
+        // Get model_id from context
+        let model_id = ctx.input.model_id.as_deref().unwrap();
+
+        let tokenizer = ctx
+            .components
+            .tokenizer_registry
+            .get(model_id)
+            .ok_or_else(|| {
+                error!(
+                    function = "GeneratePreparationStage::execute",
+                    model = %model_id,
+                    "Tokenizer not found for model"
+                );
+                error::internal_error(format!("Tokenizer not found for model: {}", model_id))
+            })?;
+
         if is_streaming {
             // Streaming: Use StreamingProcessor and return SSE response (done)
             return Ok(Some(
@@ -82,6 +98,7 @@ impl GenerateResponseProcessingStage {
                     execution_result,
                     ctx.generate_request_arc(), // Cheap Arc clone (8 bytes)
                     dispatch,
+                    tokenizer,
                 ),
             ));
         }
