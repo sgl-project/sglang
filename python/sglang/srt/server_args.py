@@ -1261,7 +1261,6 @@ class ServerArgs:
                 )
                 self.disable_overlap_schedule = True
             if is_sm100_supported():
-                self.attention_backend = "triton"
                 quantization_config = getattr(hf_config, "quantization_config", None)
                 quant_method = (
                     quantization_config.get("quant_method")
@@ -1279,6 +1278,18 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+        elif model_arch in [
+            "NemotronHForCausalLM",
+            "FalconH1ForCausalLM",
+            "JetNemotronForCausalLM",
+            "JetVLMForConditionalGeneration",
+        ]:
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
+                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -1711,9 +1722,13 @@ class ServerArgs:
                     self.speculative_draft_model_path = self.model_path
                     self.speculative_draft_model_revision = self.revision
                 else:
-                    logger.warning(
-                        "DeepSeek MTP does not require setting speculative_draft_model_path."
-                    )
+                    if model_arch not in [
+                        "MistralLarge3ForCausalLM",
+                        "PixtralForConditionalGeneration",
+                    ]:
+                        logger.warning(
+                            "DeepSeek MTP does not require setting speculative_draft_model_path."
+                        )
 
             if self.speculative_num_steps is None:
                 assert (

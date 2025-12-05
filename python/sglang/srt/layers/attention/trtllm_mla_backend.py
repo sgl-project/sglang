@@ -964,7 +964,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Apply llama 4 scaling if provided
         if llama_4_scaling is not None:
-            q *= llama_4_scaling
+            q = q.to(self.q_data_type) * llama_4_scaling
+            q = q.to(self.data_type)
 
         if (
             forward_batch.forward_mode.is_target_verify()

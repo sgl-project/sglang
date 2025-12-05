@@ -66,6 +66,11 @@ MODELS = {
         "processor_class": "Llama4ImageProcessorFast",
         "description": "Tile-based processing with 336x336 tiles and global tile",
     },
+    "pixtral": {
+        "model_id": "mistralai/Pixtral-12B-2409",
+        "processor_class": "PixtralImageProcessor",
+        "description": "Dynamic resolution with CLIP normalization and bicubic resize",
+    },
 }
 
 # Default test images
@@ -547,6 +552,64 @@ def generate_golden_llama4_vision(image_path: str, output_dir: str) -> dict:
     return result
 
 
+def generate_golden_pixtral(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for Pixtral/Mistral3 Vision.
+
+    Pixtral uses dynamic resolution processing:
+    1. If image exceeds longest_edge (default 1024), scale down proportionally
+    2. Resize to dimensions that are multiples of patch_size (default 16)
+    3. Use bicubic interpolation for resize
+    4. Normalize with CLIP mean/std
+
+    Output:
+    - pixel_values: [1, 3, H, W] where H, W are multiples of patch_size
+    - image_sizes: [(H, W)]
+
+    Token count: (H / patch_size) * (W / patch_size)
+    """
+    from transformers import PixtralImageProcessor
+
+    processor = PixtralImageProcessor.from_pretrained("mistral-community/pixtral-12b")
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image
+    outputs = processor(images=image, return_tensors="np")
+    pixel_values = outputs["pixel_values"]
+    image_sizes = outputs.get("image_sizes")
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": processor.to_dict(),
+    }
+
+    if image_sizes is not None:
+        result["image_sizes"] = np.array(image_sizes)
+
+    # Calculate num_tokens from image_sizes
+    if image_sizes is not None:
+        h, w = image_sizes[0]
+        patch_size = getattr(processor, "patch_size", {"height": 16, "width": 16})
+        if isinstance(patch_size, dict):
+            patch_h = patch_size.get("height", 16)
+            patch_w = patch_size.get("width", 16)
+        else:
+            patch_h = patch_w = patch_size
+        num_tokens = (h // patch_h) * (w // patch_w)
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "longest_edge": processor.size.get("longest_edge", 1024),
+        "patch_size": processor.patch_size,
+        "image_mean": processor.image_mean,
+        "image_std": processor.image_std,
+    }
+
+    return result
+
+
 def generate_for_model(model_key: str, image_paths: list, output_dir: str):
     """Generate golden outputs for a specific model."""
     print(f"\nGenerating golden outputs for {model_key}...")
@@ -560,6 +623,7 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
         "phi3_vision": generate_golden_phi3_vision,
         "phi4_vision": generate_golden_phi4_vision,
         "llama4_vision": generate_golden_llama4_vision,
+        "pixtral": generate_golden_pixtral,
     }.get(model_key)
 
     if generator_fn is None:

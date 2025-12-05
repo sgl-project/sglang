@@ -56,7 +56,8 @@ class PixtralProcessor(BaseMultimodalProcessor):
         self.patch_size = self.vision_config.patch_size
 
         self._processor.patch_size = self.patch_size
-        self._processor.spatial_merge_size = self.vision_config.spatial_merge_size
+        if hasattr(self.vision_config, "spatial_merge_size"):
+            self._processor.spatial_merge_size = self.vision_config.spatial_merge_size
 
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=_processor.image_token,
