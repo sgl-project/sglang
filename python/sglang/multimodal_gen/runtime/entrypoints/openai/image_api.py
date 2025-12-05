@@ -7,7 +7,7 @@ import time
 from typing import List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageResponse,
     ImageResponseData,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import IMAGE_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
@@ -123,23 +124,44 @@ async def generations(
     # Run synchronously for images and save to disk
     save_file_path = await process_generation_batch(scheduler_client, batch)
 
+    resp_format = (request.response_format or "b64_json").lower()
+    b64_data = None
+
+    # 1. Read content first if needed (while file exists)
+    if resp_format == "b64_json":
+        with open(save_file_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+    # 2. Upload and Delete local file
+    cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
+    # 3. Update Database
     await IMAGE_STORE.upsert(
         request_id,
         {
             "id": request_id,
             "created_at": int(time.time()),
-            "file_path": save_file_path,
+            "file_path": None if cloud_url else save_file_path,
+            "url": cloud_url,
         },
     )
 
-    resp_format = (request.response_format or "b64_json").lower()
-    if resp_format == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
+    # 4. Return Response
+    if b64_data:
         return ImageResponse(
             data=[
                 ImageResponseData(
-                    b64_json=b64,
+                    b64_json=b64_data,
+                    revised_prompt=request.prompt,
+                )
+            ]
+        )
+    elif resp_format == "url":
+        final_url = cloud_url or f"/v1/images/{request_id}/content"
+        return ImageResponse(
+            data=[
+                ImageResponseData(
+                    url=final_url,
                     revised_prompt=request.prompt,
                 )
             ]
@@ -147,7 +169,7 @@ async def generations(
     else:
         # Return error, not supported
         raise HTTPException(
-            status_code=400, detail="response_format=url is not supported"
+            status_code=400, detail=f"response_format={resp_format} is not supported"
         )
 
 
@@ -220,27 +242,40 @@ async def edits(
 
     save_file_path = await process_generation_batch(scheduler_client, batch)
 
+    resp_format = (response_format or "b64_json").lower()
+    b64_data = None
+
+    # 1. Read content first if needed (while file exists)
+    if resp_format == "b64_json":
+        with open(save_file_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+
+    # 2. Upload and Delete local file
+    cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
+    # 3. Update Database
     await IMAGE_STORE.upsert(
         request_id,
         {
             "id": request_id,
             "created_at": int(time.time()),
-            "file_path": save_file_path,
+            "file_path": None if cloud_url else save_file_path,
+            "url": cloud_url,
             "input_image_paths": input_paths,  # Store all input image paths
             "num_input_images": len(input_paths),
         },
     )
 
-    # Default to b64_json to align with gpt-image-1 behavior in OpenAI examples
-    if (response_format or "b64_json").lower() == "b64_json":
-        with open(save_file_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
+    # 4. Return Response
+    if b64_data:
         return ImageResponse(
-            data=[ImageResponseData(b64_json=b64, revised_prompt=prompt)]
+            data=[ImageResponseData(b64_json=b64_data, revised_prompt=prompt)]
         )
     else:
-        url = f"/v1/images/{request_id}/content"
-        return ImageResponse(data=[ImageResponseData(url=url, revised_prompt=prompt)])
+        final_url = cloud_url or f"/v1/images/{request_id}/content"
+        return ImageResponse(
+            data=[ImageResponseData(url=final_url, revised_prompt=prompt)]
+        )
 
 
 @router.get("/{image_id}/content")
@@ -250,6 +285,9 @@ async def download_image_content(
     item = await IMAGE_STORE.get(image_id)
     if not item:
         raise HTTPException(status_code=404, detail="Image not found")
+
+    if item.get("url"):
+        return RedirectResponse(item.get("url"))
 
     file_path = item.get("file_path")
     if not file_path or not os.path.exists(file_path):

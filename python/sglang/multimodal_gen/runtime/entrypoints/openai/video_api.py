@@ -16,7 +16,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoListResponse,
     VideoResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.storage import cloud_storage
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import VIDEO_STORE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
@@ -118,10 +119,19 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     from sglang.multimodal_gen.runtime.scheduler_client import scheduler_client
 
     try:
-        await process_generation_batch(scheduler_client, batch)
+        save_file_path = await process_generation_batch(scheduler_client, batch)
+
+        cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
+
         await VIDEO_STORE.update_fields(
             job_id,
-            {"status": "completed", "progress": 100, "completed_at": int(time.time())},
+            {
+                "status": "completed",
+                "progress": 100,
+                "completed_at": int(time.time()),
+                "url": cloud_url,
+                "file_path": save_file_path if not cloud_url else None,
+            },
         )
     except Exception as e:
         logger.error(f"{e}")
@@ -313,6 +323,9 @@ async def download_video_content(
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    if job.get("url"):
+        return RedirectResponse(job.get("url"))
 
     file_path = job.get("file_path")
     if not file_path or not os.path.exists(file_path):
