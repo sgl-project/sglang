@@ -3270,8 +3270,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
-        elif get_moe_expert_parallel_world_size() > 1 and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        elif (
+            get_moe_expert_parallel_world_size() > 1
+            and _is_hip
+            and torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
             disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
         elif disable_reason is None and get_moe_a2a_backend().is_deepep():
