@@ -1,5 +1,5 @@
-from sglang.srt.sparsity2.core.representation_pool import RepresentationPool
-from sglang.srt.sparsity2.core.sparse_coordinator import (
+from sglang.srt.mem_cache.sparsity.core.representation_pool import RepresentationPool
+from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     RequestTrackers,
     SparseConfig,
     SparseCoordinator,

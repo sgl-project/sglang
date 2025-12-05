@@ -109,6 +109,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     is_in_piecewise_cuda_graph,
@@ -117,7 +118,6 @@ from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_lo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.single_batch_overlap import SboFlags
-from sglang.srt.sparsity2 import get_sparse_coordinator
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
@@ -1770,7 +1770,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         topk_indices = None
         if q_lora is not None:
             sparse_coordinator = get_sparse_coordinator()
-            if forward_batch.forward_mode.is_decode() and sparse_coordinator is not None:
+            if (
+                forward_batch.forward_mode.is_decode()
+                and sparse_coordinator is not None
+            ):
                 topk_indices = sparse_coordinator.attention_begin(
                     query=q_nope_out,
                     key=k_nope,

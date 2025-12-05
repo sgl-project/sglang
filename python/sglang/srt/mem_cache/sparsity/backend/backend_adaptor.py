@@ -63,7 +63,7 @@ class FlashAttentionAdaptor(BackendAdaptor):
         layer_id: int,
         **kwargs,
     ) -> Any:
-        from sglang.srt.sparsity2.algorithms.base_algorithm import SparseMode
+        from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import SparseMode
 
         if self.sparse_mode == SparseMode.PAGE_WISE:
             return self._adapt_for_page_wise(

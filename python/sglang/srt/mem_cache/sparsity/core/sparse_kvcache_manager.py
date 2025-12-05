@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.sparsity2.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
+from sglang.srt.mem_cache.sparsity.ops.triton_kernel import invoke_nsa_sparse_diff_kernel
 
 if TYPE_CHECKING:
     pass

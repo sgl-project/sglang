@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from sglang.srt.sparsity2.algorithms.base_algorithm import (
+from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
     SparseMode,
 )

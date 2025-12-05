@@ -6,12 +6,12 @@ import nvtx
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.sparsity2.algorithms.base_algorithm import (
+from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
 )
-from sglang.srt.sparsity2.backend.backend_adaptor import BackendAdaptor
-from sglang.srt.sparsity2.core.representation_pool import RepresentationPool
-from sglang.srt.sparsity2.core.sparse_kvcache_manager import SparseKVCacheManager
+from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
+from sglang.srt.mem_cache.sparsity.core.representation_pool import RepresentationPool
+from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import SparseKVCacheManager
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

@@ -1942,10 +1942,7 @@ class ModelRunner:
             return
 
         try:
-            from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
-                DecodeKVCacheOffloadManager,
-            )
-            from sglang.srt.sparsity2 import create_sparse_coordinator
+            from sglang.srt.mem_cache.sparsity import create_sparse_coordinator
 
             # Get CPU group for offload communication
             if self.server_args.enable_dp_attention:
@@ -2236,7 +2233,7 @@ class ModelRunner:
         ):
             if self.sparse_coordinator is not None:
                 self.sparse_coordinator.forward_begin(forward_batch)
-                
+
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,

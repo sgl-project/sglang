@@ -1,17 +1,17 @@
-from sglang.srt.sparsity2.algorithms import (
+from sglang.srt.mem_cache.sparsity.algorithms import (
     BaseSparseAlgorithm,
     DeepSeekNSAAlgorithm,
     FakeRandomSparseAlgorithm,
     PageMeanPoolingAlgorithm,
     SparseMode,
 )
-from sglang.srt.sparsity2.backend import BackendAdaptor, FlashAttentionAdaptor
-from sglang.srt.sparsity2.core import (
+from sglang.srt.mem_cache.sparsity.backend import BackendAdaptor, FlashAttentionAdaptor
+from sglang.srt.mem_cache.sparsity.core import (
     RepresentationPool,
     SparseConfig,
     SparseCoordinator,
 )
-from sglang.srt.sparsity2.factory import (
+from sglang.srt.mem_cache.sparsity.factory import (
     create_sparse_coordinator,
     get_sparse_coordinator,
     register_sparse_coordinator,

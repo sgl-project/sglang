@@ -11,9 +11,9 @@ import triton.language as tl
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.sparsity import SparseMode, get_sparse_coordinator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.sparsity2 import SparseMode, get_sparse_coordinator
 from sglang.srt.speculative.spec_info import SpecInput
 
 if TYPE_CHECKING:

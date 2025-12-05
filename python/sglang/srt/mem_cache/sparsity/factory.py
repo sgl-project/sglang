@@ -3,20 +3,20 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.sparsity2.algorithms.base_algorithm import (
+from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
     BaseSparseAlgorithm,
     FakeRandomSparseAlgorithm,
     SparseMode,
 )
-from sglang.srt.sparsity2.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
-from sglang.srt.sparsity2.algorithms.page_mean_pooling import PageMeanPoolingAlgorithm
-from sglang.srt.sparsity2.backend.backend_adaptor import (
+from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
+from sglang.srt.mem_cache.sparsity.algorithms.page_mean_pooling import PageMeanPoolingAlgorithm
+from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
     NSABackendAdaptor,
 )
-from sglang.srt.sparsity2.core.sparse_coordinator import SparseConfig, SparseCoordinator
+from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import SparseConfig, SparseCoordinator
 
-from sglang.srt.sparsity2.core.sparse_kvcache_manager import SparseKVCacheManager
+from sglang.srt.mem_cache.sparsity.core.sparse_kvcache_manager import SparseKVCacheManager
 
 logger = logging.getLogger(__name__)
 

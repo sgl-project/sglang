@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
     truncate_kv_cache_after_prefill,
 )
-from sglang.srt.sparsity2 import get_sparse_coordinator
+from sglang.srt.mem_cache.sparsity import get_sparse_coordinator
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
 if TYPE_CHECKING:

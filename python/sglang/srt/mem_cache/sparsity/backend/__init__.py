@@ -1,4 +1,4 @@
-from sglang.srt.sparsity2.backend.backend_adaptor import (
+from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     BackendAdaptor,
     FlashAttentionAdaptor,
     NSABackendAdaptor,
