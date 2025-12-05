@@ -48,6 +48,8 @@ jobs:
 
           RUN echo "=== Aiter version BEFORE uninstall ===" && pip show aiter || true
           RUN pip uninstall -y aiter
+          RUN rm -rf /opt/aiter/aiter/jit/build
+          RUN rm -rf /opt/aiter/aiter/jit/*.so
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
 
