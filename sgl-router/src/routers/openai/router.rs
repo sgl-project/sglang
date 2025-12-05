@@ -22,11 +22,7 @@ use super::{
         ComponentRefs, PayloadState, RequestContext, ResponsesComponents, SharedComponents,
         WorkerSelection,
     },
-    conversations::{
-        create_conversation, create_conversation_items, delete_conversation,
-        delete_conversation_item, get_conversation, get_conversation_item, list_conversation_items,
-        persist_conversation_items, update_conversation,
-    },
+    conversations::persist_conversation_items,
     mcp::{
         ensure_request_mcp_client, execute_tool_loop, prepare_mcp_payload_for_streaming,
         McpLoopConfig,
@@ -34,7 +30,6 @@ use super::{
     provider::ProviderRegistry,
     responses::{mask_tools_as_mcp, patch_streaming_response_json},
     streaming::handle_streaming_response,
-    utils::{apply_provider_headers, extract_auth_header},
 };
 use crate::{
     app_context::AppContext,
@@ -52,6 +47,7 @@ use crate::{
             ResponsesGetParams, ResponsesRequest,
         },
     },
+    routers::header_utils::{apply_provider_headers, extract_auth_header},
 };
 
 pub struct OpenAIRouter {
@@ -1111,8 +1107,16 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         (StatusCode::NOT_IMPLEMENTED, "Rerank not supported").into_response()
     }
 
+    fn router_type(&self) -> &'static str {
+        "openai"
+    }
+
+    // ============================================================================
+    // Conversation API Methods - delegate to conversations module
+    // ============================================================================
+
     async fn create_conversation(&self, _headers: Option<&HeaderMap>, body: &Value) -> Response {
-        create_conversation(
+        super::conversations::create_conversation(
             &self.responses_components.conversation_storage,
             body.clone(),
         )
@@ -1124,7 +1128,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         conversation_id: &str,
     ) -> Response {
-        get_conversation(
+        super::conversations::get_conversation(
             &self.responses_components.conversation_storage,
             conversation_id,
         )
@@ -1137,7 +1141,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         conversation_id: &str,
         body: &Value,
     ) -> Response {
-        update_conversation(
+        super::conversations::update_conversation(
             &self.responses_components.conversation_storage,
             conversation_id,
             body.clone(),
@@ -1150,7 +1154,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         conversation_id: &str,
     ) -> Response {
-        delete_conversation(
+        super::conversations::delete_conversation(
             &self.responses_components.conversation_storage,
             conversation_id,
         )
@@ -1162,25 +1166,16 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         conversation_id: &str,
         limit: Option<usize>,
-        order: Option<String>,
-        after: Option<String>,
+        order: Option<&str>,
+        after: Option<&str>,
     ) -> Response {
-        let mut query_params = std::collections::HashMap::new();
-        query_params.insert("limit".to_string(), limit.unwrap_or(100).to_string());
-        if let Some(after_val) = after {
-            if !after_val.is_empty() {
-                query_params.insert("after".to_string(), after_val);
-            }
-        }
-        if let Some(order_val) = order {
-            query_params.insert("order".to_string(), order_val);
-        }
-
-        list_conversation_items(
+        super::conversations::list_conversation_items(
             &self.responses_components.conversation_storage,
             &self.responses_components.conversation_item_storage,
             conversation_id,
-            query_params,
+            limit,
+            order,
+            after,
         )
         .await
     }
@@ -1191,7 +1186,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         conversation_id: &str,
         body: &Value,
     ) -> Response {
-        create_conversation_items(
+        super::conversations::create_conversation_items(
             &self.responses_components.conversation_storage,
             &self.responses_components.conversation_item_storage,
             conversation_id,
@@ -1207,7 +1202,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         item_id: &str,
         include: Option<Vec<String>>,
     ) -> Response {
-        get_conversation_item(
+        super::conversations::get_conversation_item(
             &self.responses_components.conversation_storage,
             &self.responses_components.conversation_item_storage,
             conversation_id,
@@ -1223,16 +1218,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         conversation_id: &str,
         item_id: &str,
     ) -> Response {
-        delete_conversation_item(
+        super::conversations::delete_conversation_item(
             &self.responses_components.conversation_storage,
             &self.responses_components.conversation_item_storage,
             conversation_id,
             item_id,
         )
         .await
-    }
-
-    fn router_type(&self) -> &'static str {
-        "openai"
     }
 }

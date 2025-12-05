@@ -214,6 +214,7 @@ suites = {
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_profile_v2.py"),
+        TestFile("models/test_ministral3_models.py"),
     ],
 }
 
