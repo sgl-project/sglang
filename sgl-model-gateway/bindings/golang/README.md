@@ -2,7 +2,7 @@
 
 A high-level Go SDK for interacting with SGLang gRPC API, designed with an OpenAI-style API for familiarity and ease of use.
 
-**Location**: `sgl-router/bindings/golang/`
+**Location**: `sgl-model-gateway/bindings/golang/`
 
 ## Table of Contents
 
@@ -501,8 +501,8 @@ bindings/golang/
 **Error**: `library 'sglang_router_rs' not found`
 
 **Solution**:
-1. Rebuild Rust library: `cd sgl-router/bindings/golang && make build`
-2. Or manually with cargo: `cd sgl-router/bindings/golang && cargo build --release`
+1. Rebuild Rust library: `cd sgl-model-gateway/bindings/golang && make build`
+2. Or manually with cargo: `cd sgl-model-gateway/bindings/golang && cargo build --release`
 3. Set `CARGO_BUILD_DIR` if using non-standard build location
 4. Ensure Rust toolchain is installed: `rustup toolchain list`
 

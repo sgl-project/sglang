@@ -6,7 +6,7 @@ set -e
 
 # Configuration
 GATEWAY_PATHS=(
-    "sgl-router"
+    "sgl-model-gateway"
     "python/sglang/srt/grpc"
     "python/sglang/srt/entrypoints/grpc_server.py"
 )
@@ -86,7 +86,7 @@ if [[ -z "$PREV_TAG" ]] || [[ -z "$CURR_TAG" ]]; then
     usage
 fi
 
-# Navigate to repo root (main sglang repo, not sgl-router)
+# Navigate to repo root (main sglang repo, not sgl-model-gateway)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"

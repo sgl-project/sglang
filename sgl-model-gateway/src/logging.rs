@@ -27,7 +27,7 @@ impl Default for LoggingConfig {
             json_format: false,
             log_dir: None,
             colorize: true,
-            log_file_name: "sgl-router".to_string(),
+            log_file_name: "sgl-model-gateway".to_string(),
             log_targets: Some(vec!["sgl_model_gateway".to_string()]),
         }
     }
