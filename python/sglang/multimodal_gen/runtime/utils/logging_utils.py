@@ -8,6 +8,7 @@ import datetime
 import logging
 import os
 import sys
+import time
 import warnings
 from contextlib import contextmanager
 from functools import lru_cache, partial
@@ -381,6 +382,17 @@ def configure_logger(server_args, prefix: str = ""):
     set_uvicorn_logging_configs()
 
 
+def suppress_loggers(loggers_to_suppress: list[str]):
+    original_levels = {}
+
+    for logger_name in loggers_to_suppress:
+        logger = logging.getLogger(logger_name)
+        original_levels[logger_name] = logger.level
+        logger.setLevel(logging.WARNING)
+
+    return original_levels
+
+
 @contextmanager
 def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
     """
@@ -400,14 +412,8 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
         if get_is_main_process() == 0:
             should_suppress = False
 
-    loggers_to_suppress = ["urllib3"]
-    original_levels = {}
-
-    if should_suppress:
-        for logger_name in loggers_to_suppress:
-            logger = logging.getLogger(logger_name)
-            original_levels[logger_name] = logger.level
-            logger.setLevel(logging.WARNING)
+    loggers_to_suppress = ["urllib3", "imageio", "imageio_ffmpeg", "PIL", "PIL_Image"]
+    original_levels = suppress_loggers(loggers_to_suppress)
 
     try:
         yield
@@ -415,3 +421,62 @@ def suppress_other_loggers(not_suppress_on_main_rank: bool = False):
         if should_suppress:
             for logger_name, level in original_levels.items():
                 logging.getLogger(logger_name).setLevel(level)
+
+
+class GenerationTimer:
+    def __init__(self):
+        self.start_time = 0.0
+        self.end_time = 0.0
+        self.duration = 0.0
+
+
+@contextmanager
+def log_generation_timer(
+    logger: logging.Logger,
+    prompt: str,
+    request_idx: int | None = None,
+    total_requests: int | None = None,
+):
+    if request_idx is not None and total_requests is not None:
+        logger.info(
+            "Processing prompt %d/%d: %s",
+            request_idx,
+            total_requests,
+            prompt[:100],
+        )
+    else:
+        max_len = 100
+        suffix = "..." if len(prompt) > max_len else ""
+        logger.info(f"Processing prompt: {prompt[:100]}{suffix}")
+
+    timer = GenerationTimer()
+    timer.start_time = time.perf_counter()
+    try:
+        yield timer
+        timer.end_time = time.perf_counter()
+        timer.duration = timer.end_time - timer.start_time
+        logger.info("Pixel data generated successfully in %.2f seconds", timer.duration)
+    except Exception as e:
+        if request_idx is not None:
+            logger.error(
+                "Failed to generate output for prompt %d: %s",
+                request_idx,
+                e,
+                exc_info=True,
+            )
+        else:
+            logger.error(
+                f"Failed to generate output for prompt: {e}",
+                exc_info=True,
+            )
+        raise
+
+
+def log_batch_completion(
+    logger: logging.Logger, num_outputs: int, total_time: float
+) -> None:
+    logger.info(
+        "Completed batch processing. Generated %d outputs in %.2f seconds.",
+        num_outputs,
+        total_time,
+    )
