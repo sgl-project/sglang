@@ -1087,16 +1087,22 @@ class DenoisingStage(PipelineStage):
         Args:
             func: The function to prepare kwargs for.
             kwargs: The kwargs to prepare.
-
-        Returns:
-            The prepared kwargs.
         """
-        extra_step_kwargs = {}
-        for k, v in kwargs.items():
-            accepts = k in set(inspect.signature(func).parameters.keys())
-            if accepts:
-                extra_step_kwargs[k] = v
-        return extra_step_kwargs
+        import functools
+
+        # Handle cache-dit's partial wrapping logic.
+        # Cache-dit wraps the forward method with functools.partial where args[0] is the instance.
+        # We access `_original_forward` if available to inspect the underlying signature.
+        # See: https://github.com/vipshop/cache-dit
+        if isinstance(func, functools.partial) and func.args:
+            func = getattr(func.args[0], "_original_forward", func)
+
+        # Unwrap any decorators (e.g. functools.wraps)
+        target_func = inspect.unwrap(func)
+
+        # Filter kwargs based on the signature
+        params = inspect.signature(target_func).parameters
+        return {k: v for k, v in kwargs.items() if k in params}
 
     def progress_bar(
         self, iterable: Iterable | None = None, total: int | None = None
