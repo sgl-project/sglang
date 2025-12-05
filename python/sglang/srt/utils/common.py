@@ -3573,3 +3573,40 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+def distribute_requests_via_mq(
+    reqs: Optional[List[Any]],
+    mq: Any,  # MessageQueue from sglang
+    rank: int,
+    writer_rank: int,
+) -> List[Any]:
+    """
+    Distribute requests via MessageQueue (shared memory).
+    
+    Replaces broadcast_pyobj with zero-copy communication.
+    
+    Args:
+        reqs: Request list (only writer has valid data)
+        mq: MessageQueue instance
+        rank: Current rank
+        writer_rank: Writer's rank
+    
+    Returns:
+        Request list (all ranks get the same data)
+    """
+    if rank == writer_rank:
+        # Writer: enqueue requests
+        if reqs is None or len(reqs) == 0:
+            # Send empty list for synchronization
+            mq.enqueue([])
+        else:
+            # Send request list
+            mq.enqueue(reqs)
+        
+        # Writer returns the original list
+        return reqs if reqs else []
+    else:
+        # Readers: dequeue requests
+        reqs = mq.dequeue()
+        return reqs if reqs else []
