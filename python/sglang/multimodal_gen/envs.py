@@ -285,6 +285,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("SGLANG_DIFFUSION_ATTENTION_CONFIG", None) is None
         else os.path.expanduser(os.getenv("SGLANG_DIFFUSION_ATTENTION_CONFIG", "."))
     ),
+    # Optional override to force a specific attention backend (e.g. "aiter")
+    "SGLANG_DIFFUSION_ATTENTION_BACKEND": lambda: os.getenv(
+        "SGLANG_DIFFUSION_ATTENTION_BACKEND"
+    ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
     "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": lambda: os.getenv(
