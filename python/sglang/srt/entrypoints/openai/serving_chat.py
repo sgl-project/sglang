@@ -476,8 +476,8 @@ class OpenAIServingChat(OpenAIServingBase):
             ):
                 index = content.get("index", 0)
 
-                prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
-                completion_tokens[index] = content["meta_info"]["completion_tokens"]
+                prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens[index] = content["meta_info"].get("completion_tokens", 0)
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
@@ -488,7 +488,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         content, n_prev_tokens.get(index, 0)
                     )
                     n_prev_tokens[index] = len(
-                        content["meta_info"]["output_token_logprobs"]
+                        content["meta_info"].get("output_token_logprobs", [])
                     )
 
                 finish_reason = content["meta_info"]["finish_reason"]
@@ -802,7 +802,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata={"weight_version": ret[0]["meta_info"].get("weight_version", None)},
         )
 
     def _process_logprobs_tokens(
