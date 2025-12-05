@@ -1,7 +1,7 @@
 # Tokenizer Module
 
 ## Overview
-The `sgl-router` tokenizer subsystem exposes a single `Tokenizer` facade around multiple backends
+The `sgl-model-gateway` tokenizer subsystem exposes a single `Tokenizer` facade around multiple backends
 (Hugging Face JSON tokenizers, OpenAI/tiktoken models, and an in-memory mock).  It packages the
 shared behaviours needed by the router–encoding user text, incrementally decoding streamed tokens,
 tracking per-request state, and detecting stop conditions—behind trait objects so the rest of the
@@ -17,7 +17,7 @@ Key capabilities:
 
 The implementation deliberately keeps the surface area small—metrics, batching, or SentencePiece
 support mentioned in earlier drafts do **not** exist today.  This document reflects the actual code
-as of `sgl-router/src/tokenizer/*`.
+as of `sgl-model-gateway/src/tokenizer/*`.
 
 ## Source Map
 - `mod.rs` – module exports and the `Tokenizer` wrapper around `Arc<dyn Tokenizer>`
@@ -125,7 +125,7 @@ as of `sgl-router/src/tokenizer/*`.
   stop-sequence behaviour (`tests.rs`, `sequence.rs`, `stop.rs`, `tiktoken.rs`, `factory.rs`,
   `hub.rs`).  Network-dependent Hugging Face downloads are exercised behind a best-effort async test
   that skips in CI without credentials.
-- Use `cargo test -p sgl-router tokenizer` to run the module’s test suite.
+- Use `cargo test -p sgl-model-gateway tokenizer` to run the module’s test suite.
 
 ## Known Limitations & Future Work
 - SentencePiece (`.model`) and GGUF tokenizers are detected but deliberately unimplemented.

@@ -1,6 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use hf_hub::api::tokio::ApiBuilder;
 
@@ -53,9 +51,7 @@ fn is_chat_template_file(filename: &str) -> bool {
 /// Returns the directory containing the downloaded tokenizer files
 pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
     let model_id = model_id.as_ref();
-    let api = ApiBuilder::from_env()
-        .with_progress(true)
-        .build()?;
+    let api = ApiBuilder::from_env().with_progress(true).build()?;
     let model_name = model_id.display().to_string();
 
     let repo = api.model(model_name.clone());
@@ -147,9 +143,7 @@ pub async fn download_tokenizer_from_hf(model_id: impl AsRef<Path>) -> anyhow::R
 /// If ignore_weights is true, model weight files will be skipped
 pub async fn from_hf(name: impl AsRef<Path>, ignore_weights: bool) -> anyhow::Result<PathBuf> {
     let name = name.as_ref();
-    let api = ApiBuilder::from_env()
-        .with_progress(true)
-        .build()?;
+    let api = ApiBuilder::from_env().with_progress(true).build()?;
     let model_name = name.display().to_string();
 
     let repo = api.model(model_name.clone());

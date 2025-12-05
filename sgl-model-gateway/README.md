@@ -611,7 +611,7 @@ cargo test
 cd bindings/python && maturin develop
 
 # Run Python tests
-cd ../..  # Back to sgl-router root
+cd ../..  # Back to sgl-model-gateway root
 pytest py_test/
 ```
 For production builds, use `maturin build --release --out dist` from the `bindings/python/` directory to create optimized wheels. During development, `maturin develop` rebuilds and installs instantly without creating wheel files. Use `python -m sglang_router.launch_server` to co-launch router and SGLang workers in small clusters for local validation.
@@ -665,7 +665,7 @@ make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0 CREATE_RELEASE=1 DRAF
 ### Filtered Paths
 
 Release notes only include commits touching:
-- `sgl-router/` - Router codebase
+- `sgl-model-gateway/` - Router codebase
 - `python/sglang/srt/grpc/` - gRPC protocol
 - `python/sglang/srt/entrypoints/grpc_server.py` - gRPC server
 
