@@ -141,14 +141,18 @@ __global__ void transfer_page_head_kernel_impl(
   int32_t lane_id = tid % WARP_SIZE;
   int32_t warp_id = tid / WARP_SIZE;
   const int64_t head_size_bytes = item_size_bytes / head_num;
+  int32_t warp_num = gridDim.x * blockDim.x / WARP_SIZE;
 
   for (int i = 0; i < items_per_warp; ++i) {
-    int64_t item_id = warp_id * items_per_warp + i;
+    int64_t item_id = i * warp_num + warp_id;
     if (item_id >= num_items) {
       break;
     }
     const int64_t src_page_id = src_indices[item_id];
     const int64_t dst_page_id = dst_indices[item_id];
+    if (src_page_id < 0 || dst_page_id < 0) {
+      continue;
+    }
 
     // Loop over layers if necessary
     for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
@@ -224,15 +228,18 @@ __global__ void transfer_kernel_impl(
   int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   int32_t lane_id = tid % WARP_SIZE;
   int32_t warp_id = tid / WARP_SIZE;
+  int32_t warp_num = gridDim.x * blockDim.x / WARP_SIZE;
 
   for (int i = 0; i < items_per_warp; ++i) {
-    int64_t item_id = warp_id * items_per_warp + i;
+    int64_t item_id = i * warp_num + warp_id;
     if (item_id >= num_items) {
       break;
     }
     const int64_t src_page_id = src_indices[item_id];
     const int64_t dst_page_id = dst_indices[item_id];
-
+    if (src_page_id < 0 || dst_page_id < 0) {
+      continue;
+    }
     // Loop over layers if necessary
     for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
       const char* src_ptr = SrcOffsetFn(
@@ -805,3 +812,74 @@ void transfer_kv_all_layer_direct_lf_pf(
     int64_t page_size) {
   transfer_kv_page_first_direct_impl<true>(src_ptrs, dst_ptrs, src_indices, dst_indices, 0, page_size);
 }
+
+#ifdef TEST_MAIN
+#include <torch/torch.h>
+#include <iostream>
+#include <vector>
+
+int main() {
+  if (!torch::cuda::is_available()) {
+    std::cerr << "CUDA is not available" << std::endl;
+    return 1;
+  }
+
+  int64_t kv_lora_rank = 512;
+  int64_t qk_rope_head_dim = 64;
+  int64_t token_stride = kv_lora_rank + qk_rope_head_dim;
+  // Using float16 (Half)
+  auto dtype = torch::kFloat16;
+  int64_t item_size = token_stride * 2; // 2 bytes for half
+
+  int64_t num_tokens = 1024;
+  int64_t num_transfer = 64;
+
+  auto device = torch::kCUDA;
+
+  std::cout << "Initializing tensors..." << std::endl;
+
+  // src on CPU (pinned)
+  auto src_buffer = torch::randn({num_tokens, token_stride},
+    torch::TensorOptions().dtype(dtype).device(torch::kCPU).pinned_memory(true));
+  
+  // dst on GPU
+  auto dst_buffer = torch::zeros({num_tokens, token_stride},
+    torch::TensorOptions().dtype(dtype).device(device));
+  
+  // indices
+  auto src_indices = torch::arange(num_transfer, 
+    torch::TensorOptions().dtype(torch::kInt64).device(device));
+  auto dst_indices = torch::arange(num_transfer, 
+    torch::TensorOptions().dtype(torch::kInt64).device(device));
+
+  int64_t block_quota = 8;
+  int64_t num_warps_per_block = 4;
+
+  std::cout << "Running transfer_kv_per_layer_mla..." << std::endl;
+  
+  transfer_kv_per_layer_mla(
+      src_buffer,
+      dst_buffer,
+      src_indices,
+      dst_indices,
+      item_size,
+      block_quota,
+      num_warps_per_block
+  );
+
+  torch::cuda::synchronize();
+
+  std::cout << "Checking results..." << std::endl;
+  auto src_cpu = src_buffer.index({torch::indexing::Slice(0, num_transfer)});
+  auto dst_cpu = dst_buffer.index({torch::indexing::Slice(0, num_transfer)}).cpu();
+
+  if (torch::allclose(src_cpu, dst_cpu)) {
+      std::cout << "Test Passed!" << std::endl;
+  } else {
+      std::cout << "Test Failed!" << std::endl;
+      std::cout << "Max difference: " << (src_cpu - dst_cpu).abs().max().item<double>() << std::endl;
+  }
+
+  return 0;
+}
+#endif
