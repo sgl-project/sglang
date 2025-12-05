@@ -39,5 +39,8 @@ pub use image_processor::{
     ImagePreProcessor, ImageProcessorRegistry, ModelSpecificValue, PreprocessedImages,
 };
 pub use preprocessor_config::PreProcessorConfig;
-pub use processors::{LlavaNextProcessor, LlavaProcessor, Qwen2VLProcessor, Qwen3VLProcessor};
+pub use processors::{
+    Llama4VisionProcessor, LlavaNextProcessor, LlavaProcessor, Phi3VisionProcessor,
+    Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
+};
 pub use transforms::TransformError;

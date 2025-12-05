@@ -117,7 +117,8 @@ jobs:
 
       - name: Generate vision golden fixtures
         run: |
-          pip install transformers pillow numpy
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers pillow numpy scipy
           cd sgl-router/
           python scripts/generate_vision_golden.py
 

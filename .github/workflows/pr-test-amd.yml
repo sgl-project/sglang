@@ -18,6 +18,12 @@ on:
       - "sgl-kernel/**"
       - ".github/workflows/pr-test-amd.yml"
   workflow_dispatch:
+    inputs:
+      target_stage:
+        description: "Specific stage to run (optional, for quick testing)"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: pr-test-amd-${{ github.ref }}
@@ -58,7 +64,15 @@ jobs:
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
     needs: [check-changes]
-    if: needs.check-changes.outputs.sgl_kernel == 'true'
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'sgl-kernel-unit-test-amd') ||
+        (
+          !inputs.target_stage &&
+          needs.check-changes.outputs.sgl_kernel == 'true'
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -94,8 +108,16 @@ jobs:
 
   stage-a-test-1-amd:
     needs: [check-changes]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'stage-a-test-1-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -161,8 +183,16 @@ jobs:
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -191,8 +221,16 @@ jobs:
 
   unit-test-backend-2-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -222,8 +260,17 @@ jobs:
   unit-test-backend-8-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
     # Temporarily disabled - uncomment when ready to re-enable
-    if: false && always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'unit-test-backend-8-gpu-amd') ||
+        (
+          false &&
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     env:
       RUNNER_LABELS: linux-mi300-gpu-8
     strategy:
@@ -260,8 +307,16 @@ jobs:
 
   performance-test-1-gpu-part-1-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-1-gpu-part-1-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -305,8 +360,16 @@ jobs:
 
   performance-test-1-gpu-part-2-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-1-gpu-part-2-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -344,8 +407,16 @@ jobs:
 
   performance-test-2-gpu-amd:
     needs: [check-changes, unit-test-backend-2-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'performance-test-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -393,8 +464,16 @@ jobs:
 
   accuracy-test-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'accuracy-test-1-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -424,8 +503,16 @@ jobs:
 
   accuracy-test-2-gpu-amd:
     needs: [check-changes, accuracy-test-1-gpu-amd]
-    if: always() && !failure() && !cancelled() &&
-      ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+    if: |
+      always() &&
+      (
+        (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
+        (
+          !inputs.target_stage &&
+          (!failure() && !cancelled()) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
+      )
     strategy:
       fail-fast: false
       matrix:
