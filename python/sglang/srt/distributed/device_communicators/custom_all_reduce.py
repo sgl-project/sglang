@@ -325,12 +325,12 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         if not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
-                return inp_size < self.max_size
+                return inp_size <= self.max_size
             return False
 
         if _is_hip:
             if self.full_nvlink:
-                return inp_size < self.max_size
+                return inp_size <= self.max_size
             return False
 
         return False
