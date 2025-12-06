@@ -23,7 +23,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | return_text_in_logprobs    | `bool = False`                                                               | Whether to detokenize tokens in text in the returned logprobs.                                                                                                  |
 | stream                     | `bool = False`                                                               | Whether to stream output.                                                                                                                                       |
 | lora_path                  | `Optional[Union[List[Optional[str]], Optional[str]]] = None`                 | The path to the LoRA.                                                                                                                                           |
-| custom_logit_processor     | `Optional[Union[List[Optional[str]], str]] = None`                           | Custom logit processor for advanced sampling control. Must be a serialized instance of `CustomLogitProcessor` using its `to_str()` method. For usage see below. |
+| custom_logit_processor     | `Optional[Union[List[Optional[str]], str]] = None`                           | Custom logit processor for advanced sampling control. Should be the built-in class path or the serialized instance of `CustomLogitProcessor` using its `to_str()` method. For usage see below. |
 | return_hidden_states       | `Union[List[bool], bool] = False`                                            | Whether to return hidden states.                                                                                                                                |
 
 ## Sampling parameters
@@ -268,6 +268,65 @@ print(response.json())
 Detailed example in [structured outputs](../advanced_features/structured_outputs.ipynb).
 
 ### Custom logit processor
+
+#### Built-in custom logit processors
+
+Currently all built-in custom logit processors are defined in module `sglang.srt.sampling.custom_logit_processor`. You can pass the class path in format of `module_path:class_name` as the `custom_logit_processor` parameter.
+
+Launch a server with `--enable-custom-logit-processor` flag on.
+
+```bash
+python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1 --tp 8 --port 30000 --host 0.0.0.0 --mem-fraction-static 0.9 --disable-cuda-graph --reasoning-parser deepseek-r1 --enable-custom-logit-processor
+```
+
+Send a request with `/generate` endpoint:
+
+```python
+import requests
+
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "The capital of France is",
+        "custom_logit_processor": "sglang.srt.sampling.custom_logit_processor:DeepSeekR1ThinkingBudgetLogitProcessor",
+        "sampling_params": {
+            "temperature": 0.0,
+            "max_new_tokens": 32,
+            "custom_params": {"token_id": 5},
+        },
+    },
+)
+print(response.json())
+```
+
+Send an OpenAI chat completion request:
+
+```python
+import openai
+from rich.pretty import pprint
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-R1",
+    messages=[
+        {
+            "role": "user",
+            "content": "Question: Is Paris the Capital of France?",
+        }
+    ],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": "sglang.srt.sampling.custom_logit_processor:DeepSeekR1ThinkingBudgetLogitProcessor",
+        "custom_params": {
+            "thinking_budget": 512,
+        },
+    },
+)
+pprint(response)
+```
+
+
+#### User-defined custom logit processors
 
 Launch a server with `--enable-custom-logit-processor` flag on.
 

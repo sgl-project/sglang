@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import ImageData
 
@@ -255,6 +256,11 @@ class GenerateReqInput(BaseReq):
             self._normalize_single_inputs()
         else:
             self._normalize_batch_inputs()
+
+    def validate(self):
+        """Validate the request parameters."""
+        self._validate_custom_logit_processor()
+        # TODO: Add more validations as needed
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -526,6 +532,26 @@ class GenerateReqInput(BaseReq):
                 "Cannot use list custom_logit_processor with parallel_sample_num > 1"
             )
 
+    def _validate_single_custom_logit_processor(self, clp: str):
+        """Validate a single custom_logit_processor parameter."""
+        try:
+            _logit_processor = CustomLogitProcessor.from_str(clp)
+        except Exception as e:
+            raise ValueError(str(e))
+
+    def _validate_custom_logit_processor(self):
+        """Validate the provided custom_logit_processor parameter."""
+        # Check the custom_logit_processor is a validate class path
+        if self.custom_logit_processor is not None:
+            if isinstance(self.custom_logit_processor, list):
+                for clp in self.custom_logit_processor:
+                    if clp is not None:
+                        self._validate_single_custom_logit_processor(clp)
+            elif isinstance(self.custom_logit_processor, str):
+                self._validate_single_custom_logit_processor(
+                    self.custom_logit_processor
+                )
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -752,6 +778,11 @@ class EmbeddingReqInput(BaseReq):
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+
+    def validate(self):
+        """Validate the request parameters."""
+        # TODO: Add more validations as needed
+        pass
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
