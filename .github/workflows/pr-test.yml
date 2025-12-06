@@ -25,6 +25,9 @@ concurrency:
   group: pr-test-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
+
 jobs:
   # =============================================== check changes ====================================================
   check-changes:
