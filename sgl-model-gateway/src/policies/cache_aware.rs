@@ -309,7 +309,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 matched_worker.to_string()
             } else {
                 RouterMetrics::record_cache_miss();
-                / Load-Aware Fallback for Cache Misses
+                // Load-Aware Fallback for Cache Misses
                 // just get smallest tenant
                 let candidate_url = tree.get_smallest_tenant();
                 // Peek at the candidate's load.
