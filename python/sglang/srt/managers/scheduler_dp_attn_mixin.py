@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Callable
 
 import torch
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.two_batch_overlap import TboDPAttentionPreparer
 from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
@@ -30,6 +30,8 @@ class MLPSyncBatchInfo:
     tp0_info: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    tbo_split_seq_index: torch.Tensor = None
+    global_forward_mode: int = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -67,6 +69,28 @@ class MLPSyncBatchInfo:
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
 
 
+def _update_gather_batch(
+    batch: ScheduleBatch,
+    mlp_sync_info: MLPSyncBatchInfo,
+    require_mlp_tp_gather: bool,
+):
+    # TODO: handle the case when moe_dense_tp_size != 1
+    if not require_mlp_tp_gather:
+        batch.global_num_tokens = [mlp_sync_info.num_tokens]
+        batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+    else:
+        batch.global_num_tokens = mlp_sync_info.global_num_tokens
+        batch.global_num_tokens_for_logprob = (
+            mlp_sync_info.global_num_tokens_for_logprob
+        )
+    batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
+    batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
+    batch.global_forward_mode = mlp_sync_info.global_forward_mode
+
+    # Check forward mode for cuda graph
+    batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     dp_size: int,
@@ -79,7 +103,7 @@ def prepare_mlp_sync_batch_raw(
     offload_tags: set[str],
 ):
     # Check if other DP workers have running batches
-    if local_batch is None:
+    if local_batch is None or local_batch.forward_mode.is_prebuilt():
         num_tokens = 0
         num_tokens_for_logprob = 0
     elif local_batch.forward_mode.is_decode():
@@ -101,10 +125,14 @@ def prepare_mlp_sync_batch_raw(
             num_tokens_for_logprob = local_batch.batch_size()
 
     can_cuda_graph = (
-        local_batch is None or local_batch.forward_mode.is_decode_or_idle()
+        local_batch is None
+        or local_batch.forward_mode.is_decode_or_idle()
+        or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
+    if local_batch is not None:
+        local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
     if len(offload_tags) == 0 and disable_overlap_schedule:
@@ -128,29 +156,21 @@ def prepare_mlp_sync_batch_raw(
     )
     mlp_sync_info.all_gather(device=device, group=group)
 
-    tbo_split_seq_index, global_forward_mode = tbo_preparer.compute_output(
-        mlp_sync_info.tp0_info[:, 4:6],
+    mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
+        tbo_preparer.compute_output(
+            mlp_sync_info.tp0_info[:, 4:6],
+        )
     )
 
-    if local_batch is None and max(mlp_sync_info.global_num_tokens) > 0:
-        local_batch = get_idle_batch()
-
-    if local_batch is not None:
-        # TODO: handle the case when moe_dense_tp_size != 1
-        if not require_mlp_tp_gather:
-            local_batch.global_num_tokens = [num_tokens]
-            local_batch.global_num_tokens_for_logprob = [num_tokens_for_logprob]
-        else:
-            local_batch.global_num_tokens = mlp_sync_info.global_num_tokens
-            local_batch.global_num_tokens_for_logprob = (
-                mlp_sync_info.global_num_tokens_for_logprob
-            )
-        local_batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
-        local_batch.tbo_split_seq_index = tbo_split_seq_index
-        local_batch.global_forward_mode = global_forward_mode
-
-        # Check forward mode for cuda graph
-        local_batch.can_run_dp_cuda_graph = mlp_sync_info.can_cuda_graph
+    need_idle_batch = max(mlp_sync_info.global_num_tokens) > 0
+    if need_idle_batch:
+        batch_to_gather = local_batch
+        if local_batch is None:
+            batch_to_gather = local_batch = get_idle_batch()
+        elif local_batch.forward_mode.is_prebuilt():
+            # NOTE: for prebuilt batch, we add an inner idle batch to run MLP sync
+            batch_to_gather = local_batch.inner_idle_batch = get_idle_batch()
+        _update_gather_batch(batch_to_gather, mlp_sync_info, require_mlp_tp_gather)
 
     return local_batch
 

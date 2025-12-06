@@ -13,9 +13,13 @@
 # ==============================================================================
 """Common utilities."""
 
+from typing import Any, List, Optional, Tuple
+
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.environ import envs
 
 
 @triton.jit
@@ -39,7 +43,7 @@ def set_mla_kv_buffer_kernel(
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
 
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -164,7 +168,7 @@ def get_mla_kv_buffer_kernel(
     rope_dim: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
-    loc = tl.load(loc_ptr + pid_loc)
+    loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     loc_src_ptr = kv_buffer_ptr + loc * buffer_stride
 
     nope_offs = tl.arange(0, nope_dim)
@@ -208,3 +212,42 @@ def get_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
     )
+
+
+def maybe_init_custom_mem_pool(
+    device: str,
+) -> Tuple[bool, Optional[Any], Optional[str]]:
+    """
+    Initialize custom memory pool based on environment variable.
+
+    This function can be modified to support more features that require a custom memory pool.
+
+    Args:
+        device: The device to allocate memory on
+
+    Returns:
+        Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
+    """
+    enable_custom_mem_pool = (
+        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
+    )
+
+    if enable_custom_mem_pool:
+        # Currently, only mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
+        from sglang.srt.disaggregation.mooncake.utils import (
+            init_mooncake_custom_mem_pool,
+        )
+
+        return init_mooncake_custom_mem_pool(device)
+    else:
+        return False, None, None
+
+
+def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
+    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
+    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
+    if len(tokens) and isinstance(tokens[0], tuple):
+        return tokens
+    if len(tokens) < 2:
+        return []
+    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]

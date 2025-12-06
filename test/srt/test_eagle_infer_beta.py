@@ -68,6 +68,7 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
 
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
+        assert self.process.poll() is None
 
     def test_gsm8k(self):
         args = SimpleNamespace(
@@ -84,6 +85,11 @@ class TestEagleServerBase(CustomTestCase, MatchedStopMixin):
         self.assertGreater(
             metrics["accuracy"], 0.23
         )  # 0.3333 for 60 questions; 0.234 for 1319 questions
+        assert self.process.poll() is None
+
+
+class TestEagleServerPage(TestEagleServerBase):
+    other_launch_args = ["--page-size", "64"]
 
 
 if __name__ == "__main__":

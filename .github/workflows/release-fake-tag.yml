@@ -27,9 +27,9 @@ jobs:
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           echo "TAG=v$version" >> $GITHUB_OUTPUT
 
-      - name: Create and push fake tag
+      - name: Create and push tag
         run: |
           git config user.name "sglang-bot"
           git config user.email "sglang-bot@users.noreply.github.com"
-          git checkout -b ${{ steps.get_version.outputs.TAG }}
-          git push --set-upstream origin ${{ steps.get_version.outputs.TAG }}
+          git tag ${{ steps.get_version.outputs.TAG }}
+          git push origin ${{ steps.get_version.outputs.TAG }}
