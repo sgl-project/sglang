@@ -72,7 +72,7 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import RotaryPosMixin, permute_inv
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +166,9 @@ class Qwen2_5_VisionBlock(nn.Module):
         x: torch.Tensor,
         cu_seqlens: torch.Tensor,
         position_embeddings: torch.Tensor,
+        output_ws=None,
     ) -> torch.Tensor:
+        ws = output_ws
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
         x2d = x.reshape(-1, H)
@@ -178,6 +180,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             hidden_states,
             cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            output_ws=ws,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -246,6 +249,227 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         return out
 
 
+class ViTCudaGraphRunner:
+    """ViT CUDA Graph Runner
+
+    Cached with graph_key = seq_len, for each seq_len capture once.
+    expose run(), internally call create_graph().
+    exceed call invokes replay().
+    """
+
+    def __init__(self, vit: "Qwen2_5_VisionTransformer"):
+        self.vit = vit
+
+        # graph_key -> buffers / graphs
+        self.block_input = {}
+        self.block_output = {}
+        self.block_ws = {}
+        self.block_graphs = {}
+
+        self.cu_full_len = {}
+        self.cu_window_len = {}
+        self.cu_full_len_kk = {}
+        self.cu_window_len_kk = {}
+
+        # rotary position buffer for all graphs
+        self.sin_cos_ws = None
+        self.max_context_len = vit.max_context_len
+
+    @property
+    def device(self) -> torch.device:
+        return self.vit.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.vit.dtype
+
+    def _ensure_sin_cos_ws(self, seq_len: int, head_dim: int):
+        if self.sin_cos_ws is None:
+            max_shape = self.max_context_len or seq_len
+            max_shape = max(max_shape, seq_len)
+            cos_ws = torch.empty(
+                max_shape, head_dim, dtype=self.dtype, device=self.device
+            )
+            sin_ws = torch.empty(
+                max_shape, head_dim, dtype=self.dtype, device=self.device
+            )
+            self.sin_cos_ws = (cos_ws, sin_ws)
+        else:
+            if self.sin_cos_ws[0].size(0) < seq_len:
+                max_shape = max(self.sin_cos_ws[0].size(0) * 2, seq_len)
+                cos_ws = torch.empty(
+                    max_shape, head_dim, dtype=self.dtype, device=self.device
+                )
+                sin_ws = torch.empty(
+                    max_shape, head_dim, dtype=self.dtype, device=self.device
+                )
+                self.sin_cos_ws = (cos_ws, sin_ws)
+
+    def _get_graph_key(self, x_3d: torch.Tensor) -> int:
+        # x_3d: [S, B, H], B=1, S as graph_key
+        return x_3d.shape[0]
+
+    def _create_graph(self, graph_key: int, temp_cos_sin):
+        graph = torch.cuda.CUDAGraph()
+        vit = self.vit
+
+        cu_window = self.cu_window_len[graph_key]
+        cu_full = self.cu_full_len[graph_key]
+        cu_window_kk = self.cu_window_len_kk[graph_key]
+        cu_full_kk = self.cu_full_len_kk[graph_key]
+
+        max_window_len = cu_window_kk.max().item()
+        max_full_len = cu_full_kk.max().item()
+
+        override_backend = get_global_server_args().mm_attention_backend
+
+        with torch.cuda.graph(graph):
+            y = None
+            for layer_num, blk in enumerate(vit.blocks):
+                if layer_num in vit.fullatt_block_indexes:
+                    cu_seqlens_now = cu_full
+                    cu_seqlens_kk_now = cu_full_kk
+                    max_len = max_full_len
+                else:
+                    cu_seqlens_now = cu_window
+                    cu_seqlens_kk_now = cu_window_kk
+                    max_len = max_window_len
+
+                if override_backend == "triton_attn":
+                    cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
+                elif override_backend == "fa3":
+                    cu_seq_len_ws = [cu_seqlens_now, max_len]
+                else:
+                    raise RuntimeError("Not supported ViT attention backend")
+
+                if layer_num == 0:
+                    y = blk(
+                        self.block_input[graph_key],
+                        cu_seqlens=cu_seq_len_ws,
+                        position_embeddings=temp_cos_sin,
+                        output_ws=self.block_ws[graph_key],
+                    )
+                else:
+                    y = blk(
+                        y,
+                        cu_seqlens=cu_seq_len_ws,
+                        position_embeddings=temp_cos_sin,
+                        output_ws=self.block_ws[graph_key],
+                    )
+
+            self.block_output[graph_key] = vit.merger(y)
+
+        self.block_graphs[graph_key] = graph
+
+    def create_graph(
+        self,
+        x_3d: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        cu_seqlens: torch.Tensor,
+        cu_window_seqlens: torch.Tensor,
+    ) -> int:
+        vit = self.vit
+        graph_key = self._get_graph_key(x_3d)
+
+        if graph_key in self.block_graphs:
+            return graph_key
+
+        # make sure rotary workspace
+        head_dim = position_embeddings[0].shape[1]
+        self._ensure_sin_cos_ws(graph_key, head_dim)
+
+        used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
+        used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
+        used_cos_ws.copy_(position_embeddings[0])
+        used_sin_ws.copy_(position_embeddings[1])
+        temp_cos_sin = (used_cos_ws, used_sin_ws)
+
+        # pre-allocate workspace
+        attn_module: VisionAttention = vit.blocks[0].attn
+        num_heads = attn_module.num_attention_heads_per_partition
+        attn_head_dim = attn_module.head_size
+
+        if graph_key not in self.block_output:
+            self.block_output[graph_key] = torch.empty_like(
+                x_3d, device=self.device
+            ).contiguous()
+            self.block_input[graph_key] = torch.empty_like(
+                x_3d, device=self.device
+            ).contiguous()
+            self.block_ws[graph_key] = torch.empty(
+                graph_key,
+                num_heads,
+                attn_head_dim,
+                device=self.device,
+                dtype=self.dtype,
+            )
+
+        if graph_key not in self.cu_window_len:
+            self.cu_window_len[graph_key] = cu_window_seqlens
+            self.cu_full_len[graph_key] = cu_seqlens
+            self.cu_window_len_kk[graph_key] = (
+                cu_window_seqlens[1:] - cu_window_seqlens[:-1]
+            )
+            self.cu_full_len_kk[graph_key] = cu_seqlens[1:] - cu_seqlens[:-1]
+
+        self._create_graph(graph_key, temp_cos_sin)
+
+        return graph_key
+
+    def replay(
+        self,
+        graph_key: int,
+        x_3d: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        window_index: torch.Tensor,
+    ) -> torch.Tensor:
+        # update rotary workspace content
+        head_dim = position_embeddings[0].shape[1]
+        self._ensure_sin_cos_ws(graph_key, head_dim)
+        used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
+        used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
+        used_cos_ws.copy_(position_embeddings[0])
+        used_sin_ws.copy_(position_embeddings[1])
+
+        # copy input
+        self.block_input[graph_key].copy_(x_3d)
+
+        # replay
+        self.block_graphs[graph_key].replay()
+
+        reverse_indices = torch.argsort(window_index)
+        out = self.block_output[graph_key][reverse_indices, :]
+
+        return out
+
+    def run(
+        self,
+        x: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        window_index: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_window_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        # x: [seq_len, hidden] -> [S, B=1, H]
+        x_3d = x.unsqueeze(1)
+        graph_key = self._get_graph_key(x_3d)
+
+        if graph_key not in self.block_graphs:
+            self.create_graph(
+                x_3d=x_3d,
+                position_embeddings=position_embeddings,
+                cu_seqlens=cu_seqlens,
+                cu_window_seqlens=cu_window_seqlens,
+            )
+
+        return self.replay(
+            graph_key=graph_key,
+            x_3d=x_3d,
+            position_embeddings=position_embeddings,
+            window_index=window_index,
+        )
+
+
 class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
     def __init__(
@@ -255,6 +479,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        max_context_len: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -306,6 +531,10 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             prefix=add_prefix("merger", prefix),
             use_data_parallel=use_data_parallel,
         )
+
+        # Resource prepared for vit cuda graph
+        self.max_context_len = max_context_len
+        self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
 
     def get_window_index(self, grid_thw):
         cu_window_seqlens: list = [0]
@@ -377,6 +606,9 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        if get_bool_env_var("SGLANG_VIT_CUDA_GRAPH"):
+            return self.forward_in_cuda_graph(x, grid_thw)
+
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
@@ -445,6 +677,72 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
         return x
 
+    def forward_in_cuda_graph(
+        self,
+        x: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        # patchify
+        x = x.to(device=self.device, dtype=self.dtype)
+        x = self.patch_embed(x)
+
+        # compute position embedding
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        window_index, cu_window_seqlens = self.get_window_index(grid_thw)
+        cu_window_seqlens = torch.tensor(
+            cu_window_seqlens,
+            device=x.device,
+            dtype=torch.int32,
+        )
+        cu_window_seqlens = torch.unique_consecutive(cu_window_seqlens)
+
+        window_index = window_index.to(device=x.device)
+
+        rotary_pos_emb = rotary_pos_emb.to(device=x.device, dtype=x.dtype)
+
+        # patch token num
+        seq_len, _ = x.size()
+
+        # [G, M, hidden]
+        x = x.reshape(seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1)
+        x = x[window_index, :, :]  # [G, M, hidden]
+        x = x.reshape(seq_len, -1)  # [seq_len, hidden]
+
+        rotary_pos_emb = rotary_pos_emb.reshape(
+            seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
+        )
+        rotary_pos_emb = rotary_pos_emb[window_index, :, :]
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+        # After building position_embeddings, make sure both cos and sin are on
+        # the same device/dtype as the attention input
+        position_embeddings = (
+            position_embeddings[0].to(x.device, x.dtype),
+            position_embeddings[1].to(x.device, x.dtype),
+        )
+
+        # compute cu_seqlens - move cu_seqlens to GPU and make it int32
+        cu_seqlens = torch.cat(
+            [
+                torch.tensor([0], device=x.device, dtype=torch.int32),
+                (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
+                .cumsum(dim=0)
+                .to(device=x.device, dtype=torch.int32),
+            ]
+        )
+        cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+
+        return self.cuda_graph_runner.run(
+            x=x,
+            position_embeddings=position_embeddings,
+            window_index=window_index,
+            cu_seqlens=cu_seqlens,
+            cu_window_seqlens=cu_window_seqlens,
+        )
+
 
 class Qwen2_5_VLForConditionalGeneration(nn.Module):
     # BitandBytes specific attributes
@@ -484,6 +782,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
+            max_context_len=self.config.max_position_embeddings,
         )
 
         self.model = Qwen2Model(
