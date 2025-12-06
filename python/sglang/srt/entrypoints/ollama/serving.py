@@ -1,6 +1,3 @@
-# Copyright 2023-2024 SGLang Team
-# Licensed under the Apache License, Version 2.0
-
 """
 Ollama-compatible API serving handlers.
 
