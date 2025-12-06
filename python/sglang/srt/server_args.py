@@ -40,6 +40,7 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
+    is_blackwell,
     is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
@@ -1278,6 +1279,18 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+        elif model_arch in [
+            "NemotronHForCausalLM",
+            "FalconH1ForCausalLM",
+            "JetNemotronForCausalLM",
+            "JetVLMForConditionalGeneration",
+        ]:
+            if not self.disable_radix_cache:
+                logger.warning(
+                    "Disabling overlap schedule since MambaRadixCache is not compatible with "
+                    "overlap schedule currently, try to use --disable-radix-cache if overlap schedule is necessary"
+                )
+                self.disable_overlap_schedule = True
 
     def _handle_sampling_backend(self):
         if self.sampling_backend is None:
@@ -1301,7 +1314,8 @@ class ServerArgs:
 
             1. Models with MHA Architecture (e.g: Llama, QWen)
                 1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
-                1.2 In other cases, we will use flashinfer if available, otherwise use triton.
+                1.2 Use trtllm_mha for Blackwell excluding spec with topk > 1.
+                1.3 In other cases, we will use flashinfer if available, otherwise use triton.
             2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
                 2.2 We will use Flashinfer backend on blackwell.
@@ -1316,6 +1330,8 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
+                elif is_blackwell() and is_no_spec_infer_or_topk_one(self):
+                    self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
                 else:
@@ -1710,9 +1726,13 @@ class ServerArgs:
                     self.speculative_draft_model_path = self.model_path
                     self.speculative_draft_model_revision = self.revision
                 else:
-                    logger.warning(
-                        "DeepSeek MTP does not require setting speculative_draft_model_path."
-                    )
+                    if model_arch not in [
+                        "MistralLarge3ForCausalLM",
+                        "PixtralForConditionalGeneration",
+                    ]:
+                        logger.warning(
+                            "DeepSeek MTP does not require setting speculative_draft_model_path."
+                        )
 
             if self.speculative_num_steps is None:
                 assert (
@@ -2781,7 +2801,7 @@ class ServerArgs:
         parser.add_argument(
             "--preferred-sampling-params",
             type=str,
-            help="json-formatted sampling settings that will be returned in /get_model_info",
+            help="json-formatted sampling settings that will be returned in /model_info",
         )
 
         # LoRA
