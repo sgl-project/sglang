@@ -343,6 +343,24 @@ def fused_fp8_set_kv_buffer(
         # - dim 2: K/V (0=K, 1=V)
         grid = (num_tokens, num_head_blocks, 2)
 
+        # Convert scale to Python float to avoid Triton pointer type issues.
+        # k_scale and v_scale may be torch.nn.Parameter (0-d tensor), but Triton
+        # treats tensor arguments as pointers. We need Python float scalars to
+        # allow direct arithmetic operations like "1.0 / k_scale" in the kernel.
+        if k_scale is None:
+            k_scale_val = 1.0
+        elif isinstance(k_scale, torch.Tensor):
+            k_scale_val = float(k_scale)
+        else:
+            k_scale_val = k_scale
+
+        if v_scale is None:
+            v_scale_val = 1.0
+        elif isinstance(v_scale, torch.Tensor):
+            v_scale_val = float(v_scale)
+        else:
+            v_scale_val = v_scale
+
         # Launch Triton kernel
         _fused_fp8_set_kv_buffer_kernel[grid](
             k_3d,
@@ -350,8 +368,8 @@ def fused_fp8_set_kv_buffer(
             k_cache,
             v_cache,
             cache_loc,
-            k_scale if k_scale is not None else 1.0,
-            v_scale if v_scale is not None else 1.0,
+            k_scale_val,
+            v_scale_val,
             use_provided_scale,
             num_kv_heads,
             head_dim,
