@@ -132,7 +132,7 @@ def handle_rerun_stage(
     if not stage_name:
         print("Error: No stage name provided")
         comment.create_reaction("confused")
-        comment.create_comment(
+        pr.create_issue_comment(
             f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
             f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
         )
@@ -140,8 +140,8 @@ def handle_rerun_stage(
 
     print(f"Permission granted. Triggering workflow_dispatch for stage '{stage_name}'.")
 
-    # Valid stage names that support target_stage
-    valid_stages = [
+    # Valid NVIDIA stage names that support target_stage
+    nvidia_stages = [
         "stage-a-test-1",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
@@ -163,43 +163,69 @@ def handle_rerun_stage(
         "unit-test-backend-4-gpu-gb200",
     ]
 
+    # Valid AMD stage names that support target_stage
+    amd_stages = [
+        "sgl-kernel-unit-test-amd",
+        "stage-a-test-1-amd",
+        "unit-test-backend-1-gpu-amd",
+        "unit-test-backend-2-gpu-amd",
+        "unit-test-backend-8-gpu-amd",
+        "performance-test-1-gpu-part-1-amd",
+        "performance-test-1-gpu-part-2-amd",
+        "performance-test-2-gpu-amd",
+        "accuracy-test-1-gpu-amd",
+        "accuracy-test-2-gpu-amd",
+    ]
+
+    valid_stages = nvidia_stages + amd_stages
+    is_amd_stage = stage_name in amd_stages
+
     if stage_name not in valid_stages:
         comment.create_reaction("confused")
-        comment.create_comment(
+        pr.create_issue_comment(
             f"❌ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
-            f"Currently supported stages:\n"
-            + "\n".join(f"- `{s}`" for s in valid_stages)
+            f"**NVIDIA stages:**\n"
+            + "\n".join(f"- `{s}`" for s in nvidia_stages)
+            + "\n\n**AMD stages:**\n"
+            + "\n".join(f"- `{s}`" for s in amd_stages)
             + "\n\nOther stages will be added soon. For now, use `/rerun-failed-ci` for those stages."
         )
         return False
 
     try:
-        # Get the PR Test workflow
+        # Get the appropriate workflow based on stage type
+        workflow_name = "PR Test (AMD)" if is_amd_stage else "PR Test"
         workflows = gh_repo.get_workflows()
-        pr_test_workflow = None
+        target_workflow = None
         for wf in workflows:
-            if wf.name == "PR Test":
-                pr_test_workflow = wf
+            if wf.name == workflow_name:
+                target_workflow = wf
                 break
 
-        if not pr_test_workflow:
-            print("Error: PR Test workflow not found")
+        if not target_workflow:
+            print(f"Error: {workflow_name} workflow not found")
             return False
 
         # Trigger workflow_dispatch on the PR's head branch
         ref = pr.head.ref
-        print(f"Triggering workflow on branch: {ref}")
+        print(f"Triggering {workflow_name} workflow on branch: {ref}")
 
-        success = pr_test_workflow.create_dispatch(
+        # AMD workflow doesn't have version input, only target_stage
+        if is_amd_stage:
+            inputs = {"target_stage": stage_name}
+        else:
+            inputs = {"version": "release", "target_stage": stage_name}
+
+        success = target_workflow.create_dispatch(
             ref=ref,
-            inputs={"version": "release", "target_stage": stage_name},
+            inputs=inputs,
         )
 
         if success:
             print(f"Successfully triggered workflow for stage '{stage_name}'")
             if react_on_success:
                 comment.create_reaction("+1")
-                comment.create_comment(
+                pr.create_issue_comment(
                     f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
@@ -211,7 +237,7 @@ def handle_rerun_stage(
     except Exception as e:
         print(f"Error triggering workflow_dispatch: {e}")
         comment.create_reaction("confused")
-        comment.create_comment(
+        pr.create_issue_comment(
             f"❌ Failed to trigger workflow: {str(e)}\n\n"
             f"Please check the logs or contact maintainers."
         )
