@@ -257,6 +257,15 @@ def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
     )
 
 
+def marlin_moe_intermediate_size(w1_packed: torch.Tensor, w2_packed: torch.Tensor) -> int:
+    """
+    Given Marlin packed weight matrices w1_packed, and w2_packed,
+    return the MoE intermediate size N
+    """
+    marlin_tile_size = 16
+    return w2_packed.size(1) * marlin_tile_size
+
+
 def marlin_make_workspace(
     device: torch.device, max_blocks_per_sm: int = 1
 ) -> torch.Tensor:
