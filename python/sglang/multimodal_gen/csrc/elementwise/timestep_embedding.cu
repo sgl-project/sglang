@@ -109,64 +109,70 @@ template <typename O, typename T> __device__ O cast_to(T x) {
     }                                                                          \
   }()
 
-// TODO:
-// assert operations is float??
-__device__ float calculate_frequency_and_angle(float t_val, int freq_idx,
-                                               int half, int max_period) {
-  float log_max_period = logf(static_cast<float>(max_period));
-  float freqs = expf(-log_max_period * static_cast<float>(freq_idx) /
-                     static_cast<float>(half));
-  return t_val * freqs;
-}
+// // TODO: remove
+// // assert operations is float??
+// __device__ float calculate_frequency_and_angle(float t_val, int freq_idx,
+//                                                int half, int max_period) {
+//   float log_max_period = logf(static_cast<float>(max_period));
+//   float freqs = expf(-log_max_period * static_cast<float>(freq_idx) / static_cast<float>(half));
+//   return t_val * freqs;
+// }
 
-template <typename T, typename O, uint32_t vec_size = 8>
+template <typename T, typename O, uint32_t kBlockSizeDim, uint32_t kVecSize = 8, uint32_t kNumThr>
 __global__ void
 timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
-                          int max_period, int stride_t_b, int stride_out_b,
-                          int stride_out_d, int BLOCK_SIZE_DIM) {
+                          int max_period, int stride_out_b) {
   // TODO: add comments
   int pid_b = blockIdx.x;
   int pid_d = blockIdx.y;
   int tid = threadIdx.x;
-  int num_threads = blockDim.x;
+  constexpr int stride_t_b = 1;
+  constexpr int stride_out_d = 1;
 
   // Get the timestep for this batch
-  float t_val = cast_to<float>(t_ptr[pid_b * stride_t_b]);
+  float t_val = cast_to<float>(t_ptr[pid_b]);
 
   // Calculate half dimension
   int half = dim / 2;
 
   // Create range of indices for this block
-  int d_start = pid_d * BLOCK_SIZE_DIM;
-  int d_end = d_start + BLOCK_SIZE_DIM;
+  int d_start = pid_d * kBlockSizeDim;
+  int d_end = d_start + kBlockSizeDim;
 
-  vec_t<O, vec_size> o_vec_cos;
-  vec_t<O, vec_size> o_vec_sin;
+  vec_t<O, kVecSize> o_vec_cos;
+  vec_t<O, kVecSize> o_vec_sin;
 
   int end = min(d_end, half);
 
+  // prepare reusable
+  const float absorbed_scale = -logf(static_cast<float>(max_period)) / static_cast<float>(half);
+  const int output_row_offset = pid_b * stride_out_b;
+  constexpr int num_thread_values = kNumThr * kVecSize;
+
   // main loop
-  int d_idx = d_start + tid * vec_size;
-  for (; d_idx < end; d_idx += num_threads * vec_size) {
+  int d_idx = d_start + tid * kVecSize;
+  for (; d_idx < end; d_idx += num_thread_values) {
 
 #pragma unroll
-    for (int i = d_idx; i < d_idx + vec_size; i++) {
-      if (i >= end) {
+    for (int i = 0; i < kVecSize; i++) {
+      if (d_idx + i >= end) {
         continue;
       }
-      float angles =
-          calculate_frequency_and_angle(t_val, i % half, half, max_period);
-      o_vec_cos[i - d_idx] = cast_to<O>(cosf(angles));
-      o_vec_sin[i - d_idx] = cast_to<O>(sinf(angles));
+
+      // where angles = exp(-log(max_period) * freq_idx / half)
+      //    (-log(max_period) / half) can be absorbe
+      float angles = expf(absorbed_scale * static_cast<float>(d_idx + i)) * t_val;
+      o_vec_cos[i] = cast_to<O>(cosf(angles));
+      o_vec_sin[i] = cast_to<O>(sinf(angles));
     }
 
     // skip last write back if not align
-    if (end % num_threads * vec_size != 0 && d_idx + num_threads * vec_size >= end) {
+    if (end % num_thread_values != 0 && d_idx + num_thread_values >= end) {
       break;
     }
 
-    int out_idx_cos = pid_b * stride_out_b + d_idx * stride_out_d;
-    int out_idx_sin = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
+    int out_idx_cos = output_row_offset + d_idx;
+    int out_idx_sin = output_row_offset + (d_idx + half);
 
     o_vec_cos.store(output_ptr + out_idx_cos);
     o_vec_sin.store(output_ptr + out_idx_sin);
@@ -175,10 +181,10 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
   // epilogue
   // handle last loop inst locality warp divergence
   if (d_idx < end) {
-    int out_idx_cos = pid_b * stride_out_b + d_idx * stride_out_d;
-    int out_idx_sin = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
+    int out_idx_cos = output_row_offset + d_idx;
+    int out_idx_sin = output_row_offset + (d_idx + half);
 #pragma unroll
-    for (int i = 0; i < vec_size; i++) {
+    for (int i = 0; i < kVecSize; i++) {
       if (i + d_idx >= end) {
         continue;
       }
@@ -189,7 +195,7 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
 
   // fill zero if odd
   if (dim % 2 != 0) {
-    int out_idx_pad = pid_b * stride_out_b + (dim - 1) * stride_out_d;
+    int out_idx_pad = output_row_offset + (dim - 1);
     output_ptr[out_idx_pad] = 0.;
   }
 }
@@ -199,8 +205,8 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
 torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
                                              torch::Tensor &output, int dim,
                                              int max_period) {
-  TORCH_CHECK(t.dim() == 1, "t should be 1D");
-  TORCH_CHECK(output.dim() == 2, "output should be 2D");
+  TORCH_CHECK(t.dim() == 1 and t.stride(0) == 1, "t should be 1D");
+  TORCH_CHECK(output.dim() == 2 and output.stride(1) == 1, "output should be a contiguous 2D tensor.");
 
   const int B = t.size(0);
   TORCH_CHECK(output.size(0) == B, "Output batch size doesn't match t");
@@ -245,11 +251,11 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
     DISPATCH_FLOAT_TYPES(t.scalar_type(), "timestep_embedding_kernel", [&] {
       using t_type = scalar_t;
       using o_type = float;
-      timestep_embedding_kernel<t_type, o_type, vec_size>
+      timestep_embedding_kernel<t_type, o_type, BLOCK_SIZE_DIM, vec_size, num_threads>
           <<<grid_size, block_size, 0, stream>>>(
               static_cast<t_type *>(t.data_ptr()),
               static_cast<o_type *>(output.data_ptr()), B, dim, max_period,
-              stride_t_b, stride_out_b, stride_out_d, BLOCK_SIZE_DIM);
+              stride_out_b);
     });
   });
 
