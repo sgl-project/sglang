@@ -2,7 +2,6 @@ import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
-    embedding_extra_tokens_modified,
     embedding_lora_a_fwd,
     gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
@@ -40,24 +39,6 @@ class TritonLoRABackend(BaseLoRABackend):
             batch_info=self.batch_info,
             vocab_size=vocab_size,
             extra_embeddings=extra_embeddings,
-        )
-
-    def run_extra_token_embedding(
-        self,
-        input_ids: torch.Tensor,
-        output: torch.Tensor,
-        extra_embeddings: torch.Tensor,
-        vocab_size: int,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Run extra token embedding lookup using Triton kernel."""
-        return embedding_extra_tokens_modified(
-            input_ids=input_ids,
-            output=output,
-            extra_embeddings=extra_embeddings,
-            batch_info=self.batch_info,
-            vocab_size=vocab_size,
         )
 
     def run_lora_a_sgemm(

@@ -4,8 +4,6 @@ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
-    embedding_extra_tokens_modified,
-    embedding_lora_a_fwd,
 )
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -34,50 +32,6 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch, device)
         self.max_chunk_size = server_args.max_lora_chunk_size
-
-    def run_lora_a_embedding(
-        self,
-        input_ids: torch.Tensor,
-        weights: torch.Tensor,
-        vocab_size: int,
-        extra_embeddings: torch.Tensor = None,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Run LoRA A embedding lookup.
-
-        For chunked backend, we use the same triton kernel as triton backend
-        since embedding lookup doesn't benefit much from chunking.
-        """
-        return embedding_lora_a_fwd(
-            input_ids=input_ids,
-            weights=weights,
-            batch_info=self.batch_info,
-            vocab_size=vocab_size,
-            extra_embeddings=extra_embeddings,
-        )
-
-    def run_extra_token_embedding(
-        self,
-        input_ids: torch.Tensor,
-        output: torch.Tensor,
-        extra_embeddings: torch.Tensor,
-        vocab_size: int,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Run extra token embedding lookup.
-
-        For chunked backend, we use the same triton kernel as triton backend
-        since embedding lookup doesn't benefit from chunking.
-        """
-        return embedding_extra_tokens_modified(
-            input_ids=input_ids,
-            output=output,
-            extra_embeddings=extra_embeddings,
-            batch_info=self.batch_info,
-            vocab_size=vocab_size,
-        )
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
