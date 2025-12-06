@@ -19,7 +19,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidual,
-    ScaleResidualLayerNormScaleShift,
+    ScaleResidualNormScaleShift,
 )
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
@@ -74,7 +74,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.img_attn_norm = LayerNormScaleShift(
             hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
         )
-        self.img_attn_residual_mlp_norm = ScaleResidualLayerNormScaleShift(
+        self.img_attn_residual_mlp_norm = ScaleResidualNormScaleShift(
             hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
         )
         self.img_mlp_residual = ScaleResidual()
@@ -120,7 +120,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.txt_attn_norm = LayerNormScaleShift(
             hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
         )
-        self.txt_attn_residual_mlp_norm = ScaleResidualLayerNormScaleShift(
+        self.txt_attn_residual_mlp_norm = ScaleResidualNormScaleShift(
             hidden_size, norm_type="layer", elementwise_affine=False, dtype=dtype
         )
         self.txt_mlp_residual = ScaleResidual()
