@@ -233,15 +233,12 @@ def forward_mla_core_npu(
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_bmm_output = torch.empty(
-        (attn_output.shape[0], m.num_local_heads * m.v_head_dim),
+        (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
         dtype=attn_output.dtype,
         device=attn_output.device,
     )
-    torch.bmm(
-        attn_output.transpose(0, 1),
-        m.w_vc,
-        out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(0, 1),
-    )
+    torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+
     output, _ = m.o_proj(attn_bmm_output)
 
     return output
@@ -358,7 +355,11 @@ def forward_dsa_core_npu(
         device=attn_output.device,
     )
 
-    if not forward_batch.forward_mode.is_decode():
+    if (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+        and not forward_batch.forward_mode.is_target_verify()
+    ):
         attn_output = attn_output.transpose(0, 1)
         torch.bmm(
             attn_output,
