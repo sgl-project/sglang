@@ -613,6 +613,9 @@ class Engine(EngineBase):
     def save_sharded_model(self, **kwargs):
         self.collective_rpc("save_sharded_model", **kwargs)
 
+    def save_serverless_llm_state(self, **kwargs):
+        self.collective_rpc("save_serverless_llm_state", **kwargs)
+
     def score(
         self,
         query: Optional[Union[str, List[int]]] = None,
@@ -753,7 +756,17 @@ def _set_envs_and_config(server_args: ServerArgs):
             )
             kill_process_tree(os.getpid())
 
-        signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+        # Only register signal handler if we're in the main thread
+        # When running in Ray actors or other non-main threads, signal registration will fail
+        try:
+            signal.signal(signal.SIGQUIT, launch_phase_sigquit_handler)
+        except ValueError:
+            # signal only works in main thread of the main interpreter
+            # This is expected when running in Ray actors or subprocesses
+            logger.warning(
+                "Cannot register signal handler (not in main thread). "
+                "Signal handling will be disabled."
+            )
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
