@@ -96,7 +96,7 @@ diffusion = [
   "vsa==0.0.4",
   "yunchang==0.6.3.post1",
   "runai_model_streamer",
-  "cache-dit==1.1.6"
+  "cache-dit==1.1.7"
 ]
 
 [tool.uv.extra-build-dependencies]
