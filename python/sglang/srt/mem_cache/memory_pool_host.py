@@ -52,7 +52,16 @@ def synchronized(func):
     return wrapper
 
 
-def alloc_manual_pinned(dims, dtype, device, pin_memory):
+def alloc_with_host_register(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+) -> torch.Tensor:
+    """
+    Allocate tensor and register host memory with cudaHostRegister.
+    CudaHostRegister only applies when pin_memory=True.
+    """
     buffer = torch.empty(dims, dtype=dtype, device=device)
     if pin_memory:
         torch.cuda.cudart().cudaHostRegister(
@@ -61,15 +70,23 @@ def alloc_manual_pinned(dims, dtype, device, pin_memory):
     return buffer
 
 
-def alloc_native_pinned(dims, dtype, device, pin_memory):
+def alloc_with_pin_memory(
+    dims,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+) -> torch.Tensor:
+    """
+    Allocate tensor using PyTorch's built-in pin_memory flag.
+    """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 
 
 ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_manual_pinned,
+    lambda: alloc_with_host_register,
     {
-        "npu": alloc_native_pinned,
+        "npu": alloc_with_pin_memory,
     },
 )
 
