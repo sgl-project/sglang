@@ -2062,7 +2062,7 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
+            base_url + "/server_info", headers=get_auth_headers()
         )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
@@ -2180,7 +2180,7 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
     server_info = resp.json() if resp.status_code == 200 else None
 
     if (
