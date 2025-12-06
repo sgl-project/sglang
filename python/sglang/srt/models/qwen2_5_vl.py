@@ -476,6 +476,31 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+
+        if not self.config.encoder_only:
+            self.model = Qwen2Model(
+                config,
+                quant_config,
+                prefix=add_prefix("model", prefix),
+            )
+
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
+            else:
+                # ranks other than the last rank will have a placeholder layer
+                self.lm_head = PPMissingLayer()
+        else:
+            # mm_only mode: no language model, so no lm_head needed
+            self.lm_head = None
+
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
@@ -483,28 +508,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
             # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
-            use_data_parallel=self.use_data_parallel,
         )
-
-        self.model = Qwen2Model(
-            config,
-            quant_config,
-            prefix=add_prefix("model", prefix),
-        )
-
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
-        else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
 
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
@@ -661,6 +665,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 layer_id = get_layer_id(name)
                 if (
                     layer_id is not None
+                    and hasattr(self, "model")
                     and hasattr(self.model, "start_layer")
                     and (
                         layer_id < self.model.start_layer
@@ -671,6 +676,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
 
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Skip loading visual/language model weights
+                if (
+                    self.config.encoder_only or self.config.language_only
+                ) and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader

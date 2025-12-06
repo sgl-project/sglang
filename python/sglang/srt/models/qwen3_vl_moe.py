@@ -243,7 +243,7 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    if "visual" in name:
+                    if "visual" in name or self.config.encoder_only:
                         continue
                     # Anyway, this is an expert weight and should not be
                     # attempted to load as other weights later
@@ -307,6 +307,12 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:
+                        continue
+
+                    # Skip loading mm/language parameters
+                    if (
+                        self.config.encoder_only or self.config.language_only
+                    ) and name not in params_dict:
                         continue
 
                     if name in params_dict.keys():
