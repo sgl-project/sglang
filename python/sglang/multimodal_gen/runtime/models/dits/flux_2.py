@@ -114,6 +114,7 @@ class Flux2FeedForward(nn.Module):
 
 
 class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
+    _supports_qkv_fusion = True
 
     def __init__(
         self,
@@ -785,11 +786,15 @@ class Flux2Transformer2DModel(CachableDiT):
 
     def fuse_qkv_projections(self):
         for block in self.transformer_blocks:
-            if hasattr(block.attn, "fuse_projections"):
+            if hasattr(block.attn, "fuse_projections") and getattr(
+                block.attn, "_supports_qkv_fusion", True
+            ):
                 block.attn.fuse_projections()
 
         for block in self.single_transformer_blocks:
-            if hasattr(block.attn, "fuse_projections"):
+            if hasattr(block.attn, "fuse_projections") and getattr(
+                block.attn, "_supports_qkv_fusion", True
+            ):
                 block.attn.fuse_projections()
 
     def forward(
