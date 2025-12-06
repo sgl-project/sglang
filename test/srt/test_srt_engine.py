@@ -16,8 +16,10 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.few_shot_gsm8k_engine import run_eval
 from sglang.test.test_utils import (
+    DEFAULT_IMAGE_URL,
     DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
     CustomTestCase,
 )
 
@@ -212,6 +214,56 @@ class TestSRTEngine(CustomTestCase):
         self.assertTrue(
             torch.allclose(out1, out2, atol=1e-5, rtol=1e-3),
             "Sync and async embeddings are not equal within tolerance",
+        )
+
+    def test_9_engine_vlm_encode_with_batch_tokenizer(self):
+        prompt1 = "Today is a sunny day and I like"
+        prompt2 = "Today is a rainy day and I like"
+        model_path = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            enable_multimodal=True,
+            is_embedding=True,
+            random_seed=42,
+            disable_radix_cache=True,
+            enable_tokenizer_batch_encode=True,
+        )
+        out1 = engine.encode(
+            [prompt1, prompt2], image_data=[DEFAULT_IMAGE_URL, DEFAULT_IMAGE_URL]
+        )
+        engine.shutdown()
+        self.assertEqual(len(out1), 2)
+
+        engine = sgl.Engine(
+            model_path=model_path,
+            enable_multimodal=True,
+            is_embedding=True,
+            random_seed=42,
+            disable_radix_cache=True,
+            enable_tokenizer_batch_encode=False,
+        )
+        out2 = engine.encode(
+            [prompt1, prompt2], image_data=[DEFAULT_IMAGE_URL, DEFAULT_IMAGE_URL]
+        )
+        engine.shutdown()
+        self.assertEqual(len(out2), 2)
+
+        self.assertTrue(
+            torch.allclose(
+                torch.Tensor(out1[0]["embedding"]),
+                torch.Tensor(out2[0]["embedding"]),
+                atol=1e-2,
+                rtol=1e-2,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                torch.Tensor(out1[1]["embedding"]),
+                torch.Tensor(out2[1]["embedding"]),
+                atol=1e-2,
+                rtol=1e-2,
+            )
         )
 
 
