@@ -7,6 +7,7 @@ from torch import nn
 
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.distributed import divide, get_pp_group
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -818,13 +819,14 @@ class Qwen3NextModel(nn.Module):
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states, residual = layer(
-                layer_id=i,
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-                forward_batch=forward_batch,
-            )
+            with get_global_expert_distribution_recorder().with_current_layer(i):
+                hidden_states, residual = layer(
+                    layer_id=i,
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    forward_batch=forward_batch,
+                )
 
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
