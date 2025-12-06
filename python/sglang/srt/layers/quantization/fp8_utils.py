@@ -268,7 +268,6 @@ def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
     """Get the current FP8 GEMM runner backend."""
     global FP8_GEMM_RUNNER_BACKEND
     if FP8_GEMM_RUNNER_BACKEND is None:
-        # Default to AUTO when not explicitly configured
         FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend.AUTO
     return FP8_GEMM_RUNNER_BACKEND
 
