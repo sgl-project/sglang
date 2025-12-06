@@ -3186,10 +3186,20 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
+        tp_size = get_tensor_model_parallel_world_size()
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                    # Handle deferred all-reduce from previous layer if fusion was enabled
+                    capture_hs = hidden_states
+                    if (
+                        tp_size > 1
+                        and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
+                        and hidden_states._sglang_needs_allreduce_fusion
+                    ):
+                        capture_hs = tensor_model_parallel_all_reduce(hidden_states)
+                    captured_hidden = capture_hs + residual
+                    aux_hidden_states.append(captured_hidden)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,

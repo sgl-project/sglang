@@ -480,7 +480,7 @@ class ModelRunner:
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
+        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None and self.model_config.num_nextn_predict_layers > 0
         model_num_layers = (
             self.model_config.num_nextn_predict_layers
             if self.is_draft_worker and model_has_mtp_layers
@@ -1454,11 +1454,10 @@ class ModelRunner:
             cpu_group=get_world_group().cpu_group,
         )
         if self.is_draft_worker:
-            num_layers = getattr(
-                self.model_config.hf_config,
-                "num_nextn_predict_layers",
-                self.num_effective_layers,
-            )
+            if getattr(self.model_config.hf_config, "num_nextn_predict_layers", None) is not None and self.model_config.num_nextn_predict_layers > 0:
+                num_layers = self.model_config.num_nextn_predict_layers
+            else:
+                num_layers = self.num_effective_layers
         elif config := self.mambaish_config:
             num_layers = len(config.full_attention_layer_ids)
         elif self.model_config.full_attention_layer_ids:

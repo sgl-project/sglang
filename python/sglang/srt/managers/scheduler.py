@@ -479,6 +479,17 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
+        if self.server_args.speculative_draft_quantization is not None:
+            if self.server_args.speculative_draft_quantization == "none":
+                self.server_args.quantization = None
+            else:
+                self.server_args.quantization = (
+                    self.server_args.speculative_draft_quantization
+                )
+            logger.info(
+                f"Using draft model quantization: '{self.server_args.speculative_draft_quantization}'"
+            )
+
         # Draft workers are looked up via `SpeculativeAlgorithm` registry; new
         # algorithms should register their factory instead of patching this code.
         if self.spec_algorithm.is_eagle():
