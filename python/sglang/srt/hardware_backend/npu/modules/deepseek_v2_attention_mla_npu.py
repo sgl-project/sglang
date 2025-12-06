@@ -229,7 +229,6 @@ def forward_mla_core_npu(
         k_rope=k_pe,
         **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
     )
-
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     attn_bmm_output = torch.empty(
@@ -238,6 +237,8 @@ def forward_mla_core_npu(
         device=attn_output.device,
     )
     torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+
+    attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
     output, _ = m.o_proj(attn_bmm_output)
 
