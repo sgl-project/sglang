@@ -197,34 +197,18 @@ Prepare the environment by installing NeMo-Skills in the docker or your own virt
   pip install git+https://github.com/NVIDIA/NeMo-Skills.git --ignore-installed blinker
   ```
 
-Nemo Skill can't enable thinking method from client side, so we need some hardcoding before launching server:
-
-**For `DeepSeek-V3.2-Exp`**:
-
-Modify the [`jinja chat_template`](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/tokenizer_config.json#L34) by replacing
-
+Then launch the SGLang server:
 ```
-{% set thinking = false %}
-```
-with
-```
-{% set thinking = true %}
-```
-and save it to `chat_template_thinking.jinja`.
-
-Then launch the SGLang server with the modified chat-template file:
-```
-python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention --chat-template chat_template_thinking.jinja
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp --tp 8 --dp 8 --enable-dp-attention
 ```
 
 **For `DeepSeek-V3.2` and `DeepSeek-V3.2-Speciale`**:
 
-Hardcode the thinking mode to be `thinking` in `_apply_jinja_template` function [here](https://github.com/sgl-project/sglang/blob/7c38eca1e4a704bf09fe6b52ea040a41d3cfc55d/python/sglang/srt/entrypoints/openai/serving_chat.py#L286), then launch the server as usual:
 ```
 python3 -m sglang.launch_server   --model-path deepseek-ai/DeepSeek-V3.2   --trust-remote-code   --tp-size 8 --dp-size 8 --enable-dp-attention   --tool-call-parser deepseekv32   --reasoning-parser deepseek-v3
 ```
 
-After hardcoding, run the following script to evaluate AIME 2025:
+Run the following script to evaluate AIME 2025:
 ```
 #! /bin/bash
 export NEMO_SKILLS_DISABLE_UNCOMMITTED_CHANGES_CHECK=1
@@ -243,6 +227,7 @@ ns eval \
   --model=$MODEL \
   --server_address=http://localhost:${PORT}/v1 \
   --output_dir=nemo_skills_aime25_${MODEL_NAME}_output_${BACKEND}_$(date +%Y%m%d_%H%M%S) \
+  ++chat_template_kwargs.thinking=true \
   ++inference.temperature=1.0 \
   ++inference.top_p=0.95 \
   ++inference.tokens_to_generate=64000
@@ -253,13 +238,12 @@ Test results:
 
 DeepSeek-V3.2-Exp：
 
-| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct     | no_answer |
+| evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
 |--------------------|-------------|------------|-------------|-----------------------|-----------|
-| pass@1[avg-of-4]   | 30          | 14410      | 1758        | 85.83% ± 4.19%        | 0.00%     |
-| majority@4         | 30          | 14410      | 1758        | 90.00%                | 0.00%     |
-| pass@4             | 30          | 14410      | 1758        | 93.33%                | 0.00%     |
+| pass@1[avg-of-4]   | 30          | 15040      | 1673        | 87.50% ± 1.67%        | 0.00%     |
+| majority@4         | 30          | 15040      | 1673        | 90.00%                | 0.00%     |
+| pass@4             | 30          | 15040      | 1673        | 90.00%                | 0.00%     |
 
-Note that the result of problem#3 with id `aime25-2` is marked as false by nemo-skills  but is actually correct because nemo-skills fails to match predicted_answer `016` with expected_answer `16`. If we add 1/30 = 3.33% to the results, the pass@1[avg-of-4] results match with official reference. (89.3%)
 
 DeepSeek-V3.2:
 | evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
