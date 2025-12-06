@@ -41,9 +41,7 @@ class OllamaServing:
         """Get current timestamp in Ollama format."""
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
-    def _convert_options_to_sampling_params(
-        self, options: dict = None, max_tokens: int = None
-    ) -> dict:
+    def _convert_options_to_sampling_params(self, options: dict = None) -> dict:
         """Convert Ollama options to SGLang sampling params."""
         sampling_params = {}
 
@@ -63,9 +61,7 @@ class OllamaServing:
                 if ollama_param in options:
                     sampling_params[sglang_param] = options[ollama_param]
 
-        # Default max tokens if not specified
-        if "max_new_tokens" not in sampling_params:
-            sampling_params["max_new_tokens"] = max_tokens or 2048
+        # If max_new_tokens not specified, SGLang will use its default (128)
 
         return sampling_params
 
