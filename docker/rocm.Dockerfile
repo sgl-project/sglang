@@ -2,12 +2,14 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx942 -t v0.5.6-rocm630-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx942-rocm700 -t v0.5.6-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx950 -t v0.5.6-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.6 --build-arg GPU_ARCH=gfx1201 -t v0.5.6-rocm702-navi48 -f rocm.Dockerfile .
 
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:vllm20250114"
 ARG BASE_IMAGE_942_ROCM700="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
+ARG BASE_IMAGE_1201="rocm/vllm-dev:rocm7.0.2_navi_ubuntu24.04_py3.12_pytorch_2.8_vllm_0.10.2rc1"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -18,6 +20,7 @@ FROM $BASE_IMAGE_942 AS gfx942
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
+ENV BUILD_AITER="1"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.4"
@@ -29,6 +32,7 @@ FROM $BASE_IMAGE_942_ROCM700 AS gfx942-rocm700
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
+ENV BUILD_AITER="1"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.7.post1"
@@ -40,9 +44,22 @@ FROM $BASE_IMAGE_950 AS gfx950
 ENV BUILD_VLLM="0"
 ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
+ENV BUILD_AITER="1"
 ENV BUILD_AITER_ALL="0"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT="v0.1.7.post2"
+ENV NO_DEPS_FLAG=""
+
+# ===============================
+# Base image 1201 and args
+FROM $BASE_IMAGE_1201 AS gfx1201
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="0"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER="0"
+ENV BUILD_AITER_ALL="0"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT=""
 ENV NO_DEPS_FLAG=""
 # ===============================
 # Chosen arch and args
@@ -98,12 +115,12 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 # -----------------------
 # AITER
-RUN pip uninstall -y aiter
-RUN git clone ${AITER_REPO} \
- && cd aiter \
- && git checkout ${AITER_COMMIT} \
- && git submodule update --init --recursive
-RUN cd aiter \
+RUN if [ "$BUILD_AITER" = "1" ]; then \
+        pip uninstall -y aiter \
+     && git clone ${AITER_REPO} \
+     && cd aiter \
+     && git checkout ${AITER_COMMIT} \
+     && git submodule update --init --recursive \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
@@ -111,7 +128,8 @@ RUN cd aiter \
           sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
         else \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
-        fi
+        fi; \
+    fi
 
 # -----------------------
 # Triton
@@ -304,7 +322,7 @@ ENV SGLANG_MOE_PADDING=1
 ENV SGLANG_ROCM_DISABLE_LINEARQUANT=0
 ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
-ENV SGLANG_USE_AITER=1
+ENV SGLANG_USE_AITER=${BUILD_AITER}
 ENV SGLANG_USE_ROCM700A=1
 
 ENV NCCL_MIN_NCHANNELS=112
