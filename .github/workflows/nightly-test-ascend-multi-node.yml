@@ -1,0 +1,132 @@
+name: 'e2e nightly test multi_node (Ascend NPU)'
+
+on:
+  workflow_call:
+    inputs:
+      soc_version:
+        required: true
+        type: string
+        description: use a2 or a3
+      runner:
+        required: false
+        type: string
+        default: linux-amd64-cpu-0
+      image:
+        required: false
+        type: string
+        description: image for pods
+        default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.3.rc1-a3"
+      test_config_name:
+        required: true
+        type: string
+        description: test config name
+      prefill_size:
+        required: true
+        type: number
+        description: number of prefill nodes
+      decode_size:
+        required: true
+        type: number
+        description: number of decode nodes
+      router_size:
+        required: true
+        type: number
+        description: number of router nodes
+      sglang_source_path:
+        required: true
+        type: string
+        description: sglang source path in container
+      test_case:
+        required: true
+        type: string
+        description: path of test case file
+
+concurrency:
+  group: ascend-nightly-multinode-${{ github.ref }}-${{ inputs.soc_version }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: ${{ inputs.test_config_name }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: swr.ap-southeast-1.myhuaweicloud.com/base_image/ascend-ci/sglang:main-x86
+      env:
+        KUBECONFIG: /data/.cache/kb.yaml
+        KUBECTL: /data/.cache/kubectl
+        NAMESPACE: ascend-sglang
+        ASCEND_TEST_CASE_PATH: test/srt/ascend_k8s
+        KUBE_JOB_TYPE: multi
+        KUBE_JOB_NAME: ascend-sglang-multi
+        KUBE_CONFIG_MAP: ascend-sglang-info
+    steps:
+      - name: Install system denpendencies
+        run: |
+          pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple jinja2-cli
+
+      - name: Install kubernetes
+        run: |
+          # Install kubernetes
+          pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple kubernetes
+          cp $KUBECTL /usr/local/sbin/
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Prepare scripts
+        run: |
+          # prepare for deepep.yaml
+          image="${{ inputs.image }}"
+          prefill_size="${{ inputs.prefill_size }}"
+          decode_size="${{ inputs.decode_size }}"
+          router_size="${{ inputs.router_size }}"
+          sglang_source_path="${{ inputs.sglang_source_path }}"
+          test_case="${{ inputs.test_case }}"          
+          echo "{ \"image\": $image,                                        \
+                  \"name_space\": \"$NAMESPACE\",                           \
+                  \"kube_job_name\": \"$KUBE_JOB_NAME\",                    \
+                  \"kube_config\": \"$KUBECONFIG\",                         \
+                  \"kube_config_map\": \"$KUBE_CONFIG_MAP\",                \
+                  \"prefill_size\": $prefill_size,                          \
+                  \"decode_size\": $decode_size,                            \
+                  \"router_size\": $router_size,                            \
+                  \"sglang_source_path\": \"$sglang_source_path\",          \
+                  \"test_case\": \"$test_case\" }"                         |\
+              jinja2 ${ASCEND_TEST_CASE_PATH}/deepep.yaml.jinja2 -o ${ASCEND_TEST_CASE_PATH}/deepep.yaml
+          echo "Kubelete config file is generated: ${ASCEND_TEST_CASE_PATH}/deepep.yaml"
+
+      - name: Clear resources
+        run: |
+          cd $ASCEND_TEST_CASE_PATH
+          kubectl delete -f ./deepep.yaml --ignore-not-found=true || true
+
+          pod_name_prefix="${KUBE_JOB_NAME}-sglang"
+          echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
+          while true; do
+            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
+              echo "Found exist sglang job, sleeping for 30 seconds..."
+              sleep 30
+              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
+            else
+              echo "No sglang job exist, start deepep case..."
+              break
+            fi
+          done
+
+      - name: Run test
+        timeout-minutes: 300
+        env:
+          SGLANG_USE_MODELSCOPE: true
+          SGLANG_IS_IN_CI: true
+          HF_ENDPOINT: https://hf-mirror.com
+        run: |
+
+          cd $ASCEND_TEST_CASE_PATH
+          python3 -u run_ascend_ci.py
+
+      - name: Post process
+        if: always()
+        run: |
+          kubectl get pods -n $NAMESPACE
+          cd $ASCEND_TEST_CASE_PATH
+          kubectl delete -f ./deepep.yaml --ignore-not-found=true || true
