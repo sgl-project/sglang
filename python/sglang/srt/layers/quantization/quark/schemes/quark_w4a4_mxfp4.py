@@ -6,10 +6,10 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkScheme
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 
-_is_hip = is_hip()
-if _is_hip:
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+if _use_aiter:
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4
     from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import gemm_afp4wfp4_pre_quant
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
@@ -25,6 +25,10 @@ class QuarkW4A4MXFP4(QuarkScheme):
     def __init__(
         self, weight_quant_spec: dict[str, Any], input_quant_spec: dict[str, Any]
     ):
+        if not _use_aiter:
+            raise ImportError(
+                "QuarkW4A4MXFP4 requires the 'aiter' package, but it is not installed or not enabled via SGLANG_USE_AITER."
+            )
         self.out_dtype = torch.get_default_dtype()
         self.qscheme = "per_group"
         self.weight_quant_spec = weight_quant_spec
