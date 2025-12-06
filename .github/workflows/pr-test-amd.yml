@@ -144,13 +144,14 @@ jobs:
         run: |
           docker exec -w /sglang-checkout/test ci_sglang python3 run_suite.py --hw amd --suite stage-a-test-1
 
-  multimodal-gen-test-amd:
+  multimodal-gen-test-1-gpu-amd:
     needs: [check-changes]
     if: needs.check-changes.outputs.multimodal_gen == 'true'
     strategy:
       fail-fast: false
       matrix:
         runner: [linux-mi325-gpu-1]
+        part: [0, 1]
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -176,10 +177,68 @@ jobs:
         run: |
           bash scripts/ci/amd_ci_install_dependency.sh diffusion
 
-      - name: Run diffusion server tests
+      - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 60
         run: |
-          docker exec -w /sglang-checkout/python ci_sglang python3 -m pytest sglang/multimodal_gen/test/server -s -v --log-cli-level=INFO
+          docker exec \
+            -e SGLANG_E2E_TOLERANCE=0.35 \
+            -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
+            -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
+            -e SGLANG_DENOISE_STEP_TOLERANCE=0.3 \
+            -e SGLANG_DENOISE_AGG_TOLERANCE=0.25 \
+            -w /sglang-checkout/python \
+            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
+              --suite 1-gpu \
+              --partition-id ${{ matrix.part }} \
+              --total-partitions 2
+
+  multimodal-gen-test-2-gpu-amd:
+    needs: [check-changes]
+    if: needs.check-changes.outputs.multimodal_gen == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-mi325-gpu-2]
+        part: [0, 1]
+    runs-on: ${{matrix.runner}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ensure_vram_clear.sh rocm
+
+      - name: Download artifacts
+        if: needs.check-changes.outputs.sgl_kernel == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda12.9
+
+      - name: Start CI container
+        run: bash scripts/ci/amd_ci_start_container.sh
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/amd_ci_install_dependency.sh diffusion
+
+      - name: Run diffusion server tests (2-GPU)
+        timeout-minutes: 60
+        run: |
+          docker exec \
+            -e SGLANG_E2E_TOLERANCE=0.3 \
+            -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
+            -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
+            -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
+            -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
+            -w /sglang-checkout/python \
+            ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
+              --suite 2-gpu \
+              --partition-id ${{ matrix.part }} \
+              --total-partitions 2
 
   unit-test-backend-1-gpu-amd:
     needs: [check-changes, stage-a-test-1-amd]
@@ -545,7 +604,8 @@ jobs:
         check-changes,
 
         sgl-kernel-unit-test-amd,
-        multimodal-gen-test-amd,
+        multimodal-gen-test-1-gpu-amd,
+        multimodal-gen-test-2-gpu-amd,
 
         stage-a-test-1-amd,
         unit-test-backend-1-gpu-amd,
