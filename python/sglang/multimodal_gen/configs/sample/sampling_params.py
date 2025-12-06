@@ -563,7 +563,7 @@ class SamplingParams:
         if user_params is None:
             return
 
-        subclass_defined_fields = set(type(self).__annotations__.keys())
+        predefined_fields = set(type(self).__annotations__.keys())
 
         # global switch: if True, allow overriding protected fields
         allow_override_protected = not user_params.no_override_protected_fields
@@ -574,7 +574,7 @@ class SamplingParams:
 
             # A field is considered user-modified if its value is different from the default
             is_user_modified = user_value != default_class_value
-            is_protected_field = field_name in subclass_defined_fields
+            is_protected_field = field_name in predefined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
             ):
