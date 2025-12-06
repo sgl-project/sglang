@@ -273,6 +273,10 @@ class VisionTritonAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
+        use_data_parallel = (
+            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
+        )
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
 
     def forward(
         self,
@@ -290,7 +294,7 @@ class VisionTritonAttention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if get_bool_env_var("SGLANG_VIT_CUDA_GRAPH"):
+        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
 
@@ -338,6 +342,10 @@ class VisionFlash3Attention(nn.Module):
         if not _is_cuda:
             raise Exception("VisionFlash3Attention is only available for cuda")
         super().__init__()
+        use_data_parallel = (
+            kwargs["use_data_parallel"] if "use_data_parallel" in kwargs else False
+        )
+        self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
 
     def forward(
         self,
@@ -355,7 +363,7 @@ class VisionFlash3Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
-        if get_bool_env_var("SGLANG_VIT_CUDA_GRAPH"):
+        if get_bool_env_var("SGLANG_VIT_ENABLE_CUDA_GRAPH") and self.tp_size == 1:
             max_seqlen = cu_seqlens[1]
             output = flash_attn_varlen_func(
                 q,
@@ -576,6 +584,7 @@ class VisionAttention(nn.Module):
             dropout=dropout,
             flatten_batch=flatten_batch,
             softmax_in_single_precision=softmax_in_single_precision,
+            use_data_parallel=use_data_parallel,
         )
 
         self.use_qkv_parallel = use_qkv_parallel
