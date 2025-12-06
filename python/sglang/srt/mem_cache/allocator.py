@@ -249,8 +249,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        assert self.full_to_swa_index_mapping is not None
-        return self.full_to_swa_index_mapping[kv_indices]
+        return kv_indices
+        # assert self.full_to_swa_index_mapping is not None
+        # return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
     @nvtx_annotated_method("swa_kv_cache_allocator.alloc")
     def alloc(self, need_size: int):

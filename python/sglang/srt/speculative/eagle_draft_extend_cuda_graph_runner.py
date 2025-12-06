@@ -91,9 +91,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.ones((self.max_num_token,), dtype=torch.int64)
-            self.swa_out_cache_loc = torch.ones(
-                (self.max_num_token,), dtype=torch.int64
-            )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
@@ -238,7 +235,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:bs]
         accept_length = self.accept_length[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
-        swa_out_cache_loc = self.swa_out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
         hidden_states = self.hidden_states[:num_tokens]
@@ -301,7 +297,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            swa_out_cache_loc=swa_out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
@@ -388,7 +383,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         if bs * self.num_tokens_per_bs != num_tokens:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
-            self.swa_out_cache_loc.zero_()
             self.positions.zero_()
             self.accept_length.fill_(self.num_tokens_per_bs)
             self.extend_seq_lens.fill_(self.num_tokens_per_bs)
@@ -401,7 +395,6 @@ class EAGLEDraftExtendCudaGraphRunner:
         else:
             self.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        self.swa_out_cache_loc[:num_tokens].copy_(forward_batch.swa_out_cache_loc)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         if (
             forward_batch.spec_info.hidden_states.shape[1]

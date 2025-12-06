@@ -103,7 +103,6 @@ class MTPDraftExtendCudaGraphRunner:
             # slice according to max_num_token
             self.input_ids = cuda_graph_buffers["input_ids"][offset : offset + self.max_num_token]
             self.out_cache_loc = cuda_graph_buffers["out_cache_loc"][offset : offset + self.max_num_token]
-            self.swa_out_cache_loc = cuda_graph_buffers["swa_out_cache_loc"][offset : offset + self.max_num_token]
             self.positions = cuda_graph_buffers["positions"][offset : offset + self.max_num_token]
 
             # shared states
@@ -235,7 +234,6 @@ class MTPDraftExtendCudaGraphRunner:
         extend_start_loc = self.extend_start_loc[:bs]
         accept_length = self.accept_length[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
-        swa_out_cache_loc = self.swa_out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
         hidden_states = self.hidden_states[:num_tokens]
@@ -296,7 +294,6 @@ class MTPDraftExtendCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
-            swa_out_cache_loc=swa_out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
@@ -394,11 +391,6 @@ class MTPDraftExtendCudaGraphRunner:
                     forward_batch.req_to_token_pool.req_to_token,
                     self.mtp_worker.req_to_hidden_states_pool,
                 )
-                self.next_cuda_graph_runner.swa_out_cache_loc.copy_(
-                    self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        self.next_cuda_graph_runner.out_cache_loc
-                    )
-                )
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -422,7 +414,6 @@ class MTPDraftExtendCudaGraphRunner:
             self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
             self.extend_start_loc[:raw_bs].copy_(forward_batch.extend_start_loc)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-        self.swa_out_cache_loc[:num_tokens].copy_(forward_batch.swa_out_cache_loc)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         if (
             forward_batch.spec_info.hidden_states.shape[1]
@@ -558,7 +549,6 @@ class MTPMultiStepDraftExtendCudaGraphRunner:
             # Sliced buffers
             self.cuda_graph_buffers['input_ids'] = torch.zeros((self.offsets[-1],), dtype=torch.int64)
             self.cuda_graph_buffers['out_cache_loc'] = torch.ones((self.offsets[-1],), dtype=torch.int64)
-            self.cuda_graph_buffers['swa_out_cache_loc'] = torch.ones((self.offsets[-1],), dtype=torch.int64)
             self.cuda_graph_buffers['positions'] = torch.zeros((self.offsets[-1],), dtype=torch.int64)
 
             # Shared states
@@ -593,7 +583,6 @@ class MTPMultiStepDraftExtendCudaGraphRunner:
         self.cuda_graph_buffers['input_ids'].zero_()
         self.cuda_graph_buffers['seq_lens'].fill_(self.seq_len_fill_value)
         self.cuda_graph_buffers['out_cache_loc'].zero_()
-        self.cuda_graph_buffers['swa_out_cache_loc'].zero_()
         self.cuda_graph_buffers['positions'].zero_()
         self.cuda_graph_buffers['accept_length'][:forward_batch.batch_size].copy_(batch_result.accept_lens)
 
