@@ -14,13 +14,17 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::{
+    events::{self, Event},
+    pd_types::api_path,
+};
 use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
     metrics::RouterMetrics,
+    otel_trace::inject_trace_context_http,
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -391,6 +395,12 @@ impl PDRouter {
             None
         };
 
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        let headers = match inject_trace_context_http(&mut headers_with_trace) {
+            Ok(()) => Some(&headers_with_trace),
+            Err(_) => headers,
+        };
+
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
@@ -410,15 +420,16 @@ impl PDRouter {
         );
 
         // Send both requests concurrently and wait for both
-        debug!(
-            "Sending concurrent requests to prefill={} decode={}",
-            prefill.url(),
-            decode.url()
-        );
+        events::RequestPDSentEvent {
+            prefill_url: prefill.url().to_string(),
+            decode_url: decode.url().to_string(),
+        }
+        .emit();
 
         let (prefill_result, decode_result) =
             tokio::join!(prefill_request.send(), decode_request.send());
-        debug!("Received responses from both servers");
+
+        events::RequestReceivedEvent {}.emit();
 
         let duration = start_time.elapsed();
         RouterMetrics::record_pd_request_duration(context.route, duration);
@@ -873,7 +884,11 @@ impl PDRouter {
                 // Whitelist important end-to-end headers, skip hop-by-hop
                 let forward = matches!(
                     name_lc.as_str(),
-                    "authorization" | "x-request-id" | "x-correlation-id"
+                    "authorization"
+                    | "x-request-id"
+                    | "x-correlation-id"
+                    | "traceparent"      // W3C Trace Context
+                    | "tracestate" // W3C Trace Context
                 ) || name_lc.starts_with("x-request-id-");
                 if forward {
                     if let Ok(val) = value.to_str() {

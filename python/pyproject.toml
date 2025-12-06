@@ -58,7 +58,7 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.18.post2",
+  "sgl-kernel==0.3.18.post3",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
@@ -85,7 +85,8 @@ checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle",
-  "diffusers==0.35.2",
+  # this is temporary
+  "diffusers @ git+https://github.com/huggingface/diffusers.git@6290fdfda40610ce7b99920146853614ba529c6e",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
