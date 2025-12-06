@@ -169,6 +169,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 67108864)]
     max_tree_size: usize,
 
+    #[arg(long, default_value_t = 5)]
+    load_aware_fallback_threshold: usize,
+
     #[arg(long, default_value_t = 536870912)]
     max_payload_size: usize,
 
@@ -387,6 +390,7 @@ impl CliArgs {
                 balance_rel_threshold: self.balance_rel_threshold,
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
+                load_aware_fallback_threshold: self.load_aware_fallback_threshold,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,

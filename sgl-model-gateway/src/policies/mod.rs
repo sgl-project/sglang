@@ -97,6 +97,7 @@ pub struct CacheAwareConfig {
     pub balance_rel_threshold: f32,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
+    pub load_aware_fallback_threshold: usize,
 }
 
 impl Default for CacheAwareConfig {
@@ -107,6 +108,7 @@ impl Default for CacheAwareConfig {
             balance_rel_threshold: 1.1,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
+            load_aware_fallback_threshold: 5,
         }
     }
 }

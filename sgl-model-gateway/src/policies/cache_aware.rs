@@ -309,7 +309,35 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 matched_worker.to_string()
             } else {
                 RouterMetrics::record_cache_miss();
-                tree.get_smallest_tenant()
+                / Load-Aware Fallback for Cache Misses
+                // just get smallest tenant
+                let candidate_url = tree.get_smallest_tenant();
+                // Peek at the candidate's load.
+                // If the "Smallest Cache" worker is significantly overloaded,
+                // override the decision and pick the "Least Loaded" worker.
+
+                let candidate_worker = workers.iter().find(|w| w.url() == candidate_url);
+
+                if let Some(w) = candidate_worker {
+                    // Check if candidate is overloaded (load > min_load + 5)
+                    // The threshold 5 is arbitrary but prevents jitter
+                    if w.load() > min_load + self.config.load_aware_fallback_threshold {
+                        debug!("Cache-Aware Override: Candidate {} is overloaded (load: {} vs min: {} + {}). Fallback to least loaded.",
+                            w.url(), w.load(), min_load, self.config.load_aware_fallback_threshold);
+
+                        let best_idx = healthy_indices
+                            .iter()
+                            .min_by_key(|&&idx| workers[idx].load())
+                            .copied()
+                            .unwrap();
+
+                        workers[best_idx].url().to_string()
+                    } else {
+                        candidate_url
+                    }
+                } else {
+                    candidate_url
+                }
             };
 
             // Find the index of the selected worker
@@ -471,6 +499,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
+            load_aware_fallback_threshold: 5,
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -529,5 +558,138 @@ mod tests {
         // All requests should now go to worker2
         let idx = policy.select_worker(&workers, Some("test1")).unwrap();
         assert_eq!(idx, 1);
+    }
+    #[test]
+    fn test_prove_cache_aware_overload_flaw() {
+        // 1. Setup the Policy
+        // We set a high balance threshold so standard load balancing doesn't trigger immediately,
+        // isolating the specific behavior of the cache-aware fallback logic.
+        let config = CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 100, // High threshold to force cache logic
+            balance_rel_threshold: 10.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 1_000_000,
+            load_aware_fallback_threshold: 5,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+        // 2. Setup Workers
+        let worker_overloaded = BasicWorkerBuilder::new("http://overloaded:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker_idle = BasicWorkerBuilder::new("http://idle:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        // 3. Simulate "Workload A": Overloaded worker with Small Cache
+        // We set load to 50 (busy) but only insert a short prompt into the tree
+        for _ in 0..50 {
+            worker_overloaded.increment_load();
+        }
+        policy.add_worker_by_url("http://overloaded:8000", "default");
+        // Insert short prompt -> Small Tree Size (e.g. 5 chars)
+        if let Some(tree) = policy.trees.get("default") {
+            tree.insert("short", "http://overloaded:8000");
+        }
+
+        // 4. Simulate "Workload B": Idle worker with Large Cache
+        // Load is 0 (idle), but we insert a massive prompt into the tree
+        policy.add_worker_by_url("http://idle:8000", "default");
+        if let Some(tree) = policy.trees.get("default") {
+            // Insert massive prompt -> Large Tree Size (e.g. 1000 chars)
+            let massive_prompt = "x".repeat(1000);
+            tree.insert(&massive_prompt, "http://idle:8000");
+        }
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(worker_overloaded),
+            Arc::new(worker_idle)
+        ];
+
+        // 5. The Trigger: A completely new request (Cache Miss)
+        // Since it's a miss, the router falls back to "get_smallest_tenant()"
+        println!("Sending Probe Request (Cache Miss)...");
+        let selected_idx = policy.select_worker(&workers, Some("new_unique_prompt")).unwrap();
+        let selected_url = workers[selected_idx].url();
+
+        println!("Selected Worker: {}", selected_url);
+        println!("Overloaded Load: {}", workers[0].load());
+        println!("Idle Load:       {}", workers[1].load());
+
+        // 6. The corrected implementation should pick the IDLE worker
+        assert_eq!(selected_url, "http://idle:8000",
+            "SUCCESS: Router correctly prioritized the IDLE worker despite its larger cache usage.");
+    }
+
+    #[test]
+    fn test_simulation_production_traffic() {
+
+        let config = CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 1000,
+            balance_rel_threshold: 100.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 1_000_000,
+            load_aware_fallback_threshold: 5,
+        };
+        let policy = CacheAwarePolicy::with_config(config);
+
+
+        // Worker 0: The "Trap" - High Load, Small Cache (e.g., stuck decoding)
+        let w0 = BasicWorkerBuilder::new("http://w0:8000").worker_type(WorkerType::Regular).build();
+        // Worker 1: Normal - Medium Load, Medium Cache
+        let w1 = BasicWorkerBuilder::new("http://w1:8000").worker_type(WorkerType::Regular).build();
+        // Worker 2: Idle, Large Cache (e.g., just finished a big job)
+        let w2 = BasicWorkerBuilder::new("http://w2:8000").worker_type(WorkerType::Regular).build();
+
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(w0), Arc::new(w1), Arc::new(w2)];
+        policy.init_workers(&workers);
+
+        // Initialize States
+        // W0: Load 20, Cache Size 1 (Small)
+        for _ in 0..20 { workers[0].increment_load(); }
+        policy.trees.get("default").unwrap().insert("a", "http://w0:8000");
+
+        // W1: Load 5, Cache Size 10 (Medium)
+        for _ in 0..5 { workers[1].increment_load(); }
+        policy.trees.get("default").unwrap().insert("a".repeat(10).as_str(), "http://w1:8000");
+
+        // W2: Load 0, Cache Size 100 (Large)
+        // Ideally this node should take new requests, but current logic shuns it due to cache size
+        policy.trees.get("default").unwrap().insert("a".repeat(100).as_str(), "http://w2:8000");
+
+        println!("\n--- STARTING SIMULATION (100 Requests) ---");
+        println!("Initial Loads -> W0: {}, W1: {}, W2: {}", workers[0].load(), workers[1].load(), workers[2].load());
+
+
+        let mut distribution = vec![0; 3];
+
+        for i in 0..100 {
+            // Simulate 80% Cache Misses (New traffic)
+            let prompt = format!("unique_request_{}", i);
+
+            // In a real router, selecting a worker increments its load.
+            // We must simulate that manually here to track the "pile up".
+            let idx = policy.select_worker(&workers, Some(&prompt)).unwrap();
+            workers[idx].increment_load();
+            distribution[idx] += 1;
+        }
+
+        println!("\n--- RESULTS ---");
+        println!("Final Loads   -> W0: {}, W1: {}, W2: {}", workers[0].load(), workers[1].load(), workers[2].load());
+        println!("Requests Sent -> W0: {}, W1: {}, W2: {}", distribution[0], distribution[1], distribution[2]);
+
+
+
+        let w0_traffic = distribution[0];
+        let w2_traffic = distribution[2];
+
+        if w0_traffic > w2_traffic {
+            println!("\n[FAIL] ROUTER IS UNBALANCED: It sent {} reqs to the Overloaded node (W0) and only {} to the Idle node (W2).", w0_traffic, w2_traffic);
+            panic!("Router prioritized cache size over actual compute availability!");
+        } else {
+            println!("\n[SUCCESS] ROUTER IS BALANCED: It correctly prioritized the Idle node.");
+        }
     }
 }

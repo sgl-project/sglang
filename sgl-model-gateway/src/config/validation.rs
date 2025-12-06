@@ -151,6 +151,7 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                load_aware_fallback_threshold: _,
             } => {
                 if !(0.0..=1.0).contains(cache_threshold) {
                     return Err(ConfigError::InvalidValue {
@@ -661,6 +662,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_aware_fallback_threshold: 5,
             },
         );
 
@@ -680,6 +682,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_aware_fallback_threshold: 5,
             },
         );
 
@@ -734,6 +737,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_aware_fallback_threshold: 5,
             },
         );
 
@@ -778,6 +782,7 @@ mod tests {
                     balance_rel_threshold: 1.1,
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
+                    load_aware_fallback_threshold: 5,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,

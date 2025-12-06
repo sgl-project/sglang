@@ -315,6 +315,8 @@ pub enum PolicyConfig {
         balance_rel_threshold: f32,
         eviction_interval_secs: u64,
         max_tree_size: usize,
+        #[serde(default = "default_load_aware_fallback_threshold")]
+        load_aware_fallback_threshold: usize,
     },
 
     #[serde(rename = "power_of_two")]
@@ -329,6 +331,9 @@ pub enum PolicyConfig {
         /// Interval between bucket boundary adjustment cycles (seconds)
         bucket_adjust_interval_secs: usize,
     },
+}
+fn default_load_aware_fallback_threshold() -> usize {
+    5
 }
 
 impl PolicyConfig {
@@ -718,6 +723,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            load_aware_fallback_threshold: 5,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -739,11 +745,13 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 1000,
+            load_aware_fallback_threshold: 5,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
         assert!(json.contains("\"cache_threshold\":0.8"));
         assert!(json.contains("\"balance_abs_threshold\":10"));
+        assert!(json.contains("\"load_aware_fallback_threshold\":5"));
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
@@ -761,6 +769,7 @@ mod tests {
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 600,
             max_tree_size: 5000,
+            load_aware_fallback_threshold: 5,
         };
 
         match cache_aware {
@@ -770,12 +779,14 @@ mod tests {
                 balance_rel_threshold,
                 eviction_interval_secs,
                 max_tree_size,
+                load_aware_fallback_threshold,
             } => {
                 assert!((cache_threshold - 0.75).abs() < 0.0001);
                 assert_eq!(balance_abs_threshold, 20);
                 assert!((balance_rel_threshold - 2.0).abs() < 0.0001);
                 assert_eq!(eviction_interval_secs, 600);
                 assert_eq!(max_tree_size, 5000);
+                assert_eq!(load_aware_fallback_threshold, 10);
             }
             _ => panic!("Expected CacheAware"),
         }
@@ -1123,6 +1134,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_aware_fallback_threshold: 5,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1153,6 +1165,7 @@ mod tests {
                 balance_rel_threshold: 1.1,
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
+                load_aware_fallback_threshold: 5,
             }),
             decode_policy: None,
         };
@@ -1209,6 +1222,7 @@ mod tests {
             balance_rel_threshold: 1.5,
             eviction_interval_secs: 300,
             max_tree_size: 2000,
+            load_aware_fallback_threshold: 5,
         };
 
         match pd.get_prefill_policy(&main_policy) {
