@@ -43,6 +43,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -1422,6 +1423,12 @@ class MLATokenToKVPool(KVCache):
     ):
         layer_id = layer.layer_id
         assert not (self.use_nsa and self.nsa_kv_cache_store_fp8)
+
+        valid_mask = loc % get_dcp_world_size() == get_dcp_rank()
+        if not valid_mask.all():
+            loc = loc[valid_mask]
+            cache_k = cache_k[valid_mask]
+
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 

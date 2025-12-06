@@ -1530,7 +1530,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.is_prefill_only = False
 
     def new_page_count_next_decode(self, selected_indices: Optional[List[int]] = None):
-        page_size = self.token_to_kv_pool_allocator.page_size
+        page_size = self.tree_cache.page_size
         requests = (
             self.reqs
             if selected_indices is None
@@ -1564,7 +1564,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         num_tokens = (
             self.new_page_count_next_decode(selected_indices)
             * buf_multiplier
-            * self.token_to_kv_pool_allocator.page_size
+            * self.tree_cache.page_size
         )
 
         evict_from_tree_cache(self.tree_cache, num_tokens)
