@@ -45,7 +45,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 ## Architecture
 
 ### Control Plane
-- **Worker Manager** discovers capabilities (`/server_info`, `/model_info`), tracks load, and registers/removes workers in the shared registry.
+- **Worker Manager** discovers capabilities (`/get_server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
 - **Job Queue** serializes add/remove requests and exposes status (`/workers/{url}`) so clients can track onboarding progress.
 - **Load Monitor** feeds cache-aware and power-of-two policies with live worker load statistics.
 - **Health Checker** continuously probes workers and updates readiness, circuit breaker state, and router metrics.
