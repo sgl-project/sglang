@@ -190,9 +190,18 @@ class AiterAttnBackend(AttentionBackend):
             if self.num_draft_tokens is None and _use_mla_ps_kernel:
                 self.max_split_per_batch = 64
 
+            self.fix_max_split_per_batch = self.max_split_per_batch
+
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
         nhead = self.num_head
         dtype = self.kv_cache_dtype
+
+        gpu = torch.cuda.current_device()
+        device_properties = torch.cuda.get_device_properties(gpu)
+        cu_num = device_properties.multi_processor_count
+        self.max_split_per_batch = min(
+            (cu_num + batch_size - 1) // batch_size, self.fix_max_split_per_batch
+        )
 
         (
             (work_meta_data_size, work_meta_data_type),
@@ -263,6 +272,8 @@ class AiterAttnBackend(AttentionBackend):
 
         nhead_kv = 1
         page_size = 1
+        dtype = self.kv_cache_dtype
+
         meta = get_mla_metadata_v1(
             qo_indptr,
             kv_indptr,
@@ -280,7 +291,9 @@ class AiterAttnBackend(AttentionBackend):
             uni_seqlen_qo=max_q_len,
             fast_mode=fast_mode,
             max_split_per_batch=max_split_per_batch,
-            intera_batch_mode=intra_batch_mode,
+            intra_batch_mode=intra_batch_mode,
+            dtype_q=dtype,
+            dtype_kv=dtype,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -330,8 +343,6 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len = 1
 
                 if _use_mla_ps_kernel:
-                    num_kv_splits = self.max_split_per_batch
-
                     (
                         work_metadata,
                         work_indptr,
@@ -340,6 +351,8 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                     ) = self.make_mla_decode_meta_data_buffer(max_q_len, bs)
+
+                    num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
                         qo_indptr,
@@ -384,9 +397,6 @@ class AiterAttnBackend(AttentionBackend):
                 )
 
                 if _use_mla_ps_kernel:
-
-                    num_kv_splits = self.max_split_per_batch
-
                     max_seqlen_qo = max(forward_batch.extend_seq_lens_cpu)
                     (
                         work_metadata,
@@ -396,6 +406,8 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                     ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+
+                    num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
                         qo_indptr,
@@ -480,9 +492,6 @@ class AiterAttnBackend(AttentionBackend):
 
                 # if self.kv_cache_dtype == fp8_dtype:
                 if _use_mla_ps_kernel:
-
-                    num_kv_splits = self.max_split_per_batch
-
                     max_seqlen_qo = draft_num
                     (
                         work_metadata,
@@ -492,6 +501,8 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                     ) = self.make_mla_decode_meta_data_buffer(max_seqlen_qo, bs)
+
+                    num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
                         qo_indptr,
