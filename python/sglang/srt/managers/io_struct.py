@@ -197,6 +197,9 @@ class GenerateReqInput(BaseReq):
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
 
+    # For reasoning
+    reasoning: bool = False
+
     # Validation step duration
     validation_time: Optional[float] = None
 
@@ -674,6 +677,9 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
+
+    # For reasoning
+    reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
