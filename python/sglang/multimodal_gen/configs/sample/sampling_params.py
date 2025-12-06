@@ -116,8 +116,8 @@ class SamplingParams:
     fps: int = 24
 
     # Denoising parameters
-    num_inference_steps: int = 50
-    guidance_scale: float = 1.0
+    num_inference_steps: int = None
+    guidance_scale: float = None
     guidance_rescale: float = 0.0
     boundary_ratio: float | None = None
 
@@ -137,8 +137,8 @@ class SamplingParams:
     return_frames: bool = False
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
-    # if True, allow user params to override subclass-defined protected fields
-    override_protected_fields: bool = False
+    # if True, disallow user params to override subclass-defined protected fields
+    no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
     adjust_frames: bool = True
 
@@ -289,15 +289,6 @@ class SamplingParams:
 
         self._set_output_file_name()
         self.log(server_args=server_args)
-
-    def update(self, source_dict: dict[str, Any]) -> None:
-        for key, value in source_dict.items():
-            if hasattr(self, key):
-                setattr(self, key, value)
-            else:
-                logger.exception("%s has no attribute %s", type(self).__name__, key)
-
-        self.__post_init__()
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
@@ -522,12 +513,11 @@ class SamplingParams:
             help="Whether to return the decoded trajectory",
         )
         parser.add_argument(
-            "--override-protected-fields",
+            "--no-override-protected-fields",
             action="store_true",
-            default=SamplingParams.override_protected_fields,
+            default=SamplingParams.no_override_protected_fields,
             help=(
-                "If set, allow user params to override fields defined in subclasses "
-                "(protected by default)."
+                "If set, disallow user params to override fields defined in subclasses."
             ),
         )
         parser.add_argument(
@@ -569,46 +559,26 @@ class SamplingParams:
     def _merge_with_user_params(self, user_params: "SamplingParams"):
         """
         Merges parameters from a user-provided SamplingParams object.
-
-        This method updates the current object with values from `user_params`,
-        but skips any fields that are explicitly defined in the current object's
-        subclass. This is to preserve model-specific optimal parameters.
-        It also skips fields that the user has not changed from the default
-        in `user_params`.
         """
         if user_params is None:
             return
 
-        # user is not allowed to modify any param defined in the SamplingParams subclass
-        subclass_defined_fields = set(type(self).__annotations__.keys())
+        predefined_fields = set(type(self).__annotations__.keys())
 
         # global switch: if True, allow overriding protected fields
-        allow_override_protected = bool(
-            user_params.override_protected_fields or self.override_protected_fields
-        )
-
-        # Compare against current instance to avoid constructing a default instance
-        default_params = SamplingParams()
-
+        allow_override_protected = not user_params.no_override_protected_fields
         for field in dataclasses.fields(user_params):
             field_name = field.name
             user_value = getattr(user_params, field_name)
-            default_value = getattr(default_params, field_name)
+            default_class_value = getattr(SamplingParams, field_name)
 
-            # A field is considered user-modified if its value is different from
-            # the default, with an exception for `output_file_name` which is
-            # auto-generated with a random component.
-            is_user_modified = (
-                user_value != default_value
-                if field_name != "output_file_name"
-                else user_params.output_file_path is not None
-            )
+            # A field is considered user-modified if its value is different from the default
+            is_user_modified = user_value != default_class_value
+            is_protected_field = field_name in predefined_fields
             if is_user_modified and (
-                allow_override_protected or field_name not in subclass_defined_fields
+                allow_override_protected or not is_protected_field
             ):
-                if hasattr(self, field_name):
-                    setattr(self, field_name, user_value)
-
+                setattr(self, field_name, user_value)
         self.height_not_provided = user_params.height_not_provided
         self.width_not_provided = user_params.width_not_provided
         self.__post_init__()
