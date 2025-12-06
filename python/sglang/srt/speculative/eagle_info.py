@@ -732,13 +732,17 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return
 
+        if has_been_filtered and len(new_indices) != len(self.topk_p):
+            # has_been_filtered has default value True
+            # but if the lengths are not equal, the batch is not filtered yet
+            logger.debug(
+                f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, adjuesting has_been_filtered to False"
+            )
+            has_been_filtered = False
+
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
             # therefore, we don't need to filter the batch again in scheduler
-            if len(new_indices) != len(self.topk_p):
-                logger.warning(
-                    f"length of new_indices: {len(new_indices)} != length of topk_p: {len(self.topk_p)}, this should not happen"
-                )
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
