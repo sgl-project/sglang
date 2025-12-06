@@ -18,6 +18,7 @@ class GraphInputBuffers:
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
+    xdrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
     next_token_logits_buffer: torch.Tensor
@@ -53,6 +54,7 @@ class GraphInputBuffers:
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
+            xdrope_positions = torch.zeros((4, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             custom_mask = torch.ones(
                 (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
@@ -104,6 +106,7 @@ class GraphInputBuffers:
             out_cache_loc=out_cache_loc,
             positions=positions,
             mrope_positions=mrope_positions,
+            xdrope_positions=xdrope_positions,
             num_token_non_padded=num_token_non_padded,
             custom_mask=custom_mask,
             next_token_logits_buffer=next_token_logits_buffer,
@@ -152,6 +155,11 @@ class GraphInputBuffers:
 
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
+
+        if forward_batch.xdrope_positions is not None:
+            self.xdrope_positions[:, :raw_num_token].copy_(
+                forward_batch.xdrope_positions
+            )
 
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
