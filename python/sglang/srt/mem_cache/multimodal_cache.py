@@ -17,10 +17,12 @@ class MultimodalCache(abc.ABC):
     def combine_hashes(mm_hashes: List[int]) -> Optional[int]:
         """
         Get a combined hash from individual mm item hashes
+        Uses a string to enable hash randomization, protecting against maliciously crafted collisions.
+        Like CVE-2025-25183.
         """
         if not mm_hashes:
             return None
-        return hash(tuple(mm_hashes))
+        return hash(("random_seed", tuple(mm_hashes)))
 
     @abc.abstractmethod
     def get(

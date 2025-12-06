@@ -793,7 +793,7 @@ def get_multimodal_data_bounds(
 
 
 def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
+    hash_bytes = hashlib.sha256(data).digest()
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
