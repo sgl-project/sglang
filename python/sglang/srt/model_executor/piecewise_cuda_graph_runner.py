@@ -227,6 +227,7 @@ class PiecewiseCudaGraphRunner:
             self.positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
+
             if (
                 self.is_multimodal
             ):  # Only create input_embeds and mrope_positions for multimodal model to save memory
@@ -240,10 +241,6 @@ class PiecewiseCudaGraphRunner:
                 self.mrope_positions = torch.zeros(
                     (3, self.max_num_tokens), dtype=torch.int64
                 )
-
-            self.extend_prefix_lens = torch.zeros(
-                (self.max_num_tokens,), dtype=torch.int64
-            )
 
         self.attention_layers = self.model_runner.attention_layers
 
@@ -411,7 +408,6 @@ class PiecewiseCudaGraphRunner:
             if self.out_cache_loc_swa is not None
             else None
         )
-        extend_prefix_lens = self.extend_prefix_lens[:bs]
         positions = self.positions[:num_tokens]
         mrope_positions = (
             self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
@@ -447,7 +443,7 @@ class PiecewiseCudaGraphRunner:
                 return_logprob=False,
                 extend_num_tokens=num_tokens,
                 extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=extend_prefix_lens,
+                extend_prefix_lens=torch.tensor([num_tokens], device=self.device),
                 extend_start_loc=torch.tensor([0], device=self.device),
                 extend_prefix_lens_cpu=torch.tensor([num_tokens]),
                 extend_seq_lens_cpu=torch.tensor([num_tokens]),
@@ -528,12 +524,9 @@ class PiecewiseCudaGraphRunner:
                     forward_batch.out_cache_loc
                 )
             )
-        self.extend_prefix_lens[:bs].copy_(forward_batch.extend_prefix_lens)
-
         input_ids = self.input_ids[:static_num_tokens]
         positions = self.positions[:static_num_tokens]
         out_cache_loc = self.out_cache_loc[:static_num_tokens]
-        extend_prefix_lens = self.extend_prefix_lens[:bs]
 
         out_cache_loc_swa = (
             self.out_cache_loc_swa[:static_num_tokens]
@@ -576,7 +569,7 @@ class PiecewiseCudaGraphRunner:
             encoder_lens=forward_batch.encoder_lens,
             return_logprob=False,
             extend_seq_lens=forward_batch.extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
             extend_start_loc=forward_batch.extend_start_loc,
             extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,

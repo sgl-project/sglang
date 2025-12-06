@@ -710,7 +710,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
 
                 torch.ops.sglang.causal_conv1d_gdn_with_output(
-                    mixed_qkv.transpose(0, 1),
+                    mixed_qkv,
                     conv_weights,
                     bias,
                     activation,
@@ -721,6 +721,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     g,
                     beta,
                     ssm_states,
+                    seq_len,
                     key_dim,
                     value_dim,
                     attn_tp_size,
@@ -731,7 +732,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
             else:
                 core_attn_out = self._causal_conv1d_gdn_core(
-                    mixed_qkv.transpose(0, 1),
+                    mixed_qkv,
                     conv_weights,
                     bias,
                     activation,
@@ -742,6 +743,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     g,
                     beta,
                     ssm_states,
+                    seq_len,
                     key_dim,
                     value_dim,
                     attn_tp_size,
@@ -752,7 +754,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def _causal_conv1d_gdn_core(
         self,
-        mixed_qkv_t: torch.Tensor,
+        mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
         bias: torch.Tensor,
         activation: str,
@@ -763,17 +765,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
         g: torch.Tensor,
         beta: torch.Tensor,
         ssm_states: torch.Tensor,
+        seq_len: int,
         key_dim: int,
         value_dim: int,
         attn_tp_size: int,
         head_k_dim: int,
         head_v_dim: int,
     ):
-        has_initial_state = extend_prefix_lens > 0
-
+        has_initial_state0 = extend_prefix_lens > 0
+        has_initial_state = extend_prefix_lens.long() > 0
+        device_id = torch.cuda.current_device()
+        if device_id == 0:
+            print("has_initial_state long:", has_initial_state)
+            print("has_initial_state :", has_initial_state0)
         # ---- 1. conv ----
-        x_conv = causal_conv1d_fn(
-            mixed_qkv_t,
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
             conv_weights,
             bias,
             activation=activation,
@@ -781,9 +788,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             has_initial_state=has_initial_state,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
-        )
-
-        mixed_qkv = x_conv.transpose(0, 1)  # [seq, *, dim]
+        ).transpose(0, 1)[:seq_len]
 
         # ---- 2. split ----
         key_split_dim = key_dim // attn_tp_size
@@ -820,7 +825,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
         ssm_states[cache_indices] = last_recurrent_state
-
         return core_attn_out
 
 
@@ -1086,7 +1090,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
 
 def causal_conv1d_gdn_with_output_fake(
-    mixed_qkv_t: torch.Tensor,
+    mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     bias: torch.Tensor,
     activation: str,
@@ -1097,6 +1101,7 @@ def causal_conv1d_gdn_with_output_fake(
     g: torch.Tensor,
     beta: torch.Tensor,
     ssm_states: torch.Tensor,
+    seq_len: int,
     key_dim: int,
     value_dim: int,
     attn_tp_size: int,
@@ -1108,7 +1113,7 @@ def causal_conv1d_gdn_with_output_fake(
 
 
 def causal_conv1d_gdn_with_output(
-    mixed_qkv_t: torch.Tensor,
+    mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     bias: torch.Tensor,
     activation: str,
@@ -1119,6 +1124,7 @@ def causal_conv1d_gdn_with_output(
     g: torch.Tensor,
     beta: torch.Tensor,
     ssm_states: torch.Tensor,
+    seq_len: int,
     key_dim: int,
     value_dim: int,
     attn_tp_size: int,
@@ -1130,7 +1136,7 @@ def causal_conv1d_gdn_with_output(
     forward_batch = context.forward_batch
     core_attn_out_ret = ret = (
         forward_batch.attn_backend.linear_attn_backend._causal_conv1d_gdn_core(
-            mixed_qkv_t,
+            mixed_qkv,
             conv_weights,
             bias,
             activation,
@@ -1141,6 +1147,7 @@ def causal_conv1d_gdn_with_output(
             g,
             beta,
             ssm_states,
+            seq_len,
             key_dim,
             value_dim,
             attn_tp_size,
