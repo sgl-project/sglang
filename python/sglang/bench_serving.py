@@ -36,9 +36,15 @@ import aiohttp
 import numpy as np
 import pybase64
 import requests
+
+# This change addresses the CI errors encountered on b200 when upgrading to transformers v5.0.
+# TODO: Remove this code once a better solution is available.
+import transformers
 from datasets import load_dataset
 from PIL import Image
 from tqdm.asyncio import tqdm
+
+transformers.utils.import_utils.is_flash_attn_2_available = lambda: False
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
