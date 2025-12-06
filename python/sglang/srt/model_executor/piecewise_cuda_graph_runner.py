@@ -653,7 +653,7 @@ class PiecewiseCudaGraphRunner:
                 del forward_kwargs["pp_proxy_tensors"]
 
             static_forward_batch = self.replay_prepare(
-                forward_batch, pp_proxy_tensors=pp_proxy_tensors, **kwargs
+                forward_batch, pp_proxy_tensors=pp_proxy_tensors, **forward_kwargs
             )
 
             # Prepare PP proxy tensors for forward if needed

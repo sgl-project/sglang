@@ -2449,14 +2449,10 @@ class ModelRunner:
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
-        if not self.server_args.enable_piecewise_cuda_graph:
-            return
-
-        if not self.can_run_piecewise_cuda_graph():
-            log_info_on_rank0(
-                logger,
-                "Piecewise CUDA graph is enabled but cannot run (check can_run_piecewise_cuda_graph for details)",
-            )
+        if (
+            not self.server_args.enable_piecewise_cuda_graph
+            or not self.can_run_piecewise_cuda_graph()
+        ):
             return
 
         # Collect attention layers from the model
