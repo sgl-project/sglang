@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
@@ -8,13 +9,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 import torch
 
 from sglang.srt.layers.parameter import (
-    BasevLLMParameter,
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
     PackedColumnParameter,
     PackedvLLMParameter,
     RowvLLMParameter,
-    permute_param_layout_,
 )
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -23,24 +22,15 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.marlin_utils import (
-    apply_gptq_marlin_linear,
     check_marlin_supported,
-    check_marlin_supports_shape,
-    marlin_is_k_full,
-    marlin_make_empty_g_idx,
-    marlin_make_workspace,
     marlin_moe_permute_scales,
-    marlin_permute_scales,
     marlin_repeat_scales_on_all_ranks,
-    marlin_sort_g_idx,
-    marlin_zero_points,
     verify_marlin_supported,
 )
 from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
     replace_parameter,
-    unpack_cols,
 )
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.patch_torch import register_fake_if_exists
@@ -89,6 +79,10 @@ def gptq_marlin_moe_repack(
     return output
 
 
+def get_compute_capability():
+    return torch.cuda.get_device_capability()[0]*10 + torch.cuda.get_device_capability()[1]
+
+
 @dataclass
 class MarlinLinearLayerConfig:
     full_weight_shape: tuple[int, int]  # [in, out]
@@ -98,6 +92,63 @@ class MarlinLinearLayerConfig:
     group_size: int
     zero_points: bool
     has_g_idx: bool
+
+
+class GPTQKernel(ABC):
+
+    def __init__(self,
+                 c: MarlinLinearLayerConfig,
+                 w_q_param_name: str,
+                 w_s_param_name: str,
+                 w_zp_param_name: Optional[str] = None,
+                 w_gidx_param_name: Optional[str] = None) -> None:
+        #assern self.can_implement(c)
+        self.kernel_config = c
+        self.w_q_name = w_q_param_name
+        self.w_s_name = w_s_param_name
+        if c.zero_points:
+            assert w_zp_param_name is not None
+        if c.has_g_idx:
+            assert w_gidx_param_name is not None
+        self.w_zp_name = w_zp_param_name
+        self.w_gidx_name = w_gidx_param_name
+
+    @abstractmethod
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply_weights(self,
+                      layer: torch.nn.Module,
+                      x: torch.Tensor,
+                      bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _transform_param(self, layer: torch.nn.Module, name: Optional[str],
+                         fn: Callable) -> None:
+        if name is not None and getattr(layer, name, None) is not None:
+
+            old_param = getattr(layer, name)
+            new_param = fn(old_param)
+            # replace the parameter with torch.nn.Parameter for TorchDynamo
+            # compatibility
+            replace_parameter(
+                layer, name,
+                torch.nn.Parameter(new_param.data, requires_grad=False))
+
+    def _get_weight_params(
+            self, layer: torch.nn.Module) -> tuple[
+                torch.Tensor,  # w_q
+                torch.Tensor,  # w_s
+                Optional[torch.Tensor],  # w_zp,
+                Optional[torch.Tensor]  # w_gidx
+            ]:
+        return (
+            getattr(layer, self.w_q_name),
+            getattr(layer, self.w_s_name),
+            getattr(layer, self.w_zp_name or "", None),
+            getattr(layer, self.w_gidx_name or "", None),
+        )
 
 
 class GPTQConfig(QuantizationConfig):
@@ -199,6 +250,7 @@ class GPTQConfig(QuantizationConfig):
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[LinearMethodBase]:
         # Delay the import to avoid circular dependency
+        from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
@@ -581,6 +633,10 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
+
+        from sglang.srt.layers.quantization.machete_kernel import MacheteLinearKernel
+        from sglang.srt.layers.quantization.marlin_kernel import MarlinLinearKernel
+
         output_size_per_partition = sum(output_partition_sizes)
         is_row_parallel = input_size != input_size_per_partition
         weight_loader = extra_weight_attrs.get("weight_loader")
@@ -684,99 +740,22 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         layer.register_parameter("scales", scales)
         layer.register_parameter("qzeros", qzeros)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        device = getattr(layer, "qweight").device
-        c = self.kernel_config
+        cc = get_compute_capability()
+        if cc == 90:
+            kernel_type = MacheteLinearKernel
+        else:
+            kernel_type = MarlinLinearKernel
 
-        check_marlin_supports_shape(
-            c.partition_weight_shape[1],  # out_features
-            c.partition_weight_shape[0],  # in_features
-            c.full_weight_shape[0],  # in_features
-            c.group_size,
+        self.kernel = kernel_type(
+            self.kernel_config,
+            w_q_param_name="qweight",
+            w_s_param_name="scales",
+            w_zp_param_name="qzeros",
+            w_gidx_param_name="g_idx"
         )
 
-        row_parallel = c.partition_weight_shape[0] != c.full_weight_shape[0]
-        self.is_k_full = marlin_is_k_full(c.has_g_idx, row_parallel)
-
-        # Allocate marlin workspace.
-        self.workspace = marlin_make_workspace(device)
-
-        # Default names since marlin requires empty parameters for these,
-        # TODO: remove this requirement from marlin (allow optional tensors)
-        self.w_q_name = "qweight"
-        self.w_s_name = "scales"
-        self.w_zp_name = "qzeros"
-        self.w_gidx_name = "g_idx"
-
-        def _transform_param(
-            layer: torch.nn.Module, name: Optional[str], fn: Callable
-        ) -> None:
-            if name is not None and getattr(layer, name, None) is not None:
-
-                old_param = getattr(layer, name)
-                new_param = fn(old_param)
-                # replace the parameter with torch.nn.Parameter for TorchDynamo
-                # compatibility
-                replace_parameter(
-                    layer, name, torch.nn.Parameter(new_param.data, requires_grad=False)
-                )
-
-        def transform_w_q(x):
-            assert isinstance(x, BasevLLMParameter)
-            permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
-            x.data = gptq_marlin_repack(
-                x.data.contiguous(),
-                perm=layer.g_idx_sort_indices,
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                num_bits=c.weight_type.size_bits,
-            )
-            return x
-
-        def transform_w_s(x):
-            assert isinstance(x, BasevLLMParameter)
-            permute_param_layout_(x, input_dim=0, output_dim=1)
-            x.data = marlin_permute_scales(
-                x.data.contiguous(),
-                size_k=c.partition_weight_shape[0],
-                size_n=c.partition_weight_shape[1],
-                group_size=c.group_size,
-            )
-            return x
-
-        if c.has_g_idx:
-            g_idx, g_idx_sort_indices = marlin_sort_g_idx(
-                getattr(layer, self.w_gidx_name)
-            )
-            _transform_param(layer, self.w_gidx_name, lambda _: g_idx)
-            layer.g_idx_sort_indices = g_idx_sort_indices
-        else:
-            setattr(layer, self.w_gidx_name, marlin_make_empty_g_idx(device))
-            layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
-
-        if c.zero_points:
-            grouped_k = (
-                c.partition_weight_shape[0] // c.group_size if c.group_size != -1 else 1
-            )
-            _transform_param(
-                layer,
-                self.w_zp_name,
-                lambda x: marlin_zero_points(
-                    unpack_cols(
-                        x.t(),
-                        c.weight_type.size_bits,
-                        grouped_k,
-                        c.partition_weight_shape[1],
-                    ),
-                    size_k=grouped_k,
-                    size_n=c.partition_weight_shape[1],
-                    num_bits=c.weight_type.size_bits,
-                ),
-            )
-        else:
-            setattr(layer, self.w_zp_name, marlin_make_empty_g_idx(device))
-        _transform_param(layer, self.w_q_name, transform_w_q)
-        _transform_param(layer, self.w_s_name, transform_w_s)
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.process_weights_after_loading(layer)
 
     def apply(
         self,
@@ -784,41 +763,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        c = self.kernel_config
-
-        def _get_weight_params(
-            layer: torch.nn.Module,
-        ) -> tuple[
-            torch.Tensor,  # w_q
-            torch.Tensor,  # w_s
-            Optional[torch.Tensor],  # w_zp,
-            Optional[torch.Tensor],  # w_gidx
-        ]:
-            return (
-                getattr(layer, self.w_q_name),
-                getattr(layer, self.w_s_name),
-                getattr(layer, self.w_zp_name or "", None),
-                getattr(layer, self.w_gidx_name or "", None),
-            )
-
-        w_q, w_s, w_zp, w_gidx = _get_weight_params(layer)
-
-        # `process_weights_after_loading` will ensure w_zp and w_gidx are not
-        #  None for marlin
-        return apply_gptq_marlin_linear(
-            input=x,
-            weight=w_q,
-            weight_scale=w_s,
-            weight_zp=w_zp,  # type: ignore
-            g_idx=w_gidx,  # type: ignore
-            g_idx_sort_indices=layer.g_idx_sort_indices,
-            workspace=self.workspace,
-            wtype=c.weight_type,
-            input_size_per_partition=c.partition_weight_shape[0],
-            output_size_per_partition=c.partition_weight_shape[1],
-            is_k_full=self.is_k_full,
-            bias=bias,
-        )
+        return self.kernel.apply_weights(layer, x, bias)
 
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):

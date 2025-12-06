@@ -63,6 +63,10 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
     shuffle_rows,
     silu_and_mul_scaled_fp4_grouped_quant,
+    permute_cols,
+    machete_mm,
+    machete_prepack_B,
+    machete_supported_schedules,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.hadamard import (
