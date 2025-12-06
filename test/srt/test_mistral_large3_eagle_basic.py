@@ -83,7 +83,8 @@ class TestMistralLarge3EagleBasic(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_bs_1_speed (mistral-large-3-eagle)\n" f"{speed=:.2f} token/s\n"
+                f"### test_bs_1_speed (mistral-large-3-eagle)\n"
+                f"{speed=:.2f} token/s\n"
             )
             self.assertGreater(speed, 50)
 
