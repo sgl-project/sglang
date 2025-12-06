@@ -128,6 +128,16 @@ namespace {
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
+template <bool is_only_lastdim_contiguous>
+static inline void CHECK_INPUT_SHAPE_DTYPE(const at::Tensor& tensor, const at::IntArrayRef sizes, at::ScalarType st) {
+  TORCH_CHECK(tensor.sizes() == sizes, "Input tensor shape mismatch: expected ", sizes, ", got ", tensor.sizes());
+  TORCH_CHECK(tensor.scalar_type() == st, "Input tensor dtype mismatch");
+  if constexpr (is_only_lastdim_contiguous) {
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(tensor);
+  } else {
+    CHECK_INPUT(tensor);
+  }
+}
 #define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
 
 // [NB] Parallel Routines
