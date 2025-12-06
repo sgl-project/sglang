@@ -259,7 +259,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         # Workspace allocation
-        self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        self.workspace_size = int(DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024 * 1.2)
         global global_zero_init_workspace_buffer
         if global_zero_init_workspace_buffer is None:
             global_zero_init_workspace_buffer = torch.zeros(
@@ -1066,6 +1066,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 out=torch.zeros(*output_shape, dtype=q.dtype, device=q.device),
             )
 
+        out = None
+        if self.data_type == torch.float8_e4m3fn:
+            out = torch.empty(
+                q.shape[0],
+                q.shape[1],
+                v.shape[2],
+                device=q.device,
+                dtype=torch.bfloat16,
+            )
+            q = q.to(torch.float8_e4m3fn)
+            k = k.to(torch.float8_e4m3fn)
+            v = v.to(torch.float8_e4m3fn)
+
         return flashinfer.prefill.trtllm_ragged_attention_deepseek(
             query=q,
             key=k,
@@ -1084,6 +1097,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             enable_pdl=False,
             is_causal=True,
             return_lse=forward_batch.mha_return_lse,
+            out=out,
         )
 
 
