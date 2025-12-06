@@ -76,6 +76,9 @@ def moe_forward_native(
     else:
         raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
 
+    # Get bias terms if available
+    w13_bias = getattr(layer, "w13_weight_bias", None)
+    w2_bias = getattr(layer, "w2_weight_bias", None)
     outputs = []
     start_idx = 0
     for i, num_tokens in enumerate(tokens_per_expert):
@@ -87,9 +90,52 @@ def moe_forward_native(
         layer_w13_weight = layer.w13_weight[i]
         layer_w2_weight = layer.w2_weight[i]
 
-        gate_up = F.linear(tokens_for_this_expert, layer_w13_weight)
-        gate_up = act(gate_up)
-        expert_out = F.linear(gate_up, layer_w2_weight)
+        # Store original dtype
+        original_dtype = tokens_for_this_expert.dtype
+
+        # Get bias terms if available for this expert
+        layer_w13_bias = w13_bias[i] if w13_bias is not None else None
+        layer_w2_bias = w2_bias[i] if w2_bias is not None else None
+
+        # Apply w13 linear with bias for models like GPT-OSS
+        if layer_w13_bias is not None:
+            # BF16 matmul with FP32 accumulation
+            gate_up = F.linear(tokens_for_this_expert, layer_w13_weight, bias=None)
+            gate_up_fp32 = gate_up.float() + layer_w13_bias
+            gate_up = gate_up_fp32.to(original_dtype)
+
+            # Split the interleaved gate and up projections as per GPT-OSS weight layout:
+            gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+
+            # Apply clamping and modified SiLU activation
+            if (
+                moe_runner_config.activation == "silu"
+                and moe_runner_config.gemm1_alpha is not None
+            ):
+                assert moe_runner_config.gemm1_clamp_limit is not None
+                gate = gate.clamp(min=None, max=moe_runner_config.gemm1_clamp_limit)
+                up = up.clamp(
+                    min=-moe_runner_config.gemm1_clamp_limit,
+                    max=moe_runner_config.gemm1_clamp_limit,
+                )
+                glu = gate * torch.sigmoid(gate * moe_runner_config.gemm1_alpha)
+                gate_up = glu * (up + 1)
+            else:
+                gate_up = act(gate_up)
+        else:
+            # Direct path for models without bias (e.g., Mixtral, DeepSeek)
+            gate_up = F.linear(tokens_for_this_expert, layer_w13_weight)
+            gate_up = act(gate_up)
+
+        # Apply w2 linear
+        if layer_w2_bias is not None:
+            expert_out = F.linear(gate_up, layer_w2_weight, bias=None)
+            expert_out = expert_out.float() + layer_w2_bias
+            expert_out = expert_out.to(original_dtype)
+        else:
+            # Direct path for models without bias (e.g., Mixtral, DeepSeek)
+            expert_out = F.linear(gate_up, layer_w2_weight)
+
         outputs.append(expert_out)
         start_idx = end_idx
 
