@@ -419,6 +419,7 @@ class ServerArgs:
     speculative_draft_model_path: Optional[str] = None
     speculative_draft_model_revision: Optional[str] = None
     speculative_draft_load_format: Optional[str] = None
+    speculative_draft_quantization: Optional[str] = None
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -3468,6 +3469,15 @@ class ServerArgs:
             help="The format of the draft model weights to load. "
             "If not specified, will use the same format as --load-format. "
             "Use 'dummy' to initialize draft model weights with random values for profiling.",
+        )
+        parser.add_argument(
+            "--speculative-draft-quantization",
+            type=str,
+            default=ServerArgs.speculative_draft_quantization,
+            choices=[None, "none"] + QUANTIZATION_CHOICES,
+            help="The quantization method for the draft model. "
+            "If not specified, will use the same quantization as --quantization. "
+            "Use 'none' to explicitly disable quantization for the draft model.",
         )
         parser.add_argument(
             "--speculative-num-steps",
