@@ -9,6 +9,7 @@ use sgl_model_gateway::{
     },
     core::ConnectionMode,
     metrics::PrometheusConfig,
+    otel_trace::{is_otel_enabled, shutdown_otel},
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
     version,
@@ -780,6 +781,8 @@ Provide --worker-urls or PD flags as usual.",
     let server_config = cli_args.to_server_config(router_config);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async move { server::startup(server_config).await })?;
-
+    if is_otel_enabled() {
+        shutdown_otel();
+    }
     Ok(())
 }

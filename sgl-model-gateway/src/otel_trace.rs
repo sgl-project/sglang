@@ -77,7 +77,7 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
         return Ok(());
     }
 
-    let endpoint = otlp_endpoint.unwrap_or("0.0.0.0:4317");
+    let endpoint = otlp_endpoint.unwrap_or("localhost:4317");
     let endpoint = if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
         format!("http://{}", endpoint)
     } else {
