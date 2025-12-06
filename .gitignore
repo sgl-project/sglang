@@ -249,3 +249,6 @@ lmms-eval
 **/.serena/
 ctags/
 outputs/
+
+# Eval Cache
+.longbench_cache/

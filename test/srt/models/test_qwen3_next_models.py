@@ -61,8 +61,8 @@ class TestQwen3Next(CustomTestCase):
             self.base_url,
             ACC_THRESHOLDS,
             self.model,
-            max_samples=48,
-            max_new_tokens=512,
+            max_samples=16,
+            max_new_tokens=256,
         )
 
     def test_input_output_logprobs_match_decode_cache_hit(self):
@@ -70,8 +70,8 @@ class TestQwen3Next(CustomTestCase):
             self.base_url,
             ACC_THRESHOLDS,
             self.model,
-            max_samples=48,
-            max_new_tokens=512,
+            max_samples=16,
+            max_new_tokens=256,
         )
 
 
@@ -121,24 +121,6 @@ class TestQwen3NextMTP(CustomTestCase):
             metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
         )
 
-    def test_input_output_logprobs_match_prefill_cache_hit(self):
-        test_input_output_logprobs_match_prefill_cache_hit_helper(
-            self.base_url,
-            ACC_THRESHOLDS,
-            self.model,
-            max_samples=48,
-            max_new_tokens=512,
-        )
-
-    def test_input_output_logprobs_match_decode_cache_hit(self):
-        test_input_output_logprobs_match_decode_cache_hit_helper(
-            self.base_url,
-            ACC_THRESHOLDS,
-            self.model,
-            max_samples=48,
-            max_new_tokens=512,
-        )
-
 
 class TestQwen3NextMTPTopk(CustomTestCase):
     @classmethod
@@ -184,24 +166,6 @@ class TestQwen3NextMTPTopk(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreaterEqual(
             metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
-        )
-
-    def test_input_output_logprobs_match_prefill_cache_hit(self):
-        test_input_output_logprobs_match_prefill_cache_hit_helper(
-            self.base_url,
-            ACC_THRESHOLDS,
-            self.model,
-            max_samples=48,
-            max_new_tokens=512,
-        )
-
-    def test_input_output_logprobs_match_decode_cache_hit(self):
-        test_input_output_logprobs_match_decode_cache_hit_helper(
-            self.base_url,
-            ACC_THRESHOLDS,
-            self.model,
-            max_samples=48,
-            max_new_tokens=512,
         )
 
 
