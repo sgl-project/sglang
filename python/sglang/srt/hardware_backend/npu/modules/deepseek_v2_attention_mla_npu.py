@@ -311,7 +311,16 @@ def forward_dsa_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
+        if enable_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+            positions = cp_split_and_rebuild_position(forward_batch, positions)
+
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+
+        if enable_prefill_cp(forward_batch, m.nsa_enable_prefill_cp):
+            # support allgather+rerrange
+            k_nope, k_pe = m.rebuild_cp_kv_cache(
+                latent_cache, forward_batch, k_nope, k_pe
+            )
 
     topk_indices = m.indexer(
         hidden_states, q_lora, positions, forward_batch, m.layer_id
