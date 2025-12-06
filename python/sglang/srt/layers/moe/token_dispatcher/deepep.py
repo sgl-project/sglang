@@ -609,8 +609,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
-        elif not get_bool_env_var("SGLANG_DEEPEP_BF16_DISPATCH"):
-            use_fp8 = True
 
         buffer = self._get_buffer()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
@@ -619,7 +617,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=use_fp8,
+                use_fp8=True,
                 **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
