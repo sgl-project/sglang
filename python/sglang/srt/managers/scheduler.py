@@ -2424,7 +2424,7 @@ class Scheduler(
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
-            if self.recv_req.mode == "in_place":
+            if recv_req.mode == "in_place":
                 if self.chunked_req is not None:
                     chunked_req_to_exclude.add(self.chunked_req)
             self.last_batch.filter_batch(
