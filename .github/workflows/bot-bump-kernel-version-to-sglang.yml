@@ -66,3 +66,13 @@ jobs:
     with:
       ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
     secrets: inherit
+
+  run-stress-tests:
+    needs: bump-kernel-version-to-sglang
+    if: needs.bump-kernel-version-to-sglang.outputs.needs_sync == 'true'
+    uses: ./.github/workflows/stress-test.yml
+    with:
+      ref: ${{ needs.bump-kernel-version-to-sglang.outputs.branch_name }}
+      num_prompts: '20000'
+      duration_minutes: '30'
+    secrets: inherit
