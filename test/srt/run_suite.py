@@ -182,6 +182,7 @@ suites = {
     ],
     "per-commit-8-gpu-b200": [
         TestFile("test_mistral_large3_basic.py", 275),
+        TestFile("test_mistral_large3_eagle_basic.py", 275),
     ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),

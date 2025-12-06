@@ -161,6 +161,7 @@ def handle_rerun_stage(
         "unit-test-deepep-8-gpu",
         "unit-test-backend-4-gpu-b200",
         "unit-test-backend-4-gpu-gb200",
+        "unit-test-backend-8-gpu-b200",
     ]
 
     # Valid AMD stage names that support target_stage
