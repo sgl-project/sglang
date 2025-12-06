@@ -21,6 +21,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_xpu,
 )
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
@@ -39,6 +40,7 @@ _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_xpu = is_xpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
@@ -54,6 +56,8 @@ elif _is_hip:
             raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
     else:
         from vllm import _custom_ops as vllm_ops
+elif _is_xpu:
+    from sgl_kernel import moe_sum, silu_and_mul
 
 padding_size = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
@@ -553,7 +557,7 @@ def fused_experts_impl(
                     gemm1_alpha,
                     gemm1_limit,
                 )
-            elif _is_cuda or _is_hip:
+            elif _is_cuda or _is_hip or _is_xpu:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.silu_and_mul(
@@ -659,6 +663,11 @@ def fused_experts_impl(
                         out_hidden_states[begin_chunk_idx:end_chunk_idx],
                         routed_scaling_factor,
                     )
+        elif _is_xpu:
+            moe_sum(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                out_hidden_states[begin_chunk_idx:end_chunk_idx],
+            )
         else:
             vllm_ops.moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
