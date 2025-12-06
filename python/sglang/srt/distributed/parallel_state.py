@@ -282,23 +282,25 @@ class GroupCoordinator:
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a cpu_group to allow direct coordination between processes through
-            # the CPU. The backend is chosen based on `torch_distributed_backend`
-            if "mooncake" in torch_distributed_backend:
-                cpu_group = torch.distributed.new_group(ranks, backend="mooncake-cpu")
-            else:
-                cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
-                )
             if self.rank in ranks:
                 self.ranks = ranks
                 self.world_size = len(ranks)
                 self.rank_in_group = ranks.index(self.rank)
-                self.device_group = device_group
-                self.cpu_group = cpu_group
+
+                self.device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a cpu_group to allow direct coordination between processes through
+                # the CPU. The backend is chosen based on `torch_distributed_backend`
+                if "mooncake" in torch_distributed_backend:
+                    self.cpu_group = torch.distributed.new_group(
+                        ranks, backend="mooncake-cpu"
+                    )
+                else:
+                    self.cpu_group = torch.distributed.new_group(
+                        ranks, backend="gloo", timeout=gloo_timeout
+                    )
+                break
 
         assert self.cpu_group is not None
         assert self.device_group is not None
