@@ -65,7 +65,7 @@ class BaseLayerWithLoRA(nn.Module):
 
     @property
     def bias(self):
-        return getattr(self.base_layer, 'bias', None)
+        return getattr(self.base_layer, "bias", None)
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
