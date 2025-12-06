@@ -40,6 +40,7 @@ from sglang.srt.utils.common import (
     get_device,
     get_device_memory_capacity,
     get_device_sm,
+    is_blackwell,
     is_blackwell_supported,
     is_cuda,
     is_fa3_default_architecture,
@@ -1313,7 +1314,8 @@ class ServerArgs:
 
             1. Models with MHA Architecture (e.g: Llama, QWen)
                 1.1 We will turn on FA3 on hopper unless user use spec decode with topk > 1 or page_size > 1.
-                1.2 In other cases, we will use flashinfer if available, otherwise use triton.
+                1.2 Use trtllm_mha for Blackwell excluding spec with topk > 1.
+                1.3 In other cases, we will use flashinfer if available, otherwise use triton.
             2. Models with MLA Architecture and using FA3
                 2.1 We will use FA3 backend on hopper.
                 2.2 We will use Flashinfer backend on blackwell.
@@ -1328,6 +1330,8 @@ class ServerArgs:
                     and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
+                elif is_blackwell() and is_no_spec_infer_or_topk_one(self):
+                    self.attention_backend = "trtllm_mha"
                 elif is_hip():
                     self.attention_backend = "aiter"
                 else:
