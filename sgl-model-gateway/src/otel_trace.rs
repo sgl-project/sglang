@@ -17,6 +17,7 @@ use opentelemetry_sdk::{
     trace::{BatchConfigBuilder, BatchSpanProcessor, Tracer as SdkTracer, TracerProvider},
     Resource,
 };
+use tokio::task::spawn_blocking;
 use tracing::{Metadata, Subscriber};
 use tracing_opentelemetry::{self, OpenTelemetrySpanExt};
 use tracing_subscriber::{
@@ -30,6 +31,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 
 // global tracer
 static TRACER: OnceLock<SdkTracer> = OnceLock::new();
+static PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
 
 pub struct CustomOtelFilter {
     allowed_targets: HashSet<String>,
@@ -109,6 +111,9 @@ pub fn otel_tracing_init(enable: bool, otlp_endpoint: Option<&str>) -> Result<()
             .with_span_processor(span_processor)
             .with_resource(resource)
             .build();
+        PROVIDER
+            .set(provider.clone())
+            .map_err(|_| anyhow::anyhow!("Provider already initialized"))?;
 
         let tracer = provider.tracer("sgl-router");
 
@@ -168,6 +173,26 @@ where
 
 pub fn is_otel_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
+}
+
+pub async fn flush_spans_async() -> Result<()> {
+    if !is_otel_enabled() {
+        return Ok(());
+    }
+
+    if let Some(provider) = PROVIDER.get() {
+        let provider = provider.clone();
+
+        spawn_blocking(move || provider.force_flush())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to join blocking task for flushing spans: {}", e)
+            })?;
+
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Provider not initialized"))
+    }
 }
 
 pub fn shutdown_otel() {
