@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import Any, Dict, List
 
 import pytest
 
@@ -24,6 +25,14 @@ class DummyDetector(BaseFormatDetector):
 
     def structure_info(self):
         pass
+
+    def build_structural_tag(
+        self,
+        tools: List[Tool],
+        at_least_one: bool = False,
+        stop_after_first: bool = False,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError()
 
 
 def test_unknown_tool_name_dropped_default(caplog):
