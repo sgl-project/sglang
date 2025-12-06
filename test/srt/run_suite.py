@@ -177,8 +177,7 @@ suites = {
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
-        # TODO: Add it back after the bug is fixed
-        # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
+        TestFile("test_eagle_infer_beta_dp_attention.py", 300),
     ],
     "per-commit-8-gpu-b200": [
         TestFile("test_mistral_large3_basic.py", 275),
