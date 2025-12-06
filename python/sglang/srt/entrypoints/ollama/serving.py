@@ -49,22 +49,19 @@ class OllamaServing:
 
         if options:
             # Map Ollama options to SGLang params
-            if "temperature" in options:
-                sampling_params["temperature"] = options["temperature"]
-            if "top_p" in options:
-                sampling_params["top_p"] = options["top_p"]
-            if "top_k" in options:
-                sampling_params["top_k"] = options["top_k"]
-            if "num_predict" in options:
-                sampling_params["max_new_tokens"] = options["num_predict"]
-            if "stop" in options:
-                sampling_params["stop"] = options["stop"]
-            if "presence_penalty" in options:
-                sampling_params["presence_penalty"] = options["presence_penalty"]
-            if "frequency_penalty" in options:
-                sampling_params["frequency_penalty"] = options["frequency_penalty"]
-            if "seed" in options:
-                sampling_params["seed"] = options["seed"]
+            param_mapping = {
+                "temperature": "temperature",
+                "top_p": "top_p",
+                "top_k": "top_k",
+                "num_predict": "max_new_tokens",
+                "stop": "stop",
+                "presence_penalty": "presence_penalty",
+                "frequency_penalty": "frequency_penalty",
+                "seed": "seed",
+            }
+            for ollama_param, sglang_param in param_mapping.items():
+                if ollama_param in options:
+                    sampling_params[sglang_param] = options[ollama_param]
 
         # Default max tokens if not specified
         if "max_new_tokens" not in sampling_params:
