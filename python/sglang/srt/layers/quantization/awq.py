@@ -7,10 +7,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
+from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-
-from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,

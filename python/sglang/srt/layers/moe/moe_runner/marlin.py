@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import functools
-import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -16,7 +14,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
@@ -25,9 +22,11 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+
 @dataclass
 class MarlinRunnerInput(RunnerInput):
     """Input bundle passed to the Marlin runner core."""
+
     hidden_states: torch.Tensor
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -36,6 +35,7 @@ class MarlinRunnerInput(RunnerInput):
     @property
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.MARLIN
+
 
 @dataclass
 class MarlinRunnerOutput(RunnerOutput):
@@ -47,9 +47,11 @@ class MarlinRunnerOutput(RunnerOutput):
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.MARLIN
 
+
 @dataclass
 class MarlinMoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by the Marlin backend."""
+
     w13_qweight: torch.Tensor
     w2_qweight: torch.Tensor
     w13_scales: torch.Tensor
@@ -57,24 +59,25 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w13_g_idx_sort_indices: Optional[torch.Tensor]
     w2_g_idx_sort_indices: Optional[torch.Tensor]
     weight_bits: int
-    
+
     # GPTQ specific (Optional)
     w13_g_idx: Optional[torch.Tensor] = None
     w2_g_idx: Optional[torch.Tensor] = None
     is_k_full: bool = True
-    
+
     # AWQ specific (Optional)
     w13_qzeros: Optional[torch.Tensor] = None
     w2_qzeros: Optional[torch.Tensor] = None
-    
+
     # Optional
     workspace: Optional[torch.Tensor] = None
     expert_map: Optional[torch.Tensor] = None
 
+
 class MarlinRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-    
+
     def run(
         self,
         runner_input: MarlinRunnerInput,
@@ -86,11 +89,9 @@ class MarlinRunnerCore(MoeRunnerCore):
         )
 
         x = runner_input.hidden_states
-        
-        assert (
-            self.config.activation == "silu"
-        ), "Only SiLU activation is supported."
-        
+
+        assert self.config.activation == "silu", "Only SiLU activation is supported."
+
         orig_dtype = x.dtype
         # removed since fused_marlin_moe.py now accepts bfloat16
         # x = x.half()
@@ -118,14 +119,13 @@ class MarlinRunnerCore(MoeRunnerCore):
             routed_scaling_factor=self.config.routed_scaling_factor,
         ).to(orig_dtype)
 
-        return MarlinRunnerOutput(
-            hidden_states=output
-        )
+        return MarlinRunnerOutput(hidden_states=output)
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
         return MoeRunnerBackend.MARLIN
-        
+
+
 @register_pre_permute("standard", "marlin")
 def pre_permute_standard_to_marlin(
     dispatch_output: StandardDispatchOutput,
@@ -138,9 +138,9 @@ def pre_permute_standard_to_marlin(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    assert TopKOutputChecker.format_is_standard(topk_output), (
-        "Marlin runner expects StandardTopKOutput"
-    )
+    assert TopKOutputChecker.format_is_standard(
+        topk_output
+    ), "Marlin runner expects StandardTopKOutput"
 
     return MarlinRunnerInput(
         hidden_states=hidden_states,
@@ -148,6 +148,7 @@ def pre_permute_standard_to_marlin(
         topk_ids=topk_output.topk_ids,
         router_logits=topk_output.router_logits,
     )
+
 
 @register_post_permute("marlin", "standard")
 def post_permute_marlin_to_standard(

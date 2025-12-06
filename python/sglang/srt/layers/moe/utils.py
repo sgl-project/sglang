@@ -87,7 +87,7 @@ class MoeRunnerBackend(Enum):
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS
-    
+
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
 

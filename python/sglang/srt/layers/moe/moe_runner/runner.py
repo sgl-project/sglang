@@ -10,9 +10,9 @@ from sglang.srt.layers.moe.moe_runner.base import (
     PermuteMethodPool,
 )
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
+from sglang.srt.layers.moe.moe_runner.marlin import MarlinRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
-from sglang.srt.layers.moe.moe_runner.marlin import MarlinRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
