@@ -10,6 +10,8 @@ use tracing_subscriber::{
     fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 
+use crate::{config::TraceConfig, otel_trace::get_otel_layer};
+
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
     pub level: Level,
@@ -38,7 +40,7 @@ pub struct LogGuard {
     _file_guard: Option<WorkerGuard>,
 }
 
-pub fn init_logging(config: LoggingConfig) -> LogGuard {
+pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig>) -> LogGuard {
     let _ = LogTracer::init();
 
     let level_filter = match config.level {
@@ -119,6 +121,19 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
         };
 
         layers.push(file_layer);
+    }
+
+    if let Some(otel_layer_config) = &otel_layer_config {
+        if otel_layer_config.enable_trace {
+            match get_otel_layer() {
+                Ok(otel_layer) => {
+                    layers.push(otel_layer);
+                }
+                Err(e) => {
+                    eprintln!("Failed to initialize OpenTelemetry: {}", e);
+                }
+            }
+        }
     }
 
     let _ = tracing_subscriber::registry()

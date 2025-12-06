@@ -55,6 +55,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 tracing-log = "0.2"
 tracing-appender = "0.2.3"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.28"
 chrono = "0.4"
 kube = { version = "1.1.0", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.25.0", features = ["v1_33"] }
@@ -131,6 +135,9 @@ tempfile = "3.8"
 lazy_static = "1.4"
 wasm-encoder = "0.242"
 npyz = { version = "0.8", features = ["npz"] }  # For reading numpy .npz files in golden tests
+opentelemetry-proto = { version = "0.27", features = ["gen-tonic"] }
+tonic-v12 = { version = "0.12.3", package = "tonic" }
+serial_test = "3.0"
 
 [[bench]]
 name = "request_processing"

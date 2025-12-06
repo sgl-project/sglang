@@ -18,6 +18,10 @@ impl ConfigValidator {
             Self::validate_metrics(metrics)?;
         }
 
+        if let Some(trace_config) = &config.trace_config {
+            Self::validate_trace(trace_config)?;
+        }
+
         Self::validate_compatibility(config)?;
 
         let retry_cfg = config.effective_retry_config();
@@ -353,6 +357,46 @@ impl ConfigValidator {
                 reason: "Host cannot be empty".to_string(),
             });
         }
+
+        Ok(())
+    }
+
+    fn validate_trace(trace_config: &TraceConfig) -> ConfigResult<()> {
+        if !trace_config.enable_trace {
+            return Ok(());
+        }
+
+        let endpoint = &trace_config.otlp_traces_endpoint;
+
+        let Some((host, port_str)) = endpoint.rsplit_once(':') else {
+            return Err(ConfigError::InvalidValue {
+                field: "trace_config.otlp_traces_endpoint".to_string(),
+                value: endpoint.clone(),
+                reason:
+                    "expected format <host>:<port>, e.g., otel-collector:4317 or 127.0.0.1:4317"
+                        .to_string(),
+            });
+        };
+
+        if host.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "trace_config.otlp_traces_endpoint".to_string(),
+                value: endpoint.clone(),
+                reason: "host part cannot be empty".to_string(),
+            });
+        }
+
+        // check port: must be 1~65535
+        match port_str.parse::<u16>() {
+            Ok(p) if p > 0 => (), // valid port
+            _ => {
+                return Err(ConfigError::InvalidValue {
+                    field: "trace_config.otlp_traces_endpoint".to_string(),
+                    value: endpoint.clone(),
+                    reason: "port must be a number between 1 and 65535".to_string(),
+                });
+            }
+        };
 
         Ok(())
     }
