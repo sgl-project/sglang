@@ -446,6 +446,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             self.server_args.language_only
             and isinstance(obj, GenerateReqInput)
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            and obj.contains_mm_input()
         ):
             self.mm_receiver.send_encode_requset(obj)
 

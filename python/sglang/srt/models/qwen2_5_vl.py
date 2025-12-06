@@ -484,19 +484,22 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 prefix=add_prefix("model", prefix),
             )
 
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
+            if self.pp_group.is_last_rank:
+                if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                    self.lm_head = self.model.embed_tokens
+                else:
+                    self.lm_head = ParallelLMHead(
+                        self.config.vocab_size,
+                        self.config.hidden_size,
+                        quant_config=quant_config,
+                        prefix=add_prefix("lm_head", prefix),
+                    )
             else:
-                self.lm_head = ParallelLMHead(
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+                # ranks other than the last rank will have a placeholder layer
+                self.lm_head = PPMissingLayer()
         else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
+            # mm_only mode: no language model, so no lm_head needed
+            self.lm_head = None
 
         self.visual = Qwen2_5_VisionTransformer(
             config.vision_config,

@@ -636,6 +636,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
                 )
+        else:
+            # mm_only mode: no language model, so no lm_head needed
+            self.lm_head = None
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
 
         self.logits_processor = LogitsProcessor(self.config)
