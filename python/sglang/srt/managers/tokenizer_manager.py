@@ -1589,6 +1589,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 "total_retractions": recv_obj.retraction_counts[i],
             }
 
+            self._add_metric_if_present(recv_obj, "reasoning_tokens", meta_info, i)
+
             if self.enable_metrics:
                 self._add_metric_if_present(recv_obj, "queue_time", meta_info, i)
                 self._add_metric_if_present(

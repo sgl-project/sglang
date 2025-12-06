@@ -704,6 +704,9 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
+            self.tokenizer.think_start_id = self.tokenizer.encode(
+                reasoning_parser.detector.think_start_token, add_special_tokens=False
+            )[0]
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
@@ -740,12 +743,10 @@ class Scheduler(
 
                 self.tree_cache = ChunkCache(params)
             else:
-
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
                 self.tree_cache = SWAChunkCache(params)
         else:
-
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
@@ -1775,7 +1776,6 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
-
             if self.enable_lora and not self.tp_worker.can_run_lora_batch(
                 lora_set
                 | set([req.lora_id for req in adder.can_run_list])
