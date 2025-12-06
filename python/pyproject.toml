@@ -85,7 +85,8 @@ checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle",
-  "diffusers==0.35.2",
+  # this is temporary
+  "diffusers @ git+https://github.com/huggingface/diffusers.git@6290fdfda40610ce7b99920146853614ba529c6e",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
@@ -94,6 +95,8 @@ diffusion = [
   "st_attn ==0.0.7",
   "vsa==0.0.4",
   "yunchang==0.6.3.post1",
+  "runai_model_streamer",
+  "cache-dit==1.1.6"
 ]
 
 [tool.uv.extra-build-dependencies]
