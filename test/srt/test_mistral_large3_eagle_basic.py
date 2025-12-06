@@ -14,6 +14,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
+# Base model and Eagle draft model
+MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
 MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-Eagle"
 
 
@@ -23,15 +25,25 @@ class TestMistralLarge3EagleBasic(CustomTestCase):
         # Set environment variable to disable JIT DeepGemm
         os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "0"
 
-        cls.model = MISTRAL_LARGE3_EAGLE_MODEL_PATH
+        cls.model = MISTRAL_LARGE3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Mistral-Large-3 with Eagle speculative decoding
+        # Eagle model is used as draft model for speculative decoding
         other_args = [
             "--tp",
             "8",
             "--attention-backend",
             "trtllm_mla",
-            "--speculative-moe-runner-backend",
-            "flashinfer_trtllm",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-draft-model-path",
+            MISTRAL_LARGE3_EAGLE_MODEL_PATH,
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "4",
+            "--speculative-num-draft-tokens",
+            "16",
             "--kv-cache-dtype",
             "auto",
             "--model-loader-extra-config",
