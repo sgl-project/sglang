@@ -346,6 +346,7 @@ class ForwardBatch:
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
     # For matryoshka embeddings
@@ -797,6 +798,11 @@ class ForwardBatch:
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
         )
+        if self.tbo_children:
+            for child in self.tbo_children:
+                child._pad_inputs_to_size(
+                    model_runner, child.tbo_padded_len, child.batch_size
+                )
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
