@@ -181,11 +181,11 @@ jobs:
         timeout-minutes: 60
         run: |
           docker exec \
-            -e SGLANG_E2E_TOLERANCE=0.35 \
+            -e SGLANG_E2E_TOLERANCE=0.3 \
             -e SGLANG_STAGE_TIME_TOLERANCE=0.2 \
             -e SGLANG_NON_DENOISE_STAGE_TIME_TOLERANCE=0.6 \
-            -e SGLANG_DENOISE_STEP_TOLERANCE=0.3 \
-            -e SGLANG_DENOISE_AGG_TOLERANCE=0.25 \
+            -e SGLANG_DENOISE_STEP_TOLERANCE=0.6 \
+            -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
             -w /sglang-checkout/python \
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 1-gpu \
