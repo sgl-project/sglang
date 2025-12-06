@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <cassert>
+#include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <math.h>
@@ -99,6 +100,9 @@ template <typename O, typename T> __device__ O cast_to(T x) {
     } else if (COND == 4096) {                                                 \
       constexpr static int CONST_NAME = 4096;                                  \
       return __VA_ARGS__();                                                    \
+    } else if (COND == 8192) {                                                 \
+      constexpr static int CONST_NAME = 8192;                                  \
+      return __VA_ARGS__();                                                    \
     } else {                                                                   \
       constexpr static int CONST_NAME = BAD_CASE;                              \
       return __VA_ARGS__();                                                    \
@@ -141,8 +145,9 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
 
   int end = min(d_end, half);
 
-  for (int d_idx = d_start + tid * vec_size; d_idx < end;
-       d_idx += num_threads * vec_size) {
+  // main loop
+  int d_idx = d_start + tid * vec_size;
+  for (; d_idx < end; d_idx += num_threads * vec_size) {
 
 #pragma unroll
     for (int i = d_idx; i < d_idx + vec_size; i++) {
@@ -155,16 +160,30 @@ timestep_embedding_kernel(T *t_ptr, O *output_ptr, int B, int dim,
       o_vec_sin[i - d_idx] = cast_to<O>(sinf(angles));
     }
 
+    // skip last write back if not align
+    if (end % num_threads * vec_size != 0 && d_idx + num_threads * vec_size >= end) {
+      break;
+    }
+
     int out_idx_cos = pid_b * stride_out_b + d_idx * stride_out_d;
     int out_idx_sin = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
-    if (d_idx + vec_size <= end) {
-      o_vec_cos.store(output_ptr + out_idx_cos);
-      o_vec_sin.store(output_ptr + out_idx_sin);
-    } else {
-      for (int i = d_idx; i < end; i++) {
-        output_ptr[out_idx_cos + i] = o_vec_cos[i];
-        output_ptr[out_idx_sin + i] = o_vec_sin[i];
+
+    o_vec_cos.store(output_ptr + out_idx_cos);
+    o_vec_sin.store(output_ptr + out_idx_sin);
+  }
+
+  // epilogue
+  // handle last loop inst locality warp divergence
+  if (d_idx < end) {
+    int out_idx_cos = pid_b * stride_out_b + d_idx * stride_out_d;
+    int out_idx_sin = pid_b * stride_out_b + (d_idx + half) * stride_out_d;
+#pragma unroll
+    for (int i = 0; i < vec_size; i++) {
+      if (i + d_idx >= end) {
+        continue;
       }
+      output_ptr[out_idx_cos + i] = o_vec_cos[i];
+      output_ptr[out_idx_sin + i] = o_vec_sin[i];
     }
   }
 
@@ -205,11 +224,14 @@ torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
   DIM_SWITCH(dim, kDim, /* bad case */ 1, [&] {
     // if dim not in [512, 1024, 2048, 4096]:
     //    vec_size = 1
-    constexpr int vec_size = (kDim % 8 == 0)   ? 4
+    constexpr int vec_size = (kDim % 16 == 0)   ? 8
+                             : (kDim % 8 == 0) ? 4
                              : (kDim % 4 == 0) ? 2
                                                : 1;
-    constexpr int num_threads = 512 / vec_size;
-    constexpr int BLOCK_SIZE_DIM = vec_size * num_threads;
+    // constexpr int num_threads = 512;
+    // constexpr int BLOCK_SIZE_DIM = vec_size * num_threads;
+    constexpr int num_threads = 128;
+    constexpr int BLOCK_SIZE_DIM = 1024 * 4;
     // TODO: low sm usage, like 512 / 8 / 2 = 32
     const int half = dim / 2;
 

@@ -215,6 +215,12 @@ from torch.utils.cpp_extension import load
 cuda_module = load(
     "timestep_embedding_kernel_cuda",
     sources=["./csrc/elementwise/timestep_embedding.cu"],
+    extra_cuda_cflags=[
+        "-keep",
+        "-Xptxas -v",
+        "-gencode=arch=compute_80,code=sm_80",
+        "-save-temps",
+    ],
 )
 
 
