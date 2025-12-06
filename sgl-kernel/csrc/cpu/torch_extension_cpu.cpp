@@ -33,6 +33,9 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps);
 // rmsnorm
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
 
+// layernorm
+void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
+
 // qwen3_next_rmsnorm_gated
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps);
 
@@ -308,6 +311,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // norm
   m.def("rmsnorm_cpu(Tensor input, Tensor weight, float eps) -> Tensor");
   m.impl("rmsnorm_cpu", torch::kCPU, &rmsnorm_cpu);
+  m.def("layernorm_cpu(Tensor(a!) input, Tensor weight, float eps) -> ()");
+  m.impl("layernorm_cpu", torch::kCPU, &layernorm_cpu);
   m.def("l2norm_cpu(Tensor input, float eps) -> Tensor");
   m.impl("l2norm_cpu", torch::kCPU, &l2norm_cpu);
   m.def("fused_rmsnorm_gated_cpu(Tensor input, Tensor weight, Tensor gate, float eps) -> Tensor");

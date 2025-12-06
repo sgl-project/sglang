@@ -567,6 +567,34 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
 
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}
+void layernorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
+  RECORD_FUNCTION("sgl-kernel::layernorm_cpu", std::vector<c10::IValue>({input, weight}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_INPUT(weight);
+  CHECK_DIM(2, input);
+  CHECK_DIM(1, weight);
+  CHECK_EQ(input.size(1), weight.size(0));
+  int64_t batch_size = input.size(0);
+  int64_t hidden_size = input.size(1);
+  int64_t input_strideN = input.stride(0);
+
+  int64_t num_threads = at::get_num_threads();
+  at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "layernorm_kernel", [&] {
+    layernorm_kernel_impl<scalar_t>(
+        input.data_ptr<scalar_t>(),
+        weight.data_ptr<scalar_t>(),
+        buffer.data_ptr<float>(),
+        batch_size,
+        hidden_size,
+        input_strideN,
+        eps);
+  });
+}
+
+// input : {batch_size, hidden_size}
+// weight: {hidden_size}
 // gate: {batch_size, hidden_size}
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps) {
   RECORD_FUNCTION("sgl-kernel::fused_rmsnorm_gated_cpu", std::vector<c10::IValue>({input, weight, gate}));
