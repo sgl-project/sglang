@@ -21,7 +21,12 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.model_config import is_deepseek_nsa
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_context_model_parallel_rank,
+    get_context_model_parallel_world_size,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
@@ -237,6 +242,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
+                )
+        else:
+            cp_size = get_context_model_parallel_world_size()
+            if cp_size > 1:
+                cp_rank = get_context_model_parallel_rank()
+                input_ids = input_ids.tensor_split(cp_size)[cp_rank]
+                forward_batch.spec_info.hidden_states = (
+                    forward_batch.spec_info.hidden_states.tensor_split(cp_size)[cp_rank]
                 )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(

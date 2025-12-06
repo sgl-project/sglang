@@ -212,6 +212,7 @@ class TpModelWorker(BaseTpWorker):
         moe_ep_rank: int,
         pp_rank: int,
         dp_rank: Optional[int],
+        cp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
@@ -219,9 +220,11 @@ class TpModelWorker(BaseTpWorker):
     ):
         # Parse args
         self.tp_size = server_args.tp_size
+        self.pp_size = server_args.pp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
+        self.cp_rank = cp_rank if cp_rank is not None else 0
 
         # Init model and tokenizer
         self.model_config = ModelConfig.from_server_args(
@@ -252,6 +255,8 @@ class TpModelWorker(BaseTpWorker):
             moe_ep_size=server_args.ep_size,
             pp_rank=pp_rank,
             pp_size=server_args.pp_size,
+            cp_rank=cp_rank if cp_rank is not None else 0,
+            cp_size=server_args.cp_size,
             nccl_port=nccl_port,
             dp_rank=dp_rank,
             server_args=server_args,

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboDPAttentionPreparer
+from sglang.srt.distributed import get_context_model_parallel_world_size
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.utils.common import require_mlp_tp_gather
 
@@ -49,8 +50,9 @@ class MLPSyncBatchInfo:
 
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
+        cp_size = get_context_model_parallel_world_size()
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size, 6),
+            (max(self.dp_size, cp_size), self.tp_size, 6),
             dtype=torch.int64,
             device=device,
         )

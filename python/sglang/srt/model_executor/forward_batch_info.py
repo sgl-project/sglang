@@ -39,6 +39,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed.parallel_state import (
+    get_context_model_parallel_world_size,
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
@@ -727,13 +728,19 @@ class ForwardBatch:
         global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
-
+        tp_size = get_tensor_model_parallel_world_size()
+        cp_size = get_context_model_parallel_world_size()
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = (
-                (global_num_tokens[i] - 1) // attn_tp_size + 1
-            ) * attn_tp_size
+            if cp_size > 1:
+                global_num_tokens[i] = (
+                    (global_num_tokens[i] - 1) // tp_size + 1
+                ) * tp_size
+            else:
+                global_num_tokens[i] = (
+                    (global_num_tokens[i] - 1) // attn_tp_size + 1
+                ) * attn_tp_size
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -758,7 +765,10 @@ class ForwardBatch:
 
         self.global_dp_buffer_len = buffer_len
         set_dp_buffer_len(
-            buffer_len, num_tokens, dp_padding_mode.is_max_len(), global_num_tokens
+            buffer_len // cp_size,
+            num_tokens // cp_size,
+            dp_padding_mode.is_max_len(),
+            global_num_tokens,
         )
         set_is_extend_in_batch(self.is_extend_in_batch)
 

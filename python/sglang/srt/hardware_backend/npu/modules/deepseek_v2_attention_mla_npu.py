@@ -2,6 +2,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.distributed import (
+    context_model_parallel_all_gather,
+    get_context_model_parallel_world_size,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
     is_mla_preprocess_enabled,
@@ -295,6 +299,11 @@ def forward_dsa_prepare_npu(
         q, latent_cache = fused_qkv_a_proj_out.split(
             [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
         )
+        if get_context_model_parallel_world_size() > 1:
+            latent_cache = context_model_parallel_all_gather(
+                latent_cache.contiguous(), dim=0
+            )
+
         k_nope = latent_cache[..., : m.kv_lora_rank]
 
         q = m.q_a_layernorm(q)

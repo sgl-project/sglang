@@ -23,6 +23,8 @@ import triton.language as tl
 from torch import nn
 
 from sglang.srt.distributed import (
+    context_model_parallel_all_gather,
+    get_context_model_parallel_world_size,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -408,7 +410,10 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
-            if logits_metadata.padded_static_len < 0:
+            if get_context_model_parallel_world_size() > 1:
+                hidden_states = context_model_parallel_all_gather(hidden_states, 0)
+                last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            elif logits_metadata.padded_static_len < 0:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             else:
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
