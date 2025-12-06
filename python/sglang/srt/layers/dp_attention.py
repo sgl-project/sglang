@@ -20,7 +20,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -42,6 +42,7 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_is_cpu = is_cpu()
 
 
 class DpPaddingMode(IntEnum):
@@ -429,6 +430,33 @@ def prod(x):
     return functools.reduce(lambda a, b: a * b, x, 1)
 
 
+# TODO: write c++ kernel for cpu
+def memcpy_cpu(dst, src, dim, offset, sz, offset_src):
+    assert dim == 0, "Only dim=0 supported"
+    assert src.shape[1:] == dst.shape[1:], "src and dst must have same trailing shape"
+
+    total_rows_dst, total_rows_src = dst.shape[0], src.shape[0]
+    dst_start, src_start = 0, 0
+
+    if offset_src:
+        # src[offset:] → dst[0:]
+        src_start = offset
+        dst_start = 0
+    else:
+        # src[0:] → dst[offset:]
+        src_start = 0
+        dst_start = offset
+
+    dst_end = min(dst_start + sz, total_rows_dst)
+    src_end = min(src_start + sz, total_rows_src)
+    actual_sz = min(dst_end - dst_start, src_end - src_start)
+
+    if actual_sz <= 0:
+        return
+
+    dst[dst_start : dst_start + actual_sz].copy_(src[src_start : src_start + actual_sz])
+
+
 def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     max_size = min(src.numel(), dst.numel())
     assert dim == 0, "dim != 0 unsupported"
@@ -438,6 +466,13 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     grid = (triton.cdiv(max_size, BLOCK_SIZE),)
 
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
+
+
+memcpy_func = memcpy_cpu if _is_cpu else memcpy_triton
+
+
+def memcpy(dst, src, dim, offset, sz, offset_src):
+    memcpy_func(dst, src, dim, offset, sz, offset_src)
 
 
 def _dp_gather_via_all_reduce(
@@ -457,9 +492,7 @@ def _dp_gather_via_all_reduce(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        memcpy_triton(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
-        )
+        memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -544,9 +577,7 @@ def dp_scatter(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
-        memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
-        )
+        memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):

@@ -51,7 +51,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+from sglang.srt.utils import get_compiler_backend, is_cpu, is_npu, support_triton
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 
 class ForwardMode(IntEnum):
@@ -791,8 +792,13 @@ class ForwardBatch:
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
-        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
-        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+        self.use_pin_memory = not _is_cpu
+        global_num_tokens_pinned = torch.tensor(
+            global_num_tokens, pin_memory=self.use_pin_memory
+        )
+        self.global_num_tokens_gpu.copy_(
+            global_num_tokens_pinned, non_blocking=self.use_pin_memory
+        )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
@@ -804,8 +810,12 @@ class ForwardBatch:
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
+        from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
+
         seq_len_fill_value = (
-            model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            model_runner.attn_backend.get_graph_seq_len_fill_value()
+            if isinstance(model_runner.attn_backend, IntelAMXAttnBackend)
+            else model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         self.seq_lens_sum = self.seq_lens_sum + seq_len_fill_value * (
             bs - self.seq_lens.shape[0]

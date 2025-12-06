@@ -840,7 +840,9 @@ class DeepseekV2MoE(nn.Module):
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states, should_allreduce_fusion)
+            return self.forward_cpu(
+                hidden_states, should_allreduce_fusion, use_reduce_scatter
+            )
 
         if hidden_states.shape[0] > 0:
             if (
@@ -912,6 +914,7 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
@@ -962,7 +965,7 @@ class DeepseekV2MoE(nn.Module):
             None,  # a2_scale
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not should_allreduce_fusion:
+        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
