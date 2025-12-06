@@ -29,7 +29,7 @@ QWEN3_8B_OTHER_ARGS = (
         "--device",
         "npu",
         "--quantization",
-        "w8a8_int8",
+        "modelslim",
         "--max-running-requests",
         "16",
         "--disable-radix-cache",

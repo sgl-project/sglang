@@ -31,7 +31,7 @@ MODEL_OTHER_ARGS = (
         "--device",
         "npu",
         "--quantization",
-        "w8a8_int8",
+        "modelslim",
         "--watchdog-timeout",
         "9000",
         "--cuda-graph-bs",

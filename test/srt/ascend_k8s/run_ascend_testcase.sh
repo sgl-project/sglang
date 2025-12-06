@@ -25,6 +25,7 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 
 export PYTHONPATH=$SGLANG_SOURCE_PATH/python:$PYTHONPATH
+source /usr/local/Ascend/8.5.0/bisheng_toolkit/set_env.sh
 
 echo "Running test case ${test_case}"
 python3 -u ${test_case}
