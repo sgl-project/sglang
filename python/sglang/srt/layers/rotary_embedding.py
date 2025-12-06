@@ -132,9 +132,6 @@ class RotaryEmbedding(CustomOp):
 
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
-                self._apply_rotary_emb_wrapped
-            )
         self.position_cos, self.position_sin = None, None
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
