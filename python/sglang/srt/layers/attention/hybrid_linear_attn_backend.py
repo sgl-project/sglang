@@ -666,22 +666,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
 
-            key_split_dim = key_dim // attn_tp_size
-            value_split_dim = value_dim // attn_tp_size
-
-            query, key, value = torch.split(
+            query, key, value = self.split_and_reshape_qkv(
                 mixed_qkv,
-                [key_split_dim, key_split_dim, value_split_dim],
-                dim=-1,
+                key_dim,
+                value_dim,
+                attn_tp_size,
+                head_k_dim,
+                head_v_dim,
             )
-
-            actual_seq_len = query.shape[0]
-            num_heads = query.shape[1] // head_k_dim
-            num_value_heads = value.shape[1] // head_v_dim
-
-            query = query.view(1, actual_seq_len, num_heads, head_k_dim)
-            key = key.view(1, actual_seq_len, num_heads, head_k_dim)
-            value = value.view(1, actual_seq_len, num_value_heads, head_v_dim)
             core_attn_out = fused_recurrent_gated_delta_rule_update(
                 q=query,
                 k=key,
@@ -773,7 +765,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         head_v_dim: int,
     ):
         has_initial_state = extend_prefix_lens > 0
-        # ---- 1. conv ----
+
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             conv_weights,
@@ -785,26 +777,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=query_start_loc,
         ).transpose(0, 1)[:seq_len]
 
-        # ---- 2. split ----
-        key_split_dim = key_dim // attn_tp_size
-        value_split_dim = value_dim // attn_tp_size
-
-        query, key, value = torch.split(
+        query, key, value = self.split_and_reshape_qkv(
             mixed_qkv,
-            [key_split_dim, key_split_dim, value_split_dim],
-            dim=-1,
+            key_dim,
+            value_dim,
+            attn_tp_size,
+            head_k_dim,
+            head_v_dim,
         )
 
-        # ---- 3. reshape ----
-        seq_len = query.shape[0]
-        num_heads = query.shape[1] // head_k_dim
-        num_value_heads = value.shape[1] // head_v_dim
-
-        query = query.view(1, seq_len, num_heads, head_k_dim)
-        key = key.view(1, seq_len, num_heads, head_k_dim)
-        value = value.view(1, seq_len, num_value_heads, head_v_dim)
-
-        # ---- 4. GDN ----
         recurrent_state = ssm_states[cache_indices]
         core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
             q=query,
@@ -821,6 +802,34 @@ class GDNAttnBackend(MambaAttnBackendBase):
         last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
         ssm_states[cache_indices] = last_recurrent_state
         return core_attn_out
+
+    def split_and_reshape_qkv(
+        self,
+        mixed_qkv: torch.Tensor,  # [seq_len, hidden_dim]
+        key_dim: int,
+        value_dim: int,
+        attn_tp_size: int,
+        head_k_dim: int,
+        head_v_dim: int,
+    ):
+
+        key_split_dim = key_dim // attn_tp_size
+        value_split_dim = value_dim // attn_tp_size
+
+        query, key, value = torch.split(
+            mixed_qkv,
+            [key_split_dim, key_split_dim, value_split_dim],
+            dim=-1,
+        )
+        seq_len = query.shape[0]
+        num_heads = query.shape[1] // head_k_dim
+        num_value_heads = value.shape[1] // head_v_dim
+
+        query = query.view(1, seq_len, num_heads, head_k_dim)
+        key = key.view(1, seq_len, num_heads, head_k_dim)
+        value = value.view(1, seq_len, num_value_heads, head_v_dim)
+
+        return query, key, value
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
