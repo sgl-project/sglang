@@ -27,10 +27,11 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     def __init__(
         self,
         max_loras_per_batch: int,
+        max_loras_prefetch: int,
         device: torch.device,
         server_args: ServerArgs,
     ):
-        super().__init__(max_loras_per_batch, device)
+        super().__init__(max_loras_per_batch, max_loras_prefetch, device)
         self.max_chunk_size = server_args.max_lora_chunk_size
 
     def run_lora_a_sgemm(
@@ -175,8 +176,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 seg_indptr=torch.zeros(max_num_segments + 1, dtype=torch.int32),
                 weight_indices=torch.zeros(max_num_segments, dtype=torch.int32),
                 permutation=torch.zeros(max_num_tokens, dtype=torch.int32),
-                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
-                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
+                lora_ranks=torch.zeros(self.max_loras_total, dtype=torch.int32),
+                scalings=torch.zeros(self.max_loras_total, dtype=torch.float),
                 num_segments=None,  # Set per batch
                 max_len=None,  # Not used in CSGMV backend
             )
@@ -222,10 +223,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                     (num_segments,), dtype=torch.int32, device=self.device
                 ),
                 lora_ranks=torch.empty(
-                    (self.max_loras_per_batch,), dtype=torch.int32, device=self.device
+                    (self.max_loras_total,), dtype=torch.int32, device=self.device
                 ),
                 scalings=torch.empty(
-                    (self.max_loras_per_batch,), dtype=torch.float, device=self.device
+                    (self.max_loras_total,), dtype=torch.float, device=self.device
                 ),
                 permutation=torch.empty(
                     (len(permutation),), dtype=torch.int32, device=self.device
@@ -240,10 +241,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             batch_info.max_len = chunk_size
 
         # Copy to device asynchronously
-        batch_info.lora_ranks[: self.max_loras_per_batch].copy_(
+        batch_info.lora_ranks[: self.max_loras_total].copy_(
             lora_ranks_tensor, non_blocking=True
         )
-        batch_info.scalings[: self.max_loras_per_batch].copy_(
+        batch_info.scalings[: self.max_loras_total].copy_(
             scalings_tensor, non_blocking=True
         )
         batch_info.weight_indices[:num_segments].copy_(

@@ -18,10 +18,11 @@ class AscendLoRABackend(BaseLoRABackend):
     def __init__(
         self,
         max_loras_per_batch: int,
+        max_loras_prefetch: int,
         device: torch.device,
         **kwargs,
     ):
-        super().__init__(max_loras_per_batch, device)
+        super().__init__(max_loras_per_batch, max_loras_prefetch, device)
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -268,19 +269,19 @@ class AscendLoRABackend(BaseLoRABackend):
                     (bs,), dtype=torch.int32, device=self.device
                 ),
                 lora_ranks=torch.empty(
-                    (self.max_loras_per_batch,), dtype=torch.int32, device=self.device
+                    (self.max_loras_total,), dtype=torch.int32, device=self.device
                 ),
                 scalings=torch.empty(
-                    (self.max_loras_per_batch,), dtype=torch.float, device=self.device
+                    (self.max_loras_total,), dtype=torch.float, device=self.device
                 ),
                 permutation=None,
             )
 
         # Copy to device asynchronously
-        batch_info.lora_ranks[: self.max_loras_per_batch].copy_(
+        batch_info.lora_ranks[: self.max_loras_total].copy_(
             lora_ranks_tensor, non_blocking=True
         )
-        batch_info.scalings[: self.max_loras_per_batch].copy_(
+        batch_info.scalings[: self.max_loras_total].copy_(
             scalings_tensor, non_blocking=True
         )
         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
