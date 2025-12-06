@@ -1039,6 +1039,11 @@ class EAGLEWorker(TpModelWorker):
         )
         return success, message
 
+    def execute_task_in_model_worker(self, task_spec):
+        """Execute a task on model shard"""
+        models = [self.target_worker.model_runner.model, self.draft_model_runner.model]
+        return self.target_worker.execute_task_in_model_worker(task_spec, models=models)
+
 
 @torch.compile(dynamic=True, disable=_is_npu)
 def get_last_loc_large_page_size_top_k_1(

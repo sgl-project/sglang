@@ -27,7 +27,7 @@ import random
 import signal
 import threading
 import time
-from typing import AsyncIterator, Dict, Iterator, List, Optional, Tuple, Union
+from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import zmq
 
@@ -425,6 +425,21 @@ class Engine(EngineBase):
             "internal_states": internal_states,
             "version": __version__,
         }
+
+    async def async_execute_task_in_model_worker(
+        self, task_func: Callable, **kwargs
+    ) -> List:
+        """Execute a task on every model worker subprocess"""
+        return await self.tokenizer_manager.execute_task_in_model_worker(
+            task_func, **kwargs
+        )
+
+    def execute_task_in_model_worker(self, task_func: Callable, **kwargs) -> List:
+        """Execute a task on every model worker subprocess"""
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(
+            self.tokenizer_manager.execute_task_in_model_worker(task_func, **kwargs)
+        )
 
     def init_weights_update_group(
         self,
