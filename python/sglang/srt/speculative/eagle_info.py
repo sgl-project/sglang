@@ -67,6 +67,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     seq_lens_cpu: torch.Tensor
     grammar: BaseGrammarObject = None
 
+    # Shape info for padding
+    num_tokens_per_batch: int = -1
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
 
