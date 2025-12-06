@@ -668,7 +668,7 @@ class PrefillAdder:
         )
 
         sorted_valid_running_reqs = sorted(
-            self.running_batch.reqs,
+            valid_running_reqs,
             key=lambda x: (
                 x.priority * (-priority_sign),
                 -x.time_stats.wait_queue_entry_time,
