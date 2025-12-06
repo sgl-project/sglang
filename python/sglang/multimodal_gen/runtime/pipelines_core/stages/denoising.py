@@ -109,6 +109,9 @@ class DenoisingStage(PipelineStage):
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        self.transformer_compiled_func = None
+        self.transformer_2_compiled_func = None
+        self.full_graph = False
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -118,13 +121,12 @@ class DenoisingStage(PipelineStage):
 
         # torch compile
         if self.server_args.enable_torch_compile:
-            full_graph = False
-            self.transformer = torch.compile(
-                self.transformer, mode="max-autotune", fullgraph=full_graph
+            self.transformer_compiled_func = torch.compile(
+                self.transformer, mode="max-autotune", fullgraph=self.full_graph
             )
-            self.transformer_2 = (
+            self.transformer_2_compiled_func = (
                 torch.compile(
-                    self.transformer_2, mode="max-autotune", fullgraph=full_graph
+                    self.transformer_2, mode="max-autotune", fullgraph=self.full_graph
                 )
                 if transformer_2 is not None
                 else None
@@ -490,9 +492,12 @@ class DenoisingStage(PipelineStage):
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(batch.num_inference_steps)
 
-            if self.server_args.enable_torch_compile:
-                self.transformer = torch.compile(
-                    self.transformer, mode="max-autotune", fullgraph=True
+            if (
+                self.server_args.enable_torch_compile
+                and not self.transformer_compiled_func
+            ):
+                self.transformer_compiled_func = torch.compile(
+                    self.transformer, mode="max-autotune", fullgraph=self.full_graph
                 )
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
@@ -832,13 +837,31 @@ class DenoisingStage(PipelineStage):
     ):
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
-            current_model = self.transformer
-            model_to_offload = self.transformer_2
+            if server_args.enable_torch_compile and not self.transformer_compiled_func:
+                current_model = self.transformer_compiled_func
+            else:
+                current_model = self.transformer
+            if (
+                server_args.enable_torch_compile
+                and not self.transformer_2_compiled_func
+            ):
+                model_to_offload = self.transformer_2_compiled_func
+            else:
+                model_to_offload = self.transformer_2
             current_guidance_scale = batch.guidance_scale
         else:
             # Low-noise stage
-            current_model = self.transformer_2
-            model_to_offload = self.transformer
+            if (
+                server_args.enable_torch_compile
+                and not self.transformer_2_compiled_func
+            ):
+                current_model = self.transformer_2_compiled_func
+            else:
+                current_model = self.transformer_2
+            if server_args.enable_torch_compile and not self.transformer_compiled_func:
+                model_to_offload = self.transformer_compiled_func
+            else:
+                model_to_offload = self.transformer
             current_guidance_scale = batch.guidance_scale_2
 
         self._manage_device_placement(current_model, model_to_offload, server_args)
