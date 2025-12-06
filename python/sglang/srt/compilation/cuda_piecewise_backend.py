@@ -96,8 +96,6 @@ class CUDAPiecewiseBackend:
 
         self.sym_shape_indices = sym_shape_indices
 
-        self.is_debugging_mode = True
-
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
         self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}
@@ -161,10 +159,11 @@ class CUDAPiecewiseBackend:
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            entry.input_addresses = input_addresses
+            if self.compile_config.get_enable_debug_mode():
+                input_addresses = [
+                    x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+                ]
+                entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -202,7 +201,7 @@ class CUDAPiecewiseBackend:
             # manage the memory during cuda graph capture
             return output
 
-        if self.is_debugging_mode:
+        if self.compile_config.get_enable_debug_mode():
             # check if the input addresses are the same
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)

@@ -11,6 +11,7 @@ in a functional manner, reducing the need for explicit parameter passing.
 
 from __future__ import annotations
 
+import os
 import pprint
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
@@ -18,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
@@ -26,7 +27,6 @@ from sglang.multimodal_gen.configs.sample.teacache import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from torchcodec.decoders import VideoDecoder
 
     from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 
@@ -54,7 +54,9 @@ class Req:
     image_path: str | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
-    pil_image: torch.Tensor | PIL.Image.Image | None = None
+
+    original_condition_image_size: tuple[int, int] = None
+    condition_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
@@ -86,15 +88,21 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
+    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    # Flux-2
+    latent_ids: torch.Tensor | None = None
+
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
-    image_latent: torch.Tensor | None = None
+    # vae-encoded condition image
+    image_latent: torch.Tensor | list[torch.Tensor] | None = None
+    condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -187,6 +195,18 @@ class Req:
         batch_size *= self.num_outputs_per_prompt
         return batch_size
 
+    def output_file_path(self, num_outputs, output_idx):
+        output_file_name = self.output_file_name
+        if num_outputs > 1 and output_file_name:
+            base, ext = os.path.splitext(output_file_name)
+            output_file_name = f"{base}_{output_idx}{ext}"
+
+        return (
+            os.path.join(self.output_path, output_file_name)
+            if output_file_name
+            else None
+        )
+
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
         # Set do_classifier_free_guidance based on guidance scale and negative prompt
@@ -197,13 +217,7 @@ class Req:
         if self.guidance_scale_2 is None:
             self.guidance_scale_2 = self.guidance_scale
 
-    def set_width_and_height(self, server_args: ServerArgs):
-        if self.height is None or self.width is None:
-            width, height = server_args.pipeline_config.adjust_size(
-                self.width, self.height, self.pil_image
-            )
-            self.width = width
-            self.height = height
+    def adjust_size(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
             self.width = 1280
             self.height = 720
@@ -226,9 +240,3 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
-
-
-@dataclass
-class PreprocessBatch(Req):
-    video_loader: list["VideoDecoder"] | list[str] = field(default_factory=list)
-    video_file_name: list[str] = field(default_factory=list)

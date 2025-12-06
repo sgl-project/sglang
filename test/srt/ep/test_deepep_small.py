@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -224,6 +225,10 @@ class TestTBO(CustomTestCase):
                 "--max-running-requests",
                 "512",
             ],
+            env={
+                **os.environ,
+                "SGLANG_TBO_DEBUG": "1",
+            },
         )
 
     @classmethod
@@ -302,7 +307,7 @@ class TestMTP(CustomTestCase):
 
         self.assertGreater(metrics["accuracy"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -351,6 +356,10 @@ class TestMTPWithTBO(CustomTestCase):
                 "--max-running-requests",
                 "128",
             ],
+            env={
+                **os.environ,
+                "SGLANG_TBO_DEBUG": "1",
+            },
         )
 
     @classmethod
@@ -372,7 +381,7 @@ class TestMTPWithTBO(CustomTestCase):
 
         self.assertGreater(metrics["accuracy"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

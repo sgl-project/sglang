@@ -45,7 +45,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 ## Architecture
 
 ### Control Plane
-- **Worker Manager** discovers capabilities (`/get_server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
+- **Worker Manager** discovers capabilities (`/server_info`, `/model_info`), tracks load, and registers/removes workers in the shared registry.
 - **Job Queue** serializes add/remove requests and exposes status (`/workers/{url}`) so clients can track onboarding progress.
 - **Load Monitor** feeds cache-aware and power-of-two policies with live worker load statistics.
 - **Health Checker** continuously probes workers and updates readiness, circuit breaker state, and router metrics.
@@ -275,6 +275,7 @@ PD deployments can specify `--prefill-selector` and `--decode-selector` plus the
 | `memory` (default) | In-memory storage for quick prototyping. | `--history-backend memory` |
 | `none` | No persistence; APIs operate but store nothing. | `--history-backend none` |
 | `oracle` | Oracle Autonomous Database-backed storage (pooled connections). | `--history-backend oracle` |
+| `postgres` | PostgreSQL Database-backed storage (pooled connections). | `--history-backend postgres` |
 
 Oracle configuration (choose DSN *or* TNS alias):
 Install the Oracle Instant Client and set `LD_LIBRARY_PATH` accordingly.
