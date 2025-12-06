@@ -35,7 +35,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self.tokens_after_think_end = -1
 
     def maybe_init_reasoning(self, reasoning: bool):
-        self.tokens_after_think_end = 0
+        self.tokens_after_think_end = -1 if reasoning else 0
 
     def transfer_state(self, token: int) -> int:
         if self.tokens_after_think_end == -1 and token == self.think_end_id:
