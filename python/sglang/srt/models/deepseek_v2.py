@@ -48,6 +48,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -2655,7 +2656,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
-        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+        if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
             # refer to real DeepSeek V3 quant config
             return Fp8Config(
                 is_checkpoint_fp8_serialized=True,
@@ -3591,7 +3592,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if get_bool_env_var("SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN"):
+        if envs.SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN.get():
             weights = self._quant_attn_to_fp8_ue8m0(weights, is_nextn=is_nextn)
         if is_nextn and enable_nextn_moe_bf16_cast_to_fp8(self.quant_config):
             weights = self._quant_nextn_moe_to_fp8_ue8m0(
