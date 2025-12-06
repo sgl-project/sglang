@@ -422,7 +422,6 @@ class Qwen3MoeAttention(nn.Module):
             q_bias=getattr(self.q_norm, "bias", None),
             k_bias=getattr(self.k_norm, "bias", None),
         )
-
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -450,7 +449,6 @@ class Qwen3MoeAttention(nn.Module):
                 else None
             ),
         )
-
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -479,14 +477,8 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-
-        q, k, v, fb = inner_state
-
         attn_output = self.attn(
-            q,
-            k,
-            v,
-            fb,
+            *inner_state,
             save_kv_cache=not (
                 enable_fused_set_kv_buffer(forward_batch)
                 and self.compatible_with_fused_kv_buffer
