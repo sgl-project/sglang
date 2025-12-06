@@ -202,9 +202,9 @@ class SchedulerRuntimeCheckerMixin:
             )
 
     def check_memory(self: Scheduler):
-        if self.is_hybrid:
+        if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
-        elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
+        elif self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache):
             memory_leak, token_msg = self._check_mamba_memory()
         else:
             memory_leak, token_msg = self._check_radix_cache_memory()
@@ -226,7 +226,7 @@ class SchedulerRuntimeCheckerMixin:
             and time.perf_counter() > self.metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 (
                     full_num_used,
                     swa_num_used,
@@ -239,7 +239,7 @@ class SchedulerRuntimeCheckerMixin:
                 ) = self._get_swa_token_info()
                 num_used = max(full_num_used, swa_num_used)
                 token_usage = max(full_token_usage, swa_token_usage)
-            elif self.is_hybrid_gdn:
+            elif self.is_ssm_model:
                 (
                     num_used,
                     _,
@@ -277,8 +277,8 @@ class SchedulerRuntimeCheckerMixin:
         self._publish_kv_events()
 
     def check_tree_cache(self: Scheduler):
-        if (self.is_hybrid and isinstance(self.tree_cache, SWARadixCache)) or (
-            self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache)
+        if (self.is_hybrid_swa and isinstance(self.tree_cache, SWARadixCache)) or (
+            self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache)
         ):
             self.tree_cache.sanity_check()
 
@@ -320,9 +320,9 @@ class SchedulerRuntimeCheckerMixin:
 
         if not disable_request_logging():
             # Print batch size and memory pool info to check whether there are de-sync issues.
-            if self.is_hybrid:
+            if self.is_hybrid_swa:
                 _, info_msg = self._check_hybrid_memory()
-            elif self.is_hybrid_gdn and isinstance(self.tree_cache, MambaRadixCache):
+            elif self.is_ssm_model and isinstance(self.tree_cache, MambaRadixCache):
                 _, info_msg = self._check_mamba_memory()
             else:
                 _, info_msg = self._check_radix_cache_memory()

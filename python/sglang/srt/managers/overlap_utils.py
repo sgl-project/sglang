@@ -50,7 +50,7 @@ class FutureMap:
             if chunked_prefill_size
             else 0
         )
-        self.future_limit = max_running_requests * 3 + max_num_chunks
+        self.future_limit = max_running_requests * (3 + max_num_chunks)
         # Adding 2 * max_running_requests to future_limit ensures the buffer is sufficiently large.
         self.future_buffer_len = self.future_limit + 2 * max_running_requests
         self.device = device

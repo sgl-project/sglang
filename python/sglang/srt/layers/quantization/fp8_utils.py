@@ -244,6 +244,13 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     if not (shape_supported and dtype_supported):
         # fall back to triton
+        # If weight_scale is in UE8M0 packed format (int32), convert back to float32
+        # UE8M0 format has shape (N, K//block_k//4) with dtype int32
+        # Triton expects shape (N//block_n, K//block_k) with dtype float32
+        if weight_scale.dtype == torch.int32:
+            weight_scale = _unpack_ue8m0_scale_for_triton(
+                weight_scale, weight.shape, block_size
+            )
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
@@ -265,6 +272,67 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
+
+
+def _unpack_ue8m0_scale_for_triton(
+    sf_packed: torch.Tensor,
+    weight_shape: Tuple[int, int],
+    block_size: List[int],
+) -> torch.Tensor:
+    """
+    Unpack UE8M0 packed scale tensor back to float32 format for triton kernel.
+
+    The UE8M0 format packs scales as:
+    - Shape: (N, K//block_k//4) with dtype int32
+    - Each int32 contains 4 uint8 scale values
+
+    Triton expects:
+    - Shape: (N//block_n, K//block_k) with dtype float32
+
+    Args:
+        sf_packed: Packed scale tensor with shape (N, packed_k_groups) and dtype int32
+        weight_shape: (N, K) shape of the weight tensor
+        block_size: [block_n, block_k] quantization block size
+
+    Returns:
+        Unpacked scale tensor with shape (n_groups, k_groups) and dtype float32
+    """
+    assert sf_packed.dtype == torch.int32
+    assert len(sf_packed.shape) == 2
+
+    N, K = weight_shape
+    block_n, block_k = block_size
+    n_groups = ceil_div(N, block_n)
+    k_groups = ceil_div(K, block_k)
+
+    mn_repeat, k_div_4 = sf_packed.shape
+    k_packed = k_div_4 * 4
+
+    # Unpack int32 -> 4x uint8 -> float32
+    # Each uint8 represents an exponent in UE8M0 format
+    sf_u8 = sf_packed.contiguous().view(torch.uint8).view(mn_repeat, k_packed)
+    sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
+
+    # Handle row dimension - may have 128x replication or direct mapping
+    if mn_repeat == N:
+        # Rows are replicated 128 times, take every 128th row
+        # sf_fp32 shape: (N, k_packed) -> (n_groups, k_packed)
+        # Select representative rows at indices 0, 128, 256, ...
+        indices = torch.arange(0, N, block_n, device=sf_packed.device)
+        sf_fp32 = sf_fp32.index_select(0, indices)
+    elif mn_repeat == n_groups:
+        # Already in the correct n_groups format
+        pass
+    else:
+        raise ValueError(
+            f"Unexpected scale shape: sf_packed.shape={sf_packed.shape}, "
+            f"weight_shape={weight_shape}, block_size={block_size}"
+        )
+
+    # Crop k dimension to expected size (remove padding if any)
+    sf_fp32 = sf_fp32[:, :k_groups].contiguous()
+
+    return sf_fp32
 
 
 def aiter_w8a8_block_fp8_linear(
@@ -507,21 +575,59 @@ def transform_scale_ue8m0_inplace(param, mn):
 
 
 # NOTE copy and modified from DeepGEMM
-def transform_scale_ue8m0(sf, mn):
+def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
     import deep_gemm.utils.layout
 
+    get_mn_major_tma_aligned_packed_ue8m0_tensor = (
+        _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
+        if use_torch_impl
+        else deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
+    )
+
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
-    sf = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+    sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
     return sf
+
+
+# Copied from DeepGEMM tests
+def _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    from deep_gemm.utils import align, get_tma_aligned_size
+
+    assert x.dtype == torch.float and x.dim() in (2, 3)
+
+    # First, convert into UE8M0 `uint8_t`
+    ue8m0_tensor = (x.view(torch.int) >> 23).to(torch.uint8)
+
+    # Second, make padded packed tensors
+    mn, k = x.shape[-2], x.shape[-1]
+    remove_dim = False
+    if x.dim() == 2:
+        x, remove_dim = x.unsqueeze(0), True
+    b = x.shape[0]
+    aligned_mn = get_tma_aligned_size(mn, 4)
+    aligned_k = align(k, 4)
+    padded = torch.zeros((b, aligned_mn, aligned_k), device=x.device, dtype=torch.uint8)
+    padded[:, :mn, :k] = ue8m0_tensor
+    padded = padded.view(-1).view(dtype=torch.int).view(b, aligned_mn, aligned_k // 4)
+
+    # Finally, transpose
+    transposed = torch.zeros(
+        (b, aligned_k // 4, aligned_mn), device=x.device, dtype=torch.int
+    ).mT
+    transposed[:, :, :] = padded
+    aligned_x = transposed[:, :mn, :]
+    return aligned_x.squeeze(0) if remove_dim else aligned_x
 
 
 def inverse_transform_scale_ue8m0(sf_packed, mn):
     sf_fp32 = _inverse_transform_scale_ue8m0_impl(sf_packed)
     # Can call consistency check every time since this is only called on startup
-    sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn)
+    sf_packed_recreated = transform_scale_ue8m0(sf_fp32, mn=mn, use_torch_impl=True)
     assert torch.all(
         sf_packed == sf_packed_recreated
-    ), f"{sf_packed=} {sf_packed_recreated}"
+    ), f"{sf_packed=} {sf_packed_recreated=} {sf_fp32=}"
     return sf_fp32
 
 
@@ -532,8 +638,13 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     :param sf_packed: (scale_mn, scale_k/4) int32
     :return: (scale_mn, scale_k), float32
     """
+    if len(sf_packed.shape) == 3:
+        return torch.stack(
+            [_inverse_transform_scale_ue8m0_impl(x) for x in sf_packed], dim=0
+        )
+
     block_size = 128
-    assert len(sf_packed.shape) == 2
+    assert len(sf_packed.shape) == 2, f"{sf_packed.shape=}"
     assert sf_packed.dtype == torch.int32
 
     mn_repeat_128, k_div_4 = sf_packed.shape
@@ -547,7 +658,12 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     # remove repeat
     sf_reshaped = sf_fp32.view(mn, block_size, k)
     sf_unrepeated = sf_reshaped[:, 0:1, :]
-    assert torch.all(sf_unrepeated == sf_reshaped)
+    if not torch.all(sf_unrepeated == sf_reshaped):
+        from sglang.srt.debug_utils.dumper import get_tensor_info
+
+        raise AssertionError(
+            f"sf_unrepeated != sf_reshaped ({get_tensor_info(sf_unrepeated)=} {get_tensor_info(sf_reshaped)=})"
+        )
     sf_unrepeated = sf_unrepeated.squeeze(1).contiguous()
 
     assert sf_unrepeated.shape == (mn, k)
@@ -820,3 +936,81 @@ def can_auto_enable_marlin_fp8() -> bool:
         return 80 <= sm < 89
     except Exception:
         return False
+
+
+def apply_fp8_ptpc_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    input_scale_ub: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    cutlass_fp8_supported: bool = cutlass_fp8_supported(),
+    use_per_token_if_dynamic: bool = False,
+    pad_output: Optional[bool] = None,
+    compressed_tensor_quant: bool = False,
+) -> torch.Tensor:
+    # View input as 2D matrix for fp8 methods
+    input_2d = input.view(-1, input.shape[-1])
+
+    # weight is transposed (K, N)
+    output_shape = [*input.shape[:-1], weight.shape[1]]
+
+    q_input, x_scale = aiter.per_token_quant_hip(input_2d, quant_dtype=aiter.dtypes.fp8)
+
+    per_tensor_weights = (weight_scale.numel() == 1) and weight_scale.dim() < 2
+    per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
+
+    if not (per_tensor_weights and per_tensor_activations):
+        # weight is in (N, K)
+        output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    output = aiter.gemm_a8w8_bpreshuffle(
+        q_input, weight, x_scale, weight_scale, None, input.dtype
+    )
+    if bias is not None:
+        output = output + bias
+    return output.view(*output_shape)
+
+
+def validate_fp8_block_shape(
+    layer: torch.nn.Module,
+    input_size: int,
+    output_size: int,
+    input_size_per_partition: int,
+    output_partition_sizes: list[int],
+    block_size: list[int],
+) -> None:
+    """Validate block quantization shapes for tensor parallelism."""
+    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+    tp_size = getattr(layer, "tp_size", get_tensor_model_parallel_world_size())
+    block_n, block_k = block_size[0], block_size[1]
+
+    # Required by row parallel
+    if (
+        tp_size > 1
+        and input_size // input_size_per_partition == tp_size
+        and input_size_per_partition % block_k != 0
+    ):
+        raise ValueError(
+            f"Weight input_size_per_partition = {input_size_per_partition} "
+            f"is not divisible by weight quantization block_k = {block_k}."
+        )
+
+    # Required by column parallel or enabling merged weights
+    is_tp_split = tp_size > 1 and output_size // sum(output_partition_sizes) == tp_size
+    is_merged_gemm = len(output_partition_sizes) > 1
+    if is_tp_split or is_merged_gemm:
+        sizes_to_check = output_partition_sizes
+        if not is_tp_split and is_merged_gemm:
+            # In case of merged matrices, we allow the last
+            # matrix to not be a multiple of block size
+            sizes_to_check = output_partition_sizes[:-1]
+        for output_partition_size in sizes_to_check:
+            if output_partition_size % block_n != 0:
+                raise ValueError(
+                    f"Weight output_partition_size = "
+                    f"{output_partition_size} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )
