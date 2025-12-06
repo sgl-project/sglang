@@ -16,6 +16,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=600, suite="nightly-8-gpu-b200", nightly=True)
 
+# Base model and Eagle draft model
+MISTRAL_LARGE3_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512"
 MISTRAL_LARGE3_EAGLE_MODEL_PATH = "mistralai/Mistral-Large-3-675B-Instruct-2512-Eagle"
 PROFILE_DIR = "performance_profiles_mistral_large3_eagle"
 
@@ -26,21 +28,29 @@ class TestNightlyMistralLarge3EaglePerformance(unittest.TestCase):
         # Set environment variable to disable JIT DeepGemm
         os.environ["SGLANG_ENABLE_JIT_DEEPGEMM"] = "0"
 
-        cls.model = MISTRAL_LARGE3_EAGLE_MODEL_PATH
+        cls.model = MISTRAL_LARGE3_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
-        # Mistral-Large-3-Eagle requires TP=8, trtllm_mla attention backend,
-        # speculative MoE runner backend, and auto kv cache dtype
+        # Mistral-Large-3 with Eagle speculative decoding
+        # Eagle model is used as draft model for speculative decoding
         cls.other_args = [
             "--tp",
             "8",
             "--attention-backend",
             "trtllm_mla",
-            "--speculative-moe-runner-backend",
-            "flashinfer_trtllm",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-draft-model-path",
+            MISTRAL_LARGE3_EAGLE_MODEL_PATH,
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "4",
+            "--speculative-num-draft-tokens",
+            "16",
             "--kv-cache-dtype",
             "auto",
             "--model-loader-extra-config",
@@ -76,7 +86,7 @@ class TestNightlyMistralLarge3EaglePerformance(unittest.TestCase):
             )
 
     def test_accuracy_mgsm(self):
-        """Run MGSM accuracy evaluation for Mistral Large 3 Eagle."""
+        """Run MGSM accuracy evaluation for Mistral Large 3 with Eagle."""
         process = popen_launch_server(
             model=self.model,
             base_url=self.base_url,
@@ -93,7 +103,7 @@ class TestNightlyMistralLarge3EaglePerformance(unittest.TestCase):
                 num_threads=1024,
             )
             metrics = run_eval(args)
-            print(f"MGSM accuracy for {self.model}: {metrics['score']}")
+            print(f"MGSM accuracy for {self.model} with Eagle: {metrics['score']}")
 
             # Placeholder threshold - adjust after first successful run
             expected_threshold = 0.90
