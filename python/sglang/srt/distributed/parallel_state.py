@@ -757,6 +757,9 @@ class GroupCoordinator:
         eliminating the CPU-side launch-kernel blocking issue caused by synchronization problems.
         The specific implementation uses the interface provided by pynccl to remove the synchronization logic of events.
         """
+        if _is_npu:
+            self._all_gather_into_tensor(output, input)
+            return
         assert (
             stream is not None
         ), f"Invalid params stream ({stream}, Please specify the stream to use when calling cp_all_gather_into_tensor_async.)"
