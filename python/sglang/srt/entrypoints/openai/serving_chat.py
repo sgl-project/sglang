@@ -802,7 +802,7 @@ class OpenAIServingChat(OpenAIServingBase):
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"].get("weight_version", None)},
+            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
         )
 
     def _process_logprobs_tokens(
@@ -850,7 +850,7 @@ class OpenAIServingChat(OpenAIServingBase):
     def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
         """Process logprobs for non-streaming response"""
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
+            output_token_logprobs=ret_item["meta_info"].get("output_token_logprobs", None),
             output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
         )
 
@@ -961,7 +961,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> ChoiceLogprobs:
         """Process logprobs for streaming response"""
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=content["meta_info"]["output_token_logprobs"][
+            output_token_logprobs=content["meta_info"].get("output_token_logprobs", [])[
                 n_prev_token:
             ],
             output_top_logprobs=content["meta_info"].get("output_top_logprobs", [])[
