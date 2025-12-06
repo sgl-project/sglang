@@ -543,7 +543,6 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
-
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
