@@ -71,7 +71,7 @@ from typing import (
     TypeVar,
     Union,
 )
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 import orjson
@@ -874,6 +874,9 @@ def load_image(
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        image = Image.open(image_file)
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):
@@ -894,6 +897,10 @@ def get_image_bytes(image_file: Union[str, bytes]):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
         response = requests.get(image_file, timeout=timeout)
         return response.content
+    elif image_file.startswith("file://"):
+        image_file = unquote(urlparse(image_file).path)
+        with open(image_file, "rb") as f:
+            return f.read()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -943,8 +950,11 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
                 tmp_file.write(video_bytes)
                 tmp_file.close()
                 vr = VideoReader(tmp_file.name, ctx=ctx)
+            elif video_file.startswith("file://"):
+                video_file = unquote(urlparse(video_file).path)
+                vr = VideoReader(video_file, ctx=ctx)
             # `urlparse` supports file:// paths, and so does VideoReader
-            elif os.path.isfile(urlparse(video_file).path):
+            elif os.path.isfile(unquote(urlparse(video_file).path)):
                 vr = VideoReader(video_file, ctx=ctx)
             else:
                 video_bytes = pybase64.b64decode(video_file, validate=True)
