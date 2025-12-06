@@ -31,6 +31,7 @@ from sgl_kernel.elementwise import (
     gemma_rmsnorm,
     rmsnorm,
     rotary_embedding,
+    scale_residual_norm_scale_shift,
     silu_and_mul,
 )
 from sgl_kernel.expert_specialization import (
