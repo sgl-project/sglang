@@ -71,6 +71,9 @@ class LoRAAdapter(nn.Module):
             ]
         )
 
+        self.embedding_layers: Dict[str, torch.Tensor] = {}
+        self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
+
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
         model_path = self.config.path
@@ -84,6 +87,16 @@ class LoRAAdapter(nn.Module):
             layer_id = get_layer_id(name)
             if layer_id is not None:
                 self.layers[layer_id].weights[name] = loaded_weight.cpu()
+            elif "embed_tokens" in name or "lm_head" in name:
+                # self.embedding_layers.weights[name] = loaded_weight.cpu()
+                self.embedding_layers[name] = loaded_weight.cpu()
+            elif "input_embeddings" in name or "output_embeddings" in name:
+                # added token emb
+                self.added_tokens_embeddings[name] = loaded_weight.cpu()
+                assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
+                    f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
+                    f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+                )
 
         # normalize kv_proj and gate_up_proj
         for layer in self.layers:
