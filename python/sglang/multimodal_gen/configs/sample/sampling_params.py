@@ -567,7 +567,6 @@ class SamplingParams:
 
         # global switch: if True, allow overriding protected fields
         allow_override_protected = not user_params.no_override_protected_fields
-
         for field in dataclasses.fields(user_params):
             field_name = field.name
             user_value = getattr(user_params, field_name)
@@ -575,13 +574,11 @@ class SamplingParams:
 
             # A field is considered user-modified if its value is different from the default
             is_user_modified = user_value != default_class_value
-            is_protected_field = field_name not in subclass_defined_fields
-
+            is_protected_field = field_name in subclass_defined_fields
             if is_user_modified and (
                 allow_override_protected or not is_protected_field
             ):
                 setattr(self, field_name, user_value)
-
         self.height_not_provided = user_params.height_not_provided
         self.width_not_provided = user_params.width_not_provided
         self.__post_init__()
