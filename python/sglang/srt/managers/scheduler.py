@@ -276,6 +276,7 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
+        self.need_prefetch_storage = self.enable_hicache_storage
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -729,6 +730,7 @@ class Scheduler(
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
+            gpu_id=self.gpu_id,
         )
 
         if (
@@ -752,6 +754,19 @@ class Scheduler(
 
                 logger.info("Using experimental C++ radix tree implementation.")
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
+            elif (
+                self.enable_hierarchical_cache
+                and self.server_args.hicache_storage_backend == "memcache"
+            ):
+                from sglang.srt.mem_cache.ascend_radix_cache import AscendHiRadixCache
+
+                self.tree_cache = AscendHiRadixCache(
+                    params=params, server_args=server_args
+                )
+                self.need_prefetch_storage = False
+                self.tp_worker.register_hicache_layer_transfer_counter(
+                    self.tree_cache.cache_controller.layer_done_counter
+                )
             elif self.enable_hierarchical_cache:
                 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
@@ -1459,7 +1474,7 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage and self.need_prefetch_storage:
             req.init_next_round_input(self.tree_cache)
             if req.last_node.backuped:
                 # only to initiate the prefetch if the last node is backuped
@@ -1764,6 +1779,7 @@ class Scheduler(
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
+            self.enable_hierarchical_cache,
         )
 
         if self.chunked_req is not None:
