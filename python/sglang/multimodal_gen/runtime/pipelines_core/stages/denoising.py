@@ -49,6 +49,11 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
+
+try:
+    from torch.distributed.fsdp import FSDPModule
+except ImportError:
+    FSDPModule = None
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -97,6 +102,43 @@ except ImportError:
     vsa_available = False
 
 logger = init_logger(__name__)
+
+
+def get_fsdp_wrapped_attr(module: torch.nn.Module, attr_name: str, default=None):
+    """
+    Get an attribute from a potentially FSDP-wrapped module.
+    
+    When using FSDP with CPU offloading, module attributes may not be directly
+    accessible via getattr(). This function attempts to traverse the FSDP wrapper
+    to access the underlying module's attributes.
+    
+    Args:
+        module: The module (potentially FSDP-wrapped)
+        attr_name: Name of the attribute to retrieve
+        default: Default value if attribute is not found
+        
+    Returns:
+        The attribute value or default if not found
+    """
+    # Try direct attribute access first
+    attr = getattr(module, attr_name, None)
+    if attr is not None:
+        return attr
+    
+    # If FSDP is available and module might be wrapped, try to unwrap
+    if FSDPModule is not None and isinstance(module, FSDPModule):
+        # FSDP2 stores the original module in _orig_mod
+        if hasattr(module, "_orig_mod"):
+            return getattr(module._orig_mod, attr_name, default)
+    
+    # Recursively check if any child module has the attribute
+    # (for cases where FSDP wraps submodules)
+    for child in module.children():
+        attr = get_fsdp_wrapped_attr(child, attr_name, None)
+        if attr is not None:
+            return attr
+    
+    return default
 
 
 class DenoisingStage(PipelineStage):
@@ -605,7 +647,7 @@ class DenoisingStage(PipelineStage):
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
                 self.device,
-                getattr(self.transformer, "rotary_emb", None),
+                get_fsdp_wrapped_attr(self.transformer, "rotary_emb", None),
                 dtype=target_dtype,
             ),
         )
@@ -620,7 +662,7 @@ class DenoisingStage(PipelineStage):
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
                     self.device,
-                    getattr(self.transformer, "rotary_emb", None),
+                    get_fsdp_wrapped_attr(self.transformer, "rotary_emb", None),
                     dtype=target_dtype,
                 ),
             )
