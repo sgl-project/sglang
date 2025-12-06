@@ -46,6 +46,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -3050,6 +3051,10 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
+            self.enable_a2a_moe = True
+        else:
+            self.enable_a2a_moe = False
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
@@ -3128,7 +3133,13 @@ class DeepseekV2Model(nn.Module):
         for i in range(normal_start_layer, normal_end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                    if i <= 3 or not self.enable_a2a_moe:
+                        aux_hidden_states.append(hidden_states + residual)
+                    else:
+                        aux_hidden_state = tensor_model_parallel_all_gather(
+                            hidden_states + residual, dim=0
+                        )
+                        aux_hidden_states.append(aux_hidden_state)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
