@@ -12,6 +12,7 @@ from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
+    from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
@@ -40,13 +41,13 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
-    grammars: Optional[List] = None
+    grammars: Optional[List[BaseGrammarObject]] = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
     # Penalizer
     penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
-    acc_linear_penalties: torch.Tensor = None  # Used in the overlap mode
+    accumulated_linear_penalties: torch.Tensor = None  # Used in the overlap mode
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -178,11 +179,13 @@ class SamplingBatchInfo:
     def __len__(self):
         return len(self.temperatures)
 
-    def update_regex_vocab_mask(self):
+    def init_regex_vocab_mask(
+        self, use_callback: bool = True
+    ) -> Tuple[Callable[[], None], torch.cuda.Event]:
         if not self.grammars:
             self.vocab_mask = None
             self.apply_mask_func = None
-            return
+            return lambda: None, None
 
         # Find a grammar from the list
         first_grammar = next(grammar for grammar in self.grammars if grammar)
@@ -193,33 +196,52 @@ class SamplingBatchInfo:
             batch_size=len(self.temperatures),
             device=self.device,
         )
-        self.apply_mask_func = (
-            first_grammar.apply_vocab_mask
-        )  # force to use static method
-
-        # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)
-
         # Move the mask to the device if needed
         self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
 
+        # force to use static method
+        self.apply_mask_func = first_grammar.apply_vocab_mask
+        from sglang.jit_kernel.cuda_wait_value import Event
+
+        mask_ready = Event()
+
+        def update_regex_vocab_callback():
+            # Apply the mask
+            mask_buf = first_grammar.allocate_vocab_mask(
+                vocab_size=self.vocab_size,
+                batch_size=len(self.temperatures),
+                device=self.device,
+            )
+            for i, grammar in enumerate(self.grammars):
+                if grammar and not grammar.finished and not grammar.is_terminated():
+                    grammar.fill_vocab_mask(mask_buf, i)
+
+            mask_buf = grammar.move_vocab_mask(mask_buf, self.device)
+            self.vocab_mask.copy_(mask_buf)
+            mask_ready.record()
+            print("Regex vocab mask is ready.")
+
+        if use_callback:
+            return update_regex_vocab_callback, mask_ready
+        else:
+            update_regex_vocab_callback()
+            return lambda: None, mask_ready
+
     def update_penalties(self):
         if self.penalizer_orchestrator.is_required:
-            self.acc_linear_penalties = torch.zeros(
+            self.accumulated_linear_penalties = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
                 device=self.temperatures.device,
             )
-            self.penalizer_orchestrator.apply(self.acc_linear_penalties)
+            self.penalizer_orchestrator.apply(self.accumulated_linear_penalties)
         else:
-            self.acc_linear_penalties = None
+            self.accumulated_linear_penalties = None
 
     def apply_logits_bias(self, logits: torch.Tensor):
-        if self.acc_linear_penalties is not None:
+        if self.accumulated_linear_penalties is not None:
             # Used in the overlap mode
-            logits.add_(self.acc_linear_penalties)
+            logits.add_(self.accumulated_linear_penalties)
 
         if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
             # Used in the non-overlap mode
@@ -227,6 +249,7 @@ class SamplingBatchInfo:
 
         if self.vocab_mask is not None:
             self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
+            print(f"{logits=}")
 
         if self.logit_bias is not None:
             logits.add_(self.logit_bias)

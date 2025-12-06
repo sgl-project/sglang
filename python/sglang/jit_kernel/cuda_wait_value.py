@@ -18,6 +18,7 @@ def _jit_stream_wait_value_module() -> Module:
         "cuda_wait_value",
         cuda_files=["cuda_wait_value.cuh"],
         cuda_wrappers=[("stream_wait_value", "stream_wait_value")],
+        extra_ldflags=["-lcuda"],
     )
 
 
@@ -31,7 +32,7 @@ class Event:
         self.flag = torch.zeros(1, dtype=torch.int32, device="cuda")
 
     def record(self, value: int = 1) -> None:
-        self.flag[0] = value
+        self.flag.fill_(value)
 
     def wait(self, value: int = 1) -> None:
         stream_wait_value(self.flag, value)
@@ -40,14 +41,20 @@ class Event:
 def test_wait_before_record(event: Event | torch.cuda.Event):
     stream_a = torch.cuda.Stream()
     stream_b = torch.cuda.Stream()
+    a = torch.randn(10000, device="cuda")
+    b = a * a
+    stream_a.synchronize()
+    stream_b.synchronize()
 
     with torch.cuda.stream(stream_a):
         event.wait()
-
-    stream_a.synchronize()
+        a = torch.randn(10000, device="cuda")
+        b = a - a * a
 
     with torch.cuda.stream(stream_b):
         event.record()
+
+    stream_a.synchronize()
 
 
 def main():
@@ -76,4 +83,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
+    test_wait_before_record(Event())
