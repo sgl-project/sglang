@@ -120,7 +120,7 @@ def send_one_batch(base_url, num_prompts, batch_size, processor, is_multimodal):
     acc_length = results["accept_length"] or 1.0
     avg_output_token = results["total_output_tokens"] / results["completed"]
 
-    server_info = requests.get(base_url + "/server_info").json()
+    server_info = requests.get(base_url + "/get_server_info").json()
     # We use 20% percentile instead of median on purpose
     step_time = np.percentile(
         server_info["internal_states"][0]["step_time_dict"][str(batch_size)], 20
