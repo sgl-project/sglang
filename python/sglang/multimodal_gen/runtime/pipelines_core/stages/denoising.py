@@ -37,14 +37,23 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_world_rank,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
-    FlashAttentionBackend,
-)
+
+try:
+    from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+        FlashAttentionBackend,
+    )
+except ImportError:
+    FlashAttentionBackend = None
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
+
+try:
+    from torch.distributed.fsdp import FSDPModule
+except ImportError:
+    FSDPModule = None
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -95,6 +104,43 @@ except ImportError:
 logger = init_logger(__name__)
 
 
+def get_fsdp_wrapped_attr(module: torch.nn.Module, attr_name: str, default=None):
+    """
+    Get an attribute from a potentially FSDP-wrapped module.
+    
+    When using FSDP with CPU offloading, module attributes may not be directly
+    accessible via getattr(). This function attempts to traverse the FSDP wrapper
+    to access the underlying module's attributes.
+    
+    Args:
+        module: The module (potentially FSDP-wrapped)
+        attr_name: Name of the attribute to retrieve
+        default: Default value if attribute is not found
+        
+    Returns:
+        The attribute value or default if not found
+    """
+    # Try direct attribute access first
+    attr = getattr(module, attr_name, None)
+    if attr is not None:
+        return attr
+    
+    # If FSDP is available and module might be wrapped, try to unwrap
+    if FSDPModule is not None and isinstance(module, FSDPModule):
+        # FSDP2 stores the original module in _orig_mod
+        if hasattr(module, "_orig_mod"):
+            return getattr(module._orig_mod, attr_name, default)
+    
+    # Recursively check if any child module has the attribute
+    # (for cases where FSDP wraps submodules)
+    for child in module.children():
+        attr = get_fsdp_wrapped_attr(child, attr_name, None)
+        if attr is not None:
+            return attr
+    
+    return default
+
+
 class DenoisingStage(PipelineStage):
     """
     Stage for running the denoising loop in diffusion pipelines.
@@ -139,6 +185,7 @@ class DenoisingStage(PipelineStage):
             dtype=torch.float16,  # TODO(will): hack
             supported_attention_backends={
                 AttentionBackendEnum.SLIDING_TILE_ATTN,
+                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.VIDEO_SPARSE_ATTN,
                 AttentionBackendEnum.VMOBA_ATTN,
                 AttentionBackendEnum.FA,
@@ -600,7 +647,7 @@ class DenoisingStage(PipelineStage):
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
                 self.device,
-                getattr(self.transformer, "rotary_emb", None),
+                get_fsdp_wrapped_attr(self.transformer, "rotary_emb", None),
                 dtype=target_dtype,
             ),
         )
@@ -615,7 +662,7 @@ class DenoisingStage(PipelineStage):
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
                     self.device,
-                    getattr(self.transformer, "rotary_emb", None),
+                    get_fsdp_wrapped_attr(self.transformer, "rotary_emb", None),
                     dtype=target_dtype,
                 ),
             )
@@ -1176,7 +1223,11 @@ class DenoisingStage(PipelineStage):
             The attention metadata, or None if not applicable.
         """
         attn_metadata = None
-        self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        self.attn_metadata_builder = None
+        try:
+            self.attn_metadata_builder_cls = self.attn_backend.get_builder_cls()
+        except NotImplementedError:
+            self.attn_metadata_builder_cls = None
         if self.attn_metadata_builder_cls:
             self.attn_metadata_builder = self.attn_metadata_builder_cls()
         if (st_attn_available and self.attn_backend == SlidingTileAttentionBackend) or (

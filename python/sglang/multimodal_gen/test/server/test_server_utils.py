@@ -41,6 +41,88 @@ from sglang.multimodal_gen.test.test_utils import (
 logger = init_logger(__name__)
 
 
+# Custom Videos Resource for OpenAI client to support /v1/videos endpoints
+class VideosResource:
+    """Custom videos resource for OpenAI client to support sglang's /v1/videos API."""
+    
+    def __init__(self, client):
+        self._client = client
+        
+    def create(self, **kwargs):
+        """Create a video generation job."""
+        from types import SimpleNamespace
+        
+        # Handle multipart if input_reference is provided
+        if 'input_reference' in kwargs and kwargs['input_reference'] is not None:
+            # Use multipart/form-data
+            files = {'input_reference': kwargs.pop('input_reference')}
+            response = self._client._client.post(
+                "/videos",
+                data=kwargs,
+                files=files,
+            )
+        else:
+            # Use JSON
+            response = self._client._client.post(
+                "/videos",
+                json=kwargs,
+            )
+        
+        response.raise_for_status()
+        data = response.json()
+        # Return a simple object with the response data
+        return SimpleNamespace(**data)
+    
+    def list(self, **kwargs):
+        """List video jobs."""
+        from types import SimpleNamespace
+        
+        response = self._client._client.get("/videos", params=kwargs)
+        response.raise_for_status()
+        data = response.json()
+        # Convert to simple namespace with data list
+        result = SimpleNamespace(**data)
+        result.data = [SimpleNamespace(**item) for item in data.get('data', [])]
+        return result
+    
+    def retrieve(self, video_id):
+        """Retrieve a specific video job."""
+        from types import SimpleNamespace
+        
+        response = self._client._client.get(f"/videos/{video_id}")
+        response.raise_for_status()
+        return SimpleNamespace(**response.json())
+    
+    def download_content(self, video_id, **kwargs):
+        """Download video content."""
+        response = self._client._client.get(
+            f"/videos/{video_id}/content",
+            params=kwargs,
+        )
+        response.raise_for_status()
+        # Return the response object which has a .read() method
+        return response
+    
+    def delete(self, video_id):
+        """Delete a video job."""
+        from types import SimpleNamespace
+        
+        response = self._client._client.delete(f"/videos/{video_id}")
+        response.raise_for_status()
+        return SimpleNamespace(**response.json())
+
+
+# Monkey-patch OpenAI client to add videos support
+_original_openai_init = OpenAI.__init__
+
+def _patched_openai_init(self, *args, **kwargs):
+    _original_openai_init(self, *args, **kwargs)
+    # Add videos resource
+    self.videos = VideosResource(self)
+
+OpenAI.__init__ = _patched_openai_init
+
+
 def download_image_from_url(url: str) -> Path:
     """Download an image from a URL to a temporary file.
 

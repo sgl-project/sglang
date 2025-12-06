@@ -2,7 +2,7 @@
 
 You can install sglang-diffusion using one of the methods below.
 
-This page primarily applies to common NVIDIA GPU platforms.
+This page primarily applies to common NVIDIA GPU platforms. For AMD Instinct/ROCm environments see the dedicated [ROCm quickstart](install_rocm.md), which lists the exact steps (including kernel builds) we used to validate sgl-diffusion on MI300X.
 
 ## Method 1: With pip or uv
 
