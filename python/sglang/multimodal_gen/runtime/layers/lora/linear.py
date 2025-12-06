@@ -59,6 +59,14 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_A = None
         self.lora_B = None
 
+    @property
+    def weight(self):
+        return self.base_layer.weight
+
+    @property
+    def bias(self):
+        return getattr(self.base_layer, 'bias', None)
+
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lora_A = self.lora_A
@@ -79,7 +87,7 @@ class BaseLayerWithLoRA(nn.Module):
             return out + delta, output_bias
         else:
             out, output_bias = self.base_layer(x)
-            return out.to(x), output_bias
+            return out, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
