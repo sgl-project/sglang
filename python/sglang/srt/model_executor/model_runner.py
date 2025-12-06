@@ -353,6 +353,9 @@ class ModelRunner:
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
+        # Check FP4 KV cache compatibility with the attention backend
+        self._handle_kv4_compatibility()
+
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
 
@@ -383,6 +386,80 @@ class ModelRunner:
                 server_args=self.server_args,
                 port=self.dist_port,
             )
+
+    def _handle_kv4_compatibility(self):
+        self.prefill_attention_backend_str, self.decode_attention_backend_str = (
+            self.server_args.get_attention_backends()
+        )
+
+        if is_cuda():
+            if (
+                self.prefill_attention_backend_str != self.decode_attention_backend_str
+                and self.prefill_attention_backend_str != "fa4"
+            ):  # Take care of prefill=fa4 later
+                logger.warning(
+                    f"Attention: Using KV4 with PREFILL = {self.prefill_attention_backend_str} "
+                    f"and DECODE = {self.decode_attention_backend_str}. "
+                    f"Compatibility issues are unlikely, but may occur in rare edge cases."
+                )
+            else:
+                if self.prefill_attention_backend_str == "fa4":
+                    if self.use_mla_backend:  # FA4 + MLA
+                        KV4_FA4_MLA_BACKEND_CHOICES = [
+                            "cutlass_mla",
+                            "flashinfer",
+                            "trtllm_mla",
+                        ]
+                        assert (
+                            self.decode_attention_backend_str
+                            in KV4_FA4_MLA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 FA4 MLA expects decode_attention_backend to be one of "
+                            f"{KV4_FA4_MLA_BACKEND_CHOICES}, but got {self.decode_attention_backend_str}"
+                        )
+                    else:  # FA4 + MHA
+                        KV4_FA4_MHA_BACKEND_CHOICES = [
+                            "triton",
+                            "torch_native",
+                            "flex_attention",
+                        ]
+                        assert (
+                            self.decode_attention_backend_str
+                            in KV4_FA4_MHA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 FA4 MHA expects decode_attention_backend to be one of "
+                            f"{KV4_FA4_MHA_BACKEND_CHOICES}, but got {self.decode_attention_backend_str}"
+                        )
+                else:
+                    if self.use_mla_backend:  # !FA4 + MLA
+                        KV4_ATTENTION_MLA_BACKEND_CHOICES = [
+                            "cutlass_mla",
+                            "flashinfer",
+                            "trtllm_mla",
+                        ]
+                        assert (
+                            self.server_args.attention_backend
+                            in KV4_ATTENTION_MLA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 MLA expects attention_backend to be one of "
+                            f"{KV4_ATTENTION_MLA_BACKEND_CHOICES}, but got {self.server_args.attention_backend}"
+                        )
+                    else:  # !FA4 + MHA
+                        KV4_ATTENTION_MHA_BACKEND_CHOICES = [
+                            "triton",
+                            "torch_native",
+                            "flex_attention",
+                            "trtllm_mha",
+                        ]
+                        assert (
+                            self.server_args.attention_backend
+                            in KV4_ATTENTION_MHA_BACKEND_CHOICES
+                        ), (
+                            f"KV4 MHA expects attention_backend to be one of "
+                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.server_args.attention_backend}"
+                        )
+        else:
+            raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
     def initialize(self, min_per_gpu_memory: float):
         server_args = self.server_args

@@ -13,33 +13,33 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
 
 ### MHA Backends
 
-| **Backend**                     | **Page Size > 1 (native)** | **FP8 KV Cache** | **Spec topk=1** | **Spec topk>1** | **Sliding Window** | **MultiModal** |
-|---------------------------------|-----------------------------|------------------|-----------------|-----------------|--------------------|----------------|
-| **FlashInfer**                  | ✅                          | ✅               | ✅              | ✅              | ✅                 | ❌             |
-| **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ✅              | ✅              | ✅                 | ✅             |
-| **FA4 (FlashAttention 4)**      | 128                         | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅                 | ✅             |
-| **Torch Native (SDPA)**         | ❌                          | ❌               | ❌              | ❌              | ❌                 | ✅             |
-| **FlexAttention (PyTorch)**     | ❌                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ❌              | ✅                 | ❌             |
-| **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **AITER (ROCm)**                | ✅                          | ❌               | ✅              | ✅              | ❌                 | ✅             |
-| **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌                 | ❌             |
-| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌                 | ✅             |
-| **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ✅                 | ❌             |
+| **Backend**                     | **Page Size > 1 (native)** | **FP8 KV Cache** | **FP4 KV Cache** | **Spec topk=1** | **Spec topk>1** | **Sliding Window** | **MultiModal** |
+|---------------------------------|-----------------------------|------------------|-----------------|-----------------|-----------------|--------------------|----------------|
+| **FlashInfer**                  | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ❌             |
+| **FA3 (FlashAttention 3)**      | ✅                          | ✅               | ❌              | ✅              | ✅              | ✅                 | ✅             |
+| **FA4 (FlashAttention 4)**      | 128                         | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
+| **Triton**                      | ❌                          | ❌               | ✅              | ✅              | ✅              | ✅                 | ✅             |
+| **Torch Native (SDPA)**         | ❌                          | ❌               | ✅              | ❌              | ❌              | ❌                 | ✅             |
+| **FlexAttention (PyTorch)**     | ❌                          | ❌               | ✅              | ❌              | ❌              | ❌                 | ❌             |
+| **TRTLLM MHA**                  | 16, 32 or 64                | ✅               | ✅              | ✅              | ❌              | ✅                 | ❌             |
+| **Dual Chunk FlashAttention**   | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
+| **AITER (ROCm)**                | ✅                          | ❌               | ❌              | ✅              | ✅              | ❌                 | ✅             |
+| **Wave (ROCm)**                 | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ❌             |
+| **Ascend (NPU)**                | ✅                          | ❌               | ❌              | ❌              | ❌              | ❌                 | ✅             |
+| **Intel XPU**                   | ✅                          | ❌               | ❌              | ❌              | ❌              | ✅                 | ❌             |
 
 ### MLA Backends
 
-| **Backend**                | **Native Page Sizes**     | **FP8 KV Cache** | **Chunked Prefix Cache** | **Spec topk=1** | **Spec topk>1** |
-|----------------------------|---------------------------|------------------|--------------------------|-----------------|-----------------|
-| **FlashInfer MLA**         | 1                         | ❌               | ✅                       | ✅              | ❌              |
-| **FlashMLA**               | 64                        | ✅               | ✅                       | ✅              | ❌              |
-| **Cutlass MLA**            | 128                       | ✅               | ✅                       | ✅              | ❌              |
-| **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅                       | ✅              | ❌              |
-| **FA3 (FlashAttention 3)** | n/a                       | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
-| **Triton**                 | n/a                       | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
-| **FA4**                    | 1                         | ❌               | ❌                       | ❌              | ❌              |
-| **Ascend MLA (NPU)**       | 128                       | ❌               | ❌                       | ❌              | ❌              |
+| **Backend**                | **Native Page Sizes**     | **FP8 KV Cache** | **FP4 KV Cache** | **Chunked Prefix Cache** | **Spec topk=1** | **Spec topk>1** |
+|----------------------------|---------------------------|------------------|------------------|--------------------------|-----------------|-----------------|
+| **FlashInfer MLA**         | 1                         | ❌               | ✅               | ✅                       | ✅              | ❌              |
+| **FlashMLA**               | 64                        | ✅               | ❌               | ✅                       | ✅              | ❌              |
+| **Cutlass MLA**            | 128                       | ✅               | ✅               | ✅                       | ✅              | ❌              |
+| **TRTLLM MLA (Blackwell)** | 32 or 64                  | ✅               | ✅               | ✅                       | ✅              | ❌              |
+| **FA3 (FlashAttention 3)** | n/a                       | ❌               | ❌               | ✅                       | ✅              | ⚠️ (page_size=1 only) |
+| **Triton**                 | n/a                       | ❌               | ❌               | ❌                       | ✅              | ⚠️ (page_size=1 only) |
+| **FA4**                    | 1                         | ❌               | ✅               | ❌                       | ❌              | ❌              |
+| **Ascend MLA (NPU)**       | 128                       | ❌               | ❌               | ❌                       | ❌              | ❌              |
 
 ```{note}
 Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" column indicates whether a corresponding multimodal implementation exists for that backend family.
@@ -52,6 +52,10 @@ Multimodal attention is selected by `--mm-attention-backend`. The "MultiModal" c
 
 ```{tip}
 Speculative decoding topk: `topk` is the number of draft tokens sampled per step from the draft model. `topk = 1` follows classic EAGLE; `topk > 1` explores multiple branches and requires backend support in both draft and verification paths.
+```
+
+```{note}
+For the KV4 FA4 scenario, FA4 requires using a different --decode-attention-backend to run. Except for trtllm_mha being incompatible with FA4, all other decode backends behave as shown in the table.
 ```
 
 Note: Many backends that do not natively operate on pages can emulate `page_size > 1` at the wrapper layer by expanding page tables to per-token indices. The "Page Size > 1 (native)" column indicates true in-kernel paging. Some backends require fixed native page sizes and cannot be reduced/emulated differently: TRTLLM MHA (16/32/64), TRTLLM MLA (32/64), FlashMLA (64), Cutlass MLA (128), Ascend (128).
