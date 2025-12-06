@@ -89,10 +89,10 @@ def compute_overlap_args(dispatch_output, alt_stream):
         device="cuda"
     ).multi_processor_count
 
-    communicate_num_sms = envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.get()
-    if not is_blackwell() and communicate_num_sms == 32:
-        # Reset num_sms on Hopper to 3 if it uses default value 32 for blackwell
-        communicate_num_sms = 3
+    if envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.is_set():
+        communicate_num_sms = envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.get()
+    else:
+        communicate_num_sms = 32 if is_blackwell() else 3
     compute_num_sms = total_num_sms - communicate_num_sms
 
     assert alt_stream is not None
