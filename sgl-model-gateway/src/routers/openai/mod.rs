@@ -14,7 +14,6 @@ pub mod provider;
 mod responses;
 mod router;
 mod streaming;
-mod utils;
 
 // Re-export the main types for external use
 pub use provider::{Provider, ProviderError, ProviderRegistry};
