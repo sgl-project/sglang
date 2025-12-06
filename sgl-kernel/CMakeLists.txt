@@ -333,7 +333,7 @@ set(SOURCES
 
     "csrc/quantization/gguf/gguf_kernel.cu"
 
-    "csrc/scale_residual_norm_scale_shift/scale_residual_norm_scale_shift_host.cu"
+    "csrc/sgl_diffusion/scale_residual_norm_scale_shift/scale_residual_norm_scale_shift_host.cu"
 
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
