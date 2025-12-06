@@ -515,7 +515,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
-                completion_tokens[index] = content["meta_info"].get("completion_tokens", 0)
+                completion_tokens[index] = content["meta_info"].get(
+                    "completion_tokens", 0
+                )
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
 
@@ -888,7 +890,9 @@ class OpenAIServingChat(OpenAIServingBase):
     def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
         """Process logprobs for non-streaming response"""
         logprobs = to_openai_style_logprobs(
-            output_token_logprobs=ret_item["meta_info"].get("output_token_logprobs", None),
+            output_token_logprobs=ret_item["meta_info"].get(
+                "output_token_logprobs", None
+            ),
             output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
         )
 
