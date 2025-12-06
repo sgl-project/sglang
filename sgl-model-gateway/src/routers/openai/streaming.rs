@@ -7,7 +7,7 @@
 //! - MCP tool execution loops within streaming responses
 //! - Event transformation and output index remapping
 
-use std::{borrow::Cow, collections::HashMap, io, sync::Arc};
+use std::{borrow::Cow, io, sync::Arc};
 
 use axum::{
     body::Body,
@@ -22,15 +22,17 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::warn;
 
 // Import from sibling modules
-use super::context::{RequestContext, StreamingEventContext, StreamingRequest};
+use super::accumulator::StreamingResponseAccumulator;
 use super::{
+    context::{RequestContext, StreamingEventContext, StreamingRequest},
     conversations::persist_conversation_items,
     mcp::{
         build_resume_payload, ensure_request_mcp_client, execute_streaming_tool_calls,
         inject_mcp_metadata_streaming, prepare_mcp_payload_for_streaming,
-        send_mcp_list_tools_events, FunctionCallInProgress, McpLoopConfig, ToolLoopState,
+        send_mcp_list_tools_events, McpLoopConfig, ToolLoopState,
     },
     responses::{mask_tools_as_mcp, patch_streaming_response_json, rewrite_streaming_block},
+    tool_handler::{StreamAction, StreamingToolHandler},
 };
 use crate::{
     protocols::{
@@ -44,73 +46,18 @@ use crate::{
 };
 
 // ============================================================================
-// Stream Action Enum
-// ============================================================================
-
-/// Action to take based on streaming event processing
-#[derive(Debug)]
-pub(crate) enum StreamAction {
-    Forward,      // Pass event to client
-    Buffer,       // Accumulate for tool execution
-    ExecuteTools, // Function call complete, execute now
-}
-
-// ============================================================================
-// Output Index Mapper
-// ============================================================================
-
-/// Maps upstream output indices to sequential downstream indices
-#[derive(Debug, Default)]
-pub(crate) struct OutputIndexMapper {
-    next_index: usize,
-    // Map upstream output_index -> remapped output_index
-    assigned: HashMap<usize, usize>,
-}
-
-impl OutputIndexMapper {
-    pub fn with_start(next_index: usize) -> Self {
-        Self {
-            next_index,
-            assigned: HashMap::new(),
-        }
-    }
-
-    pub fn ensure_mapping(&mut self, upstream_index: usize) -> usize {
-        *self.assigned.entry(upstream_index).or_insert_with(|| {
-            let assigned = self.next_index;
-            self.next_index += 1;
-            assigned
-        })
-    }
-
-    pub fn lookup(&self, upstream_index: usize) -> Option<usize> {
-        self.assigned.get(&upstream_index).copied()
-    }
-
-    pub fn allocate_synthetic(&mut self) -> usize {
-        let assigned = self.next_index;
-        self.next_index += 1;
-        assigned
-    }
-
-    pub fn next_index(&self) -> usize {
-        self.next_index
-    }
-}
-
-// ============================================================================
 // Helper Functions
 // ============================================================================
 
 /// Extract output_index from a JSON value
 #[inline]
-fn extract_output_index(value: &Value) -> Option<usize> {
+pub(super) fn extract_output_index(value: &Value) -> Option<usize> {
     value.get("output_index")?.as_u64().map(|v| v as usize)
 }
 
 /// Get event type from event name or parsed JSON, returning a reference to avoid allocation
 #[inline]
-fn get_event_type<'a>(event_name: Option<&'a str>, parsed: &'a Value) -> &'a str {
+pub(super) fn get_event_type<'a>(event_name: Option<&'a str>, parsed: &'a Value) -> &'a str {
     event_name
         .or_else(|| parsed.get("type").and_then(|v| v.as_str()))
         .unwrap_or("")
@@ -139,25 +86,28 @@ impl ChunkProcessor {
             Ok(s) => Cow::Borrowed(s),
             Err(_) => Cow::Owned(String::from_utf8_lossy(chunk).into_owned()),
         };
-        // Normalize CRLF to LF
-        if chunk_str.contains("\r\n") {
-            self.pending.push_str(&chunk_str.replace("\r\n", "\n"));
-        } else {
-            self.pending.push_str(&chunk_str);
+        // Normalize CRLF to LF without extra allocation
+        let mut chars = chunk_str.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\r' && chars.peek() == Some(&'\n') {
+                // Skip \r when followed by \n
+                continue;
+            }
+            self.pending.push(c);
         }
     }
 
     /// Extract the next complete SSE block from the buffer, if available
     pub fn next_block(&mut self) -> Option<String> {
-        let pos = self.pending.find("\n\n")?;
-        let block = self.pending[..pos].to_string();
-        self.pending.drain(..pos + 2);
+        loop {
+            let pos = self.pending.find("\n\n")?;
+            let block = self.pending[..pos].to_string();
+            self.pending.drain(..pos + 2);
 
-        if block.trim().is_empty() {
-            // Skip empty blocks, try next
-            self.next_block()
-        } else {
-            Some(block)
+            if !block.trim().is_empty() {
+                return Some(block);
+            }
+            // If block is empty, loop again to find the next one
         }
     }
 
@@ -169,435 +119,6 @@ impl ChunkProcessor {
     /// Take any remaining content from the buffer
     pub fn take_remaining(&mut self) -> String {
         std::mem::take(&mut self.pending)
-    }
-}
-
-// ============================================================================
-// Streaming Response Accumulator
-// ============================================================================
-
-/// Helper that parses SSE frames from the OpenAI responses stream and
-/// accumulates enough information to persist the final response locally.
-pub(super) struct StreamingResponseAccumulator {
-    /// The initial `response.created` payload (if emitted).
-    initial_response: Option<Value>,
-    /// The final `response.completed` payload (if emitted).
-    completed_response: Option<Value>,
-    /// Collected output items keyed by the upstream output index, used when
-    /// a final response payload is absent and we need to synthesize one.
-    output_items: Vec<(usize, Value)>,
-    /// Captured error payload (if the upstream stream fails midway).
-    encountered_error: Option<Value>,
-}
-
-impl StreamingResponseAccumulator {
-    pub fn new() -> Self {
-        Self {
-            initial_response: None,
-            completed_response: None,
-            output_items: Vec::new(),
-            encountered_error: None,
-        }
-    }
-
-    /// Feed the accumulator with the next SSE chunk.
-    pub fn ingest_block(&mut self, block: &str) {
-        if block.trim().is_empty() {
-            return;
-        }
-        self.process_block(block);
-    }
-
-    /// Consume the accumulator and produce the best-effort final response value.
-    pub fn into_final_response(mut self) -> Option<Value> {
-        if self.completed_response.is_some() {
-            return self.completed_response;
-        }
-
-        self.build_fallback_response()
-    }
-
-    pub fn encountered_error(&self) -> Option<&Value> {
-        self.encountered_error.as_ref()
-    }
-
-    pub fn original_response_id(&self) -> Option<&str> {
-        self.initial_response
-            .as_ref()
-            .and_then(|response| response.get("id"))
-            .and_then(|id| id.as_str())
-    }
-
-    pub fn snapshot_final_response(&self) -> Option<Value> {
-        if let Some(resp) = &self.completed_response {
-            return Some(resp.clone());
-        }
-        self.build_fallback_response_snapshot()
-    }
-
-    fn build_fallback_response_snapshot(&self) -> Option<Value> {
-        let mut response = self.initial_response.clone()?;
-
-        if let Some(obj) = response.as_object_mut() {
-            obj.insert("status".to_string(), Value::String("completed".to_string()));
-
-            let mut output_items = self.output_items.clone();
-            output_items.sort_by_key(|(index, _)| *index);
-            let outputs: Vec<Value> = output_items.into_iter().map(|(_, item)| item).collect();
-            obj.insert("output".to_string(), Value::Array(outputs));
-        }
-
-        Some(response)
-    }
-
-    fn process_block(&mut self, block: &str) {
-        let trimmed = block.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-
-        let mut event_name: Option<String> = None;
-        let mut data_lines: Vec<String> = Vec::new();
-
-        for line in trimmed.lines() {
-            if let Some(rest) = line.strip_prefix("event:") {
-                event_name = Some(rest.trim().to_string());
-            } else if let Some(rest) = line.strip_prefix("data:") {
-                data_lines.push(rest.trim_start().to_string());
-            }
-        }
-
-        let data_payload = data_lines.join("\n");
-        if data_payload.is_empty() {
-            return;
-        }
-
-        self.handle_event(event_name.as_deref(), &data_payload);
-    }
-
-    fn handle_event(&mut self, event_name: Option<&str>, data_payload: &str) {
-        let parsed: Value = match serde_json::from_str(data_payload) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!("Failed to parse streaming event JSON: {}", err);
-                return;
-            }
-        };
-
-        match get_event_type(event_name, &parsed) {
-            ResponseEvent::CREATED => {
-                if self.initial_response.is_none() {
-                    if let Some(response) = parsed.get("response") {
-                        self.initial_response = Some(response.clone());
-                    }
-                }
-            }
-            ResponseEvent::COMPLETED => {
-                if let Some(response) = parsed.get("response") {
-                    self.completed_response = Some(response.clone());
-                }
-            }
-            OutputItemEvent::DONE => {
-                if let (Some(index), Some(item)) =
-                    (extract_output_index(&parsed), parsed.get("item"))
-                {
-                    self.output_items.push((index, item.clone()));
-                }
-            }
-            "response.error" => {
-                self.encountered_error = Some(parsed);
-            }
-            _ => {}
-        }
-    }
-
-    fn build_fallback_response(&mut self) -> Option<Value> {
-        let mut response = self.initial_response.clone()?;
-
-        if let Some(obj) = response.as_object_mut() {
-            obj.insert("status".to_string(), Value::String("completed".to_string()));
-
-            self.output_items.sort_by_key(|(index, _)| *index);
-            let outputs: Vec<Value> = self
-                .output_items
-                .iter()
-                .map(|(_, item)| item.clone())
-                .collect();
-            obj.insert("output".to_string(), Value::Array(outputs));
-        }
-
-        Some(response)
-    }
-}
-
-// ============================================================================
-// Streaming Tool Handler
-// ============================================================================
-
-/// Handles streaming responses with MCP tool call interception
-pub(super) struct StreamingToolHandler {
-    /// Accumulator for response persistence
-    pub accumulator: StreamingResponseAccumulator,
-    /// Function calls being built from deltas
-    pub pending_calls: Vec<FunctionCallInProgress>,
-    /// Track if we're currently in a function call
-    in_function_call: bool,
-    /// Manage output_index remapping so they increment per item
-    output_index_mapper: OutputIndexMapper,
-    /// Original response id captured from the first response.created event
-    pub original_response_id: Option<String>,
-}
-
-impl StreamingToolHandler {
-    pub fn with_starting_index(start: usize) -> Self {
-        Self {
-            accumulator: StreamingResponseAccumulator::new(),
-            pending_calls: Vec::new(),
-            in_function_call: false,
-            output_index_mapper: OutputIndexMapper::with_start(start),
-            original_response_id: None,
-        }
-    }
-
-    pub fn ensure_output_index(&mut self, upstream_index: usize) -> usize {
-        self.output_index_mapper.ensure_mapping(upstream_index)
-    }
-
-    pub fn mapped_output_index(&self, upstream_index: usize) -> Option<usize> {
-        self.output_index_mapper.lookup(upstream_index)
-    }
-
-    pub fn allocate_synthetic_output_index(&mut self) -> usize {
-        self.output_index_mapper.allocate_synthetic()
-    }
-
-    pub fn next_output_index(&self) -> usize {
-        self.output_index_mapper.next_index()
-    }
-
-    pub fn original_response_id(&self) -> Option<&str> {
-        self.original_response_id
-            .as_deref()
-            .or_else(|| self.accumulator.original_response_id())
-    }
-
-    pub fn snapshot_final_response(&self) -> Option<Value> {
-        self.accumulator.snapshot_final_response()
-    }
-
-    /// Process an SSE event and determine what action to take
-    pub fn process_event(&mut self, event_name: Option<&str>, data: &str) -> StreamAction {
-        // Always feed to accumulator for storage
-        self.accumulator.ingest_block(&format!(
-            "{}data: {}",
-            event_name
-                .map(|n| format!("event: {}\n", n))
-                .unwrap_or_default(),
-            data
-        ));
-
-        let parsed: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => return StreamAction::Forward,
-        };
-
-        match get_event_type(event_name, &parsed) {
-            ResponseEvent::CREATED => {
-                if self.original_response_id.is_none() {
-                    self.original_response_id = parsed
-                        .get("response")
-                        .and_then(|v| v.get("id"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
-                StreamAction::Forward
-            }
-            ResponseEvent::COMPLETED => StreamAction::Forward,
-            OutputItemEvent::ADDED => self.handle_output_item_added(&parsed),
-            FunctionCallEvent::ARGUMENTS_DELTA => self.handle_arguments_delta(&parsed),
-            FunctionCallEvent::ARGUMENTS_DONE => self.handle_arguments_done(&parsed),
-            OutputItemEvent::DELTA => self.process_output_delta(&parsed),
-            OutputItemEvent::DONE => {
-                if let Some(output_index) = extract_output_index(&parsed) {
-                    self.ensure_output_index(output_index);
-                }
-                if self.has_complete_calls() {
-                    StreamAction::ExecuteTools
-                } else {
-                    StreamAction::Forward
-                }
-            }
-            _ => StreamAction::Forward,
-        }
-    }
-
-    fn handle_output_item_added(&mut self, parsed: &Value) -> StreamAction {
-        if let Some(output_index) = extract_output_index(parsed) {
-            self.ensure_output_index(output_index);
-        }
-
-        // Check if this is a function_call item being added
-        let Some(item) = parsed.get("item") else {
-            return StreamAction::Forward;
-        };
-        let Some(item_type) = item.get("type").and_then(|v| v.as_str()) else {
-            return StreamAction::Forward;
-        };
-
-        if !is_function_call_type(item_type) {
-            return StreamAction::Forward;
-        }
-
-        let Some(output_index) = extract_output_index(parsed) else {
-            warn!(
-                "Missing output_index in function_call added event, \
-                 forwarding without processing for tool execution"
-            );
-            return StreamAction::Forward;
-        };
-
-        let assigned_index = self.ensure_output_index(output_index);
-        let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-
-        let call = self.get_or_create_call(output_index, item);
-        call.call_id = call_id.to_string();
-        call.name = name.to_string();
-        call.assigned_output_index = Some(assigned_index);
-        self.in_function_call = true;
-
-        StreamAction::Forward
-    }
-
-    fn handle_arguments_delta(&mut self, parsed: &Value) -> StreamAction {
-        let Some(output_index) = extract_output_index(parsed) else {
-            return StreamAction::Forward;
-        };
-
-        let assigned_index = self.ensure_output_index(output_index);
-
-        if let Some(delta) = parsed.get("delta").and_then(|v| v.as_str()) {
-            if let Some(call) = self.find_call_mut(output_index) {
-                call.arguments_buffer.push_str(delta);
-                if let Some(obfuscation) = parsed.get("obfuscation").and_then(|v| v.as_str()) {
-                    call.last_obfuscation = Some(obfuscation.to_string());
-                }
-                if call.assigned_output_index.is_none() {
-                    call.assigned_output_index = Some(assigned_index);
-                }
-            }
-        }
-        StreamAction::Forward
-    }
-
-    fn handle_arguments_done(&mut self, parsed: &Value) -> StreamAction {
-        if let Some(output_index) = extract_output_index(parsed) {
-            let assigned_index = self.ensure_output_index(output_index);
-            if let Some(call) = self.find_call_mut(output_index) {
-                if call.assigned_output_index.is_none() {
-                    call.assigned_output_index = Some(assigned_index);
-                }
-            }
-        }
-
-        if self.has_complete_calls() {
-            StreamAction::ExecuteTools
-        } else {
-            StreamAction::Forward
-        }
-    }
-
-    fn find_call_mut(&mut self, output_index: usize) -> Option<&mut FunctionCallInProgress> {
-        self.pending_calls
-            .iter_mut()
-            .find(|c| c.output_index == output_index)
-    }
-
-    /// Process output delta events to detect and accumulate function calls
-    fn process_output_delta(&mut self, event: &Value) -> StreamAction {
-        let output_index = extract_output_index(event).unwrap_or(0);
-        let assigned_index = self.ensure_output_index(output_index);
-
-        let delta = match event.get("delta") {
-            Some(d) => d,
-            None => return StreamAction::Forward,
-        };
-
-        // Check if this is a function call delta
-        let item_type = delta.get("type").and_then(|v| v.as_str());
-
-        if item_type.is_some_and(is_function_call_type) {
-            self.in_function_call = true;
-
-            // Get or create function call for this output index
-            let call = self.get_or_create_call(output_index, delta);
-            call.assigned_output_index = Some(assigned_index);
-
-            // Accumulate call_id if present
-            if let Some(call_id) = delta.get("call_id").and_then(|v| v.as_str()) {
-                call.call_id = call_id.to_string();
-            }
-
-            // Accumulate name if present
-            if let Some(name) = delta.get("name").and_then(|v| v.as_str()) {
-                call.name.push_str(name);
-            }
-
-            // Accumulate arguments if present
-            if let Some(args) = delta.get("arguments").and_then(|v| v.as_str()) {
-                call.arguments_buffer.push_str(args);
-            }
-
-            if let Some(obfuscation) = delta.get("obfuscation").and_then(|v| v.as_str()) {
-                call.last_obfuscation = Some(obfuscation.to_string());
-            }
-
-            // Buffer this event, don't forward to client
-            return StreamAction::Buffer;
-        }
-
-        // Forward non-function-call events
-        StreamAction::Forward
-    }
-
-    fn get_or_create_call(
-        &mut self,
-        output_index: usize,
-        delta: &Value,
-    ) -> &mut FunctionCallInProgress {
-        // Find existing call for this output index
-        if let Some(pos) = self
-            .pending_calls
-            .iter()
-            .position(|c| c.output_index == output_index)
-        {
-            return &mut self.pending_calls[pos];
-        }
-
-        // Create new call
-        let call_id = delta
-            .get("call_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let mut call = FunctionCallInProgress::new(call_id, output_index);
-        if let Some(obfuscation) = delta.get("obfuscation").and_then(|v| v.as_str()) {
-            call.last_obfuscation = Some(obfuscation.to_string());
-        }
-
-        self.pending_calls.push(call);
-        self.pending_calls
-            .last_mut()
-            .expect("Just pushed to pending_calls, must have at least one element")
-    }
-
-    fn has_complete_calls(&self) -> bool {
-        !self.pending_calls.is_empty() && self.pending_calls.iter().all(|c| c.is_complete())
-    }
-
-    pub fn take_pending_calls(&mut self) -> Vec<FunctionCallInProgress> {
-        std::mem::take(&mut self.pending_calls)
     }
 }
 
