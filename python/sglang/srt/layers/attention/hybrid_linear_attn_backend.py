@@ -772,12 +772,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         head_k_dim: int,
         head_v_dim: int,
     ):
-        has_initial_state0 = extend_prefix_lens > 0
-        has_initial_state = extend_prefix_lens.long() > 0
-        device_id = torch.cuda.current_device()
-        if device_id == 0:
-            print("has_initial_state long:", has_initial_state)
-            print("has_initial_state :", has_initial_state0)
+        has_initial_state = extend_prefix_lens > 0
         # ---- 1. conv ----
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
