@@ -371,10 +371,6 @@ class SchedulerOutputProcessorMixin:
 
                 req.time_stats.completion_time = time.perf_counter()
 
-                if req.lora_id is not None:
-                    # req.lora_id may not be in prefetch_loras_record
-                    self.prefetch_loras_record.discard(req.lora_id)
-
             if req.return_logprob and batch.spec_algorithm.is_none():
                 # speculative worker handles logprob in speculative decoding
                 req.output_token_logprobs_val.append(next_token_logprobs[i])

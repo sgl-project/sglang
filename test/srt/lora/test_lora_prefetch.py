@@ -13,22 +13,20 @@
 # ==============================================================================
 
 import multiprocessing as mp
-from pathlib import Path
 import sys
-import torch
 import unittest
+from pathlib import Path
+
+import torch
 
 # Add test directory to path for lora_utils import
 # TODO: can be removed after migration
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from lora_utils import (
-    DEFAULT_PROMPTS,
-    ensure_reproducibility,
-)
+from lora_utils import DEFAULT_PROMPTS, ensure_reproducibility
+
 from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import CustomTestCase
-
 
 BASE_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 ADAPTERS = [
@@ -37,6 +35,7 @@ ADAPTERS = [
     "philschmid/code-llama-3-1-8b-text-to-sql-lora",
     "pbevan11/llama-3.1-8b-ocr-correction",
 ]
+
 
 class TestLoRAPrefetch(CustomTestCase):
     def test_lora_prefetch_basic(self):
@@ -60,9 +59,7 @@ class TestLoRAPrefetch(CustomTestCase):
 
         with SRTRunner(**base_runner_kwargs, max_loras_prefetch=2) as runner:
             prefetch_output = runner.forward(
-                DEFAULT_PROMPTS,
-                max_new_tokens=max_new_tokens,
-                lora_paths=ADAPTERS
+                DEFAULT_PROMPTS, max_new_tokens=max_new_tokens, lora_paths=ADAPTERS
             ).output_ids
 
         self.assertEqual(baseline_output, prefetch_output)
