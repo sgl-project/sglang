@@ -78,7 +78,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(f"{metrics=}")
 
-        server_info = requests.get(self.base_url + "/server_info")
+        server_info = requests.get(self.base_url + "/get_server_info")
         server_data = server_info.json()
 
         # Try to get avg_spec_accept_length

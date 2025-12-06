@@ -47,6 +47,9 @@ concurrency:
   group: nightly-test-nvidia-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_IS_IN_CI: true
+
 jobs:
   # General tests - 1 GPU
   nightly-test-general-1-gpu-runner:
