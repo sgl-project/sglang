@@ -177,38 +177,48 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             surr_ids.append(s.decode_ids[s.surr_offset : s.read_offset])
 
         # TODO(lmzheng): better handle skip_special_tokens/spaces_between_special_tokens per request
-        if self.disable_tokenizer_batch_decode:
-            surr_texts = [
-                self.tokenizer.decode(
-                    surr, skip_special_tokens=skip, spaces_between_special_tokens=space
-                )
-                for surr, skip, space in zip(
+        # Protect against piggyback requests with empty batch
+        if bs > 0:
+            if self.disable_tokenizer_batch_decode:
+                surr_texts = [
+                    self.tokenizer.decode(
+                        surr,
+                        skip_special_tokens=skip,
+                        spaces_between_special_tokens=space,
+                    )
+                    for surr, skip, space in zip(
+                        surr_ids,
+                        recv_obj.skip_special_tokens,
+                        recv_obj.spaces_between_special_tokens,
+                    )
+                ]
+                read_texts = [
+                    self.tokenizer.decode(
+                        read,
+                        skip_special_tokens=skip,
+                        spaces_between_special_tokens=space,
+                    )
+                    for read, skip, space in zip(
+                        read_ids,
+                        recv_obj.skip_special_tokens,
+                        recv_obj.spaces_between_special_tokens,
+                    )
+                ]
+            else:
+                surr_texts = self.tokenizer.batch_decode(
                     surr_ids,
-                    recv_obj.skip_special_tokens,
-                    recv_obj.spaces_between_special_tokens,
+                    skip_special_tokens=recv_obj.skip_special_tokens[0],
+                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                        0
+                    ],
                 )
-            ]
-            read_texts = [
-                self.tokenizer.decode(
-                    read, skip_special_tokens=skip, spaces_between_special_tokens=space
-                )
-                for read, skip, space in zip(
+                read_texts = self.tokenizer.batch_decode(
                     read_ids,
-                    recv_obj.skip_special_tokens,
-                    recv_obj.spaces_between_special_tokens,
+                    skip_special_tokens=recv_obj.skip_special_tokens[0],
+                    spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[
+                        0
+                    ],
                 )
-            ]
-        else:
-            surr_texts = self.tokenizer.batch_decode(
-                surr_ids,
-                skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-            )
-            read_texts = self.tokenizer.batch_decode(
-                read_ids,
-                skip_special_tokens=recv_obj.skip_special_tokens[0],
-                spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
-            )
 
         # Incremental decoding
         output_strs = []
@@ -280,6 +290,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             forward_entry_time=recv_obj.forward_entry_time,
             prefill_launch_delay=recv_obj.prefill_launch_delay,
             prefill_launch_latency=recv_obj.prefill_launch_latency,
+            load=recv_obj.load,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
