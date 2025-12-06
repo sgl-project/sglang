@@ -614,25 +614,39 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_config, torch_dtype=torch_dtype, trust_remote_code=True
             )
         max_memory = get_max_memory()
-        inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
-
-        on_cpu = "cpu" in inferred_device_map.values()
+        on_cpu = False
         model_kwargs = {"torch_dtype": "auto"}
         device_map = "auto"
+        if getattr(hf_config, "model_type", None) != "kimi_k2":
+            with init_empty_weights():
+                torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
+                model = AutoModelForCausalLM.from_config(
+                    hf_config, torch_dtype=torch_dtype, trust_remote_code=True
+                )
+            inferred_device_map = infer_auto_device_map(model, max_memory=max_memory)
+            on_cpu = "cpu" in inferred_device_map.values()
 
-        if on_cpu:
-            for device in max_memory.keys():
-                if isinstance(device, int):
-                    max_memory[device] *= DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION
+            if on_cpu:
+                for device in max_memory.keys():
+                    if isinstance(device, int):
+                        max_memory[device] *= (
+                            DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION
+                        )
 
+                logger.warning(
+                    "Model does not fit to the GPU mem. "
+                    f"We apply the following memory limit for calibration: \n{max_memory}\n"
+                    f"If you hit GPU OOM issue, please adjust the memory fraction "
+                    f"(currently {DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION}) or "
+                    "reduce the calibration `batch_size` manually."
+                )
+                model_kwargs["max_memory"] = max_memory
+        else:
             logger.warning(
-                "Model does not fit to the GPU mem. "
-                f"We apply the following memory limit for calibration: \n{max_memory}\n"
-                f"If you hit GPU OOM issue, please adjust the memory fraction "
-                f"(currently {DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION}) or "
-                "reduce the calibration `batch_size` manually."
+                "Skipping AutoModelForCausalLM.from_config() preflight for KimiK2 "
+                "because Transformers has no causal-LM AutoModel mapping for "
+                "KimiK2Config. Falling back to from_pretrained(..., trust_remote_code=True)."
             )
-            model_kwargs["max_memory"] = max_memory
 
         model = AutoModelForCausalLM.from_pretrained(
             model_config.model_path,

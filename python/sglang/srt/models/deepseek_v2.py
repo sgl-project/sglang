@@ -2039,13 +2039,33 @@ class DeepseekV2Model(nn.Module):
             )
             with ctx:
                 if i in self.layers_to_capture:
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_attention_tp_group().all_gather(
-                            hidden_states + residual, dim=0
+                    # The capture happens before the next layer runs, so deferred
+                    # TP all-reduce fusion must be flushed before we snapshot the
+                    # hidden state for EAGLE3 aux-state handoff.
+                    captured_hidden_states = hidden_states
+                    if (
+                        residual is not None
+                        and hasattr(
+                            captured_hidden_states, "_sglang_needs_allreduce_fusion"
                         )
-                        aux_hidden_states.append(aux_hidden_state)
-                    else:
-                        aux_hidden_states.append(hidden_states + residual)
+                        and captured_hidden_states._sglang_needs_allreduce_fusion
+                    ):
+                        captured_hidden_states = tensor_model_parallel_all_reduce(
+                            captured_hidden_states
+                        )
+
+                    captured_hidden_states = (
+                        captured_hidden_states
+                        if residual is None
+                        else captured_hidden_states + residual
+                    )
+
+                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                        captured_hidden_states = tensor_model_parallel_all_gather(
+                            captured_hidden_states, dim=0
+                        )
+
+                    aux_hidden_states.append(captured_hidden_states.clone())
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
                     positions,
