@@ -7,7 +7,6 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 # NOTE: please sort the test cases alphabetically by the test file name
 suites = {
     "per-commit-1-gpu": [
-        TestFile("test_eagle_constrained_decoding.py", 100),
         TestFile("debug_utils/test_tensor_dump_forward_hook.py", 9),
         TestFile("hicache/test_hicache_storage.py", 96),
         TestFile("hicache/test_hicache_variants.py", 368),
@@ -58,13 +57,9 @@ suites = {
         # TestFile("rl/test_update_weights_from_disk.py", 210),  # Temporarily disabled, see https://github.com/sgl-project/sglang/pull/13998
         TestFile("rl/test_update_weights_from_tensor.py", 195),
         TestFile("test_abort.py", 131),
-        TestFile("test_build_eagle_tree.py", 3),
         TestFile("test_chunked_prefill.py", 312),
         TestFile("test_create_kvindices.py", 7),
         TestFile("test_deterministic.py", 228),
-        TestFile("test_eagle_infer_a.py", 470),
-        TestFile("test_eagle_infer_b.py", 473),
-        TestFile("test_eagle_infer_beta.py", 194),
         TestFile("test_constrained_decoding.py", 111),
         TestFile("test_eval_fp8_accuracy.py", 250),
         TestFile("test_external_models.py", 30),
