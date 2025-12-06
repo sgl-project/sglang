@@ -12,7 +12,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 | text                       | `Optional[Union[List[str], str]] = None`                                     | The input prompt. Can be a single prompt or a batch of prompts.                                                                                                 |
 | input_ids                  | `Optional[Union[List[List[int]], List[int]]] = None`                         | The token IDs for text; one can specify either text or input_ids.                                                                                               |
 | input_embeds               | `Optional[Union[List[List[List[float]]], List[List[float]]]] = None`         | The embeddings for input_ids; one can specify either text, input_ids, or input_embeds.                                                                          |
-| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Can be an image instance, file name, URL, or base64 encoded string. Can be a single image, list of images, or list of lists of images. |
+| image_data                 | `Optional[Union[List[List[ImageDataItem]], List[ImageDataItem], ImageDataItem]] = None` | The image input. Supports three formats: (1) **Raw images**: PIL Image, file path, URL, or base64 string; (2) **Processor output**: Dict with `format: "processor_output"` containing HuggingFace processor outputs; (3) **Precomputed embeddings**: Dict with `format: "precomputed_embedding"` and `feature` containing pre-calculated visual embeddings. Can be a single image, list of images, or list of lists of images. See [Multimodal Input Formats](#multimodal-input-formats) for details. |
 | audio_data                 | `Optional[Union[List[AudioDataItem], AudioDataItem]] = None`                 | The audio input. Can be a file name, URL, or base64 encoded string.                                                                                             |
 | sampling_params            | `Optional[Union[List[Dict], Dict]] = None`                                   | The sampling parameters as described in the sections below.                                                                                                     |
 | rid                        | `Optional[Union[List[str], str]] = None`                                     | The request ID.                                                                                                                                                 |
@@ -191,6 +191,43 @@ The `image_data` can be a file name, a URL, or a base64 encoded string. See also
 Streaming is supported in a similar manner as [above](#streaming).
 
 Detailed example in [OpenAI API Vision](openai_api_vision.ipynb).
+
+#### Multimodal Input Formats
+
+SGLang supports three different formats for `image_data` to accommodate various use cases:
+
+##### 1. Raw Images (Basic Usage)
+
+The simplest way to pass images - SGLang will handle all preprocessing automatically.
+**Use case**: Quick prototyping, simple applications, when you don't need fine control over preprocessing.
+
+##### 2. Processor Output (Advanced)
+
+Pass the output from a HuggingFace processor directly, bypassing SGLang's preprocessing.
+**Use case**: When you need precise control over image preprocessing, custom image transformations, or when integrating with existing preprocessing pipelines.
+
+##### 3. Precomputed Embeddings (High Performance)
+
+Pre-calculate visual embeddings to avoid redundant vision encoder computation, ideal for caching or serving the same image multiple times.
+**Use case**:
+- High-throughput serving with repeated image queries
+- Caching visual embeddings for frequently used images
+- Reducing latency when the same image is used across multiple requests
+- Multi-turn conversations with the same image
+**Performance benefits**:
+- Avoids redundant vision encoder computation (can save 30-50% of total inference time)
+- Enables efficient caching strategies
+- Reduces GPU memory usage during inference
+
+**Format Comparison**:
+
+| Format | Preprocessing | Vision Encoding | Use Case |
+|--------|--------------|-----------------|----------|
+| Raw Images | Automatic | Automatic | Simple usage, prototyping |
+| Processor Output | Manual | Automatic | Custom preprocessing pipelines |
+| Precomputed Embeddings | Manual | Pre-computed | High performance, caching |
+
+For detailed examples and model-specific usage, see [VLM Query Guide](https://github.com/sgl-project/sglang/blob/main/docs/advanced_features/vlm_query.ipynb).
 
 ### Structured Outputs (JSON, Regex, EBNF)
 
