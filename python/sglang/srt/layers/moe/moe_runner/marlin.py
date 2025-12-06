@@ -13,14 +13,14 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
-    register_fused_func,
     register_post_permute,
     register_pre_permute,
 )
+
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
+    from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -91,9 +91,9 @@ class MarlinRunnerCore(MoeRunnerCore):
             self.config.activation == "silu"
         ), "Only SiLU activation is supported."
         
-        # The input must currently be float16
         orig_dtype = x.dtype
-        x = x.half()
+        # removed since fused_marlin_moe.py now accepts bfloat16
+        # x = x.half()
 
         output = fused_marlin_moe(
             hidden_states=x,
