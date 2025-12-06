@@ -33,6 +33,7 @@ Its core features include:
    :caption: Advanced Features
 
    advanced_features/server_arguments.md
+   advanced_features/expert_parallelism.md
    advanced_features/hyperparameter_tuning.md
    advanced_features/attention_backend.md
    advanced_features/speculative_decoding.ipynb
