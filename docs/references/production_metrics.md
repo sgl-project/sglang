@@ -2,6 +2,47 @@
 
 SGLang exposes the following metrics via Prometheus. You can enable it by adding `--enable-metrics` when you launch the server.
 
+## Configuration Options
+
+| Argument | Description |
+|----------|-------------|
+| `--enable-metrics` | Enable Prometheus metrics endpoint |
+| `--metrics-port PORT` | Serve metrics on a separate HTTP port instead of the main server port |
+
+### Default Behavior (HTTP Mode)
+
+By default, when using the HTTP server, metrics are served on the same port as the main server at the `/metrics` endpoint:
+
+```bash
+python -m sglang.launch_server --model-path <model> --port 30000 --enable-metrics
+# Metrics available at: http://localhost:30000/metrics
+```
+
+### Separate Metrics Port
+
+You can optionally serve metrics on a dedicated port using `--metrics-port`. This is useful when you want to:
+- Isolate metrics traffic from inference traffic
+- Apply different network policies or access controls to metrics
+- Expose metrics on a standard Prometheus port (e.g., 9090)
+
+```bash
+python -m sglang.launch_server --model-path <model> --port 30000 --enable-metrics --metrics-port 9090
+# Main server at: http://localhost:30000
+# Metrics available at: http://localhost:9090/metrics
+```
+
+### gRPC Mode
+
+When running in gRPC mode (`--grpc-mode`), you may specify `--metrics-port` because gRPC servers cannot serve HTTP endpoints on the same port:
+
+```bash
+python -m sglang.launch_server --model-path <model> --port 30000 --grpc-mode --enable-metrics --metrics-port 9090
+# gRPC server at: localhost:30000
+# Metrics available at: http://localhost:9090/metrics
+```
+
+If you enable metrics in gRPC mode without specifying `--metrics-port`, you will see a warning and metrics will not be available.
+
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
 Here is an example of the metrics:

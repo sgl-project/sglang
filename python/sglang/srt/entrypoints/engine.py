@@ -878,7 +878,10 @@ def _launch_subprocesses(
             return None, None, None, port_args
 
         launch_dummy_health_check_server(
-            server_args.host, server_args.port, server_args.enable_metrics
+            server_args.host,
+            server_args.port,
+            server_args.enable_metrics,
+            server_args.metrics_port,
         )
 
         for proc in scheduler_procs:
