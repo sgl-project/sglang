@@ -225,11 +225,7 @@ def is_blackwell():
 
 @lru_cache(maxsize=1)
 def is_blackwell_supported(device=None) -> bool:
-    if not is_cuda_alike():
-        return False
-    return (torch.cuda.get_device_capability(device)[0] in [10, 12]) and (
-        torch.version.cuda >= "12.8"
-    )
+    return is_sm100_supported(device) or is_sm120_supported(device)
 
 
 @lru_cache(maxsize=1)
@@ -257,6 +253,15 @@ def is_sm90_supported(device=None) -> bool:
     return (torch.cuda.get_device_capability(device)[0] == 9) and (
         torch.version.cuda >= "12.3"
     )
+
+
+@lru_cache(maxsize=1)
+def supports_pdl(device: torch.device | None = None) -> bool:
+    """
+    Return True if PDL is supported on the given device, for the use case in Triton.
+    PDL requires Hopper (SM90) or newer.
+    """
+    return bool(is_cuda() and is_sm90_supported(device))
 
 
 _warned_bool_env_var_keys = set()

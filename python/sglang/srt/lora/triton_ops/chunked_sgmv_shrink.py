@@ -3,11 +3,16 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.utils import LoRABatchInfo
-from sglang.srt.utils import cached_triton_kernel
+from sglang.srt.utils import cached_triton_kernel, supports_pdl
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (kwargs["K"], kwargs["NUM_SLICES"], kwargs["BLOCK_M"])
+    lambda _, kwargs: (
+        kwargs["K"],
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["USE_GDC"],
+    )
 )
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_shrink_kernel(
@@ -28,6 +33,7 @@ def _chunked_lora_shrink_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_GDC: tl.constexpr,
 ):
     """
     Computes a chunked SGMV for LoRA shrink operations.
@@ -110,6 +116,8 @@ def _chunked_lora_shrink_kernel(
         w_ptrs += BLOCK_K * w_stride_2
 
     # Store result to output matrix
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
     partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = output + (
         s_offset_physical[:, None] * output_stride_0
@@ -155,6 +163,7 @@ def chunked_sgmv_lora_shrink_forward(
     )
 
     output = torch.empty((S, N), device=x.device, dtype=x.dtype)
+    use_gdc = supports_pdl(x.device)
     _chunked_lora_shrink_kernel[grid](
         x=x,
         weights=weights,
@@ -171,6 +180,8 @@ def chunked_sgmv_lora_shrink_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        USE_GDC=use_gdc,
+        launch_pdl=use_gdc,
     )
 
     return output
