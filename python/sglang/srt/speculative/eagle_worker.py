@@ -5,6 +5,9 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
+    EAGLEDraftNpuGraphRunner,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
@@ -31,7 +34,6 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_draft_npu_graph_runner import EAGLEDraftNpuGraphRunner
 from sglang.srt.speculative.eagle_info import (
     EagleDraftInput,
     EagleVerifyInput,
@@ -731,7 +733,10 @@ class EAGLEWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        if self.target_worker.model_runner.hybrid_gdn_config is not None:
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.mamba2_config is not None
+        ):
             accepted_length = (
                 torch.tensor(
                     res.accept_length_per_req_cpu,
