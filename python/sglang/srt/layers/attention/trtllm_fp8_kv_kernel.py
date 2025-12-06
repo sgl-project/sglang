@@ -94,9 +94,9 @@ def _fused_fp8_set_kv_buffer_kernel(
     v_cache_ptr,  # [total_slots, num_kv_heads, head_dim]
     # Cache location indices
     cache_loc_ptr,  # [num_tokens] -> token to cache location mapping
-    # Scalar scale (if provided, will be used; otherwise computed per-token)
-    k_scale,  # scalar float
-    v_scale,  # scalar float
+    # Pointers to scalar inverse scales (computed on GPU in wrapper)
+    inv_k_scale_ptr,  # pointer to 0-D tensor on GPU
+    inv_v_scale_ptr,  # pointer to 0-D tensor on GPU
     use_provided_scale: tl.constexpr,  # whether to use provided scale
     # Tensor dimensions
     num_kv_heads: tl.constexpr,
@@ -147,7 +147,10 @@ def _fused_fp8_set_kv_buffer_kernel(
     # Select K or V based on kv_idx
     if kv_idx == 0:
         # Process K tensor
-        inv_scale = 1.0 / k_scale if use_provided_scale else 1.0
+        if use_provided_scale:
+            inv_scale = tl.load(inv_k_scale_ptr)
+        else:
+            inv_scale = 1.0
         _process_kv_tensor(
             token_id,
             head_block_id,
@@ -171,7 +174,10 @@ def _fused_fp8_set_kv_buffer_kernel(
         )
     else:
         # Process V tensor
-        inv_scale = 1.0 / v_scale if use_provided_scale else 1.0
+        if use_provided_scale:
+            inv_scale = tl.load(inv_v_scale_ptr)
+        else:
+            inv_scale = 1.0
         _process_kv_tensor(
             token_id,
             head_block_id,
@@ -343,6 +349,30 @@ def fused_fp8_set_kv_buffer(
         # - dim 2: K/V (0=K, 1=V)
         grid = (num_tokens, num_head_blocks, 2)
 
+        device = k_3d.device
+
+        def _to_tensor_scale(scale):
+            """Convert scale to 0-D CUDA tensor (accepts Python float or Tensor)."""
+            if isinstance(scale, torch.Tensor):
+                return scale.to(device=device, dtype=torch.float32)
+            else:
+                # Python float / np scalar
+                return torch.tensor(float(scale), device=device, dtype=torch.float32)
+
+        # Compute inverse scales on GPU to avoid GPU→CPU sync in CUDA graph capture.
+        # Previously we used float(k_scale) which triggers synchronization and fails
+        # during CUDA graph capture with cudaErrorStreamCaptureUnsupported.
+        if use_provided_scale:
+            k_scale_tensor = _to_tensor_scale(k_scale)
+            v_scale_tensor = _to_tensor_scale(v_scale)
+
+            # Pure GPU scalar operation, safe for CUDA graph
+            inv_k_scale = (1.0 / k_scale_tensor).to(device=device, dtype=torch.float32)
+            inv_v_scale = (1.0 / v_scale_tensor).to(device=device, dtype=torch.float32)
+        else:
+            inv_k_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+            inv_v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+
         # Launch Triton kernel
         _fused_fp8_set_kv_buffer_kernel[grid](
             k_3d,
@@ -350,8 +380,8 @@ def fused_fp8_set_kv_buffer(
             k_cache,
             v_cache,
             cache_loc,
-            k_scale if k_scale is not None else 1.0,
-            v_scale if v_scale is not None else 1.0,
+            inv_k_scale,
+            inv_v_scale,
             use_provided_scale,
             num_kv_heads,
             head_dim,
