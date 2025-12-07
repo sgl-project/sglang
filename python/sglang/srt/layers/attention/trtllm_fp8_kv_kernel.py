@@ -369,9 +369,16 @@ def fused_fp8_set_kv_buffer(
             # Pure GPU scalar operation, safe for CUDA graph
             inv_k_scale = (1.0 / k_scale_tensor).to(device=device, dtype=torch.float32)
             inv_v_scale = (1.0 / v_scale_tensor).to(device=device, dtype=torch.float32)
+
+            inv_k_scale_ptr = inv_k_scale
+            inv_v_scale_ptr = inv_v_scale
         else:
-            inv_k_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
-            inv_v_scale = torch.tensor(1.0, device=device, dtype=torch.float32)
+            # When use_provided_scale=False, kernel uses constant 1.0 for inv_scale.
+            # Triton will optimize away the tl.load() calls via constant folding.
+            # We pass dummy pointers (k_3d) which won't be accessed in the kernel.
+            # This avoids creating new GPU tensors during CUDA graph capture.
+            inv_k_scale_ptr = k_3d
+            inv_v_scale_ptr = k_3d
 
         # Launch Triton kernel
         _fused_fp8_set_kv_buffer_kernel[grid](
@@ -380,8 +387,8 @@ def fused_fp8_set_kv_buffer(
             k_cache,
             v_cache,
             cache_loc,
-            inv_k_scale,
-            inv_v_scale,
+            inv_k_scale_ptr,
+            inv_v_scale_ptr,
             use_provided_scale,
             num_kv_heads,
             head_dim,
