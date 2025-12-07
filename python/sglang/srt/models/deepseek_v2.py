@@ -2836,10 +2836,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             llama_4_scaling=llama_4_scaling,
         )
 
-        if hidden_states.shape != residual.shape:
-            print(f"{hidden_states.shape=}, {residual.shape=}")
-            exit(0)
-
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )

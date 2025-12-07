@@ -789,11 +789,6 @@ class ForwardBatch:
                     )
                 else:
                     bs = self.batch_size = num_tokens
-
-            print(
-                f"[mlp sync in forward batch]{self._original_batch_size=} {self.batch_size=}"
-            )
-
         elif self.forward_mode.is_extend():
             self.extend_num_tokens = num_tokens
 

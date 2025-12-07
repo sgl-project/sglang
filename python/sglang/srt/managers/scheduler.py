@@ -1700,9 +1700,6 @@ class Scheduler(
         # Handle DP attention
         if need_mlp_sync:
             ret = self.prepare_mlp_sync_batch(ret)
-            bs = ret.batch_size() if ret else 0
-            if bs > 0:
-                print(f"[MLP SYNC] {ret.global_num_tokens=}, {bs=}")
 
         if ret:
             trace_event_batch("schedule", ret.reqs)

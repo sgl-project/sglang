@@ -517,7 +517,7 @@ class EagleDraftWorker(BaseDraftWorker):
             )
         else:
             draft_logits_output, _ = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=False
+                forward_batch, skip_attn_backend_init=True
             )
 
         # Reorganize the spec info for the next batch
