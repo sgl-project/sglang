@@ -118,7 +118,10 @@ class RotaryEmbedding(CustomOp):
             and not (_is_cpu and _is_cpu_amx_available)
             and not (_is_xpu)
         ):
-            from sgl_kernel.elementwise import rotary_embedding
+            if _is_hip:
+                from vllm._custom_ops import rotary_embedding
+            else:
+                from sgl_kernel.elementwise import rotary_embedding
 
             self.use_fallback_kernel = True
             self.fallback_rotary_embedding = rotary_embedding
@@ -340,7 +343,7 @@ class RotaryEmbedding(CustomOp):
         else:
             assert (
                 fused_set_kv_buffer_arg is None
-            ), "save kv cache is not supported for vllm_rotary_embedding."
+            ), "save kv cache is not supported for fallback_rotary_embedding."
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             self.fallback_rotary_embedding(
                 positions,
