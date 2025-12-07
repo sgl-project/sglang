@@ -72,8 +72,8 @@ class BaseTpWorker(ABC):
         return self.model_runner.sliding_window_size
 
     @property
-    def is_hybrid(self) -> bool:
-        return self.model_runner.is_hybrid is not None
+    def is_hybrid_swa(self) -> bool:
+        return self.model_runner.is_hybrid_swa is not None
 
     def get_tokens_per_layer_info(self):
         return (
