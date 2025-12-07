@@ -281,6 +281,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     scikit-build-core \
     nixl \
     py-spy \
+    cubloaty \
     flash_attn
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
