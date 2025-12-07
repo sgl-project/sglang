@@ -21,7 +21,7 @@ class SyncExecutor(PipelineExecutor):
     A simple synchronous executor that runs stages sequentially.
     """
 
-    def run_all_stages(
+    def run_profile_all_stages(
         self,
         stages: List[PipelineStage],
         batch: Req,
@@ -50,6 +50,6 @@ class SyncExecutor(PipelineExecutor):
         """
 
         with self.profile_execution(batch, check_rank=0, dump_rank=0):
-            batch = self.run_all_stages(stages, batch, server_args)
+            batch = self.run_profile_all_stages(stages, batch, server_args)
 
         return batch

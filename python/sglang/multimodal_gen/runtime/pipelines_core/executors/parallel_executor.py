@@ -98,7 +98,7 @@ class ParallelExecutor(PipelineExecutor):
     ) -> Req:
         rank = get_classifier_free_guidance_rank()
 
-        if batch.profile and batch.all_stages:
+        if batch.profile and batch.profile_all_stages:
             world_rank = get_world_rank()
         else:
             world_rank = 0

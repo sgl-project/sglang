@@ -13,7 +13,7 @@ class SGLDiffusionProfiler:
     Supports both full profiling and scheduled profiling.
 
 
-    1. if all_stages is on: profile all stages, including all denoising steps
+    1. if profile_all_stages is on: profile all stages, including all denoising steps
     2. otherwise, if num_profiled_timesteps is specified: profile {num_profiled_timesteps} denoising steps. profile all steps if num_profiled_timesteps==-1
     """
 
@@ -35,7 +35,7 @@ class SGLDiffusionProfiler:
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
-        except Exception:
+        except OSError:
             pass
 
         activities = [torch.profiler.ProfilerActivity.CPU]
@@ -115,10 +115,11 @@ class SGLDiffusionProfiler:
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
+            sanitized_profile_mode_id = self.profile_mode_id.replace(" ", "_")
             trace_path = os.path.abspath(
                 os.path.join(
                     self.log_dir,
-                    f"{self.request_id}-{self.profile_mode_id}-global-rank{dump_rank}.trace.json.gz",
+                    f"{self.request_id}-{sanitized_profile_mode_id}-global-rank{dump_rank}.trace.json.gz",
                 )
             )
             logger.info(f"Saving profiler traces to: {trace_path}")

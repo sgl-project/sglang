@@ -127,7 +127,7 @@ class SamplingParams:
     # Profiling
     profile: bool = False
     num_profiled_timesteps: int = 5
-    all_stages: bool = False
+    profile_all_stages: bool = False
 
     # Debugging
     debug: bool = False
@@ -345,10 +345,10 @@ class SamplingParams:
             help="Number of timesteps to profile after warmup",
         )
         parser.add_argument(
-            "--all-stages",
+            "--profile-all-stages",
             action="store_true",
-            dest="all_stages",
-            default=SamplingParams.all_stages,
+            dest="profile_all_stages",
+            default=SamplingParams.profile_all_stages,
             help="Used with --profile, profile all pipeline stages",
         )
 

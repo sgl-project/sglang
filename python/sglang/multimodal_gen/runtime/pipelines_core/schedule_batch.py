@@ -171,7 +171,7 @@ class Req:
 
     # profile
     profile: bool = False
-    all_stages: bool = False
+    profile_all_stages: bool = False
     num_profiled_timesteps: int = None
 
     # debugging
