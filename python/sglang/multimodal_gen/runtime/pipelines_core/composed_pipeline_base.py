@@ -153,6 +153,10 @@ class ComposedPipelineBase(ABC):
             return default_value
         return self.modules[module_name]
 
+    def has_module(self, module_name: str) -> bool:
+        """Check if a module exists and is not None"""
+        return module_name in self.modules and self.modules[module_name] is not None
+
     def add_module(self, module_name: str, module: Any):
         self.modules[module_name] = module
 
@@ -311,6 +315,17 @@ class ComposedPipelineBase(ABC):
                     component_model_path = maybe_download_model(component_model_path)
                 logger.info(
                     "Using custom VAE path: %s instead of default path: %s",
+                    component_model_path,
+                    os.path.join(self.model_path, load_module_name),
+                )
+            # Use custom ControlNet path if provided
+            elif module_name == "controlnet" and server_args.controlnet_path is not None:
+                component_model_path = server_args.controlnet_path
+                # Download from HuggingFace Hub if path doesn't exist locally
+                if not os.path.exists(component_model_path):
+                    component_model_path = maybe_download_model(component_model_path)
+                logger.info(
+                    "Using custom ControlNet path: %s instead of default path: %s",
                     component_model_path,
                     os.path.join(self.model_path, load_module_name),
                 )

@@ -89,6 +89,10 @@ class SamplingParams:
     # Image inputs
     image_path: str | None = None
 
+    # ControlNet inputs (optional)
+    control_image_path: str | None = None  # Path or URL to control image
+    controlnet_conditioning_scale: float = 1.0  # Strength of ControlNet guidance (0.0-2.0)
+
     # Text inputs
     prompt: str | list[str] | None = None
     negative_prompt: str = (

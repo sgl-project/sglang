@@ -29,6 +29,9 @@ class ImageGenerationsRequest(BaseModel):
     seed: Optional[int] = 1024
     generator_device: Optional[str] = "cuda"
     user: Optional[str] = None
+    # ControlNet parameters (optional)
+    control_image_path: Optional[str] = None  # Path or URL to pre-processed control image
+    controlnet_conditioning_scale: Optional[float] = 1.0  # Strength of ControlNet guidance (0.0-2.0)
 
 
 # Video API protocol models

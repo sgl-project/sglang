@@ -256,6 +256,10 @@ class ServerArgs:
 
     # VAE parameters
     vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
+
+    # ControlNet parameters
+    controlnet_path: str | None = None  # Path to ControlNet model (optional)
+
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None

@@ -55,6 +55,11 @@ class Req:
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
 
+    # ControlNet inputs (optional)
+    control_image_path: str | None = None  # Path or URL to pre-processed control image
+    control_image: torch.Tensor | None = None  # Preprocessed control tensor [1, 3, H, W]
+    controlnet_conditioning_scale: float = 1.0  # Strength of ControlNet guidance
+
     original_condition_image_size: tuple[int, int] = None
     condition_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None

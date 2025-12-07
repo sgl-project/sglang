@@ -55,6 +55,8 @@ def _build_sampling_params_from_request(
     image_path: Optional[str] = None,
     seed: Optional[int] = None,
     generator_device: Optional[str] = None,
+    control_image_path: Optional[str] = None,
+    controlnet_conditioning_scale: Optional[float] = 1.0,
 ) -> SamplingParams:
     if size is None:
         width, height = None, None
@@ -77,6 +79,8 @@ def _build_sampling_params_from_request(
         output_file_name=f"{request_id}.{ext}",
         seed=seed,
         generator_device=generator_device,
+        control_image_path=control_image_path,
+        controlnet_conditioning_scale=controlnet_conditioning_scale,
     )
     return sampling_params
 
@@ -97,6 +101,8 @@ def _build_req_from_sampling(s: SamplingParams) -> Req:
         output_file_name=s.output_file_name,
         num_outputs_per_prompt=s.num_outputs_per_prompt,
         save_output=s.save_output,
+        control_image_path=s.control_image_path,
+        controlnet_conditioning_scale=s.controlnet_conditioning_scale,
     )
 
 
@@ -114,6 +120,8 @@ async def generations(
         background=request.background,
         seed=request.seed,
         generator_device=request.generator_device,
+        control_image_path=request.control_image_path,
+        controlnet_conditioning_scale=request.controlnet_conditioning_scale,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
