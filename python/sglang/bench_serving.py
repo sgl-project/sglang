@@ -12,6 +12,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import importlib.metadata as m
 import importlib.util
 import io
 import json
@@ -38,6 +39,13 @@ import pybase64
 import requests
 from datasets import load_dataset
 from PIL import Image
+
+print("Python:", sys.executable)
+print("sys.path:", sys.path)
+
+print("all dists:", [d.metadata["Name"] for d in m.distributions()])
+print("packages_distributions for xxx:", m.packages_distributions().get("xxx"))
+print("", flush=True)
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoProcessor,
