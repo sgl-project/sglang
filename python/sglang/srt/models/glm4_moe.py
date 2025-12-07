@@ -356,11 +356,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.num_fused_shared_experts = (
-            0
-            if get_global_server_args().disable_shared_experts_fusion
-            else config.n_shared_experts
-        )
+        # TODO: fix me. It does not work for GLM4V - https://github.com/sgl-project/sglang/issues/14582
+        # self.num_fused_shared_experts = (
+        #     0
+        #     if get_global_server_args().disable_shared_experts_fusion
+        #     else config.n_shared_experts
+        # )
+        self.num_fused_shared_experts = 0
+
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
