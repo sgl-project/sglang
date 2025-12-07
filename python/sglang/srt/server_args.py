@@ -1282,6 +1282,21 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+                if self.attention_backend is None:
+                    self.attention_backend = "triton"
+                    logger.info(
+                        "Use triton as attention backend on sm100 for Qwen3NextForCausalLM"
+                    )
+                if (
+                    not self.disable_radix_cache
+                    and self.attention_backend == "trtllm_mha"
+                ):
+                    logger.warning(
+                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                        "Try to use --attention-backend triton if radix cache is necessary."
+                    )
+                    self.disable_radix_cache = True
+                    self.disable_overlap_schedule = False
         elif model_arch in [
             "NemotronHForCausalLM",
             "FalconH1ForCausalLM",
