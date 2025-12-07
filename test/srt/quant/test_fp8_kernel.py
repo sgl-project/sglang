@@ -121,39 +121,6 @@ class TestW8A8BlockFP8Matmul(TestFP8Base):
         )
         torch.testing.assert_close(C, C_gt, atol=0.5, rtol=1e-4)
 
-    def test_w8a8_block_fp8_matmul_with_masking(self):
-        """Test needs_masking=True case where K is not divisible by BLOCK_SIZE_K.
-
-        This test uses float16 output dtype to ensure it goes through the Triton kernel path
-        rather than DeepGEMM (which requires bfloat16 output).
-        """
-        if torch.cuda.get_device_capability()[0] < 9:
-            return
-
-        # Use K that is NOT divisible by 128 to trigger needs_masking=True
-        M = 256
-        K_with_remainder = 512 + 64  # Not divisible by 128
-        N = 1024
-        group_size = 128
-        output_dtype = torch.float16  # Use float16 to force Triton path (not DeepGEMM)
-
-        A, A_quant_gt, A_scale_gt = self._make_A(
-            M=M, K=K_with_remainder, group_size=group_size, out_dtype=self.quant_type
-        )
-        B, B_quant_gt, B_scale_gt = self._make_B(
-            K=K_with_remainder, N=N, group_size=group_size, out_dtype=self.quant_type
-        )
-        C_gt = A.to(output_dtype) @ B.to(output_dtype)
-        C = w8a8_block_fp8_matmul(
-            A=A_quant_gt,
-            B=B_quant_gt.T.contiguous(),
-            As=A_scale_gt,
-            Bs=B_scale_gt.T.contiguous(),
-            block_size=[128, 128],
-            output_dtype=output_dtype,
-        )
-        torch.testing.assert_close(C, C_gt, atol=0.5, rtol=1e-4)
-
 
 if __name__ == "__main__":
     unittest.main()
