@@ -46,9 +46,11 @@ class QwenImageControlNetOutput(BaseOutput):
 class QwenImageControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin, CacheMixin):
     _supports_gradient_checkpointing = True
 
-    @register_to_config
     def __init__(
         self,
+        config=None,  # SGLang config object
+        hf_config=None,  # HuggingFace config dict
+        # Diffusers-style individual parameters (for compatibility)
         patch_size: int = 2,
         in_channels: int = 64,
         out_channels: Optional[int] = 16,
@@ -59,9 +61,30 @@ class QwenImageControlNetModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
         extra_condition_channels: int = 0, # for controlnet-inpainting
     ):
+        # If SGLang config is provided, extract parameters from it
+        if config is not None:
+            from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+            if isinstance(config, QwenImageDitConfig):
+                patch_size = config.arch_config.patch_size
+                in_channels = config.arch_config.in_channels
+                out_channels = config.arch_config.out_channels
+                attention_head_dim = config.arch_config.attention_head_dim
+                num_attention_heads = config.arch_config.num_attention_heads
+                joint_attention_dim = config.arch_config.joint_attention_dim
+                axes_dims_rope = config.arch_config.axes_dims_rope
+
+        # If hf_config is provided, extract num_layers from it
+        if hf_config is not None:
+            num_layers = hf_config.get("num_layers", num_layers)
+            extra_condition_channels = hf_config.get("extra_condition_channels", extra_condition_channels)
+
         super().__init__()
         self.out_channels = out_channels or in_channels
         self.inner_dim = num_attention_heads * attention_head_dim
+
+        # Store config for param_names_mapping compatibility
+        if config is not None:
+            self.param_names_mapping = config.arch_config.param_names_mapping
 
         self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
 
