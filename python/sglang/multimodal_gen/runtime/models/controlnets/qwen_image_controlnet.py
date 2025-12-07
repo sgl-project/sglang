@@ -60,6 +60,9 @@ class QwenImageControlNetModel(nn.Module):
 
         logger.info(f"Initializing QwenImageControlNet with {self.num_layers} blocks")
 
+        # Param names mapping for FSDP/LoRA loading (same pattern as base model)
+        self.param_names_mapping = config.arch_config.param_names_mapping
+
         # ===== CONTROL IMAGE PROCESSING =====
         # Convert control image to latent space (8x downsampling to match VAE)
         self.controlnet_cond_embedding = nn.Sequential(
