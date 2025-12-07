@@ -24,6 +24,10 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_lora
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
+    normalize_lora_state_dict,
+)
+
 # to avoid deadlocks when forking
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -292,136 +296,15 @@ class LoRAPipeline(ComposedPipelineBase):
             return bool(self.cur_adapter_name)
         return target in self.cur_adapter_name
 
-    @staticmethod
-    def _normalize_lora_state_dict(
-        lora_state_dict: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        """
-        Normalize a raw LoRA state_dict into a standard (diffusers-style) format.
-
-        Simple version:
-        - Detect only: {"standard", "xlabs-ai"}.
-        - If "xlabs-ai": call diffusers' xlabs->diffusers converter (if available).
-        - Otherwise: passthrough.
-        """
-        import inspect
-
-        if not lora_state_dict:
-            return lora_state_dict
-
-        keys = list(lora_state_dict.keys())
-
-        def _is_xlabs_ai_key(k: str) -> bool:
-            # XLabs Flux LoRA typically looks like:
-            #   double_blocks.0.processor.proj_lora1.down.weight / up.weight
-            #   double_blocks.0.processor.qkv_lora1.down.weight / up.weight
-            # (sometimes prefixed with "diffusion_model.")
-            if not (k.endswith(".down.weight") or k.endswith(".up.weight")):
-                return False
-
-            if not k.startswith(
-                (
-                    "double_blocks.",
-                    "single_blocks.",
-                    "diffusion_model.double_blocks",
-                    "diffusion_model.single_blocks",
-                )
-            ):
-                return False
-
-            # XLabs uses "processor.*" and names like proj_lora / qkv_lora
-            return (".processor." in k) or (".proj_lora" in k) or (".qkv_lora" in k)
-
-        def _detect_lora_format() -> str:
-            return "xlabs-ai" if any(_is_xlabs_ai_key(k) for k in keys) else "standard"
-
-        def _convert_xlabs_ai_via_diffusers(
-            sd: dict[str, torch.Tensor]
-        ) -> dict[str, torch.Tensor]:
-            try:
-                import diffusers.loaders.lora_conversion_utils as lcu  # type: ignore
-            except Exception:
-                logger.warning(
-                    "XLabs-ai LoRA detected but diffusers is not available; returning raw state dict."
-                )
-                return sd
-
-            # Prefer state-dict converters (diffusers may expose different names across versions)
-            candidate_names = (
-                # Newer/internal diffusers (known to exist in recent lora_conversion_utils.py)
-                "_convert_xlabs_flux_lora_to_diffusers",
-                # Potential public names (may exist in some versions/forks)
-                "convert_xlabs_lora_state_dict_to_diffusers",
-                "convert_xlabs_lora_to_diffusers",
-                "convert_xlabs_flux_lora_to_diffusers",
-            )
-
-            converters = []
-            for name in candidate_names:
-                fn = getattr(lcu, name, None)
-                if callable(fn):
-                    converters.append((name, fn))
-
-            if not converters:
-                logger.warning(
-                    "XLabs-ai LoRA detected but no XLabs converter found in diffusers.lora_conversion_utils; "
-                    "returning raw state dict."
-                )
-                return sd
-
-            # Some diffusers converters mutate/pop from the dict -> pass a shallow copy
-            sd_copy = dict(sd)
-
-            last_err: Exception | None = None
-            for name, fn in converters:
-                try:
-                    # Try calling with a single positional arg.
-                    out = fn(sd_copy)  # type: ignore[misc]
-                    # Some converters might return tuples; keep the dict part.
-                    if isinstance(out, tuple) and out and isinstance(out[0], dict):
-                        out = out[0]
-                    if not isinstance(out, dict):
-                        raise TypeError(
-                            f"Converter {name} returned {type(out)} (expected dict or (dict, ...))."
-                        )
-                    logger.info("Converted XLabs-ai LoRA using diffusers.%s", name)
-                    return out
-                except TypeError as e:
-                    # signature mismatch / wrong callable
-                    last_err = e
-                    continue
-                except Exception as e:
-                    last_err = e
-                    logger.exception(
-                        "XLabs-ai conversion failed via diffusers.%s; trying next converter if available.",
-                        name,
-                    )
-                    continue
-
-            logger.warning(
-                "XLabs-ai LoRA detected but all diffusers converters failed; returning raw state dict. "
-                "Last error: %r",
-                last_err,
-            )
-            return sd
-
-        detected = _detect_lora_format()
-        if detected == "standard":
-            return lora_state_dict
-        if detected == "xlabs-ai":
-            return _convert_xlabs_ai_via_diffusers(lora_state_dict)
-
-        # (Shouldn't happen in this simplified version.)
-        return lora_state_dict
-
-
     def load_lora_adapter(self, lora_path: str, lora_nickname: str, rank: int):
         """
         Load the LoRA, and setup the lora_adapters for later weight replacement
         """
         assert lora_path is not None
         lora_local_path = maybe_download_lora(lora_path)
-        lora_state_dict = self._normalize_lora_state_dict(load_file(lora_local_path))
+
+        raw_state_dict = load_file(lora_local_path)
+        lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
 
         if lora_nickname in self.lora_adapters:
             self.lora_adapters[lora_nickname].clear()
