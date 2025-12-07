@@ -98,6 +98,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 (3, self.max_num_token), dtype=torch.int64
             )
 
+            # Use target model's hidden size for hidden_states since they're used during verification
+            target_hidden_size = (
+                self.eagle_worker.target_worker.model_runner.model_config.hidden_size
+            )
             if self.eagle_worker.speculative_algorithm.is_eagle3():
                 self.hidden_states = torch.zeros(
                     (
@@ -109,14 +113,14 @@ class EAGLEDraftExtendCudaGraphRunner:
                                 self.model_runner.model_config.hf_config,
                                 "target_hidden_size",
                             )
-                            else self.model_runner.model_config.hidden_size * 3
+                            else target_hidden_size * 3
                         ),
                     ),
                     dtype=self.model_runner.dtype,
                 )
             else:
                 self.hidden_states = torch.zeros(
-                    (self.max_num_token, self.model_runner.model_config.hidden_size),
+                    (self.max_num_token, target_hidden_size),
                     dtype=self.model_runner.dtype,
                 )
             self.seq_len_fill_value = (
