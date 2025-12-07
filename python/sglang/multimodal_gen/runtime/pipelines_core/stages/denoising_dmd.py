@@ -143,7 +143,6 @@ class DmdDenoisingStage(DenoisingStage):
 
         # Run denoising loop
         denoising_loop_start_time = time.time()
-        self.start_profile(batch=batch)
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Skip if interrupted

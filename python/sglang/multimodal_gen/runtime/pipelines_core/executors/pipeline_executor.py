@@ -76,16 +76,18 @@ class SGLDiffusionProfiler:
                 record_shapes=True,
                 with_stack=True,
             )
-            logger.info(f"Profiling request: {request_id} for full stages...")
+            self.profile_mode_id = "full stages"
         else:
             # profile denoising stage only
-            num_active_steps = num_inference_steps if num_steps == -1 else num_steps
+            warmup = 1
+            num_actual_steps = num_inference_steps if num_steps == -1 else num_steps
+            num_active_steps = num_actual_steps + warmup
             self.profiler = torch.profiler.profile(
                 activities=activities,
                 schedule=torch.profiler.schedule(
                     skip_first=0,
                     wait=0,
-                    warmup=1,
+                    warmup=warmup,
                     active=num_active_steps,
                     repeat=5,
                 ),
@@ -95,18 +97,20 @@ class SGLDiffusionProfiler:
                 record_shapes=True,
                 with_stack=True,
             )
-            logger.info(f"Profiling request: {request_id} for {num_active_steps} steps...")
+            self.profile_mode_id = f"{num_actual_steps} steps"
+
+        logger.info(f"Profiling request: {request_id} for {self.profile_mode_id}...")
 
         self.has_stopped = False
 
         SGLDiffusionProfiler._instance = self
+        self.start()
 
     def start(self):
         logger.info("Starting Profiler...")
         self.profiler.start()
 
     def _step(self):
-        print(f"stepping profiler")
         # if torch.cuda.is_available():
         #     torch.cuda.synchronize()
         self.profiler.step()
@@ -116,8 +120,6 @@ class SGLDiffusionProfiler:
             self._step()
 
     def step_denoising_step(self):
-        print(f"stepping step_denoising_step")
-
         if not self.full_profile:
             self._step()
 
@@ -137,8 +139,7 @@ class SGLDiffusionProfiler:
         if export_trace:
             self._export_trace(dump_rank)
 
-        if SGLDiffusionProfiler._instance == self:
-            SGLDiffusionProfiler._instance = None
+        SGLDiffusionProfiler._instance = None
 
     def _export_trace(self, dump_rank: int | None = None):
         if dump_rank is None:
@@ -149,22 +150,13 @@ class SGLDiffusionProfiler:
             trace_path = os.path.abspath(
                 os.path.join(
                     self.log_dir,
-                    f"{self.request_id}-global-rank{dump_rank}.trace.json.gz",
+                    f"{self.request_id}-{self.profile_mode_id}-global-rank{dump_rank}.trace.json.gz",
                 )
             )
             logger.info(f"Saving profiler traces to: {trace_path}")
             self.profiler.export_chrome_trace(trace_path)
         except Exception as e:
             logger.error(f"Failed to export trace: {e}")
-
-    def __enter__(self):
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # When used as context manager, we usually assume full profiling
-        # and want to export at the end
-        self.stop(export_trace=True)
 
 
 class PipelineExecutor(ABC):
@@ -202,12 +194,6 @@ class PipelineExecutor(ABC):
     def profile_execution(self, batch: Req, check_rank: int = 0, dump_rank: int = 0):
         """
         Context manager for profiling execution.
-
-        Args:
-            batch: The request batch.
-            check_rank: The rank used to check if we should export the trace (usually local rank or cfg rank).
-                        If 0, trace is exported.
-            dump_rank: The rank used in the output filename (usually world rank).
         """
         do_profile = batch.profile
 
@@ -222,8 +208,6 @@ class PipelineExecutor(ABC):
             full_profile=batch.full_stages,
             num_steps=batch.num_profiled_timesteps,
         )
-
-        profiler.start()
         try:
             yield
         finally:
