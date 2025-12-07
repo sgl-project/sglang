@@ -501,9 +501,11 @@ class EAGLEWorker(TpModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
+        # Use target model's hidden size for hidden_states since they're used during verification
+        target_hidden_size = self.target_worker.model_runner.model_config.hidden_size
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.hidden_size,
+            hidden_size=target_hidden_size,
             dtype=self.model_config.dtype,
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -939,10 +941,12 @@ class EAGLEWorker(TpModelWorker):
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
+            # Use target model's hidden size for hidden_states since they're used during verification
+            target_hidden_size = self.target_worker.model_runner.model_config.hidden_size
             hidden_size = (
-                self.model_config.hidden_size * 3
+                target_hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
-                else self.model_config.hidden_size
+                else target_hidden_size
             )
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,
