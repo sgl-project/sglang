@@ -151,7 +151,7 @@ suites = {
         TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 291),
+        TestFile("models/test_qwen3_next_models.py", 472),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
@@ -180,7 +180,9 @@ suites = {
         # TODO: Add it back after the bug is fixed
         # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
     ],
-    "per-commit-8-gpu-b200": [],
+    "per-commit-8-gpu-b200": [
+        TestFile("test_mistral_large3_basic.py", 275),
+    ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 590),
@@ -214,6 +216,7 @@ suites = {
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_profile_v2.py"),
+        TestFile("models/test_ministral3_models.py"),
     ],
 }
 
@@ -323,26 +326,27 @@ suite_amd = {
 }
 
 # Add Intel Xeon tests
-# NOTE: please sort the test cases alphabetically by the test file name
 suite_xeon = {
     "per-commit-cpu": [
         TestFile("cpu/test_activation.py"),
         TestFile("cpu/test_binding.py"),
+        TestFile("cpu/test_causal_conv1d.py"),
+        TestFile("cpu/test_cpu_graph.py"),
         TestFile("cpu/test_decode.py"),
         TestFile("cpu/test_extend.py"),
         TestFile("cpu/test_gemm.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_a.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_b.py"),
+        TestFile("cpu/test_intel_amx_attention_backend_c.py"),
         TestFile("cpu/test_mamba.py"),
         TestFile("cpu/test_mla.py"),
         TestFile("cpu/test_moe.py"),
         TestFile("cpu/test_norm.py"),
         TestFile("cpu/test_qkv_proj_with_rope.py"),
+        TestFile("cpu/test_qwen3.py"),
         TestFile("cpu/test_rope.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
-        TestFile("cpu/test_cpu_graph.py"),
-        TestFile("cpu/test_intel_amx_attention_backend_a.py"),
-        TestFile("cpu/test_intel_amx_attention_backend_b.py"),
-        TestFile("cpu/test_intel_amx_attention_backend_c.py"),
     ],
 }
 
