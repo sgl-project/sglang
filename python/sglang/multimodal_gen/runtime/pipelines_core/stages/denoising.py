@@ -149,9 +149,6 @@ class DenoisingStage(PipelineStage):
         # cfg
         self.guidance = None
 
-        # misc
-        self.profiler = None
-
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
         """Builds a guidance tensor. This method is cached."""
@@ -581,27 +578,23 @@ class DenoisingStage(PipelineStage):
 
         self._profile_full = batch.full_denoise
         request_id = batch.request_id if batch.request_id else "profile_trace"
+        profiler = SGLDiffusionProfiler.get_instance()
 
-        self.profiler = SGLDiffusionProfiler(
-            request_id=request_id,
-            rank=0,  # We control export manually
-            full_profile=self._profile_full,
-            num_steps=batch.num_profiled_timesteps,
-        )
-        self.profiler.start()
+        profiler.start()
 
     def step_profile(self):
-        if self.profiler:
-            if not getattr(self, "_profile_full", False):
-                self.profiler.step()
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_denoising_step()
 
     def stop_profile(self, batch: Req):
+        profiler = SGLDiffusionProfiler.get_instance()
+
         try:
-            if self.profiler:
+            if profiler:
                 rank = get_world_rank()
-                self.profiler.stop(export_trace=True, dump_rank=rank)
+                profiler.stop(export_trace=True, dump_rank=rank)
                 torch.distributed.barrier()
-                self.profiler = None
         except Exception as e:
             logger.error(f"{e}")
 

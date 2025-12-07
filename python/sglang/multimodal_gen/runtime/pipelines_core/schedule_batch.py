@@ -173,7 +173,7 @@ class Req:
     profile: bool = False
     full_denoise: bool = False
     full_stages: bool = False
-    num_profiled_timesteps: int = 8
+    num_profiled_timesteps: int = None
 
     # debugging
     debug: bool = False

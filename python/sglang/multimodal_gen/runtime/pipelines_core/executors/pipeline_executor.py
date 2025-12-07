@@ -38,7 +38,13 @@ class SGLDiffusionProfiler:
     """
     A wrapper around torch.profiler to simplify usage in pipelines.
     Supports both full profiling and scheduled profiling.
+
+
+    1. if full_stages is on: profile all stages, including all denoising steps
+    2. otherwise, if num_profiled_timesteps is specified: profile {num_profiled_timesteps} denoising steps. profile all steps if num_profiled_timesteps==-1
     """
+
+    _instance = None
 
     def __init__(
         self,
@@ -52,6 +58,7 @@ class SGLDiffusionProfiler:
         self.rank = rank
         self.full_profile = full_profile
         self.log_dir = log_dir
+        SGLDiffusionProfiler._instance = self
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
@@ -63,12 +70,14 @@ class SGLDiffusionProfiler:
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
         if self.full_profile:
+            # profile all stages
             self.profiler = torch.profiler.profile(
                 activities=activities,
                 record_shapes=True,
                 with_stack=True,
             )
         else:
+            # profile denoising stage only
             self.profiler = torch.profiler.profile(
                 activities=activities,
                 schedule=torch.profiler.schedule(
@@ -94,16 +103,31 @@ class SGLDiffusionProfiler:
             torch.cuda.synchronize()
         self.profiler.step()
 
+    def step_stage(self):
+        if self.full_profile:
+            self.step()
+
+    def step_denoising_step(self):
+        if not self.full_profile:
+            self.step()
+
+    @classmethod
+    def get_instance(cls) -> "SGLDiffusionProfiler":
+        return cls._instance
+
     def stop(self, export_trace: bool = True, dump_rank: int | None = None):
         logger.info("Stopping Profiler...")
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         self.profiler.stop()
 
-        if export_trace and self.full_profile:
-            self.export_trace(dump_rank)
+        if export_trace:
+            self._export_trace(dump_rank)
 
-    def export_trace(self, dump_rank: int | None = None):
+        if SGLDiffusionProfiler._instance == self:
+            SGLDiffusionProfiler._instance = None
+
+    def _export_trace(self, dump_rank: int | None = None):
         if dump_rank is None:
             dump_rank = self.rank
 
@@ -172,9 +196,9 @@ class PipelineExecutor(ABC):
                         If 0, trace is exported.
             dump_rank: The rank used in the output filename (usually world rank).
         """
-        do_full_stages_profile = bool(batch.profile and batch.full_stages)
+        do_profile = batch.profile
 
-        if not do_full_stages_profile:
+        if not do_profile:
             yield
             return
 
