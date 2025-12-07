@@ -142,6 +142,14 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     else
         WHEEL_ARCH="x86_64"
     fi
+
+    WHEEL_PATH="sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl"
+    if [ -f "$WHEEL_PATH" ]; then
+        echo "147 Wheel file $WHEEL_PATH exists."
+    else
+        echo "149 Error: Wheel file $WHEEL_PATH does not exist."
+    fi
+
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
     $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
