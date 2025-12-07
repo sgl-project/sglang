@@ -147,11 +147,3 @@ python3 -c "import torch; print(torch.version.cuda)"
 
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
-
-if [ -d "/usr/local/lib/python3.10/dist-packages/flash_attn" ]; then
-    echo "Directory /usr/local/lib/python3.10/dist-packages/flash_attn exists."
-else
-    echo "Directory /usr/local/lib/python3.10/dist-packages/flash_attn does not exist."
-fi
-
-rm -rf /usr/local/lib/python3.10/dist-packages/flash_attn
