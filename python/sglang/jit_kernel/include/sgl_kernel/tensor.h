@@ -103,9 +103,9 @@ struct PrintableDevice {
 inline auto& operator<<(std::ostream& os, DLDevice device) {
   const auto& mapping = kDeviceStringMap;
   const auto entry = static_cast<std::size_t>(device.device_type);
-  host::RuntimeCheck(entry < mapping.size());
+  RuntimeCheck(entry < mapping.size());
   const auto name = mapping[entry];
-  host::RuntimeCheck(!name.empty(), "Unknown device: ", int(device.device_type));
+  RuntimeCheck(!name.empty(), "Unknown device: ", int(device.device_type));
   os << name;
   if (device.device_id != kAnyDeviceID) os << "[" << device.device_id << "]";
   return os;
@@ -138,7 +138,7 @@ struct SymbolicSize {
     return m_annotation;
   }
   auto set_value(int64_t value) -> void {
-    host::RuntimeCheck(!this->has_value(), "Size value already set");
+    RuntimeCheck(!this->has_value(), "Size value already set");
     m_value = value;
   }
   auto has_value() const -> bool {
@@ -148,22 +148,40 @@ struct SymbolicSize {
     return this->has_value() ? std::optional{m_value} : std::nullopt;
   }
   auto unwrap() const -> int64_t {
-    host::RuntimeCheck(this->has_value(), "Size value is not set");
+    RuntimeCheck(this->has_value(), "Size value is not set");
     return m_value;
   }
 
   SymbolicSize(const SymbolicSize&) = delete;
   SymbolicSize& operator=(const SymbolicSize&) = delete;
 
-  auto verify(int64_t dim) -> void {
+  auto verify(int64_t value, const char* prefix, int64_t dim) -> void {
     if (this->has_value()) {
-      host::RuntimeCheck(m_value == dim, "Size mismatch: expected ", m_value, " but got ", dim);
+      if (m_value != value) {
+        [[unlikely]];
+        Panic("Size mismatch for ", m_name_str(prefix, dim), ": expected ", m_value, " but got ", value);
+      }
     } else {
-      this->set_value(dim);
+      this->set_value(value);
+    }
+  }
+
+  auto value_or_name(const char* prefix, int64_t dim) const -> std::string {
+    if (const auto value = this->get_value()) {
+      return std::to_string(*value);
+    } else {
+      return m_name_str(prefix, dim);
     }
   }
 
  private:
+  auto m_name_str(const char* prefix, int64_t dim) const -> std::string {
+    std::ostringstream os;
+    os << prefix << '#' << dim;
+    if (!m_annotation.empty()) os << "('" << m_annotation << "')";
+    return std::move(os).str();
+  }
+
   std::int64_t m_value;
   std::string_view m_annotation;
 };
@@ -177,8 +195,8 @@ struct SymbolicDType {
   SymbolicDType() : m_value({details::kNullDType, 0, 0}) {}
 
   auto set_value(DLDataType value) -> void {
-    host::RuntimeCheck(!this->has_value(), "Dtype value already set");
-    host::RuntimeCheck(
+    RuntimeCheck(!this->has_value(), "Dtype value already set");
+    RuntimeCheck(
         m_check(value), "Dtype value [", value, "] not in the allowed options: ", details::PrintAbleSpan{m_options});
     m_value = value;
   }
@@ -189,7 +207,7 @@ struct SymbolicDType {
     return this->has_value() ? std::optional{m_value} : std::nullopt;
   }
   auto unwrap() const -> DLDataType {
-    host::RuntimeCheck(this->has_value(), "Dtype value is not set");
+    RuntimeCheck(this->has_value(), "Dtype value is not set");
     return m_value;
   }
 
@@ -203,7 +221,7 @@ struct SymbolicDType {
 
   auto verify(DLDataType dtype) -> void {
     if (this->has_value()) {
-      host::RuntimeCheck(m_value == dtype, "DType mismatch: expected ", m_value, " but got ", dtype);
+      RuntimeCheck(m_value == dtype, "DType mismatch: expected ", m_value, " but got ", dtype);
     } else {
       this->set_value(dtype);
     }
@@ -223,8 +241,8 @@ struct SymbolicDevice {
   SymbolicDevice() : m_value({details::kNullDevice, details::kAnyDeviceID}) {}
 
   auto set_value(DLDevice value) -> void {
-    host::RuntimeCheck(!this->has_value(), "Device value already set");
-    host::RuntimeCheck(
+    RuntimeCheck(!this->has_value(), "Device value already set");
+    RuntimeCheck(
         m_check(value),
         "Device value [",
         details::PrintableDevice{value},
@@ -239,7 +257,7 @@ struct SymbolicDevice {
     return this->has_value() ? std::optional{m_value} : std::nullopt;
   }
   auto unwrap() const -> DLDevice {
-    host::RuntimeCheck(this->has_value(), "Device value is not set");
+    RuntimeCheck(this->has_value(), "Device value is not set");
     return m_value;
   }
 
@@ -253,7 +271,7 @@ struct SymbolicDevice {
 
   auto verify(DLDevice device) -> void {
     if (this->has_value()) {
-      host::RuntimeCheck(
+      RuntimeCheck(
           m_value == device,
           "Device mismatch: expected ",
           details::PrintableDevice{m_value},
@@ -313,19 +331,6 @@ struct SizeRef : BaseRef<SymbolicSize> {
       // otherwise, we can match any size
     }
   }
-
-  auto value_or_name(std::size_t dim) const -> std::string {
-    if (const auto value = (**this).get_value()) {
-      return std::to_string(*value);
-    } else {
-      const auto annotation = (**this).get_name();
-      if (annotation.empty()) {
-        return "dim#" + std::to_string(dim);
-      } else {
-        return static_cast<std::string>(annotation);
-      }
-    }
-  }
 };
 
 struct DTypeRef : BaseRef<SymbolicDType> {
@@ -371,8 +376,8 @@ struct TensorMatcher {
 
   auto with_strides(std::initializer_list<SizeRef> strides) && -> TensorMatcher&& {
     // no partial update allowed
-    host::RuntimeCheck(m_strides.size() == 0, "Strides already specified");
-    host::RuntimeCheck(m_shape.size() == strides.size(), "Strides size must match shape size");
+    RuntimeCheck(m_strides.size() == 0, "Strides already specified");
+    RuntimeCheck(m_shape.size() == strides.size(), "Strides size must match shape size");
     m_strides = strides;
     return std::move(*this);
   }
@@ -410,66 +415,64 @@ struct TensorMatcher {
   // once we start verification, we cannot modify anymore
   auto verify(tvm::ffi::TensorView view, Loc_t loc = Loc_t::current()) const&& -> const TensorMatcher&& {
     try {
-      this->m_verify_impl(view);
+      m_verify_impl(view);
     } catch (PanicError& e) {
       auto oss = std::ostringstream{};
-      oss << "Tensor match failed for " << this->debug_str() << " at " << loc.file_name() << ":" << loc.line()
-          << "\n- Root cause:  " << e.detail();
+      oss << "Tensor match failed for ";
+      s_print_debug_str(oss, view);
+      oss << " at " << loc.file_name() << ":" << loc.line() << "\n- Root cause: " << e.root_cause();
       throw PanicError(std::move(oss).str());
     }
     return std::move(*this);
   }
 
-  auto debug_str() const -> std::string {
-    auto oss = std::ostringstream{};
+ private:
+  static auto s_print_debug_str(std::ostringstream& oss, tvm::ffi::TensorView view) -> void {
     oss << "Tensor<";
-    std::size_t dim = 0;
-    for (const auto& size_ref : m_shape) {
-      if (dim > 0) {
+    int64_t dim = 0;
+    for (const auto& size : view.shape()) {
+      if (dim++ > 0) oss << ", ";
+      oss << size;
+    }
+    oss << ">[strides=<";
+    dim = 0;
+    for (const auto& stride : view.strides()) {
+      if (dim++ > 0) {
         oss << ", ";
       }
-      oss << size_ref.value_or_name(dim++);
+      oss << stride;
     }
-    oss << ">";
-    if (m_strides.size() > 0) {
-      oss << " [strides=<";
-      dim = 0;
-      for (const auto& stride_ref : m_strides) {
-        if (dim > 0) {
-          oss << ", ";
-        }
-        oss << stride_ref.value_or_name(dim++);
-      }
-      oss << ">]";
-    }
-    return std::move(oss).str();
+    oss << ">, dtype=" << view.dtype();
+    oss << ", device=" << details::PrintableDevice{view.device()} << "]";
   }
 
- private:
   auto m_verify_impl(tvm::ffi::TensorView view) const -> void {
     const auto dim = static_cast<std::size_t>(view.dim());
-    host::RuntimeCheck(dim == m_shape.size(), "Tensor dimension mismatch: expected ", m_shape.size(), " but got ", dim);
+    RuntimeCheck(dim == m_shape.size(), "Tensor dimension mismatch: expected ", m_shape.size(), " but got ", dim);
     for (const auto i : stdv::iota(std::size_t{0}, dim)) {
-      m_shape[i]->verify(view.size(i));
+      m_shape[i]->verify(view.size(i), "shape", i);
     }
-    if (this->m_has_strides()) {
+    if (m_has_strides()) {
       for (const auto i : stdv::iota(std::size_t{0}, dim)) {
-        m_strides[i]->verify(view.stride(i));
+        if (view.size(i) != 1 || !m_strides[i]->has_value()) {
+          // skip stride check for size 1 dimension
+          m_strides[i]->verify(view.stride(i), "stride", i);
+        }
       }
     } else {
-      host::RuntimeCheck(view.is_contiguous(), "Tensor is not contiguous as expected");
+      RuntimeCheck(view.is_contiguous(), "Tensor is not contiguous as expected");
     }
-    // since we may use the same matcher to verify again, we will force to check
+    // since we may double verify, we will force to check
     m_dtype->verify(view.dtype());
     m_device->verify(view.device());
   }
 
   auto m_init_dtype() -> void {
-    host::RuntimeCheck(!m_has_dtype, "DType already specified");
+    RuntimeCheck(!m_has_dtype, "DType already specified");
     m_has_dtype = true;
   }
   auto m_init_device() -> void {
-    host::RuntimeCheck(!m_has_device, "Device already specified");
+    RuntimeCheck(!m_has_device, "Device already specified");
     m_has_device = true;
   }
   auto m_has_strides() const -> bool {
