@@ -36,6 +36,13 @@ def create_ascend_backend():
     return AscendLoRABackend
 
 
+@register_lora_backend("torch_native")
+def create_torch_native_backend():
+    from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABackend
+
+    return TorchNativeLoRABackend
+
+
 @register_lora_backend("flashinfer")
 def create_flashinfer_backend():
     raise ValueError(

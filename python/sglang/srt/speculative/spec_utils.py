@@ -117,26 +117,15 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
-    if _is_cuda or _is_hip:
-        assign_req_to_token_pool[(batch_size,)](
-            req_pool_indices,
-            req_to_token,
-            start_offset,
-            end_offset,
-            out_cache_loc,
-            req_to_token.shape[1],
-            next_power_of_2(batch_size),
-        )
-    elif _is_npu:
-        import sgl_kernel_npu  # noqa: F401
-
-        torch.ops.npu.cache_loc_assign(
-            req_pool_indices,
-            req_to_token,
-            start_offset.to(torch.int64),
-            end_offset.to(torch.int64),
-            out_cache_loc,
-        )
+    assign_req_to_token_pool[(batch_size,)](
+        req_pool_indices,
+        req_to_token,
+        start_offset,
+        end_offset,
+        out_cache_loc,
+        req_to_token.shape[1],
+        next_power_of_2(batch_size),
+    )
 
 
 @triton.jit
@@ -580,8 +569,6 @@ def traverse_tree(
     assert (
         retrieve_next_token.shape == retrieve_next_sibling.shape == draft_tokens.shape
     )
-
-    allocate_token_bitmask.fill_(0)
 
     def dfs(
         curr: int,
