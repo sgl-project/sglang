@@ -1,10 +1,10 @@
 # DeepSeek V3.2 Usage
 
-DeepSeek-V3.2 model families equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
+DeepSeek-V3.2 model family equips DeepSeek-V3.1-Terminus with DeepSeek Sparse Attention (DSA) through continued training. With DSA, a fine-grained sparse attention mechanism powered by a lightning indexer, DeepSeek-V3.2 achieves efficiency improvements in long-context scenarios.
 
 For reporting issues or tracking upcoming features, please refer to this [Roadmap](https://github.com/sgl-project/sglang/issues/11060).
 
-Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except the tool call parser.
+Note: This document is originally written for the usage of [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) model. The usage of [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) or [DeepSeek-V3.2-Speciale](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Speciale) is the same as DeepSeek-V3.2-Exp except for the tool call parser.
 
 
 ## Installation
@@ -248,17 +248,17 @@ DeepSeek-V3.2-Exp：
 DeepSeek-V3.2:
 | evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
 |--------------------|-------------|------------|-------------|-----------------------|-----------|
-| pass@1[avg-of-4]   | 30          | 13311      | 1630        | 90.83% ± 4.19%        | 0.00%     |
-| majority@4         | 30          | 13311      | 1630        | 90.00%                | 0.00%     |
-| pass@4             | 30          | 13311      | 1630        | 96.67%                | 0.00%     |
+| pass@1[avg-of-4]   | 30          | 13550      | 1632        | 92.50% ± 1.67%        | 0.00%     |
+| majority@4         | 30          | 13550      | 1632        | 94.71%                | 0.00%     |
+| pass@4             | 30          | 13550      | 1632        | 96.67%                | 0.00%     |
 
 
 DeepSeek-V3.2-Speciale:
 | evaluation_mode    | num_entries | avg_tokens | gen_seconds | symbolic_correct      | no_answer |
 |--------------------|-------------|------------|-------------|-----------------------|-----------|
-| pass@1[avg-of-4]   | 30          | 21210      | 3018        | 95.00% ± 3.33%        | 0.00%     |
-| majority@4         | 30          | 21210      | 3018        | 96.67%                | 0.00%     |
-| pass@4             | 30          | 21210      | 3018        | 100.00%               | 0.00%     |
+| pass@1[avg-of-4]   | 30          | 24155      | 3583        | 95.00% ± 1.92%        | 0.00%     |
+| majority@4         | 30          | 24155      | 3583        | 95.83%                | 0.00%     |
+| pass@4             | 30          | 24155      | 3583        | 100.00%               | 0.00%     |
 
 
 
