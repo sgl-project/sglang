@@ -60,6 +60,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
+
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
