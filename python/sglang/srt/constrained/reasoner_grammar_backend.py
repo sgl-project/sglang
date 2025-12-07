@@ -51,6 +51,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.grammar.accept_token(token)
         self.transfer_state(token)
 
+    def is_terminated(self):
+        return self.grammar.is_terminated()
+
     def rollback(self, k):
         steps_after_think = min(k, self.tokens_after_think_end)
         if steps_after_think > 0:
