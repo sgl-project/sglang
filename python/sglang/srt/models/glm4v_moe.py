@@ -61,20 +61,13 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
         )
-
-        if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    quant_config=quant_config,
-                    prefix=add_prefix("lm_head", prefix),
-                )
-        else:
-            # ranks other than the last rank will have a placeholder layer
-            self.lm_head = PPMissingLayer()
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        )
 
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
