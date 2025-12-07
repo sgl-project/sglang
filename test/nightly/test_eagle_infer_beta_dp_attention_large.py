@@ -7,12 +7,13 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
+    DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
+    write_github_step_summary,
 )
 
 
@@ -39,19 +40,24 @@ def test_gsm8k(base_url: str):
     return metrics, avg_spec_accept_length
 
 
-class TestEagleDPAttnServerSmall(CustomTestCase):
+class TestEagleDPAttnServerLarge(CustomTestCase):
+    # FIXME: move this large mode test into nightly tests
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.model = DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--tp-size",
-            "2",
+            "4",
             "--dp-size",
-            "2",
+            "4",
             "--enable-dp-attention",
-            "--speculative-draft-model-path",
-            DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
+            "--attention-backend",
+            "trtllm_mla",
+            "--moe-runner-backend",
+            "flashinfer_trtllm",
+            "--quantization",
+            "modelopt_fp4",
             "--speculative-algorithm",
             "EAGLE",
             "--speculative-num-steps",
@@ -60,6 +66,10 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
             "1",
             "--speculative-num-draft-tokens",
             "4",
+            "--kv-cache-dtype",
+            "fp8_e4m3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true,"num_threads": 64}',
         ]
         with envs.SGLANG_ENABLE_SPEC_V2.override(True):
             cls.process = popen_launch_server(
@@ -75,16 +85,24 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
 
     def test_a_gsm8k(self):
         metrics, avg_spec_accept_length = test_gsm8k(self.base_url)
-        self.assertGreater(metrics["accuracy"], 0.64)
+
+        self.assertGreater(metrics["accuracy"], 0.94)
+        # TODO: Update accept len to 2.04 once the bug is fixed
         self.assertGreater(avg_spec_accept_length, 1.4)
+        if is_in_ci():
+            write_github_step_summary(
+                f"### test_gsm8k (deepseek-v3-fp4 mtp)\n"
+                f'{metrics["accuracy"]=:.3f}\n'
+                f"{avg_spec_accept_length=:.2f}\n"
+            )
 
 
 if __name__ == "__main__":
     s = unittest.TestSuite()
-    small_test = unittest.defaultTestLoader.loadTestsFromTestCase(
-        TestEagleDPAttnServerSmall
+    large_test = unittest.defaultTestLoader.loadTestsFromTestCase(
+        TestEagleDPAttnServerLarge
     )
-    s.addTest(small_test)
+    s.addTest(large_test)
 
     runner = unittest.TextTestRunner()
     runner.run(s)
