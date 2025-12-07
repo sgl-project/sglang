@@ -13,7 +13,7 @@ class SGLDiffusionProfiler:
     Supports both full profiling and scheduled profiling.
 
 
-    1. if full_stages is on: profile all stages, including all denoising steps
+    1. if all_stages is on: profile all stages, including all denoising steps
     2. otherwise, if num_profiled_timesteps is specified: profile {num_profiled_timesteps} denoising steps. profile all steps if num_profiled_timesteps==-1
     """
 
@@ -81,8 +81,6 @@ class SGLDiffusionProfiler:
         self.profiler.start()
 
     def _step(self):
-        # if torch.cuda.is_available():
-        #     torch.cuda.synchronize()
         self.profiler.step()
 
     def step_stage(self):

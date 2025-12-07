@@ -78,7 +78,7 @@ class PipelineExecutor(ABC):
         profiler = SGLDiffusionProfiler(
             request_id=request_id,
             rank=check_rank,
-            full_profile=batch.full_stages,
+            full_profile=batch.all_stages,
             num_steps=batch.num_profiled_timesteps,
         )
         try:

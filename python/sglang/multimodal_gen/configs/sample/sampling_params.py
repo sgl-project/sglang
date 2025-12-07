@@ -127,7 +127,7 @@ class SamplingParams:
     # Profiling
     profile: bool = False
     num_profiled_timesteps: int = 5
-    full_stages: bool = False
+    all_stages: bool = False
 
     # Debugging
     debug: bool = False
@@ -330,25 +330,13 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.enable_teacache,
         )
+
+        # profiling
         parser.add_argument(
             "--profile",
             action="store_true",
             default=SamplingParams.profile,
             help="Enable torch profiler for denoising stage",
-        )
-        # pipeline-wide profiling
-        parser.add_argument(
-            "--full-stages",
-            action="store_true",
-            dest="full_stages",
-            default=SamplingParams.full_stages,
-            help="With --profile, profile all pipeline stages (equivalent to legacy global profiling).",
-        )
-        parser.add_argument(
-            "--debug",
-            action="store_true",
-            default=SamplingParams.debug,
-            help="",
         )
         parser.add_argument(
             "--num-profiled-timesteps",
@@ -356,6 +344,21 @@ class SamplingParams:
             default=SamplingParams.num_profiled_timesteps,
             help="Number of timesteps to profile after warmup",
         )
+        parser.add_argument(
+            "--all-stages",
+            action="store_true",
+            dest="all_stages",
+            default=SamplingParams.all_stages,
+            help="Used with --profile, profile all pipeline stages",
+        )
+
+        parser.add_argument(
+            "--debug",
+            action="store_true",
+            default=SamplingParams.debug,
+            help="",
+        )
+
         parser.add_argument(
             "--prompt",
             type=str,
