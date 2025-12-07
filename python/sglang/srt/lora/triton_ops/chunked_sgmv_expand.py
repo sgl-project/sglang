@@ -5,10 +5,12 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.utils import LoRABatchInfo
-from sglang.srt.utils import cached_triton_kernel
+from sglang.srt.utils import cached_triton_kernel, supports_pdl
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
+@cached_triton_kernel(
+    lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"], kwargs["USE_GDC"])
+)
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
@@ -32,6 +34,7 @@ def _chunked_lora_expand_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_GDC: tl.constexpr,
 ):
     """
     Computes a chunked SGMV for LoRA expand operations.
@@ -111,16 +114,18 @@ def _chunked_lora_expand_kernel(
     # Iterate to compute the block in output matrix
     partial_sum = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(cur_rank, BLOCK_K)):
-        x_tile = tl.load(
-            x_ptrs,
-            mask=(s_offset_logical[:, None] < seg_end)
-            & (k_offset[None, :] < cur_rank - k * BLOCK_K),
-            other=0.0,
-        )
         w_tile = tl.load(
             w_ptrs,
             mask=(k_offset[:, None] < cur_rank - k * BLOCK_K)
             & (n_offset[None, :] < slice_end),
+            other=0.0,
+        )
+        if USE_GDC:
+            tl.extra.cuda.gdc_wait()
+        x_tile = tl.load(
+            x_ptrs,
+            mask=(s_offset_logical[:, None] < seg_end)
+            & (k_offset[None, :] < cur_rank - k * BLOCK_K),
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -191,6 +196,7 @@ def chunked_sgmv_lora_expand_forward(
     else:
         output = base_output
 
+    use_gdc = supports_pdl(x.device)
     _chunked_lora_expand_kernel[grid](
         x=x,
         weights=weights,
@@ -209,6 +215,8 @@ def chunked_sgmv_lora_expand_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        USE_GDC=use_gdc,
+        launch_pdl=use_gdc,
     )
 
     return output
