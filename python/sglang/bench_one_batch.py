@@ -125,17 +125,18 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
             activities.append(torch_npu.profiler.ProfilerActivity.NPU)
         if activities:
             experiment_config = torch_npu.profiler._ExperimentalConfig(
-                profile_level = torch_npu.profiler.ProfilerLevel.Level1,
+                export_type=[torch_npu.profiler.ExportType.Text],
+                profiler_level = torch_npu.profiler.ProfilerLevel.Level1,
                 aic_metrics = torch_npu.profiler.AiCMetrics.AiCoreNone,
             )
             os.makedirs(trace_filepath, exist_ok=True)
             profiler = torch_npu.profiler.profile(
                 activities=activities,
-                with_stack=True,
-                record_shapes=profile_record_shapes,
                 on_trace_ready = torch_npu.profiler.tensorboard_trace_handler(trace_filepath),
+                record_shapes=profile_record_shapes,
+                with_stack=True,
                 profile_memory=True,
-                experiment_config=experiment_config,
+                experimental_config=experiment_config,
             )
             profiler.start()
             return profiler
