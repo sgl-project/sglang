@@ -29,7 +29,6 @@ dependencies = [
   "fastapi",
   "flashinfer_python==0.5.3", # keep it aligned with jit-cache version in Dockerfile
   "flashinfer_cubin==0.5.3",
-  "flash_attn", # required by 5.x transformer
   "gguf",
   "hf_transfer",
   "huggingface_hub",
