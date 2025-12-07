@@ -6,7 +6,16 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
+    EAGLEDraftExtendNpuGraphRunner,
+)
+from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
+    EAGLEDraftNpuGraphRunner,
+)
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -21,10 +30,6 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_draft_extend_npu_graph_runner import (
-    EAGLEDraftExtendNpuGraphRunner,
-)
-from sglang.srt.speculative.eagle_draft_npu_graph_runner import EAGLEDraftNpuGraphRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
@@ -110,7 +115,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        with empty_context(), speculative_moe_backend_context():
+        with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -138,7 +143,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         with self.draft_tp_context(
             self.draft_runner.tp_group
-        ), speculative_moe_backend_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -609,12 +614,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
-                model_worker_batch,
-                batch_output.logits_output.hidden_states,
-                batch_output.next_token_ids,
-            )
-            return batch_output
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                batch_output.next_draft_input = (
+                    self.draft_worker._draft_extend_for_prefill(
+                        model_worker_batch,
+                        batch_output.logits_output.hidden_states,
+                        batch_output.next_token_ids,
+                    )
+                )
+                return batch_output
         else:
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
@@ -624,11 +632,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                verify_input: EagleVerifyInput = self.draft_worker.draft(
+                    model_worker_batch
+                )
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+            with speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                self.draft_worker._draft_extend_for_decode(
+                    model_worker_batch, batch_output
+                )
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
@@ -641,6 +655,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
+        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
