@@ -164,6 +164,7 @@ class DenoisingStage(PipelineStage):
         except ImportError:
             pass
         mode = os.environ.get("SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs")
+        logger.info(f"Compiling transformer with mode: {mode}")
         compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
         setattr(module, "forward", compiled_forward)
         return module
