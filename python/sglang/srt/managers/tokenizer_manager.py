@@ -624,7 +624,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.reserve_input_token_num
 
-        error_msg = validate_input_length(input_token_num, self.context_len)
+        error_msg = validate_input_length(
+            input_ids,
+            self.context_len,
+            self.server_args.allow_auto_truncate,
+            revised_input_token_num=input_token_num,
+        )
         if error_msg:
             raise ValueError(
                 f"The input ({input_token_num} tokens) is longer than the "
