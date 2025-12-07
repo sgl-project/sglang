@@ -75,6 +75,7 @@ class SGLDiffusionProfiler:
                 activities=activities,
                 record_shapes=True,
                 with_stack=True,
+                on_trace_ready=None,
             )
             self.profile_mode_id = "full stages"
         else:
@@ -91,9 +92,7 @@ class SGLDiffusionProfiler:
                     active=num_active_steps,
                     repeat=5,
                 ),
-                on_trace_ready=lambda _: torch.profiler.tensorboard_trace_handler(
-                    self.log_dir
-                ),
+                on_trace_ready=None,
                 record_shapes=True,
                 with_stack=True,
             )

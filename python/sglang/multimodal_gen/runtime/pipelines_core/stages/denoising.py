@@ -746,31 +746,6 @@ class DenoisingStage(PipelineStage):
                         trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
 
-    def start_profile(self, batch: Req):
-        if not batch.profile:
-            return
-
-        logger.info("Starting Profiler...")
-        # Build activities dynamically to avoid CUDA hangs when CUDA is unavailable
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-        self.profiler = torch.profiler.profile(
-            activities=activities,
-            schedule=torch.profiler.schedule(
-                skip_first=0,
-                wait=0,
-                warmup=1,
-                active=batch.num_profiled_timesteps,
-                repeat=5,
-            ),
-            on_trace_ready=None,
-            record_shapes=True,
-            with_stack=True,
-        )
-        self.profiler.start()
-
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
         if profiler:
