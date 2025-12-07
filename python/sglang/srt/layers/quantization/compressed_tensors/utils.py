@@ -5,8 +5,13 @@ import re
 from types import MappingProxyType
 from typing import Iterable, List, Mapping, Optional
 
+import torch
 from compressed_tensors import CompressionFormat
 from torch.nn import Module
+
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_is_hip = is_hip()
 
 
 def is_activation_quantization_format(format: str) -> bool:
@@ -216,3 +221,82 @@ def _match_fused_layer(
             unfused_matches.append(None)
 
     return unfused_matches[0] if all(unfused_matches) else None
+
+
+class AiterHipblaslt:
+    """
+    AiterHipblaslt is a class that initializes the hipblaslt extension for aiter.
+    It also provides a static method to swizzle the unquantized gemm.
+    """
+
+    _HIPBLASLT_INITIALIZED = False
+
+    @classmethod
+    def _initialize_hipblaslt(cls) -> None:
+        if not _is_hip or not get_bool_env_var("SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE"):
+            return
+        if cls._HIPBLASLT_INITIALIZED:
+            return
+        from aiter import hipb_create_extension
+
+        hipb_create_extension()
+        cls._HIPBLASLT_INITIALIZED = True
+
+    @staticmethod
+    def can_shuffle(n: int, k: int, layout: tuple[int, int]) -> bool:
+        IN, IK = layout
+        BK = IK * 2
+        return (n % IN == 0) and (k % BK == 0)
+
+    @staticmethod
+    def hip_bpreshuffle_gemm(
+        input: torch.Tensor,  # [M, K]
+        weight: torch.Tensor,  # [K, N]
+        bias: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+        scale_a: torch.Tensor | None = None,
+        scale_b: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if out_dtype is None:
+            out_dtype = torch.bfloat16
+
+        assert out_dtype == torch.bfloat16, (
+            f"hip_bpreshuffle_gemm only supports bfloat16 output dtype"
+            f", you have passed in {out_dtype}"
+        )
+        if input.dim() >= 3:
+            inp_view = input.view(-1, input.size(-1))
+            batched = True
+        else:
+            inp_view = input
+            batched = False
+
+        from aiter import hipb_mm
+
+        output = hipb_mm(
+            inp_view,
+            weight,
+            solution_index=-1,
+            bias=bias,
+            out_dtype=out_dtype,
+            scaleA=scale_a,
+            scaleB=scale_b,
+            scaleOut=None,
+            bpreshuffle=True,
+        )
+
+        if batched:
+            output = output.view(*input.shape[:-1], weight.shape[1])
+
+        return output
+
+
+def rocm_aiter_swizzle_hipb_unquantized_gemm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+):
+    output = AiterHipblaslt.hip_bpreshuffle_gemm(x, weight, bias=None)
+    if bias is not None:
+        output = output + bias
+    return output

@@ -43,7 +43,10 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     should_ignore_layer,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedEmbeddingMethod,
+    UnquantizedLinearMethod,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,13 +120,17 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
         # Check if the layer is skipped for quantization.
         # TODO (@robertgshaw2): support module names
         if should_ignore_layer(
             prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
+            if isinstance(layer, VocabParallelEmbedding):
+                return UnquantizedEmbeddingMethod()
             return UnquantizedLinearMethod()
+
         if isinstance(layer, LinearBase):
             if CompressedTensorsConfig.DeepSeekFP8Config is not None:
                 return Fp8LinearMethod(CompressedTensorsConfig.DeepSeekFP8Config)

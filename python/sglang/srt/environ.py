@@ -167,6 +167,7 @@ class Envs:
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
