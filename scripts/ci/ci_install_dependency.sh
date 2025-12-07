@@ -5,10 +5,10 @@ PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
 if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
+    echo "8 Directory $FLASH_ATTN_PATH exists. Removing..."
     rm -rf "$FLASH_ATTN_PATH"
 else
-    echo "Directory $FLASH_ATTN_PATH does not exist."
+    echo "11 Directory $FLASH_ATTN_PATH does not exist."
 fi
 
 rm -rf $FLASH_ATTN_PATH
@@ -119,6 +119,16 @@ $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytor
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
+PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
+
+if [ -d "$FLASH_ATTN_PATH" ]; then
+    echo "126 Directory $FLASH_ATTN_PATH exists. Removing..."
+    rm -rf "$FLASH_ATTN_PATH"
+else
+    echo "129 Directory $FLASH_ATTN_PATH does not exist."
+fi
+
 # Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
@@ -165,20 +175,18 @@ PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
 if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
+    echo "178 Directory $FLASH_ATTN_PATH exists. Removing..."
     rm -rf "$FLASH_ATTN_PATH"
 else
-    echo "Directory $FLASH_ATTN_PATH does not exist."
+    echo "181 Directory $FLASH_ATTN_PATH does not exist."
 fi
 
-rm -rf $FLASH_ATTN_PATH
 
 PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn_origin"
 
 if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
-    rm -rf "$FLASH_ATTN_PATH"
+    echo "189 Directory $FLASH_ATTN_PATH exists."
 else
-    echo "Directory $FLASH_ATTN_PATH does not exist."
+    echo "191 Directory $FLASH_ATTN_PATH does not exist."
 fi
