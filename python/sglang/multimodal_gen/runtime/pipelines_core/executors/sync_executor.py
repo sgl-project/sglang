@@ -34,7 +34,6 @@ class SyncExecutor(PipelineExecutor):
             with Timer(stage.__class__.__name__):
                 batch = stage(batch, server_args)
 
-            # Step profiler if active
             profiler = SGLDiffusionProfiler.get_instance()
             if profiler:
                 profiler.step_stage()

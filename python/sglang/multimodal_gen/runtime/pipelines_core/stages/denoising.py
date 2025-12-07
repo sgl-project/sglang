@@ -33,7 +33,6 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
-    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -45,9 +44,6 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 )
 from sglang.multimodal_gen.runtime.loader.component_loader import TransformerLoader
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
-    SGLDiffusionProfiler,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -63,6 +59,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEn
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 try:
@@ -751,16 +748,6 @@ class DenoisingStage(PipelineStage):
         if profiler:
             profiler.step_denoising_step()
 
-    def stop_profile(self, batch: Req):
-        profiler = SGLDiffusionProfiler.get_instance()
-        try:
-            if profiler:
-                rank = get_world_rank()
-                profiler.stop(export_trace=True, dump_rank=rank)
-                torch.distributed.barrier()
-        except Exception as e:
-            logger.error(f"{e}")
-
     def _manage_device_placement(
         self,
         model_to_use: torch.nn.Module,
@@ -1030,8 +1017,6 @@ class DenoisingStage(PipelineStage):
                             progress_bar.update()
 
                         self.step_profile()
-
-        self.stop_profile(batch)
 
         denoising_end_time = time.time()
 

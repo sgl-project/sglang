@@ -184,7 +184,6 @@ class DmdDenoisingStage(DenoisingStage):
 
                     self.step_profile()
 
-        self.stop_profile(batch)
         denoising_loop_end_time = time.time()
         if len(timesteps) > 0:
             self.log_info(
