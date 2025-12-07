@@ -4,8 +4,9 @@ Server management and performance validation for diffusion tests.
 
 from __future__ import annotations
 
+import base64
 import os
-import statistics
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -13,22 +14,28 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from urllib.request import urlopen
 
-from openai import OpenAI
+import pytest
+from openai import Client, OpenAI
 
+from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.test.server.testcase_configs import (
+    DiffusionSamplingParams,
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
 )
+from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
+    is_image_url,
     prepare_perf_log,
-    sample_step_indices,
     validate_image,
+    validate_openai_video,
 )
 
 logger = init_logger(__name__)
@@ -133,7 +140,9 @@ class ServerManager:
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
         env["SGLANG_PERF_LOG_DIR"] = log_dir.as_posix()
 
-        stdout_fh = stdout_path.open("w", encoding="utf-8", buffering=1)
+        # TODO: unify with run_command
+        logger.info(f"Running command: {shlex.join(command)}")
+
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -144,6 +153,7 @@ class ServerManager:
         )
 
         log_thread = None
+        stdout_fh = stdout_path.open("w", encoding="utf-8", buffering=1)
         if process.stdout:
 
             def _log_pipe(pipe: Any, file: Any) -> None:
@@ -319,9 +329,7 @@ class PerformanceValidator:
         Uses the larger of relative tolerance or absolute tolerance to prevent
         flaky failures on very fast operations.
         """
-        rel_limit = expected * (1 + tolerance)
-        abs_limit = expected + min_abs_tolerance_ms
-        upper_bound = max(rel_limit, abs_limit)
+        upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance_ms)
         assert actual <= upper_bound, (
             f"Validation failed for '{name}'.\n"
             f"  Actual:   {actual:.4f}ms\n"
@@ -331,10 +339,10 @@ class PerformanceValidator:
         )
 
     def validate(
-        self, perf_record: dict, stage_metrics: dict, *args, **kwargs
+        self, perf_record: RequestPerfRecord, *args, **kwargs
     ) -> PerformanceSummary:
         """Validate all performance metrics and return summary."""
-        summary = self.collect_metrics(perf_record, stage_metrics)
+        summary = self.collect_metrics(perf_record)
         if self.is_baseline_generation_mode:
             return summary
 
@@ -347,40 +355,9 @@ class PerformanceValidator:
 
     def collect_metrics(
         self,
-        perf_record: dict,
-        stage_metrics: dict,
+        perf_record: RequestPerfRecord,
     ) -> PerformanceSummary:
-        """Collect all performance metrics into a summary without validation."""
-        e2e_ms = float(perf_record.get("total_duration_ms", 0.0))
-        steps = [
-            s
-            for s in perf_record.get("steps", []) or []
-            if s.get("name") == "denoising_step_guided" and "duration_ms" in s
-        ]
-
-        avg_denoise = 0.0
-        median_denoise = 0.0
-        if steps:
-            durations = [float(s["duration_ms"]) for s in steps]
-            avg_denoise = sum(durations) / len(durations)
-            median_denoise = statistics.median(durations)
-
-        per_step = {
-            int(s["index"]): float(s["duration_ms"])
-            for s in steps
-            if s.get("index") is not None
-        }
-        sample_indices = sample_step_indices(per_step, self.step_fractions)
-        sampled_steps = {idx: per_step[idx] for idx in sample_indices}
-
-        return PerformanceSummary(
-            e2e_ms=e2e_ms,
-            avg_denoise_ms=avg_denoise,
-            median_denoise_ms=median_denoise,
-            stage_metrics=stage_metrics,
-            sampled_steps=sampled_steps,
-            all_denoise_steps=per_step,
-        )
+        return PerformanceSummary.from_req_perf_record(perf_record, self.step_fractions)
 
     def _validate_e2e(self, summary: PerformanceSummary) -> None:
         """Validate end-to-end performance."""
@@ -455,12 +432,11 @@ class VideoPerformanceValidator(PerformanceValidator):
 
     def validate(
         self,
-        perf_record: dict,
-        stage_metrics: dict,
+        perf_record: RequestPerfRecord,
         num_frames: int | None = None,
     ) -> PerformanceSummary:
         """Validate video metrics including frame generation rates."""
-        summary = super().validate(perf_record, stage_metrics)
+        summary = super().validate(perf_record)
 
         if num_frames and summary.e2e_ms > 0:
             summary.total_frames = num_frames
@@ -489,3 +465,232 @@ VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
 }
+
+
+def get_generate_fn(
+    model_path: str,
+    modality: str,
+    sampling_params: DiffusionSamplingParams,
+) -> Callable[[str, Client], str]:
+    """Return appropriate generation function for the case."""
+
+    def _create_and_download_video(
+        client,
+        case_id,
+        *,
+        model: str,
+        size: str,
+        prompt: str | None = None,
+        seconds: int | None = None,
+        input_reference: Any | None = None,
+    ) -> str:
+        """
+        Create a video job via /v1/videos, poll until completion,
+        then download the binary content and validate it.
+        """
+
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "size": size,
+        }
+        if prompt is not None:
+            create_kwargs["prompt"] = prompt
+        if seconds is not None:
+            create_kwargs["seconds"] = seconds
+        if input_reference is not None:
+            create_kwargs["input_reference"] = input_reference  # triggers multipart
+
+        job = client.videos.create(**create_kwargs)  # type: ignore[attr-defined]
+        video_id = job.id
+
+        job_completed = False
+        is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
+        timeout = 3600.0 if is_baseline_generation_mode else 1200.0
+        deadline = time.time() + timeout
+        while True:
+            page = client.videos.list()  # type: ignore[attr-defined]
+            item = next((v for v in page.data if v.id == video_id), None)
+
+            if item and getattr(item, "status", None) == "completed":
+                job_completed = True
+                break
+
+            if time.time() > deadline:
+                break
+
+            time.sleep(1)
+
+        if not job_completed:
+            if is_baseline_generation_mode:
+                logger.warning(
+                    f"{id}: video job {video_id} timed out during baseline generation. "
+                    "Attempting to collect performance data anyway."
+                )
+                return video_id
+
+            pytest.fail(f"{id}: video job {video_id} did not complete in time")
+
+        # download video
+        resp = client.videos.download_content(video_id=video_id)  # type: ignore[attr-defined]
+        content = resp.read()
+        validate_openai_video(content)
+
+        tmp_path = f"{video_id}.mp4"
+        with open(tmp_path, "wb") as f:
+            f.write(content)
+        upload_file_to_slack(
+            case_id=case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            file_path=tmp_path,
+            origin_file_path=sampling_params.image_path,
+        )
+        os.remove(tmp_path)
+
+        return video_id
+
+    video_seconds = sampling_params.seconds or 4
+
+    def generate_image(case_id, client) -> str:
+        """T2I: Text to Image generation."""
+        if not sampling_params.prompt:
+            pytest.skip(f"{id}: no text prompt configured")
+
+        response = client.images.with_raw_response.generate(
+            model=model_path,
+            prompt=sampling_params.prompt,
+            n=1,
+            size=sampling_params.output_size,
+            response_format="b64_json",
+        )
+        result = response.parse()
+        validate_image(result.data[0].b64_json)
+
+        img_data = base64.b64decode(result.data[0].b64_json)
+        tmp_path = f"{result.created}.png"
+        with open(tmp_path, "wb") as f:
+            f.write(img_data)
+        upload_file_to_slack(
+            case_id=case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            file_path=tmp_path,
+        )
+        os.remove(tmp_path)
+
+        return str(result.created)
+
+    def generate_image_edit(case_id, client) -> str:
+        """TI2I: Text + Image ? Image edit."""
+        if not sampling_params.prompt or not sampling_params.image_path:
+            pytest.skip(f"{id}: no edit config")
+
+        if is_image_url(sampling_params.image_path):
+            image_path = download_image_from_url(str(sampling_params.image_path))
+        else:
+            image_path = Path(sampling_params.image_path)
+            if not image_path.exists():
+                pytest.skip(f"{id}: file missing: {image_path}")
+
+        with image_path.open("rb") as fh:
+            response = client.images.with_raw_response.edit(
+                model=model_path,
+                image=fh,
+                prompt=sampling_params.prompt,
+                n=1,
+                size=sampling_params.output_size,
+                response_format="b64_json",
+            )
+        rid = response.headers.get("x-request-id", "")
+
+        result = response.parse()
+        validate_image(result.data[0].b64_json)
+
+        img_data = base64.b64decode(result.data[0].b64_json)
+        tmp_path = f"{rid}.png"
+        with open(tmp_path, "wb") as f:
+            f.write(img_data)
+        upload_file_to_slack(
+            case_id=case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            file_path=tmp_path,
+            origin_file_path=sampling_params.image_path,
+        )
+        os.remove(tmp_path)
+
+        return rid
+
+    def generate_video(case_id, client) -> str:
+        """T2V: Text ? Video."""
+        if not sampling_params.prompt:
+            pytest.skip(f"{id}: no text prompt configured")
+
+        return _create_and_download_video(
+            client,
+            case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            size=sampling_params.output_size,
+            seconds=video_seconds,
+        )
+
+    def generate_image_to_video(case_id, client) -> str:
+        """I2V: Image ? Video (optional prompt)."""
+        if not sampling_params.image_path:
+            pytest.skip(f"{id}: no input image configured")
+
+        if is_image_url(sampling_params.image_path):
+            image_path = download_image_from_url(str(sampling_params.image_path))
+        else:
+            image_path = Path(sampling_params.image_path)
+            if not image_path.exists():
+                pytest.skip(f"{id}: file missing: {image_path}")
+
+        with image_path.open("rb") as fh:
+            return _create_and_download_video(
+                client,
+                case_id,
+                model=model_path,
+                prompt=sampling_params.prompt,
+                size=sampling_params.output_size,
+                seconds=video_seconds,
+                input_reference=fh,
+            )
+
+    def generate_text_image_to_video(case_id, client) -> str:
+        """TI2V: Text + Image ? Video."""
+        if not sampling_params.prompt or not sampling_params.image_path:
+            pytest.skip(f"{id}: no edit config")
+
+        if is_image_url(sampling_params.image_path):
+            image_path = download_image_from_url(str(sampling_params.image_path))
+        else:
+            image_path = Path(sampling_params.image_path)
+            if not image_path.exists():
+                pytest.skip(f"{id}: file missing: {image_path}")
+
+        with image_path.open("rb") as fh:
+            return _create_and_download_video(
+                client,
+                case_id,
+                model=model_path,
+                prompt=sampling_params.prompt,
+                size=sampling_params.output_size,
+                seconds=video_seconds,
+                input_reference=fh,
+            )
+
+    if modality == "video":
+        if sampling_params.image_path and sampling_params.prompt:
+            fn = generate_text_image_to_video
+        elif sampling_params.image_path:
+            fn = generate_image_to_video
+        else:
+            fn = generate_video
+    elif sampling_params.prompt and sampling_params.image_path:
+        fn = generate_image_edit
+    else:
+        fn = generate_image
+
+    return fn

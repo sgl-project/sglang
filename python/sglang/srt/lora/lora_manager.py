@@ -37,15 +37,8 @@ from sglang.srt.lora.utils import (
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_npu, replace_submodule
+from sglang.srt.utils import replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
-
-if is_npu():
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
-
-    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it to True
-    torch.cuda.is_available = lambda: False
-
 
 logger = logging.getLogger(__name__)
 
@@ -155,13 +148,17 @@ class LoRAManager:
         """
 
         # Check if this LoRA adapter is already loaded
-        if any(
-            lora_ref.lora_name == existing_lora_ref.lora_name
-            for existing_lora_ref in self.lora_refs.values()
-        ):
-            raise ValueError(
-                f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
-            )
+        for existing_lora_ref in self.lora_refs.values():
+            if lora_ref.lora_name == existing_lora_ref.lora_name:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                )
+
+            if lora_ref.lora_path == existing_lora_ref.lora_path:
+                logger.warning(
+                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
