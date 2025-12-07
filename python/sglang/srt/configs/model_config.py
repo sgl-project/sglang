@@ -1030,6 +1030,8 @@ def is_hybrid_model(
         and context_length > attention_chunk_size
     ):
         return hybrid_kvcache_ratio
+    elif hybrid_kvcache_ratio > 0 and model_architectures[0] == "GptOssForCausalLM":
+        return hybrid_kvcache_ratio
     else:
         return None
 

@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.elastic.elasticmem_orchestrator import (
     cu_page_size,
     use_elasticmem,
 )
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, SWAKVPool
+from sglang.srt.mem_cache.memory_pool import GB, MHATokenToKVPool, SWAKVPool
 
 if use_elasticmem:
     from kvcached.etensor import ETensor
@@ -94,6 +94,17 @@ class ElasticMHATokenToKVPool(MHATokenToKVPool, ElasticMempool):
         self.v_buffer = [etensor.etensor for etensor in self.ev_buffer]
         self.state_memsize = self.ek_buffer[0].state_memsize
         logger.debug(f"{self.esize=}, {self.k_buffer[0].shape=}, {self.state_memsize=}")
+
+    @override
+    def _finalize_allocation_log(self, num_tokens: int):
+        k_size = self.state_memsize * self.size * self.layer_num
+        v_size = k_size
+        k_size_GB = k_size / GB
+        v_size_GB = v_size / GB
+        logger.info(
+            f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+        )
+        self.mem_usage = k_size_GB + v_size_GB
 
     # TODO: exception handler, consistency in mempool size for each kv layer
     @override
