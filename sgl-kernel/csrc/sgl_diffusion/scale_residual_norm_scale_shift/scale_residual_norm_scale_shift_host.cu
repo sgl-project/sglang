@@ -137,7 +137,7 @@ struct NormParams {
   bool has_bias_tensor;
 };
 
-template <typename ParamType>
+template <typename ParamDType>
 NormParams prepare_norm_params(
     const c10::optional<at::Tensor>& weight_opt,
     const c10::optional<at::Tensor>& bias_opt,
@@ -165,7 +165,7 @@ NormParams prepare_norm_params(
   return params;
 }
 
-template <typename DType, typename ParamType, NormType norm_type, bool is_d_aligned>
+template <typename DType, typename ParamDType, NormType norm_type, bool is_d_aligned>
 void launch_fused(
     dim3 grid,
     dim3 block,
@@ -173,10 +173,10 @@ void launch_fused(
     DType* residual,
     DType* x,
     DType* gate,
-    const ParamType* w,
-    const ParamType* b,
-    BroadcastDesc<DType> scale_desc,
+    const ParamDType* w,
+    const ParamDType* b,
     BroadcastDesc<DType> shift_desc,
+    BroadcastDesc<DType> scale_desc,
     double eps,
     DType* modulated,
     DType* residual_output,
@@ -187,14 +187,14 @@ void launch_fused(
     bool is_warp_reduce,
     bool has_weight_tensor,
     bool has_bias_tensor) {
-  scale_residual_norm_scale_shift_kernel<DType, ParamType, norm_type, is_d_aligned><<<grid, block, 0, stream>>>(
+  scale_residual_norm_scale_shift_kernel<DType, ParamDType, norm_type, is_d_aligned><<<grid, block, 0, stream>>>(
       residual,
       x,
       gate,
       w,
       b,
-      scale_desc,
       shift_desc,
+      scale_desc,
       eps,
       modulated,
       residual_output,
@@ -207,7 +207,7 @@ void launch_fused(
       has_bias_tensor);
 }
 
-template <typename DType, typename ParamType>
+template <typename DType, typename ParamDType>
 using LauncherFn = void (*)(
     dim3,
     dim3,
@@ -215,8 +215,8 @@ using LauncherFn = void (*)(
     DType*,
     DType*,
     DType*,
-    const ParamType*,
-    const ParamType*,
+    const ParamDType*,
+    const ParamDType*,
     BroadcastDesc<DType>,
     BroadcastDesc<DType>,
     double,
@@ -230,12 +230,12 @@ using LauncherFn = void (*)(
     bool,
     bool);
 
-template <typename DType, typename ParamType>
-static constexpr LauncherFn<DType, ParamType> DISPATCH_TABLE[2][2] = {
-    {&launch_fused<DType, ParamType, NormType::LayerNorm, false>,
-     &launch_fused<DType, ParamType, NormType::LayerNorm, true>},
-    {&launch_fused<DType, ParamType, NormType::RMSNorm, false>,
-     &launch_fused<DType, ParamType, NormType::RMSNorm, true>}};
+template <typename DType, typename ParamDType>
+static constexpr LauncherFn<DType, ParamDType> DISPATCH_TABLE[2][2] = {
+    {&launch_fused<DType, ParamDType, NormType::LayerNorm, false>,
+     &launch_fused<DType, ParamDType, NormType::LayerNorm, true>},
+    {&launch_fused<DType, ParamDType, NormType::RMSNorm, false>,
+     &launch_fused<DType, ParamDType, NormType::RMSNorm, true>}};
 }  // namespace
 
 /*==========================================================================*
@@ -249,15 +249,15 @@ std::tuple<at::Tensor, at::Tensor> scale_residual_norm_scale_shift(
     const c10::optional<at::Tensor>& gate_opt,
     const c10::optional<at::Tensor>& norm_weight_opt,
     const c10::optional<at::Tensor>& norm_bias_opt,
-    const at::Tensor& scale,
     const at::Tensor& shift,
+    const at::Tensor& scale,
     double eps,
     bool use_rms_norm) {
   // --- basic input validation ---
   CHECK_CUDA(residual);
   CHECK_CUDA(x);
-  CHECK_CUDA(scale);
   CHECK_CUDA(shift);
+  CHECK_CUDA(scale);
   TORCH_CHECK(residual.dim() == 3, "residual must be [B, S, D]");
   TORCH_CHECK(x.sizes() == residual.sizes(), "x must match residual shape");
 
@@ -326,13 +326,13 @@ std::tuple<at::Tensor, at::Tensor> scale_residual_norm_scale_shift(
     using DType = decltype(dtype_tag);
     auto gate_param = prepare_gate<DType>(gate_opt, B, S, D, act_opts_const);
     bool has_gate_tensor = gate_param.frame_len != -1;
-    auto scale_param = prepare_scale_shift_tensor<DType>(scale, B, S, D, act_opts_const);
     auto shift_param = prepare_scale_shift_tensor<DType>(shift, B, S, D, act_opts_const);
+    auto scale_param = prepare_scale_shift_tensor<DType>(scale, B, S, D, act_opts_const);
 
     auto dispatch_param = [&](auto param_tag) {
-      using ParamType = decltype(param_tag);
-      auto norm_params = prepare_norm_params<ParamType>(norm_weight_opt, norm_bias_opt, D, param_opts);
-      auto launcher = DISPATCH_TABLE<DType, ParamType>[use_rms_norm][is_d_aligned];
+      using ParamDType = decltype(param_tag);
+      auto norm_params = prepare_norm_params<ParamDType>(norm_weight_opt, norm_bias_opt, D, param_opts);
+      auto launcher = DISPATCH_TABLE<DType, ParamDType>[use_rms_norm][is_d_aligned];
       launcher(
           grid,
           block,
@@ -340,10 +340,10 @@ std::tuple<at::Tensor, at::Tensor> scale_residual_norm_scale_shift(
           residual_f.data_ptr<DType>(),
           x_f.data_ptr<DType>(),
           has_gate_tensor ? gate_param.storage.template data_ptr<DType>() : nullptr,
-          norm_params.has_weight_tensor ? norm_params.weight.template data_ptr<ParamType>() : nullptr,
-          norm_params.has_bias_tensor ? norm_params.bias.template data_ptr<ParamType>() : nullptr,
-          scale_param.desc,
+          norm_params.has_weight_tensor ? norm_params.weight.template data_ptr<ParamDType>() : nullptr,
+          norm_params.has_bias_tensor ? norm_params.bias.template data_ptr<ParamDType>() : nullptr,
           shift_param.desc,
+          scale_param.desc,
           eps,
           modulated.data_ptr<DType>(),
           residual_output.data_ptr<DType>(),

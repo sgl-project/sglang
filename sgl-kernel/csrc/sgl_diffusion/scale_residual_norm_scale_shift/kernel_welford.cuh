@@ -74,7 +74,7 @@ __inline__ __device__ WelfoldValue compute_scale_residual(float x, float g, floa
 }
 
 // Vectorized path of (x*gate + residual), computing 4 elements per thread.
-template <typename DType, typename ParamType, NormType norm_type>
+template <typename DType, typename ParamDType, NormType norm_type>
 __inline__ __device__ WelfoldValue scale_residual_aligned(
     WelfoldValue welf,
     const DType* x,
@@ -110,7 +110,7 @@ __inline__ __device__ WelfoldValue scale_residual_aligned(
 }
 
 // Scalar fallback path for residual = x * gate + residual.
-template <typename DType, typename ParamType, NormType norm_type>
+template <typename DType, typename ParamDType, NormType norm_type>
 __inline__ __device__ WelfoldValue scale_residual_general(
     WelfoldValue welf,
     const DType* x,
@@ -200,13 +200,13 @@ __inline__ __device__ void cta_reduce(
 }
 
 // Vectorized path for norm (LayerNorm/RMSNorm) + scale/shift modulation.
-template <typename DType, typename ParamType, NormType norm_type>
+template <typename DType, typename ParamDType, NormType norm_type>
 __inline__ __device__ void norm_scale_shift_aligned(
     const DType* residual_output,
-    const ParamType* norm_weight,
-    const ParamType* norm_bias,
-    PtrValUnion<DType> scale_union,
+    const ParamDType* norm_weight,
+    const ParamDType* norm_bias,
     PtrValUnion<DType> shift_union,
+    PtrValUnion<DType> scale_union,
     DType* modulated,
     float mean,
     float inv,
@@ -224,12 +224,12 @@ __inline__ __device__ void norm_scale_shift_aligned(
     float mod_i[4];
     load4_cast<DType, float>(residual_output + idx, resi_out_i);
     if (has_weight_tensor) {
-      load4_cast<ParamType, float>(norm_weight + idx, weight_i);
+      load4_cast<ParamDType, float>(norm_weight + idx, weight_i);
     } else {
       weight_i[0] = weight_i[1] = weight_i[2] = weight_i[3] = 1.0f;
     }
     if (has_bias_tensor) {
-      load4_cast<ParamType, float>(norm_bias + idx, bias_i);
+      load4_cast<ParamDType, float>(norm_bias + idx, bias_i);
     } else {
       bias_i[0] = bias_i[1] = bias_i[2] = bias_i[3] = 0.0f;
     }
@@ -258,13 +258,13 @@ __inline__ __device__ void norm_scale_shift_aligned(
 }
 
 // Scalar fallback path for norm + scale/shift, used when D is unaligned.
-template <typename DType, typename ParamType, NormType norm_type>
+template <typename DType, typename ParamDType, NormType norm_type>
 __inline__ __device__ void norm_scale_shift_general(
     const DType* residual_output,
-    const ParamType* norm_weight,
-    const ParamType* norm_bias,
-    PtrValUnion<DType> scale_union,
+    const ParamDType* norm_weight,
+    const ParamDType* norm_bias,
     PtrValUnion<DType> shift_union,
+    PtrValUnion<DType> scale_union,
     DType* modulated,
     float mean,
     float inv,
@@ -300,15 +300,15 @@ __inline__ __device__ void norm_scale_shift_general(
 /**
  * @brief ScaleResidualNormScaleShift.
  */
-template <typename DType, typename ParamType, NormType norm_type, bool is_d_aligned>
+template <typename DType, typename ParamDType, NormType norm_type, bool is_d_aligned>
 __global__ __launch_bounds__(THREADS_PER_CTA) void scale_residual_norm_scale_shift_kernel(
     const DType* residual,
     const DType* x,
     const DType* gate,
-    const ParamType* norm_weight,
-    const ParamType* norm_bias,
-    BroadcastDesc<DType> scale_desc,
+    const ParamDType* norm_weight,
+    const ParamDType* norm_bias,
     BroadcastDesc<DType> shift_desc,
+    BroadcastDesc<DType> scale_desc,
     double eps,
     DType* modulated,
     DType* residual_output,
@@ -338,8 +338,8 @@ __global__ __launch_bounds__(THREADS_PER_CTA) void scale_residual_norm_scale_shi
   if (is_scale_shift_tensor) {
     const int64_t batch_idx = tile_id / S;
     const int64_t seq_idx = tile_id % S;
-    scale_desc.union_value.ptr += (batch_idx * scale_desc.stride_b + seq_idx) / scale_desc.frame_len * D;
     shift_desc.union_value.ptr += (batch_idx * shift_desc.stride_b + seq_idx) / shift_desc.frame_len * D;
+    scale_desc.union_value.ptr += (batch_idx * scale_desc.stride_b + seq_idx) / scale_desc.frame_len * D;
   }
   modulated += tile_id * D;
   residual_output += tile_id * D;
@@ -347,10 +347,10 @@ __global__ __launch_bounds__(THREADS_PER_CTA) void scale_residual_norm_scale_shi
   // Scale & Residual
   WelfoldValue welf;
   if constexpr (is_d_aligned) {
-    welf = scale_residual_aligned<DType, ParamType, norm_type>(
+    welf = scale_residual_aligned<DType, ParamDType, norm_type>(
         welf, x, gate, residual, residual_output, is_warp_reduce, has_gate_tensor, D, thr_id, lane_id);
   } else {
-    welf = scale_residual_general<DType, ParamType, norm_type>(
+    welf = scale_residual_general<DType, ParamDType, norm_type>(
         welf, x, gate, residual, residual_output, is_warp_reduce, has_gate_tensor, D, thr_id, lane_id);
   }
 
@@ -383,12 +383,12 @@ __global__ __launch_bounds__(THREADS_PER_CTA) void scale_residual_norm_scale_shi
 
   // Norm & Modulate
   if constexpr (is_d_aligned) {
-    norm_scale_shift_aligned<DType, ParamType, norm_type>(
+    norm_scale_shift_aligned<DType, ParamDType, norm_type>(
         residual_output,
         norm_weight,
         norm_bias,
-        scale_desc.union_value,
         shift_desc.union_value,
+        scale_desc.union_value,
         modulated,
         mean,
         inv,
@@ -400,12 +400,12 @@ __global__ __launch_bounds__(THREADS_PER_CTA) void scale_residual_norm_scale_shi
         thr_id,
         lane_id);
   } else {
-    norm_scale_shift_general<DType, ParamType, norm_type>(
+    norm_scale_shift_general<DType, ParamDType, norm_type>(
         residual_output,
         norm_weight,
         norm_bias,
-        scale_desc.union_value,
         shift_desc.union_value,
+        scale_desc.union_value,
         modulated,
         mean,
         inv,
