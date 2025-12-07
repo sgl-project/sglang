@@ -41,10 +41,13 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         output_size_per_partition = sum(output_partition_sizes)
 
+        weight_data = torch.empty(
+            (output_size_per_partition, input_size_per_partition), dtype=torch.int8
+        )
+        layer.__dict__["weight_data"] = weight_data
+
         weight = ModelWeightParameter(
-            data=torch.empty(
-                (output_size_per_partition, input_size_per_partition), dtype=torch.int8
-            ),
+            data=weight_data,
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
@@ -79,8 +82,11 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         input_offset.ignore_warning = True
         layer.register_parameter("input_offset", input_offset)
 
+        quant_bias_data = torch.empty(output_size_per_partition, dtype=torch.int32)
+        layer.__dict__["quant_bias_data"] = quant_bias_data
+
         quant_bias = ChannelQuantScaleParameter(
-            data=torch.empty(output_size_per_partition, dtype=torch.int32),
+            data=quant_bias_data,
             output_dim=0,
             weight_loader=weight_loader,
         )
@@ -92,8 +98,12 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             deq_scale_dtype = torch.int64
         else:
             raise ValueError(f"Unsupported params_dtype: {params_dtype}")
+
+        deq_scale_data = torch.empty(output_size_per_partition, dtype=deq_scale_dtype)
+        layer.__dict__["deq_scale_data"] = deq_scale_data
+
         deq_scale = ChannelQuantScaleParameter(
-            data=torch.empty(output_size_per_partition, dtype=deq_scale_dtype),
+            data=deq_scale_data,
             output_dim=0,
             weight_loader=weight_loader,
         )
@@ -118,7 +128,7 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
 
             x = torch.ops.npu.npu_quantize(
                 x,
-                layer.aclnn_input_scale_reciprocal,
+                aclnn_input_scale_reciprocal,
                 layer.aclnn_input_offset,
                 torch.qint8,
                 -1,
@@ -129,11 +139,11 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         if isinstance(layer, RowParallelLinear) and layer.tp_rank > 0:
             quant_bias = None
         else:
-            quant_bias = layer.quant_bias
+            quant_bias = layer.quant_bias_data
         return torch.ops.npu.npu_quant_matmul(
             x,
-            layer.weight,
-            layer.deq_scale,
+            layer.weight_data,
+            layer.deq_scale_data,
             bias=quant_bias,
             output_dtype=layer.params_dtype,
         )
@@ -141,6 +151,7 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
+        layer.weight_data = layer.weight.data
 
         layer.weight_scale.data = torch.flatten(layer.weight_scale.data)
         layer.weight_offset.data = torch.flatten(layer.weight_offset.data)
@@ -184,18 +195,26 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         weight_loader = extra_weight_attrs.get("weight_loader")
         output_size_per_partition = sum(output_partition_sizes)
 
+        weight_data = torch.empty(
+            (output_size_per_partition, input_size_per_partition), dtype=torch.int8
+        )
+        layer.__dict__["weight_data"] = weight_data
+
         weight = ModelWeightParameter(
-            data=torch.empty(
-                (output_size_per_partition, input_size_per_partition), dtype=torch.int8
-            ),
+            data=weight_data,
             input_dim=1,
             output_dim=0,
             weight_loader=weight_loader,
         )
         layer.register_parameter("weight", weight)
 
+        weight_scale_data = torch.empty(
+            (output_size_per_partition, 1), dtype=params_dtype
+        )
+        layer.__dict__["weight_scale_data"] = weight_scale_data
+
         weight_scale = ChannelQuantScaleParameter(
-            data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
+            data=weight_scale_data,
             output_dim=0,
             weight_loader=weight_loader,
         )
@@ -218,8 +237,8 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
         return torch.ops.npu.npu_quant_matmul(
             quant_out,
-            layer.weight,
-            layer.weight_scale,
+            layer.weight_data,
+            layer.weight_scale_data,
             pertoken_scale=dynamic_scale,
             bias=bias,
             output_dtype=original_dtype,
@@ -228,6 +247,7 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
+        layer.weight_data = layer.weight.data
 
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_offset.data = layer.weight_offset.data.flatten()

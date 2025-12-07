@@ -4,100 +4,12 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils import direct_register_custom_op, is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-
-import sgl_kernel_npu.norm.split_qkv_rmsnorm_rope
-
-import sglang.srt.utils
-
-
-@torch.library.custom_op("sglang::split_qkv_rmsnorm_rope", mutates_args=())
-def split_qkv_rmsnorm_rope(
-    input: torch.Tensor,
-    sin: torch.Tensor,
-    cos: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    q_hiddent_size: int,
-    kv_hidden_size: int,
-    head_dim: int,
-    eps: float,
-    q_bias: torch.Tensor,
-    k_bias: torch.Tensor,
-) -> List[torch.Tensor]:
-    q, k, v = sgl_kernel_npu.norm.split_qkv_rmsnorm_rope.split_qkv_rmsnorm_rope(
-        input,
-        sin,
-        cos,
-        q_weight,
-        k_weight,
-        q_hiddent_size,
-        kv_hidden_size,
-        head_dim,
-        eps,
-        q_bias,
-        k_bias,
-    )
-    return [q, k, v]
-
-
-@split_qkv_rmsnorm_rope.register_fake
-def split_qkv_rmsnorm_rope_fake(
-    input: torch.Tensor,
-    sin: torch.Tensor,
-    cos: torch.Tensor,
-    q_weight: torch.Tensor,
-    k_weight: torch.Tensor,
-    q_hiddent_size: int,
-    kv_hidden_size: int,
-    head_dim: int,
-    eps: float,
-    q_bias: torch.Tensor,
-    k_bias: torch.Tensor,
-) -> List[torch.Tensor]:
-    q = torch.empty((128, 4096), dtype=input.dtype, device=input.device)
-    k = torch.empty((128, 512), dtype=input.dtype, device=input.device)
-    v = torch.empty((128, 512), dtype=input.dtype, device=input.device)
-    return [q, k, v]
-
-
-@torch.library.custom_op("sglang::wait_cmo_stream", mutates_args=())
-def wait_cmo_stream() -> None:
-    if sglang.srt.utils.get_cmo_stream():
-        sglang.srt.utils.wait_cmo_stream()
-
-
-@wait_cmo_stream.register_fake
-def wait_cmo_stream_fake() -> None:
-    pass
-
-
-def get_cmo_stream() -> bool:
-    return True
-
-
-def prepare_weight_cache(handle: torch.Tensor, cache: List[torch.Tensor]) -> None:
-    sglang.srt.utils.prepare_weight_cache(handle, cache)
-
-
-def prepare_weight_cache_register_fake(
-    handle: torch.Tensor, cache: List[torch.Tensor]
-) -> None:
-    pass
-
-
-direct_register_custom_op(
-    op_name="prepare_weight_cache",
-    op_func=prepare_weight_cache,
-    mutates_args=["handle"],
-    fake_impl=prepare_weight_cache_register_fake,
-)
-
 
 IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip
 IS_QUICK_AR_AVAILABLE = _is_hip

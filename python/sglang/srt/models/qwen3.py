@@ -32,24 +32,28 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_npu, supports_custom_op
 
-if (
-    is_npu()
-    and supports_custom_op()
-    and (
-        get_global_server_args().enable_torch_compile
-        or get_global_server_args().enable_piecewise_npu_graph_decode
-    )
-):
-    from python.sglang.srt.distributed.device_communicators.custom_all_reduce_ops import get_cmo_stream, wait_cmo_stream
-else:
-    from sglang.srt.utils import get_cmo_stream, wait_cmo_stream
-from sglang.srt.utils import add_prefix, is_cuda, is_npu
-
 Qwen3Config = None
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+if _is_npu:
+    if supports_custom_op() and (
+        get_global_server_args().enable_torch_compile
+        or get_global_server_args().enable_piecewise_npu_graph_decode
+    ):
+        from sglang.srt.hardware_backend.npu.cmo import get_weight_cache
+        from sglang.srt.hardware_backend.npu.cmo_custom_ops import (
+            get_cmo_stream,
+            wait_cmo_stream,
+        )
+    else:
+        from sglang.srt.hardware_backend.npu.cmo import (
+            get_cmo_stream,
+            get_weight_cache,
+            wait_cmo_stream,
+        )
 
 
 class Qwen3Attention(nn.Module):
@@ -282,7 +286,10 @@ class Qwen3DecoderLayer(nn.Module):
             residual,
             forward_batch,
             cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+                [
+                    get_weight_cache(self.mlp.gate_up_proj),
+                    get_weight_cache(self.mlp.down_proj),
+                ]
                 if _is_npu
                 else None
             ),
