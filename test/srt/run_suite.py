@@ -91,6 +91,7 @@ suites = {
         TestFile("test_srt_endpoint.py", 127),
         TestFile("test_srt_engine.py", 252),
         TestFile("test_standalone_speculative_decoding.py", 150),
+        TestFile("test_standalone_v2_speculative_decoding.py", 150),
         TestFile("test_start_profile.py", 41),
         TestFile("test_profile_merger.py", 8),
         TestFile("test_profile_merger_http_api.py", 9),
