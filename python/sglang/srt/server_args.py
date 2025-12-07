@@ -168,6 +168,8 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
 ]
 
+MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
+
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 
@@ -395,6 +397,7 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
+    speculative_moe_a2a_backend: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -1279,6 +1282,21 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+                if self.attention_backend is None:
+                    self.attention_backend = "triton"
+                    logger.info(
+                        "Use triton as attention backend on sm100 for Qwen3NextForCausalLM"
+                    )
+                if (
+                    not self.disable_radix_cache
+                    and self.attention_backend == "trtllm_mha"
+                ):
+                    logger.warning(
+                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                        "Try to use --attention-backend triton if radix cache is necessary."
+                    )
+                    self.disable_radix_cache = True
+                    self.disable_overlap_schedule = False
         elif model_arch in [
             "NemotronHForCausalLM",
             "FalconH1ForCausalLM",
@@ -2801,7 +2819,7 @@ class ServerArgs:
         parser.add_argument(
             "--preferred-sampling-params",
             type=str,
-            help="json-formatted sampling settings that will be returned in /model_info",
+            help="json-formatted sampling settings that will be returned in /get_model_info",
         )
 
         # LoRA
@@ -3011,6 +3029,13 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_runner_backend,
             help="Choose the runner backend for MoE in speculative decoding.",
         )
+        parser.add_argument(
+            "--speculative-moe-a2a-backend",
+            type=str,
+            choices=MOE_A2A_BACKEND_CHOICES,
+            default=ServerArgs.speculative_moe_a2a_backend,
+            help="Choose the backend for MoE A2A in speculative decoding",
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -3069,7 +3094,7 @@ class ServerArgs:
         parser.add_argument(
             "--moe-a2a-backend",
             type=str,
-            choices=["none", "deepep", "mooncake", "ascend_fuseep"],
+            choices=MOE_A2A_BACKEND_CHOICES,
             default=ServerArgs.moe_a2a_backend,
             help="Choose the backend for MoE A2A.",
         )
