@@ -15,6 +15,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -70,13 +71,13 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w2_qzeros: Optional[torch.Tensor] = None
 
     # Optional
-    workspace: Optional[torch.Tensor] = None
     expert_map: Optional[torch.Tensor] = None
 
 
 class MarlinRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
+        self.workspace: Optional[torch.Tensor] = None
 
     def run(
         self,
@@ -92,9 +93,8 @@ class MarlinRunnerCore(MoeRunnerCore):
 
         assert self.config.activation == "silu", "Only SiLU activation is supported."
 
-        orig_dtype = x.dtype
-        # removed since fused_marlin_moe.py now accepts bfloat16
-        # x = x.half()
+        if self.workspace is None:
+            self.workspace = marlin_make_workspace(x.device, max_blocks_per_sm=4)
 
         output = fused_marlin_moe(
             hidden_states=x,
@@ -112,12 +112,12 @@ class MarlinRunnerCore(MoeRunnerCore):
             sort_indices2=quant_info.w2_g_idx_sort_indices,
             w1_zeros=quant_info.w13_qzeros,
             w2_zeros=quant_info.w2_qzeros,
-            workspace=quant_info.workspace,
+            workspace=self.workspace,
             num_bits=quant_info.weight_bits,
             is_k_full=quant_info.is_k_full,
             inplace=self.config.inplace,
             routed_scaling_factor=self.config.routed_scaling_factor,
-        ).to(orig_dtype)
+        ).to(x.dtype)
 
         return MarlinRunnerOutput(hidden_states=output)
 

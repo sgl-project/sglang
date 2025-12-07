@@ -849,7 +849,6 @@ class AWQMoEMethod(FusedMoEMethodBase):
             w13_qzeros=layer.w13_qzeros,
             w2_qzeros=layer.w2_qzeros,
             weight_bits=self.quant_config.weight_bits,
-            workspace=layer.workspace,
         )
 
         return self.runner.run(dispatch_output, quant_info)

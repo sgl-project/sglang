@@ -1078,7 +1078,6 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
             w2_g_idx_sort_indices=layer.w2_g_idx_sort_indices,
             weight_bits=self.quant_config.weight_bits,
             is_k_full=self.is_k_full,
-            workspace=layer.workspace,
         )
 
         return self.runner.run(dispatch_output, quant_info)
