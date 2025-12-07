@@ -26,12 +26,11 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
 
     def __init__(
         self,
-        max_loras_per_batch: int,
-        max_loras_prefetch: int,
+        max_loras_total: int,
         device: torch.device,
         server_args: ServerArgs,
     ):
-        super().__init__(max_loras_per_batch, max_loras_prefetch, device)
+        super().__init__(max_loras_total, device)
         self.max_chunk_size = server_args.max_lora_chunk_size
 
     def run_lora_a_sgemm(

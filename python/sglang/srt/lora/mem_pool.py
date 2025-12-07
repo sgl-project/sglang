@@ -203,15 +203,12 @@ class LoRAMemoryPool:
         lora_refs: Dict[str, LoRARef],
         prefetch: bool,
     ):
-        stream_ctx = (
-            torch.cuda.stream(self.prefetch_stream)
-            if prefetch and self.prefetch_stream is not None
-            else (
-                torch.cuda.stream(torch.cuda.current_stream(self.device))
-                if self.device.type == "cuda"
-                else contextlib.nullcontext()
-            )
-        )
+        if prefetch and self.prefetch_stream is not None:
+            stream_ctx = torch.cuda.stream(self.prefetch_stream)
+        elif self.device.type == "cuda":
+            stream_ctx = torch.cuda.stream(torch.cuda.current_stream(self.device))
+        else:
+            stream_ctx = contextlib.nullcontext()
 
         def get_available_buffer_slot():
             # 1. Prioritize empty slots

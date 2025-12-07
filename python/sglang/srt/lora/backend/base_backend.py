@@ -16,12 +16,8 @@ class BaseLoRABackend:
         device: the device where the backend runs.
     """
 
-    def __init__(
-        self, max_loras_per_batch: int, max_loras_prefetch: int, device: torch.device
-    ):
-        self.max_loras_per_batch = max_loras_per_batch
-        self.max_loras_prefetch = max_loras_prefetch
-        self.max_loras_total = max_loras_per_batch + max_loras_prefetch
+    def __init__(self, max_loras_total: int, device: torch.device):
+        self.max_loras_total = max_loras_total
         self.device = device
 
     def run_lora_a_sgemm(

@@ -83,9 +83,9 @@ class LoRAManager:
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
+        self.max_loras_total = max_loras_per_batch + max_loras_prefetch
         self.lora_backend: BaseLoRABackend = backend_type(
-            max_loras_per_batch=max_loras_per_batch,
-            max_loras_prefetch=max_loras_prefetch,
+            max_loras_total=self.max_loras_total,
             device=self.device,
             server_args=server_args,
         )
@@ -270,8 +270,8 @@ class LoRAManager:
         )
 
         weight_indices = [0] * len(forward_batch.lora_ids)
-        lora_ranks = [0] * (self.max_loras_per_batch + self.max_loras_prefetch)
-        scalings = [0] * (self.max_loras_per_batch + self.max_loras_prefetch)
+        lora_ranks = [0] * self.max_loras_total
+        scalings = [0] * self.max_loras_total
         for i, uid in enumerate(forward_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:

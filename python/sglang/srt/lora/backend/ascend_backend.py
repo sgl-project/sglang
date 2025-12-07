@@ -17,12 +17,11 @@ class AscendLoRABackend(BaseLoRABackend):
 
     def __init__(
         self,
-        max_loras_per_batch: int,
-        max_loras_prefetch: int,
+        max_loras_total: int,
         device: torch.device,
         **kwargs,
     ):
-        super().__init__(max_loras_per_batch, max_loras_prefetch, device)
+        super().__init__(max_loras_total, device)
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
