@@ -80,6 +80,7 @@ class HumanEval(Eval):
         instruction = "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\n"
 
         def find_code(completion):
+            completion = completion or ""
             pattern = re.compile(r"```python\n(.*?)```", re.DOTALL)
             matches = pattern.findall(completion)
             extracted_answer = matches[0] if len(matches) >= 1 else completion

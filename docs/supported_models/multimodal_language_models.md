@@ -11,7 +11,7 @@ python3 -m sglang.launch_server \
   --port 30000 \
 ```
 
-> See the [OpenAI APIs section](https://docs.sglang.ai/basic_usage/openai_api_vision.html) for how to send multimodal requests.
+> See the [OpenAI APIs section](https://docs.sglang.io/basic_usage/openai_api_vision.html) for how to send multimodal requests.
 
 ## Supported models
 
@@ -44,6 +44,54 @@ in the GitHub search bar.
 | **GLM-4.5V** (106B) /  **GLM-4.1V**(9B)           | `zai-org/GLM-4.5V`                   | GLM-4.5V and GLM-4.1V-Thinking: Towards Versatile Multimodal Reasoning with Scalable Reinforcement Learning                                                                                                                                                                                                      | Use `--chat-template glm-4v` |
 | **DotsVLM** (General/OCR)  | `rednote-hilab/dots.vlm1.inst`             | RedNote's vision-language model built on a 1.2B vision encoder and DeepSeek V3 LLM, featuring NaViT vision encoder trained from scratch with dynamic resolution support and enhanced OCR capabilities through structured image data training. |  |
 | **DotsVLM-OCR**            | `rednote-hilab/dots.ocr`                   | Specialized OCR variant of DotsVLM optimized for optical character recognition tasks with enhanced text extraction and document understanding capabilities. | Don't use `--trust-remote-code` |
+| **NVILA** (8B, 15B, Lite-2B, Lite-8B, Lite-15B) | `Efficient-Large-Model/NVILA-8B` | `chatml` | NVILA explores the full stack efficiency of multi-modal design, achieving cheaper training, faster deployment and better performance. |
+| **NVIDIA Nemotron Nano 2.0 VL** | `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` | NVIDIA Nemotron Nano v2 VL enables multi-image reasoning and video understanding, along with strong document intelligence, visual Q&A and summarization capabilities. It builds on Nemotron Nano V2, a hybrid Mamba-Transformer LLM, in order to achieve higher inference throughput in long document and video scenarios. | Use `--trust-remote-code`. You may need to adjust `--max-mamba-cache-size` [default is 512] to fit memory constraints. |
+| **JetVLM** |  | JetVLM is an vision-language model designed for high-performance multimodal understanding and generation tasks built upon Jet-Nemotron. | Coming soon |
+
+## Video Input Support
+
+SGLang supports video input for Vision-Language Models (VLMs), enabling temporal reasoning tasks such as video question answering, captioning, and holistic scene understanding. Video clips are decoded, key frames are sampled, and the resulting tensors are batched together with the text prompt, allowing multimodal inference to integrate visual and linguistic context.
+
+| Model Family | Example Identifier | Video notes |
+|--------------|--------------------|-------------|
+| **Qwen-VL** (Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3-Omni) | `Qwen/Qwen3-VL-235B-A22B-Instruct` | The processor gathers `video_data`, runs Qwen's frame sampler, and merges the resulting features with text tokens before inference. |
+| **GLM-4v** (4.5V, 4.1V, MOE) | `zai-org/GLM-4.5V` | Video clips are read with Decord, converted to tensors, and passed to the model alongside metadata for rotary-position handling. |
+| **NVILA** (Full & Lite) | `Efficient-Large-Model/NVILA-8B` | The runtime samples eight frames per clip and attaches them to the multimodal request when `video_data` is present. |
+| **LLaVA video variants** (LLaVA-NeXT-Video, LLaVA-OneVision) | `lmms-lab/LLaVA-NeXT-Video-7B` | The processor routes video prompts to the LlavaVid video-enabled architecture, and the provided example shows how to query it with `sgl.video(...)` clips. |
+| **NVIDIA Nemotron Nano 2.0 VL** | `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16` | For video, the processor is configured to sample at 2 FPS, at a max of 128 frames, as per model training. |
+| **JetVLM** |  | The runtime samples eight frames per clip and attaches them to the multimodal request when `video_data` is present. |
+
+Use `sgl.video(path, num_frames)` when building prompts to attach clips from your SGLang programs.
+
+Example OpenAI-compatible request that sends a video clip:
+
+```python
+import requests
+
+url = "http://localhost:30000/v1/chat/completions"
+
+data = {
+    "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What’s happening in this video?"},
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "https://github.com/sgl-project/sgl-test-files/raw/refs/heads/main/videos/jobs_presenting_ipod.mp4"
+                    },
+                },
+            ],
+        }
+    ],
+    "max_tokens": 300,
+}
+
+response = requests.post(url, json=data)
+print(response.text)
+```
 
 ## Usage Notes
 
@@ -55,3 +103,9 @@ For multimodal models, you can use the `--keep-mm-feature-on-device` flag to opt
 - **With `--keep-mm-feature-on-device`**: Feature tensors remain on GPU, reducing device-to-host copy overhead and improving latency, but consuming more GPU memory
 
 Use this flag when you have sufficient GPU memory and want to minimize latency for multimodal inference.
+
+### Multimodal Inputs Limitation
+
+- **Use `--mm-process-config '{"image":{"max_pixels":1048576},"video":{"fps":3,"max_pixels":602112,"max_frames":60}}'`**: To set `image`, `video`, and `audio` input limits.
+
+This can reduce GPU memory usage, improve inference speed, and help to avoid OOM, but may impact model performance, thus set a proper value based on your specific use case. Currently, only `qwen_vl` supports this config. Please refer to [qwen_vl processor](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/multimodal/processors/qwen_vl.py) for understanding the meaning of each parameter.

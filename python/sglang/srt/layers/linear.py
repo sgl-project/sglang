@@ -13,7 +13,7 @@ from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    parallel_state,
+    get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -21,6 +21,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -161,6 +162,7 @@ class LinearBase(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
+        self.quant_config = quant_config
         if quant_config is None:
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
@@ -734,7 +736,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = self.quant_method.quant_config.weight_block_size
-            block_n, _ = weight_block_size[0], weight_block_size[1]
+            raw_block_n, _ = weight_block_size[0], weight_block_size[1]
+            block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (
                 (sum(self.output_sizes[:loaded_shard_id]) + block_n - 1) // block_n
             ) // self.tp_size
@@ -964,7 +967,8 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if isinstance(param, BlockQuantScaleParameter):
             weight_block_size = self.quant_method.quant_config.weight_block_size
-            block_n, _ = weight_block_size[0], weight_block_size[1]
+            raw_block_n, _ = weight_block_size[0], weight_block_size[1]
+            block_n = 1 if getattr(param, "format_ue8m0", False) else raw_block_n
             shard_offset = (shard_offset + block_n - 1) // block_n
             shard_size = (shard_size + block_n - 1) // block_n
 
@@ -1372,9 +1376,10 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
-            sm.tag(output_parallel)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             output = tensor_model_parallel_all_reduce(output_parallel)

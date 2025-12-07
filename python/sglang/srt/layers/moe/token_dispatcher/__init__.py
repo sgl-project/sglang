@@ -12,10 +12,11 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPConfig,
     DeepEPDispatcher,
     DeepEPLLCombineInput,
-    DeepEPLLOutput,
+    DeepEPLLDispatchOutput,
     DeepEPNormalCombineInput,
-    DeepEPNormalOutput,
+    DeepEPNormalDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeCombineInput,
     MooncakeDispatchOutput,
@@ -44,8 +45,9 @@ __all__ = [
     "StandardCombineInput",
     "DeepEPConfig",
     "DeepEPDispatcher",
-    "DeepEPNormalOutput",
-    "DeepEPLLOutput",
+    "DeepEPNormalDispatchOutput",
+    "DeepEPLLDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
+    "NpuFuseEPDispatcher",
 ]

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -82,6 +83,7 @@ class FlashInferMhaChunkKVRunner:
 
         # Buffers and wrappers
         self.qo_indptr = attn_backend.qo_indptr
+        self.kv_indptr = attn_backend.kv_indptr
         self.workspace_buffer = attn_backend.workspace_buffer
         self.fmha_backend = attn_backend.fmha_backend
 
@@ -132,9 +134,14 @@ class FlashInferMhaChunkKVRunner:
             )
         # ragged prefill
         if not disable_flashinfer_ragged:
+            kv_indptr = (
+                qo_indptr
+                if not forward_batch.mha_one_shot
+                else self.kv_indptr[: bs + 1]
+            )
             self.ragged_wrapper.begin_forward(
                 qo_indptr=qo_indptr,
-                kv_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
                 num_qo_heads=self.num_local_heads,
                 num_kv_heads=self.num_local_heads,
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -156,7 +163,7 @@ class FlashInferMhaChunkKVRunner:
             chunk_idx = forward_batch.prefix_chunk_idx
             assert chunk_idx >= 0
             wrapper = self.chunk_ragged_wrappers[chunk_idx]
-            o1, s1 = wrapper.forward_return_lse(
+            o = wrapper.forward_return_lse(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -165,7 +172,12 @@ class FlashInferMhaChunkKVRunner:
                 logits_soft_cap=logits_soft_cap,
             )
         else:
-            o1, s1 = self.ragged_wrapper.forward_return_lse(
+            forward = (
+                self.ragged_wrapper.forward_return_lse
+                if forward_batch.mha_return_lse
+                else self.ragged_wrapper.forward
+            )
+            o = forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                 v.view(-1, layer.tp_v_head_num, layer.v_head_dim).to(q.dtype),
@@ -173,8 +185,7 @@ class FlashInferMhaChunkKVRunner:
                 sm_scale=layer.scaling,
                 logits_soft_cap=logits_soft_cap,
             )
-
-        return o1, s1
+        return o
 
 
 class FlashInferMLAAttnBackend(AttentionBackend):
@@ -232,9 +243,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        self.fmha_backend = "auto"
         if is_sm100_supported():
             self.fmha_backend = "cutlass"
+        else:
+            self.fmha_backend = "auto"
+
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=self.fmha_backend
         )
@@ -310,6 +323,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             use_ragged = (
                 not get_global_server_args().flashinfer_mla_disable_ragged
                 and extend_no_prefix
+                # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
+                and not is_in_piecewise_cuda_graph()
             )
 
             self.indices_updater_prefill.update(
@@ -512,15 +527,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if (
-            forward_batch.attn_attend_prefix_cache is not None
-            and forward_batch.mha_return_lse
+        if forward_batch.attn_attend_prefix_cache is not None and any(
+            forward_batch.extend_prefix_lens_cpu
         ):  # MHA Chunk
             assert self.enable_chunk_kv
             assert q_rope is None
             assert k_rope is None
-            o1, s1 = self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
-            return o1, s1
+            return self.mha_chunk_kv_cache.forward(q, k, v, layer, forward_batch)
 
         cache_loc = forward_batch.out_cache_loc
         logits_soft_cap = layer.logit_cap

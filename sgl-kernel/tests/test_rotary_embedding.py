@@ -7,6 +7,7 @@ from sgl_kernel.testing.rotary_embedding import (
     FlashInferRotaryEmbedding,
     MHATokenToKVPool,
     RotaryEmbedding,
+    SglKernelRotaryEmbedding,
     create_inputs,
 )
 
@@ -47,6 +48,12 @@ from sgl_kernel.testing.rotary_embedding import (
         (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 32, 8, False),
         (128, 128, 2048, 10000, False, torch.bfloat16, "cuda", 2, 512, 16, 4, False),
         (512, 128, 311, 10000, False, torch.bfloat16, "cuda", 3, 39, 4, 2, False),
+        (64, 64, 32, 8000, True, torch.float32, "cuda", 32, 32, 1, 1, False),
+        (256, 128, 4096, 10000, True, torch.float32, "cuda", 2, 512, 4, 2, False),
+        (512, 128, 311, 10000, True, torch.float32, "cuda", 3, 39, 4, 2, False),
+        (128, 128, 2048, 10000, False, torch.float32, "cuda", 2, 512, 32, 8, False),
+        (128, 128, 2048, 10000, False, torch.float32, "cuda", 2, 512, 16, 4, False),
+        (512, 128, 311, 10000, False, torch.float32, "cuda", 3, 39, 4, 2, False),
     ],
 )
 def test_correctness(
@@ -74,7 +81,7 @@ def test_correctness(
 
     rope_ref = RotaryEmbedding(**config).to(device)
     rope_flashinfer = FlashInferRotaryEmbedding(**config).to(device)
-
+    rope_sglkernel = SglKernelRotaryEmbedding(**config).to(device)
     inputs = create_inputs(
         head_size=head_size,
         batch_size=batch_size,
@@ -86,19 +93,27 @@ def test_correctness(
     )
 
     if save_kv_cache:
-        pool_ref = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
+        pool_ref_for_flashinfer = MHATokenToKVPool(
+            head_num=num_kv_heads, head_dim=head_size
+        )
         pool_flashinfer = MHATokenToKVPool(head_num=num_kv_heads, head_dim=head_size)
 
     query_ref, key_ref = inputs["query"].clone(), inputs["key"].clone()
     query_flashinfer, key_flashinfer = inputs["query"].clone(), inputs["key"].clone()
+    query_sglkernel, key_sglkernel = inputs["query"].clone(), inputs["key"].clone()
 
-    query_ref_out, key_ref_out = rope_ref.forward_native(
+    # This is to align with the flashinfer implementation, flashinfer uses float32 cos/sin cache
+    query_ref_for_flashinfer_out, key_ref_for_flashinfer_out = rope_ref.forward_native(
+        inputs["pos_ids"], query_ref.to(torch.float32), key_ref.to(torch.float32)
+    )
+
+    query_ref_for_sglkernel_out, key_ref_for_sglkernel_out = rope_ref.forward_native(
         inputs["pos_ids"], query_ref, key_ref
     )
     if save_kv_cache:
-        pool_ref.set_kv_buffer(
+        pool_ref_for_flashinfer.set_kv_buffer(
             loc=inputs["out_cache_loc"],
-            cache_k=key_ref_out.view(-1, num_kv_heads, head_size),
+            cache_k=key_ref_for_flashinfer_out.view(-1, num_kv_heads, head_size),
             cache_v=inputs["value"].view(-1, num_kv_heads, head_size),
         )
 
@@ -120,13 +135,27 @@ def test_correctness(
         ),
     )
 
-    torch.testing.assert_close(
-        query_ref_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
+    query_sglkernel_out, key_sglkernel_out = rope_sglkernel.forward_cuda(
+        inputs["pos_ids"],
+        query_sglkernel,
+        key_sglkernel,
     )
-    torch.testing.assert_close(key_ref_out, key_flashinfer_out, atol=1e-2, rtol=1e-2)
+
+    torch.testing.assert_close(
+        query_ref_for_flashinfer_out, query_flashinfer_out, atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        key_ref_for_flashinfer_out, key_flashinfer_out, atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        query_ref_for_sglkernel_out, query_sglkernel_out, atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        key_ref_for_sglkernel_out, key_sglkernel_out, atol=1e-2, rtol=1e-2
+    )
     if save_kv_cache:
         for field in ["k_buffer", "v_buffer"]:
-            x_ref = getattr(pool_ref, field)[0]
+            x_ref = getattr(pool_ref_for_flashinfer, field)[0]
             x_flashinfer = getattr(pool_flashinfer, field)[0]
             torch.testing.assert_close(x_ref, x_flashinfer, atol=1e-2, rtol=1e-2)
             nonzero_ref = x_ref != 0

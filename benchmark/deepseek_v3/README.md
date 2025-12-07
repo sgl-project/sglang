@@ -4,7 +4,7 @@ The SGLang and DeepSeek teams collaborated to get DeepSeek V3 FP8 running on NVI
 
 Special thanks to Meituan's Search & Recommend Platform Team and Baseten's Model Performance Team for implementing the model, and DataCrunch for providing GPU resources.
 
-For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.ai/basic_usage/deepseek.html).
+For optimizations made on the DeepSeek series models regarding SGLang, please refer to [DeepSeek Model Optimizations in SGLang](https://docs.sglang.io/basic_usage/deepseek.html).
 
 ## Installation & Launch
 
@@ -33,7 +33,7 @@ Add [performance optimization options](#performance-optimization-options) as nee
 
 ```bash
 # Installation
-pip install "sglang[all]>=0.5.4"
+pip install "sglang[all]>=0.5.6"
 
 # Launch
 python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code
@@ -167,6 +167,30 @@ python3 -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3 --tp 16 --d
 If you have two H100 nodes, the usage is similar to the aforementioned H20.
 
 > **Note that the launch command here does not enable Data Parallelism Attention or `torch.compile` Optimization**. For optimal performance, please refer to the command options in [Performance Optimization Options](#option_args).
+
+### Example: Serving with one B200 node
+
+There is one B200 node with 4 (for FP4) GPUs or 8 (for FP4 or FP8) GPUs.  Both FP4 and FP8 models are supported for DeepSeek R1.  The flags to achieve optimal performance for each are slightly different.
+
+#### FP4
+
+If using 4 GPUs:
+
+```bash
+python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=4 --cuda-graph-max-bs 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 4 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
+```
+
+If using 8 GPUs:
+
+```bash
+python3 -m sglang.launch_server --model-path nvidia/DeepSeek-R1-0528-FP4-V2 --host 0.0.0.0 --port 8000 --tensor-parallel-size=8 --cuda-graph-max-bs 256 --max-running-requests 256 --mem-fraction-static 0.85 --ep-size 8 --scheduler-recv-interval 30 --enable-symm-mem --stream-interval 10
+```
+
+#### FP8
+
+```
+SGLANG_ENABLE_JIT_DEEPGEMM=false SGLANG_ENABLE_FLASHINFER_GEMM=true bash python3 -m sglang.launch_server --model-path=deepseek-ai/DeepSeek-R1-0528 --host=0.0.0.0 --port=8000 --tensor-parallel-size=8 --cuda-graph-max-bs 128 --max-running-requests 128 --mem-fraction-static 0.82 --kv-cache-dtype fp8_e4m3 --chunked-prefill-size 32768 --max-prefill-tokens 32768 --scheduler-recv-interval 30 --stream-interval 30
+```
 
 ### Example: Serving with two H200\*8 nodes and docker
 
@@ -367,6 +391,21 @@ edit your `config.json` and remove the `quantization_config` block. For example:
 ```
 
 Removing this block typically resolves the error. For more details, see the discussion in [sgl-project/sglang#3491](https://github.com/sgl-project/sglang/issues/3491#issuecomment-2650779851).
+
+# Example: Serving with 4 H200 with w4fp8 Quantization
+There are mixed-precision quantization methods where MoE layers are computed using W4(int)A(FP)8 quantization while the dense layers remain in FP8 precision. Users can run these models efficiently on 4xH200 GPUs (or potentially 8xH100 GPUs), as the pre-quantized weights are already available on Hugging Face. Here's an example:
+
+```bash
+python -m sglang.launch_server --model novita/Deepseek-V3-0324-W4AFP8 --mem-fraction-static 0.85 --disable-shared-experts-fusion --tp-size 4
+```
+
+Other variants of pre-quantized DeepSeek models are also available:
+
+- [novita/Deepseek-V3.1-W4AFP8](https://huggingface.co/novita/Deepseek-V3.1-W4AFP8)
+- [novita/Deepseek-R1-0528-W4AFP8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8)
+- [novita/Deepseek-R1-W4AFP8](https://huggingface.co/novita/Deepseek-R1-W4AFP8)
+- [novita/Deepseek-V3-0324-W4AFP8](https://huggingface.co/novita/Deepseek-V3-0324-W4AFP8)
+
 
 ## DeepSeek V3 Optimization Plan
 
