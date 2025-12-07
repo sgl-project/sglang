@@ -4,11 +4,13 @@ import json
 import os
 import re
 import subprocess
+import unittest
 from typing import Dict, List, Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
@@ -471,43 +473,50 @@ class StressTestRunner:
     ) -> None:
         """Add success entry to report with throughput metrics."""
         model_name = model_path.split("/")[-1]
-        self.full_report += f"### {model_name} - Success\n"
+        self.full_report += f"### {model_name} - Success ß\n"
         self.full_report += f"- Model: `{model_path}`\n"
         self.full_report += f"- Input Length: {input_len}\n"
         self.full_report += f"- Output Length: {output_len}\n"
+        self.full_report += f"- Duration: {self.duration_minutes} minutes\n"
         self.full_report += f"- Target Prompts: {self.num_prompts}\n"
 
-        # Add throughput metrics if available
-        if metrics.get("completed"):
-            self.full_report += f"- Completed Requests: {int(metrics['completed'])}\n"
-        if metrics.get("duration"):
-            self.full_report += f"- Duration: {metrics['duration']:.1f}s\n"
-        if metrics.get("request_throughput"):
-            self.full_report += (
-                f"- Request Throughput: {metrics['request_throughput']:.2f} req/s\n"
-            )
-        if metrics.get("output_throughput"):
-            self.full_report += (
-                f"- Output Token Throughput: {metrics['output_throughput']:.2f} tok/s\n"
-            )
-        if metrics.get("median_ttft_ms"):
-            self.full_report += f"- Median TTFT: {metrics['median_ttft_ms']:.2f}ms\n"
+        # Emphasize the main point: stability
+        self.full_report += f"\n**Server remained stable and continued processing requests for {self.duration_minutes} minutes without crashing.**\n\n"
 
-        # If no metrics were parsed, add a note
-        if not metrics:
-            self.full_report += (
-                "- ⚠️ Metrics not available (check output file for details)\n"
-            )
+        # Add throughput metrics if available (secondary information)
+        if metrics.get("completed") or metrics.get("request_throughput"):
+            self.full_report += "#### Performance Metrics\n"
+            if metrics.get("completed"):
+                self.full_report += (
+                    f"- Completed Requests: {int(metrics['completed'])}\n"
+                )
+            if metrics.get("duration"):
+                self.full_report += f"- Actual Duration: {metrics['duration']:.1f}s\n"
+            if metrics.get("request_throughput"):
+                self.full_report += (
+                    f"- Request Throughput: {metrics['request_throughput']:.2f} req/s\n"
+                )
+            if metrics.get("output_throughput"):
+                self.full_report += f"- Output Token Throughput: {metrics['output_throughput']:.2f} tok/s\n"
+            if metrics.get("median_ttft_ms"):
+                self.full_report += (
+                    f"- Median TTFT: {metrics['median_ttft_ms']:.2f}ms\n"
+                )
+            self.full_report += "\n"
+        elif not metrics:
+            # If no metrics were parsed, add a note but still emphasize success
+            self.full_report += "_Note: Detailed metrics not available, but test completed without errors._\n\n"
 
-        self.full_report += "- Status: **PASSED**\n\n"
+        self.full_report += "---\n\n"
 
     def _add_failure_to_report(self, model_path: str, error: str) -> None:
         """Add failure entry to report."""
         model_name = model_path.split("/")[-1]
-        self.full_report += f"### {model_name} - Failure\n"
+        self.full_report += f"### {model_name} - Failed \n"
         self.full_report += f"- Model: `{model_path}`\n"
-        self.full_report += "- Status: **FAILED**\n"
-        self.full_report += f"- Error: {error}\n\n"
+        self.full_report += f"\n** Server crashed or failed during stress test.**\n\n"
+        self.full_report += f"**Error:** {error}\n\n"
+        self.full_report += "---\n\n"
 
     def write_final_report(self) -> None:
         """Write the final report to GitHub summary if in CI."""
@@ -521,3 +530,77 @@ class StressTestRunner:
             The full markdown report as a string
         """
         return self.full_report
+
+
+class StressTestBase(unittest.TestCase):
+    """Base class for model stress tests.
+
+    Subclasses should set these class attributes:
+        MODEL_PATH: str - Path to the model
+        OUTPUT_FILE: str - Output file name for test results
+        TEST_NAME: str - Name of the test (e.g., "DeepSeek-V3 Stress Test")
+        RANDOM_INPUT_LEN: int - Random input length (default: 16384)
+        RANDOM_OUTPUT_LEN: int - Random output length (default: 1024)
+        SERVER_ARGS: List[str] - Additional server arguments (default: ["--tp", "8", "--trust-remote-code", "--mem-fraction-static", "0.90"])
+    """
+
+    MODEL_PATH: str
+    OUTPUT_FILE: str
+    TEST_NAME: str
+    RANDOM_INPUT_LEN: int = 16384
+    RANDOM_OUTPUT_LEN: int = 1024
+    SERVER_ARGS: List[str] = [
+        "--tp",
+        "8",
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.90",
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up the stress test runner."""
+        cls.model = cls.MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.num_prompts = int(os.environ.get("NUM_PROMPTS", "20000"))
+        cls.duration_minutes = int(os.environ.get("DURATION_MINUTES", "30"))
+
+        cls.runner = StressTestRunner(
+            test_name=cls.TEST_NAME,
+            base_url=cls.base_url,
+            num_prompts=cls.num_prompts,
+            duration_minutes=cls.duration_minutes,
+        )
+
+    def run_stress_test(
+        self,
+        model_path: Optional[str] = None,
+        random_input_len: Optional[int] = None,
+        random_output_len: Optional[int] = None,
+        output_file: Optional[str] = None,
+        server_args: Optional[List[str]] = None,
+    ):
+        """Run the stress test with configurable parameters.
+
+        Args:
+            model_path: Path to the model (defaults to cls.MODEL_PATH)
+            random_input_len: Random input length (defaults to cls.RANDOM_INPUT_LEN)
+            random_output_len: Random output length (defaults to cls.RANDOM_OUTPUT_LEN)
+            output_file: Output file name (defaults to cls.OUTPUT_FILE)
+            server_args: Additional server arguments (defaults to cls.SERVER_ARGS)
+        """
+        try:
+            success = self.runner.run_stress_test_for_model(
+                model_path=model_path or self.MODEL_PATH,
+                random_input_len=random_input_len or self.RANDOM_INPUT_LEN,
+                random_output_len=random_output_len or self.RANDOM_OUTPUT_LEN,
+                output_file=output_file or self.OUTPUT_FILE,
+                server_args=server_args or self.SERVER_ARGS,
+            )
+
+            self.assertTrue(
+                success, f"Stress test failed for {model_path or self.MODEL_PATH}"
+            )
+
+        finally:
+            self.runner.write_final_report()
