@@ -184,31 +184,6 @@ FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
 if [ -d "$FLASH_ATTN_PATH" ]; then
     echo "178 Directory $FLASH_ATTN_PATH exists. Removing..."
-    rm -rf "$FLASH_ATTN_PATH"
 else
     echo "181 Directory $FLASH_ATTN_PATH does not exist."
 fi
-
-
-PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
-FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn_origin"
-
-if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "107 Directory $FLASH_ATTN_PATH exists."
-    echo "Contents of $FLASH_ATTN_PATH:"
-    ls -al "$FLASH_ATTN_PATH"
-else
-    echo "191 Directory $FLASH_ATTN_PATH does not exist."
-fi
-
-# Print sgl_kernel RECORD file
-echo "Searching for sgl_kernel RECORD file in $PYTHON_LIB_PATH..."
-for dist_info in "$PYTHON_LIB_PATH"/sgl_kernel-*.dist-info; do
-    if [ -d "$dist_info" ]; then
-        record_file="$dist_info/RECORD"
-        if [ -f "$record_file" ]; then
-            echo "Contents of $record_file:"
-            cat "$record_file"
-        fi
-    fi
-done
