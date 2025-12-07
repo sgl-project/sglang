@@ -1063,7 +1063,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
-        elif self.reasoning_parser in ["qwen3", "qwen3-thinking", "glm45"]:
+        elif self.reasoning_parser in ["qwen3", "glm45"]:
             # qwen3 and glm45 are reasoning by default
             return (
                 not request.chat_template_kwargs
@@ -1071,12 +1071,18 @@ class OpenAIServingChat(OpenAIServingBase):
             )
         elif self.reasoning_parser in [
             "kimi_k2",
+            "kimi",
             "deepseek-r1",
             "step3",
             "minimax-append-think",
+            "qwen3-thinking",
+            "minimax",
+            "gpt-oss",
         ]:
             return True
-        return False
+        raise ValueError(
+            f"Unsupported reasoning parser: {self.reasoning_parser}, this should not happen"
+        )
 
     async def _process_tool_call_stream(
         self,
