@@ -196,12 +196,13 @@ class AiterAttnBackend(AttentionBackend):
         nhead = self.num_head
         dtype = self.kv_cache_dtype
 
-        gpu = torch.cuda.current_device()
-        device_properties = torch.cuda.get_device_properties(gpu)
-        cu_num = device_properties.multi_processor_count
-        self.max_split_per_batch = min(
-            (cu_num + batch_size - 1) // batch_size, self.fix_max_split_per_batch
-        )
+        if self.enable_dp_attention:
+            gpu = torch.cuda.current_device()
+            device_properties = torch.cuda.get_device_properties(gpu)
+            cu_num = device_properties.multi_processor_count
+            self.max_split_per_batch = min(
+                (cu_num + batch_size - 1) // batch_size, self.fix_max_split_per_batch
+            )
 
         (
             (work_meta_data_size, work_meta_data_type),
