@@ -595,7 +595,7 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     # flash_attn/cute
     install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
-            DESTINATION "flash_attn_origin/cute"
+        DESTINATION "flash_attn/cute"
             PATTERN ".git*" EXCLUDE
             PATTERN "__pycache__" EXCLUDE)
     endif()

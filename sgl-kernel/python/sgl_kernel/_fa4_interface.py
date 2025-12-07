@@ -19,9 +19,9 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
-from flash_attn_origin.cute import utils
-from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute import utils
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 
 def maybe_contiguous(x):
