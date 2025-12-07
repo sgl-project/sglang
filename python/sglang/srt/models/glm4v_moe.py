@@ -7,11 +7,13 @@ import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
@@ -36,7 +38,9 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
     ) -> None:
         nn.Module.__init__(self)
 
+        self.pp_group = get_pp_group()
         self.config = config
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
@@ -55,15 +59,23 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             config.vision_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
+            use_data_parallel=self.use_data_parallel,
         )
 
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-        )
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and self.config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                )
+        else:
+            # ranks other than the last rank will have a placeholder layer
+            self.lm_head = PPMissingLayer()
+
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
