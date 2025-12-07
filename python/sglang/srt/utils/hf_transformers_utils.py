@@ -60,7 +60,7 @@ from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
+from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -184,6 +184,37 @@ def _load_deepseek_v32_model(
     )
 
 
+# Temporary hack for Mistral Large
+def _load_mistral_large_3_for_causal_LM(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    # first get the local path
+    local_path = download_from_hf(model_path)
+    # then load the config file in json
+    parser = mistral_utils.MistralConfigParser()
+    config_dict, _ = parser.parse(local_path)
+
+    with tempfile.NamedTemporaryFile(mode="w+", suffix=".json") as f:
+        json.dump(config_dict, f)
+        f.flush()
+        loaded_config = AutoConfig.from_pretrained(
+            f.name, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    text_config = getattr(loaded_config, "text_config", None)
+    if text_config is not None and isinstance(text_config, dict):
+        text_config = AutoConfig.for_model(**text_config)
+        setattr(loaded_config, "text_config", text_config)
+    vision_config = getattr(loaded_config, "vision_config", None)
+    if vision_config is not None and isinstance(vision_config, dict):
+        vision_config = AutoConfig.for_model(**vision_config)
+        setattr(loaded_config, "vision_config", vision_config)
+
+    return loaded_config
+
+
 def _is_deepseek_ocr_model(config: PretrainedConfig) -> bool:
     # TODO: Remove this workaround related when AutoConfig correctly identifies deepseek-ocr.
     # Hugging Face's AutoConfig currently misidentifies it as deepseekvl2.
@@ -215,17 +246,21 @@ def get_config(
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
-    try:
-        config = AutoConfig.from_pretrained(
+    if "mistral-large-3" in str(model).lower():
+        config = _load_mistral_large_3_for_causal_LM(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
-
-    except ValueError as e:
-        if not "deepseek_v32" in str(e):
-            raise e
-        config = _load_deepseek_v32_model(
-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-        )
+    else:
+        try:
+            config = AutoConfig.from_pretrained(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
+        except ValueError as e:
+            if not "deepseek_v32" in str(e):
+                raise e
+            config = _load_deepseek_v32_model(
+                model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+            )
 
     if (
         config.architectures is not None
@@ -465,14 +500,20 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
-
-    config = AutoConfig.from_pretrained(
-        tokenizer_name,
-        trust_remote_code=trust_remote_code,
-        revision=revision,
-        **kwargs,
-    )
-
+    if "mistral-large-3" in str(tokenizer_name).lower():
+        config = _load_mistral_large_3_for_causal_LM(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+    else:
+        config = AutoConfig.from_pretrained(
+            tokenizer_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
     if _is_deepseek_ocr_model(config):
         # Temporary hack for load deepseek-ocr
         config.model_type = "deepseek-ocr"

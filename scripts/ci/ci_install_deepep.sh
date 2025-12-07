@@ -21,7 +21,7 @@ if python3 -c "import deep_ep" >/dev/null 2>&1; then
 fi
 
 # Install system dependencies
-apt install -y curl wget git sudo libibverbs-dev rdma-core infiniband-diags openssh-server perftest ibverbs-providers libibumad3 libibverbs1 libnl-3-200 libnl-route-3-200 librdmacm1 build-essential cmake
+apt install -y curl wget git sudo rdma-core infiniband-diags openssh-server perftest libibumad3 libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils libnl-3-200 libnl-route-3-200 librdmacm1 build-essential cmake
 
 # Install GDRCopy
 rm -rf /opt/gdrcopy && mkdir -p /opt/gdrcopy

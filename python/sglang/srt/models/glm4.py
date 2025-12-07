@@ -220,7 +220,9 @@ class Glm4DecoderLayer(nn.Module):
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+        partial_rotary_factor = getattr(
+            getattr(config, "rope_parameters", None), "partial_rotary_factor", None
+        ) or getattr(config, "partial_rotary_factor", 0.5)
         dual_chunk_attention_config = getattr(
             config, "dual_chunk_attention_config", None
         )

@@ -55,6 +55,7 @@ jobs:
                   docker buildx build \
                     --platform ${{ matrix.platform }} \
                     --push \
+                    --target framework \
                     -f docker/Dockerfile \
                     --build-arg CUDA_VERSION=${{ matrix.version }} \
                     --build-arg BUILD_TYPE=${{ matrix.build_type }} \
