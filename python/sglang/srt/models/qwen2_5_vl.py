@@ -498,7 +498,7 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module):
                 # ranks other than the last rank will have a placeholder layer
                 self.lm_head = PPMissingLayer()
         else:
-            # mm_only mode: no language model, so no lm_head needed
+            # encoder_only mode: no language model, so no lm_head needed
             self.lm_head = None
 
         self.visual = Qwen2_5_VisionTransformer(
