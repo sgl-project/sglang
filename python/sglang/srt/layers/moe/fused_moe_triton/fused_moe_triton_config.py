@@ -208,6 +208,7 @@ def try_get_optimal_moe_config(
     M: int,
     is_marlin: bool = False,
     block_shape: Optional[List[int]] = None,
+    per_channel_quant: bool = False,
     return_down_config: bool = False,
 ):
     from sglang.srt.layers.moe.fused_moe_triton import get_config
@@ -222,7 +223,15 @@ def try_get_optimal_moe_config(
         E, _, N = w2_shape
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        configs = get_moe_configs(E, N, dtype, block_n, block_k, down_moe=False)
+        configs = get_moe_configs(
+            E,
+            N,
+            dtype,
+            block_n,
+            block_k,
+            per_channel_quant=per_channel_quant,
+            down_moe=False,
+        )
 
         if configs:
             # If an optimal configuration map has been found, look up the
@@ -234,7 +243,15 @@ def try_get_optimal_moe_config(
                 M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
             )
         if return_down_config:
-            down_configs = get_moe_configs(E, N, dtype, block_n, block_k, down_moe=True)
+            down_configs = get_moe_configs(
+                E,
+                N,
+                dtype,
+                block_n,
+                block_k,
+                per_channel_quant=per_channel_quant,
+                down_moe=True,
+            )
             if down_configs:
                 down_config = down_configs[
                     min(down_configs.keys(), key=lambda x: abs(x - M))
