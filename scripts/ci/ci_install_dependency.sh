@@ -86,7 +86,7 @@ fi
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
     # so we can only use pip with `--break-system-packages`
-    PIP_CMD="uv pip"
+    PIP_CMD="pip"
     PIP_INSTALL_SUFFIX="--break-system-packages"
     $PIP_CMD install --upgrade pip
 
