@@ -142,7 +142,7 @@ $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFI
 $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 
 # flash_attn is required by transformer 5.x in case if not yet installed
-$PIP_CMD install flash_attn $PIP_INSTALL_SUFFIX
+$PIP_CMD install flash_attn $PIP_INSTALL_SUFFIX --no-build-isolation
 $PIP_CMD uninstall xformers || true
 # Show current packages
 $PIP_CMD list

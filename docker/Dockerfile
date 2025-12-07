@@ -265,8 +265,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     fi && \
     TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} pip install --no-build-isolation .
 
-# Install essential Python packages
+# Install flash_attn
 # flash_attn is required by transformer 5.x in case if not yet installed
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install flash_attn --no-build-isolation
+
+# Install essential Python packages
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install \
     datamodel_code_generator \
@@ -281,8 +285,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     scikit-build-core \
     nixl \
     py-spy \
-    cubloaty \
-    flash_attn
+    cubloaty
 
 # Build and install sgl-model-gateway (install Rust, build, then remove to save space)
 RUN --mount=type=cache,target=/root/.cache/pip \
