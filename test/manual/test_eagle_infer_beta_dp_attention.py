@@ -137,4 +137,16 @@ class TestEagleDPAttnServerLarge(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    # Force the unittest to run the small test first
+    s = unittest.TestSuite()
+    small_test = unittest.defaultTestLoader.loadTestsFromTestCase(
+        TestEagleDPAttnServerSmall
+    )
+    large_test = unittest.defaultTestLoader.loadTestsFromTestCase(
+        TestEagleDPAttnServerLarge
+    )
+    s.addTest(small_test)
+    s.addTest(large_test)
+
+    runner = unittest.TextTestRunner()
+    runner.run(s)
