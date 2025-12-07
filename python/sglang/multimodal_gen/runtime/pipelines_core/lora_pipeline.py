@@ -46,6 +46,7 @@ class LoRAPipeline(ComposedPipelineBase):
     # [dit_layer_name] = wrapped_lora_layer
     lora_layers: dict[str, BaseLayerWithLoRA] = {}
     lora_layers_critic: dict[str, BaseLayerWithLoRA] = {}
+    lora_layers_transformer_2: dict[str, BaseLayerWithLoRA] = {}
     server_args: ServerArgs
     exclude_lora_layers: list[str] = []
     device: torch.device = get_local_torch_device()
@@ -107,6 +108,35 @@ class LoRAPipeline(ComposedPipelineBase):
                 replace_submodule(self.modules["transformer"], name, lora_layer)
                 converted_count += 1
         logger.info("Converted %d layers to LoRA layers", converted_count)
+
+        # Convert transformer_2 if exists (e.g., Wan2.2 A14B dual-transformer)
+        if (
+            "transformer_2" in self.modules
+            and self.modules["transformer_2"] is not None
+        ):
+            converted_count_2 = 0
+            for name, layer in self.modules["transformer_2"].named_modules():
+                if not self.is_target_layer(name):
+                    continue
+
+                excluded = any(
+                    exclude_layer in name for exclude_layer in self.exclude_lora_layers
+                )
+                if excluded:
+                    continue
+
+                lora_layer = wrap_with_lora_layer(
+                    layer,
+                    lora_rank=self.lora_rank,
+                    lora_alpha=self.lora_alpha,
+                )
+                if lora_layer is not None:
+                    self.lora_layers_transformer_2[name] = lora_layer
+                    replace_submodule(self.modules["transformer_2"], name, lora_layer)
+                    converted_count_2 += 1
+            logger.info(
+                "Converted %d layers to LoRA layers in transformer_2", converted_count_2
+            )
 
         if "fake_score_transformer" in self.modules:
             for name, layer in self.modules["fake_score_transformer"].named_modules():
@@ -256,6 +286,30 @@ class LoRAPipeline(ComposedPipelineBase):
                         name,
                     )
                 layer.disable_lora = True
+
+        # Apply LoRA to transformer_2 if exists
+        for name, layer in self.lora_layers_transformer_2.items():
+            lora_A_name = name + ".lora_A"
+            lora_B_name = name + ".lora_B"
+            if (
+                lora_A_name in self.lora_adapters[lora_nickname]
+                and lora_B_name in self.lora_adapters[lora_nickname]
+            ):
+                layer.set_lora_weights(
+                    self.lora_adapters[lora_nickname][lora_A_name],
+                    self.lora_adapters[lora_nickname][lora_B_name],
+                    lora_path=lora_path,
+                )
+                adapted_count += 1
+            else:
+                if rank == 0:
+                    logger.warning(
+                        "LoRA adapter %s does not contain the weights for layer '%s'. LoRA will not be applied to it.",
+                        lora_path,
+                        name,
+                    )
+                layer.disable_lora = True
+
         self.is_lora_merged = True
         logger.info(
             "Rank %d: LoRA adapter %s applied to %d layers",
@@ -271,6 +325,8 @@ class LoRAPipeline(ComposedPipelineBase):
 
         for name, layer in self.lora_layers.items():
             layer.merge_lora_weights()
+        for name, layer in self.lora_layers_transformer_2.items():
+            layer.merge_lora_weights()
         logger.info("LoRA weights merged")
         self.is_lora_merged = True
 
@@ -280,5 +336,7 @@ class LoRAPipeline(ComposedPipelineBase):
             return
 
         for name, layer in self.lora_layers.items():
+            layer.unmerge_lora_weights()
+        for name, layer in self.lora_layers_transformer_2.items():
             layer.unmerge_lora_weights()
         self.is_lora_merged = False
