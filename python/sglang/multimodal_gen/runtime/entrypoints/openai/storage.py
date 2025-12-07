@@ -20,15 +20,18 @@ class CloudStorage:
             self.enabled = False
             return
 
+        endpoint_url = os.getenv("SGLANG_S3_ENDPOINT_URL") or None
+        region_name = os.getenv("SGLANG_S3_REGION_NAME") or None
+
         self.client = boto3.client(
             "s3",
             aws_access_key_id=os.getenv("SGLANG_S3_ACCESS_KEY_ID"),
             aws_secret_access_key=os.getenv("SGLANG_S3_SECRET_ACCESS_KEY"),
-            endpoint_url=os.getenv("SGLANG_S3_ENDPOINT_URL") or None,
-            region_name=os.getenv("SGLANG_S3_REGION_NAME") or None,
+            endpoint_url=endpoint_url,
+            region_name=region_name,
         )
-        self.endpoint_url = os.getenv("SGLANG_S3_ENDPOINT_URL")
-        self.region_name = os.getenv("SGLANG_S3_REGION_NAME")
+        self.endpoint_url = endpoint_url
+        self.region_name = region_name
 
     def is_enabled(self) -> bool:
         return self.enabled
@@ -86,11 +89,10 @@ class CloudStorage:
 
         if url:
             try:
-                #pass if removal fails
+                # pass if removal fails
                 os.remove(file_path)
-            except OSError:
-                pass
-
+            except OSError as e:
+                logger.warning(f"Failed to remove temporary file {file_path}: {e}")
         return url
 
 
