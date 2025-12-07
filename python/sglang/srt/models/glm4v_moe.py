@@ -68,7 +68,6 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             prefix=add_prefix("lm_head", prefix),
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
-
         self.logits_processor = LogitsProcessor(config)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
