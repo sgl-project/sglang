@@ -78,7 +78,13 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.hardware_backend.npu.graph_runner.npu_compile_model_runner import (
+    NPUCompileModelRunner,
+)
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.hardware_backend.npu.graph_runner.piecewise_npu_graph_runner_decode import (
+    PiecewiseNPUGraphRunnerDecode,
+)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -130,12 +136,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.input_buffers import GraphInputBuffers
-from sglang.srt.model_executor.npu_compile_model_runner import NPUCompileModelRunner
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
-)
-from sglang.srt.model_executor.piecewise_npu_graph_runner_decode import (
-    PiecewiseNPUGraphRunnerDecode,
 )
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader

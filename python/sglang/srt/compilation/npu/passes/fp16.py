@@ -12,8 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
-import torch
 import sgl_kernel_npu
+import torch
 
 
 class SplitQkvRmsnormRopeFuse:

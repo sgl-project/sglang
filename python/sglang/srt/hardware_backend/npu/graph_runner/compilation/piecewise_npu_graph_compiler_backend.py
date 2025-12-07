@@ -167,7 +167,7 @@ class PiecewiseNpuGraphCompilerBackend(NpuGraphCompilerBackend):
         )
 
         npu_graph_backend = resolve_obj_by_qualname(
-            "sglang.srt.model_executor.compilation.npu_graph_backend.NPUGraphBackend"
+            "sglang.srt.hardware_backend.npu.graph_runner.compilation.npu_graph_backend.NPUGraphBackend"
         )
 
         self.submod_names_compiled_only = [

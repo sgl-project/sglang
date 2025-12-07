@@ -1923,7 +1923,7 @@ def get_compiler_backend(
 
     if hasattr(torch, "npu") and torch.npu.is_available():
         if mode == "piecewise":
-            from sglang.srt.model_executor.compilation.piecewise_npu_graph_compiler_backend import (
+            from sglang.srt.hardware_backend.npu.graph_runner.compilation.piecewise_npu_graph_compiler_backend import (
                 PiecewiseNpuGraphCompilerBackend,
             )
 
