@@ -572,18 +572,20 @@ class DenoisingStage(PipelineStage):
         return latents, trajectory_tensor
 
     def start_profile(self, batch: Req):
-
-        if (not batch.profile) or batch.full_stages:
-            return
-
-        self._profile_full = batch.full_denoise
-        request_id = batch.request_id if batch.request_id else "profile_trace"
-        profiler = SGLDiffusionProfiler.get_instance()
-
-        profiler.start()
+        pass
+        # if (not batch.profile) or batch.full_stages:
+        #     return
+        #
+        # self._profile_full = batch.full_denoise
+        # request_id = batch.request_id if batch.request_id else "profile_trace"
+        # profiler = SGLDiffusionProfiler.get_instance()
+        #
+        # profiler.start()
 
     def step_profile(self):
         profiler = SGLDiffusionProfiler.get_instance()
+        print(f"step_profile....")
+
         if profiler:
             profiler.step_denoising_step()
 

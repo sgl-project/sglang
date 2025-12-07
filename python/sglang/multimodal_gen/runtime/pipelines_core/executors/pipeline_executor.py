@@ -50,15 +50,15 @@ class SGLDiffusionProfiler:
         self,
         request_id: str | None = None,
         rank: int = 0,
-        full_profile: bool = True,
+        full_profile: bool = False,
         num_steps: int | None = None,
+        num_inference_steps: int | None = None,
         log_dir: str = "./logs",
     ):
         self.request_id = request_id or "profile_trace"
         self.rank = rank
         self.full_profile = full_profile
         self.log_dir = log_dir
-        SGLDiffusionProfiler._instance = self
 
         try:
             os.makedirs(self.log_dir, exist_ok=True)
@@ -76,15 +76,17 @@ class SGLDiffusionProfiler:
                 record_shapes=True,
                 with_stack=True,
             )
+            logger.info(f"Profiling request: {request_id} for full stages...")
         else:
             # profile denoising stage only
+            num_active_steps = num_inference_steps if num_steps == -1 else num_steps
             self.profiler = torch.profiler.profile(
                 activities=activities,
                 schedule=torch.profiler.schedule(
                     skip_first=0,
                     wait=0,
                     warmup=1,
-                    active=num_steps if num_steps else 2,
+                    active=num_active_steps,
                     repeat=5,
                 ),
                 on_trace_ready=lambda _: torch.profiler.tensorboard_trace_handler(
@@ -93,29 +95,40 @@ class SGLDiffusionProfiler:
                 record_shapes=True,
                 with_stack=True,
             )
+            logger.info(f"Profiling request: {request_id} for {num_active_steps} steps...")
+
+        self.has_stopped = False
+
+        SGLDiffusionProfiler._instance = self
 
     def start(self):
         logger.info("Starting Profiler...")
         self.profiler.start()
 
-    def step(self):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+    def _step(self):
+        print(f"stepping profiler")
+        # if torch.cuda.is_available():
+        #     torch.cuda.synchronize()
         self.profiler.step()
 
     def step_stage(self):
         if self.full_profile:
-            self.step()
+            self._step()
 
     def step_denoising_step(self):
+        print(f"stepping step_denoising_step")
+
         if not self.full_profile:
-            self.step()
+            self._step()
 
     @classmethod
     def get_instance(cls) -> "SGLDiffusionProfiler":
         return cls._instance
 
     def stop(self, export_trace: bool = True, dump_rank: int | None = None):
+        if self.has_stopped:
+            return
+        self.has_stopped = True
         logger.info("Stopping Profiler...")
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -206,7 +219,8 @@ class PipelineExecutor(ABC):
         profiler = SGLDiffusionProfiler(
             request_id=request_id,
             rank=check_rank,
-            full_profile=True,
+            full_profile=batch.full_stages,
+            num_steps=batch.num_profiled_timesteps,
         )
 
         profiler.start()

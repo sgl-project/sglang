@@ -125,10 +125,7 @@ class SamplingParams:
 
     # Profiling
     profile: bool = False
-    num_profiled_timesteps: int = 2
-    # --profile --full-stages => profile entire pipeline stages
-    # --profile --full-denoise => profile full denoising stage
-    full_denoise: bool = False
+    num_profiled_timesteps: int = 5
     full_stages: bool = False
 
     # Debugging
@@ -352,14 +349,6 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.profile,
             help="Enable torch profiler for denoising stage",
-        )
-        # denoising profiling mode selection
-        parser.add_argument(
-            "--full-denoise",
-            action="store_true",
-            dest="full_denoise",
-            default=SamplingParams.full_denoise,
-            help="With --profile, profile the entire denoising stage (no schedule/step).",
         )
         # pipeline-wide profiling
         parser.add_argument(
