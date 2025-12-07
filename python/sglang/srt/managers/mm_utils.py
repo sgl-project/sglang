@@ -36,6 +36,44 @@ _is_npu = is_npu()
 # cuda_ipc: for intranode tensor sharing
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
 
+cudnn_version = torch.backends.cudnn.version()
+version_float = float(str(cudnn_version)[:3]) / 100
+enable_matmul = torch.__version__.split("+", 1)[0] == "2.9.1" and version_float < 9.15
+
+
+def _forward_mulmat(conv3d, x: torch.Tensor) -> torch.Tensor:
+    import torch.nn.functional as F
+
+    B, C, T, H, W = x.shape
+    k_t, k_h, k_w = conv3d.kernel_size
+
+    # (B, C, T, H, W) -> (B, C, out_t, k_t, out_h, k_h, out_w, k_w)
+    x = x.view(B, C, T // k_t, k_t, H // k_h, k_h, W // k_w, k_w)
+
+    # (B, out_t, out_h, out_w, C, k_t, k_h, k_w)
+    x = x.permute(0, 2, 4, 6, 1, 3, 5, 7)
+
+    # Flatten patches: (B, out_t, out_h, out_w, C * k_t * k_h * k_w)
+    x = x.flatten(4)
+
+    # Linear projection: (B, out_t, out_h, out_w, out_channels)
+    x = F.linear(x, conv3d.weight.view(conv3d.out_channels, -1), conv3d.bias)
+
+    # (B, out_channels, out_t, out_h, out_w)
+    return x.permute(0, 4, 1, 2, 3).contiguous()
+
+
+def patch_conv3d(conv3d, x):
+    """
+    torch 2.9.1 has compatibility issues with cuDNN 9.14 and below,
+    causing extremely slow nn.Conv3d performance.
+    TODO(yhyang201): Remove this check when sglang no longer uses torch 2.9.1.
+    """
+    if enable_matmul:
+        return _forward_mulmat(conv3d, x)
+    else:
+        return conv3d.forward(x)
+
 
 class TransportProxyTensor(torch.Tensor):
     """

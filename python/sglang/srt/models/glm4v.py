@@ -49,6 +49,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    patch_conv3d,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -214,7 +215,8 @@ class Glm4vVisionPatchEmbed(nn.Module):
             self.patch_size,
             self.patch_size,
         )
-        x = self.proj(x).view(-1, self.hidden_size)
+        # x = self.proj(x).view(-1, self.hidden_size)
+        x = patch_conv3d(self.proj, x).view(-1, self.hidden_size)
         return x
 
 
