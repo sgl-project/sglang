@@ -243,14 +243,26 @@ class ComposedPipelineBase(ABC):
         # used by Wan2.2 ti2v
         model_index.pop("expand_timesteps", None)
 
+        # Add controlnet to required modules if controlnet_path is provided
+        if server_args.controlnet_path is not None:
+            logger.info(
+                "ControlNet path provided: %s, adding controlnet to required_config_modules",
+                server_args.controlnet_path,
+            )
+            if "controlnet" not in self.required_config_modules:
+                self.required_config_modules.append("controlnet")
+
         # some sanity checks
         assert (
             len(model_index) > 1
         ), "model_index.json must contain at least one pipeline module"
 
+        # Filter model_index to only include required modules (that exist in model_index)
+        # Some modules like controlnet may be loaded from external paths
         model_index = {
             required_module: model_index[required_module]
             for required_module in self.required_config_modules
+            if required_module in model_index
         }
 
         for module_name in self.required_config_modules:
@@ -342,6 +354,28 @@ class ComposedPipelineBase(ABC):
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)
             components[module_name] = module
+
+        # Special handling for ControlNet (loaded from external path)
+        if "controlnet" in required_modules and "controlnet" not in components:
+            if server_args.controlnet_path is not None:
+                logger.info("Loading ControlNet from external path: %s", server_args.controlnet_path)
+                component_model_path = server_args.controlnet_path
+                # Download from HuggingFace Hub if path doesn't exist locally
+                if not os.path.exists(component_model_path):
+                    component_model_path = maybe_download_model(component_model_path)
+
+                # Load ControlNet module
+                # Note: We don't know the exact architecture name, so we'll let the loader infer it
+                controlnet_module = PipelineComponentLoader.load_module(
+                    module_name="controlnet",
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers="diffusers",  # ControlNets are typically diffusers models
+                    server_args=server_args,
+                )
+                components["controlnet"] = controlnet_module
+                logger.info("Loaded ControlNet from %s", component_model_path)
+            else:
+                logger.warning("ControlNet in required modules but controlnet_path not provided")
 
         # Check if all required modules were loaded
         for module_name in required_modules:
