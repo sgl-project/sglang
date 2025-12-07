@@ -11,7 +11,7 @@ If you don't specify `--attention-backend`, SGLang does the best effort to autom
 
 ## Support Matrix
 
-The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](https://docs.sglang.io/basic_usage/deepseek_v3.html#multi-head-latent-attention-mla-throughput-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
+The support matrix is split into two parts: MHA (standard attention) and MLA (multi-head latent attention). For an explanation of the key differences between MHA and MLA, please see the [SGLang documentation on DeepSeek MLA](../basic_usage/deepseek_v3.md#multi-head-latent-attention-mla-throughput-optimizations) and the original [DeepSeek MLA paper](https://arxiv.org/pdf/2405.04434).
 
 ### MHA Backends
 
