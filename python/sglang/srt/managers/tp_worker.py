@@ -44,7 +44,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
-from sglang.srt.utils.common import log_debug_on_rank0
+from sglang.srt.utils.common import log_info_on_rank0
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -292,20 +292,20 @@ class TpModelWorker(BaseTpWorker):
         token_pool_size = self.model_runner.req_to_token_pool.size
         if server_args.max_running_requests is None:
             running_limit = self.max_total_num_tokens // 2
-            log_debug_on_rank0(
+            log_info_on_rank0(
                 logger,
                 f"max_running_requests: no arg, using total_tokens//2 = {running_limit}",
             )
         else:
             dp_divisor = server_args.dp_size if server_args.enable_dp_attention else 1
             running_limit = server_args.max_running_requests // dp_divisor
-            log_debug_on_rank0(
+            log_info_on_rank0(
                 logger,
                 f"max_running_requests: arg={server_args.max_running_requests} // dp_divisor={dp_divisor} = {running_limit}",
             )
         self.max_running_requests = min(running_limit, token_pool_size)
         if self.max_running_requests < running_limit:
-            log_debug_on_rank0(
+            log_info_on_rank0(
                 logger,
                 f"max_running_requests: clamped by token_pool_size {running_limit} -> {self.max_running_requests}",
             )
@@ -321,12 +321,12 @@ class TpModelWorker(BaseTpWorker):
         memory_limit = self.max_total_num_tokens - 1
         self.max_req_len = min(context_limit, memory_limit)
         if context_limit <= memory_limit:
-            log_debug_on_rank0(
+            log_info_on_rank0(
                 logger,
                 f"max_req_len: limited by context_len ({self.model_config.context_len} - 1 = {self.max_req_len})",
             )
         else:
-            log_debug_on_rank0(
+            log_info_on_rank0(
                 logger,
                 f"max_req_len: limited by memory ({self.max_total_num_tokens} - 1 = {self.max_req_len})",
             )
