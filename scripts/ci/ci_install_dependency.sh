@@ -1,5 +1,18 @@
 #!/bin/bash
 # Install the dependency in CI.
+
+PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
+
+if [ -d "$FLASH_ATTN_PATH" ]; then
+    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
+    rm -rf "$FLASH_ATTN_PATH"
+else
+    echo "Directory $FLASH_ATTN_PATH does not exist."
+fi
+
+rm -rf $FLASH_ATTN_PATH
+
 set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
@@ -148,10 +161,24 @@ python3 -c "import torch; print(torch.version.cuda)"
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
 
-if [ -d "/usr/local/lib/python3.10/dist-packages/flash_attn" ]; then
-    echo "Directory /usr/local/lib/python3.10/dist-packages/flash_attn exists."
+PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
+
+if [ -d "$FLASH_ATTN_PATH" ]; then
+    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
+    rm -rf "$FLASH_ATTN_PATH"
 else
-    echo "Directory /usr/local/lib/python3.10/dist-packages/flash_attn does not exist."
+    echo "Directory $FLASH_ATTN_PATH does not exist."
 fi
 
-rm -rf /usr/local/lib/python3.10/dist-packages/flash_attn
+rm -rf $FLASH_ATTN_PATH
+
+PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn_origin"
+
+if [ -d "$FLASH_ATTN_PATH" ]; then
+    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
+    rm -rf "$FLASH_ATTN_PATH"
+else
+    echo "Directory $FLASH_ATTN_PATH does not exist."
+fi
