@@ -19,25 +19,9 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
-
-try:
-    from flash_attn_origin.cute import utils
-except ImportError as e:
-    print(f"Failed to import flash_attn_origin.cute.utils: {e}")
-
-try:
-    from flash_attn_origin.cute.flash_fwd import FlashAttentionForwardSm90
-except ImportError as e:
-    print(
-        f"Failed to import FlashAttentionForwardSm90 from flash_attn_origin.cute.flash_fwd: {e}"
-    )
-
-try:
-    from flash_attn_origin.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-except ImportError as e:
-    print(
-        f"Failed to import FlashAttentionForwardSm100 from flash_attn_origin.cute.flash_fwd_sm100: {e}"
-    )
+from flash_attn.cute import utils
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 
 
 def maybe_contiguous(x):
