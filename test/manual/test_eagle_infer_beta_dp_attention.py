@@ -110,6 +110,8 @@ class TestEagleDPAttnServerLarge(CustomTestCase):
             "4",
             "--kv-cache-dtype",
             "fp8_e4m3",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true,"num_threads": 64}',
         ]
         with envs.SGLANG_ENABLE_SPEC_V2.override(True):
             cls.process = popen_launch_server(
