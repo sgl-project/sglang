@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -48,11 +47,9 @@ class TestDeepseek(CustomTestCase):
                 "--max-running-requests",
                 "2048",
                 "--disable-radix-cache",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load": true,"num_threads": 64}',
             ],
-            env={
-                **os.environ,
-                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
-            },
         )
 
     @classmethod
@@ -75,7 +72,6 @@ class TestDeepseek(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.92)
 
 
-@unittest.skip("Can pass locally, but will cause Timeout on CI runner.")
 class TestDeepseekMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -117,11 +113,9 @@ class TestDeepseekMTP(CustomTestCase):
                 "--speculative-num-draft-tokens",
                 "2",
                 "--disable-radix-cache",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load": true,"num_threads": 64}',
             ],
-            env={
-                **os.environ,
-                "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
-            },
         )
 
     @classmethod
