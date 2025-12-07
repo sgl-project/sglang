@@ -115,6 +115,7 @@ diffusion = [
   "torchcodec==0.5.0",
   "st_attn==0.0.7",
   "vsa==0.0.4",
+  "runai_model_streamer",
 ]
 all_hip = ["sglang[srt_hip]"]
 all_npu = ["sglang[srt_npu]"]
