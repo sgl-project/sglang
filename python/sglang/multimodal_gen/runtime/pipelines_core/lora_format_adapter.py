@@ -17,7 +17,7 @@ except Exception:
 class LoRAFormat(str, Enum):
     """Enumerates supported external LoRA formats before normalization."""
     STANDARD = "standard"                # Already diffusers/PEFT-style
-    NON_DIFFUSERS_SD = "non-diffusers"   # SD1/2/XL LoRA: Kohya / A1111 / Comfy / LyCORIS / DoRA
+    NON_DIFFUSERS_SD = "non-diffusers"   # SD1/2/XL LoRA: Kohya / A1111 / Comfy / LyCORIS / DoRA & SD1/2/XL 以及 Wan / HunyuanVideo / LTX-Video
     XLABS_FLUX = "xlabs-ai"              # XLabs FLUX-style LoRA format
     KOHYA_FLUX = "kohya-flux"            # Kohya-style FLUX format (sd-scripts/flux_lora.py)
     UNKNOWN = "unknown"
@@ -102,6 +102,14 @@ def detect_lora_format_from_state_dict(
 
     # SD1/2/XL non-diffusers LoRA (Kohya/A1111)
     if _looks_like_non_diffusers_sd(lora_state_dict):
+        return LoRAFormat.NON_DIFFUSERS_SD
+
+    # Wan / Musubi-Wan / HunyuanVideo / LTX-Video 等：
+    # 仍然是非 diffusers 命名，通常带 .lora_down/.lora_up
+    if any(
+        (".lora_down.weight" in k) or (".lora_up.weight" in k)
+        for k in keys
+    ):
         return LoRAFormat.NON_DIFFUSERS_SD
 
     # Otherwise assume diffusers/PEFT-style
@@ -211,46 +219,70 @@ def _convert_non_diffusers_sd_via_diffusers(
 ) -> Dict[str, torch.Tensor]:
     """
     Converts classic SD1/2/XL LoRA formats (A1111/Kohya/sd-scripts)
+    as well as non-diffusers video LoRAs (Wan / Musubi-Wan / HunyuanVideo / LTX-Video)
     into diffusers-compatible LoRA naming.
+
+    Delegates to diffusers.loaders.lora_conversion_utils, trying all known
+    non-diffusers converters in order and stopping at the first one that succeeds.
     """
     if lcu is None:
         if logger:
-            logger.warning("Non-diffusers SD LoRA detected but diffusers unavailable.")
+            logger.warning("Non-diffusers SD/Video LoRA detected but diffusers unavailable.")
         return lora_state_dict
 
     candidate_names = (
+        # 传统 SD non-diffusers (Kohya/A1111/sd-scripts)
         "_convert_non_diffusers_lora_to_diffusers",
         "convert_non_diffusers_lora_to_diffusers",
+        # Wan / Musubi-Wan
+        "_convert_non_diffusers_wan_lora_to_diffusers",
+        "convert_non_diffusers_wan_lora_to_diffusers",
+        "_convert_musubi_wan_lora_to_diffusers",
+        "convert_musubi_wan_lora_to_diffusers",
+        # HunyuanVideo
+        "_convert_hunyuan_video_lora_to_diffusers",
+        "convert_hunyuan_video_lora_to_diffusers",
+        # LTX-Video
+        "_convert_non_diffusers_ltxv_lora_to_diffusers",
+        "convert_non_diffusers_ltxv_lora_to_diffusers",
     )
 
-    converters = [(name, getattr(lcu, name)) for name in candidate_names if callable(getattr(lcu, name, None))]
+    converters = [
+        (name, getattr(lcu, name))
+        for name in candidate_names
+        if callable(getattr(lcu, name, None))
+    ]
 
     if not converters:
         if logger:
-            logger.warning("No SD converter found in diffusers; returning raw dict.")
+            logger.warning(
+                "No non-diffusers SD/video LoRA converters found in diffusers; returning raw dict."
+            )
         return lora_state_dict
 
     sd_copy = dict(lora_state_dict)
-    last_err = None
+    last_err: Optional[Exception] = None
 
     for name, fn in converters:
         try:
             out = fn(sd_copy)
+            # 一些 converter 可能返回 (state_dict, metadata)
             if isinstance(out, tuple) and isinstance(out[0], dict):
                 out = out[0]
             if not isinstance(out, dict):
                 raise TypeError(f"Converter {name} returned unexpected type {type(out)}")
             if logger:
-                logger.info(f"Converted SD LoRA using {name}")
+                logger.info(f"Converted non-diffusers SD/video LoRA using {name}")
             return out
         except Exception as e:
             last_err = e
             continue
 
     if logger:
-        logger.warning(f"All SD converters failed; last error: {last_err}")
+        logger.warning(
+            f"All non-diffusers SD/video LoRA converters failed; last error: {last_err}"
+        )
     return lora_state_dict
-
 
 # ----------- Normalization Dispatcher -----------
 
