@@ -942,7 +942,9 @@ class EAGLEWorker(TpModelWorker):
             batch = batch.copy()
             batch.prepare_for_idle()
             # Use target model's hidden size for hidden_states since they're used during verification
-            target_hidden_size = self.target_worker.model_runner.model_config.hidden_size
+            target_hidden_size = (
+                self.target_worker.model_runner.model_config.hidden_size
+            )
             hidden_size = (
                 target_hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
