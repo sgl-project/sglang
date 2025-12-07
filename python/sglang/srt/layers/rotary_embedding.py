@@ -118,10 +118,10 @@ class RotaryEmbedding(CustomOp):
             and not (_is_cpu and _is_cpu_amx_available)
             and not (_is_xpu)
         ):
-            if _is_hip:
-                from vllm._custom_ops import rotary_embedding
+            if _is_cuda:
+                from sgl_kernel import rotary_embedding
             else:
-                from sgl_kernel.elementwise import rotary_embedding
+                from vllm._custom_ops import rotary_embedding
 
             self.use_fallback_kernel = True
             self.fallback_rotary_embedding = rotary_embedding
