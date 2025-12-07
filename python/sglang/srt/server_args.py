@@ -1284,6 +1284,9 @@ class ServerArgs:
                     )
                 if self.attention_backend is None:
                     self.attention_backend = "triton"
+                    logger.info(
+                        "Use triton as attention backend on sm100 for Qwen3NextForCausalLM"
+                    )
                 if (
                     not self.disable_radix_cache
                     and self.attention_backend == "trtllm_mha"
