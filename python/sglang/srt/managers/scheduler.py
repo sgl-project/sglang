@@ -818,7 +818,7 @@ class Scheduler(
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
         if isinstance(self.token_to_kv_pool_allocator, ElasticAllocator):
-            self.token_to_kv_pool_allocator.register_scheduler(self)
+            self.emem_orch.register_scheduler(self)
 
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(

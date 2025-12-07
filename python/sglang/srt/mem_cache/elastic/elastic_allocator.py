@@ -255,3 +255,191 @@ class ElasticSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator, ElasticAllocat
             f"{(self._size_swa, self._size_full)=}, "
             f"{(self.scheduler.swa_tokens_per_layer, self.scheduler.full_tokens_per_layer)=}"
         )
+
+
+##################################################
+
+
+class ElasticMambaPoolAllocator(ElasticAllocator):
+    def __init__(self, mamba_pool):
+        self._kvcache = mamba_pool
+        logger.debug(f"ElasticMambaPoolAllocator register_allocator")
+
+    @override  # ElasticAllocator
+    def can_unmap(self) -> bool:
+        if self.token_usage() > 0.8:
+            return False
+
+        self.evict(self.evictable_size())
+
+        self._kvcache.sort_free()
+        cu_page_token = (cu_page_size // self._kvcache.state_memsize + 1) * 2
+        return (
+            len(self._kvcache.free_slots) >= cu_page_token
+            and self._kvcache.free_slots[-cu_page_token]
+            == self._kvcache.size - cu_page_token
+        )
+
+    @override  # ElasticAllocator
+    def can_map(self) -> bool:
+        return self.token_usage() > 0.9
+
+    @override  # ElasticAllocator
+    def reduce(self) -> int:
+        self._kvcache.sort_free()
+
+        low, mid, high = 0, 0, len(self._kvcache.free_slots)
+        tail_consecutive_size = -1
+        while low < high:
+            mid = (low + high) // 2
+            tail_consecutive_value = len(self._kvcache.free_slots) - mid
+            if (
+                self._kvcache.free_slots[mid]
+                == self._kvcache.size - tail_consecutive_value
+            ):
+                tail_consecutive_size = len(self._kvcache.free_slots) - mid
+                high = mid
+            elif (
+                self._kvcache.free_slots[mid]
+                < self._kvcache.size - tail_consecutive_value
+            ):
+                low = mid + 1
+            else:
+                assert False
+
+        reduce_size = tail_consecutive_size // 2
+        reduce_size = reduce_size
+        if reduce_size <= 0:
+            return 0
+
+        new_size = self._kvcache.size - reduce_size
+        self._kvcache.free_slots = self._kvcache.free_slots[:-reduce_size]
+        unmap_num, cur_size = self._kvcache.reduce(new_size)
+        logger.debug(f"{(unmap_num, cur_size)=}")
+        assert cur_size == self._kvcache.free_slots[-1] + 1
+
+        return unmap_num
+
+    @override  # ElasticAllocator
+    def expand(self, expand_size: int) -> int:
+        if expand_size <= 0:
+            return 0
+
+        old_size = self._kvcache.size
+        new_size = self._kvcache.size + expand_size
+        map_num, cur_size = self._kvcache.expand(new_size)
+        logger.debug(f"{(map_num, cur_size)=}")
+        self._kvcache.free_slots = torch.cat(
+            (
+                self._kvcache.free_slots,
+                torch.tensor(
+                    range(old_size, cur_size),
+                    dtype=self._kvcache.free_slots.dtype,
+                    device=self._kvcache.free_slots.device,
+                ),
+            )
+        )
+
+        return map_num
+
+    @override  # ElasticAllocator
+    def cu_page_to_token(self, cu_page_num: int) -> int:
+        return self._kvcache.cu_page_to_token(cu_page_num)
+
+    @override  # ElasticAllocator
+    def register_evict_func(self, func_evictable_size, func_evict) -> None:
+        self.func_evictable_size = func_evictable_size
+        self.func_evict = func_evict
+
+    @override  # ElasticAllocator
+    def token_usage(self) -> float:
+        num_used = self._kvcache.size - (
+            len(self._kvcache.free_slots) + self.evictable_size()
+        )
+        return num_used / self._kvcache.size
+
+    @override  # ElasticAllocator
+    def evictable_size(self) -> int:
+        return self.func_evictable_size()
+
+    @override  # ElasticAllocator
+    def evict(self, evictable_size: int) -> None:
+        self.func_evict(evictable_size)
+
+    @override  # ElasticAllocator
+    def update_size(self) -> None:
+        pass
+
+
+class ElasticHybridLinearKVPoolAllocator(ElasticAllocator):
+    def __init__(self, emem_orch, token_to_kv_pool_allocator):
+        self.emem_orch = emem_orch
+        self.full_allocator = token_to_kv_pool_allocator
+        self.mamba_allocator = ElasticMambaPoolAllocator(
+            self.full_allocator._kvcache.mamba_pool
+        )
+        logger.debug(f"ElasticHybridLinearKVPoolAllocator initialized")
+
+        self.emem_orch.register_allocator(self)
+        self.emem_orch.register_allocator(self.full_allocator)
+        self.emem_orch.register_allocator(self.mamba_allocator)
+        logger.debug(f"ElasticHybridLinearKVPoolAllocator register_allocator")
+
+    @override
+    def register_scheduler(self, scheduler) -> None:
+        self.scheduler = scheduler
+        self.full_allocator.register_evict_func(
+            func_evictable_size=self.scheduler.tree_cache.full_evictable_size,
+            func_evict=lambda evictable_size: self.scheduler.tree_cache.evict(
+                evictable_size
+            ),
+        )
+        self.mamba_allocator.register_evict_func(
+            func_evictable_size=self.scheduler.tree_cache.mamba_evictable_size,
+            func_evict=lambda evictable_size: self.scheduler.tree_cache.evict_mamba(
+                evictable_size
+            ),
+        )
+
+    @override
+    def can_unmap(self) -> bool:
+        return False
+
+    @override
+    def can_map(self) -> bool:
+        return False
+
+    @override
+    def reduce(self) -> int:
+        raise NotImplementedError()
+
+    @override
+    def expand(self, expand_size: int) -> int:
+        raise NotImplementedError()
+
+    @override
+    def cu_page_to_token(self, cu_page_num: int) -> int:
+        raise NotImplementedError()
+
+    @override
+    def register_evict_func(self, func_evictable_size, func_evict) -> None:
+        raise NotImplementedError()
+
+    @override
+    def token_usage(self) -> float:
+        return 1
+
+    @override
+    def evictable_size(self) -> int:
+        raise NotImplementedError()
+
+    @override
+    def evict(self, evictable_size: int) -> None:
+        raise NotImplementedError()
+
+    @override
+    def update_size(self):
+        logger.info(
+            "ElasticHybridLinearKVPoolAllocator update_size: "
+            f"{(self.full_allocator.size, self.mamba_allocator._kvcache.size)=}"
+        )

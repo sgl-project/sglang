@@ -1010,7 +1010,7 @@ class Qwen3NextForCausalLM(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if (
                         name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
+                    ) or name not in params_dict:
                         continue
                     param = params_dict[name]
 
@@ -1029,6 +1029,9 @@ class Qwen3NextForCausalLM(nn.Module):
                         continue
                     # if is_pp_missing_parameter(name, self):
                     #     continue
+
+                    if name not in params_dict:
+                        continue
 
                     param = params_dict[name]
                     weight_loader = getattr(

@@ -128,6 +128,43 @@ nohup python3 -m sglang.bench_serving --backend sglang \
   --num-prompts 8192 --random-input 8192 --random-output 8192 --random-range-ratio 0.5 \
   --max-concurrency 24 > bench.out &
 
+####################################################################################################
+# qwen3-next
+
+for _ in {1..2}; do
+  ps aux | grep "sglang.launch_server" | grep -v grep | awk '{print $2}' | xargs kill -9
+  ps aux | grep "sglang::" | grep -v grep | awk '{print $2}' | xargs kill -9
+  sleep 1
+done
+
+export CUDA_LAUNCH_BLOCKING=1
+export TORCH_USE_CUDA_DSA=1
+export CUDA_ENABLE_COREDUMP_ON_EXCEPTION=1
+export CUDA_COREDUMP_SHOW_PROGRESS=1
+export CUDA_COREDUMP_GENERATION_FLAGS='skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_constbank_memory'
+export CUDA_COREDUMP_FILE="/tmp/cuda_coredump_%h.%p.%t"
+export SGLANG_ELASTIC_MEM_POOL=true
+export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
+python3 -m sglang.launch_server \
+  --log-level debug \
+  --model /data-mnt/Qwen3-Next-80B-A3B-Instruct/ \
+  --tp 2 \
+  --attention-backend triton \
+  --cuda-graph-max-bs 1024 \
+
+python3 -m sglang.bench_serving --backend sglang \
+  --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 512 --random-input 24576 --random-output 1024 --random-range-ratio 0.5 \
+  --max-concurrency 128
+
+python3 -m sglang.bench_serving --backend sglang \
+  --dataset-name random --dataset-path /data-mnt/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 8192 --random-input 8192 --random-output 8192 --random-range-ratio 0.5 \
+  --max-concurrency 1024
+
+####################################################################################################
+
 curl -L -X POST 'http://127.0.0.1:30000/v1/chat/completions' \
 -H 'Content-Type: application/json' \
 -H 'Accept: application/json' \

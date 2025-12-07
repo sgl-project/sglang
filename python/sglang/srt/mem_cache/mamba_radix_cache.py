@@ -501,6 +501,7 @@ class MambaRadixCache(BasePrefixCache):
             mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
                 mamba_value
             )
+            # Do we need an assertion here? Can we just skip the cache when mamba_value_forked is None?
             assert mamba_value_forked is not None, "Can not alloc mamba cache"
         new_prefix_len, mamba_exist = self.insert(
             RadixKey(page_aligned_token_ids, req.extra_key),

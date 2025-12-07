@@ -149,6 +149,7 @@ class ElasticMempoolOrchestrator:
 
         current_device_id = f"cuda:{torch.cuda.current_device()}"
         vmm_ops.init_emem(current_device_id, cu_page_size)
+        logger.info(f"vmm_ops.init_emem({current_device_id=}, {cu_page_size=})")
 
         self.allocators = []
         self.free_all = False
@@ -159,6 +160,11 @@ class ElasticMempoolOrchestrator:
     def register_allocator(self, allocator: ElasticAllocator):
         allocator.register_emem_orch(self)
         self.allocators.append(allocator)
+
+    def register_scheduler(self, scheduler):
+        logger.info(f"register_scheduler to {self.allocators=}")
+        for allocator in self.allocators:
+            allocator.register_scheduler(scheduler)
 
     def try_resize(self) -> None:
         map_candidate = None
@@ -201,8 +207,8 @@ class ElasticMempoolOrchestrator:
         ):
             logger.info(
                 "ElasticMempoolOrchestrator try_resize "
-                f"{map_candidate.token_usage()=}, "
-                f"{unmap_candidate.token_usage()=}"
+                f"{(map_candidate, map_candidate.token_usage())=}, "
+                f"{(unmap_candidate, unmap_candidate.token_usage())=}"
             )
             self.do_resize(map_candidate, unmap_candidate)
 
