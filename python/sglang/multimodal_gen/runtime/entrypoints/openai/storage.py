@@ -60,7 +60,7 @@ class CloudStorage:
             # Offload the blocking I/O call to a thread executor
             await asyncio.get_running_loop().run_in_executor(None, _sync_upload)
         except Exception as e:
-            # If upload fails, log the error and return None for graceful fallback
+            # If upload fails, log the error and return None for fallback
             logger.error(f"Upload failed for {destination_key}: {e}")
             return None
 
@@ -86,7 +86,7 @@ class CloudStorage:
 
         if url:
             try:
-                # Simplified cleanup: silently pass if removal fails
+                #pass if removal fails
                 os.remove(file_path)
             except OSError:
                 pass
