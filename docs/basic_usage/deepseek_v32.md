@@ -234,7 +234,7 @@ ns eval \
   # ++inference.tokens_to_generate=120000 for Speciale model
 ```
 
-Test results:
+Test results (8*B200):
 
 DeepSeek-V3.2-Exp：
 
