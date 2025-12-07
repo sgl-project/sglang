@@ -56,7 +56,7 @@ FetchContent_Populate(repo-cutlass)
 FetchContent_Declare(
     repo-deepgemm
     GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        f4adba8a6695e635b0106ce3dae3202016ad0ee5
+    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-deepgemm)
@@ -278,8 +278,11 @@ set(SOURCES
     "csrc/elementwise/copy.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
+    "csrc/elementwise/pos_enc.cu"
     "csrc/elementwise/topk.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"
+    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
+    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
 
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"

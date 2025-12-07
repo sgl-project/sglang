@@ -6,14 +6,14 @@ on:
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
-      - 'sgl-router/**'
+      - 'sgl-model-gateway/**'
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
-      - 'sgl-router/**'
+      - 'sgl-model-gateway/**'
   workflow_dispatch:
 
 concurrency:
@@ -58,8 +58,8 @@ jobs:
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
-          sgl-router/target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
+          sgl-model-gateway/target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-model-gateway/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
 
@@ -147,11 +147,11 @@ jobs:
         python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.7.post2
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
 
-    - name: Build and install sgl-router
+    - name: Build and install sgl-model-gateway
       run: |
         source "$HOME/.cargo/env"
-        echo "Building sgl-router..."
-        cd sgl-router/bindings/python
+        echo "Building sgl-model-gateway..."
+        cd sgl-model-gateway/bindings/python
         pip install maturin
         maturin build --release --out dist --features vendored-openssl
         pip install --force-reinstall dist/*.whl

@@ -438,6 +438,14 @@ python -m sglang_router.launch_router \
   --request-id-headers x-request-id x-trace-id
 ```
 
+Enable opentelmetry tracing:
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --enable-trace \
+  --otlp-traces-endpoint 0.0.0.0:4317
+```
+
 ---
 
 ## Troubleshooting

@@ -330,6 +330,25 @@ class Indexer(CustomOp):
         topk_result = metadata.topk_transform(logits, self.index_topk)
         return topk_result
 
+    def _should_chunk_mqa_logits(
+        self, num_q: int, num_k: int, device: torch.device
+    ) -> Tuple[bool, int]:
+        """
+        Detect whether we need to chunk the MQA logits computation to avoid OOM
+        Return: (need_chunk, free_mem)
+        """
+        # Quick static check for normal batches
+        if num_q * num_k < 8_000_000:  # 8M elements ≈ 32MB logits
+            return False, 0
+
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        bytes_per_elem = 4  # float32
+        logits_bytes = num_q * num_k * bytes_per_elem
+
+        # Logits should not exceed 50% of free memory or 30% of total memory
+        need_chunk = (logits_bytes * 2 > free_mem) or (logits_bytes > total_mem * 0.3)
+        return need_chunk, free_mem
+
     def _get_topk_ragged(
         self,
         forward_batch: ForwardBatch,
@@ -351,6 +370,8 @@ class Indexer(CustomOp):
         k_scale_list = []
         ks_list = []
         ke_list = []
+        # Token-to-batch mapping for PAGED chunk alignment
+        token_to_batch_idx: List[int] = []
 
         q_offset = 0
         k_offset = 0
@@ -366,12 +387,8 @@ class Indexer(CustomOp):
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens_cpu[i].item()
             assert isinstance(seq_len, int)
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+            # Use fused Triton kernel to get both K and scale in a single call
+            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
                 layer_id,
                 seq_len,
                 block_tables[i],
@@ -386,6 +403,7 @@ class Indexer(CustomOp):
             ks_list.append(ks)
             ke_list.append(ke)
 
+            token_to_batch_idx.extend([i] * extend_seq_len)
             q_offset += extend_seq_len
             k_offset += seq_len
 
@@ -409,24 +427,104 @@ class Indexer(CustomOp):
         # ks = [0, 0, 0, 10, 10]
         # ke = [8, 9, 10, 13, 14]
 
-        logits = deep_gemm.fp8_mqa_logits(
-            q_fp8[:q_offset],
-            kv_fp8,
-            weights[:q_offset],
-            ks,
-            ke,
-            clean_logits=False,
-        )
-
         token_nums, _, _ = q_fp8.shape
-        assert logits.shape[0] == len(seq_lens_expanded)
-        assert logits.shape[1] == k_offset
+        device = q_fp8.device
 
-        raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+        # Check if we need to chunk to avoid OOM
+        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
+
+        if not need_chunk:
+            logits = deep_gemm.fp8_mqa_logits(
+                q_fp8[:q_offset],
+                kv_fp8,
+                weights[:q_offset],
+                ks,
+                ke,
+                clean_logits=False,
+            )
+            assert logits.shape[0] == len(seq_lens_expanded)
+            assert logits.shape[1] == k_offset
+
+            raw_topk_result = metadata.topk_transform(logits, self.index_topk, ks=ks)
+            topk_result = torch.full(
+                (token_nums, self.index_topk),
+                -1,
+                device=device,
+                dtype=torch.int32,
+            )
+            topk_result[:q_offset] = raw_topk_result
+            return topk_result
+
+        # Chunk path
+        bytes_per_elem = 4  # float32
+        bytes_per_row = k_offset * bytes_per_elem
+        # Reserve 50% of free memory for logits
+        max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
+        max_rows = min(max_rows, q_offset)
+
+        global_topk_offset = metadata.attn_metadata.topk_indices_offset
+
+        assert (
+            seq_lens_expanded.shape[0] == q_offset
+        ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
+        if global_topk_offset is not None:
+            assert (
+                global_topk_offset.shape[0] >= q_offset
+            ), f"topk_indices_offset too short: {global_topk_offset.shape[0]} < {q_offset}"
+
         topk_result = torch.full(
-            (token_nums, self.index_topk), -1, device=q_fp8.device, dtype=torch.int32
+            (token_nums, self.index_topk), -1, device=device, dtype=torch.int32
         )
-        topk_result[:q_offset] = raw_topk_result
+
+        # Only materialize batch index tensor when PAGED path needs it
+        token_to_batch_idx_tensor = None
+        if global_topk_offset is None:
+            token_to_batch_idx_tensor = torch.tensor(
+                token_to_batch_idx, dtype=torch.long, device=device
+            )
+
+        start = 0
+        while start < q_offset:
+            end = min(start + max_rows, q_offset)
+
+            logits_chunk = deep_gemm.fp8_mqa_logits(
+                q_fp8[start:end],
+                kv_fp8,
+                weights[start:end],
+                ks[start:end],
+                ke[start:end],
+                clean_logits=False,
+            )
+
+            lengths_chunk = seq_lens_expanded[start:end]
+
+            # RAGGED: use global offset; PAGED: construct local cu_seqlens_q per chunk
+            if global_topk_offset is not None:
+                # RAGGED path
+                topk_offset_chunk = global_topk_offset[start:end]
+                cu_seqlens_q_chunk = None
+                batch_idx_chunk = None
+            else:
+                # PAGED path: treat each token as a length-1 sequence
+                topk_offset_chunk = None
+                B_chunk = logits_chunk.shape[0]
+                cu_seqlens_q_chunk = torch.ones(
+                    B_chunk, dtype=torch.int32, device=device
+                )
+                batch_idx_chunk = token_to_batch_idx_tensor[start:end]
+
+            raw_topk_chunk = metadata.topk_transform(
+                logits_chunk,
+                self.index_topk,
+                ks=ks[start:end],
+                cu_seqlens_q=cu_seqlens_q_chunk,
+                ke_offset=lengths_chunk,
+                batch_idx_list=batch_idx_chunk,
+                topk_indices_offset_override=topk_offset_chunk,
+            )
+            topk_result[start:end] = raw_topk_chunk
+            start = end
+
         return topk_result
 
     def _forward_cuda_k_only(
@@ -926,7 +1024,7 @@ class Indexer(CustomOp):
         )  # [bs, 64, 64 + 64]
 
         q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(
+        q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
             bs, self.n_heads, self.rope_head_dim
         )  # [bs, n, d]
         q = torch.cat([q_pe, q_nope], dim=-1)
@@ -940,7 +1038,7 @@ class Indexer(CustomOp):
         )  # [bs, 64 + 64]
 
         k_pe = k_pe.view(-1, 1, 1, self.rope_head_dim)
-        k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin).view(
+        k_pe = torch_npu.npu_rotary_mul(k_pe, cos, sin).view(
             bs, 1, self.rope_head_dim
         )  # [bs, 1, d]
         k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
@@ -1010,7 +1108,7 @@ class Indexer(CustomOp):
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
 
         x = x.view(-1, self.hidden_size)
-        weights = self.weights_proj(x.float())[0]
+        weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
         block_table = (
             block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table
         )

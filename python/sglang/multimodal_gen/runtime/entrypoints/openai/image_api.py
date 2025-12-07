@@ -53,8 +53,13 @@ def _build_sampling_params_from_request(
     output_format: Optional[str],
     background: Optional[str],
     image_path: Optional[str] = None,
+    seed: Optional[int] = None,
+    generator_device: Optional[str] = None,
 ) -> SamplingParams:
-    width, height = _parse_size(size)
+    if size is None:
+        width, height = None, None
+    else:
+        width, height = _parse_size(size)
     ext = _choose_ext(output_format, background)
     server_args = get_global_server_args()
     # Build user params
@@ -70,6 +75,8 @@ def _build_sampling_params_from_request(
         save_output=True,
         server_args=server_args,
         output_file_name=f"{request_id}.{ext}",
+        seed=seed,
+        generator_device=generator_device,
     )
     return sampling_params
 
@@ -85,6 +92,7 @@ def _build_req_from_sampling(s: SamplingParams) -> Req:
         fps=1,
         num_frames=s.num_frames,
         seed=s.seed,
+        generator_device=s.generator_device,
         output_path=s.output_path,
         output_file_name=s.output_file_name,
         num_outputs_per_prompt=s.num_outputs_per_prompt,
@@ -104,6 +112,8 @@ async def generations(
         size=request.size,
         output_format=request.output_format,
         background=request.background,
+        seed=request.seed,
+        generator_device=request.generator_device,
     )
     batch = prepare_request(
         server_args=get_global_server_args(),
@@ -149,9 +159,11 @@ async def edits(
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     response_format: Optional[str] = Form(None),
-    size: Optional[str] = Form("1024x1024"),
+    size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
+    seed: Optional[int] = Form(1024),
+    generator_device: Optional[str] = Form("cuda"),
     user: Optional[str] = Form(None),
 ):
     request_id = generate_request_id()
@@ -175,6 +187,8 @@ async def edits(
         output_format=output_format,
         background=background,
         image_path=input_path,
+        seed=seed,
+        generator_device=generator_device,
     )
     batch = _build_req_from_sampling(sampling)
 

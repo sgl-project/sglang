@@ -10,6 +10,13 @@ from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 @dataclass
 class ZImageSamplingParams(SamplingParams):
     num_inference_steps: int = 9
+
+    num_frames: int = 1
+    negative_prompt: str = None
+    # height: int = 720
+    # width: int = 1280
+    # fps: int = 24
+
     guidance_scale: float = 0.0
 
     teacache_params: TeaCacheParams = field(
