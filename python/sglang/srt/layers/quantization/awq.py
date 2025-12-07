@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -824,6 +829,7 @@ class AWQMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        assert get_moe_runner_backend().is_auto()
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
