@@ -102,10 +102,18 @@ profile_activities = [torch.profiler.ProfilerActivity.CPU] + [
     if available
 ]
 if _is_npu:
-    profile_activities = [torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU]
+    profile_activities = [
+        torch_npu.profiler.ProfilerActivity.CPU, 
+        torch_npu.profiler.ProfilerActivity.NPU,
+    ]
     
 
-def start_profile(profile_activities, profile_record_shapes=False, rank_print=print, trace_filepath=None):
+def start_profile(
+    profile_activities, 
+    profile_record_shapes=False, 
+    rank_print=print, 
+    trace_filepath=None
+):
     """
     Abstracted function to start profiling based on profile_activities.
     Returns profiler object (or None). For NPU, saves trace results by default.
@@ -126,13 +134,15 @@ def start_profile(profile_activities, profile_record_shapes=False, rank_print=pr
         if activities:
             experiment_config = torch_npu.profiler._ExperimentalConfig(
                 export_type=[torch_npu.profiler.ExportType.Text],
-                profiler_level = torch_npu.profiler.ProfilerLevel.Level1,
-                aic_metrics = torch_npu.profiler.AiCMetrics.AiCoreNone,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                aic_metrics=torch_npu.profiler.AiCMetrics.AiCoreNone,
             )
             os.makedirs(trace_filepath, exist_ok=True)
             profiler = torch_npu.profiler.profile(
                 activities=activities,
-                on_trace_ready = torch_npu.profiler.tensorboard_trace_handler(trace_filepath),
+                on_trace_ready = torch_npu.profiler.tensorboard_trace_handler(
+                    trace_filepath
+                ),
                 record_shapes=profile_record_shapes,
                 with_stack=True,
                 profile_memory=True,
@@ -455,7 +465,7 @@ def _get_torch_profiler_output_dir():
     return os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
 
 
-def _create_torch_profiler_filename(
+def _create_torch_profiler_path(
     profile_filename_prefix, batch_size, input_len, output_len, stage, suffix=""
 ):
     output_dir = _get_torch_profiler_output_dir()
@@ -566,7 +576,7 @@ def latency_test_run_once(
     profiler = None
     enable_profile_prefill = profile and profile_stage in ["all", "prefill"]
     if enable_profile_prefill:
-        trace_filepath = _create_torch_profiler_filename(
+        trace_filepath = _create_torch_profiler_path(
             profile_filename_prefix, batch_size, input_len, output_len, "prefill", ""
         )
         profiler = start_profile(
@@ -583,8 +593,13 @@ def latency_test_run_once(
     prefill_latency = time.perf_counter() - tic
 
     if enable_profile_prefill:
-        trace_filename = _create_torch_profiler_filename(
-            profile_filename_prefix, batch_size, input_len, output_len, "prefill", ".trace.json.gz"
+        trace_filename = _create_torch_profiler_path(
+            profile_filename_prefix,
+            batch_size, 
+            input_len, 
+            output_len, 
+            "prefill", 
+            ".trace.json.gz",
         )
         stop_profile(
             profiler,
@@ -610,7 +625,7 @@ def latency_test_run_once(
         synchronize(device)
         profiler = None
         if enable_profile_decode and i == profile_step_of_interest:
-            trace_filepath = _create_torch_profiler_filename(
+            trace_filepath = _create_torch_profiler_path(
                 profile_filename_prefix, batch_size, input_len, output_len, "decode", ""
             )
             profiler = start_profile(
@@ -626,8 +641,13 @@ def latency_test_run_once(
         latency = time.perf_counter() - tic
 
         if enable_profile_decode and i == profile_step_of_interest:
-            trace_filename = _create_torch_profiler_filename(
-                profile_filename_prefix, batch_size, input_len, output_len, "decode", ".trace.json.gz"
+            trace_filename = _create_torch_profiler_path(
+                profile_filename_prefix, 
+                batch_size, 
+                input_len, 
+                output_len, 
+                "decode", 
+                ".trace.json.gz"
             )
             stop_profile(
                 profiler,
