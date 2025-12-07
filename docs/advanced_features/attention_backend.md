@@ -6,7 +6,7 @@ You can test them according to your needs.
 ```{important}
 Selecting an optimal attention backend is crucial for maximizing your performance. Different backends excel in various scenarios, so choose based on your model, hardware, and use case. Not all backends are supported on all platforms and model architectures.
 
-If you don't specify `--attention-backend`, SGLang does the best effort to automatically select the most performant backend based on your hardware and model architecture.
+If you don't specify `--attention-backend`, SGLang makes a best effort to automatically select the most performant backend based on your hardware and model architecture.
 ```
 
 ## Support Matrix
