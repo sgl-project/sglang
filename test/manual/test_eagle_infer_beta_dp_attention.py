@@ -19,7 +19,71 @@ from sglang.test.test_utils import (
 )
 
 
+def test_gsm8k(base_url: str):
+    requests.get(base_url + "/flush_cache")
+
+    args = SimpleNamespace(
+        num_shots=5,
+        data_path=None,
+        num_questions=200,
+        max_new_tokens=512,
+        parallel=128,
+        host="http://127.0.0.1",
+        port=int(base_url.split(":")[-1]),
+    )
+    metrics = run_eval_few_shot_gsm8k(args)
+    server_info = requests.get(base_url + "/get_server_info")
+    avg_spec_accept_length = server_info.json()["internal_states"][0][
+        "avg_spec_accept_length"
+    ]
+
+    print(f"{metrics=}")
+    print(f"{avg_spec_accept_length=}")
+    return metrics, avg_spec_accept_length
+
+
+class TestEagleDPAttnServerSmall(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = [
+            "--tp-size",
+            "2",
+            "--dp-size",
+            "2",
+            "--enable-dp-attention",
+            "--speculative-draft-model-path",
+            DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+        ]
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=other_args,
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_a_gsm8k(self):
+        metrics, avg_spec_accept_length = test_gsm8k(self.base_url)
+        self.assertGreater(metrics["accuracy"], 0.94)
+        self.assertGreater(avg_spec_accept_length, 2.04)
+
+
 class TestEagleDPAttnServerLarge(CustomTestCase):
+    # FIXME: move this large mode test into nightly tests
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST
@@ -59,104 +123,17 @@ class TestEagleDPAttnServerLarge(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_a_gsm8k(
-        self,
-    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
-        requests.get(self.base_url + "/flush_cache")
+    def test_a_gsm8k(self):
+        metrics, avg_spec_accept_length = test_gsm8k(self.base_url)
 
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-
+        self.assertGreater(metrics["accuracy"], 0.94)
+        self.assertGreater(avg_spec_accept_length, 2.04)
         if is_in_ci():
             write_github_step_summary(
                 f"### test_gsm8k (deepseek-v3-fp4 mtp)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["accuracy"], 0.94)
-            self.assertGreater(avg_spec_accept_length, 2.04)
-
-
-class TestEagleDPAttnServerSmall(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        other_args = [
-            "--tp-size",
-            "2",
-            "--dp-size",
-            "2",
-            "--enable-dp-attention",
-            "--speculative-draft-model-path",
-            DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "3",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "4",
-        ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-                other_args=other_args,
-            )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_a_gsm8k(
-        self,
-    ):  # Append an "a" to make this test run first (alphabetically) to warm up the server
-        requests.get(self.base_url + "/flush_cache")
-
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-
-        server_info = requests.get(self.base_url + "/get_server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-
-        if is_in_ci():
-            write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3-fp4 mtp)\n"
-                f'{metrics["accuracy"]=:.3f}\n'
-                f"{avg_spec_accept_length=:.2f}\n"
-            )
-            self.assertGreater(metrics["accuracy"], 0.94)
-            self.assertGreater(avg_spec_accept_length, 2.04)
 
 
 if __name__ == "__main__":
