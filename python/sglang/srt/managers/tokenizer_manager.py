@@ -27,7 +27,7 @@ import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
-from enum import Enum
+from enum import Enum, auto
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
@@ -72,6 +72,7 @@ from sglang.srt.managers.multimodal_processor import get_mm_processor, import_pr
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -140,6 +141,12 @@ class ReqState:
     input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+
+
+class InputFormat(Enum):
+    SINGLE_STRING = auto()
+    BATCH_STRING = auto()
+    CROSS_ENCODER_PAIRS = auto()
 
 
 class TokenizerManager(TokenizerCommunicatorMixin):
@@ -414,7 +421,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
-    ) -> str:
+    ) -> InputFormat:
         """Detect the format of input texts for proper tokenization handling.
 
         Returns:
@@ -423,7 +430,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             - "cross_encoder_pairs": Cross-encoder pairs like [["query", "document"]]
         """
         if isinstance(texts, str):
-            return "single_string"
+            return InputFormat.SINGLE_STRING
 
         if (
             is_cross_encoder
@@ -439,9 +446,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self, texts: Union[str, List[str]], input_format: str
     ) -> Union[List[str], List[List[str]]]:
         """Prepare input for the tokenizer based on detected format."""
-        if input_format == "single_string":
+        if input_format == InputFormat.SINGLE_STRING:
             return [texts]  # Wrap single string for batch processing
-        elif input_format == "cross_encoder_pairs":
+        elif input_format == InputFormat.CROSS_ENCODER_PAIRS:
             return texts  # Already in correct format: [["query", "doc"]]
         else:  # batch_strings
             return texts  # Already in correct format: ["text1", "text2"]
@@ -460,7 +467,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         # For single inputs (string or single cross-encoder pair), extract first element
         if (
-            input_format in ["single_string", "cross_encoder_pairs"]
+            input_format in [InputFormat.SINGLE_STRING, InputFormat.CROSS_ENCODER_PAIRS]
             and original_batch_size == 1
         ):
             single_input_ids = input_ids[0] if input_ids else []
@@ -524,7 +531,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         # Step 3: Choose tokenization strategy
         use_async_tokenizer = (
             self.async_dynamic_batch_tokenizer is not None
-            and input_format == "single_string"
+            and input_format == InputFormat.SINGLE_STRING
         )
 
         if use_async_tokenizer:
@@ -612,25 +619,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
         """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-        # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
 
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.reserve_input_token_num
-        if input_token_num >= self.context_len:
-            if self.server_args.allow_auto_truncate:
-                logger.warning(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
-                )
-                del input_ids[_max_req_len:]
-                input_token_num = len(input_ids)
-            else:
-                raise ValueError(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)."
-                )
+
+        error_msg = validate_input_length(input_token_num, self.context_len)
+        if error_msg:
+            raise ValueError(
+                f"The input ({input_token_num} tokens) is longer than the "
+                f"model's context length ({self.context_len} tokens)."
+            )
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
