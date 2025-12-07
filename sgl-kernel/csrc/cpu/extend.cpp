@@ -6,10 +6,10 @@
 namespace {
 
 // [NOTE]: extend attention for CPU
-//   1. tune BLOCK_M and BLOCK_N
-//   2. can handle non-contiguous k_exttend and v_extend
+//   1. BLOCK_M and BLOCK_N tuned for various seq lengths
+//   2. can handle non-contiguous k_extend and v_extend
 //   3. computes attention for prefix and extend separately
-//   4. TODO: vectorize `pack_vnni` and `pack_vnni2`
+//   4. TODO: apply head dimension blocking to optimize GQA
 //
 
 template <typename scalar_t>
@@ -407,6 +407,60 @@ void extend_attention_kernel_impl(
 
 }  // anonymous namespace
 
+template <int BLOCK_M, int BLOCK_N>
+inline int resize_buffer(at::Tensor& buffer, int num_threads, int head_size, int head_size_v) {
+  const int size_per_thread =
+      /* s_i     */ BLOCK_M * BLOCK_N * sizeof(float) +
+      /* v_prime */ BLOCK_M * head_size_v * sizeof(float) +
+      /* s_delta */ BLOCK_M * BLOCK_N * sizeof(uint16_t) +
+      /* Btmp    */ BLOCK_N * std::max(head_size, head_size_v) * sizeof(uint16_t);
+
+  buffer.resize_({num_threads, size_per_thread});
+  return size_per_thread;
+}
+
+#define LAUNCH_EXTEND_ATTENTION_KERNEL(BLOCK_M, BLOCK_N)                                   \
+  do {                                                                                     \
+    int sz = resize_buffer<BLOCK_M, BLOCK_N>(buffer, num_threads, head_size, head_size_v); \
+                                                                                           \
+    extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(                     \
+        o_extend.data_ptr<scalar_t>(),                                                     \
+        q_extend.data_ptr<scalar_t>(),                                                     \
+        k_extend.data_ptr<scalar_t>(),                                                     \
+        v_extend.data_ptr<scalar_t>(),                                                     \
+        k_buffer.data_ptr<scalar_t>(),                                                     \
+        v_buffer.data_ptr<scalar_t>(),                                                     \
+        req_to_token.data_ptr<index_t>(),                                                  \
+        req_pool_indices.data_ptr<int64_t>(),                                              \
+        seq_lens.data_ptr<int64_t>(),                                                      \
+        extend_seq_lens.data_ptr<index_t>(),                                               \
+        extend_start_loc.data_ptr<index_t>(),                                              \
+        buffer.data_ptr(),                                                                 \
+        num_seqs,                                                                          \
+        num_heads,                                                                         \
+        num_heads_kv,                                                                      \
+        head_size,                                                                         \
+        head_size_v,                                                                       \
+        q_strideM,                                                                         \
+        q_strideH,                                                                         \
+        ke_strideN,                                                                        \
+        ke_strideH,                                                                        \
+        ve_strideN,                                                                        \
+        ve_strideH,                                                                        \
+        k_strideN,                                                                         \
+        k_strideH,                                                                         \
+        v_strideN,                                                                         \
+        v_strideH,                                                                         \
+        sm_scale,                                                                          \
+        logit_cap,                                                                         \
+        max_num_reqs,                                                                      \
+        max_context_len,                                                                   \
+        max_total_num_tokens,                                                              \
+        max_len_extend,                                                                    \
+        sz,                                                                                \
+        is_prefix_skipped);                                                                \
+  } while (0)
+
 // q_extend, k_extend, v_extend, o_extend: contiguous tensors
 // k_buffer, v_buffer: (prefix + extend) tensors in mem_manager
 //
@@ -450,7 +504,8 @@ void extend_attention_cpu(
            req_pool_indices,
            seq_lens,
            extend_seq_lens,
-           extend_start_loc}));
+           extend_start_loc,
+           max_len_extend}));
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_extend);
   CHECK_INPUT(o_extend);
@@ -512,58 +567,20 @@ void extend_attention_cpu(
   TORCH_CHECK(head_size % 32 == 0, "invalid head_size ", head_size);
   TORCH_CHECK(head_size_v % 32 == 0, "invalid head_size_v ", head_size_v);
 
-  // block size for query seq length
-  constexpr int BLOCK_M = 32;
-  // block size for key/value seq length
-  constexpr int BLOCK_N = 32;
-
-  const int size_per_thread =
-      /* s_i     */ BLOCK_M * BLOCK_N * sizeof(float) +
-      /* v_prime */ BLOCK_M * head_size_v * sizeof(float) +
-      /* s_delta */ BLOCK_M * BLOCK_N * sizeof(uint16_t) +
-      /* Btmp    */ BLOCK_N * std::max(head_size, head_size_v) * sizeof(uint16_t);
-
   int num_threads = at::get_num_threads();
-  auto buffer = at::empty({num_threads, size_per_thread}, q_extend.options().dtype(at::kChar));
+  auto buffer = at::empty({}, q_extend.options().dtype(at::kChar));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
-      extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(
-          o_extend.data_ptr<scalar_t>(),
-          q_extend.data_ptr<scalar_t>(),
-          k_extend.data_ptr<scalar_t>(),
-          v_extend.data_ptr<scalar_t>(),
-          k_buffer.data_ptr<scalar_t>(),
-          v_buffer.data_ptr<scalar_t>(),
-          req_to_token.data_ptr<index_t>(),
-          req_pool_indices.data_ptr<int64_t>(),
-          seq_lens.data_ptr<int64_t>(),
-          extend_seq_lens.data_ptr<index_t>(),
-          extend_start_loc.data_ptr<index_t>(),
-          buffer.data_ptr(),
-          num_seqs,
-          num_heads,
-          num_heads_kv,
-          head_size,
-          head_size_v,
-          q_strideM,
-          q_strideH,
-          ke_strideN,
-          ke_strideH,
-          ve_strideN,
-          ve_strideH,
-          k_strideN,
-          k_strideH,
-          v_strideN,
-          v_strideH,
-          sm_scale,
-          logit_cap,
-          max_num_reqs,
-          max_context_len,
-          max_total_num_tokens,
-          max_len_extend,
-          size_per_thread,
-          is_prefix_skipped);
+      if (max_len_extend <= 256) {
+        LAUNCH_EXTEND_ATTENTION_KERNEL(32, 64);
+      } else if (max_len_extend <= 1024) {
+        LAUNCH_EXTEND_ATTENTION_KERNEL(128, 256);
+      } else if (max_len_extend <= 4096) {
+        LAUNCH_EXTEND_ATTENTION_KERNEL(256, 768);
+      } else {  // max_len_extend > 4096
+        LAUNCH_EXTEND_ATTENTION_KERNEL(512, 768);
+      }
     });
   });
 }
