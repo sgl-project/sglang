@@ -1282,6 +1282,8 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+                if self.attention_backend is None:
+                    self.attention_backend = "triton"
                 if (
                     not self.disable_radix_cache
                     and self.attention_backend == "trtllm_mha"
