@@ -268,7 +268,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Install flash_attn
 # flash_attn is required by transformer 5.x in case if not yet installed
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install flash_attn --no-build-isolation
+    python3 -c "import flash_attn" 2>/dev/null \
+    || python3 -m pip install flash_attn --no-build-isolation
 
 # Install essential Python packages
 RUN --mount=type=cache,target=/root/.cache/pip \
