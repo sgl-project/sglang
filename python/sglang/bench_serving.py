@@ -46,6 +46,100 @@ print("sys.path:", sys.path)
 print("all dists:", [d.metadata["Name"] for d in m.distributions()])
 print("packages_distributions for xxx:", m.packages_distributions().get("xxx"))
 print("", flush=True)
+
+
+def debug_sgl_kernel_flash_attn(
+    dist_name: str = "sgl-kernel",
+    module_names=("flash_attn", "sgl_kernel"),
+):
+    """
+    Debug why a module (e.g. flash_attn) appears in importlib.metadata.packages_distributions()
+    locally but not in CI.
+
+    It prints:
+    1) Python executable and distribution info
+    2) Files contained in the distribution and inferred top-level packages
+    3) Actual import behavior for the given module names
+    """
+    import importlib
+    import sys
+
+    # importlib.metadata / importlib_metadata compatibility
+    try:
+        import importlib.metadata as m
+    except ImportError:  # very old Python
+        import importlib_metadata as m  # type: ignore
+
+    print("========== STEP 1: Python & distribution info ==========")
+    print("sys.executable:", sys.executable)
+    print("sys.version   :", sys.version.replace("\n", " "))
+
+    # Check whether the target distribution is installed
+    try:
+        dist = m.distribution(dist_name)
+        print(f"{dist_name!r} is INSTALLED, version =", dist.version)
+    except m.PackageNotFoundError:
+        print(f"{dist_name!r} is NOT INSTALLED")
+        dist = None
+
+    # Try packages_distributions() (may not exist in very old versions)
+    packages_distributions = getattr(m, "packages_distributions", None)
+    if packages_distributions is None:
+        print("\nimportlib.metadata does not have packages_distributions().")
+        pkg_map = {}
+    else:
+        pkg_map = packages_distributions()
+        print("\npackages_distributions() for selected keys:")
+        for name in module_names:
+            print(f"  {name!r}: {pkg_map.get(name)}")
+
+    print("\n========== STEP 2: Distribution files & top-level packages ==========")
+    if dist is not None:
+        files = list(dist.files or [])
+        print(f"{dist_name!r} dist.files count:", len(files))
+
+        # All files that contain "flash_attn" in the path (you can adjust this filter)
+        flash_related = [str(f) for f in files if "flash_attn" in str(f)]
+        print("Number of files containing 'flash_attn':", len(flash_related))
+        for f in flash_related[:50]:
+            print("  ", f)
+        if len(flash_related) > 50:
+            print("  ... (more omitted)")
+
+        # Infer top-level packages from dist.files
+        top_level = set()
+        for f in files:
+            parts = str(f).split("/")
+            if parts and parts[0] and not parts[0].endswith(".dist-info"):
+                top_level.add(parts[0])
+        print("\nTop-level package names inferred from dist.files:")
+        for name in sorted(top_level):
+            print("  ", name)
+    else:
+        print(f"{dist_name!r} is not installed, skipping dist.files inspection.")
+
+    print("\n========== STEP 3: Import checks ==========")
+    for mod in module_names:
+        print(f"\n>>> Checking module {mod!r}")
+        # Metadata mapping
+        if pkg_map:
+            print("packages_distributions().get(...) ->", pkg_map.get(mod))
+        else:
+            print(
+                "packages_distributions() not available or empty; skipping map lookup."
+            )
+
+        # Actual import attempt
+        try:
+            module = importlib.import_module(mod)
+            print("import succeeded, __file__ =", getattr(module, "__file__", None))
+        except Exception as e:
+            print("import FAILED:", repr(e))
+
+    print("\n========== DONE ==========")
+
+
+debug_sgl_kernel_flash_attn()
 from tqdm.asyncio import tqdm
 from transformers import (
     AutoProcessor,
