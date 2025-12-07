@@ -14,10 +14,10 @@ struct PanicError : public std::runtime_error {
  public:
   // copy and move constructors
   explicit PanicError(std::string msg) : runtime_error(msg), m_message(std::move(msg)) {}
-  auto detail() const -> std::string_view {
-    const auto sv = std::string_view{m_message};
-    const auto pos = sv.find(": ");
-    return pos == std::string_view::npos ? sv : sv.substr(pos + 2);
+  auto root_cause() const -> std::string_view {
+    const auto str = std::string_view{m_message};
+    const auto pos = str.find(": ");
+    return pos == std::string_view::npos ? str : str.substr(pos + 2);
   }
 
  private:
@@ -50,8 +50,21 @@ struct RuntimeCheck {
   }
 };
 
+template <typename... Args>
+struct Panic {
+  explicit Panic(Args&&... args, std::source_location location = std::source_location::current()) {
+    ::host::panic(location, std::forward<Args>(args)...);
+  }
+  [[noreturn]] ~Panic() {
+    std::terminate();
+  }
+};
+
 template <typename Cond, typename... Args>
 explicit RuntimeCheck(Cond&&, Args&&...) -> RuntimeCheck<Args...>;
+
+template <typename... Args>
+explicit Panic(Args&&...) -> Panic<Args...>;
 
 template <std::signed_integral T, std::signed_integral U>
 inline constexpr auto div_ceil(T a, U b) {
