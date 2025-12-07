@@ -8,15 +8,18 @@ Base class for all pipeline executors.
 import contextlib
 import os
 from abc import ABC, abstractmethod
-from typing import List
+from typing import TYPE_CHECKING, List
 
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+
+if TYPE_CHECKING:
+    # Only for type checkers; avoids runtime circular import
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
 
@@ -141,7 +144,7 @@ class PipelineExecutor(ABC):
     @abstractmethod
     def execute(
         self,
-        stages: List[PipelineStage],
+        stages: List["PipelineStage"],
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
