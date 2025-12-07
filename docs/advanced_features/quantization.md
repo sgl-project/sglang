@@ -12,7 +12,7 @@ on-the-fly to convert high-precision weights into a lower-precision format.
 **Note: For better performance, usability and convenience, offline quantization is recommended over online quantization.**
 
 If you use a pre-quantized model, do not add `--quantization` to enable online quantization at the same time.
-For popular pre-quantized models, please visit [Unsloth](https://huggingface.co/unsloth), [ModelCloud](https://huggingface.co/collections/ModelCloud/vortex-673743382af0a52b2a8b9fe2)
+For popular pre-quantized models, please visit [Unsloth](https://huggingface.co/unsloth), [NVIDIA ModelOpt](https://huggingface.co/collections/nvidia/inference-optimized-checkpoints-with-model-optimizer)
 or [NeuralMagic](https://huggingface.co/collections/neuralmagic) collections on HF for some
 popular quality validated quantized models. Quantized models must be validated via benchmarks post-quantization
 to guard against abnormal quantization loss regressions.

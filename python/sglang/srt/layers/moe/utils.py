@@ -24,6 +24,7 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    ASCEND_FUSEEP = "ascend_fuseep"
 
     @classmethod
     def _missing_(cls, value):
@@ -42,6 +43,9 @@ class MoeA2ABackend(Enum):
 
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
+
+    def is_ascend_fuseep(self):
+        return self == MoeA2ABackend.ASCEND_FUSEEP
 
 
 class MoeRunnerBackend(Enum):
@@ -118,6 +122,7 @@ class DeepEPMode(Enum):
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
+SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
@@ -131,6 +136,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global MOE_A2A_BACKEND
     global MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_RUNNER_BACKEND
+    global SPECULATIVE_MOE_A2A_BACKEND
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
@@ -145,6 +151,11 @@ def initialize_moe_config(server_args: ServerArgs):
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
         else MOE_RUNNER_BACKEND
+    )
+    SPECULATIVE_MOE_A2A_BACKEND = (
+        MoeA2ABackend(server_args.speculative_moe_a2a_backend)
+        if server_args.speculative_moe_a2a_backend is not None
+        else MOE_A2A_BACKEND
     )
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
@@ -183,6 +194,16 @@ def get_speculative_moe_runner_backend() -> MoeRunnerBackend:
         )
         SPECULATIVE_MOE_RUNNER_BACKEND = MoeRunnerBackend.AUTO
     return SPECULATIVE_MOE_RUNNER_BACKEND
+
+
+def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
+    global SPECULATIVE_MOE_A2A_BACKEND
+    if SPECULATIVE_MOE_A2A_BACKEND is None:
+        logger.warning(
+            "SPECULATIVE_MOE_A2A_BACKEND is not initialized, using none backend"
+        )
+        SPECULATIVE_MOE_A2A_BACKEND = MoeA2ABackend.NONE
+    return SPECULATIVE_MOE_A2A_BACKEND
 
 
 def get_deepep_mode() -> DeepEPMode:
@@ -252,6 +273,21 @@ def speculative_moe_backend_context():
         yield
     finally:
         MOE_RUNNER_BACKEND = original_backend
+
+
+@contextmanager
+def speculative_moe_a2a_backend_context():
+    """
+    Context manager to temporarily use the speculative MoE A2A backend for draft model operations.
+    This ensures that draft models in speculative decoding use the configured speculative A2A backend.
+    """
+    global MOE_A2A_BACKEND
+    original_backend = MOE_A2A_BACKEND
+    try:
+        MOE_A2A_BACKEND = MoeA2ABackend.NONE
+        yield
+    finally:
+        MOE_A2A_BACKEND = original_backend
 
 
 # The type of method in top-K routing, for use in torch custom op

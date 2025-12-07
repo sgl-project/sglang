@@ -8,13 +8,9 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
-import logging
+import dataclasses
 
-# Suppress verbose logging from imageio, which is triggered when saving images.
-logging.getLogger("imageio").setLevel(logging.WARNING)
-logging.getLogger("imageio_ffmpeg").setLevel(logging.WARNING)
-
-from sglang.multimodal_gen.configs.sample.base import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -31,11 +27,12 @@ def prepare_request(
     Settle SamplingParams according to ServerArgs
 
     """
-    # Create a copy of inference args to avoid modifying the original
-    req = Req(
-        **shallow_asdict(sampling_params),
-        VSA_sparsity=server_args.VSA_sparsity,
-    )
+    # Create a copy of inference args to avoid modifying the original.
+    # Filter out fields not defined in Req to avoid unexpected-kw TypeError.
+    params_dict = shallow_asdict(sampling_params)
+    req_field_names = {f.name for f in dataclasses.fields(Req)}
+    filtered_params = {k: v for k, v in params_dict.items() if k in req_field_names}
+    req = Req(**filtered_params, VSA_sparsity=server_args.VSA_sparsity)
     req.adjust_size(server_args)
 
     if req.width <= 0 or req.height <= 0:
