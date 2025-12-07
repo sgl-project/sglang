@@ -86,9 +86,11 @@ fi
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
     # so we can only use pip with `--break-system-packages`
-    PIP_CMD="pip"
+    pip install --upgrade pip
+    pip install uv
+    PIP_CMD="uv pip"
+    export UV_SYSTEM_PYTHON=true
     PIP_INSTALL_SUFFIX="--break-system-packages"
-    $PIP_CMD install --upgrade pip
 
     # Clean up existing installations
     $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
