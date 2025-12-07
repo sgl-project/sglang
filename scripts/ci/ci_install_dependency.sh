@@ -86,15 +86,14 @@ fi
 if [ "$IS_BLACKWELL" = "1" ]; then
     # The blackwell CI runner has some issues with pip and uv,
     # so we can only use pip with `--break-system-packages`
-    pip install --upgrade pip
-    pip install uv
-    PIP_CMD="uv pip"
-    export UV_SYSTEM_PYTHON=true
+    PIP_CMD="pip"
     PIP_INSTALL_SUFFIX="--break-system-packages"
+    $PIP_CMD install --upgrade pip
 
     # Clean up existing installations
     $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
     $PIP_CMD uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_INSTALL_SUFFIX || true
+    $PIP_CMD install "importlib-metadata>=4.7" $PIP_INSTALL_SUFFIX
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
