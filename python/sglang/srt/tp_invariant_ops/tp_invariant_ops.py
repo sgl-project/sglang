@@ -345,8 +345,6 @@ def enable_tp_invariant_mode():
     if _tp_inv_MODE:
         return
 
-    print("Enabling TP invariant mode.")
-
     _tp_inv_MODE = True
 
 

@@ -34,6 +34,7 @@ from sglang.srt.layers.parameter import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.tp_invariant_ops import is_tp_invariant_mode_enabled
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -1378,7 +1379,15 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
 
-        from sglang.srt.tp_invariant_ops import is_tp_invariant_mode_enabled
+        if (
+            is_tp_invariant_mode_enabled()
+            and self.tp_size > 1
+            and (skip_all_reduce or not self.reduce_results)
+            and self.bias is not None
+        ):
+            raise NotImplementedError(
+                "Bias addition with TP invariant mode and tp_size>1 is not supported yet."
+            )
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
@@ -1394,13 +1403,23 @@ class RowParallelLinear(LinearBase):
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             if is_tp_invariant_mode_enabled():
+                # use tree-structure all reduce
                 output = tensor_model_parallel_tree_all_reduce(output_parallel)
-                if (not self.skip_bias_add) and self.bias is not None:
-                    output += self.bias
             else:
                 output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
+
+        if (
+            is_tp_invariant_mode_enabled()
+            and self.bias is not None
+            and (
+                (not self.skip_bias_add and not skip_all_reduce and self.reduce_results)
+                or self.tp_size == 1
+            )
+        ):
+            # In TP invariant mode, bias is added after all-reduce
+            output += self.bias
 
         output_bias = self.bias if self.skip_bias_add else None
 

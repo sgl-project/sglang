@@ -25,6 +25,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_tree_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -775,7 +776,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     hidden_states, residual
                 )
             else:
-                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                if get_global_server_args().rl_on_policy_target == "fsdp_tp":
+                    hidden_states = tensor_model_parallel_tree_all_reduce(hidden_states)
+                else:
+                    hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)

@@ -518,7 +518,7 @@ class ModelRunner:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
-        if server_args.enable_tp_deterministic_inference:
+        if server_args.rl_on_policy_target == "fsdp_tp":
             from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
 
             enable_tp_invariant_mode()
