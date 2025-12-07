@@ -767,7 +767,6 @@ class ForwardBatch:
         if (
             self.forward_mode.is_decode()
             or self.forward_mode.is_target_verify()
-            or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
