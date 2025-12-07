@@ -380,5 +380,3 @@ class QwenImageMultiControlNetModel(ModelMixin):
 
         return control_block_samples
 
-# Register as EntryClass for automatic discovery
-EntryClass = QwenImageControlNetModel
