@@ -670,7 +670,7 @@ class EAGLEWorker(TpModelWorker):
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
         spec_info.prepare_for_verify(batch, self.page_size)
-        spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
+        spec_info.num_tokens_per_batch = spec_info.draft_token_num
         batch.return_hidden_states = False
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
