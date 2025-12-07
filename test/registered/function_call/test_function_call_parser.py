@@ -1357,7 +1357,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                         ] += call.parameters
 
         # Verify that the no-parameter function was correctly parsed
-        self.assertEqual(len(tool_calls_by_index), 1, "Should have exactly one tool call")
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
         self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
 
         # Parameters should be empty JSON object
@@ -1410,7 +1412,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                         ] += call.parameters
 
         # Should still parse correctly even with whitespace-only content
-        self.assertEqual(len(tool_calls_by_index), 1, "Should have exactly one tool call")
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
         self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params, {})
