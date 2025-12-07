@@ -1168,7 +1168,7 @@ jobs:
           python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 2 --timeout-per-file 1800
 
   unit-test-backend-4-gpu-gb200:
-    needs: [check-changes, call-gate, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
+    needs: [check-changes, call-gate, stage-a-test-1, sgl-kernel-build-wheels-arm]
     if: |
       always() &&
       (
