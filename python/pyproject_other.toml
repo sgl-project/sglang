@@ -104,7 +104,7 @@ test = [
   "tabulate",
 ]
 diffusion = [
-  "diffusers==0.35.2",
+  "diffusers @ git+https://github.com/huggingface/diffusers.git@6290fdfda40610ce7b99920146853614ba529c6e",
   "opencv-python==4.10.0.84",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
