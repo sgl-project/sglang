@@ -2,6 +2,23 @@
 
 Auto-tune Triton FP8/INT8 block-wise quantization kernels for optimal performance.
 
+## When to Use Triton FP8 Block-wise Quantization Kernel vs DeepGEMM
+
+**Use Triton FP8 Block-wise Quantization Kernel when:**
+- Output dtype is NOT `bfloat16` (e.g., `float16`, `float32`)
+- DeepGEMM is disabled (environment variable `SGLANG_ENABLE_JIT_DEEPGEMM=0`)
+- Running on GPUs with compute capability < SM90 (DeepGEMM requires SM90+)
+- You need cross-platform compatibility (Triton works on both NVIDIA and AMD GPUs)
+
+**Use DeepGEMM when:**
+- Output dtype is `bfloat16` AND DeepGEMM is enabled
+- Running on NVIDIA GPUs with compute capability >= SM90 (e.g., H100, H200)
+- Need maximum performance for production workloads (DeepGEMM is highly optimized for Hopper architecture)
+
+**Note:** DeepGEMM requires CUDA compute capability >= 9.0 (SM90+). It is specifically optimized for NVIDIA Hopper GPUs (H100/H200).
+
+The kernel selection logic in SGLang automatically chooses DeepGEMM when conditions are met (see `w8a8_block_fp8_matmul` function in `fp8_kernel.py`), otherwise falls back to Triton implementation.
+
 ## Quick Start
 
 **Default (DeepSeek-V3):**
