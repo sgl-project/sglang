@@ -105,7 +105,7 @@ void extend_attention_kernel_impl(
     bool is_prefix_skipped) {
   using Vec = at::vec::Vectorized<float>;
 
-  // make sure that `last_col` index is always positive
+  // Ensure BLOCK_M <= BLOCK_N to prevent potential buffer overflows during causal masking
   static_assert(BLOCK_M <= BLOCK_N);
 
   // strides
