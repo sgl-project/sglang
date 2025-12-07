@@ -225,6 +225,8 @@ struct Router {
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
     ca_cert_paths: Vec<String>,
+    enable_trace: bool,
+    otlp_traces_endpoint: String,
 }
 
 impl Router {
@@ -311,6 +313,11 @@ impl Router {
             _ => None,
         };
 
+        let trace_config = Some(config::TraceConfig {
+            enable_trace: self.enable_trace,
+            otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
+        });
+
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
@@ -378,6 +385,7 @@ impl Router {
             .maybe_api_key(self.api_key.as_ref())
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
+            .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
@@ -480,6 +488,8 @@ impl Router {
         client_cert_path = None,
         client_key_path = None,
         ca_cert_paths = vec![],
+        enable_trace = false,
+        otlp_traces_endpoint = String::from("localhost:4317"),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -556,6 +566,8 @@ impl Router {
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
         ca_cert_paths: Vec<String>,
+        enable_trace: bool,
+        otlp_traces_endpoint: String,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -646,6 +658,8 @@ impl Router {
             client_cert_path,
             client_key_path,
             ca_cert_paths,
+            enable_trace,
+            otlp_traces_endpoint,
         })
     }
 

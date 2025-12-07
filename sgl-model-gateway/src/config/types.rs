@@ -23,6 +23,7 @@ pub struct RouterConfig {
     pub api_key: Option<String>,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
+    pub trace_config: Option<TraceConfig>,
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
@@ -466,6 +467,21 @@ impl Default for MetricsConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceConfig {
+    pub enable_trace: bool,
+    pub otlp_traces_endpoint: String,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enable_trace: false,
+            otlp_traces_endpoint: "localhost:4317".to_string(),
+        }
+    }
+}
+
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
@@ -483,6 +499,7 @@ impl Default for RouterConfig {
             api_key: None,
             discovery: None,
             metrics: None,
+            trace_config: None,
             log_dir: None,
             log_level: None,
             request_id_headers: None,
@@ -549,6 +566,14 @@ impl RouterConfig {
         self.metrics.is_some()
     }
 
+    /// Check if tracing is enabled
+    pub fn has_tracing(&self) -> bool {
+        match &self.trace_config {
+            Some(trace_config) => trace_config.enable_trace,
+            None => false,
+        }
+    }
+
     /// Compute the effective retry config considering disable flag
     pub fn effective_retry_config(&self) -> RetryConfig {
         let mut cfg = self.retry.clone();
@@ -593,6 +618,7 @@ mod tests {
         assert_eq!(config.worker_startup_check_interval_secs, 30);
         assert!(config.discovery.is_none());
         assert!(config.metrics.is_none());
+        assert!(config.trace_config.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
     }
@@ -641,6 +667,7 @@ mod tests {
         assert_eq!(config.log_level, deserialized.log_level);
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
+        assert!(deserialized.trace_config.is_none());
     }
 
     #[test]
@@ -903,6 +930,25 @@ mod tests {
     }
 
     #[test]
+    fn test_trace_config_default() {
+        let config = TraceConfig::default();
+
+        assert!(!config.enable_trace);
+        assert_eq!(config.otlp_traces_endpoint, "localhost:4317");
+    }
+
+    #[test]
+    fn test_trace_config_custom() {
+        let config = TraceConfig {
+            enable_trace: true,
+            otlp_traces_endpoint: "otel-collector:4317".to_string(),
+        };
+
+        assert!(config.enable_trace);
+        assert_eq!(config.otlp_traces_endpoint, "otel-collector:4317");
+    }
+
+    #[test]
     fn test_mode_type() {
         let config = RouterConfig::builder()
             .regular_mode(vec![])
@@ -941,6 +987,17 @@ mod tests {
             .metrics_config(MetricsConfig::default())
             .build_unchecked();
         assert!(config.has_metrics());
+    }
+
+    #[test]
+    fn test_has_tracing() {
+        let config = RouterConfig::default();
+        assert!(!config.has_tracing());
+
+        let config = RouterConfig::builder()
+            .enable_trace("localhost:4317")
+            .build_unchecked();
+        assert!(config.has_tracing());
     }
 
     #[test]
@@ -1027,6 +1084,7 @@ mod tests {
                 ..Default::default()
             })
             .enable_metrics("0.0.0.0", 9090)
+            .enable_trace("localhost:4317")
             .log_dir("/var/log/sglang")
             .log_level("info")
             .max_concurrent_requests(64)
@@ -1037,6 +1095,7 @@ mod tests {
         assert_eq!(config.policy.name(), "power_of_two");
         assert!(config.has_service_discovery());
         assert!(config.has_metrics());
+        assert!(config.has_tracing());
     }
 
     #[test]
@@ -1066,6 +1125,7 @@ mod tests {
                 ..Default::default()
             })
             .metrics_config(MetricsConfig::default())
+            .enable_trace("localhost:4317")
             .log_level("debug")
             .max_concurrent_requests(64)
             .build_unchecked();
@@ -1075,6 +1135,7 @@ mod tests {
         assert_eq!(config.policy.name(), "cache_aware");
         assert!(config.has_service_discovery());
         assert!(config.has_metrics());
+        assert!(config.has_tracing());
     }
 
     #[test]
@@ -1103,6 +1164,7 @@ mod tests {
                 bootstrap_port_annotation: "mycompany.io/bootstrap".to_string(),
             })
             .enable_metrics("::", 9999) // IPv6 any
+            .enable_trace("localhost:4317")
             .log_dir("/opt/logs/sglang")
             .log_level("trace")
             .max_concurrent_requests(64)
@@ -1110,6 +1172,7 @@ mod tests {
 
         assert!(config.has_service_discovery());
         assert!(config.has_metrics());
+        assert!(config.has_tracing());
         assert_eq!(config.mode_type(), "regular");
 
         let json = serde_json::to_string_pretty(&config).unwrap();
