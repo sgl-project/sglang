@@ -461,7 +461,7 @@ class ServerArgs:
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
-    dllm_block_size: Optional[int] = None
+    dllm_algorithm_config: Optional[str] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -1282,6 +1282,21 @@ class ServerArgs:
                     logger.info(
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Qwen3NextForCausalLM"
                     )
+                if self.attention_backend is None:
+                    self.attention_backend = "triton"
+                    logger.info(
+                        "Use triton as attention backend on sm100 for Qwen3NextForCausalLM"
+                    )
+                if (
+                    not self.disable_radix_cache
+                    and self.attention_backend == "trtllm_mha"
+                ):
+                    logger.warning(
+                        "Disabling radix cache since trtllm_mha does not support page_size = 1, which is required by MambaRadixCache. "
+                        "Try to use --attention-backend triton if radix cache is necessary."
+                    )
+                    self.disable_radix_cache = True
+                    self.disable_overlap_schedule = False
         elif model_arch in [
             "NemotronHForCausalLM",
             "FalconH1ForCausalLM",
@@ -3337,13 +3352,13 @@ class ServerArgs:
             "--dllm-algorithm",
             type=str,
             default=ServerArgs.dllm_algorithm,
-            help="The diffusion LLM algorithm.",
+            help="The diffusion LLM algorithm, such as LowConfidence.",
         )
         parser.add_argument(
-            "--dllm-block-size",
-            type=int,
-            default=ServerArgs.dllm_block_size,
-            help="The number of tokens processed in each iteration of the block diffusion LLM.",
+            "--dllm-algorithm-config",
+            type=str,
+            default=ServerArgs.dllm_algorithm_config,
+            help="The diffusion LLM algorithm configurations. Must be a YAML file.",
         )
 
         # Double Sparsity
