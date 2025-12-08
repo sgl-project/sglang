@@ -1143,7 +1143,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
 
     steps:
       - name: Checkout code
@@ -1165,7 +1165,7 @@ jobs:
         timeout-minutes: 30
         run: |
           cd test/srt
-          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 2 --timeout-per-file 1800
+          python3 run_suite.py --suite per-commit-4-gpu-b200 --auto-partition-id ${{ matrix.part }}  --auto-partition-size 3 --timeout-per-file 1800
 
   unit-test-backend-4-gpu-gb200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu, sgl-kernel-build-wheels-arm]
@@ -1209,11 +1209,14 @@ jobs:
   unit-test-backend-8-gpu-b200:
     needs: [check-changes, call-gate, unit-test-backend-2-gpu]
     if: |
-      (inputs.target_stage == 'unit-test-backend-8-gpu-b200') ||
+      always() &&
       (
-        always() &&
-        (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
-        ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        (inputs.target_stage == 'unit-test-backend-8-gpu-b200') ||
+        (
+          !inputs.target_stage &&
+          (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
+          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
+        )
       )
     runs-on: 8-gpu-b200
     env:
