@@ -84,6 +84,11 @@ def run_eval(args):
         from sglang.test.simple_eval_mgsm import MGSMEval
 
         eval_obj = MGSMEval(args.num_examples, args.num_threads, languages=["en"])
+    elif args.eval_name == "aime":
+        from sglang.test.simple_eval_aime import AIMEEval
+
+        config = getattr(args, "aime_config", "AIME2025-I")
+        eval_obj = AIMEEval(args.num_examples, args.num_threads, config=config)
     elif args.eval_name == "gpqa":
         from sglang.test.simple_eval_gpqa import GPQAEval
 
@@ -207,6 +212,15 @@ if __name__ == "__main__":
         type=str,
         choices=THINKING_MODE_CHOICES,
         help="Enable thinking mode in Deepseek R1, V3.1/3.2, or Qwen3",
+    )
+
+    # AIME specific arguments
+    parser.add_argument(
+        "--aime-config",
+        type=str,
+        default="AIME2025-I",
+        choices=["AIME2025-I", "AIME2025-II"],
+        help="AIME configuration to use (default: AIME2025-I)",
     )
 
     # LongBench-v2 specific arguments
