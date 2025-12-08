@@ -80,7 +80,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-checkpoint-engine = ["checkpoint-engine==0.1.2"]
+checkpoint-engine = ["checkpoint-engine==0.2.1"]
 diffusion = [
     "diffusers==0.35.2",
     "yunchang==0.6.3.post1",
