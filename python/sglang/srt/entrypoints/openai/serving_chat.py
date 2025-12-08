@@ -209,10 +209,14 @@ class OpenAIServingChat(OpenAIServingBase):
             lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
-            bootstrap_room=request.bootstrap_room if request.bootstrap_room is not None else (
-                self._get_balanced_bootstrap_room() 
-                if self.tokenizer_manager.server_args.disaggregation_decode_enable_fake_auto 
-                else None
+            bootstrap_room=(
+                request.bootstrap_room
+                if request.bootstrap_room is not None
+                else (
+                    self._get_balanced_bootstrap_room()
+                    if self.tokenizer_manager.server_args.disaggregation_decode_enable_fake_auto
+                    else None
+                )
             ),
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
