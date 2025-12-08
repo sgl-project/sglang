@@ -322,9 +322,31 @@ class MultimodalInputs:
 
     def ensure_pad_values(self):
         """Ensure pad values are set for all items."""
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            from sglang.srt.managers.mm_utils import (
+                init_feature_buffer,
+                is_feature_buffer_initialized,
+                reset_buffer_offset,
+                try_add_to_buffer,
+            )
+
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            if not is_feature_buffer_initialized():
+                init_feature_buffer(device)
+            reset_buffer_offset()
+            for item in self.mm_items:
+                if item.feature is not None:
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = try_add_to_buffer(item.feature)
+
         for item in self.mm_items:
             if item.pad_value is None:
                 item.set_pad_value()
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            for item in self.mm_items:
+                if item.feature is not None:
+                    item.feature = item.feature.to("cpu", non_blocking=True)
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)

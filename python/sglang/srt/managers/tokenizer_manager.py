@@ -1108,8 +1108,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     if finish_reason.get("type") == "abort" and finish_reason.get(
                         "status_code"
                     ) in (
-                            HTTPStatus.SERVICE_UNAVAILABLE,
-                            HTTPStatus.INTERNAL_SERVER_ERROR,
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
                     ):
                         # This is an abort request initiated by scheduler.
                         # Delete the key to prevent resending abort request to the scheduler and
@@ -1630,7 +1630,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 state.text += recv_obj.output_strs[i]
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset:]
+                    output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1644,7 +1644,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             elif isinstance(recv_obj, BatchTokenIDOutput):
                 if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
-                    output_token_ids = state.output_ids[state.last_output_offset:]
+                    output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)
                 else:
                     state.output_ids.extend(recv_obj.output_ids[i])
@@ -1979,7 +1979,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             retraction_count = (
                 recv_obj.retraction_counts[i]
                 if getattr(recv_obj, "retraction_counts", None)
-                   and i < len(recv_obj.retraction_counts)
+                and i < len(recv_obj.retraction_counts)
                 else 0
             )
 
@@ -2498,6 +2498,7 @@ class SignalHandler:
         )
         self.tokenizer_manager.dump_requests_before_crash()
         kill_process_tree(os.getpid())
+
 
 # Note: request abort handling logic
 # We should handle all of the following cases correctly.
