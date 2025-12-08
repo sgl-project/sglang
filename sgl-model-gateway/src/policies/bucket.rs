@@ -312,25 +312,6 @@ impl LoadBalancingPolicy for BucketPolicy {
         workers.iter().position(|w| w.url() == prefill_url)
     }
 
-    fn select_worker_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<(usize, usize)> {
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-
-        let healthy_decode = get_healthy_worker_indices(decode_workers);
-        if healthy_decode.is_empty() {
-            return None;
-        }
-
-        let mut rng = rand::rng();
-        let decode_idx = rng.random_range(0..healthy_decode.len());
-
-        Some((prefill_idx, decode_idx))
-    }
-
     fn name(&self) -> &'static str {
         "bucket"
     }
