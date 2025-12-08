@@ -11,6 +11,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.eot_token = "</｜DSML｜function_calls>"
         self.invoke_begin_regex = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>'
         self.invoke_end_token = "</｜DSML｜invoke>"
-        self.parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
+        self.xml_parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
         self._last_arguments = ""
         self.current_tool_id = -1
 
@@ -117,6 +118,29 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 except (json.JSONDecodeError, ValueError):
                     parameters[param_name] = param_value.strip()
         return parameters
+
+    def parse_parameters_partially(self, invoke_content: str) -> str:
+        invoke_content_stripped = invoke_content.strip()
+        # 1. check json format
+        if invoke_content_stripped.startswith("{"):
+            return invoke_content_stripped
+
+        # 2. check xml format
+        xml_param_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)(</｜DSML｜parameter>|$)'
+        xml_param_matches = re.findall(xml_param_regex, invoke_content, re.DOTALL)
+        parameters_str = "{"
+        for param_name, param_type, param_value, is_param_end in xml_param_matches:
+            # Convert value based on type
+            if param_type == "true":  # string type
+                parameters_str += f"{param_name}: {param_value}"
+            else:
+                # Try to parse as JSON for other types
+                try:
+                    parameters_str += f"{param_name}: {json.loads(param_value.strip())}"
+                except (json.JSONDecodeError, ValueError):
+                    parameters_str[param_name] = param_value.strip()
+
+        return ""
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -203,111 +227,92 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        all_calls: list[ToolCallItem] = []
+        calls: list[ToolCallItem] = []
         try:
-            # Loop to handle multiple consecutive invoke blocks
-            while True:
-                # Try to match an invoke block (may be partial)
-                invoke_match = re.search(
-                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
-                    string=current_text,
-                    flags=re.DOTALL,
-                )
+            # Try to match an invoke block (may be partial)
+            invoke_match = re.search(
+                pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
+                string=current_text,
+                flags=re.DOTALL,
+            )
 
-                if not invoke_match:
-                    break
+            func_name = invoke_match.group(1).strip()
+            invoke_content = invoke_match.group(2)
 
-                func_name = invoke_match.group(1).strip()
-                invoke_content = invoke_match.group(2)
-                # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
-                is_tool_end = bool(invoke_match.group(3))
+            def parse_invoke_content_increment(invoke_content: str):
+                pass
 
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
+            func_args_raw = parse_invoke_content_increment(invoke_content)
 
-                # Don't pre-allocate arrays until we actually complete a tool call
-                # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
+            # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
+            is_tool_end = bool(invoke_match.group(3))
 
-                # Parse current parameters from XML/JSON
-                current_params = self._parse_parameters_from_xml(invoke_content)
-                current_args_json = json.dumps(current_params, ensure_ascii=False)
+            # Initialize state if this is the first tool call
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = [""]
 
-                # Check if tool call is complete (has closing tag)
-                if is_tool_end:
-                    # Only emit the tool call when it's complete (saw </｜DSML｜invoke>)
-                    # This ensures each function returns at most once
-                    calls_for_this_invoke: list[ToolCallItem] = []
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
 
-                    # Check if invoke_content is empty or whitespace only
-                    # If so, skip this tool call entirely (it's likely incomplete or malformed)
-                    if not invoke_content.strip():
-                        # Remove the incomplete tool call from buffer
-                        self._buffer = current_text[invoke_match.end() :]
-                        current_text = self._buffer
-                        continue
-
-                    # Send tool name
-                    calls_for_this_invoke.append(
-                        ToolCallItem(
-                            tool_index=self.current_tool_id,
-                            name=func_name,
-                            parameters="",
-                        )
+            if not self.current_tool_name_sent:
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=func_name,
+                        parameter="",
                     )
-
-                    # Send parameters as complete JSON
-                    # Always send parameters, even if empty, to maintain consistency
-                    calls_for_this_invoke.append(
+                )
+                self.current_tool_name_sent = True
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": func_name,
+                    "arguments": {},
+                }
+            else:
+                argument_diff = (
+                    func_args_raw[len(self._last_arguments) :]
+                    if func_args_raw.startswith(self._last_arguments)
+                    else func_args_raw
+                )
+                if argument_diff:
+                    calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
                             name=None,
-                            parameters=current_args_json,
+                            parameters=argument_diff,
                         )
                     )
+                    self._last_arguments += argument_diff
+                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-                    # Ensure arrays are large enough for current tool
-                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                        self.prev_tool_call_arr.append({})
-                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                        self.streamed_args_for_tool.append("")
-
+                if _is_complete_json(func_args_raw):
                     # Update the stored arguments
-                    self.prev_tool_call_arr[self.current_tool_id] = {
-                        "name": func_name,
-                        "arguments": current_params,
-                    }
-                    self.streamed_args_for_tool[self.current_tool_id] = (
-                        current_args_json
-                    )
+                    try:
+                        parsed_args = json.loads(func_args_raw)
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = parsed_args
+                    except json.JSONDecodeError:
+                        pass
 
-                    # Remove the completed tool call from buffer
-                    self._buffer = current_text[invoke_match.end() :]
-                    current_text = self._buffer  # Update for next iteration
+                    if is_tool_end:
+                        # Remove the completed tool call from buffer, keep any remaining content
+                        self._buffer = current_text[invoke_match.end(3) :]
+                    else:
+                        self._buffer = ""
 
-                    # Add calls for this invoke to all_calls
-                    all_calls.extend(calls_for_this_invoke)
-
-                    # Move to next tool call
+                    result = StreamingParseResult(normal_text="", calls=calls)
+                    # reset state
                     self.current_tool_id += 1
                     self._last_arguments = ""
                     self.current_tool_name_sent = False
-
-                    # Don't pre-allocate arrays for the next tool
-                    # Only allocate when we actually complete a tool call
-                    # This prevents _check_for_unstreamed_tool_args from sending incomplete calls
-
-                    # Continue loop to check for more invoke blocks
-                    continue
-                else:
-                    # Tool call not complete yet, don't return anything
-                    # Wait for more chunks until we see </｜DSML｜invoke>
-                    break
+                    return result
 
             # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text="", calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
