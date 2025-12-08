@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Union
 from sglang.srt.managers.multimodal_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 
@@ -62,10 +63,9 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            # TODO(mick): could we return MultimodalSpecialTokens directly?
-            "im_token_id": self.mm_tokens.image_token_id,
-            "audio_token_id": self.mm_tokens.audio_token_id,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            input_ids=input_ids.tolist(),
+        )

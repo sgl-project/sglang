@@ -79,6 +79,7 @@ from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -247,7 +248,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
-            self.mm_processor = get_mm_processor(
+            self.mm_processor: BaseMultimodalProcessor = get_mm_processor(
                 self.model_config.hf_config, server_args, _processor, transport_mode
             )
             self.mm_data_processor = AsyncMMDataProcessor(

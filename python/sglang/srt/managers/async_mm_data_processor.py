@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Dict, List, Optional, Union
 
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+
 logger = logging.getLogger(__name__)
 
 
@@ -20,7 +22,7 @@ class AsyncMMDataProcessor:
 
     def __init__(
         self,
-        mm_processor: Any,
+        mm_processor: BaseMultimodalProcessor,
         *,
         max_concurrent_calls: Optional[int] = None,
         timeout_s: Optional[float] = None,
@@ -34,7 +36,7 @@ class AsyncMMDataProcessor:
             max_concurrent_calls: Optional concurrency cap for per-call execution.
             timeout_s: Optional timeout (seconds) for each `process()` call.
         """
-        self.mm_processor = mm_processor
+        self.mm_processor: BaseMultimodalProcessor = mm_processor
         self.timeout_s = timeout_s
 
         # Concurrency guard (None -> unlimited)
@@ -43,7 +45,7 @@ class AsyncMMDataProcessor:
         )
 
         # Detect async path; if missing, prepare a fallback executor for sync path
-        self._proc_async = getattr(mm_processor, "process_mm_data_async", None)
+        self._proc_async = mm_processor.process_mm_data_async
         self.is_async = asyncio.iscoroutinefunction(self._proc_async)
         self.fallback_exec: Optional[ThreadPoolExecutor] = (
             ThreadPoolExecutor(max_workers=max_concurrent_calls)
@@ -52,7 +54,12 @@ class AsyncMMDataProcessor:
         )
 
     async def _invoke(
-        self, image_data, audio_data, input_text_or_ids, request_obj, kwargs
+        self,
+        image_data,
+        audio_data,
+        input_text_or_ids,
+        request_obj,
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         if self.is_async:
             # Native async implementation
@@ -65,7 +72,7 @@ class AsyncMMDataProcessor:
             )
 
         # Synchronous fallback
-        sync_fn = getattr(self.mm_processor, "process_mm_data", None)
+        sync_fn = self.mm_processor.process_mm_data
         if not callable(sync_fn):
             raise RuntimeError(
                 "mm_processor has neither 'process_mm_data_async' nor 'process_mm_data'."

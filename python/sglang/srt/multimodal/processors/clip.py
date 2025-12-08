@@ -1,5 +1,6 @@
 from typing import List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.clip import CLIPModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -29,7 +30,7 @@ class ClipImageProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+        )

@@ -1,11 +1,10 @@
-from typing import Any
-
 import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.jet_vlm import JetVLMForConditionalGeneration
 from sglang.srt.models.nvila import NVILAForConditionalGeneration
 from sglang.srt.models.nvila_lite import NVILALiteForConditionalGeneration
@@ -53,7 +52,7 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
         input_text,
         request_obj: GenerateReqInput,
         **kwargs,
-    ) -> dict[str, Any] | None:
+    ) -> MultimodalInputs:
         base_output = self.load_mm_data(
             prompt=input_text,
             multimodal_tokens=self.mm_tokens,
@@ -71,9 +70,9 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
             num_frames=NUM_VIDEO_FRAMES,
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.video_token_id,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+        )

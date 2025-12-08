@@ -7,7 +7,11 @@ import torch
 from decord import VideoReader, cpu, gpu
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
 from sglang.srt.multimodal.processors.base_processor import (
@@ -271,10 +275,10 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
             )
         ]
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": items,
-            "im_start_id": self.img_start_token_id,
-            "im_end_id": self.img_end_token_id,
-            "im_token_id": self.mm_tokens.image_token_id,
-        }
+        return MultimodalInputs(
+            mm_items=items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.mm_tokens.image_token_id,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+        )

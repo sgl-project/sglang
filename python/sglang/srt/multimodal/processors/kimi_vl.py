@@ -1,6 +1,7 @@
 import re
 from typing import Dict, List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.kimi_vl import KimiVLForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -39,8 +40,8 @@ class KimiVLImageProcessor(SGLangBaseProcessor):
             base_output, self.mm_tokens
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.mm_tokens.image_token_id,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.mm_tokens.image_token_id,
+        )

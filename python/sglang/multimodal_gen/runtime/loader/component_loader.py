@@ -756,7 +756,7 @@ class PipelineComponentLoader:
             The loaded module
         """
         logger.info(
-            "Loading %s using %s from %s",
+            "Loading %s using %s from %s with: {}",
             module_name,
             transformers_or_diffusers,
             component_model_path,

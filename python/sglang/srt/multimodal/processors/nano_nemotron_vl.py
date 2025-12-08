@@ -17,7 +17,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
 from sglang.srt.multimodal.internvl_utils import image_to_pixel_values
 from sglang.srt.multimodal.processors.base_processor import (
@@ -187,11 +191,11 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
             )
             items.append(item)
 
-        return {
-            "input_ids": prompt_ids.tolist(),
-            "mm_items": items,
-            "im_start_id": self.img_start_token_id,
-            "im_end_id": self.img_end_token_id,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.image_token_id,
-        }
+        return MultimodalInputs(
+            mm_items=items,
+            input_ids=prompt_ids.tolist(),
+            im_token_id=self.mm_tokens.image_token_id,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+            video_token_id=self.mm_tokens.image_token_id,
+        )

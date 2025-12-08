@@ -1,6 +1,6 @@
 import re
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.schedule_batch import Modality, MultimodalInputs
 from sglang.srt.models.qwen2_audio import Qwen2AudioForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -58,10 +58,10 @@ class Qwen2AudioMultimodalProcessor(BaseMultimodalProcessor):
 
         mm_items[0].audio_feature_lens = output_lengths
 
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_token_id": self.audio_token_id,
-            "audio_end_id": self.audio_end_id,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            audio_start_id=self.audio_start_id,
+            audio_token_id=self.audio_token_id,
+            audio_end_id=self.audio_end_id,
+        )

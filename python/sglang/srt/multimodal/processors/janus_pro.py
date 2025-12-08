@@ -1,5 +1,6 @@
 from typing import List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.deepseek_janus_pro import MultiModalityCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -35,10 +36,10 @@ class JanusProImageProcessor(BaseMultimodalProcessor):
             base_out, self.mm_tokens, prompt=base_out.input_text
         )
 
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "im_start_id": self._processor.image_start_id,
-            "im_end_id": self._processor.image_end_id,
-            "im_token_id": self.mm_tokens.image_token_id,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.mm_tokens.image_token_id,
+            im_start_id=self._processor.image_start_id,
+            im_end_id=self._processor.image_end_id,
+        )

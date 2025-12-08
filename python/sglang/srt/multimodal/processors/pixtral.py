@@ -6,6 +6,7 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.pixtral import (
     PixtralForConditionalGeneration,
     PixtralVisionModel,
@@ -99,9 +100,9 @@ class PixtralProcessor(BaseMultimodalProcessor):
             mm_data, self.mm_tokens
         )
 
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "im_token_id": self.IM_TOKEN_ID,
-            "im_token": self._processor.image_token,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.IM_TOKEN_ID,
+            im_token=self._processor.image_token,
+        )
