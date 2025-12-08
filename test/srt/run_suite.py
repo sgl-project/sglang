@@ -128,7 +128,7 @@ suites = {
         TestFile("test_utils_update_weights.py", 29),
         TestFile("test_video_utils.py", 5),
         TestFile("test_vision_chunked_prefill.py", 117),
-        TestFile("test_vision_openai_server_a.py", 778),
+        TestFile("test_vision_openai_server_a.py", 848),
         TestFile("test_vlm_input_format.py", 166),
         TestFile("test_modelopt_export.py", 9),
     ],
