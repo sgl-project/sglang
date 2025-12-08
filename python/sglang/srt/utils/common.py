@@ -2723,7 +2723,6 @@ def is_fa3_default_architecture(hf_config):
         "Qwen3VLForConditionalGeneration",
         "Qwen3VLMoeForConditionalGeneration",
     }
-
     return architectures[0] in default_archs
 
 
