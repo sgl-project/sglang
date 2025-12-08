@@ -396,10 +396,8 @@ impl PDRouter {
         };
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        let headers = match inject_trace_context_http(&mut headers_with_trace) {
-            Ok(()) => Some(&headers_with_trace),
-            Err(_) => headers,
-        };
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(
