@@ -26,7 +26,7 @@ from sgl_kernel.elementwise import (
     downcast_fp8,
     fused_add_rmsnorm,
     device_layernorm_fuse_scale_shift,
-    device_scale_residual_layernorm_fuse_scale_shift
+    device_scale_residual_layernorm_fuse_scale_shift,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,

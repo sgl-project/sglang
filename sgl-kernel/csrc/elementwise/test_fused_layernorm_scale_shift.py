@@ -1,38 +1,6 @@
-# 去掉ext，去掉triton，只保留accuracy测试
-
 import torch
 import pytest
-import fused_layernorm_scale_shift as fls
-
-@torch.no_grad()
-def run_case_accuracy(
-    dtype=torch.float32,
-    M: int = 128,
-    N: int = 1024,
-    eps: float = 1e-5,
-):
-    device = "cuda"
-    x = torch.randn(M, N, device=device, dtype=dtype)
-    weight = torch.randn(N, device=device, dtype=dtype)
-    bias = torch.randn(N, device=device, dtype=dtype)
-
-    # Device (CUDA) result via pybind module
-    y_dev = fls.device_layernorm(x, weight, bias)
-
-    # Ground truth (float32 LN with eps, then cast back)
-    x32 = x.float()
-    w32 = weight.float()
-    b32 = bias.float()
-    mean = x32.mean(dim=1, keepdim=True)
-    var = (x32 - mean).pow(2).mean(dim=1, keepdim=True)
-    inv_std = (var + eps).sqrt().reciprocal()
-    y_ln32 = (x32 - mean) * inv_std
-    y_gt = (y_ln32 * w32 + b32)
-
-    dev_abs_err = (y_dev - y_gt.to(dtype)).abs().max().item()
-    print(f"[LN] dtype={dtype}, M={M}, N={N} -> dev_abs_err={dev_abs_err:.3e}")
-    return dev_abs_err
-
+import sgl_kernel
 
 @torch.no_grad()
 def run_case_fused_accuracy(
@@ -48,8 +16,7 @@ def run_case_fused_accuracy(
     scale = torch.randn(M, N, device=device, dtype=dtype)
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
-    # Device fused result via pybind module
-    y_dev_fused = fls.device_layernorm_fuse_scale_shift(x, weight, bias, scale, shift)
+    y_dev_fused = sgl_kernel.device_layernorm_fuse_scale_shift(x, weight, bias, scale, shift)
 
     # Reference fused output: compute LN in fp32, then apply scale/shift in fp32, cast back
     x32 = x.float()
@@ -87,7 +54,7 @@ def run_case_fused_4d_scale_accuracy(
     shift4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
 
     # CUDA 4D scale/shift fused
-    y_dev_fused = fls.device_layernorm_fuse_scale_shift(x, weight, bias, scale4d, shift4d)
+    y_dev_fused = sgl_kernel.device_layernorm_fuse_scale_shift(x, weight, bias, scale4d, shift4d)
 
     # Reference in fp32
     x32 = x.float()
@@ -133,7 +100,7 @@ def run_case_residual_gate_int(
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
     # gate == 1 (no gate tensor)
-    y_dev = fls.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
         residual, x, weight, bias, scale, shift, None
     )
 
@@ -169,7 +136,7 @@ def run_case_residual_gate_3d(
     scale = torch.randn(M, N, device=device, dtype=dtype)
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
-    y_dev = fls.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
         residual, x, weight, bias, scale, shift, gate
     )
 
@@ -209,7 +176,7 @@ def run_case_residual_gate_4d(
     scale4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
     shift4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
 
-    y_dev = fls.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
         residual, x, weight, bias, scale4d, shift4d, gate4d
     )
 
