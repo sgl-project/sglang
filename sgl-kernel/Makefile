@@ -24,11 +24,8 @@ ln: submodule ## Create compilation database
 install: submodule ## Install package in development mode
 	@pip install -e . --no-build-isolation
 
-# TODO: remove `pip uninstall flash_attn -y || true` block once fa4 is released as official flash_attn pip dist
-# It is required to force rebuild fa4 folder. It is required otherwise if flash_attn folder exists (suppose installed by pip install flash_attn), it won't trigger a rebuild from flash_attn main branch.
-# Rebuilding from flash_attn main branch is required for fa4 as fa4 is not yet released into pip dist.
 build: install-deps submodule ## Build and install wheel package
-	@rm -rf dist/* || true && pip uninstall flash_attn -y || true && CMAKE_POLICY_VERSION_MINIMUM=3.5 MAX_JOBS=$(nproc) CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && pip3 install dist/*whl --force-reinstall --no-deps
+	@rm -rf dist/* || true && CMAKE_POLICY_VERSION_MINIMUM=3.5 MAX_JOBS=$(nproc) CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation && pip3 install dist/*whl --force-reinstall --no-deps
 
 clean: ## Remove build artifacts
 	@rm -rf build dist *.egg-info
