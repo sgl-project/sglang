@@ -3,6 +3,8 @@
 import argparse
 import asyncio
 import copy
+import doctest
+import inspect
 import json
 import logging
 import os
@@ -18,7 +20,7 @@ from datetime import datetime
 from functools import partial, wraps
 from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
@@ -1917,3 +1919,15 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
         return wrapper
 
     return decorator
+
+
+def run_doctests(obj: Callable[..., Any] | ModuleType):
+    mod = inspect.getmodule(obj)
+    globals = dict(mod.__dict__)
+    finder = doctest.DocTestFinder()
+    runner = doctest.DocTestRunner(verbose=True)
+    tests = finder.find(obj, obj.__name__, globs=globals)
+    assert len(tests) >= 1, f"No tests found for {obj.__name__}"
+    for test in tests:
+        result = runner.run(test)
+        assert result.failed == 0, f"Test {test.name} failed"
