@@ -276,7 +276,9 @@ __global__ void mxfp8_group_quant(
   auto scale_factor_shared = make_tensor(
       make_smem_ptr(shared_memory),
       scale_factor_tile_layout);  // ((_32,_4), _4):((_16,_4), _1)
-  // TODO: Transform Groupwise Schedule into a more efficient Schedule
+  // Transform Groupwise Schedule into Flatten Schedule
+  uint group_total_tiles = 0;
+  uint head_cta_id = 0;
   for (int g = 0; g < groups; g++) {
     int m = problem_sizes[g * 3 + 0];
     int k = problem_sizes[g * 3 + 2];
@@ -323,7 +325,9 @@ __global__ void mxfp8_group_quant(
     auto tiled_predict_tensor = zipped_divide(predict_tensor, tiler);  // ((128, 128), (cdiv(M, 128), cdiv(K, 128)))
 
     auto total_tiles = size<1>(tiled_input_tensor);  // cdiv(M, 128) * cdiv(K, 128)
-    decltype(total_tiles) blk_offset = blockIdx.x;
+    group_total_tiles += total_tiles;
+    auto blk_offset = (blockIdx.x + (gridDim.x - head_cta_id)) % gridDim.x;
+    head_cta_id = group_total_tiles % gridDim.x;
     while (blk_offset < total_tiles) {
       auto current_input_tile = tensor<0>(tiled_input_tensor(_, blk_offset));
       auto current_quant_output_tile = tensor<0>(tiled_quant_output_tensor(_, blk_offset));
