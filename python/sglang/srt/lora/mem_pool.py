@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import time
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -203,12 +204,19 @@ class LoRAMemoryPool:
         lora_refs: Dict[str, LoRARef],
         prefetch: bool,
     ):
+        start_time = time.perf_counter()
+        num_loaded = 0
+        eviction_time = 0.0
+        loading_time = 0.0
+
         if prefetch and self.prefetch_stream is not None:
             stream_ctx = torch.cuda.stream(self.prefetch_stream)
         elif self.device.type == "cuda":
             stream_ctx = torch.cuda.stream(torch.cuda.current_stream(self.device))
         else:
             stream_ctx = contextlib.nullcontext()
+
+        color = "🔴" if not prefetch else "🟡"
 
         def get_available_buffer_slot():
             # 1. Prioritize empty slots
@@ -256,8 +264,8 @@ class LoRAMemoryPool:
             self.uid_to_buffer_id.pop(victim_uid)
             self.eviction_policy.remove(victim_uid)
             self.buffer_id_to_uid[victim_buffer_id] = EMPTY_SLOT
-            logger.debug(
-                f"Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
+            logger.info(
+                f"{color} Evicting LoRA {victim_uid} from buffer slot {victim_buffer_id}."
             )
             return victim_buffer_id
 
@@ -270,11 +278,71 @@ class LoRAMemoryPool:
                 if uid not in self.uid_to_buffer_id:
                     buffer_id = get_available_buffer_slot()
                     lora_adapter = lora_adapters.get(uid, None)
+                    load_weight_start = time.perf_counter()
                     self.load_lora_weight_to_buffer(
                         uid, buffer_id, lora_adapter, lora_modules
                     )
+                    load_weight_end = (time.perf_counter() - load_weight_start) * 1000
                     self.uid_to_buffer_id[uid] = buffer_id
                     self.buffer_id_to_uid[buffer_id] = uid
+                    logger.info(
+                        f"{color} LoRA weight loading time: {load_weight_end:.2f}ms, uid={uid}"
+                    )
+
+                    num_loaded += 1
+                    continue
+
+                if not prefetch and self.uid_to_buffer_id[uid] in range(
+                    self.max_loras_per_batch,
+                    self.max_loras_per_batch + self.max_loras_prefetch,
+                ):
+                    copy_start_time = time.perf_counter()
+                    prefetch_buffer_id = self.uid_to_buffer_id[uid]
+                    assert prefetch_buffer_id >= self.max_loras_per_batch
+
+                    buffer_id = get_available_buffer_slot()
+                    for layer_id in range(self.num_layer):
+                        for module_name in self.A_buffer.keys():
+                            A = self.A_buffer[module_name][layer_id]
+                            B = self.B_buffer[module_name][layer_id]
+
+                            A[buffer_id].copy_(A[prefetch_buffer_id])
+                            B[buffer_id].copy_(B[prefetch_buffer_id])
+
+                    self.buffer_id_to_uid[prefetch_buffer_id] = EMPTY_SLOT
+                    self.buffer_id_to_uid[buffer_id] = uid
+                    self.uid_to_buffer_id[uid] = buffer_id
+
+                    copy_end_time = (time.perf_counter() - copy_start_time) * 1000
+                    logger.info(
+                        f"{color} moving prefetched weight from slot: {prefetch_buffer_id} to slot: {buffer_id} "
+                        f"{color} copy time: {copy_end_time:.2f}ms"
+                    )
+                    num_loaded += 1
+
+            if num_loaded > 0:
+                total_time = (time.perf_counter() - start_time) * 1000
+                logger.info(
+                    f"{color * 3} prepare_lora_batch breakdown: "
+                    f"total={total_time:.2f}ms, "
+                    f"eviction={eviction_time:.2f}ms, "
+                    f"loading={loading_time:.2f}ms, "
+                    f"loaded={num_loaded} adapters"
+                )
+
+                logger.info(
+                    f"{color * 3} Memory Pool configuration after loading LoRA batch:"
+                )
+                logger.info("--------------------------------------------------------")
+                col_w = 12
+                header_left = "Buffer Index".ljust(col_w)
+                header_right = "UID"
+                logger.info(f"{header_left} | {header_right}")
+                logger.info("-" * (col_w + 3 + len(header_right)))
+                for buffer_id in range(self.max_loras_per_batch + self.max_loras_prefetch):
+                    left = str(buffer_id).ljust(col_w)
+                    right = str(self.buffer_id_to_uid[buffer_id])
+                    logger.info(f"{left} | {right}")
 
     def load_lora_weight_to_buffer(
         self,

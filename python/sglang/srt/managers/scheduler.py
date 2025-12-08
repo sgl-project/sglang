@@ -1899,6 +1899,9 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
+        logger.info(
+            f"🟢 new prefill batch: {[req.lora_id for req in new_batch.reqs]}"
+        )
         self.prefetch_loras_in_flight -= {req.lora_id for req in new_batch.reqs}
 
         return new_batch
@@ -2003,6 +2006,14 @@ class Scheduler(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        # Profiling: Record batch start time
+        batch_start_time = time.perf_counter()
+
+        # Calculate batch interval (time since last batch ended)
+        batch_interval_ms = None
+        if self.last_batch_end_time is not None:
+            batch_interval_ms = (batch_start_time - self.last_batch_end_time) * 1000
+
         self.forward_ct += 1
 
         # Whether to run the profiler
@@ -2123,6 +2134,29 @@ class Scheduler(
             current_time = time.perf_counter()
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
+
+        # Profiling: Calculate forward time and update last_batch_end_time
+        batch_end_time = time.perf_counter()
+        forward_time_ms = (batch_end_time - batch_start_time) * 1000
+        self.last_batch_end_time = batch_end_time
+
+        # Log batch timing (only if LoRA is enabled to reduce noise)
+        if self.enable_lora and batch.forward_mode != ForwardMode.IDLE:
+            has_lora = hasattr(batch, "lora_ids") and batch.lora_ids
+            lora_info = (
+                f", lora_ids={len(set(batch.lora_ids)) if has_lora else 0}"
+                if has_lora
+                else ""
+            )
+            interval_info = (
+                f", interval={batch_interval_ms:.2f}ms"
+                if batch_interval_ms is not None
+                else ""
+            )
+            logger.info(
+                f"🔵 Batch#{self.forward_ct}: forward={forward_time_ms:.2f}ms{interval_info}, "
+                f"mode={batch.forward_mode}, bs={len(batch.reqs)}{lora_info}"
+            )
 
         return ret
 

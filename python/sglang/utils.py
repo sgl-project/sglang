@@ -574,3 +574,17 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
+
+import pdb
+
+
+class ForkedPdb(pdb.Pdb):
+    """A Pdb subclass that may be used from a forked multiprocessing child"""
+
+    def interaction(self, *args, **kwargs):
+        _stdin = sys.stdin
+        try:
+            sys.stdin = open("/dev/stdin")
+            pdb.Pdb.interaction(self, *args, **kwargs)
+        finally:
+            sys.stdin = _stdin
