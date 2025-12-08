@@ -2703,7 +2703,9 @@ class ModelRunner:
             and require_gathered_buffer
             and not is_nsa_enable_prefill_cp()
         ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp()
+            forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                server_args=self.server_args,
+            )
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

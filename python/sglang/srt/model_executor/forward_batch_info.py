@@ -515,10 +515,15 @@ class ForwardBatch:
 
         return ret
 
-    def adjust_num_token_non_padded_for_attn_tp(self) -> None:
+    def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""
+        from sglang.srt.utils.common import require_mlp_tp_gather
+
         dp_rank = get_attention_dp_rank()
-        num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
+        if require_mlp_tp_gather(server_args):
+            num_tokens_per_dp = self.global_num_tokens_gpu[dp_rank]
+        else:
+            num_tokens_per_dp = self.global_num_tokens_gpu[0]
 
         local = compute_local_num_token_non_padded(
             global_num_token_non_padded=self.num_token_non_padded,
