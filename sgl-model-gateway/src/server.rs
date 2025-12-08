@@ -32,10 +32,12 @@ use crate::{
         },
         Job, JobQueue, JobQueueConfig, WorkerManager, WorkerType,
     },
-    logging::{self, LoggingConfig},
-    metrics::{self, PrometheusConfig},
     middleware::{self, AuthConfig, QueuedRequest},
-    otel_trace,
+    observability::{
+        logging::{self, LoggingConfig},
+        metrics::{self, PrometheusConfig},
+        otel_trace,
+    },
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
