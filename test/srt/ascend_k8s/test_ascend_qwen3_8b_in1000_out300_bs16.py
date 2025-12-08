@@ -4,12 +4,12 @@ from test_ascend_single_mix_utils import (
     TestSingleMixUtils,
 )
 QWEN3_8B_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
+    "SGLANG_SET_CPU_AFFINITY": "0",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
     "HCCL_BUFFSIZE": "400",
-    "HCCL_SOCKET_IFNAME": "enp23s0f3",
-    "GLOO_SOCKET_IFNAME": "enp23s0f3",     
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",     
     "HCCL_OP_EXPANSION_MODE": "AIV",
     
 }
