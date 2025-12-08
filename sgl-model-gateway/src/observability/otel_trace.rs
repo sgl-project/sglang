@@ -25,7 +25,7 @@ use tracing_subscriber::{
     Layer,
 };
 
-use crate::routers::http::events::get_module_path as http_router_get_module_path;
+use super::events::get_module_path as http_router_get_module_path;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
