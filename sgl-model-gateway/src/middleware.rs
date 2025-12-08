@@ -79,6 +79,9 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
+const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
     let prefix = if path.contains("/chat/completions") {
@@ -94,12 +97,12 @@ fn generate_request_id(path: &str) -> String {
     };
 
     // Generate a random string similar to OpenAI's format
-    let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    // Use byte array indexing (O(1)) instead of chars().nth() (O(n))
     let mut rng = rand::rng();
     let random_part: String = (0..24)
         .map(|_| {
-            let idx = rng.random_range(0..chars.len());
-            chars.chars().nth(idx).unwrap()
+            let idx = rng.random_range(0..REQUEST_ID_CHARS.len());
+            REQUEST_ID_CHARS[idx] as char
         })
         .collect();
 
