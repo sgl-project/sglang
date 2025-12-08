@@ -38,6 +38,7 @@ pub enum WorkerType {
     Regular,
     Prefill,
     Decode,
+    Encode,
 }
 
 #[derive(Clone, Debug)]

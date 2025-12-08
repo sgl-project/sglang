@@ -174,6 +174,7 @@ struct Router {
     service_discovery_namespace: Option<String>,
     prefill_selector: HashMap<String, String>,
     decode_selector: HashMap<String, String>,
+    encode_selector: HashMap<String, String>,
     bootstrap_port_annotation: String,
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
@@ -182,11 +183,14 @@ struct Router {
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
     pd_disaggregation: bool,
+    epd_disaggregation: bool,
     bucket_adjust_interval_secs: usize,
     prefill_urls: Option<Vec<(String, Option<u16>)>>,
     decode_urls: Option<Vec<String>>,
+    encode_urls: Option<Vec<(String, Option<u16>)>>,
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
+    encode_policy: Option<PolicyType>,
     max_concurrent_requests: i32,
     cors_allowed_origins: Vec<String>,
     retry_max_retries: u32,
@@ -278,6 +282,15 @@ impl Router {
             RoutingMode::OpenAI {
                 worker_urls: self.worker_urls.clone(),
             }
+        } else if self.epd_disaggregation {
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: self.encode_urls.clone().unwrap_or_default(),
+                prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
+                decode_urls: self.decode_urls.clone().unwrap_or_default(),
+                encode_policy: self.encode_policy.as_ref().map(convert_policy),
+                prefill_policy: self.prefill_policy.as_ref().map(convert_policy),
+                decode_policy: self.decode_policy.as_ref().map(convert_policy),
+            }
         } else if self.pd_disaggregation {
             RoutingMode::PrefillDecode {
                 prefill_urls: self.prefill_urls.clone().unwrap_or_default(),
@@ -302,6 +315,7 @@ impl Router {
                 selector: self.selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
                 decode_selector: self.decode_selector.clone(),
+                encode_selector: self.encode_selector.clone(),
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
             })
         } else {
@@ -444,6 +458,7 @@ impl Router {
         service_discovery_namespace = None,
         prefill_selector = HashMap::new(),
         decode_selector = HashMap::new(),
+        encode_selector = HashMap::new(),
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
         prometheus_port = None,
         prometheus_host = None,
@@ -452,11 +467,14 @@ impl Router {
         shutdown_grace_period_secs = 180,
         request_id_headers = None,
         pd_disaggregation = false,
+        epd_disaggregation = false,
         bucket_adjust_interval_secs = 5,
         prefill_urls = None,
         decode_urls = None,
+        encode_urls = None,
         prefill_policy = None,
         decode_policy = None,
+        encode_policy = None,
         max_concurrent_requests = -1,
         cors_allowed_origins = vec![],
         retry_max_retries = 5,
@@ -525,6 +543,7 @@ impl Router {
         service_discovery_namespace: Option<String>,
         prefill_selector: HashMap<String, String>,
         decode_selector: HashMap<String, String>,
+        encode_selector: HashMap<String, String>,
         bootstrap_port_annotation: String,
         prometheus_port: Option<u16>,
         prometheus_host: Option<String>,
@@ -533,11 +552,14 @@ impl Router {
         shutdown_grace_period_secs: u64,
         request_id_headers: Option<Vec<String>>,
         pd_disaggregation: bool,
+        epd_disaggregation: bool,
         bucket_adjust_interval_secs: usize,
         prefill_urls: Option<Vec<(String, Option<u16>)>>,
         decode_urls: Option<Vec<String>>,
+        encode_urls: Option<Vec<(String, Option<u16>)>>,
         prefill_policy: Option<PolicyType>,
         decode_policy: Option<PolicyType>,
+        encode_policy: Option<PolicyType>,
         max_concurrent_requests: i32,
         cors_allowed_origins: Vec<String>,
         retry_max_retries: u32,
@@ -584,6 +606,12 @@ impl Router {
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
+        if let Some(ref encode_urls) = encode_urls {
+            for (url, _) in encode_urls {
+                all_urls.push(url.clone());
+            }
+        }
+
         if let Some(ref prefill_urls) = prefill_urls {
             for (url, _) in prefill_urls {
                 all_urls.push(url.clone());
@@ -619,6 +647,7 @@ impl Router {
             service_discovery_namespace,
             prefill_selector,
             decode_selector,
+            encode_selector,
             bootstrap_port_annotation,
             prometheus_port,
             prometheus_host,
@@ -627,11 +656,14 @@ impl Router {
             shutdown_grace_period_secs,
             request_id_headers,
             pd_disaggregation,
+            epd_disaggregation,
             bucket_adjust_interval_secs,
             prefill_urls,
             decode_urls,
+            encode_urls,
             prefill_policy,
             decode_policy,
+            encode_policy,
             max_concurrent_requests,
             cors_allowed_origins,
             retry_max_retries,

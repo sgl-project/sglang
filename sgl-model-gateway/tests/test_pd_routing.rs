@@ -923,4 +923,472 @@ mod test_pd_routing {
             balance_rel_threshold: 1.1,
         };
     }
+
+    // =====================================================
+    // EPD (Encode-Prefill-Decode) Mode Tests
+    // =====================================================
+
+    #[test]
+    fn test_encode_worker_type() {
+        // Test WorkerType::Encode with bootstrap port
+        let encode_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://encode:8080")
+                .worker_type(WorkerType::Encode {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+        assert_eq!(encode_worker.url(), "http://encode:8080");
+        match encode_worker.worker_type() {
+            WorkerType::Encode { bootstrap_port } => {
+                assert_eq!(*bootstrap_port, Some(9000));
+            }
+            _ => panic!("Expected Encode worker type"),
+        }
+
+        // Test WorkerType::Encode without bootstrap port
+        let encode_worker_no_port: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://encode2:8080")
+                .worker_type(WorkerType::Encode {
+                    bootstrap_port: None,
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+        match encode_worker_no_port.worker_type() {
+            WorkerType::Encode { bootstrap_port } => {
+                assert_eq!(*bootstrap_port, None);
+            }
+            _ => panic!("Expected Encode worker type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_epd_router_configuration() {
+        // Test EPD routing mode configuration with all three worker types
+        let test_cases = vec![
+            (
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![
+                        ("http://encode1:8080".to_string(), Some(9000)),
+                        ("http://encode2:8080".to_string(), None),
+                    ],
+                    prefill_urls: vec![
+                        ("http://prefill1:8080".to_string(), Some(9001)),
+                        ("http://prefill2:8080".to_string(), None),
+                    ],
+                    decode_urls: vec![
+                        "http://decode1:8080".to_string(),
+                        "http://decode2:8080".to_string(),
+                    ],
+                    encode_policy: None,
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::Random,
+            ),
+            (
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![("http://encode:8080".to_string(), Some(9000))],
+                    prefill_urls: vec![("http://prefill:8080".to_string(), Some(9001))],
+                    decode_urls: vec!["http://decode:8080".to_string()],
+                    encode_policy: Some(PolicyConfig::Random),
+                    prefill_policy: Some(PolicyConfig::RoundRobin),
+                    decode_policy: Some(PolicyConfig::PowerOfTwo {
+                        load_check_interval_secs: 5,
+                    }),
+                },
+                PolicyConfig::RoundRobin,
+            ),
+            (
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![
+                        ("http://e1:8080".to_string(), Some(9000)),
+                        ("http://e2:8080".to_string(), Some(9001)),
+                    ],
+                    prefill_urls: vec![
+                        ("http://p1:8080".to_string(), Some(9002)),
+                        ("http://p2:8080".to_string(), Some(9003)),
+                        ("http://p3:8080".to_string(), Some(9004)),
+                    ],
+                    decode_urls: vec!["http://d1:8080".to_string(), "http://d2:8080".to_string()],
+                    encode_policy: None,
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.7,
+                    balance_abs_threshold: 20,
+                    balance_rel_threshold: 1.2,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000000,
+                },
+            ),
+        ];
+
+        for (mode, policy) in test_cases {
+            let config = match mode {
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls,
+                    prefill_urls,
+                    decode_urls,
+                    encode_policy,
+                    prefill_policy,
+                    decode_policy,
+                } => RouterConfig::builder()
+                    .encode_prefill_decode_mode(
+                        encode_urls,
+                        prefill_urls,
+                        decode_urls,
+                        encode_policy,
+                        prefill_policy,
+                        decode_policy,
+                    )
+                    .policy(policy)
+                    .host("127.0.0.1")
+                    .port(3001)
+                    .max_payload_size(1024 * 1024)
+                    .request_timeout_secs(60)
+                    .worker_startup_timeout_secs(10)
+                    .worker_startup_check_interval_secs(1)
+                    .max_concurrent_requests(64)
+                    .queue_timeout_secs(60)
+                    .build_unchecked(),
+                _ => panic!("Expected EncodePrefillDecode mode"),
+            };
+
+            let app_context = {
+                use std::sync::{Arc, OnceLock};
+
+                use sgl_model_gateway::{
+                    core::{LoadMonitor, WorkerRegistry},
+                    data_connector::{
+                        MemoryConversationItemStorage, MemoryConversationStorage,
+                        MemoryResponseStorage,
+                    },
+                    middleware::TokenBucket,
+                    policies::PolicyRegistry,
+                };
+
+                let client = reqwest::Client::new();
+                let rate_limiter = Some(Arc::new(TokenBucket::new(64, 64)));
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                let policy_registry = Arc::new(PolicyRegistry::new(config.policy.clone()));
+                let response_storage = Arc::new(MemoryResponseStorage::new());
+                let conversation_storage = Arc::new(MemoryConversationStorage::new());
+                let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+                let load_monitor = Some(Arc::new(LoadMonitor::new(
+                    worker_registry.clone(),
+                    policy_registry.clone(),
+                    client.clone(),
+                    config.worker_startup_check_interval_secs,
+                )));
+                let worker_job_queue = Arc::new(OnceLock::new());
+                let workflow_engine = Arc::new(OnceLock::new());
+                let mcp_manager = Arc::new(OnceLock::new());
+
+                Arc::new(
+                    AppContext::builder()
+                        .router_config(config)
+                        .client(client)
+                        .rate_limiter(rate_limiter)
+                        .tokenizer(None)
+                        .reasoning_parser_factory(None)
+                        .tool_parser_factory(None)
+                        .worker_registry(worker_registry)
+                        .policy_registry(policy_registry)
+                        .response_storage(response_storage)
+                        .conversation_storage(conversation_storage)
+                        .conversation_item_storage(conversation_item_storage)
+                        .load_monitor(load_monitor)
+                        .worker_job_queue(worker_job_queue)
+                        .workflow_engine(workflow_engine)
+                        .mcp_manager(mcp_manager)
+                        .build()
+                        .unwrap(),
+                )
+            };
+
+            let result = RouterFactory::create_router(&app_context).await;
+            assert!(
+                result.is_ok(),
+                "EPD Router creation should succeed with empty workers"
+            );
+
+            let stats = app_context.worker_registry.stats();
+            assert_eq!(
+                stats.total_workers, 0,
+                "No workers should be registered without initialization"
+            );
+        }
+    }
+
+    #[test]
+    fn test_epd_bootstrap_injection_simulation() {
+        // Test bootstrap injection for EPD mode's triple dispatch scenario
+        let encode_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://encode1:8080")
+                .worker_type(WorkerType::Encode {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill1:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9001),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+
+        let decode_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://decode1:8080")
+                .worker_type(WorkerType::Decode)
+                .api_key("test_api_key")
+                .build(),
+        );
+
+        // Encode worker should have bootstrap port for encode→prefill communication
+        let &encode_bootstrap_port = match encode_worker.worker_type() {
+            WorkerType::Encode { bootstrap_port } => bootstrap_port,
+            _ => &None,
+        };
+        assert_eq!(encode_bootstrap_port, Some(9000));
+
+        // Prefill worker should have bootstrap port for prefill→decode communication
+        let &prefill_bootstrap_port = match prefill_worker.worker_type() {
+            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => &None,
+        };
+        assert_eq!(prefill_bootstrap_port, Some(9001));
+
+        // Decode worker doesn't need bootstrap port (final stage)
+        match decode_worker.worker_type() {
+            WorkerType::Decode => (),
+            _ => panic!("Expected Decode worker type"),
+        }
+
+        // Simulate EPD request with bootstrap metadata for all stages
+        let mut epd_request = json!({
+            "text": "Hello world",
+            "stream": false,
+            "temperature": 0.7
+        });
+
+        // Stage 1: Encode worker bootstrap info
+        epd_request["encode_bootstrap_host"] = json!(encode_worker.bootstrap_host());
+        epd_request["encode_bootstrap_port"] = json!(encode_bootstrap_port);
+        epd_request["encode_bootstrap_room"] = json!(11111u64);
+
+        // Stage 2: Prefill worker bootstrap info
+        epd_request["prefill_bootstrap_host"] = json!(prefill_worker.bootstrap_host());
+        epd_request["prefill_bootstrap_port"] = json!(prefill_bootstrap_port);
+        epd_request["prefill_bootstrap_room"] = json!(22222u64);
+
+        assert_eq!(epd_request["encode_bootstrap_host"], "encode1");
+        assert_eq!(epd_request["encode_bootstrap_port"], json!(Some(9000)));
+        assert_eq!(epd_request["prefill_bootstrap_host"], "prefill1");
+        assert_eq!(epd_request["prefill_bootstrap_port"], json!(Some(9001)));
+    }
+
+    #[test]
+    fn test_epd_worker_type_display() {
+        // Test Display trait implementation for all worker types
+        let regular = WorkerType::Regular;
+        let prefill = WorkerType::Prefill {
+            bootstrap_port: Some(9000),
+        };
+        let decode = WorkerType::Decode;
+        let encode = WorkerType::Encode {
+            bootstrap_port: Some(9001),
+        };
+        let encode_no_port = WorkerType::Encode {
+            bootstrap_port: None,
+        };
+
+        assert_eq!(format!("{}", regular), "Regular");
+        assert_eq!(format!("{}", prefill), "Prefill(bootstrap:9000)");
+        assert_eq!(format!("{}", decode), "Decode");
+        assert_eq!(format!("{}", encode), "Encode(bootstrap:9001)");
+        assert_eq!(format!("{}", encode_no_port), "Encode");
+    }
+
+    #[test]
+    fn test_epd_routing_mode_detection() {
+        // Test is_epd_mode() helper on RoutingMode
+        let epd_mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![("http://encode:8080".to_string(), Some(9000))],
+            prefill_urls: vec![("http://prefill:8080".to_string(), Some(9001))],
+            decode_urls: vec!["http://decode:8080".to_string()],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        let pd_mode = RoutingMode::PrefillDecode {
+            prefill_urls: vec![("http://prefill:8080".to_string(), Some(9000))],
+            decode_urls: vec!["http://decode:8080".to_string()],
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        let regular_mode = RoutingMode::Regular {
+            worker_urls: vec!["http://worker:8080".to_string()],
+        };
+
+        assert!(epd_mode.is_epd_mode());
+        assert!(!pd_mode.is_epd_mode());
+        assert!(!regular_mode.is_epd_mode());
+    }
+
+    #[test]
+    fn test_epd_policy_fallback() {
+        // Test that EPD mode falls back to main policy when specific policies are None
+        let mode_with_policies = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![("http://encode:8080".to_string(), None)],
+            prefill_urls: vec![("http://prefill:8080".to_string(), None)],
+            decode_urls: vec!["http://decode:8080".to_string()],
+            encode_policy: Some(PolicyConfig::Random),
+            prefill_policy: Some(PolicyConfig::RoundRobin),
+            decode_policy: Some(PolicyConfig::PowerOfTwo {
+                load_check_interval_secs: 5,
+            }),
+        };
+
+        let mode_without_policies = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![("http://encode:8080".to_string(), None)],
+            prefill_urls: vec![("http://prefill:8080".to_string(), None)],
+            decode_urls: vec!["http://decode:8080".to_string()],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        // With explicit policies
+        if let RoutingMode::EncodePrefillDecode {
+            encode_policy,
+            prefill_policy,
+            decode_policy,
+            ..
+        } = mode_with_policies
+        {
+            assert!(encode_policy.is_some());
+            assert!(prefill_policy.is_some());
+            assert!(decode_policy.is_some());
+        }
+
+        // Without explicit policies (should fall back to main policy in factory)
+        if let RoutingMode::EncodePrefillDecode {
+            encode_policy,
+            prefill_policy,
+            decode_policy,
+            ..
+        } = mode_without_policies
+        {
+            assert!(encode_policy.is_none());
+            assert!(prefill_policy.is_none());
+            assert!(decode_policy.is_none());
+        }
+    }
+
+    #[test]
+    fn test_epd_worker_count() {
+        // Test worker_count() method for EPD mode
+        let mode = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![
+                ("http://e1:8080".to_string(), Some(9000)),
+                ("http://e2:8080".to_string(), Some(9001)),
+            ],
+            prefill_urls: vec![
+                ("http://p1:8080".to_string(), Some(9002)),
+                ("http://p2:8080".to_string(), Some(9003)),
+                ("http://p3:8080".to_string(), Some(9004)),
+            ],
+            decode_urls: vec![
+                "http://d1:8080".to_string(),
+                "http://d2:8080".to_string(),
+                "http://d3:8080".to_string(),
+                "http://d4:8080".to_string(),
+            ],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+
+        // Total should be 2 + 3 + 4 = 9
+        assert_eq!(mode.worker_count(), 9);
+    }
+
+    #[test]
+    fn test_epd_batch_bootstrap_injection() {
+        // Test bootstrap injection for batch requests in EPD mode
+        let batch_size = 16;
+
+        let encode_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://encode:8080")
+                .worker_type(WorkerType::Encode {
+                    bootstrap_port: Some(9000),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+
+        let prefill_worker: Box<dyn Worker> = Box::new(
+            BasicWorkerBuilder::new("http://prefill:8080")
+                .worker_type(WorkerType::Prefill {
+                    bootstrap_port: Some(9001),
+                })
+                .api_key("test_api_key")
+                .build(),
+        );
+
+        let &encode_bootstrap_port = match encode_worker.worker_type() {
+            WorkerType::Encode { bootstrap_port } => bootstrap_port,
+            _ => &None,
+        };
+        let &prefill_bootstrap_port = match prefill_worker.worker_type() {
+            WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+            _ => &None,
+        };
+
+        let mut batch_request = json!({
+            "text": vec!["Hello"; batch_size],
+            "stream": true
+        });
+
+        // Inject encode bootstrap info for batch
+        batch_request["encode_bootstrap_host"] =
+            json!(vec![encode_worker.bootstrap_host(); batch_size]);
+        batch_request["encode_bootstrap_port"] = json!(vec![encode_bootstrap_port; batch_size]);
+        batch_request["encode_bootstrap_room"] = json!((0..batch_size)
+            .map(|i| 10000u64 + i as u64)
+            .collect::<Vec<_>>());
+
+        // Inject prefill bootstrap info for batch
+        batch_request["prefill_bootstrap_host"] =
+            json!(vec![prefill_worker.bootstrap_host(); batch_size]);
+        batch_request["prefill_bootstrap_port"] = json!(vec![prefill_bootstrap_port; batch_size]);
+        batch_request["prefill_bootstrap_room"] = json!((0..batch_size)
+            .map(|i| 20000u64 + i as u64)
+            .collect::<Vec<_>>());
+
+        assert_eq!(
+            batch_request["encode_bootstrap_host"]
+                .as_array()
+                .unwrap()
+                .len(),
+            batch_size
+        );
+        assert_eq!(
+            batch_request["prefill_bootstrap_host"]
+                .as_array()
+                .unwrap()
+                .len(),
+            batch_size
+        );
+    }
 }
