@@ -1,5 +1,4 @@
 import ast
-import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Optional
@@ -198,16 +197,21 @@ def ut_parse_one_file(filename: str) -> List[CIRegistry]:
 
 def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistry]:
     ci_tests = []
+    unregistered_count = 0
+
     for file in files:
         registries = ut_parse_one_file(file)
         if len(registries) == 0:
-            msg = f"No CI registry found in {file}"
             if sanity_check:
-                raise ValueError(msg)
-            else:
-                warnings.warn(msg)
-                continue
+                raise ValueError(f"No CI registry found in {file}")
+            unregistered_count += 1
+            continue
 
         ci_tests.extend(registries)
+
+    if not sanity_check and unregistered_count > 0:
+        print(
+            f"Warning: Skipped {unregistered_count} unregistered test files (out of {len(files)} total)"
+        )
 
     return ci_tests
