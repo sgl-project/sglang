@@ -569,10 +569,19 @@ class ModelRunner:
             ),
             self.req_to_token_pool.size,
         )
+
+        if not self.server_args.disable_shared_experts_fusion and hasattr(
+            self.model, "num_fused_shared_experts"
+        ):
+            num_fused_shared_experts = self.model.num_fused_shared_experts
+        else:
+            num_fused_shared_experts = 0
+
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
                 enable=get_global_server_args().enable_return_routed_experts,
                 model_config=self.model_config,
+                num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=max_running_requests,
                 device=self.device,
@@ -2695,10 +2704,10 @@ class ModelRunner:
             )
             # Copy cached routing experts' buffers back to CPU cache
             get_global_experts_capturer().sync_fwd_experts_buffer_DtoH(
-                forward_batch.out_cache_loc,
-                forward_batch.out_cache_loc_cpu,
-                output[1],
-                getattr(self.graph_runner, "bs", None),
+                device_loc=forward_batch.out_cache_loc,
+                cpu_loc=forward_batch.out_cache_loc_cpu,
+                can_run_graph=output[1],
+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
             )
 
         if self.eplb_manager is not None:

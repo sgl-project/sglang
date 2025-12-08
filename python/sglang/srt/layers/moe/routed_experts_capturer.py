@@ -27,7 +27,12 @@ def get_tensor_size_bytes(t: torch.Tensor):
 
 class _RoutedExpertsDeviceCache:
     def __init__(
-        self, model_config: ModelConfig, max_running_requests: int, device: str
+        self,
+        max_running_requests: int,
+        num_hidden_layers: int,
+        num_experts_per_tok: int,
+        num_fused_shared_experts: int,
+        device: str,
     ) -> None:
         self.buffer = torch.zeros(
             (
@@ -36,8 +41,8 @@ class _RoutedExpertsDeviceCache:
                     * get_global_server_args().dp_size,
                     max_running_requests,
                 ),
-                model_config.hf_text_config.num_hidden_layers,
-                model_config.hf_text_config.num_experts_per_tok,
+                num_hidden_layers,
+                num_experts_per_tok + num_fused_shared_experts,
             ),
             dtype=torch.int32,
             device=device,
@@ -64,15 +69,16 @@ class _RoutedExpertsDeviceCache:
 class _RoutedExpertsHostCache:
     def __init__(
         self,
-        model_config: ModelConfig,
         num_tokens: int,
+        num_hidden_layers: int,
+        num_experts_per_tok: int,
     ) -> None:
         self.num_tokens = num_tokens
         self.buffer = torch.zeros(
             (
                 num_tokens,
-                model_config.hf_text_config.num_hidden_layers,
-                model_config.hf_text_config.num_experts_per_tok,
+                num_hidden_layers,
+                num_experts_per_tok,
             ),
             dtype=torch.int32,
             device="cpu",
@@ -100,6 +106,7 @@ class RoutedExpertsCapturer(ABC):
     def create(
         enable: bool,
         model_config: ModelConfig,
+        num_fused_shared_experts: int,
         num_tokens: int,
         max_running_requests: int,
         device: str,
@@ -109,6 +116,7 @@ class RoutedExpertsCapturer(ABC):
                 model_config,
                 num_tokens=num_tokens,
                 max_running_requests=max_running_requests,
+                num_fused_shared_experts=num_fused_shared_experts,
                 device=device,
             )
         else:
@@ -129,7 +137,7 @@ class RoutedExpertsCapturer(ABC):
         self,
         device_loc: torch.Tensor,
         cpu_loc: torch.Tensor,
-        run_cuda_graph: bool,
+        can_run_graph: bool,
         cuda_graph_batch: int,
     ):
         raise NotImplementedError
@@ -153,13 +161,26 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         model_config: ModelConfig,
         num_tokens: int,
         max_running_requests: int,
+        num_fused_shared_experts: int,
         device: str,
     ):
         self.forward_batch = None
-        self.host_cache = _RoutedExpertsHostCache(model_config, num_tokens)
+        self.num_fused_shared_experts = num_fused_shared_experts
+        self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
+        self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
+
+        self.host_cache = _RoutedExpertsHostCache(
+            num_tokens=num_tokens,
+            num_hidden_layers=self.num_hidden_layers,
+            num_experts_per_tok=self.num_experts_per_tok,
+        )
 
         self.device_cache = _RoutedExpertsDeviceCache(
-            model_config, max_running_requests, device
+            max_running_requests=max_running_requests,
+            num_hidden_layers=self.num_hidden_layers,
+            num_experts_per_tok=self.num_experts_per_tok,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            device=device,
         )
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
@@ -169,13 +190,13 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self,
         device_loc: torch.Tensor,
         cpu_loc: torch.Tensor,
-        run_cuda_graph: bool,
+        can_run_graph: bool,
         cuda_graph_batch: int,
     ):
         if is_dp_attention_enabled():
             local_start_pos, local_num_tokens = get_dp_local_info(self.forward_batch)
             # handle with cuda graph padding
-            if run_cuda_graph:
+            if can_run_graph:
                 local_start_pos = get_attention_dp_rank() * cuda_graph_batch
                 local_end_pos = local_start_pos + local_num_tokens
             else:
@@ -185,7 +206,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             local_end_pos = device_loc.shape[0]
 
         self.host_cache.buffer[cpu_loc] = self.device_cache.buffer[
-            local_start_pos:local_end_pos
+            local_start_pos:local_end_pos, :, : self.num_experts_per_tok
         ].cpu()
 
     def get_routed_experts(
@@ -230,7 +251,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         self,
         device_loc: torch.Tensor,
         cpu_loc: torch.Tensor,
-        run_cuda_graph: bool,
+        can_run_graph: bool,
         cuda_graph_batch: int,
     ):
         pass

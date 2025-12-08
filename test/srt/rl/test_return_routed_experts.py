@@ -74,6 +74,7 @@ class TestReturnRoutedExperts(CustomTestCase):
 
         if not cls.texts:
             raise ValueError("No valid texts found in the dataset")
+        cls.texts = cls.texts[:100]
 
     @classmethod
     def test_return_routed_experts(cls):
@@ -129,7 +130,7 @@ class TestReturnRoutedExperts(CustomTestCase):
                             },
                         )
                     )
-                    for text in cls.texts[:100]
+                    for text in cls.texts
                 ]
                 # return value shape: List[[seq_len, num_layers, topk]...]
                 http_result = await asyncio.gather(*tasks)
