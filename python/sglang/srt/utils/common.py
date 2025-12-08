@@ -2703,7 +2703,7 @@ def is_no_spec_infer_or_topk_one(server_args):
 
 def is_fa3_default_architecture(hf_config):
     if hf_config is None:
-        return None
+        return False
     architectures = getattr(hf_config, "architectures", None)
     if not isinstance(architectures, list) or not architectures:
         return False
