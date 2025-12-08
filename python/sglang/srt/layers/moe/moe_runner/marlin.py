@@ -15,7 +15,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -88,6 +87,7 @@ class MarlinRunnerCore(MoeRunnerCore):
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
             fused_marlin_moe,
         )
+        from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
         x = runner_input.hidden_states
 
