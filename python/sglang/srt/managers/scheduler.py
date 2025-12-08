@@ -685,8 +685,6 @@ class Scheduler(
                     "Falling back to broadcast_pyobj."
                 )
                 self.attn_tp_mq = None
-        self.attn_tp_mq = None
-        self.tp_mq = None
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
