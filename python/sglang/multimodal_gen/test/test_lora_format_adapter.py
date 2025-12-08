@@ -103,6 +103,7 @@ def is_diffusers_style_keys(
         "prior",
         "image_encoder",
         "vae",
+        "diffusion_model",
     }
     root_names = [k.split(".", 1)[0] for k in keys]
     root_ok_count = sum(r in allowed_roots for r in root_names)

@@ -26,7 +26,7 @@ class LoRAFormat(str, Enum):
 # Heuristics
 # ---------------------------------------------------------------------------
 
-def _is_xlabs_ai_key(k: str) -> bool:
+def _looks_like_xlabs_flux_key(k: str) -> bool:
     """
     Identifies XLabs FLUX-style LoRA keys. These typically appear under
     double_blocks/single_blocks with LORA subkeys such as proj_lora/qkv_lora.
@@ -88,7 +88,7 @@ def detect_lora_format_from_state_dict(
 
     keys = list(lora_state_dict.keys())
 
-    if any(_is_xlabs_ai_key(k) for k in keys):
+    if any(_looks_like_xlabs_flux_key(k) for k in keys):
         return LoRAFormat.XLABS_FLUX
 
     if _looks_like_kohya_flux(lora_state_dict):
@@ -110,6 +110,58 @@ def detect_lora_format_from_state_dict(
 # Converters
 # ---------------------------------------------------------------------------
 
+def _convert_via_diffusers_candidates(
+    lora_state_dict: Dict[str, torch.Tensor],
+    candidate_names: tuple[str, ...],
+    *,
+    unavailable_warning: str,
+    no_converter_warning: str,
+    success_info: str,
+    all_failed_warning: str,
+    logger=None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Tries a list of candidate converter functions from diffusers'
+    lora_conversion_utils and returns the first successful output.
+    """
+    if lcu is None:
+        if logger:
+            logger.warning(unavailable_warning)
+        return lora_state_dict
+
+    converters = [
+        (n, getattr(lcu, n))
+        for n in candidate_names
+        if callable(getattr(lcu, n, None))
+    ]
+
+    if not converters:
+        if logger:
+            logger.warning(no_converter_warning)
+        return lora_state_dict
+
+    last_err: Optional[Exception] = None
+
+    for name, fn in converters:
+        try:
+            # Use a fresh copy per attempt to avoid cross-contamination if a converter mutates the dict.
+            sd_copy = dict(lora_state_dict)
+            out = fn(sd_copy)
+            if isinstance(out, tuple) and isinstance(out[0], dict):
+                out = out[0]
+            if not isinstance(out, dict):
+                raise TypeError(f"Converter {name} returned {type(out)}")
+            if logger:
+                logger.info(success_info.format(name=name))
+            return out
+        except Exception as e:
+            last_err = e
+
+    if logger:
+        logger.warning(all_failed_warning.format(last_err=last_err))
+    return lora_state_dict
+
+
 def _convert_xlabs_ai_via_diffusers(
     lora_state_dict: Dict[str, torch.Tensor],
     logger=None,
@@ -117,43 +169,20 @@ def _convert_xlabs_ai_via_diffusers(
     """
     Converts XLabs FLUX LoRA into a diffusers-compatible format.
     """
-    if lcu is None:
-        if logger:
-            logger.warning("XLabs FLUX detected but diffusers is unavailable.")
-        return lora_state_dict
-
-    candidate_names = (
-        "_convert_xlabs_flux_lora_to_diffusers",
-        "convert_xlabs_lora_state_dict_to_diffusers",
-        "convert_xlabs_lora_to_diffusers",
-        "convert_xlabs_flux_lora_to_diffusers",
+    return _convert_via_diffusers_candidates(
+        lora_state_dict,
+        (
+            "_convert_xlabs_flux_lora_to_diffusers",
+            "convert_xlabs_lora_state_dict_to_diffusers",
+            "convert_xlabs_lora_to_diffusers",
+            "convert_xlabs_flux_lora_to_diffusers",
+        ),
+        unavailable_warning="XLabs FLUX detected but diffusers is unavailable.",
+        no_converter_warning="No XLabs converter found in diffusers.",
+        success_info="Converted XLabs FLUX LoRA using {name}",
+        all_failed_warning="All XLabs converters failed; last error: {last_err}",
+        logger=logger,
     )
-    converters = [(n, getattr(lcu, n)) for n in candidate_names if callable(getattr(lcu, n, None))]
-
-    if not converters:
-        if logger:
-            logger.warning("No XLabs converter found in diffusers.")
-        return lora_state_dict
-
-    sd_copy = dict(lora_state_dict)
-    last_err: Optional[Exception] = None
-
-    for name, fn in converters:
-        try:
-            out = fn(sd_copy)
-            if isinstance(out, tuple) and isinstance(out[0], dict):
-                out = out[0]
-            if not isinstance(out, dict):
-                raise TypeError(f"Converter {name} returned {type(out)}")
-            if logger:
-                logger.info(f"Converted XLabs FLUX LoRA using {name}")
-            return out
-        except Exception as e:
-            last_err = e
-
-    if logger:
-        logger.warning(f"All XLabs converters failed; last error: {last_err}")
-    return lora_state_dict
 
 
 def _convert_kohya_flux_via_diffusers(
@@ -163,41 +192,18 @@ def _convert_kohya_flux_via_diffusers(
     """
     Converts Kohya FLUX LoRA into a diffusers-compatible format.
     """
-    if lcu is None:
-        if logger:
-            logger.warning("Kohya FLUX detected but diffusers is unavailable.")
-        return lora_state_dict
-
-    candidate_names = (
-        "_convert_kohya_flux_lora_to_diffusers",
-        "convert_kohya_flux_lora_to_diffusers",
+    return _convert_via_diffusers_candidates(
+        lora_state_dict,
+        (
+            "_convert_kohya_flux_lora_to_diffusers",
+            "convert_kohya_flux_lora_to_diffusers",
+        ),
+        unavailable_warning="Kohya FLUX detected but diffusers is unavailable.",
+        no_converter_warning="No Kohya FLUX converter found.",
+        success_info="Converted Kohya FLUX LoRA using {name}",
+        all_failed_warning="Kohya FLUX conversion failed; last error: {last_err}",
+        logger=logger,
     )
-    converters = [(n, getattr(lcu, n)) for n in candidate_names if callable(getattr(lcu, n, None))]
-
-    if not converters:
-        if logger:
-            logger.warning("No Kohya FLUX converter found.")
-        return lora_state_dict
-
-    sd_copy = dict(lora_state_dict)
-    last_err: Optional[Exception] = None
-
-    for name, fn in converters:
-        try:
-            out = fn(sd_copy)
-            if isinstance(out, tuple) and isinstance(out[0], dict):
-                out = out[0]
-            if not isinstance(out, dict):
-                raise TypeError(f"Converter {name} returned {type(out)}")
-            if logger:
-                logger.info(f"Converted Kohya FLUX LoRA using {name}")
-            return out
-        except Exception as e:
-            last_err = e
-
-    if logger:
-        logger.warning(f"Kohya FLUX conversion failed; last error: {last_err}")
-    return lora_state_dict
 
 
 def _convert_non_diffusers_sd_via_diffusers(
@@ -208,65 +214,36 @@ def _convert_non_diffusers_sd_via_diffusers(
     Converts non-diffusers SD LoRA formats (SD1/2/XL, video LoRAs, transformer LoRAs)
     into diffusers-compatible naming.
     """
-    if lcu is None:
-        if logger:
-            logger.warning("Non-diffusers LoRA detected but diffusers is unavailable.")
-        return lora_state_dict
-
-    candidate_names = (
-        "_convert_non_diffusers_lora_to_diffusers",
-        "convert_non_diffusers_lora_to_diffusers",
-        "_convert_non_diffusers_wan_lora_to_diffusers",
-        "convert_non_diffusers_wan_lora_to_diffusers",
-        "_convert_musubi_wan_lora_to_diffusers",
-        "convert_musubi_wan_lora_to_diffusers",
-        "_convert_non_diffusers_flux2_lora_to_diffusers",
-        "convert_non_diffusers_flux2_lora_to_diffusers",
-        "_convert_non_diffusers_lumina2_lora_to_diffusers",
-        "convert_non_diffusers_lumina2_lora_to_diffusers",
-        "_convert_non_diffusers_ltxv_lora_to_diffusers",
-        "convert_non_diffusers_ltxv_lora_to_diffusers",
-        "_convert_non_diffusers_hidream_lora_to_diffusers",
-        "convert_non_diffusers_hidream_lora_to_diffusers",
-        "_convert_non_diffusers_z_image_lora_to_diffusers",
-        "convert_non_diffusers_z_image_lora_to_diffusers",
-        "_convert_non_diffusers_qwen_lora_to_diffusers",
-        "convert_non_diffusers_qwen_lora_to_diffusers",
-        "_convert_fal_kontext_lora_to_diffusers",
-        "convert_fal_kontext_lora_to_diffusers",
+    return _convert_via_diffusers_candidates(
+        lora_state_dict,
+        (
+            "_convert_non_diffusers_lora_to_diffusers",
+            "convert_non_diffusers_lora_to_diffusers",
+            "_convert_non_diffusers_wan_lora_to_diffusers",
+            "convert_non_diffusers_wan_lora_to_diffusers",
+            "_convert_musubi_wan_lora_to_diffusers",
+            "convert_musubi_wan_lora_to_diffusers",
+            "_convert_non_diffusers_flux2_lora_to_diffusers",
+            "convert_non_diffusers_flux2_lora_to_diffusers",
+            "_convert_non_diffusers_lumina2_lora_to_diffusers",
+            "convert_non_diffusers_lumina2_lora_to_diffusers",
+            "_convert_non_diffusers_ltxv_lora_to_diffusers",
+            "convert_non_diffusers_ltxv_lora_to_diffusers",
+            "_convert_non_diffusers_hidream_lora_to_diffusers",
+            "convert_non_diffusers_hidream_lora_to_diffusers",
+            "_convert_non_diffusers_z_image_lora_to_diffusers",
+            "convert_non_diffusers_z_image_lora_to_diffusers",
+            "_convert_non_diffusers_qwen_lora_to_diffusers",
+            "convert_non_diffusers_qwen_lora_to_diffusers",
+            "_convert_fal_kontext_lora_to_diffusers",
+            "convert_fal_kontext_lora_to_diffusers",
+        ),
+        unavailable_warning="Non-diffusers LoRA detected but diffusers is unavailable.",
+        no_converter_warning="No non-diffusers converters found.",
+        success_info="Converted non-diffusers LoRA using {name}",
+        all_failed_warning="All non-diffusers converters failed; last error: {last_err}",
+        logger=logger,
     )
-
-    converters = [
-        (n, getattr(lcu, n)) for n in candidate_names
-        if callable(getattr(lcu, n, None))
-    ]
-
-    if not converters:
-        if logger:
-            logger.warning("No non-diffusers converters found.")
-        return lora_state_dict
-
-    sd_copy = dict(lora_state_dict)
-    last_err: Optional[Exception] = None
-
-    for name, fn in converters:
-        try:
-            out = fn(sd_copy)
-            if isinstance(out, tuple) and isinstance(out[0], dict):
-                out = out[0]
-            if not isinstance(out, dict):
-                raise TypeError(f"Converter {name} returned {type(out)}")
-            if logger:
-                logger.info(f"Converted non-diffusers LoRA using {name}")
-            return out
-        except Exception as e:
-            last_err = e
-
-    if logger:
-        logger.warning(
-            f"All non-diffusers converters failed; last error: {last_err}"
-        )
-    return lora_state_dict
 
 
 # ---------------------------------------------------------------------------
