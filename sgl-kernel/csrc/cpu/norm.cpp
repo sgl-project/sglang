@@ -685,7 +685,7 @@ void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor
   at::Tensor buffer = at::empty({num_threads, hidden_size}, input.options().dtype(at::kFloat));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "fused_add_layernorm_kernel", [&] {
-    fused_add_rmsnorm_kernel_impl<scalar_t>(
+    fused_add_layernorm_kernel_impl<scalar_t>(
         input.data_ptr<scalar_t>(),
         residual.data_ptr<scalar_t>(),
         weight.data_ptr<scalar_t>(),
