@@ -184,13 +184,13 @@ class DataParallelController:
                 server_args=self.server_args,
             )
             trace_metric_ctx.trace_set_proc_propagate_context(req.trace_metric_ctx)
-            trace_metric_ctx.metric_trace_slice_start(RequestStage.DC_DISPATCH)
+            trace_metric_ctx.slice_start(RequestStage.DC_DISPATCH)
             req.trace_metric_ctx = trace_metric_ctx.trace_get_proc_propagate_context()
 
         self.dispatching(req)
 
         if self.server_args.trace_level > 0:
-            trace_metric_ctx.metric_trace_slice_end(
+            trace_metric_ctx.slice_end(
                 RequestStage.DC_DISPATCH, thread_finish_flag=True
             )
 

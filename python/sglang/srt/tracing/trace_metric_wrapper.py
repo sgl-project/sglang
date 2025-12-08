@@ -182,7 +182,7 @@ class TraceMetricContext(SGLangTraceReqContext):
             module_name=module_name,
         )
 
-    def metric_trace_slice_start(
+    def slice_start(
         self,
         stage: RequestStageConfig,
         ts: Optional[int] = None,
@@ -198,7 +198,7 @@ class TraceMetricContext(SGLangTraceReqContext):
             level=stage.level,
         )
 
-    def metric_trace_slice_end(
+    def slice_end(
         self,
         stage: RequestStageConfig,
         ts: Optional[int] = None,
@@ -229,8 +229,6 @@ class TraceMetricContext(SGLangTraceReqContext):
             level=stage.level,
         )
 
-    metric_trace_slice = metric_trace_slice_end
-
 
 class NullContext:
     __slots__ = ()
@@ -259,7 +257,7 @@ def metric_trace_slice_batch(
         return
 
     for req in reqs:
-        req.trace_metric_ctx.metric_trace_slice(
+        req.trace_metric_ctx.slice_end(
             stage,
             auto_next_anon=not req.finished(),
             thread_finish_flag=req.finished(),

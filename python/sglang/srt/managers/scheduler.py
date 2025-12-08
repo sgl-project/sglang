@@ -1481,7 +1481,7 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
-            req.trace_metric_ctx.metric_trace_slice_end(
+            req.trace_metric_ctx.slice_end(
                 RequestStage.REQUEST_PROCESS, auto_next_anon=True
             )
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1849,12 +1849,12 @@ class Scheduler(
                     self.metrics_collector.observe_queue_time(
                         req.time_stats.get_queueing_time(),
                     )
-                req.trace_metric_ctx.metric_trace_slice(
+                req.trace_metric_ctx.slice_end(
                     RequestStage.PREFILL_WAITING, auto_next_anon=True
                 )
 
         if self.chunked_req and self.chunked_req.is_chunked == 1:
-            self.chunked_req.trace_metric_ctx.metric_trace_slice_start(
+            self.chunked_req.trace_metric_ctx.slice_start(
                 RequestStage.PREFILL_CHUNKED_FORWARD
             )
 
@@ -2567,7 +2567,7 @@ class Scheduler(
             ),
         )
         req.trace_metric_ctx.trace_set_proc_propagate_context(propagation_context)
-        req.trace_metric_ctx.metric_trace_slice_start(RequestStage.ANONYMOUS)
+        req.trace_metric_ctx.slice_start(RequestStage.ANONYMOUS)
 
 
 class IdleSleeper:

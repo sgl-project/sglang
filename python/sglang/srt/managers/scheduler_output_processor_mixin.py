@@ -45,13 +45,13 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.forward_entry_time = req.time_stats.completion_time = (
                     time.perf_counter()
                 )
-                req.trace_metric_ctx.metric_trace_slice_end(
+                req.trace_metric_ctx.slice_end(
                     RequestStage.DECODE_QUICK_FINISH,
                     thread_finish_flag=True,
                 )
                 release_kv_cache(req, self.tree_cache)
             else:
-                req.trace_metric_ctx.metric_trace_slice_end(
+                req.trace_metric_ctx.slice_end(
                     RequestStage.DECODE_FAKE_OUTPUT,
                     auto_next_anon=True,
                 )
@@ -166,7 +166,7 @@ class SchedulerOutputProcessorMixin:
                             self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
-                    req.trace_metric_ctx.metric_trace_slice(
+                    req.trace_metric_ctx.slice_end(
                         RequestStage.PREFILL_FORWARD,
                         auto_next_anon=not req.finished(),
                         thread_finish_flag=req.finished(),
@@ -200,7 +200,7 @@ class SchedulerOutputProcessorMixin:
                                 )
                             logprob_pt += num_input_logprobs
 
-                    req.trace_metric_ctx.metric_trace_slice(
+                    req.trace_metric_ctx.slice_end(
                         RequestStage.PREFILL_CHUNKED_FORWARD,
                         auto_next_anon=(req.is_chunked != 0),
                     )
@@ -236,7 +236,7 @@ class SchedulerOutputProcessorMixin:
                     req.output_ids.append(0)
                     req.check_finished()
 
-                    req.trace_metric_ctx.metric_trace_slice(
+                    req.trace_metric_ctx.slice_end(
                         RequestStage.PREFILL_FORWARD,
                         auto_next_anon=not req.finished(),
                         thread_finish_flag=req.finished(),
@@ -250,7 +250,7 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-                    req.trace_metric_ctx.metric_trace_slice(
+                    req.trace_metric_ctx.slice_end(
                         RequestStage.PREFILL_CHUNKED_FORWARD,
                         auto_next_anon=(req.is_chunked != 0),
                     )

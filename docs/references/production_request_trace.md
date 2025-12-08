@@ -77,28 +77,28 @@ We have already inserted instrumentation points in the tokenizer and scheduler m
 
     * Add slice tracing normally:
         ```python
-        trace_metric_ctx.metric_trace_slice_start(RequestStage.TOKENIZER)
-        trace_metric_ctx.metric_trace_slice_end(RequestStage.TOKENIZER)
+        trace_metric_ctx.slice_start(RequestStage.TOKENIZER)
+        trace_metric_ctx.slice_end(RequestStage.TOKENIZER)
         ```
 
     - Use the `ANONYMOUS` to not specify a slice name at the start of the slice, allowing the slice name to be determined by trace_slice_end.
     <br>Note: Anonymous slices must not be nested.
         ```python
-        trace_metric_ctx.metric_trace_slice_start(RequestStage.ANONYMOUS)
-        trace_metric_ctx.metric_trace_slice_end(RequestStage.TOKENIZER)
+        trace_metric_ctx.slice_start(RequestStage.ANONYMOUS)
+        trace_metric_ctx.slice_end(RequestStage.TOKENIZER)
         ```
 
-    - In metric_trace_slice_end, use auto_next_anon to automatically create the next anonymous slice, which can reduce the number of instrumentation points needed.
+    - In slice_end, use auto_next_anon to automatically create the next anonymous slice, which can reduce the number of instrumentation points needed.
         ```python
-        trace_metric_ctx.metric_trace_slice_start(RequestStage.ANONYMOUS)
-        trace_metric_ctx.metric_trace_slice_end(RequestStage.A, auto_next_anon = True)
-        trace_metric_ctx.metric_trace_slice_end(RequestStage.B, auto_next_anon = True)
-        trace_metric_ctx.metric_trace_slice_end(RequestStage.C, auto_next_anon = True)
-        trace_metric_ctx.metric_trace_slice_end(RequestStage.D)
+        trace_metric_ctx.slice_start(RequestStage.ANONYMOUS)
+        trace_metric_ctx.slice_end(RequestStage.A, auto_next_anon = True)
+        trace_metric_ctx.slice_end(RequestStage.B, auto_next_anon = True)
+        trace_metric_ctx.slice_end(RequestStage.C, auto_next_anon = True)
+        trace_metric_ctx.slice_end(RequestStage.D)
         ```
     - The end of the last slice in a thread must be marked with thread_finish_flag=True; otherwise, the thread's span will not be properly generated.
         ```python
-        trace_metric_ctx.metric_trace_slice_end(RequestStage.D, thread_finish_flag = True)
+        trace_metric_ctx.slice_end(RequestStage.D, thread_finish_flag = True)
         ```
 
 5. When the request execution flow transfers to another thread, the trace context needs to be explicitly propagated.

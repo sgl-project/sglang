@@ -716,9 +716,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             mm_inputs = None
 
         self._validate_one_request(obj, input_ids)
-        global_get_trace_metric_ctx(obj.rid).metric_trace_slice_end(
-            RequestStage.TOKENIZE
-        )
+        global_get_trace_metric_ctx(obj.rid).slice_end(RequestStage.TOKENIZE)
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
@@ -944,9 +942,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     req, req.text, input_ids_list[i], None, None, token_type_ids
                 )
             )
-            global_get_trace_metric_ctx(req.rid).metric_trace_slice_end(
-                RequestStage.TOKENIZE
-            )
+            global_get_trace_metric_ctx(req.rid).slice_end(RequestStage.TOKENIZE)
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
@@ -1004,7 +1000,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         if self.server_args.trace_level > 0:
             trace_metric_ctx = global_get_trace_metric_ctx(obj.rid)
-            trace_metric_ctx.metric_trace_slice_start(RequestStage.TOKENIZER_DISPATCH)
+            trace_metric_ctx.slice_start(RequestStage.TOKENIZER_DISPATCH)
             tokenized_obj.trace_metric_ctx = (
                 trace_metric_ctx.trace_get_proc_propagate_context()
             )
@@ -1013,7 +1009,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
         if self.server_args.trace_level > 0:
-            trace_metric_ctx.metric_trace_slice_end(
+            trace_metric_ctx.slice_end(
                 RequestStage.TOKENIZER_DISPATCH, thread_finish_flag=True
             )
         return state
@@ -1035,9 +1031,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if self.server_args.trace_level > 0:
             for tokenized_obj in tokenized_objs:
                 trace_metric_ctx = global_get_trace_metric_ctx(tokenized_obj.rid)
-                trace_metric_ctx.metric_trace_slice_start(
-                    RequestStage.TOKENIZER_DISPATCH
-                )
+                trace_metric_ctx.slice_start(RequestStage.TOKENIZER_DISPATCH)
                 tokenized_obj.trace_metric_ctx = (
                     trace_metric_ctx.trace_get_proc_propagate_context()
                 )
@@ -1053,7 +1047,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if self.server_args.trace_level > 0:
                 trace_metric_ctx = global_get_trace_metric_ctx(tokenized_obj.rid)
-                trace_metric_ctx.metric_trace_slice_end(RequestStage.TOKENIZER_DISPATCH)
+                trace_metric_ctx.slice_end(RequestStage.TOKENIZER_DISPATCH)
 
     async def _wait_one_response(
         self,
@@ -2462,7 +2456,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             trace_metric_ctx.trace_req_start(
                 ts=int(created_time * 1e9), external_trace_header=external_trace_header
             )
-            trace_metric_ctx.metric_trace_slice_start(
+            trace_metric_ctx.slice_start(
                 RequestStage.ANONYMOUS, ts=int(created_time * 1e9)
             )
         else:
@@ -2486,7 +2480,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                     ts=int(created_time * 1e9),
                     external_trace_header=external_trace_header,
                 )
-                trace_metric_ctx.metric_trace_slice_start(
+                trace_metric_ctx.slice_start(
                     RequestStage.ANONYMOUS,
                     ts=int(created_time * 1e9),
                 )

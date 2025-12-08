@@ -194,7 +194,7 @@ class PrefillBootstrapQueue:
         )
         self._process_req(req)
         self.queue.append(req)
-        req.trace_metric_ctx.metric_trace_slice_end(
+        req.trace_metric_ctx.slice_end(
             RequestStage.PREFILL_PREPARE, auto_next_anon=True
         )
 
@@ -287,7 +287,7 @@ class PrefillBootstrapQueue:
             indices_to_remove.add(i)
             req.time_stats.wait_queue_entry_time = time.perf_counter()
 
-            req.trace_metric_ctx.metric_trace_slice_end(
+            req.trace_metric_ctx.slice_end(
                 RequestStage.PREFILL_BOOTSTRAP, auto_next_anon=True
             )
 
@@ -452,7 +452,7 @@ class SchedulerDisaggregationPrefillMixin:
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
-                req.trace_metric_ctx.metric_trace_slice(
+                req.trace_metric_ctx.slice_end(
                     RequestStage.PREFILL_FORWARD, auto_next_anon=True
                 )
 
@@ -493,7 +493,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
-                req.trace_metric_ctx.metric_trace_slice(
+                req.trace_metric_ctx.slice_end(
                     RequestStage.PREFILL_CHUNKED_FORWARD,
                     auto_next_anon=(req.is_chunked != 0),
                 )
@@ -567,7 +567,7 @@ class SchedulerDisaggregationPrefillMixin:
             req: Req
             self.req_to_metadata_buffer_idx_allocator.free(req.metadata_buffer_index)
             req.metadata_buffer_index = -1
-            req.trace_metric_ctx.metric_trace_slice(
+            req.trace_metric_ctx.slice_end(
                 RequestStage.PREFILL_TRANSFER_KV_CACHE, thread_finish_flag=True
             )
 
