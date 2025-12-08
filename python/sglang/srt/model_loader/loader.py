@@ -878,6 +878,21 @@ class QuantizedRLModelLoader(DefaultModelLoader):
     ) -> None:
         if scale_info is None:
             return
+        # Get tp rank and size
+        tp_rank = get_tensor_model_parallel_rank()
+        tp_size = get_tensor_model_parallel_world_size()
+
+        def _get_tp_sharded_scale(full_scale_tensor):
+            """Get tp sharded scale from full scale tensor"""
+            if tp_size == 1:
+                return full_scale_tensor
+            
+            full_dim = full_scale_tensor.shape[0]
+            shard_dim = full_dim // tp_size
+            start_idx = tp_rank * shard_dim
+            end_idx = start_idx + shard_dim
+            return full_scale_tensor[start_idx:end_idx]
+        
         if param_name.endswith(".weight"):
             scale_param_name = f"{param_name[:-7]}.weight_scale"
         else:
@@ -889,8 +904,8 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                 "[QuantizedRL] Scale parameter not found: %s", scale_param_name
             )
             return
-
         if isinstance(scale_info, torch.Tensor):
+            new_scale = _get_tp_sharded_scale(scale_info)
             new_scale = scale_info.t().contiguous()
             if scale_param.data.shape == new_scale.shape:
                 scale_param.data.copy_(new_scale)
@@ -931,6 +946,7 @@ class QuantizedRLModelLoader(DefaultModelLoader):
                     else idx
                 )
                 shard_scale = scale_info.get(shard_id)
+                shard_scale = _get_tp_sharded_scale(shard_scale)
                 if shard_scale is None:
                     offset += rows_per_shard
                     continue
