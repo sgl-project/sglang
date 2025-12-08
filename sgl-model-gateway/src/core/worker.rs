@@ -355,11 +355,15 @@ impl std::str::FromStr for RuntimeType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "sglang" => Ok(RuntimeType::Sglang),
-            "vllm" => Ok(RuntimeType::Vllm),
-            "external" => Ok(RuntimeType::External),
-            _ => Err(format!("Unknown runtime type: {}", s)),
+        // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
+        if s.eq_ignore_ascii_case("sglang") {
+            Ok(RuntimeType::Sglang)
+        } else if s.eq_ignore_ascii_case("vllm") {
+            Ok(RuntimeType::Vllm)
+        } else if s.eq_ignore_ascii_case("external") {
+            Ok(RuntimeType::External)
+        } else {
+            Err(format!("Unknown runtime type: {}", s))
         }
     }
 }
@@ -516,22 +520,18 @@ impl fmt::Debug for BasicWorker {
 
 impl BasicWorker {
     pub fn normalised_url(&self) -> WorkerResult<&str> {
-        if self.url().contains("@") {
-            // Use rfind to split from the right, handling IPv6 addresses with brackets
-            // e.g., "http://[::1]:8080@0" -> "http://[::1]:8080" and "0"
-            if let Some(at_pos) = self.url().rfind('@') {
-                let base_url = &self.url()[..at_pos];
-                let rank_str = &self.url()[at_pos + 1..];
+        // Use rfind directly - no need for redundant contains() check
+        // rfind already returns None if '@' is not found
+        // e.g., "http://[::1]:8080@0" -> "http://[::1]:8080" and "0"
+        if let Some(at_pos) = self.url().rfind('@') {
+            let base_url = &self.url()[..at_pos];
+            let rank_str = &self.url()[at_pos + 1..];
 
-                // Validate that the rank part is actually a number
-                match rank_str.parse::<usize>() {
-                    Ok(_) => Ok(base_url),
-                    Err(_) => {
-                        // The '@' is not a DP rank separator, return full URL
-                        Ok(self.url())
-                    }
-                }
+            // Validate that the rank part is actually a number
+            if rank_str.parse::<usize>().is_ok() {
+                Ok(base_url)
             } else {
+                // The '@' is not a DP rank separator, return full URL
                 Ok(self.url())
             }
         } else {
@@ -1085,33 +1085,38 @@ impl HealthChecker {
 
 /// Helper to convert Worker trait object to WorkerInfo struct
 pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
-    let worker_type_str = match worker.worker_type() {
+    // Cache values that are used multiple times to avoid redundant clones/allocations
+    let worker_type = worker.worker_type();
+    let connection_mode = worker.connection_mode();
+    let url = worker.url();
+    let model_id = worker.model_id();
+
+    let worker_type_str = match &worker_type {
         WorkerType::Regular => "regular",
         WorkerType::Prefill { .. } => "prefill",
         WorkerType::Decode => "decode",
     };
 
-    let bootstrap_port = match worker.worker_type() {
-        WorkerType::Prefill { bootstrap_port } => bootstrap_port,
+    let bootstrap_port = match &worker_type {
+        WorkerType::Prefill { bootstrap_port } => *bootstrap_port,
         _ => None,
     };
 
-    let runtime_type = match worker.connection_mode() {
+    let runtime_type = match &connection_mode {
         ConnectionMode::Grpc { .. } => Some(worker.metadata().runtime_type.to_string()),
         ConnectionMode::Http => None,
     };
 
-    let model_id = worker.model_id();
     WorkerInfo {
-        id: worker.url().to_string(),
-        url: worker.url().to_string(),
+        id: url.to_string(),
+        url: url.to_string(),
         model_id: model_id.to_string(),
         priority: worker.priority(),
         cost: worker.cost(),
         worker_type: worker_type_str.to_string(),
         is_healthy: worker.is_healthy(),
         load: worker.load(),
-        connection_mode: format!("{:?}", worker.connection_mode()),
+        connection_mode: connection_mode.to_string(),
         runtime_type,
         tokenizer_path: worker.tokenizer_path(model_id).map(String::from),
         reasoning_parser: worker.reasoning_parser(model_id).map(String::from),
