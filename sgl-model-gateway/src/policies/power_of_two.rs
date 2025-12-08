@@ -6,10 +6,10 @@ use std::{
 };
 
 use rand::Rng;
-use tracing::info;
+use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics};
+use crate::{core::Worker, observability::metrics::RouterMetrics};
 
 /// Power-of-two choices policy
 ///
@@ -57,15 +57,12 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             return Some(healthy_indices[0]);
         }
 
-        // Select two random workers
+        // Select two random workers - use offset to guarantee different selection in O(1)
         let mut rng = rand::rng();
         let idx1 = rng.random_range(0..healthy_indices.len());
-        let mut idx2 = rng.random_range(0..healthy_indices.len());
-
-        // Ensure we pick two different workers
-        while idx2 == idx1 {
-            idx2 = rng.random_range(0..healthy_indices.len());
-        }
+        // Pick idx2 from remaining indices: offset by 1 + random from (len-1) to guarantee different
+        let idx2 =
+            (idx1 + 1 + rng.random_range(0..healthy_indices.len() - 1)) % healthy_indices.len();
 
         let worker_idx1 = healthy_indices[idx1];
         let worker_idx2 = healthy_indices[idx2];
@@ -81,7 +78,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             worker_idx2
         };
 
-        info!(
+        debug!(
             "Power-of-two selection: {}={} vs {}={} -> selected {}",
             workers[worker_idx1].url(),
             load1,

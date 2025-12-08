@@ -101,7 +101,7 @@ impl ResponseProcessor {
         if original_request.separate_reasoning && reasoning_parser_available {
             let pooled_parser = utils::get_reasoning_parser(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_ref(),
+                self.configured_reasoning_parser.as_deref(),
                 &original_request.model,
             );
 
@@ -227,7 +227,7 @@ impl ResponseProcessor {
         let reasoning_parser_available = chat_request.separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
-                self.configured_reasoning_parser.as_ref(),
+                self.configured_reasoning_parser.as_deref(),
                 &chat_request.model,
             );
 
@@ -240,7 +240,7 @@ impl ResponseProcessor {
             && chat_request.tools.is_some()
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
-                self.configured_tool_parser.as_ref(),
+                self.configured_tool_parser.as_deref(),
                 &chat_request.model,
             );
 
@@ -308,7 +308,7 @@ impl ResponseProcessor {
         // Get pooled parser for this model
         let pooled_parser = utils::get_tool_parser(
             &self.tool_parser_factory,
-            self.configured_tool_parser.as_ref(),
+            self.configured_tool_parser.as_deref(),
             model,
         );
 

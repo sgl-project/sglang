@@ -659,7 +659,7 @@ impl Router {
     }
 
     fn start(&self) -> PyResult<()> {
-        use metrics::PrometheusConfig;
+        use observability::metrics::PrometheusConfig;
 
         let router_config = self.to_router_config().map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {}", e))

@@ -737,7 +737,7 @@ def _set_envs_and_config(server_args: ServerArgs):
     if _is_cuda and not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         assert_pkg_version(
             "sgl-kernel",
-            "0.3.18.post3",
+            "0.3.19",
             "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
         )
 

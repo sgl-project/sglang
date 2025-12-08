@@ -3,18 +3,26 @@
 //! Manages WASM component execution using wasmtime with async support.
 //! Provides a thread pool for concurrent WASM execution and metrics tracking.
 
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 use wasmtime::{
     component::{Component, Linker, ResourceTable},
-    Config, Engine, Store,
+    Config, Engine, Store, StoreLimitsBuilder, UpdateDeadline,
 };
 use wasmtime_wasi::WasiCtx;
+
+/// Epoch increment interval in milliseconds.
+/// Epochs are used for cooperative timeout enforcement in WASM execution.
+/// A smaller interval gives finer-grained timeout control but slightly more overhead.
+const EPOCH_INTERVAL_MS: u64 = 100;
 
 use crate::wasm::{
     config::WasmRuntimeConfig,
@@ -150,6 +158,17 @@ impl WasmRuntime {
     }
 }
 
+/// Maps a wasmtime error to a WasmError, detecting epoch interruption (timeout) traps.
+fn map_wasm_error(e: wasmtime::Error, timeout_ms: u64) -> WasmError {
+    // Use proper trap code detection instead of brittle string matching.
+    // Wasmtime uses Trap::Interrupt for epoch-based interruptions.
+    if e.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt) {
+        WasmError::from(WasmRuntimeError::Timeout(timeout_ms))
+    } else {
+        WasmError::from(WasmRuntimeError::CallFailed(e.to_string()))
+    }
+}
+
 impl WasmThreadPool {
     pub fn new(config: WasmRuntimeConfig) -> Result<Self> {
         let (sender, receiver) = async_channel::unbounded();
@@ -163,7 +182,7 @@ impl WasmThreadPool {
         let num_workers = config.thread_pool_size.clamp(1, max_workers);
 
         info!(
-            target: "sglang_router_rs::wasm::runtime",
+            target: "sgl_model_gateway::wasm::runtime",
             "Initializing WASM runtime with {} workers",
             num_workers
         );
@@ -178,7 +197,7 @@ impl WasmThreadPool {
                     Ok(rt) => rt,
                     Err(e) => {
                         error!(
-                            target: "sglang_router_rs::wasm::runtime",
+                            target: "sgl_model_gateway::wasm::runtime",
                             worker_id = worker_id,
                             "Failed to create tokio runtime: {}",
                             e
@@ -220,7 +239,7 @@ impl WasmThreadPool {
         config: WasmRuntimeConfig,
     ) {
         debug!(
-            target: "sglang_router_rs::wasm::runtime",
+            target: "sgl_model_gateway::wasm::runtime",
             worker_id = worker_id,
             thread_id = ?std::thread::current().id(),
             "Worker started"
@@ -230,12 +249,13 @@ impl WasmThreadPool {
         wasmtime_config.async_stack_size(config.max_stack_size);
         wasmtime_config.async_support(true);
         wasmtime_config.wasm_component_model(true); // Enable component model
+        wasmtime_config.epoch_interruption(true); // Enable epoch-based timeout interruption
 
         let engine = match Engine::new(&wasmtime_config) {
             Ok(engine) => engine,
             Err(e) => {
                 error!(
-                    target: "sglang_router_rs::wasm::runtime",
+                    target: "sgl_model_gateway::wasm::runtime",
                     worker_id = worker_id,
                     "Failed to create engine: {}",
                     e
@@ -244,15 +264,36 @@ impl WasmThreadPool {
             }
         };
 
+        // Start epoch incrementer for timeout enforcement.
+        // The engine's epoch counter is incremented periodically, and each Store
+        // can set a deadline (number of epochs). When the deadline is reached,
+        // WASM execution is interrupted with a trap.
+        let engine_for_epoch = engine.clone();
+        let epoch_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(EPOCH_INTERVAL_MS));
+            loop {
+                interval.tick().await;
+                engine_for_epoch.increment_epoch();
+            }
+        });
+
+        debug!(
+            target: "sgl_model_gateway::wasm::runtime",
+            worker_id = worker_id,
+            epoch_interval_ms = EPOCH_INTERVAL_MS,
+            "Epoch incrementer started for timeout enforcement"
+        );
+
         loop {
             let task = match receiver.recv().await {
                 Ok(task) => task,
                 Err(_) => {
                     debug!(
-                        target: "sglang_router_rs::wasm::runtime",
+                        target: "sgl_model_gateway::wasm::runtime",
                         worker_id = worker_id,
                         "Worker shutting down"
                     );
+                    epoch_handle.abort(); // Stop the epoch incrementer
                     break; // channel closed, exit loop
                 }
             };
@@ -284,7 +325,7 @@ impl WasmThreadPool {
         wasm_bytes: Vec<u8>,
         attach_point: WasmModuleAttachPoint,
         input: WasmComponentInput,
-        _config: &WasmRuntimeConfig,
+        config: &WasmRuntimeConfig,
     ) -> Result<WasmComponentOutput> {
         // Compile component from bytes
         // Note: The WASM file must be in component format (not plain WASM module)
@@ -301,13 +342,42 @@ impl WasmThreadPool {
         let mut linker = Linker::<WasiState>::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         let mut builder = WasiCtx::builder();
+
+        // Create memory limits from config.
+        // Use the config helper to get total bytes, then safely convert to usize.
+        let memory_limit_bytes =
+            usize::try_from(config.get_total_memory_bytes()).map_err(|_| {
+                WasmError::from(WasmRuntimeError::CallFailed(
+                    "Configured WASM memory limit exceeds addressable space on this platform."
+                        .to_string(),
+                ))
+            })?;
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(memory_limit_bytes)
+            .trap_on_grow_failure(true) // Trap instead of returning -1 for easier debugging
+            .build();
+
         let mut store = Store::new(
             engine,
             WasiState {
                 ctx: builder.build(),
                 table: ResourceTable::new(),
+                limits,
             },
         );
+
+        // Apply resource limits to the store.
+        // This enforces max_memory_pages by preventing memory.grow beyond the limit.
+        store.limiter(|state| &mut state.limits);
+
+        // Set epoch deadline for timeout enforcement.
+        // The deadline is the number of epoch ticks before execution is interrupted.
+        // With EPOCH_INTERVAL_MS=100ms and max_execution_time_ms=1000ms, deadline=10 epochs.
+        let deadline_epochs = (config.max_execution_time_ms / EPOCH_INTERVAL_MS).max(1);
+        store.set_epoch_deadline(deadline_epochs);
+
+        // Configure what happens when the deadline is reached during async yields
+        store.epoch_deadline_callback(|_store| Ok(UpdateDeadline::Yield(1)));
 
         let output = match attach_point {
             WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest) => {
@@ -333,7 +403,7 @@ impl WasmThreadPool {
                     .sgl_model_gateway_middleware_on_request()
                     .call_on_request(&mut store, &request)
                     .await
-                    .map_err(|e| WasmError::from(WasmRuntimeError::CallFailed(e.to_string())))?;
+                    .map_err(|e| map_wasm_error(e, config.max_execution_time_ms))?;
 
                 WasmComponentOutput::MiddlewareAction(action_result)
             }
@@ -361,7 +431,7 @@ impl WasmThreadPool {
                     .sgl_model_gateway_middleware_on_response()
                     .call_on_response(&mut store, &response)
                     .await
-                    .map_err(|e| WasmError::from(WasmRuntimeError::CallFailed(e.to_string())))?;
+                    .map_err(|e| map_wasm_error(e, config.max_execution_time_ms))?;
 
                 WasmComponentOutput::MiddlewareAction(action_result)
             }

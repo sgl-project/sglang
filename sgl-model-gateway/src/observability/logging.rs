@@ -10,7 +10,8 @@ use tracing_subscriber::{
     fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 
-use crate::{config::TraceConfig, otel_trace::get_otel_layer};
+use super::otel_trace::get_otel_layer;
+use crate::config::TraceConfig;
 
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
