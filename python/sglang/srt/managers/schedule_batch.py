@@ -1498,7 +1498,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
-        self.out_cache_loc_cpu = out_cache_loc.to("cpu", non_blocking=True)
+        self.out_cache_loc_cpu = out_cache_loc.cpu()
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
