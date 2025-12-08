@@ -2440,7 +2440,7 @@ class ServerArgs:
             "--enable-force-include-usage",
             action="store_true",
             default=ServerArgs.enable_force_include_usage,
-            help="force return usage for every request, default false",
+            help="Force the server to include token usage information in streaming responses",
         )
         parser.add_argument(
             "--device",
