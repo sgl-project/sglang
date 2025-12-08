@@ -1214,6 +1214,111 @@ def sample_sharegpt_requests(
     return filtered_dataset
 
 
+def _batch_encode_texts(
+    tokenizer: PreTrainedTokenizerBase,
+    texts: List[str],
+    target_lengths: np.ndarray,
+) -> List[List[int]]:
+    """
+    Batch encode texts.
+    Fallback to individual encoding if batch encoding fails.
+    """
+
+    def _fallback_encode():
+        warnings.warn("Batch encoding fails. Fallback to individual encoding.")
+        return [
+            tokenizer.encode(text, add_special_tokens=False)[: int(target_len)]
+            for text, target_len in zip(texts, target_lengths)
+        ]
+
+    if not hasattr(tokenizer, "batch_encode_plus"):
+        return _fallback_encode()
+
+    try:
+        # Use batch_encode_plus for batch encoding
+        encoded_batch = tokenizer.batch_encode_plus(
+            texts,
+            add_special_tokens=False,
+            padding=False,
+            truncation=False,
+            return_tensors=None,
+        )
+
+        # Extract input_ids and truncate to target length
+        truncated_sequences = []
+        for i, input_ids in enumerate(encoded_batch["input_ids"]):
+            target_len = int(target_lengths[i])
+            truncated_sequences.append(input_ids[:target_len])
+
+        return truncated_sequences
+    except Exception:
+        # If batch encoding fails, fallback to individual encoding
+        return _fallback_encode()
+
+
+def _batch_decode_tokens(
+    tokenizer: PreTrainedTokenizerBase, token_sequences: List[List[int]]
+) -> List[str]:
+    """
+    Batch decode tokens.
+    Fallback to individual decoding if batch decoding fails.
+    """
+
+    def _fallback_decode():
+        warnings.warn("Batch decoding fails. Fallback to individual decoding.")
+        return [tokenizer.decode(seq) for seq in token_sequences]
+
+    if not hasattr(tokenizer, "batch_decode"):
+        return _fallback_decode()
+
+    try:
+        # Prefer batch decoding if supported
+        return tokenizer.batch_decode(token_sequences, skip_special_tokens=True)
+    except Exception:
+        # If batch decoding fails, fallback to individual decoding
+        return _fallback_decode()
+
+
+def _normalize_prompt_lengths(
+    prompts: List[str],
+    input_lens: np.ndarray,
+    output_lens: np.ndarray,
+    tokenizer: PreTrainedTokenizerBase,
+) -> List[DatasetRow]:
+    """
+    Normalize prompt lengths.
+    After decoding the prompt we have to encode and decode it again.
+    This is done because in some cases N consecutive tokens
+    give a string tokenized into != N number of tokens.
+    For example for GPT2Tokenizer:
+    [6880, 6881] -> ['Ġcalls', 'here'] ->
+    [1650, 939, 486] -> ['Ġcall', 'sh', 'ere']
+    To avoid uncontrolled change of the prompt length,
+    the encoded sequence is truncated before being decode again.
+    """
+    # 1. Batch re-encode all texts
+    re_encoded_sequences = _batch_encode_texts(
+        tokenizer=tokenizer, texts=prompts, target_lengths=input_lens
+    )
+
+    # 2. Batch decode truncated sequences
+    final_prompts = _batch_decode_tokens(
+        tokenizer=tokenizer, token_sequences=re_encoded_sequences
+    )
+
+    # 3. Batch construct results
+    return [
+        DatasetRow(
+            prompt=final_prompt,
+            prompt_len=len(re_encoded_seq),
+            output_len=int(output_len),
+        )
+        for final_prompt, re_encoded_seq, output_len in zip(
+            final_prompts, re_encoded_sequences, output_lens
+        )
+    ]
+
+
 def sample_random_requests(
     input_len: int,
     output_len: int,
@@ -1224,6 +1329,9 @@ def sample_random_requests(
     random_sample: bool = True,
     return_text: bool = True,
 ) -> List[DatasetRow]:
+    """
+    Sample random requests.
+    """
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
         input_len + 1,
@@ -1296,21 +1404,35 @@ def sample_random_requests(
     else:
         # Sample token ids from random integers. This can cause some NaN issues.
         offsets = np.random.randint(0, tokenizer.vocab_size, size=num_prompts)
-        input_requests = []
+
+        # Pre-allocate token matrix for better performance
+        max_input_len = np.max(input_lens)
+        token_matrix = np.zeros((num_prompts, max_input_len), dtype=np.int32)
+
+        # Vectorized generation of all token sequences
+        indices = np.arange(max_input_len)
         for i in range(num_prompts):
-            input_content = [
-                (offsets[i] + i + j) % tokenizer.vocab_size
-                for j in range(input_lens[i])
-            ]
-            if return_text:
-                input_content = tokenizer.decode(input_content)
-            input_requests.append(
-                DatasetRow(
-                    prompt=input_content,
-                    prompt_len=int(input_lens[i]),
-                    output_len=int(output_lens[i]),
-                )
-            )
+            # Generate unique token sequence for each request
+            token_ids = (
+                offsets[i] + i + indices[: input_lens[i]]
+            ) % tokenizer.vocab_size
+            token_matrix[i, : input_lens[i]] = token_ids
+
+        # Extract token sequences in batch
+        token_sequences = [
+            token_matrix[i, : input_lens[i]].tolist() for i in range(num_prompts)
+        ]
+
+        # Decode to text in batch
+        prompts = _batch_decode_tokens(tokenizer, token_sequences)
+
+        # Re-encode in batch to ensure token count consistency
+        input_requests = _normalize_prompt_lengths(
+            prompts=prompts,
+            input_lens=input_lens,
+            output_lens=output_lens,
+            tokenizer=tokenizer,
+        )
 
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
