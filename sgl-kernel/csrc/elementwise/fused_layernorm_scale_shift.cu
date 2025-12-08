@@ -15,8 +15,6 @@
 
 #include "utils.h"
 
-#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
-
 // Minimal warp/block reduction helpers (sum) for small arrays
 template <typename T, int NumVals>
 __device__ __forceinline__ void warpReduceSum(T (&vals)[NumVals]) {
@@ -219,8 +217,8 @@ __global__ void layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift(
     if (index < n_4){
       const T4 gamma_val = gamma[index];
       const T4 beta_val  = beta[index];
-      const T4 scale_val = scale[offset + index];
-      const T4 shift_val = shift[offset + index];
+      const T4 scale_val = scale[index];
+      const T4 shift_val = shift[index];
       T4 tmp;
       tmp.x = T(((static_cast<float>(local_val[i].x) - s_mean) * s_variance * static_cast<float>(gamma_val.x) + static_cast<float>(beta_val.x)) * (1.0f + static_cast<float>(scale_val.x)) + static_cast<float>(shift_val.x));
       tmp.y = T(((static_cast<float>(local_val[i].y) - s_mean) * s_variance * static_cast<float>(gamma_val.y) + static_cast<float>(beta_val.y)) * (1.0f + static_cast<float>(scale_val.y)) + static_cast<float>(shift_val.y));
@@ -451,28 +449,93 @@ static void layernorm_fused_scale_shift_launch(
   }
   TORCH_CHECK(use_2d || use_4d || skip, "scale/shift must be 2D [M, N], 4D [B, F, 1, N], or scalar zeros to skip");
 
-  if (use_2d || skip) {
-    torch::Tensor scale2d = scale;
-    torch::Tensor shift2d = shift;
-    if (skip) {
-      scale2d = torch::zeros({M, N}, x.options());
-      shift2d = torch::zeros({M, N}, x.options());
+  // If skipping scale/shift, launch the non-fused LN kernel (no temporary tensors).
+  if (skip) {
+    if (N <= 4096) {
+      block.x = (int)((N/4 + 31)/32*32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<float4, float, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (int)M, (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (int)M, (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4<half4, half, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (int)M, (int)N);
+      }
+    } else if (N <= 8192) {
+      block.x = (int)(((N + 7)/8 + 31)/32*32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<float4, float, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (int)M, (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (int)M, (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4<half4, half, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (int)M, (int)N);
+      }
+    } else if (N <= 16384) {
+      block.x = (int)(((N + 15)/16 + 31)/32*32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<float4, float, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (int)M, (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (int)M, (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4<half4, half, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (int)M, (int)N);
+      }
+    } else if (N <= 32768) {
+      block.x = (int)(((N + 31)/32 + 31)/32*32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<float4, float, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (int)M, (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (int)M, (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4<half4, half, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (int)M, (int)N);
+      }
+    } else {
+      block.x = (int)(((N + 63)/64 + 31)/32*32);
+      if (block.x > 1024) block.x = 1024;
+      if (std::is_same<T, float>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<float4, float, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (int)M, (int)N);
+      } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
+        layernorm_twoPassAlgo_stored_locally_e4<bf16_4, cutlass::bfloat16_t, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (int)M, (int)N);
+      } else {
+        layernorm_twoPassAlgo_stored_locally_e4<half4, half, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+          (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (int)M, (int)N);
+      }
     }
+    return;
+  }
+
+  if (use_2d) {
     if (N <= 4096) {
       block.x = (int)((N/4 + 31)/32*32);
       if (block.x > 1024) block.x = 1024;
       if (std::is_same<T, float>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<float4, float, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), (int)M, (int)N);
       } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), (int)M, (int)N);
       } else {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), (int)M, (int)N);
       }
     } else if (N <= 8192) {
       block.x = (int)(((N + 7)/8 + 31)/32*32);
@@ -480,15 +543,15 @@ static void layernorm_fused_scale_shift_launch(
       if (std::is_same<T, float>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<float4, float, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), (int)M, (int)N);
       } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), (int)M, (int)N);
       } else {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), (int)M, (int)N);
       }
     } else if (N <= 16384) {
       block.x = (int)(((N + 15)/16 + 31)/32*32);
@@ -496,15 +559,15 @@ static void layernorm_fused_scale_shift_launch(
       if (std::is_same<T, float>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<float4, float, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), (int)M, (int)N);
       } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), (int)M, (int)N);
       } else {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), (int)M, (int)N);
       }
     } else if (N <= 32768) {
       block.x = (int)(((N + 31)/32 + 31)/32*32);
@@ -512,15 +575,15 @@ static void layernorm_fused_scale_shift_launch(
       if (std::is_same<T, float>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<float4, float, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), (int)M, (int)N);
       } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), (int)M, (int)N);
       } else {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), (int)M, (int)N);
       }
     } else {
       block.x = (int)(((N + 63)/64 + 31)/32*32);
@@ -528,15 +591,15 @@ static void layernorm_fused_scale_shift_launch(
       if (std::is_same<T, float>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<float4, float, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (float4*)y.data_ptr(), (const float4*)x.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), (int)M, (int)N);
       } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<bf16_4, cutlass::bfloat16_t, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (bf16_4*)y.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), (int)M, (int)N);
       } else {
         layernorm_twoPassAlgo_stored_locally_e4_fused_scale_shift<half4, half, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
           (half4*)y.data_ptr(), (const half4*)x.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (int)M, (int)N);
+          (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), (int)M, (int)N);
       }
     }
     return;
@@ -642,13 +705,15 @@ torch::Tensor device_layernorm(torch::Tensor x,
   TORCH_CHECK(x.stride(-1) == 1, "last dim of x must be contiguous (stride 1)");
   const int64_t N = x.size(1);
   if (gamma_opt.has_value() && gamma_opt->defined()) {
-    CHECK_CUDA(*gamma_opt);
+    const auto& gamma = gamma_opt.value();
+    TORCH_CHECK(gamma.is_cuda(), "gamma must be on CUDA");
     TORCH_CHECK(gamma_opt->dtype() == x.dtype(), "gamma must have same dtype as x");
     TORCH_CHECK(gamma_opt->dim() == 1 && gamma_opt->numel() == N, "gamma must be shape [N]");
     TORCH_CHECK(gamma_opt->stride(0) == 1, "gamma must be contiguous");
   }
   if (beta_opt.has_value() && beta_opt->defined()) {
-    CHECK_CUDA(*beta_opt);
+    const auto& beta = beta_opt.value();
+    TORCH_CHECK(beta.is_cuda(), "beta must be on CUDA");
     TORCH_CHECK(beta_opt->dtype() == x.dtype(), "beta must have same dtype as x");
     TORCH_CHECK(beta_opt->dim() == 1 && beta_opt->numel() == N, "beta must be shape [N]");
     TORCH_CHECK(beta_opt->stride(0) == 1, "beta must be contiguous");
