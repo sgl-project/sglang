@@ -16,10 +16,11 @@ if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.server_args import ServerArgs
-
+from sglang.srt.nvtx_utils import nvtx_annotated_method, nvtx_range
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
+    @nvtx_annotated_method("schedulebatch.prepare_for_prebuilt")
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
@@ -100,6 +101,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
+    @nvtx_annotated_method("decode_schedule_batch.process_prebuilt")
     def process_prebuilt(
         self: ScheduleBatch,
         server_args: ServerArgs,

@@ -83,6 +83,7 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 
 _is_npu = is_npu()
 
@@ -1573,6 +1574,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME: finally deprecate is_v2_eagle
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
+    @nvtx_annotated_method("scheduler.schedule_batch.prepare_for_decode")
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -1633,12 +1635,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
 
+    @nvtx_annotated_method("scheduler.schedule_batch.maybe_wait_verify_done")
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
+    @nvtx_annotated_method("scheduler.schedule_batch.filter_batch")
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,

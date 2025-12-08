@@ -154,7 +154,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
-from sglang.srt.nvtx_utils import nvtx_annotated_method
+from sglang.srt.nvtx_utils import nvtx_annotated_method, nvtx_range
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1933,11 +1933,13 @@ class Scheduler(
 
         return new_batch
 
+    @nvtx_annotated_method("scheduler.update_running_batch")
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
-        batch.filter_batch()
+        with nvtx_range("scheduler.update_running_batch.filter_batch"):
+            batch.filter_batch()
         if batch.is_empty():
             batch.batch_is_full = False
             return batch
@@ -2216,7 +2218,8 @@ class Scheduler(
             local_batch.forward_mode.is_extend() if local_batch else False
         )
 
-        tbo_preparer = TboDPAttentionPreparer()
+        with nvtx_range("scheduler.prepare_mlp_sync_batch_raw.tbo_preparer"):
+            tbo_preparer = TboDPAttentionPreparer()
         if len(offload_tags) == 0 and disable_overlap_schedule:
             group = tp_group.device_group
             device = tp_group.device
