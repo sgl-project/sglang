@@ -110,10 +110,10 @@ PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
 if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "126 Directory $FLASH_ATTN_PATH exists. Removing..."
+    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
     rm -rf "$FLASH_ATTN_PATH"
 else
-    echo "129 Directory $FLASH_ATTN_PATH does not exist."
+    echo "Directory $FLASH_ATTN_PATH does not exist."
 fi
 
 # Install sgl-kernel
@@ -162,7 +162,7 @@ PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
 FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
 if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "178 Directory $FLASH_ATTN_PATH exists. Removing..."
+    echo "Directory $FLASH_ATTN_PATH exists. Removing..."
     rm -rf "$FLASH_ATTN_PATH"
     echo "Bug this should not happen"
 else
