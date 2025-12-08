@@ -5,6 +5,7 @@
 from typing import Optional
 
 import torch
+import triton
 from einops import rearrange
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -13,8 +14,11 @@ from sglang.srt.layers.attention.fla.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd,
 )
 from sglang.srt.layers.attention.fla.cumsum import chunk_local_cumsum
+from sglang.srt.layers.attention.fla.fused_cumsum_kkt import fused_cumsum_kkt
+from sglang.srt.layers.attention.fla.fused_merge_recompute import fused_merge_recompute
+from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.l2norm import fused_l2norm_qk, l2norm_fwd
-from sglang.srt.layers.attention.fla.solve_tril import solve_tril
+from sglang.srt.layers.attention.fla.solve_tril import solve_tril, solve_tril_16x16_kernel
 from sglang.srt.layers.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
@@ -37,20 +41,34 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: Optional[torch.LongTensor] = None,
 ):
-    g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
-    )
-    A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-    )
+    B, T = q.shape[0], q.shape[1]
+    Hv = g.shape[2]
+    
+    if _is_hip and T >= 64:
+        g, A = fused_cumsum_kkt(g, k, beta, chunk_size=64, cu_seqlens=cu_seqlens)
+        chunk_indices_16 = prepare_chunk_indices(cu_seqlens, 16) if cu_seqlens is not None else None
+        NT_16 = len(chunk_indices_16) if cu_seqlens is not None else triton.cdiv(T, 16)
+        Ai16 = torch.empty(B, T, Hv, 16, device=A.device, dtype=torch.float32)
+        solve_tril_16x16_kernel[(NT_16, B * Hv)](
+            A=A, Ad=Ai16, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices_16,
+            T=T, H=Hv, BT=64, num_warps=1, num_stages=4,
+        )
+        w, u = fused_merge_recompute(k, v, beta, g, A, Ai16, chunk_size=64, cu_seqlens=cu_seqlens)
+    else:
+        g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k, beta=beta, g_cumsum=g, cu_seqlens=cu_seqlens, output_dtype=torch.float32
+        )
+        A = solve_tril(A=A, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+        )
+    
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         k=k,
         w=w,
