@@ -1573,7 +1573,8 @@ class ServerArgs:
 
         if get_bool_env_var("SGLANG_CUTLASS_MOE"):
             logger.warning(
-                "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
+                "SGLANG_CUTLASS_MOE is deprecated and will be completely removed in 0.5.7. "
+                "Please use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
             )
             assert (
                 self.quantization == "fp8"
