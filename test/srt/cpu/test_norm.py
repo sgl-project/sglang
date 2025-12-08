@@ -187,7 +187,6 @@ class TestLayerNorm(CustomTestCase):
         torch.testing.assert_close(x_add_ln, ref_add_ln_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
-
     def test_norm(self):
         for params in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=params[0], n=params[1], dtype=params[2]):
