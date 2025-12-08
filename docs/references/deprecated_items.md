@@ -130,4 +130,4 @@ These environment variables are deprecated in favor of new names (old names are 
 
 ## Deprecation Policy
 
-Deprecated features, server arguments, and environment variables will only be removed in major version releases (e.g., v0.5.6 → v0.5.7). This ensures users have sufficient time to migrate to the recommended alternatives and provides a stable upgrade path between major versions.
+Deprecated features, server arguments, and environment variables will only be removed in major version releases (e.g., v0.5.6 → v0.5.7). They will not be removed in post releases. This ensures users have sufficient time to migrate to the recommended alternatives and provides a stable upgrade path between minor versions.
