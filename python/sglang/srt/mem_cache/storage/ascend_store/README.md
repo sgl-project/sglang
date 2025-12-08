@@ -41,6 +41,7 @@ bash script/build_and_pack_run.sh
 cd output
 bash memfabric_hybrid-1.0.0_linux_aarch64.run
 pip3 install memfabric_hybrid/wheel/memfabric_hybrid-1.0.0-cp311-cp311-linux_aarch64.whl
+pip3 install mk_transfer_adapter/wheel/mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl
 ```
 
 The default installation path is `/usr/local/`, and you can modify the installation path by `--install-path=${your path}`.
