@@ -66,7 +66,7 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics};
+use crate::{core::Worker, observability::metrics::RouterMetrics};
 
 /// Cache-aware routing policy
 ///
