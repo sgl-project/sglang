@@ -79,6 +79,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
 
     # Clean up existing installations
     $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
+    $PIP_CMD uninstall -y flash_attn || true
     $PIP_CMD uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_INSTALL_SUFFIX || true
 else
     # In normal cases, we use uv, which is much faster than pip.
@@ -91,6 +92,7 @@ else
 
     # Clean up existing installations
     $PIP_CMD uninstall sgl-kernel sglang || true
+    $PIP_CMD uninstall flash_attn || true
     $PIP_CMD uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache || true
 fi
 
