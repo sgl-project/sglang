@@ -775,7 +775,7 @@ jobs:
           cd test/srt
           python3 -m unittest test_bench_serving.TestBenchServing.test_offline_throughput_non_stream_small_batch_size
 
-      - name: Benchmark online latency (EAGLE)  # Moved to nightly - large model
+      - name: Benchmark online latency (EAGLE)
         timeout-minutes: 10
         run: |
           cd test/srt
