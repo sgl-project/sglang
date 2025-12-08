@@ -83,10 +83,7 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import flatten_nested_list
-from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
-
-_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -328,8 +325,31 @@ class MultimodalInputs:
 
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            from sglang.srt.managers.mm_utils import (
+                init_feature_buffer,
+                is_feature_buffer_initialized,
+                reset_buffer_offset,
+                try_add_to_buffer,
+            )
+
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            if not is_feature_buffer_initialized():
+                init_feature_buffer(device)
+            reset_buffer_offset()
+            for item in ret.mm_items:
+                if item.feature is not None:
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = try_add_to_buffer(item.feature)
+
         for item in ret.mm_items:
             item.set_pad_value()
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            for item in ret.mm_items:
+                if item.feature is not None:
+                    item.feature = item.feature.to("cpu", non_blocking=True)
 
         optional_args = [
             "mrope_positions",
@@ -1152,10 +1172,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     has_grammar: bool = False
 
     # Device
-    if not _is_npu:
-        device: str = "cuda"
-    else:
-        device: str = "npu"
+    device: str = "cuda"
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
