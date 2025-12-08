@@ -119,7 +119,9 @@ def assign_new_state_kernel(
 
     old_pos = tl.load(old_positions_ptr + old_start + offs_seq, mask=mask_seq)
     tl.store(positions_ptr + new_start + 1 + offs_seq, old_pos, mask=mask_seq)
-    tl.store(positions_ptr + new_start, max(tl.load(old_positions_ptr + old_start) - 1, 0))
+    tl.store(
+        positions_ptr + new_start, max(tl.load(old_positions_ptr + old_start) - 1, 0)
+    )
 
     old_cache = tl.load(old_out_cache_loc_ptr + old_start + offs_seq, mask=mask_seq)
     tl.store(out_cache_loc_ptr + new_start + 1 + offs_seq, old_cache, mask=mask_seq)

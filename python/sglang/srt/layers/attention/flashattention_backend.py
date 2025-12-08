@@ -23,8 +23,6 @@ if TYPE_CHECKING:
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
-from sglang.srt.utils import get_bool_env_var
-
 
 @dataclass
 class FlashAttentionMetadata:
