@@ -13,6 +13,7 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     is_npu,
@@ -260,7 +261,9 @@ class BaseMultimodalProcessor(ABC):
             and isinstance(processor.image_processor, BaseImageProcessorFast)
             and not self.server_args.disable_fast_image_processor
         ):
-            if not _is_npu:
+            if get_global_server_args().rl_on_policy_target is not None:
+                kwargs["device"] = "cpu"
+            elif not _is_npu:
                 kwargs["device"] = "cuda"
             elif processor.__class__.__name__ not in {
                 "Qwen2_5_VLProcessor",

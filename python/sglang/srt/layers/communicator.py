@@ -372,6 +372,7 @@ class LayerCommunicator:
         residual: torch.Tensor,
         forward_batch: ForwardBatch,
         quant_format: str = "",
+        post_residual_addition: Optional[torch.Tensor] = None,
     ):
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
@@ -421,7 +422,9 @@ class LayerCommunicator:
                         )
 
                     else:
-                        hidden_states = self.input_layernorm(hidden_states)
+                        hidden_states = self.input_layernorm(
+                            hidden_states, post_residual_addition=post_residual_addition
+                        )
                 else:
 
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
@@ -453,7 +456,9 @@ class LayerCommunicator:
                         )
                     else:
                         hidden_states, residual = self.input_layernorm(
-                            hidden_states, residual
+                            hidden_states,
+                            residual,
+                            post_residual_addition=post_residual_addition,
                         )
 
         hidden_states = self._communicate_simple_fn(

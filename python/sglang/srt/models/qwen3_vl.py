@@ -555,20 +555,26 @@ class Qwen3LLMModel(Qwen3Model):
                     hidden_states + residual if residual is not None else hidden_states
                 )
 
+            deepstack_embeds = None
+            if input_deepstack_embeds is not None:
+                prev_layer_idx = layer_idx - 1
+                if prev_layer_idx in self.deepstack_embed_to_decoder_layer:
+                    sep = self.hidden_size * prev_layer_idx
+                    deepstack_embeds = input_deepstack_embeds[
+                        :, sep : sep + self.hidden_size
+                    ]
+
+            # SGLang applies residual at the START of the next layer, not at the END like HuggingFace.
+            # See: https://github.com/huggingface/transformers/blob/v5.0.0rc0/src/transformers/models/qwen3_vl/modeling_qwen3_vl.py#L549
+            # To match HF behavior, deepstack must be added AFTER residual: (hidden_states + residual) + deepstack
+            # The order matters because addition with different tensors is not associative in practice.
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
                 forward_batch,
                 residual,
+                post_residual_addition=deepstack_embeds,
             )
-
-            # process deepstack
-            if (
-                input_deepstack_embeds is not None
-                and layer_idx in self.deepstack_embed_to_decoder_layer
-            ):
-                sep = self.hidden_size * layer_idx
-                hidden_states += input_deepstack_embeds[:, sep : sep + self.hidden_size]
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(

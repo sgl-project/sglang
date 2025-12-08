@@ -15,7 +15,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
-    get_compiler_backend,
     is_cpu,
     is_cuda,
     is_hip,
@@ -1426,6 +1425,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
+        if get_global_server_args().rl_on_policy_target is not None:
+            self._forward_method = self.forward_native
+
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
@@ -1435,8 +1437,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         ):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
-    @torch.compile(dynamic=True, backend=get_compiler_backend())
-    def _forward_native(
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1493,7 +1494,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
-    def forward(
+    def forward_cuda(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1510,14 +1511,12 @@ class MRotaryEmbedding(RotaryEmbedding):
         """
         assert positions.ndim == 1 or positions.ndim == 2
 
-        if positions.ndim == 2 and self.mrope_section and _is_cuda:
-            return self._forward_triton(positions, query, key)
-        elif _is_npu:
-            return self._forward_npu(positions, query, key)
-        else:
-            return self._forward_native(positions, query, key)
+        # Use Triton kernel for multimodal (2D positions) with mrope
+        if positions.ndim == 2 and self.mrope_section:
+            return self.forward_triton(positions, query, key)
+        return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
-    def _forward_triton(
+    def forward_triton(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1566,15 +1565,19 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 
-    def _forward_npu(
+    def forward_npu(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # TODO: remove this when npu_mrope supports QNumHeads * QHeadSize > 4096
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for npu implementation"
         if query.shape[1] > 4096:
-            return self._forward_native(positions, query, key)
+            return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
         rotary_mode = "half"
         if self.is_neox_style:
             rotary_mode = "half"

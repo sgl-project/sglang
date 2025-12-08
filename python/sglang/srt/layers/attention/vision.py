@@ -648,6 +648,15 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
+        if (
+            get_global_server_args().rl_on_policy_target is not None
+            and position_embeddings is not None
+        ):
+            assert isinstance(position_embeddings, tuple), (
+                "expected position_embeddings to be a tuple of two tensors,\n"
+                f"but got {type(position_embeddings)}, change if needed"
+            )
+            position_embeddings = tuple(p.to(x.dtype) for p in position_embeddings)
         x_shape = x.shape
         bsz, s, _ = x_shape
         head = self.num_attention_heads_per_partition
