@@ -2,7 +2,9 @@
 
 SGLang supports various environment variables that can be used to configure its runtime behavior. This document provides a comprehensive list and aims to stay updated over time.
 
-*Note: SGLang uses two prefixes for environment variables: `SGL_` and `SGLANG_`. This is likely due to historical reasons. While both are currently supported for different settings, future versions might consolidate them.*
+:::{note}
+SGLang uses two prefixes for environment variables: `SGL_` (old) and `SGLANG_` (preferred). This is due to historical reasons. While both are currently supported for different settings, future versions might consolidate them. Please use `SGLANG_` for new configurations.
+:::
 
 ## General Configuration
 

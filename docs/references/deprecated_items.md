@@ -2,6 +2,10 @@
 
 This document lists all deprecated server arguments and environment variables in SGLang, along with their replacements and removal timelines.
 
+:::{warning}
+**For Developers**: Please be careful when modifying deprecated features. Always check this document before removing or changing deprecated items, and ensure proper migration paths are documented. Deprecated items may still be in use by existing code or configurations.
+:::
+
 ## Deprecated Server Arguments
 
 ### MoE Runner Backend Arguments
@@ -27,6 +31,8 @@ These arguments are deprecated in favor of `--moe-runner-backend`:
 | Deprecated Argument | Replacement | Notes |
 |---------------------|-------------|-------|
 | `--nccl-init-addr` | `--dist-init-addr` | For backward compatibility, will be removed in the future. Use `--dist-init-addr` instead |
+| `--enable-lora` | `--lora-paths` | Automatically set to `True` when `--lora-paths` is provided for backward compatibility. No need to set `--enable-lora` explicitly |
+| `--modelopt-quant` | `--quantization` | Legacy flag, being replaced by unified quantization flags. Use `--quantization` instead |
 
 ## Deprecated Environment Variables
 
@@ -57,8 +63,8 @@ These environment variables are deprecated in favor of new names (old names are 
 | Deprecated Env Var | Notes |
 |-------------------|-------|
 | `USE_VLLM_CUTLASS_W8A8_FP8_KERNEL` | vLLM dependency, marked as deprecated (can be removed safely) |
-| `USE_TRITON_W8A8_FP8_KERNEL` | vLLM dependency, marked as deprecated (can be removed safely) |
-| `SGLANG_ENABLE_DETERMINISTIC_INFERENCE` | Set automatically when `rl_on_policy_target` is used. TODO: remove this environment variable |
+| `USE_TRITON_W8A8_FP8_KERNEL` | SGLang FP8 quantization flag, marked as deprecated (can be removed safely). Used to force Triton kernels instead of CUTLASS for W8A8 FP8 operations |
+| `SGLANG_ENABLE_DETERMINISTIC_INFERENCE` | Set automatically when `rl_on_policy_target` is used. TODO: remove this environment variable as a whole |
 
 ## Deprecated HTTP Endpoints
 
@@ -114,6 +120,8 @@ These environment variables are deprecated in favor of new names (old names are 
 5. **For LoRA backend**: Replace `flashinfer` LoRA backend with `triton`
 6. **For load balancing**: Replace `minimum_tokens` method with `round_robin` (or wait for future implementation)
 7. **For distributed init**: Replace `--nccl-init-addr` with `--dist-init-addr`
+8. **For LoRA**: Remove `--enable-lora` flag and just use `--lora-paths` (it's automatically enabled)
+9. **For ModelOpt quantization**: Replace `--modelopt-quant` with `--quantization` flag
 
 ## References
 
@@ -123,3 +131,7 @@ These environment variables are deprecated in favor of new names (old names are 
   - Server Args: `python/sglang/srt/server_args.py`
   - Environment Variables: `python/sglang/srt/environ.py`
   - FP8 Utils: `python/sglang/srt/layers/quantization/fp8_utils.py`
+
+## Deprecation Policy
+
+Deprecated features, server arguments, and environment variables will only be removed in major version releases. This ensures users have sufficient time to migrate to the recommended alternatives and provides a stable upgrade path between major versions.
