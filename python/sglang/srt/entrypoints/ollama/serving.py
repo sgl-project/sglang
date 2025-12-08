@@ -178,6 +178,26 @@ class OllamaServing:
         if request.system:
             prompt = f"{request.system}\n\n{prompt}"
 
+        # Handle empty prompt - Ollama CLI sends empty requests on initialization
+        if not prompt or not prompt.strip():
+            empty_response = OllamaGenerateResponse(
+                model=model_name,
+                created_at=self._get_timestamp(),
+                response="",
+                done=True,
+                done_reason="stop",
+            )
+            if request.stream:
+                # Return streaming response with done=True
+                async def empty_stream() -> AsyncIterator[bytes]:
+                    yield orjson.dumps(empty_response.model_dump()) + b"\n"
+
+                return StreamingResponse(
+                    empty_stream(),
+                    media_type="application/x-ndjson",
+                )
+            return empty_response
+
         # Convert options to sampling params
         sampling_params = self._convert_options_to_sampling_params(request.options)
 
@@ -289,18 +309,39 @@ class OllamaServing:
         """Handle /api/show endpoint - show model information."""
         model_config = self.tokenizer_manager.model_config
 
+        # Extract model family from model name
+        model_family = model.split("/")[-1] if "/" in model else model
+        # Remove common suffixes to get base family
+        for suffix in ["-Instruct", "-Chat", "-Base"]:
+            if model_family.endswith(suffix):
+                model_family = model_family[: -len(suffix)]
+                break
+
+        # Build context length info
+        context_len = model_config.context_len if model_config else 4096
+
         return OllamaShowResponse(
-            modelfile="",
-            parameters="",
+            license="",  # License info not available from SGLang
+            modelfile=f'FROM {model}\nPARAMETER num_ctx {context_len}\n',
+            parameters=f"num_ctx {context_len}",
             template="",  # Template info not easily accessible
+            modified_at=self._get_timestamp(),
             details={
+                "parent_model": "",
                 "format": "sglang",
-                "family": model,
+                "family": model_family,
+                "families": [model_family],
                 "parameter_size": "unknown",
+                "quantization_level": "",
             },
             model_info={
-                "model_path": self.tokenizer_manager.model_path,
-                "context_length": model_config.context_len if model_config else None,
-                "is_generation": self.tokenizer_manager.is_generation,
+                "general.architecture": model_family,
+                "general.name": model,
+                "general.parameter_count": 0,
+                f"{model_family}.context_length": context_len,
+                f"{model_family}.block_count": 0,
+                f"{model_family}.embedding_length": 0,
+                f"{model_family}.attention.head_count": 0,
             },
+            capabilities=["completion"],
         )

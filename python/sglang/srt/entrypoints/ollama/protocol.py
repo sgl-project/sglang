@@ -127,8 +127,11 @@ class OllamaShowRequest(BaseModel):
 class OllamaShowResponse(BaseModel):
     """Ollama /api/show response format."""
 
+    license: str = ""
     modelfile: str = ""
     parameters: str = ""
     template: str = ""
+    modified_at: str = ""
     details: Dict[str, Any] = Field(default_factory=dict)
     model_info: Dict[str, Any] = Field(default_factory=dict)
+    capabilities: List[str] = Field(default_factory=list)
