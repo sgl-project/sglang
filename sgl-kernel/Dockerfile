@@ -15,7 +15,7 @@ ARG CMAKE_VERSION_MINOR=1
 # Install ccache 4.12.1 from source for CUDA support (yum provides old 3.7.7)
 ARG CCACHE_VERSION=4.12.1
 # or github.com
-ARG GITHUB_ARTIFACTORY=x.x.x/artifactory/github
+ARG GITHUB_ARTIFACTORY=github.com
 
 ENV PYTHON_ROOT_PATH=/opt/python/${PYTHON_TAG}
 ENV PATH=/opt/cmake/bin:${PATH}
@@ -79,7 +79,7 @@ RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
       *)    TORCH_VER=2.8.0; CU_TAG=cu126 ;; \
     esac; \
     ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir torch==${TORCH_VER} --index-url https://mirrors.nju.edu.cn/pytorch/whl/${CU_TAG}; \
-    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url https://x.x.x/artifactory/api/pypi/pypi-virtual/simple
+    ${PYTHON_ROOT_PATH}/bin/pip install --no-cache-dir ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url https://mirrors.aliyun.com/pypi/simple
 
 # Build stage: copy source and build wheel
 FROM deps AS build

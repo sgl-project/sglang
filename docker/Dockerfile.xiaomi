@@ -1,5 +1,5 @@
-ARG BASE_IMAGE=z.z.z/llm-infra/sglang:v0.5.5-cu129-amd64
-ARG UBUNTU_MIRROR=https://x.x.x/artifactory/deb-remote/ubuntu/
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.5-cu129-amd64
+ARG UBUNTU_MIRROR=http://mirrors.aliyun.com
 
 FROM ${BASE_IMAGE}
 
@@ -15,18 +15,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation \
-    -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple \
     py-spy \
     vllm \
-    transformer_engine[pytorch] \
-    -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple
+    nvtx \
+    -i https://mirrors.aliyun.com/pypi/simple
 
-RUN python3 -m pip install https://y.y.y/git-assert/mimo/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir  --no-dependencies --force-reinstall
+RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/mimo/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir  --no-dependencies --force-reinstall
+RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/local_attention_cuda-0.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall
 RUN python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps \
-    -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple
-RUN python3 -m pip install https://y.y.y/git-assert/local_attention_cuda-0.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall 
-
-RUN python3 -m pip install nvtx -i https://x.x.x/artifactory/api/pypi/pypi-virtual/simple
+    -i https://mirrors.aliyun.com/pypi/simple
 
 COPY . .
 

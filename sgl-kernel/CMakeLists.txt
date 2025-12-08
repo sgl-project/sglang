@@ -14,7 +14,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
 # GitHub Artifactory
-set(GITHUB_ARTIFACTORY "x.x.x/artifactory/github" CACHE STRING "GitHub mirror URL")
+set(GITHUB_ARTIFACTORY "github.com" CACHE STRING "GitHub mirror URL")
 
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
