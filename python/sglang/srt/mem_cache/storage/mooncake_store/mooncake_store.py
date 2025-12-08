@@ -1,3 +1,4 @@
+import ctypes
 import json
 import logging
 import os
@@ -15,12 +16,47 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
 
 logger = logging.getLogger(__name__)
+
+
+class MooncakeHostTensorAllocator(HostTensorAllocator):
+    def __init__(self):
+        super().__init__()
+        from mooncake.store import MooncakeHostMemAllocator
+
+        self.allocator = MooncakeHostMemAllocator()
+        self.ptr = None
+
+    def allocate(
+        self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
+    ) -> torch.Tensor:
+        """
+        Allocates memory using MooncakeHostMemAllocator and wraps it in a PyTorch tensor.
+        """
+        self.dims = dims
+        self.dtype = dtype
+        size = 1
+        for d in dims:
+            size *= d
+        size *= torch.tensor([], dtype=self.dtype).element_size()
+        ptr_int = self.allocator.alloc(size)
+        self.ptr = ptr_int
+        c_type = ctypes.c_byte * size
+        c_array = c_type.from_address(ptr_int)
+
+        tensor = torch.frombuffer(c_array, dtype=torch.uint8, count=size)
+
+        if dtype != torch.uint8:
+            element_size = torch.tensor([], dtype=dtype).element_size()
+            assert size % element_size == 0, "Size must be divisible by element size"
+            tensor = tensor.view(dtype)
+
+        return tensor.view(dims)
 
 
 def _parse_global_segment_size(value) -> int:
