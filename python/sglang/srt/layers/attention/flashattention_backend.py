@@ -798,6 +798,9 @@ class FlashAttentionBackend(AttentionBackend):
                     layer.layer_id
                 ]
                 if is_swa:
+                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        page_table
+                    )
                     window_size = (self.attention_chunk_size, 0)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
@@ -1155,6 +1158,11 @@ class FlashAttentionBackend(AttentionBackend):
                         layer.layer_id
                     ]
                     if is_swa:
+                        page_table = (
+                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                page_table
+                            )
+                        )
                         window_size = (self.attention_chunk_size, 0)
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
