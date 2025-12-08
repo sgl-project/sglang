@@ -585,7 +585,10 @@ impl Router {
                             if memmem::find(&bytes, b"data: [DONE]").is_some() {
                                 if let Some(ref w) = stream_worker {
                                     w.decrement_load();
-                                    RouterMetrics::set_running_requests(&worker_url_owned, w.load());
+                                    RouterMetrics::set_running_requests(
+                                        &worker_url_owned,
+                                        w.load(),
+                                    );
                                     decremented = true;
                                 }
                             }

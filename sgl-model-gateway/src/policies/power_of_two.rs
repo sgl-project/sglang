@@ -61,7 +61,8 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         let mut rng = rand::rng();
         let idx1 = rng.random_range(0..healthy_indices.len());
         // Pick idx2 from remaining indices: offset by 1 + random from (len-1) to guarantee different
-        let idx2 = (idx1 + 1 + rng.random_range(0..healthy_indices.len() - 1)) % healthy_indices.len();
+        let idx2 =
+            (idx1 + 1 + rng.random_range(0..healthy_indices.len() - 1)) % healthy_indices.len();
 
         let worker_idx1 = healthy_indices[idx1];
         let worker_idx2 = healthy_indices[idx2];

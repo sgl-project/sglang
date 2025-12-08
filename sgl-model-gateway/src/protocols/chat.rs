@@ -122,9 +122,9 @@ impl MessageContent {
     pub fn has_text(&self) -> bool {
         match self {
             MessageContent::Text(text) => !text.is_empty(),
-            MessageContent::Parts(parts) => parts.iter().any(|part| {
-                matches!(part, ContentPart::Text { text } if !text.is_empty())
-            }),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|part| matches!(part, ContentPart::Text { text } if !text.is_empty())),
         }
     }
 }
