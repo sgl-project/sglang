@@ -93,7 +93,6 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     # Clean up existing installations
     $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
     $PIP_CMD uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_INSTALL_SUFFIX || true
-    $PIP_CMD install "importlib-metadata>=4.7" $PIP_INSTALL_SUFFIX
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
