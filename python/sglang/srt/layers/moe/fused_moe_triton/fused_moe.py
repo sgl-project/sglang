@@ -687,9 +687,9 @@ def fused_moe(
     """
     if _use_sgl_xpu:
         topk_ids, topk_weight, _ = topk_output
-        from sgl_kernel import fused_experts
+        from sgl_kernel import fused_experts as sgl_fused_experts
 
-        return fused_experts(
+        return sgl_fused_experts(
             hidden_states,
             w1,
             w2,
