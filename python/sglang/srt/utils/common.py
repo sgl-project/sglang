@@ -3491,6 +3491,7 @@ def json_list_type(value):
 
 @contextmanager
 def maybe_reindex_device_id(gpu_id: int):
+
     if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
         yield gpu_id
         return
