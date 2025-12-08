@@ -1,5 +1,6 @@
 from transformers import PretrainedConfig
-from transformers.modeling_rope_utils import rope_config_validation
+
+# from transformers.modeling_rope_utils import rope_config_validation
 
 
 class Qwen3VLVisionConfig(PretrainedConfig):
@@ -187,7 +188,7 @@ class Qwen3VLTextConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
 
-        rope_config_validation(self, ignore_keys={"mrope_section", "mrope_interleaved"})
+        # rope_config_validation(self, ignore_keys={"mrope_section", "mrope_interleaved"})
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
@@ -450,7 +451,7 @@ class Qwen3VLMoeTextConfig(PretrainedConfig):
         self.rope_scaling = rope_scaling
         self.head_dim = head_dim or hidden_size // num_attention_heads
 
-        rope_config_validation(self, ignore_keys={"mrope_section", "mrope_interleaved"})
+        # rope_config_validation(self, ignore_keys={"mrope_section", "mrope_interleaved"})
 
         # MoE arguments
         self.decoder_sparse_step = decoder_sparse_step
