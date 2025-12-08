@@ -24,10 +24,12 @@ import logging
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
+from sglang.srt.utils import get_compiler_backend
+
 logger = logging.getLogger(__name__)
 
 
-@torch.compile
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def extract_page_table(batch_size, req_to_token, req_pool_indices, seq_lens):
     kv_indices = req_to_token[req_pool_indices, : seq_lens.max()]
     return kv_indices.view(batch_size, -1)
@@ -566,6 +568,9 @@ class XPUAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
+                    assert (
+                        q.dtype == k.dtype and q.dtype == v.dtype
+                    ), "currently only support same dtype for q, k, v"
                     output = flash_attn_with_kvcache(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k_cache=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(
@@ -579,6 +584,7 @@ class XPUAttentionBackend(AttentionBackend):
                             forward_batch.prefix_chunk_cu_seq_lens[chunk_idx]
                         ),
                         max_seqlen_q=metadata.max_seq_len_q,
+                        # TODO: make it implemented at kernel side
                         page_table=torch.arange(
                             0, metadata.cu_seqlens_q.numel(), device=self.device
                         ),
@@ -844,8 +850,6 @@ class XPUAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn,
                     **kwargs,
                 )
-                # logger.info("in attn, decode input: %s", q[0, :].to(torch.float).detach().cpu().numpy())
-                # logger.info("in attn, decode output: %s", result[0, :, :].to(torch.float).detach().cpu().numpy())
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
                     o_expand, softmax_lse_expand, *rest_expand = (
