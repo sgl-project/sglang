@@ -319,13 +319,18 @@ class LayerNorm(CustomOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         if (
+            is_batch_invariant_mode_enabled()
+            and get_global_server_args().rl_on_policy_target == "fsdp"
+        ):
+            return self.forward_native(x)
+        elif (
             _flashinfer_layernorm_available
             and x.dtype == torch.bfloat16
             and self.dtype == torch.float32
         ):
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
-        else:
-            return self.forward_native(x)
+
+        return self.forward_native(x)
 
     def forward_native(
         self,

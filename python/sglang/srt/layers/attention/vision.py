@@ -518,11 +518,25 @@ class VisionAttention(nn.Module):
         self.dummy_dim = (num_dummy_heads + num_heads) * self.head_size
 
         if self.qk_normalization:
+            norm_kwargs = (
+                dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                )
+                if get_global_server_args().rl_on_policy_target is not None
+                else {}
+            )
             self.q_norm = RMSNorm(
-                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+                self.dummy_dim,
+                eps=layer_norm_eps,
+                var_hidden_size=embed_dim,
+                **norm_kwargs,
             )
             self.k_norm = RMSNorm(
-                self.dummy_dim, eps=layer_norm_eps, var_hidden_size=embed_dim
+                self.dummy_dim,
+                eps=layer_norm_eps,
+                var_hidden_size=embed_dim,
+                **norm_kwargs,
             )
 
         # Select attention backend via a unified method

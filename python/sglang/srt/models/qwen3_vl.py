@@ -32,6 +32,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
@@ -282,7 +283,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        if get_global_server_args().rl_on_policy_target is not None:
+            norm_kwargs = dict(dtype=torch.float32)
+            norm_layer = LayerNorm(self.hidden_size, eps=norm_eps, **norm_kwargs)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
