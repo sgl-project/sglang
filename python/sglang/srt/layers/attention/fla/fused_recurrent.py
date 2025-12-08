@@ -12,13 +12,6 @@ from sglang.srt.layers.attention.fla.op import exp
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
-        "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 @triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_fwd_kernel(
     q,
@@ -175,8 +168,11 @@ def fused_recurrent_gated_delta_rule_fwd(
         V=V,
         BK=BK,
         BV=BV,
+        USE_INITIAL_STATE=initial_state is not None,
+        STORE_FINAL_STATE=final_state is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
         IS_KDA=False,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -344,18 +340,6 @@ def fused_recurrent_gated_delta_rule(
 # 3
 # When calculating token 3's attention, it should attend to token 1 (parent) and token 0 (grand-parent)
 # When calculating token 2's attention, it should attend to token 0 (parent)
-@triton.heuristics(
-    {
-        "USE_INITIAL_STATE": lambda args: args["h0_source"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
-        is not None,
-        "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args[
-            "retrieve_parent_token_ptr"
-        ]
-        is not None,
-    }
-)
 @triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_update_fwd_kernel(
     q,
@@ -603,10 +587,14 @@ def fused_recurrent_gated_delta_rule_update_fwd(
         V=V,
         BK=BK,
         BV=BV,
+        USE_INITIAL_STATE=initial_state_source is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
         DISABLE_STATE_UPDATE=disable_state_update,
         DISABLE_OUTPUT_CALCULATION=disable_output_calculation,
+        CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
+        HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )

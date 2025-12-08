@@ -269,18 +269,19 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
     ),
     # === Text and Image to Image (TI2I) ===
-    # TODO: Timeout with Torch2.9. Add back when it can pass CI
-    # DiffusionTestCase(
-    #     id="qwen_image_edit_ti2i",
-    #     model_path="Qwen/Qwen-Image-Edit",
-    #     modality="image",
-    #     prompt=None,  # not used for editing
-    #     output_size="1024x1536",
-    #     warmup_text=0,
-    #     warmup_edit=1,
-    #     edit_prompt="Convert 2D style to 3D style",
-    #     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-    # ),
+    DiffusionTestCase(
+        "qwen_image_edit_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        DiffusionSamplingParams(
+            prompt="Convert 2D style to 3D style",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
+    ),
 ]
 
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [

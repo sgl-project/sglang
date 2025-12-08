@@ -41,6 +41,7 @@ Its core features include:
    advanced_features/tool_parser.ipynb
    advanced_features/separate_reasoning.ipynb
    advanced_features/quantization.md
+   advanced_features/quantized_kv_cache.md
    advanced_features/expert_parallelism.md
    advanced_features/lora.ipynb
    advanced_features/pd_disaggregation.md

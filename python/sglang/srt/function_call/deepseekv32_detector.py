@@ -241,13 +241,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     # This ensures each function returns at most once
                     calls_for_this_invoke: list[ToolCallItem] = []
 
-                    # Check if invoke_content is empty or whitespace only
-                    # If so, skip this tool call entirely (it's likely incomplete or malformed)
-                    if not invoke_content.strip():
-                        # Remove the incomplete tool call from buffer
-                        self._buffer = current_text[invoke_match.end() :]
-                        current_text = self._buffer
-                        continue
+                    # Note: invoke_content can be empty for functions with no parameters
+                    # This is valid and should NOT be skipped
 
                     # Send tool name
                     calls_for_this_invoke.append(

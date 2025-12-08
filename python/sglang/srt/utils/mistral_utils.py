@@ -22,11 +22,15 @@ def adapt_config_dict(
     is_mistral_large_3 = (
         is_moe and (config_dict["moe"].get("num_shared_experts") or 0) > 0
     )
+    is_eagle = "eagle" in model.lower()
     if is_moe:
         if is_mistral_large_3:
             config_dict = _remap_moe_args(config_dict)
             config_dict["model_type"] = "deepseek_v3"
-            config_dict["architectures"] = ["MistralLarge3ForCausalLM"]
+            if is_eagle:
+                config_dict["architectures"] = ["MistralLarge3ForCausalLMEagle"]
+            else:
+                config_dict["architectures"] = ["MistralLarge3ForCausalLM"]
 
             assert (
                 "llama_4_scaling" in config_dict
@@ -77,6 +81,8 @@ def adapt_config_dict(
         config_dict = _remap_mistral_vision_args(config_dict)
     if is_audio:
         config_dict = _remap_mistral_audio_args(config_dict)
+    if is_eagle:
+        config_dict["routing_method_type"] = 1  # RoutingMethodType.Renormalize
 
     config = PretrainedConfig.from_dict(config_dict)
 
@@ -227,7 +233,6 @@ def _remap_moe_args(config: dict) -> dict:
             config[new_name] = value
 
     config["topk_method"] = None
-    config["routing_method_type"] = 1  # RoutingMethodType.Renormalize
     config["scoring_func"] = "softmax"
 
     return config
