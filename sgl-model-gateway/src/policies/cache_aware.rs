@@ -347,37 +347,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         }
     }
 
-    fn select_worker_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<(usize, usize)> {
-        // DEPRECATED: This method is no longer used when separate policies are configured.
-        // The PD router now uses separate policies for prefill and decode selection.
-        // This implementation remains for backward compatibility when a single policy is used.
-
-        // In PD mode with single policy:
-        // - Prefill: Use cache-aware routing for better cache utilization
-        // - Decode: Use least-load routing for better load distribution
-
-        // Select prefill worker using cache-aware logic
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-
-        // Select decode worker using least-load logic
-        let healthy_decode = get_healthy_worker_indices(decode_workers);
-        if healthy_decode.is_empty() {
-            return None;
-        }
-
-        let decode_idx = healthy_decode
-            .iter()
-            .min_by_key(|&&idx| decode_workers[idx].load())
-            .copied()?;
-
-        Some((prefill_idx, decode_idx))
-    }
-
     fn on_request_complete(&self, worker_url: &str, success: bool) {
         // Could track success rates per worker for more intelligent routing
         if !success {
