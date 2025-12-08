@@ -10,6 +10,36 @@ use tracing::info;
 
 type NodeRef = Arc<Node>;
 
+/// Pre-indexed text for efficient character access.
+/// Converts UTF-8 string to Vec<char> once to enable O(1) indexing.
+struct CharIndexedText {
+    chars: Vec<char>,
+}
+
+impl CharIndexedText {
+    #[inline]
+    fn new(text: &str) -> Self {
+        Self {
+            chars: text.chars().collect(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.chars.len()
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> Option<char> {
+        self.chars.get(idx).copied()
+    }
+
+    #[inline]
+    fn slice_to_string(&self, start: usize, end: usize) -> String {
+        self.chars[start..end].iter().collect()
+    }
+}
+
 #[derive(Debug)]
 struct Node {
     children: DashMap<char, NodeRef>,
@@ -57,13 +87,14 @@ impl PartialEq for EvictionEntry {
 // Note that in rust, `.len()` or slice is operated on the "byte" level. It causes issues for UTF-8 characters because one character might use multiple bytes.
 // https://en.wikipedia.org/wiki/UTF-8
 
-fn shared_prefix_count(a: &str, b: &str) -> usize {
+/// Efficient shared prefix count using pre-indexed chars for O(1) access
+#[inline]
+fn shared_prefix_count_indexed(a: &CharIndexedText, a_start: usize, b: &str) -> usize {
     let mut i = 0;
-    let mut a_iter = a.chars();
     let mut b_iter = b.chars();
 
-    loop {
-        match (a_iter.next(), b_iter.next()) {
+    while a_start + i < a.len() {
+        match (a.get(a_start + i), b_iter.next()) {
             (Some(a_char), Some(b_char)) if a_char == b_char => {
                 i += 1;
             }
@@ -107,6 +138,9 @@ impl Tree {
 
     pub fn insert(&self, text: &str, tenant: &str) {
         // Insert text into tree with given tenant
+        // Pre-index text once for O(1) character access (avoids O(n²) chars().nth() calls)
+        let indexed_text = CharIndexedText::new(text);
+        let text_count = indexed_text.len();
 
         let mut curr = Arc::clone(&self.root);
         let mut curr_idx = 0;
@@ -125,10 +159,9 @@ impl Tree {
 
         let mut prev = Arc::clone(&self.root);
 
-        let text_count = text.chars().count();
-
         while curr_idx < text_count {
-            let first_char = text.chars().nth(curr_idx).unwrap();
+            // O(1) character access instead of O(n) chars().nth()
+            let first_char = indexed_text.get(curr_idx).unwrap();
 
             curr = prev;
 
@@ -146,8 +179,9 @@ impl Tree {
                        [curr] => [new node]
                     */
 
-                    let curr_text = slice_by_chars(text, curr_idx, text_count);
-                    let curr_text_count = curr_text.chars().count();
+                    // Use indexed slice for efficient string extraction
+                    let curr_text = indexed_text.slice_to_string(curr_idx, text_count);
+                    let curr_text_count = text_count - curr_idx;
                     let new_node = Arc::new(Node {
                         children: DashMap::new(),
                         text: RwLock::new(curr_text),
@@ -174,11 +208,12 @@ impl Tree {
                     // matched
                     let matched_node = entry.get().clone();
 
-                    let matched_node_text = matched_node.text.read().unwrap().to_owned();
+                    let matched_node_text = matched_node.text.read().unwrap();
                     let matched_node_text_count = matched_node_text.chars().count();
 
-                    let curr_text = slice_by_chars(text, curr_idx, text_count);
-                    let shared_count = shared_prefix_count(&matched_node_text, &curr_text);
+                    // Use indexed comparison to avoid creating intermediate string
+                    let shared_count =
+                        shared_prefix_count_indexed(&indexed_text, curr_idx, &matched_node_text);
 
                     if shared_count < matched_node_text_count {
                         /*
@@ -194,7 +229,10 @@ impl Tree {
                             shared_count,
                             matched_node_text_count,
                         );
-                        let matched_text_count = matched_text.chars().count();
+                        let matched_text_count = shared_count;
+
+                        // Drop read lock before creating new node
+                        drop(matched_node_text);
 
                         let new_node = Arc::new(Node {
                             text: RwLock::new(matched_text),
@@ -203,7 +241,7 @@ impl Tree {
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
                         });
 
-                        let first_new_char = contracted_text.chars().nth(0).unwrap();
+                        let first_new_char = contracted_text.chars().next().unwrap();
                         new_node
                             .children
                             .insert(first_new_char, Arc::clone(&matched_node));
@@ -232,6 +270,9 @@ impl Tree {
                         curr_idx += shared_count;
                     } else {
                         // move to next node
+                        // Drop read lock before continuing
+                        drop(matched_node_text);
+
                         prev = Arc::clone(&matched_node);
 
                         // Atomically attach tenant to existing node and increment count once
@@ -256,22 +297,27 @@ impl Tree {
 
     #[allow(unused_assignments)]
     pub fn prefix_match(&self, text: &str) -> (String, String) {
+        // Pre-index text once for O(1) character access
+        let indexed_text = CharIndexedText::new(text);
+        let text_count = indexed_text.len();
+
         let mut curr = Arc::clone(&self.root);
         let mut curr_idx = 0;
 
         let mut prev = Arc::clone(&self.root);
-        let text_count = text.chars().count();
 
         while curr_idx < text_count {
-            let first_char = text.chars().nth(curr_idx).unwrap();
-            let curr_text = slice_by_chars(text, curr_idx, text_count);
+            // O(1) character access instead of O(n) chars().nth()
+            let first_char = indexed_text.get(curr_idx).unwrap();
 
             curr = prev.clone();
 
             if let Some(entry) = curr.children.get(&first_char) {
                 let matched_node = entry.value().clone();
                 let matched_text_guard = matched_node.text.read().unwrap();
-                let shared_count = shared_prefix_count(&matched_text_guard, &curr_text);
+                // Use indexed comparison to avoid creating intermediate string
+                let shared_count =
+                    shared_prefix_count_indexed(&indexed_text, curr_idx, &matched_text_guard);
                 let matched_node_text_count = matched_text_guard.chars().count();
                 drop(matched_text_guard);
 
@@ -299,7 +345,7 @@ impl Tree {
             .iter()
             .next()
             .map(|kv| kv.key().to_owned())
-            .unwrap_or("empty".to_string());
+            .unwrap_or_else(|| "empty".to_string());
 
         // Traverse from the curr node to the root and update the timestamp
 
@@ -308,7 +354,7 @@ impl Tree {
             .unwrap()
             .as_millis();
 
-        if !tenant.eq("empty") {
+        if tenant != "empty" {
             let mut current_node = Some(curr);
             while let Some(node) = current_node {
                 node.tenant_last_access_time
@@ -317,21 +363,25 @@ impl Tree {
             }
         }
 
-        let ret_text = slice_by_chars(text, 0, curr_idx);
+        // Use indexed slice for result
+        let ret_text = indexed_text.slice_to_string(0, curr_idx);
         (ret_text, tenant)
     }
 
     #[allow(unused_assignments, dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        // Pre-index text once for O(1) character access
+        let indexed_text = CharIndexedText::new(text);
+        let text_count = indexed_text.len();
+
         let mut curr = Arc::clone(&self.root);
         let mut curr_idx = 0;
 
         let mut prev = Arc::clone(&self.root);
-        let text_count = text.chars().count();
 
         while curr_idx < text_count {
-            let first_char = text.chars().nth(curr_idx).unwrap();
-            let curr_text = slice_by_chars(text, curr_idx, text_count);
+            // O(1) character access instead of O(n) chars().nth()
+            let first_char = indexed_text.get(curr_idx).unwrap();
 
             curr = prev.clone();
 
@@ -344,7 +394,9 @@ impl Tree {
                 }
 
                 let matched_text_guard = matched_node.text.read().unwrap();
-                let shared_count = shared_prefix_count(&matched_text_guard, &curr_text);
+                // Use indexed comparison to avoid creating intermediate string
+                let shared_count =
+                    shared_prefix_count_indexed(&indexed_text, curr_idx, &matched_text_guard);
                 let matched_node_text_count = matched_text_guard.chars().count();
                 drop(matched_text_guard);
 
@@ -381,7 +433,8 @@ impl Tree {
             }
         }
 
-        slice_by_chars(text, 0, curr_idx)
+        // Use indexed slice for result
+        indexed_text.slice_to_string(0, curr_idx)
     }
 
     fn leaf_of(node: &NodeRef) -> Vec<String> {
