@@ -227,6 +227,7 @@ impl CacheAwarePolicy {
             .map(|w| (w.url().to_string(), w.load()))
             .collect();
 
+        // TODO may change text
         debug!(
             "Load balancing triggered | max: {} | min: {} | workers: {:?}",
             max_load, min_load, worker_loads
