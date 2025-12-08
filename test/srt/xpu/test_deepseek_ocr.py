@@ -56,7 +56,7 @@ class TestDeepSeekOCR(CustomTestCase):
             self.base_url + "/generate",
             json={
                 "text": "<image>\n<|grounding|>Convert the document to pure text.",
-                "image_data": "/home/hengyume/1.png",
+                "image_data": self.image,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": max_new_tokens,
