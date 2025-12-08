@@ -1,5 +1,18 @@
 #!/bin/bash
 # Install the dependency in CI.
+
+PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
+
+if [ -d "$FLASH_ATTN_PATH" ]; then
+    echo "8 Directory $FLASH_ATTN_PATH exists. Removing..."
+    rm -rf "$FLASH_ATTN_PATH"
+else
+    echo "11 Directory $FLASH_ATTN_PATH does not exist."
+fi
+
+rm -rf $FLASH_ATTN_PATH
+
 set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
@@ -80,6 +93,7 @@ if [ "$IS_BLACKWELL" = "1" ]; then
     # Clean up existing installations
     $PIP_CMD uninstall -y sgl-kernel sglang $PIP_INSTALL_SUFFIX || true
     $PIP_CMD uninstall -y flashinfer-python flashinfer-cubin flashinfer-jit-cache $PIP_INSTALL_SUFFIX || true
+    $PIP_CMD install "importlib-metadata>=4.7" $PIP_INSTALL_SUFFIX
 else
     # In normal cases, we use uv, which is much faster than pip.
     pip install --upgrade pip
@@ -106,6 +120,16 @@ $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytor
 # Install router for pd-disagg test
 $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
 
+PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
+
+if [ -d "$FLASH_ATTN_PATH" ]; then
+    echo "126 Directory $FLASH_ATTN_PATH exists. Removing..."
+    rm -rf "$FLASH_ATTN_PATH"
+else
+    echo "129 Directory $FLASH_ATTN_PATH does not exist."
+fi
+
 # Install sgl-kernel
 SGL_KERNEL_VERSION_FROM_KERNEL=$(grep -Po '(?<=^version = ")[^"]*' sgl-kernel/pyproject.toml)
 SGL_KERNEL_VERSION_FROM_SRT=$(grep -Po -m1 '(?<=sgl-kernel==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
@@ -119,6 +143,14 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     else
         WHEEL_ARCH="x86_64"
     fi
+
+    WHEEL_PATH="sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl"
+    if [ -f "$WHEEL_PATH" ]; then
+        echo "147 Wheel file $WHEEL_PATH exists."
+    else
+        echo "149 Error: Wheel file $WHEEL_PATH does not exist."
+    fi
+
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
     $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
@@ -148,10 +180,13 @@ python3 -c "import torch; print(torch.version.cuda)"
 # Prepare the CI runner (cleanup HuggingFace cache, etc.)
 bash "${SCRIPT_DIR}/prepare_runner.sh"
 
-if [ -d "/usr/local/lib/python3.10/dist-packages/flash_attn" ]; then
-    echo "Directory /usr/local/lib/python3.10/dist-packages/flash_attn exists."
-else
-    echo "Directory /usr/local/lib/python3.10/dist-packages/flash_attn does not exist."
-fi
+PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
+FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 
-rm -rf /usr/local/lib/python3.10/dist-packages/flash_attn
+if [ -d "$FLASH_ATTN_PATH" ]; then
+    echo "178 Directory $FLASH_ATTN_PATH exists. Removing..."
+    rm -rf "$FLASH_ATTN_PATH"
+    echo "Bug this should not happen"
+else
+    echo "181 Directory $FLASH_ATTN_PATH does not exist."
+fi
