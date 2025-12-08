@@ -106,7 +106,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         # Fall back to XML parameter tag parsing (original format)
         parameters = {}
-        param_matches = re.findall(self.parameter_regex, invoke_content, re.DOTALL)
+        param_matches = re.findall(self.xml_parameter_regex, invoke_content, re.DOTALL)
         for param_name, param_type, param_value in param_matches:
             # Convert value based on type
             if param_type == "true":  # string type
@@ -121,9 +121,12 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
     def _parse_parameters_partially(self, invoke_content: str) -> str:
         invoke_content_stripped = invoke_content.strip()
+        if not invoke_content_stripped:
+            return "", "none"
+
         # 1. check json format
         if invoke_content_stripped.startswith("{"):
-            return invoke_content_stripped
+            return invoke_content_stripped, "json"
 
         # 2. check xml format
         xml_param_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)(</｜DSML｜parameter>|$)'
@@ -143,7 +146,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     parameters_str += f'"{param_name}": "{param_value.strip()}'
             if is_param_end:
                 parameters_str += '"'
-        return parameters_str
+
+        return parameters_str, "xml"
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -247,8 +251,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
                 is_tool_end = bool(invoke_match.group(3))
 
-                func_args_raw = self._parse_parameters_partially(invoke_content)
-                if is_tool_end:
+                print(f"\033[42m {func_name=} {invoke_content=} {is_tool_end=} \033[0m")
+                func_args_raw, format = self._parse_parameters_partially(invoke_content)
+                # print(f"\033[42m {func_args_raw=} \033[0m")
+                if is_tool_end and format == "xml":
                     func_args_raw += "}"
 
                 # Initialize state if this is the first tool call
@@ -267,7 +273,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         ToolCallItem(
                             tool_index=self.current_tool_id,
                             name=func_name,
-                            parameter="",
+                            parameters="",
                         )
                     )
                     self.current_tool_name_sent = True
@@ -307,6 +313,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         if is_tool_end:
                             # Remove the completed tool call from buffer, keep any remaining content
                             self._buffer = current_text[invoke_match.end(3) :]
+                            print(f"\033[41m send over, clear buffer \033[0m")
                         else:
                             self._buffer = ""
 
@@ -314,6 +321,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
+
+                if not is_tool_end:
+                    break
 
             # No more invoke blocks found
             return StreamingParseResult(normal_text="", calls=calls)
