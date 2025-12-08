@@ -51,7 +51,9 @@ class AsyncMMDataProcessor:
             else None
         )
 
-    async def _invoke(self, image_data, audio_data, input_text_or_ids, request_obj, kwargs) -> Dict[str, Any]:
+    async def _invoke(
+        self, image_data, audio_data, input_text_or_ids, request_obj, kwargs
+    ) -> Dict[str, Any]:
         if self.is_async:
             # Native async implementation
             return await self._proc_async(
@@ -97,15 +99,30 @@ class AsyncMMDataProcessor:
             async with self.semaphore:
                 if self.timeout_s is not None:
                     return await asyncio.wait_for(
-                        self._invoke(image_data, audio_data, input_text_or_ids, request_obj, **kwargs),
-                        timeout=self.timeout_s)
-                return await self._invoke(image_data, audio_data, input_text_or_ids, request_obj, **kwargs)
+                        self._invoke(
+                            image_data,
+                            audio_data,
+                            input_text_or_ids,
+                            request_obj,
+                            **kwargs,
+                        ),
+                        timeout=self.timeout_s,
+                    )
+                return await self._invoke(
+                    image_data, audio_data, input_text_or_ids, request_obj, **kwargs
+                )
 
         # No concurrency guard
         if self.timeout_s is not None:
             return await asyncio.wait_for(
-                self._invoke(image_data, audio_data, input_text_or_ids, request_obj, **kwargs), timeout=self.timeout_s)
-        return await self._invoke(image_data, audio_data, input_text_or_ids, request_obj, **kwargs)
+                self._invoke(
+                    image_data, audio_data, input_text_or_ids, request_obj, **kwargs
+                ),
+                timeout=self.timeout_s,
+            )
+        return await self._invoke(
+            image_data, audio_data, input_text_or_ids, request_obj, **kwargs
+        )
 
     def shutdown(self) -> None:
         """Gracefully shutdown resources owned by this wrapper."""
