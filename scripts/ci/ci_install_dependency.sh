@@ -133,13 +133,6 @@ fi
 # Show current packages
 $PIP_CMD list
 
-# flash_attn is required by transformer 5.x in case if not yet installed
-if python -c "import flash_attn" 2>/dev/null; then
-    echo "flash_attn already installed — skipping"
-else
-    $PIP_CMD install flash_attn $PIP_INSTALL_SUFFIX --no-build-isolation
-fi
-
 $PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # DeepEP depends on nvshmem 3.4.5
