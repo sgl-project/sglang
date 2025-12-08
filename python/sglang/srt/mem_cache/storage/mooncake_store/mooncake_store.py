@@ -85,6 +85,8 @@ class MooncakeStoreConfig:
     master_server_address: str
     master_metrics_port: int
     check_server: bool
+    standalone_storage: bool
+    client_server_address: str
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -100,8 +102,13 @@ class MooncakeStoreConfig:
         except Exception as e:
             raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
 
-        if "master_server_address" not in config:
-            raise ValueError("master_server_address is required in config file")
+        if (
+            "master_server_address" not in config
+            and "client_server_address" not in config
+        ):
+            raise ValueError(
+                "Either master_server_address or client_server_address is required in config file"
+            )
 
         return MooncakeStoreConfig(
             local_hostname=config.get(
@@ -117,11 +124,19 @@ class MooncakeStoreConfig:
             ),
             protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
             device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
-            master_server_address=config.get("master_server_address"),
+            master_server_address=config.get(
+                "master_server_address", envs.MOONCAKE_MASTER.default
+            ),
             master_metrics_port=config.get(
                 "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
             ),
             check_server=config.get("check_server", envs.MOONCAKE_CHECK_SERVER.default),
+            standalone_storage=config.get(
+                "standalone_storage", envs.MOONCAKE_STANDALONE_STORAGE.default
+            ),
+            client_server_address=config.get(
+                "client_server_address", envs.MOONCAKE_CLIENT.default
+            ),
         )
 
     @staticmethod
@@ -133,8 +148,10 @@ class MooncakeStoreConfig:
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
         """
         # other required environment variables...
-        if not envs.MOONCAKE_MASTER.is_set():
-            raise ValueError("The environment variable 'MOONCAKE_MASTER' is not set.")
+        if not envs.MOONCAKE_MASTER.is_set() and not envs.MOONCAKE_CLIENT.is_set():
+            raise ValueError(
+                "Either the environment variable 'MOONCAKE_MASTER' or 'MOONCAKE_CLIENT' is not set."
+            )
 
         # Special handling for local_hostname: try MOONCAKE_LOCAL_HOSTNAME first,
         # then fall back to LOCAL_HOSTNAME if not set.
@@ -157,13 +174,20 @@ class MooncakeStoreConfig:
             master_server_address=envs.MOONCAKE_MASTER.value,
             master_metrics_port=envs.MOONCAKE_MASTER_METRICS_PORT.value,
             check_server=envs.MOONCAKE_CHECK_SERVER.value,
+            standalone_storage=envs.MOONCAKE_STANDALONE_STORAGE.value,
+            client_server_address=envs.MOONCAKE_CLIENT.value,
         )
 
     @staticmethod
     def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
         """Load config from extra_config dictionary."""
-        if "master_server_address" not in extra_config:
-            raise ValueError("master_server_address is required in extra_config")
+        if (
+            "master_server_address" not in extra_config
+            and "client_server_address" not in extra_config
+        ):
+            raise ValueError(
+                "Either master_server_address or client_server_address is required in extra_config"
+            )
 
         return MooncakeStoreConfig(
             local_hostname=extra_config.get(
@@ -179,19 +203,29 @@ class MooncakeStoreConfig:
             ),
             protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
             device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),
-            master_server_address=extra_config["master_server_address"],
+            master_server_address=extra_config.get(
+                "master_server_address", envs.MOONCAKE_MASTER.default
+            ),
             master_metrics_port=extra_config.get(
                 "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
             ),
             check_server=extra_config.get(
                 "check_server", envs.MOONCAKE_CHECK_SERVER.default
             ),
+            standalone_storage=extra_config.get(
+                "standalone_storage", envs.MOONCAKE_STANDALONE_STORAGE.default
+            ),
+            client_server_address=extra_config.get(
+                "client_server_address", envs.MOONCAKE_CLIENT.default
+            ),
         )
 
 
 class MooncakeStore(HiCacheStorage):
 
-    def __init__(self, storage_config: HiCacheStorageConfig = None):
+    def __init__(
+        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
+    ):
         try:
             from mooncake.store import MooncakeDistributedStore
         except ImportError as e:
@@ -210,9 +244,9 @@ class MooncakeStore(HiCacheStorage):
                 else None
             )
             # Load configuration with master_server_address prioritized from extra_config if available
-            if (
-                extra_config is not None
-                and extra_config.get("master_server_address") is not None
+            if extra_config is not None and (
+                extra_config.get("master_server_address") is not None
+                or extra_config.get("client_server_address") is not None
             ):
                 # Load from extra_config
                 self.config = MooncakeStoreConfig.load_from_extra_config(extra_config)
@@ -262,16 +296,28 @@ class MooncakeStore(HiCacheStorage):
                         f"Failed to parse device_name as JSON: {device_name}"
                     )
                     device_name = ""
-
-            ret_code = self.store.setup(
-                self.config.local_hostname,
-                self.config.metadata_server,
-                per_tp_global_segment_size,
-                DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                self.config.protocol,
-                device_name,
-                self.config.master_server_address,
-            )
+            if self.config.standalone_storage:
+                if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
+                    raise RuntimeError(
+                        "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
+                        "Please set standalone_storage=False "
+                        "or upgrade Mooncake by 'pip install mooncake --upgrade'."
+                    )
+                ret_code = self.store.setup_dummy(
+                    mem_pool.size * mem_pool.size_per_token,
+                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.config.client_server_address,
+                )
+            else:
+                ret_code = self.store.setup(
+                    self.config.local_hostname,
+                    self.config.metadata_server,
+                    per_tp_global_segment_size,
+                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.config.protocol,
+                    device_name,
+                    self.config.master_server_address,
+                )
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
