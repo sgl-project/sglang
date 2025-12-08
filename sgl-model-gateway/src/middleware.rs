@@ -612,7 +612,8 @@ pub async fn wasm_middleware(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let mut headers = request.headers().clone();
-    let body_bytes = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+    let max_body_size = wasm_manager.get_max_body_size();
+    let body_bytes = match axum::body::to_bytes(request.into_body(), max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
             error!("Failed to read request body: {}", e);
@@ -708,7 +709,7 @@ pub async fn wasm_middleware(
     // Extract response data once before processing modules
     let mut status = response.status();
     let mut headers = response.headers().clone();
-    let mut body_bytes = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+    let mut body_bytes = match axum::body::to_bytes(response.into_body(), max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
             error!("Failed to read response body: {}", e);
