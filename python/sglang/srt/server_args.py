@@ -1083,6 +1083,12 @@ class ServerArgs:
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
 
+        elif model_arch in [
+            "Glm4vMoeForConditionalGeneration",
+            "Glm4vForConditionalGeneration",
+        ]:
+            # TODO: fixme - It does not work for GLM4V - https://github.com/sgl-project/sglang/issues/14582
+            self.disable_shared_experts_fusion = True
         elif model_arch in ["GptOssForCausalLM"]:
             if (
                 self.attention_backend is None
