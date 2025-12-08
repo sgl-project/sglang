@@ -29,7 +29,7 @@ suites = {
         TestFile("models/test_qwen_models.py", 90),
         TestFile("models/test_reward_models.py", 103),
         TestFile("models/test_transformers_models.py", 245),
-        TestFile("models/test_vlm_models.py", 282),
+        TestFile("models/test_vlm_models.py", 270),
         TestFile("openai_server/basic/test_openai_embedding.py", 70),
         TestFile("openai_server/basic/test_openai_server.py", 184),
         TestFile("openai_server/basic/test_protocol.py", 3),
@@ -151,7 +151,7 @@ suites = {
         TestFile("test_eagle_dp_attention.py", 200),
     ],
     "per-commit-4-gpu": [
-        TestFile("models/test_qwen3_next_models.py", 291),
+        TestFile("models/test_qwen3_next_models.py", 472),
         TestFile("test_gpt_oss_4gpu.py", 300),
         TestFile("test_local_attn.py", 411),
         TestFile("test_multi_instance_release_memory_occupation.py", 64),
@@ -177,10 +177,11 @@ suites = {
         TestFile("test_flash_attention_4.py", 300),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
-        # TODO: Add it back after the bug is fixed
-        # TestFile("test_eagle_infer_beta_dp_attention.py", 200),
+        TestFile("test_eagle_infer_beta_dp_attention.py", 300),
     ],
-    "per-commit-8-gpu-b200": [],
+    "per-commit-8-gpu-b200": [
+        TestFile("test_mistral_large3_basic.py", 275),
+    ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 590),
@@ -214,6 +215,7 @@ suites = {
         TestFile("test_moe_eval_accuracy_large.py"),
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_profile_v2.py"),
+        TestFile("models/test_ministral3_models.py"),
     ],
 }
 
@@ -234,7 +236,7 @@ suite_amd = {
         TestFile("models/test_qwen_models.py", 82),
         TestFile("models/test_reward_models.py", 132),
         TestFile("models/test_transformers_models.py", 320),
-        TestFile("models/test_vlm_models.py", 437),
+        TestFile("models/test_vlm_models.py", 387),
         TestFile("openai_server/basic/test_openai_embedding.py", 141),
         TestFile("openai_server/basic/test_openai_server.py", 149),
         TestFile("openai_server/basic/test_protocol.py", 10),
@@ -372,6 +374,7 @@ suite_ascend = {
     ],
     "per-commit-4-npu-a2": [
         TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
+        TestFile("ascend/test_ascend_hicache_mla.py", 400),
         TestFile("ascend/test_ascend_tp4_bf16.py", 400),
     ],
     "per-commit-16-npu-a3": [

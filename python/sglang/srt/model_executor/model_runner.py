@@ -441,11 +441,6 @@ class ModelRunner:
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid_swa = self.model_config.is_hybrid_swa = True
 
-        if config := self.mamba2_config:
-            class_name = config.__class__.__name__
-            logger.warning(f"{class_name} model detected, disable radix cache")
-            self.server_args.disable_radix_cache = True
-
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
         # determine the number of layers.
@@ -583,8 +578,10 @@ class ModelRunner:
             quantization_config := getattr(
                 self.model_config.hf_config, "quantization_config", None
             )
-        ) is not None and "weight_block_size" in quantization_config:
-            weight_block_size_n = quantization_config["weight_block_size"][0]
+        ) is not None and (
+            weight_block_size := quantization_config.get("weight_block_size", None)
+        ) is not None:
+            weight_block_size_n = weight_block_size[0]
 
             if self.tp_size % self.moe_ep_size != 0:
                 raise ValueError(
