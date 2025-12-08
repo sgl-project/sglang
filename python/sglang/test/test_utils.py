@@ -1176,11 +1176,6 @@ def run_bench_one_batch(model, other_args):
         device: Device type ("auto", "cuda", "rocm" or "cpu").
                 If "auto", will detect available platforms automatically.
     """
-    # Auto-detect device if needed
-
-    device = auto_config_device()
-    print(f"Auto-configed device: {device}", flush=True)
-    other_args += ["--device", str(device)]
 
     command = [
         "python3",
