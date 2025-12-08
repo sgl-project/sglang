@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rand::Rng;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics};
+use crate::{core::Worker, observability::metrics::RouterMetrics};
 
 /// Random selection policy
 ///
