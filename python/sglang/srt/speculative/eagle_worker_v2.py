@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import time
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -96,6 +97,10 @@ class EagleDraftWorker(BaseDraftWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        disable_eagle3_quant = os.getenv("DISABLE_EAGLE3_QUANT", "1")
+        if disable_eagle3_quant :
+            self.server_args.quantization = None
 
         # Set constant
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(

@@ -148,11 +148,18 @@ class EagleDraftInputV2Mixin:
             bs = len(batch.seq_lens)
 
             # Assign cache locations
-            batch.out_cache_loc = torch.empty(
-                (bs * topk * num_steps,),
-                dtype=torch.int64,
-                device=batch.input_ids.device,
-            )
+            if _is_cuda or _is_hip:
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int64,
+                    device=batch.input_ids.device,
+                )
+            elif _is_npu:
+                batch.out_cache_loc = torch.empty(
+                    (bs * topk * num_steps,),
+                    dtype=torch.int32,
+                    device=batch.input_ids.device,
+                )
             # FIXME(lsyin): align with the default code path
             assign_draft_cache_locs_page_size_1[(bs,)](
                 batch.req_pool_indices,
@@ -533,6 +540,6 @@ def assign_extend_cache_locs_func(
             end_offset,
             out_cache_loc,
         )
-        out_cache_loc = out_cache_loc.to(dtype=torch.int64)
+        out_cache_loc = out_cache_loc.to(dtype=torch.int32)
 
         return out_cache_loc

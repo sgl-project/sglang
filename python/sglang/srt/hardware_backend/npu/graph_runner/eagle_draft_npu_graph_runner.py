@@ -79,3 +79,6 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
             thread.join()
         else:
             self.graphs[self.bs].replay()
+
+    def _cache_loc_dtype(self):
+        return torch.int32
