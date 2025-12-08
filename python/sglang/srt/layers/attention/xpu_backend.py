@@ -19,11 +19,13 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+import logging
+
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
-import logging
 logger = logging.getLogger(__name__)
+
 
 @torch.compile
 def extract_page_table(batch_size, req_to_token, req_pool_indices, seq_lens):
@@ -349,6 +351,7 @@ class XPUAttentionBackend(AttentionBackend):
                     torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
                 )
             else:
+                metadata.max_seq_len_q = forward_batch.seq_lens_cpu.max().item()
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
             # Setup local attention if enabled
@@ -393,8 +396,6 @@ class XPUAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
-        logger.info("in attn, shape: %s extend key: %s", k.shape, k[:, 0, 0].to(torch.float).detach().cpu().numpy())
-        logger.info("in attn, shape: %s extend value: %s", v.shape, v[:, 0, 0].to(torch.float).detach().cpu().numpy())
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -518,12 +519,6 @@ class XPUAttentionBackend(AttentionBackend):
                 sinks=sinks,
                 **kwargs,
             )
-            logger.info("in attn, page_table: %s", page_table.to(torch.float).detach().cpu().numpy())
-            # logger.info("in attn, shape: %s extend key: %s", key_cache.shape, key_cache[page_table, :, 0, 0].to(torch.float).detach().cpu().numpy())
-            # logger.info("in attn, shape: %s extend value: %s", value_cache.shape, value_cache[page_table, 0, 0, 0].to(torch.float).detach().cpu().numpy())
-            logger.info("in attn, extend input: %s", q[:, 0].to(torch.float).detach().cpu().numpy())
-            logger.info("in attn, extend output: %s", result[:, 0, 0].to(torch.float).detach().cpu().numpy())
-
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
