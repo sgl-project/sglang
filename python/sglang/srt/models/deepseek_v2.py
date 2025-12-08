@@ -235,6 +235,7 @@ def enable_nextn_moe_bf16_cast_to_fp8(quant_config):
         quant_config is not None
         and quant_config.get_name() == "modelopt_fp4"
         and get_moe_a2a_backend().is_deepep()
+        and envs.SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE.get()
     )
 
 
