@@ -830,6 +830,9 @@ def load_audio(
         audio_file = BytesIO(response.content)
         response.close()
         audio, original_sr = sf.read(audio_file)
+    elif audio_file.startswith("file://"):
+        audio_file = unquote(urlparse(audio_file).path)
+        audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
     else:
