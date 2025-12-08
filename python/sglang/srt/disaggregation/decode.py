@@ -331,6 +331,7 @@ class DecodePreallocQueue:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
+            req.trace_metric_ctx.abort(abort_info={"abort_info": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
             return True
@@ -434,6 +435,9 @@ class DecodePreallocQueue:
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 indices_to_remove.add(i)
+                decode_req.req.trace_metric_ctx.abort(
+                    abort_info=decode_req.req.finished_reason
+                )
 
         # Then, preallocate the remaining requests if possible
         for i, decode_req in enumerate(self.queue):
@@ -743,6 +747,9 @@ class DecodeTransferQueue:
                 except Exception as e:
                     error_message += f" with exception {e}"
                 logger.error(error_message)
+                decode_req.req.trace_metric_ctx.abort(
+                    abort_info={"abort_info": error_message}
+                )
                 prepare_abort(
                     decode_req.req,
                     error_message,

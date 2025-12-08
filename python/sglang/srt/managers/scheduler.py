@@ -1315,6 +1315,9 @@ class Scheduler(
                         f"boostrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
+                    recv_req.trace_metric_ctx.abort(
+                        abort_info={"abort_info": error_msg}
+                    )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
                     self.stream_output([req], req.return_logprob)
                     return
@@ -1517,6 +1520,7 @@ class Scheduler(
                 },
                 rid=req.rid,
             )
+            req.trace_metric_ctx.abort(abort_info=abort_req.finished_reason)
             self.send_to_tokenizer.send_output(abort_req, req)
             return False
         return True
@@ -1527,6 +1531,9 @@ class Scheduler(
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
         ):
+            recv_req.trace_metric_ctx.abort(
+                abort_info={"abort_info": "Queue limit exceeded"}
+            )
             return False
 
         # Reject the incoming request by default.

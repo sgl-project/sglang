@@ -47,6 +47,7 @@ try:
     from opentelemetry.sdk.resources import SERVICE_NAME, Resource
     from opentelemetry.sdk.trace import TracerProvider, id_generator
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.trace import Status, StatusCode
     from opentelemetry.trace.propagation.tracecontext import (
         TraceContextTextMapPropagator,
     )
@@ -433,8 +434,7 @@ class SGLangTraceReqContext:
         ts = ts or get_cur_time_ns()
 
         # End all unclosed thread spans.
-        if self.thread_context and self.thread_context.thread_span:
-            self.thread_context.thread_span.end(end_time=ts)
+        self.abort()
 
         if attrs:
             self.root_span.set_attributes(attrs)
@@ -442,6 +442,9 @@ class SGLangTraceReqContext:
         self.root_span.end(end_time=ts)
 
     def __create_slice_span(self, _slice: SGLangTraceSliceContext):
+        if _slice.span:
+            return
+
         parent_span = self.thread_context.thread_span
         if _slice.parent_slice:
             parent_span = _slice.parent_slice.span
@@ -536,21 +539,7 @@ class SGLangTraceReqContext:
         # If this is the last slice in the thread,
         # release the thread context and check whether to release the request context.
         if thread_finish_flag:
-            if self.thread_context.thread_span:
-                self.thread_context.thread_span.end(end_time=ts)
-                self.thread_context.thread_span = None
-
-            # unlikely path, excepting error API usage
-            if self.thread_context.cur_slice is not None:
-                logger.warning(f"thread_finish_flag can not be set at nested slice.")
-                while self.thread_context.cur_slice.parent_slice:
-                    self.thread_context.cur_slice = (
-                        self.thread_context.cur_slice.parent_slice
-                    )
-                self.__release_slice_reference_tree(self.thread_context.cur_slice)
-                self.thread_context.cur_slice = None
-
-            self.thread_context = None
+            self.abort(ts)
             return
 
         if auto_next_anon:
@@ -671,3 +660,43 @@ class SGLangTraceReqContext:
             cur_slice.span.set_attributes(attrs)
         else:
             cur_slice.span.attrs.update(attrs)
+
+    def abort(self, ts=None, abort_info: Optional[Dict] = None):
+        if not self.tracing_enable:
+            return
+
+        if not self.thread_context:
+            return
+
+        # close all slice spans (unlikely except error API usage)
+        ts = ts or get_cur_time_ns()
+        if self.thread_context.cur_slice is not None:
+            if self.thread_context.cur_slice.span:
+                self.thread_context.cur_slice.span.end(end_time=ts)
+
+            # if has nested span, end them
+            while self.thread_context.cur_slice.parent_slice:
+                self.thread_context.cur_slice = (
+                    self.thread_context.cur_slice.parent_slice
+                )
+                if self.thread_context.cur_slice.span:
+                    self.thread_context.cur_slice.span.end(end_time=ts)
+
+            # slice will be dropped directly if slice.lazy_flag is True
+            self.__release_slice_reference_tree(self.thread_context.cur_slice)
+            self.thread_context.cur_slice = None
+
+        # set abort info into thread span
+        if self.thread_context.thread_span:
+            if abort_info:
+                from sglang.srt.managers.schedule_batch import BaseFinishReason
+
+                if isinstance(abort_info, BaseFinishReason):
+                    abort_info = abort_info.to_json()
+                self.thread_context.thread_span.set_status(Status(StatusCode.ERROR))
+                self.thread_context.thread_span.set_attributes(abort_info)
+            self.thread_context.thread_span.end(end_time=ts)
+        self.thread_context = None
+
+    def __del__(self):
+        self.abort(abort_info={"abort_info": "have unclosed span, auto closed"})
