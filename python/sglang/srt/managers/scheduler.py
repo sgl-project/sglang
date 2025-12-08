@@ -685,6 +685,8 @@ class Scheduler(
                     "Falling back to broadcast_pyobj."
                 )
                 self.attn_tp_mq = None
+        self.attn_tp_mq = None
+        self.tp_mq = None
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
@@ -1129,6 +1131,11 @@ class Scheduler(
                         recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
+                    if isinstance(recv_req, TokenizedGenerateReqInput):
+                        if recv_req.mm_inputs is not None and "mm_items" in recv_req.mm_inputs.keys():
+                            for item in recv_req.mm_inputs["mm_items"]:
+                                if item.feature is not None:
+                                    item.feature = item.feature.to(self.device, non_blocking=True)
                     recv_reqs.append(recv_req)
 
                 while True:
@@ -1195,6 +1202,7 @@ class Scheduler(
                         work_reqs,
                         self.attn_tp_mq,
                         self.attn_tp_rank,
+                        self.attn_tp_group.device_group,
                         self.attn_tp_group.ranks[0],
                     )
                 else:
@@ -1203,6 +1211,7 @@ class Scheduler(
                         work_reqs,
                         self.attn_tp_group.rank,
                         self.attn_tp_cpu_group,
+                        self.attn_tp_group.device_group,
                         src=self.attn_tp_group.ranks[0],
                     )
             
@@ -1213,6 +1222,7 @@ class Scheduler(
                     control_reqs = distribute_requests_via_mq(
                         control_reqs,
                         self.tp_mq,
+                        self.tp_group.device_group,
                         self.tp_rank,
                         self.tp_group.ranks[0],
                     )
@@ -1232,6 +1242,7 @@ class Scheduler(
                 recv_reqs = distribute_requests_via_mq(
                     recv_reqs,
                     self.tp_mq,
+                    self.tp_group.device_group,
                     self.tp_rank,
                     self.tp_group.ranks[0],
                 )
@@ -1241,6 +1252,7 @@ class Scheduler(
                     recv_reqs,
                     self.tp_group.rank,
                     self.tp_cpu_group,
+                    self.tp_group.device_group,
                     src=self.tp_group.ranks[0],
                 )
 
