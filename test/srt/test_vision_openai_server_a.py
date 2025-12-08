@@ -154,6 +154,7 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
         "--reasoning-parser=glm45",
     ]
 
+
 class TestGLM46VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.6V-Flash"
     extra_args = [

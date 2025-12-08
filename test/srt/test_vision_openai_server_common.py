@@ -177,7 +177,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
                 }
             )
         else:
@@ -331,7 +331,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                         },
                         {
                             "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                            "image_url": {"url": IMAGE_SGL_LOGO_URL},
                             "modalities": "multi-images",
                         },
                         {
