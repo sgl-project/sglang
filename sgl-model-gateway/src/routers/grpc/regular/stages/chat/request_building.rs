@@ -115,7 +115,20 @@ impl PipelineStage for ChatRequestBuildingStage {
                         _ => None,
                     })
             {
-                helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
+                // Get encode worker for EPD mode
+                let encode_worker =
+                    ctx.state
+                        .workers
+                        .as_ref()
+                        .and_then(|selection| match selection {
+                            WorkerSelection::Triple { encode, .. } => Some(encode),
+                            _ => None,
+                        });
+                helpers::inject_bootstrap_metadata(
+                    &mut proto_request,
+                    prefill_worker,
+                    encode_worker,
+                );
             }
         }
 

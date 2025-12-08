@@ -78,9 +78,15 @@ message SamplingParams {
 
 // Disaggregated serving parameters
 message DisaggregatedParams {
+  // Prefill worker bootstrap metadata (used in PD and EPD modes)
   string bootstrap_host = 1;
   int32 bootstrap_port = 2;
   int32 bootstrap_room = 3;
+
+  // Encode worker bootstrap metadata (only used in EPD mode)
+  optional string encode_bootstrap_host = 4;
+  optional int32 encode_bootstrap_port = 5;
+  optional int32 encode_bootstrap_room = 6;
 }
 
 // =====================
