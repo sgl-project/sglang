@@ -126,7 +126,8 @@ class SamplingParams:
 
     # Profiling
     profile: bool = False
-    num_profiled_timesteps: int = 2
+    num_profiled_timesteps: int = 5
+    profile_all_stages: bool = False
 
     # Debugging
     debug: bool = False
@@ -226,7 +227,7 @@ class SamplingParams:
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
-            logger.debug(f"Setting num_frames to 1 because this is a image-gen model")
+            logger.debug(f"Setting num_frames to 1 because this is an image-gen model")
             self.num_frames = 1
             self.data_type = DataType.IMAGE
         else:
@@ -329,6 +330,8 @@ class SamplingParams:
             action="store_true",
             default=SamplingParams.enable_teacache,
         )
+
+        # profiling
         parser.add_argument(
             "--profile",
             action="store_true",
@@ -336,17 +339,26 @@ class SamplingParams:
             help="Enable torch profiler for denoising stage",
         )
         parser.add_argument(
-            "--debug",
-            action="store_true",
-            default=SamplingParams.debug,
-            help="",
-        )
-        parser.add_argument(
             "--num-profiled-timesteps",
             type=int,
             default=SamplingParams.num_profiled_timesteps,
             help="Number of timesteps to profile after warmup",
         )
+        parser.add_argument(
+            "--profile-all-stages",
+            action="store_true",
+            dest="profile_all_stages",
+            default=SamplingParams.profile_all_stages,
+            help="Used with --profile, profile all pipeline stages",
+        )
+
+        parser.add_argument(
+            "--debug",
+            action="store_true",
+            default=SamplingParams.debug,
+            help="",
+        )
+
         parser.add_argument(
             "--prompt",
             type=str,

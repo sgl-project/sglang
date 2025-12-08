@@ -20,7 +20,7 @@ use serial_test::serial;
 use sgl_model_gateway::{
     config::{RouterConfig, TraceConfig},
     core::Job,
-    logging, otel_trace,
+    observability::{logging, otel_trace},
     routers::RouterFactory,
 };
 use tokio::sync::oneshot;
