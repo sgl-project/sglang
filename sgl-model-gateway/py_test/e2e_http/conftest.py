@@ -134,6 +134,8 @@ def _popen_launch_router_only(
     dp_aware: bool = False,
     enable_igw: bool = False,
     api_key: str | None = None,
+    enable_trace: bool = False,
+    otlp_traces_endpoint: str | None = None,
 ) -> subprocess.Popen:
     host, port = _parse_url(base_url)
 
@@ -155,6 +157,10 @@ def _popen_launch_router_only(
         cmd += ["--enable-igw"]
     if api_key is not None:
         cmd += ["--api-key", api_key]
+    if enable_trace:
+        cmd += ["--enable-trace"]
+        if otlp_traces_endpoint:
+            cmd += ["--otlp-traces-endpoint", otlp_traces_endpoint]
     cmd += [
         "--prometheus-port",
         str(prom_port),
@@ -711,10 +717,15 @@ def e2e_router(e2e_model: str):
 
 
 @pytest.fixture
-def e2e_router_only_rr():
+def e2e_router_only_rr(otel_config):
     port = _find_available_port()
     base_url = f"http://127.0.0.1:{port}"
-    proc = _popen_launch_router_only(base_url, policy="round_robin")
+    proc = _popen_launch_router_only(
+        base_url,
+        policy="round_robin",
+        enable_trace=otel_config.enabled,
+        otlp_traces_endpoint=otel_config.endpoint,
+    )
     try:
         yield SimpleNamespace(proc=proc, url=base_url)
     finally:
@@ -757,13 +768,19 @@ def e2e_primary_worker(e2e_model: str):
 
 
 @pytest.fixture
-def e2e_router_only_rr_dp_aware_api():
+def e2e_router_only_rr_dp_aware_api(otel_config):
     """Router-only with dp-aware enabled and an API key."""
     port = _find_available_port()
     base_url = f"http://127.0.0.1:{port}"
     api_key = "secret"
     proc = _popen_launch_router_only(
-        base_url, policy="round_robin", timeout=180.0, dp_aware=True, api_key=api_key
+        base_url,
+        policy="round_robin",
+        timeout=180.0,
+        dp_aware=True,
+        api_key=api_key,
+        enable_trace=otel_config.enabled,
+        otlp_traces_endpoint=otel_config.endpoint,
     )
     try:
         yield SimpleNamespace(proc=proc, url=base_url, api_key=api_key)
@@ -805,3 +822,88 @@ def e2e_two_workers_dp2(e2e_model: str):
     finally:
         for w in workers:
             _terminate(w.proc)
+
+
+# =============================================================================
+# OpenTelemetry / OTEL Tracing Configuration
+# =============================================================================
+
+
+def _query_jaeger_traces(jaeger_url: str, service_name: str, limit: int = 20) -> list:
+    """Query Jaeger for traces from a specific service."""
+    try:
+        r = requests.get(
+            f"{jaeger_url}/api/traces",
+            params={"service": service_name, "limit": limit},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json().get("data", [])
+    except requests.RequestException as e:
+        logger.debug(f"Failed to query Jaeger: {e}")
+    return []
+
+
+def _verify_otel_traces(jaeger_url: str, min_traces: int = 1) -> bool:
+    """Verify that traces were exported to Jaeger.
+
+    Returns True if at least min_traces were found for sgl-router service.
+    """
+    # Wait a bit for traces to be flushed
+    time.sleep(2)
+
+    traces = _query_jaeger_traces(jaeger_url, "sgl-router", limit=50)
+    trace_count = len(traces)
+
+    if trace_count >= min_traces:
+        logger.info(f"OTEL verification passed: found {trace_count} traces in Jaeger")
+        return True
+    else:
+        logger.warning(
+            f"OTEL verification: expected at least {min_traces} traces, found {trace_count}"
+        )
+        return False
+
+
+@pytest.fixture(scope="session")
+def otel_config() -> SimpleNamespace:
+    """OpenTelemetry configuration for router fixtures.
+
+    Enables OTEL tracing when OTLP_COLLECTOR_ENDPOINT is set in environment.
+    After all tests complete, verifies traces were exported to Jaeger.
+
+    Environment variables:
+        OTLP_COLLECTOR_ENDPOINT: gRPC endpoint (e.g., "localhost:4317")
+        JAEGER_QUERY_URL: Jaeger query API URL (e.g., "http://localhost:16686")
+    """
+    endpoint = os.getenv("OTLP_COLLECTOR_ENDPOINT")
+    jaeger_url = os.getenv("JAEGER_QUERY_URL", "http://localhost:16686")
+    enabled = endpoint is not None
+
+    if enabled:
+        logger.info(f"OTEL tracing enabled, exporting to {endpoint}")
+    else:
+        logger.debug("OTEL tracing disabled (OTLP_COLLECTOR_ENDPOINT not set)")
+
+    config = SimpleNamespace(
+        enabled=enabled,
+        endpoint=endpoint,
+        jaeger_url=jaeger_url,
+    )
+
+    yield config
+
+    # After all tests, verify traces were exported
+    if enabled:
+        try:
+            if _verify_otel_traces(jaeger_url, min_traces=1):
+                logger.info(
+                    "OTEL integration test passed: traces exported successfully"
+                )
+            else:
+                logger.warning(
+                    "OTEL integration test: no traces found in Jaeger. "
+                    "This may indicate tracing is not working correctly."
+                )
+        except Exception as e:
+            logger.warning(f"OTEL verification failed: {e}")
