@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -69,6 +70,8 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
+            envs.SGLANG_ENABLE_SPEC_V2.set(False)
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
