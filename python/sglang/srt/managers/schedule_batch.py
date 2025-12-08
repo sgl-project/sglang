@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import enum
-from sglang.srt.nvtx_utils import nvtx_annotated_method
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -1574,7 +1573,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME: finally deprecate is_v2_eagle
         return self.enable_overlap and self.spec_algorithm.is_eagle()
 
-    @nvtx_annotated_method("scheduler.prepare_for_decode")
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)

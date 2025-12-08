@@ -28,7 +28,6 @@ import triton.language as tl
 
 from sglang.srt.mem_cache.memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
-from sglang.srt.nvtx_utils import nvtx_annotated_method, nvtx_range
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -154,7 +153,6 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[need_size:]
         return select_index
 
-    @nvtx_annotated_method("swa_kv_cache_allocator.free")
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
@@ -253,7 +251,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # assert self.full_to_swa_index_mapping is not None
         # return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
-    @nvtx_annotated_method("swa_kv_cache_allocator.alloc")
     def alloc(self, need_size: int):
         if need_size > self.full_attn_allocator.available_size():
             return None
@@ -266,7 +263,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
-    @nvtx_annotated_method("swa_kv_cache_allocator.free")
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return

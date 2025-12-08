@@ -66,6 +66,7 @@ from sglang.srt.tracing.trace import (
 )
 from sglang.srt.utils import get_int_env_var, require_mlp_sync
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -409,7 +410,6 @@ class DecodePreallocQueue:
             else:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
-    @nvtx_annotated_method("scheduler.disagg_decode.pop_preallocated")
     def pop_preallocated(self) -> List[DecodeRequest]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._update_handshake_waiters()
@@ -481,7 +481,7 @@ class DecodePreallocQueue:
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
                     : len(decode_req.req.origin_input_ids)
                 ]
-                .to('cpu', non_blocking=True)
+                .cpu()
                 .numpy()
             )
             page_size = self.token_to_kv_pool_allocator.page_size
@@ -493,7 +493,7 @@ class DecodePreallocQueue:
                     self.req_to_token_pool.req_index_to_mamba_index_mapping[
                         decode_req.req.req_pool_idx
                     ]
-                    .to('cpu', non_blocking=True)
+                    .cpu()
                     .numpy()
                 ]
             elif isinstance(self.token_to_kv_pool, SWAKVPool):
@@ -513,14 +513,14 @@ class DecodePreallocQueue:
                         window_kv_indices_full
                     )
                 )
-                state_indices = window_kv_indices_swa.to('cpu', non_blocking=True).numpy()
+                state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
-                state_indices = kv_indices_full.to('cpu', non_blocking=True).numpy()
+                state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             else:
                 state_indices = None
@@ -613,7 +613,6 @@ class DecodePreallocQueue:
             )
         return allocatable_tokens
 
-    @nvtx_annotated_method("scheduler.disagg_decode._pre_alloc")
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
         if isinstance(self.req_to_token_pool, HybridMambaDecodeReqToTokenPool):
@@ -955,10 +954,10 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(batch, result)
         return batch, result
 
-    @nvtx_annotated_method("scheduler.disagg_decode.merge_last_extend_batch")
-    def merge_last_extend_batch(
+    @nvtx_annotated_method("scheduler.disagg_decode.get_next_batch")
+    def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
-    ) -> None:
+    ) -> Optional[Tuple[ScheduleBatch, bool]]:
         """Create fake completed prefill if possible and merge with running batch"""
         # Merge the prefill batch into the running batch
         last_batch = self.last_batch
@@ -974,11 +973,6 @@ class SchedulerDisaggregationDecodeMixin:
                     # merge running_batch with prefill batch
                     self.running_batch.merge_batch(last_batch)
 
-    @nvtx_annotated_method("scheduler.disagg_decode.get_next_batch")
-    def get_next_disagg_decode_batch_to_run(
-        self: Scheduler,
-    ) -> Optional[Tuple[ScheduleBatch, bool]]:
-        self.merge_last_extend_batch()
         new_prebuilt_batch = self.get_new_prebuilt_batch()
 
         ret: Optional[ScheduleBatch] = None
@@ -1055,6 +1049,7 @@ class SchedulerDisaggregationDecodeMixin:
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
         new_batch.process_prebuilt(self.server_args, self.future_map)
+
         return new_batch
 
     @nvtx_annotated_method("scheduler.disagg_decode.process_decode_queue")
