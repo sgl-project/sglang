@@ -323,6 +323,10 @@ class LoRAPipeline(ComposedPipelineBase):
         adapted_count += self._apply_lora_to_layers(
             self.lora_layers_transformer_2, lora_nickname, lora_path, rank
         )
+        # Apply LoRA to fake_score_transformer (critic) if exists
+        adapted_count += self._apply_lora_to_layers(
+            self.lora_layers_critic, lora_nickname, lora_path, rank
+        )
 
         self.is_lora_merged = True
         logger.info(
@@ -341,6 +345,8 @@ class LoRAPipeline(ComposedPipelineBase):
             layer.merge_lora_weights()
         for name, layer in self.lora_layers_transformer_2.items():
             layer.merge_lora_weights()
+        for name, layer in self.lora_layers_critic.items():
+            layer.merge_lora_weights()
         logger.info("LoRA weights merged")
         self.is_lora_merged = True
 
@@ -352,5 +358,7 @@ class LoRAPipeline(ComposedPipelineBase):
         for name, layer in self.lora_layers.items():
             layer.unmerge_lora_weights()
         for name, layer in self.lora_layers_transformer_2.items():
+            layer.unmerge_lora_weights()
+        for name, layer in self.lora_layers_critic.items():
             layer.unmerge_lora_weights()
         self.is_lora_merged = False
