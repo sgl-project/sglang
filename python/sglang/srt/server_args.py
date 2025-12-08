@@ -1346,13 +1346,7 @@ class ServerArgs:
                 if (
                     is_hopper_with_cuda_12_3()
                     and is_no_spec_infer_or_topk_one(self)
-                    and (
-                        is_fa3_default_architecture(self.model_config.hf_config)
-                        # For VLMs, determine with hf_config.text_config
-                        or is_fa3_default_architecture(
-                            getattr(self.model_config.hf_config, "text_config", None)
-                        )
-                    )
+                    and is_fa3_default_architecture(self.model_config.hf_config)
                 ):
                     self.attention_backend = "fa3"
                 elif is_blackwell() and is_no_spec_infer_or_topk_one(self):
