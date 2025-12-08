@@ -724,7 +724,6 @@ class MooncakeKVManager(CommonKVManager):
                     # logger.info(f"transfer_worker: {kv_chunk.room=} {self.transfer_contexts=}")
                     transfer_context = self.transfer_contexts[kv_chunk.room]
                     # Resolve the context once for all requests (thread-safe, only executes once)
-                    transfer_context.resolve()
                     
                     for req in reqs_to_be_processed:
                         if not req.is_dummy:
@@ -762,6 +761,8 @@ class MooncakeKVManager(CommonKVManager):
                             target_rank_registration_info: KVArgsRegisterInfo = (
                                 self.decode_kv_args_table[req.mooncake_session_id]
                             )
+
+                            transfer_context.resolve()
 
                             if self.is_mla_backend or (
                                 self.attn_tp_size
