@@ -2100,4 +2100,12 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.REMOTE_INSTANCE:
         return RemoteInstanceModelLoader(load_config)
 
+    if load_config.load_format == LoadFormat.PRIVATE:
+        import importlib
+        try:
+            module = importlib.import_module("sglang.private.private_model_loader")
+            return module.PrivateModelLoader(load_config)
+        except ImportError:
+            raise ValueError("Failed to import sglang.private.private_model_loader")
+
     return DefaultModelLoader(load_config)
