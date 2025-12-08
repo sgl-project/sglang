@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -32,9 +33,10 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -70,8 +72,8 @@ class BaseTpWorker(ABC):
         return self.model_runner.sliding_window_size
 
     @property
-    def is_hybrid(self) -> bool:
-        return self.model_runner.is_hybrid is not None
+    def is_hybrid_swa(self) -> bool:
+        return self.model_runner.is_hybrid_swa is not None
 
     def get_tokens_per_layer_info(self):
         return (
@@ -99,7 +101,9 @@ class BaseTpWorker(ABC):
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(
-            recv_req.model_path, recv_req.load_format
+            recv_req.model_path,
+            recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
         )
         return success, message
 
@@ -149,7 +153,11 @@ class BaseTpWorker(ABC):
         self, recv_req: UpdateWeightsFromDistributedReqInput
     ):
         success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names, recv_req.dtypes, recv_req.shapes, recv_req.group_name
+            recv_req.names,
+            recv_req.dtypes,
+            recv_req.shapes,
+            recv_req.group_name,
+            recv_req.load_format,
         )
         return success, message
 
@@ -162,6 +170,11 @@ class BaseTpWorker(ABC):
             ),
             load_format=recv_req.load_format,
         )
+        return success, message
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """Update weights from IPC for checkpoint-engine integration."""
+        success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -225,6 +238,9 @@ class TpModelWorker(BaseTpWorker):
             ),
             is_draft_model=is_draft_worker,
         )
+
+        if server_args.dllm_algorithm is not None:
+            self.dllm_algorithm = DllmAlgorithm.from_server_args(server_args)
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
@@ -303,6 +319,7 @@ class TpModelWorker(BaseTpWorker):
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 
     @property
@@ -330,6 +347,9 @@ class TpModelWorker(BaseTpWorker):
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
         )
+
+    def is_dllm(self):
+        return hasattr(self, "dllm_algorithm")
 
     def forward_batch_generation(
         self,
@@ -359,6 +379,16 @@ class TpModelWorker(BaseTpWorker):
             )
 
         if self.pp_group.is_last_rank:
+            if self.is_dllm():
+                logits_output, next_token_ids, can_run_cuda_graph = (
+                    self.dllm_algorithm.run(self.model_runner, forward_batch)
+                )
+                return GenerationBatchResult(
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
+                    can_run_cuda_graph=can_run_cuda_graph,
+                )
+
             logits_output, can_run_cuda_graph = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -375,6 +405,7 @@ class TpModelWorker(BaseTpWorker):
 
             if (
                 self.enable_overlap
+                and not self.enable_spec
                 and model_worker_batch.sampling_info.grammars is not None
             ):
 
@@ -419,3 +450,26 @@ class TpModelWorker(BaseTpWorker):
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+
+    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+        if batch.split_index == 0:
+            model_worker_batch = batch.get_model_worker_batch()
+            forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            batch.split_forward_batch = forward_batch
+            batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu
+        else:
+            model_worker_batch = batch.get_model_worker_batch(batch.seq_lens_cpu_cache)
+
+        logits_output, can_run_cuda_graph = self.model_runner.forward(
+            batch.split_forward_batch, split_forward_count=batch.split_forward_count
+        )
+        if logits_output:
+            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+        else:
+            next_token_ids = None
+        batch_result = GenerationBatchResult(
+            logits_output=logits_output,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+        batch_result.next_token_ids = next_token_ids
+        return batch_result

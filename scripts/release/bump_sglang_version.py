@@ -19,9 +19,9 @@ def main():
     version_file = Path("python/sglang/version.py")
 
     files_to_update = [
-        Path("Makefile"),
         Path("benchmark/deepseek_v3/README.md"),
-        Path("docker/Dockerfile.rocm"),
+        Path("docker/Dockerfile"),
+        Path("docker/rocm.Dockerfile"),
         Path("docs/get_started/install.md"),
         Path("docs/platforms/amd_gpu.md"),
         Path("docs/platforms/ascend_npu.md"),

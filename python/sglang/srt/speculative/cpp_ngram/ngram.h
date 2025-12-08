@@ -5,6 +5,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <new>
 #include <set>
 #include <sstream>
 #include <thread>

@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -37,9 +36,17 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
+    ModelOptFp8Config,
+)
+from sglang.srt.model_loader.weight_validation import (
+    _cleanup_corrupted_files_selective,
+    _cleanup_corrupted_model_cache,
+    _validate_safetensors_file,
+    _validate_sharded_model,
+)
 from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -67,16 +74,19 @@ enable_hf_transfer()
 
 class DisabledTqdm(tqdm):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs, disable=True)
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
 
 
-def get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
+def get_lock(
+    model_name_or_path: str, cache_dir: Optional[str] = None, suffix: str = ""
+):
     lock_dir = cache_dir or temp_dir
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
     model_name = model_name_or_path.replace("/", "-")
     hash_name = hashlib.sha256(model_name.encode()).hexdigest()
     # add hash to avoid conflict with old users' lock files
-    lock_file_name = hash_name + model_name + ".lock"
+    lock_file_name = hash_name + model_name + suffix + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
@@ -110,6 +120,9 @@ def convert_bin_to_safetensor_file(
 
     dirname = os.path.dirname(sf_filename)
     os.makedirs(dirname, exist_ok=True)
+
+    from safetensors.torch import save_file
+
     save_file(loaded, sf_filename, metadata={"format": "pt"})
 
     # check file size
@@ -132,11 +145,26 @@ def convert_bin_to_safetensor_file(
             raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
+def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
+    for prefix, new_prefix in prefix_mapping.items():
+        if key.startswith(prefix):
+            key = key.replace(prefix, new_prefix, 1)
+    return key
+
+
+def replace_substrings(key: str, substring_mapping: dict[str, str]) -> str:
+    for substr, new_substr in substring_mapping.items():
+        if substr in key:
+            key = key.replace(substr, new_substr)
+    return key
+
+
 # TODO(woosuk): Move this to other place.
 def get_quant_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
+    remap_prefix: Dict[str, str] | None = None,
 ) -> QuantizationConfig:
     quant_cls = get_quantization_config(model_config.quantization)
 
@@ -206,38 +234,33 @@ def get_quant_config(
     quant_config_file = quant_config_files[0]
     with open(quant_config_file) as f:
         config = json.load(f)
+        if remap_prefix is not None:
+            exclude_modules = [
+                replace_prefix(key, remap_prefix)
+                for key in config["quantization"]["exclude_modules"]
+            ]
+            config["quantization"]["exclude_modules"] = exclude_modules
+        config["packed_modules_mapping"] = packed_modules_mapping
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
-        elif model_config.quantization == "modelopt":
-            if config["producer"]["name"] == "modelopt":
+        elif model_config.quantization.startswith("modelopt") and (
+            config.get("producer", {}).get("name", "").startswith("modelopt")
+        ):
+            quant_algo = config["quantization"]["quant_algo"]
+            if quant_algo is None:
                 # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
-                if config["quantization"]["quant_algo"] is None:
-                    if (
-                        model_config.hf_config.architectures[0]
-                        != "LlamaForCausalLMEagle3"
-                    ):
-                        raise ValueError(
-                            f"Invalid quant_config, quantization method: {model_config.quantization},"
-                            f"hf architectures: {model_config.hf_config.architectures[0]}. "
-                        )
-                    return None
-                if "FP4" in config["quantization"]["quant_algo"]:
-                    return ModelOptFp4Config.from_config(config)
-                else:
-                    return quant_cls.from_config(config)
-        elif model_config.quantization == "modelopt_fp8":
-            if config["producer"]["name"] == "modelopt_fp8":
-                return quant_cls.from_config(config)
-            else:
-                raise ValueError(
-                    f"Unsupported quantization config"
-                    f" found for {model_config.quantization} in {f}."
-                )
-        elif model_config.quantization == "w8a8_int8":
-            config["packed_modules_mapping"] = packed_modules_mapping
-
-    return quant_cls.from_config(config)
+                if model_config.hf_config.architectures[0] != "LlamaForCausalLMEagle3":
+                    raise ValueError(
+                        f"Invalid quant_config, quantization method: {model_config.quantization},"
+                        f"hf architectures: {model_config.hf_config.architectures[0]}. "
+                    )
+                return None
+            elif quant_algo == "FP8" or model_config.quantization == "modelopt_fp8":
+                return ModelOptFp8Config.from_config(config)
+            elif "FP4" in quant_algo:
+                return ModelOptFp4Config.from_config(config)
+        return quant_cls.from_config(config)
 
 
 def find_local_hf_snapshot_dir(
@@ -287,100 +310,178 @@ def find_local_hf_snapshot_dir(
         except Exception as e:
             logger.warning("Failed to find local snapshot in default HF cache: %s", e)
 
-    # if any incomplete file exists, force re-download by returning None
-    if found_local_snapshot_dir:
-        repo_folder = os.path.abspath(
-            os.path.join(found_local_snapshot_dir, "..", "..")
-        )
-        blobs_dir = os.path.join(repo_folder, "blobs")
-        if os.path.isdir(blobs_dir) and glob.glob(
-            os.path.join(blobs_dir, "*.incomplete")
-        ):
-            logger.info(
-                "Found .incomplete files in %s for %s. "
-                "Considering local snapshot incomplete.",
-                blobs_dir,
-                model_name_or_path,
-            )
-            return None
-
     # if local snapshot exists, validate it contains at least one weight file
     # matching allow_patterns before skipping download.
     if found_local_snapshot_dir is None:
         return None
 
-    local_weight_files: List[str] = []
-    try:
-        for pattern in allow_patterns:
-            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
-            for f in matched_files:
-                # os.path.exists returns False for broken symlinks.
-                if not os.path.exists(f):
-                    continue
-                local_weight_files.append(f)
-    except Exception as e:
-        logger.warning(
-            "Failed to scan local snapshot %s with patterns %s: %s",
-            found_local_snapshot_dir,
-            allow_patterns,
-            e,
+    # Use file lock to prevent multiple processes (TP ranks) from
+    # validating and cleaning up the same model cache simultaneously.
+    # This prevents race conditions where multiple ranks detect corruption
+    # and try to delete the same files at the same time.
+    with get_lock(model_name_or_path, cache_dir, suffix="-validation"):
+        # Re-check if snapshot dir still exists after acquiring lock
+        # (another process may have already cleaned it up)
+        if not os.path.isdir(found_local_snapshot_dir):
+            return None
+
+        # Check for incomplete files and clean up if found
+        repo_folder = os.path.abspath(
+            os.path.join(found_local_snapshot_dir, "..", "..")
         )
-        local_weight_files = []
+        blobs_dir = os.path.join(repo_folder, "blobs")
 
-    # After we have a list of valid files, check for sharded model completeness.
-    # Check if all safetensors with name model-{i}-of-{n}.safetensors exists
-    checked_sharded_model = False
-    for f in local_weight_files:
-        if checked_sharded_model:
-            break
-        base_name = os.path.basename(f)
-        # Regex for files like model-00001-of-00009.safetensors
-        match = re.match(r"(.*?)-([0-9]+)-of-([0-9]+)\.(.*)", base_name)
-        if match:
-            prefix = match.group(1)
-            shard_id_str = match.group(2)
-            total_shards_str = match.group(3)
-            suffix = match.group(4)
-            total_shards = int(total_shards_str)
+        # Check for incomplete download markers
+        incomplete_files = []
+        if os.path.isdir(blobs_dir):
+            incomplete_files = glob.glob(os.path.join(blobs_dir, "*.incomplete"))
 
-            # Check if all shards are present
-            missing_shards = []
-            for i in range(1, total_shards + 1):
-                # Reconstruct shard name, preserving padding of original shard id
-                shard_name = (
-                    f"{prefix}-{i:0{len(shard_id_str)}d}-of-{total_shards_str}.{suffix}"
+        if incomplete_files:
+            log_info_on_rank0(
+                logger,
+                f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
+                f"{model_name_or_path}. Will clean up and re-download.",
+            )
+            _cleanup_corrupted_model_cache(
+                model_name_or_path,
+                found_local_snapshot_dir,
+                f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
+            )
+            return None
+
+        local_weight_files: List[str] = []
+        try:
+            for pattern in allow_patterns:
+                matched_files = glob.glob(
+                    os.path.join(found_local_snapshot_dir, pattern)
                 )
-                expected_path = os.path.join(found_local_snapshot_dir, shard_name)
-                # os.path.exists returns False for broken symlinks, which is desired.
-                if not os.path.exists(expected_path):
-                    missing_shards.append(shard_name)
+                for f in matched_files:
+                    # os.path.exists returns False for broken symlinks.
+                    if not os.path.exists(f):
+                        continue
+                    local_weight_files.append(f)
+        except Exception as e:
+            logger.warning(
+                "Failed to scan local snapshot %s with patterns %s: %s",
+                found_local_snapshot_dir,
+                allow_patterns,
+                e,
+            )
+            local_weight_files = []
 
-            if missing_shards:
-                logger.info(
-                    "Found incomplete sharded model %s. Missing shards: %s. "
-                    "Will attempt download.",
-                    model_name_or_path,
-                    missing_shards,
-                )
-                return None
+        # Validate sharded models and check for corruption
+        if local_weight_files:
+            is_valid, error_msg, corrupted_files = _validate_sharded_model(
+                found_local_snapshot_dir, local_weight_files
+            )
+            if not is_valid:
+                if corrupted_files:
+                    # Selective cleanup: only remove corrupted files
+                    log_info_on_rank0(
+                        logger,
+                        f"Found {len(corrupted_files)} corrupted file(s) for "
+                        f"{model_name_or_path}: {error_msg}. "
+                        "Will selectively clean and re-download only these files.",
+                    )
+                    _cleanup_corrupted_files_selective(
+                        model_name_or_path, corrupted_files
+                    )
+                    return None
+                else:
+                    # Cannot selectively clean (e.g., missing shards) - remove entire cache
+                    log_info_on_rank0(
+                        logger,
+                        f"Validation failed for {model_name_or_path}: {error_msg}. "
+                        "Will remove entire cache and re-download.",
+                    )
+                    _cleanup_corrupted_model_cache(
+                        model_name_or_path, found_local_snapshot_dir, error_msg
+                    )
+                    return None
 
-            # If we found and verified one set of shards, we are done.
-            checked_sharded_model = True
+            # Also validate single (non-sharded) safetensors files
+            for f in local_weight_files:
+                base_name = os.path.basename(f)
+                # Check if this is a single model file (not sharded)
+                # Include adapter_model.safetensors for LoRA adapters
+                if base_name in [
+                    "model.safetensors",
+                    "pytorch_model.safetensors",
+                    "adapter_model.safetensors",
+                ]:
+                    if not _validate_safetensors_file(f):
+                        log_info_on_rank0(
+                            logger,
+                            f"Corrupted model file {base_name} for {model_name_or_path}. "
+                            "Will selectively clean and re-download this file.",
+                        )
+                        # Selective cleanup for single file
+                        _cleanup_corrupted_files_selective(model_name_or_path, [f])
+                        return None
 
-    if len(local_weight_files) > 0:
-        logger.info(
-            "Found local HF snapshot for %s at %s; skipping download.",
+        if len(local_weight_files) > 0:
+            log_info_on_rank0(
+                logger,
+                f"Found local HF snapshot for {model_name_or_path} at "
+                f"{found_local_snapshot_dir}; skipping download.",
+            )
+            return found_local_snapshot_dir
+        else:
+            log_info_on_rank0(
+                logger,
+                f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
+                f"{allow_patterns}; will attempt download.",
+            )
+            return None
+
+
+def _validate_weights_after_download(
+    hf_folder: str,
+    allow_patterns: List[str],
+    model_name_or_path: str,
+) -> None:
+    """Validate downloaded weight files to catch corruption early.
+
+    This function validates safetensors files after download to catch
+    corruption issues (truncated downloads, network errors, etc.) before
+    model loading fails with cryptic errors.
+
+    Args:
+        hf_folder: Path to the downloaded model folder
+        allow_patterns: Patterns used to match weight files
+        model_name_or_path: Model identifier for error messages
+
+    Raises:
+        RuntimeError: If any weight files are corrupted
+    """
+    import glob as glob_module
+
+    # Find all weight files that were downloaded
+    weight_files: List[str] = []
+    for pattern in allow_patterns:
+        weight_files.extend(glob_module.glob(os.path.join(hf_folder, pattern)))
+
+    if not weight_files:
+        return  # No weight files to validate
+
+    # Validate safetensors files
+    corrupted_files = []
+    for f in weight_files:
+        if f.endswith(".safetensors") and os.path.exists(f):
+            if not _validate_safetensors_file(f):
+                corrupted_files.append(os.path.basename(f))
+
+    if corrupted_files:
+        # Clean up corrupted files so next attempt re-downloads them
+        _cleanup_corrupted_files_selective(
             model_name_or_path,
-            found_local_snapshot_dir,
+            [os.path.join(hf_folder, f) for f in corrupted_files],
         )
-        return found_local_snapshot_dir
-    else:
-        logger.info(
-            "Local HF snapshot at %s has no files matching %s; will attempt download.",
-            found_local_snapshot_dir,
-            allow_patterns,
+        raise RuntimeError(
+            f"Downloaded model files are corrupted for {model_name_or_path}: "
+            f"{corrupted_files}. The corrupted files have been removed. "
+            "Please retry to re-download the model."
         )
-    return None
 
 
 def download_weights_from_hf(
@@ -408,17 +509,19 @@ def download_weights_from_hf(
         str: The path to the downloaded model weights.
     """
 
-    if is_in_ci():
-        # If the weights are already local, skip downloading and returns the path.
-        # This is used to skip too-many Huggingface API calls in CI.
-        path = find_local_hf_snapshot_dir(
-            model_name_or_path, cache_dir, allow_patterns, revision
-        )
-        if path is not None:
-            return path
+    # Always check for valid local cache first.
+    # This validates cached files and cleans up corrupted ones.
+    path = find_local_hf_snapshot_dir(
+        model_name_or_path, cache_dir, allow_patterns, revision
+    )
+    if path is not None:
+        # Valid local cache found, skip download
+        return path
 
+    # In CI, skip HF API calls if we're in offline mode or want to avoid rate limits
+    # But we already checked for local cache above, so if we're here we need to download
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
-        # Before we download we look at that is available:
+        # Before we download we look at what is available:
         fs = HfFileSystem()
         file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
 
@@ -442,6 +545,10 @@ def download_weights_from_hf(
             revision=revision,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
+
+    # Validate downloaded files to catch corruption early
+    _validate_weights_after_download(hf_folder, allow_patterns, model_name_or_path)
+
     return hf_folder
 
 
@@ -491,6 +598,14 @@ def filter_duplicate_safetensors_files(
     # torch state_dict to safetensors file holding that weight.
     index_file_name = os.path.join(hf_folder, index_file)
     if not os.path.isfile(index_file_name):
+        # NOTE: this is a trick of handling mistral model
+        # skip the unsupported consolidated.safetensors file
+        if len(hf_weights_files) == 2:
+            hf_weights_files.sort()
+            if hf_weights_files[0].endswith(
+                "consolidated.safetensors"
+            ) and hf_weights_files[1].endswith("model.safetensors"):
+                return [hf_weights_files[1]]
         return hf_weights_files
 
     # Iterate through the weight_map (weight_name: safetensors files)

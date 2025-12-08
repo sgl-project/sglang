@@ -18,6 +18,7 @@ Usage:
 
 import asyncio
 import logging
+from typing import Optional
 
 from transformers import AutoTokenizer
 from util import (
@@ -52,11 +53,14 @@ config.freeze_gc = True  # Enable GC freeze functionality
 HTTP_URL = "http://localhost:30000/v1/embeddings"
 
 # Embeddings API Config
-EMBEDDINGS_MODEL_PATH = "/Qwen/Qwen3-Embedding-0.6B"
+EMBEDDINGS_MODEL_PATH = "Qwen/Qwen3-Embedding-0.6B"
 BATCH_SIZE = [1]  # Number of items per request (batch size)
 
 # Configurable input token length
 EMBEDDINGS_INPUT_TOKENS = 500  # Default token length
+MATRYOSHKA_DIMENSIONS: Optional[int] = (
+    None  # Set to None to disable matryoshka embeddings
+)
 
 # Load tokenizer once for embeddings text generation
 print("Loading tokenizer for embeddings input generation...")
@@ -85,6 +89,7 @@ def build_embeddings_request(index: int, item_count: int) -> tuple:
         req = {
             "input": input_data,
             "model": EMBEDDINGS_MODEL_PATH,
+            "dimensions": MATRYOSHKA_DIMENSIONS,
         }
         return (index, req)
     except Exception as e:
@@ -94,7 +99,12 @@ def build_embeddings_request(index: int, item_count: int) -> tuple:
 
 def validate_embeddings_response(response_data: dict) -> bool:
     """Validate embeddings API response."""
-    return "data" in response_data
+    return (
+        "data" in response_data
+        and len(response_data["data"][0]["embedding"]) == MATRYOSHKA_DIMENSIONS
+        if MATRYOSHKA_DIMENSIONS
+        else True
+    )
 
 
 def build_warmup_embeddings_request() -> dict:
@@ -102,6 +112,7 @@ def build_warmup_embeddings_request() -> dict:
     return {
         "input": EMBEDDINGS_INPUT_TEXT,
         "model": EMBEDDINGS_MODEL_PATH,
+        "dimensions": MATRYOSHKA_DIMENSIONS,
     }
 
 

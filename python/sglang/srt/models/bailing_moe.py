@@ -349,11 +349,9 @@ class BailingMoESparseMoeBlock(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
 
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024
         if (
             self.alt_stream is not None
             and hidden_states.shape[0] > 0
-            and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             and get_is_capture_mode()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(
@@ -380,7 +378,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             if self.num_shared_experts > 0:
                 shared_output = self.shared_experts(hidden_states)
 
-            topk_weights, topk_idx, _ = self.topk(
+            topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
@@ -389,53 +387,15 @@ class BailingMoESparseMoeBlock(nn.Module):
                 ),
             )
         else:
-            topk_idx = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
-            topk_weights = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
-            )
-
-        if self.ep_size > 1:
-            (
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                reorder_topk_ids,
-                num_recv_tokens_per_expert,
-                seg_indptr,
-                masked_m,
-                expected_m,
-            ) = self.deepep_dispatcher.dispatch(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                forward_batch=forward_batch,
-            )
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
-            reorder_topk_ids=reorder_topk_ids,
-            seg_indptr=seg_indptr,
-            masked_m=masked_m,
-            expected_m=expected_m,
-            num_recv_tokens_per_expert=num_recv_tokens_per_expert,
-            forward_batch=forward_batch,
+            topk_output=topk_output,
         )
-        if self.ep_size > 1:
-            final_hidden_states = self.deepep_dispatcher.combine(
-                final_hidden_states,
-                topk_idx,
-                topk_weights,
-                forward_batch=forward_batch,
-            )
-
-        final_hidden_states *= self.routed_scaling_factor
 
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            final_hidden_states += shared_output
         return final_hidden_states
 
 
@@ -458,14 +418,21 @@ class BailingMoEAttention(nn.Module):
         attn_tp_size = get_attention_tp_size()
 
         assert self.total_num_heads % attn_tp_size == 0
-        assert self.total_kv_heads % attn_tp_size == 0
+        if self.total_kv_heads >= attn_tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_kv_heads % attn_tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert attn_tp_size % self.total_kv_heads == 0
         assert self.total_num_heads >= self.total_kv_heads
 
         self.num_heads = self.total_num_heads // attn_tp_size
         self.head_dim = config.head_dim or (self.hidden_size // self.total_num_heads)
         self.q_size = self.head_dim * self.num_heads
 
-        self.num_kv_heads = self.total_kv_heads // attn_tp_size
+        self.num_kv_heads = max(1, self.total_kv_heads // attn_tp_size)
         self.kv_size = max(1, self.num_kv_heads * self.head_dim)
 
         self.scale = self.head_dim**-0.5
