@@ -183,6 +183,13 @@ Accuracy benchmark on long context can be tested on GPQA-diamond dataset with lo
 python3 -m sglang.test.run_eval --port 30000 --eval-name gpqa --num-examples 198 --max-tokens 120000 --repeat 8 --thinking-mode deepseek-v3
 ```
 
+### Math Reasoning Test with `aime`
+
+Test mathematical reasoning capabilities on the AIME 2025 olympiad-level math problems:
+```bash
+python3 -m sglang.test.run_eval --port 30000 --eval-name aime --num-examples 30 --max-tokens 4096 --thinking-mode deepseek-v3
+```
+
 The mean accuracy over 8 runs shows 0.797, which matches the number 79.9 in official tech report.
 ```bash
 Repeat: 8, mean: 0.797
