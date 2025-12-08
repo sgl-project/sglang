@@ -196,6 +196,7 @@ suites = {
     ],
     "quantization_test": [
         TestFile("quant/test_awq.py", 163),
+        TestFile("quant/test_marlin_moe.py", 300),
         TestFile("test_bnb.py", 5),
         TestFile("test_gptqmodel_dynamic.py", 102),
         TestFile("test_quantization.py", 185),
