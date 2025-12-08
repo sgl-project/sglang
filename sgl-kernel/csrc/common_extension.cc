@@ -218,6 +218,46 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_marlin_repack(Tensor! b_q_weight, int size_k, int size_n, int num_bits) -> Tensor");
   m.impl("awq_marlin_repack", torch::kCUDA, &awq_marlin_repack);
 
+  m.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
+  m.impl("permute_cols", torch::kCUDA, &permute_cols);
+
+  // Machete (Dense) Optimized Mixed Precision GEMM for Hopper.
+  m.def(
+    "machete_supported_schedules("
+    "   ScalarType a_type,"
+    "   int b_type,"
+    "   ScalarType? maybe_group_scales_type,"
+    "   ScalarType? maybe_group_zeros_type,"
+    "   ScalarType? maybe_channel_scales_type,"
+    "   ScalarType? maybe_token_scales_type,"
+    "   ScalarType? maybe_out_type"
+    ") -> str[]");
+  m.impl("machete_supported_schedules", &machete::supported_schedules);
+
+  m.def(
+    "machete_mm("
+    "   Tensor A,"
+    "   Tensor B,"
+    "   int b_type,"
+    "   ScalarType? out_type,"
+    "   Tensor? group_scales,"
+    "   Tensor? group_zeros,"
+    "   int?    group_size,"
+    "   Tensor? channel_scales,"
+    "   Tensor? token_scales,"
+    "   str?    schedule"
+    ") -> Tensor");
+  m.impl("machete_mm", torch::kCUDA, &machete::mm);
+
+  m.def(
+    "machete_prepack_B("
+    "   Tensor B,"
+    "   ScalarType a_type,"
+    "   int b_type,"
+    "   ScalarType? group_scales_type"
+    ") -> Tensor");
+  m.impl("machete_prepack_B", torch::kCUDA, &machete::prepack_B);
+
   /*
    * From csrc/moe
    */

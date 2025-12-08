@@ -296,6 +296,33 @@ gptq_marlin_repack(torch::Tensor& b_q_weight, torch::Tensor& perm, int64_t size_
 
 torch::Tensor awq_marlin_repack(torch::Tensor& b_q_weight, int64_t size_k, int64_t size_n, int64_t num_bits);
 
+torch::Tensor permute_cols(torch::Tensor const& A, torch::Tensor const& perm);
+
+namespace machete {
+std::vector<std::string> supported_schedules(
+    at::ScalarType a_type,
+    int64_t b_type_id,
+    std::optional<at::ScalarType> maybe_group_scales_type,
+    std::optional<at::ScalarType> maybe_group_zeros_type,
+    std::optional<at::ScalarType> maybe_channel_scales_type,
+    std::optional<at::ScalarType> maybe_token_scales_type,
+    std::optional<at::ScalarType> maybe_out_type);
+
+torch::Tensor mm(torch::Tensor const& A, torch::Tensor const& B,
+    int64_t b_type_id,
+    std::optional<at::ScalarType> const& maybe_out_type,
+    std::optional<torch::Tensor> const& maybe_group_scales,
+    std::optional<torch::Tensor> const& maybe_group_zeros,
+    std::optional<int64_t> maybe_group_size,
+    std::optional<torch::Tensor> const& maybe_channel_scales,
+    std::optional<torch::Tensor> const& maybe_token_scales,
+    std::optional<std::string> maybe_schedule);
+
+torch::Tensor prepack_B(
+    torch::Tensor const& B, at::ScalarType const& a_type, int64_t b_type_id,
+    std::optional<at::ScalarType> const& maybe_group_scales_type);
+}
+
 /*
  * From csrc/moe
  */

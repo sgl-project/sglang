@@ -562,3 +562,57 @@ def gptq_gemm(
 
 def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
     torch.torch.ops.sgl_kernel.gptq_shuffle(q_weight, q_perm, bit)
+
+
+    def machete_supported_schedules(
+    a_type: torch.dtype,
+    b_type: ScalarType,
+    group_scales_type: Optional[torch.dtype],
+    group_zeros_type: Optional[torch.dtype] = None,
+    channel_scales_type: Optional[torch.dtype] = None,
+    token_scales_type: Optional[torch.dtype] = None,
+    out_type: Optional[torch.dtype] = None,
+) -> list[str]:
+
+    return torch.ops.sgl_kernel.machete_supported_schedules.default(
+        a_type,
+        b_type.id,
+        group_scales_type,
+        group_zeros_type,
+        channel_scales_type,
+        token_scales_type,
+        out_type,
+    )
+
+
+def machete_mm(
+    a: torch.Tensor,
+    # b_q Should be the tensor returned by machete_prepack_B
+    b_q: torch.Tensor,
+    b_type: ScalarType,
+    out_type: Optional[torch.dtype] = None,
+    b_group_scales: Optional[torch.Tensor] = None,
+    b_group_zeros: Optional[torch.Tensor] = None,
+    b_group_size: Optional[int] = None,
+    b_channel_scales: Optional[torch.Tensor] = None,
+    a_token_scales: Optional[torch.Tensor] = None,
+    schedule: Optional[str] = None) -> torch.Tensor:
+    return torch.ops.sgl_kernel.machete_mm(a, b_q, b_type.id, out_type, b_group_scales,
+                                   b_group_zeros, b_group_size,
+                                   b_channel_scales, a_token_scales, schedule)
+
+
+def machete_prepack_B(
+    b_q_weight: torch.Tensor,
+    a_type: torch.dtype,
+    b_type: ScalarType,
+    group_scales_type: Optional[torch.dtype],
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.machete_prepack_B.default(
+        b_q_weight, a_type, b_type.id, group_scales_type
+    )
+
+
+def permute_cols(A: torch.Tensor, perm: torch.Tensor
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.permute_cols(A, perm)

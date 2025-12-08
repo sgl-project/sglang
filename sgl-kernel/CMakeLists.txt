@@ -262,6 +262,46 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     )
 endif()
 
+# For the Machete kernels we automatically generate sources for various
+# preselected input type pairs and schedules.
+# Generate sources: python3 scripts/generate_kernel.py
+set(MACHETE_GEN_SCRIPT
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/machete/generate.py)
+file(MD5 ${MACHETE_GEN_SCRIPT} MACHETE_GEN_SCRIPT_HASH)
+
+message(STATUS "Machete generation script hash: ${MACHETE_GEN_SCRIPT_HASH}")
+message(STATUS "Last run machete generate script hash: $CACHE{MACHETE_GEN_SCRIPT_HASH}")
+
+if (NOT DEFINED CACHE{MACHETE_GEN_SCRIPT_HASH}
+    OR NOT $CACHE{MACHETE_GEN_SCRIPT_HASH} STREQUAL ${MACHETE_GEN_SCRIPT_HASH})
+    execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env
+    PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/csrc/cutlass_extensions/:${repo-cutlass_SOURCE_DIR}/python/:$PYTHONPATH
+        ${Python_EXECUTABLE} ${MACHETE_GEN_SCRIPT}
+    RESULT_VARIABLE machete_generation_result
+    OUTPUT_VARIABLE machete_generation_output
+    OUTPUT_FILE ${CMAKE_CURRENT_BINARY_DIR}/machete_generation.log
+    ERROR_FILE ${CMAKE_CURRENT_BINARY_DIR}/machete_generation.log
+    )
+
+    if (NOT machete_generation_result EQUAL 0)
+    message(FATAL_ERROR "Machete generation failed."
+                        " Result: \"${machete_generation_result}\""
+                        "\nCheck the log for details: "
+                        "${CMAKE_CURRENT_BINARY_DIR}/machete_generation.log")
+    else()
+    set(MACHETE_GEN_SCRIPT_HASH ${MACHETE_GEN_SCRIPT_HASH}
+        CACHE STRING "Last run machete generate script hash" FORCE)
+    message(STATUS "Machete generation completed successfully.")
+    endif()
+else()
+    message(STATUS "Machete generation script has not changed, skipping generation.")
+endif()
+
+# Add machete generated sources
+file(GLOB MACHETE_GEN_SOURCES "csrc/gemm/machete/generated/*.cu")
+list(APPEND SOURCES ${MACHETE_GEN_SOURCES})
+
 # All source files
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
@@ -336,6 +376,10 @@ set(SOURCES
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
     "csrc/speculative/speculative_sampling.cu"
+
+    "csrc/gemm/machete/machete_pytorch.cu"
+    "csrc/gemm/machete/permute_cols.cu"
+    ${MACHETE_GEN_SOURCES}
 
     "${repo-flashinfer_SOURCE_DIR}/csrc/norm.cu"
     "${repo-flashinfer_SOURCE_DIR}/csrc/renorm.cu"
