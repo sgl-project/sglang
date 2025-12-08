@@ -7,7 +7,6 @@ Denoising stage for diffusion pipelines.
 
 import inspect
 import math
-import os
 import time
 import weakref
 from collections.abc import Iterable
@@ -15,10 +14,10 @@ from functools import lru_cache
 from typing import Any
 
 import torch
-import torch.profiler
 from einops import rearrange
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
 from sglang.multimodal_gen.runtime.distributed import (
@@ -34,7 +33,6 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
-    get_world_rank,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -61,6 +59,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEn
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
+from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import dict_to_3d_list, masks_like
 
 try:
@@ -151,6 +150,153 @@ class DenoisingStage(PipelineStage):
 
         # misc
         self.profiler = None
+
+        # cache-dit state (for delayed mounting and idempotent control)
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+
+    def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
+        """Enable cache-dit on the transformers if configured (idempotent).
+
+        This method should be called after the transformer is fully loaded
+        and before torch.compile is applied.
+
+        For dual-transformer models (e.g., Wan2.2), this enables cache-dit on both
+        transformers with (potentially) different configurations.
+
+        """
+        if self._cache_dit_enabled:
+            if self._cached_num_steps != num_inference_steps:
+                logger.warning(
+                    "num_inference_steps changed from %d to %d after cache-dit was enabled. "
+                    "Continuing with initial configuration (steps=%d).",
+                    self._cached_num_steps,
+                    num_inference_steps,
+                    self._cached_num_steps,
+                )
+            return
+        # check if cache-dit is enabled in config
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            return
+
+        from sglang.multimodal_gen.runtime.distributed import get_world_size
+        from sglang.multimodal_gen.runtime.utils.cache_dit_integration import (
+            CacheDitConfig,
+            enable_cache_on_dual_transformer,
+            enable_cache_on_transformer,
+            get_scm_mask,
+        )
+
+        if get_world_size() > 1:
+            logger.warning(
+                "cache-dit is disabled in distributed environment (world_size=%d). "
+                "Distributed support will be added in a future version.",
+                get_world_size(),
+            )
+            return
+        # === Parse SCM configuration from envs ===
+        # SCM is shared between primary and secondary transformers
+        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+        scm_compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
+        scm_cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
+        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
+
+        # parse custom bins if provided (both must be set together)
+        scm_compute_bins = None
+        scm_cache_bins = None
+        if scm_compute_bins_str and scm_cache_bins_str:
+            try:
+                scm_compute_bins = [
+                    int(x.strip()) for x in scm_compute_bins_str.split(",")
+                ]
+                scm_cache_bins = [int(x.strip()) for x in scm_cache_bins_str.split(",")]
+            except ValueError as e:
+                logger.warning("Failed to parse SCM bins: %s. SCM disabled.", e)
+                scm_preset = "none"
+        elif scm_compute_bins_str or scm_cache_bins_str:
+            # Only one of the bins was provided - warn user
+            logger.warning(
+                "SCM custom bins require both compute_bins and cache_bins. "
+                "Only one was provided (compute=%s, cache=%s). Falling back to preset '%s'.",
+                scm_compute_bins_str,
+                scm_cache_bins_str,
+                scm_preset,
+            )
+
+        # generate SCM mask using cache-dit's steps_mask()
+        # cache-dit handles step count validation and scaling internally
+        steps_computation_mask = get_scm_mask(
+            preset=scm_preset,
+            num_inference_steps=num_inference_steps,
+            compute_bins=scm_compute_bins,
+            cache_bins=scm_cache_bins,
+        )
+
+        # build config for primary transformer (high-noise expert)
+        primary_config = CacheDitConfig(
+            enabled=True,
+            Fn_compute_blocks=envs.SGLANG_CACHE_DIT_FN,
+            Bn_compute_blocks=envs.SGLANG_CACHE_DIT_BN,
+            max_warmup_steps=envs.SGLANG_CACHE_DIT_WARMUP,
+            residual_diff_threshold=envs.SGLANG_CACHE_DIT_RDT,
+            max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_MC,
+            enable_taylorseer=envs.SGLANG_CACHE_DIT_TAYLORSEER,
+            taylorseer_order=envs.SGLANG_CACHE_DIT_TS_ORDER,
+            num_inference_steps=num_inference_steps,
+            # SCM fields
+            steps_computation_mask=steps_computation_mask,
+            steps_computation_policy=scm_policy,
+        )
+
+        if self.transformer_2 is not None:
+            # dual transformer
+            # build config for secondary transformer (low-noise expert)
+            # uses secondary parameters which inherit from primary if not explicitly set
+            secondary_config = CacheDitConfig(
+                enabled=True,
+                Fn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_FN,
+                Bn_compute_blocks=envs.SGLANG_CACHE_DIT_SECONDARY_BN,
+                max_warmup_steps=envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP,
+                residual_diff_threshold=envs.SGLANG_CACHE_DIT_SECONDARY_RDT,
+                max_continuous_cached_steps=envs.SGLANG_CACHE_DIT_SECONDARY_MC,
+                enable_taylorseer=envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
+                taylorseer_order=envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
+                num_inference_steps=num_inference_steps,
+                # SCM fields - shared with primary
+                steps_computation_mask=steps_computation_mask,
+                steps_computation_policy=scm_policy,
+            )
+
+            # for dual transformers, must use BlockAdapter to enable cache on both simultaneously.
+            # Don't call enable_cache separately on each transformer.
+            self.transformer, self.transformer_2 = enable_cache_on_dual_transformer(
+                self.transformer,
+                self.transformer_2,
+                primary_config,
+                secondary_config,
+                model_name="wan2.2",
+            )
+            logger.info(
+                "cache-dit enabled on dual transformers (steps=%d)",
+                num_inference_steps,
+            )
+        else:
+            # single transformer
+            self.transformer = enable_cache_on_transformer(
+                self.transformer,
+                primary_config,
+                model_name="transformer",
+            )
+            logger.info(
+                "cache-dit enabled on transformer (steps=%d, Fn=%d, Bn=%d, rdt=%.3f)",
+                num_inference_steps,
+                envs.SGLANG_CACHE_DIT_FN,
+                envs.SGLANG_CACHE_DIT_BN,
+                envs.SGLANG_CACHE_DIT_RDT,
+            )
+
+        self._cache_dit_enabled = True
+        self._cached_num_steps = num_inference_steps
 
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):
@@ -338,6 +484,10 @@ class DenoisingStage(PipelineStage):
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args
             )
+
+            # enable cache-dit before torch.compile (delayed mounting)
+            self._maybe_enable_cache_dit(batch.num_inference_steps)
+
             if self.server_args.enable_torch_compile:
                 self.transformer = torch.compile(
                     self.transformer, mode="max-autotune", fullgraph=True
@@ -345,6 +495,8 @@ class DenoisingStage(PipelineStage):
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
+        else:
+            self._maybe_enable_cache_dit(batch.num_inference_steps)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -591,57 +743,10 @@ class DenoisingStage(PipelineStage):
                         trajectory_tensor = trajectory_tensor[:, :, :orig_s, :]
         return latents, trajectory_tensor
 
-    def start_profile(self, batch: Req):
-        if not batch.profile:
-            return
-
-        logger.info("Starting Profiler...")
-        # Build activities dynamically to avoid CUDA hangs when CUDA is unavailable
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-
-        self.profiler = torch.profiler.profile(
-            activities=activities,
-            schedule=torch.profiler.schedule(
-                skip_first=0,
-                wait=0,
-                warmup=1,
-                active=batch.num_profiled_timesteps,
-                repeat=5,
-            ),
-            on_trace_ready=None,
-            record_shapes=True,
-            with_stack=True,
-        )
-        self.profiler.start()
-
     def step_profile(self):
-        if self.profiler:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            self.profiler.step()
-
-    def stop_profile(self, batch: Req):
-        try:
-            if self.profiler:
-                logger.info("Stopping Profiler...")
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                self.profiler.stop()
-                request_id = batch.request_id if batch.request_id else "profile_trace"
-                log_dir = f"./logs"
-                os.makedirs(log_dir, exist_ok=True)
-
-                rank = get_world_rank()
-                trace_path = os.path.abspath(
-                    os.path.join(log_dir, f"{request_id}-rank{rank}.trace.json.gz")
-                )
-                logger.info(f"Saving profiler traces to: {trace_path}")
-                self.profiler.export_chrome_trace(trace_path)
-                torch.distributed.barrier()
-        except Exception as e:
-            logger.error(f"{e}")
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_denoising_step()
 
     def _manage_device_placement(
         self,
@@ -814,8 +919,6 @@ class DenoisingStage(PipelineStage):
         # Run denoising loop
         denoising_start_time = time.time()
 
-        self.start_profile(batch=batch)
-
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
@@ -915,8 +1018,6 @@ class DenoisingStage(PipelineStage):
 
                         self.step_profile()
 
-        self.stop_profile(batch)
-
         denoising_end_time = time.time()
 
         if num_timesteps > 0:
@@ -942,16 +1043,22 @@ class DenoisingStage(PipelineStage):
         Args:
             func: The function to prepare kwargs for.
             kwargs: The kwargs to prepare.
-
-        Returns:
-            The prepared kwargs.
         """
-        extra_step_kwargs = {}
-        for k, v in kwargs.items():
-            accepts = k in set(inspect.signature(func).parameters.keys())
-            if accepts:
-                extra_step_kwargs[k] = v
-        return extra_step_kwargs
+        import functools
+
+        # Handle cache-dit's partial wrapping logic.
+        # Cache-dit wraps the forward method with functools.partial where args[0] is the instance.
+        # We access `_original_forward` if available to inspect the underlying signature.
+        # See: https://github.com/vipshop/cache-dit
+        if isinstance(func, functools.partial) and func.args:
+            func = getattr(func.args[0], "_original_forward", func)
+
+        # Unwrap any decorators (e.g. functools.wraps)
+        target_func = inspect.unwrap(func)
+
+        # Filter kwargs based on the signature
+        params = inspect.signature(target_func).parameters
+        return {k: v for k, v in kwargs.items() if k in params}
 
     def progress_bar(
         self, iterable: Iterable | None = None, total: int | None = None
