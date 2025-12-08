@@ -102,8 +102,11 @@ def fused_recurrent_kda_fwd(
         # stride_final_state_token=stride_final_state_token,
         # stride_indices_seq=stride_indices_seq,
         # stride_indices_tok=stride_indices_tok,
+        USE_INITIAL_STATE=initial_state is not None,
+        STORE_FINAL_STATE=final_state is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
+        IS_VARLEN=cu_seqlens is not None,
         # INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=True,
         num_warps=num_warps,
@@ -152,14 +155,6 @@ def fused_recurrent_kda(
     return o, final_state
 
 
-@triton.heuristics(
-    {
-        "STORE_RESIDUAL_OUT": lambda args: args["residual_out"] is not None,
-        "HAS_RESIDUAL": lambda args: args["residual"] is not None,
-        "HAS_WEIGHT": lambda args: args["w"] is not None,
-        "HAS_BIAS": lambda args: args["b"] is not None,
-    }
-)
 @triton.jit
 def layer_norm_gated_fwd_kernel(
     x,  # pointer to the input
@@ -240,14 +235,6 @@ def layer_norm_gated_fwd_kernel(
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics(
-    {
-        "STORE_RESIDUAL_OUT": lambda args: args["residual_out"] is not None,
-        "HAS_RESIDUAL": lambda args: args["residual"] is not None,
-        "HAS_WEIGHT": lambda args: args["w"] is not None,
-        "HAS_BIAS": lambda args: args["b"] is not None,
-    }
-)
 @triton.jit
 def layer_norm_gated_fwd_kernel1(
     x,  # pointer to the input
@@ -377,6 +364,10 @@ def layer_norm_gated_fwd(
             BT=BT,
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
+            STORE_RESIDUAL_OUT=residual_out is not None,
+            HAS_RESIDUAL=residual is not None,
+            HAS_WEIGHT=weight is not None,
+            HAS_BIAS=bias is not None,
             num_warps=4,
         )
     else:
@@ -395,6 +386,10 @@ def layer_norm_gated_fwd(
             BD=BD,
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
+            STORE_RESIDUAL_OUT=residual_out is not None,
+            HAS_RESIDUAL=residual is not None,
+            HAS_WEIGHT=weight is not None,
+            HAS_BIAS=bias is not None,
             num_warps=4,
         )
     # residual_out is None if residual is None and residual_dtype == input_dtype
@@ -487,7 +482,6 @@ class FusedRMSNormGated(nn.Module):
         )
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
@@ -495,7 +489,7 @@ class FusedRMSNormGated(nn.Module):
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["BC"],
+    key=["BC", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
@@ -598,10 +592,9 @@ def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter(
     tl.store(p_Aqk, b_Aqk.to(Aqk.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-    key=["BK", "BT"],
+    key=["BK", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra(
@@ -755,6 +748,7 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         NC=NC,
+        IS_VARLEN=cu_seqlens is not None,
     )
 
     grid = (NT, NC, B * H)
@@ -774,17 +768,11 @@ def chunk_kda_scaled_dot_kkt_fwd(
         BT=BT,
         BC=BC,
         BK=BK,
+        IS_VARLEN=cu_seqlens is not None,
     )
     return A, Aqk
 
 
-@triton.heuristics(
-    {
-        "STORE_QG": lambda args: args["qg"] is not None,
-        "STORE_KG": lambda args: args["kg"] is not None,
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
@@ -979,12 +967,14 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        STORE_QG=False,
+        STORE_KG=kg is not None,
+        IS_VARLEN=cu_seqlens is not None,
         DOT_PRECISION="ieee",
     )
     return w, u, None, kg
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
@@ -993,7 +983,7 @@ def recompute_w_u_fwd(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["BT"],
+    key=["BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(
@@ -1143,6 +1133,7 @@ def chunk_gla_fwd_o_gk(
         K=K,
         V=V,
         BT=BT,
+        IS_VARLEN=cu_seqlens is not None,
     )
     return o
 
