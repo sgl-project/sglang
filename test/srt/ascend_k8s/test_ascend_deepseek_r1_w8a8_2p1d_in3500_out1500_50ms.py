@@ -2,6 +2,7 @@ import unittest
 
 from test_ascend_disaggregation_utils import (
     TestAscendDisaggregationUtils,
+    NIC_NAME
 )
 
 MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/Howeee/DeepSeek-R1-0528-w8a8"
@@ -18,8 +19,8 @@ MODEL_CONFIG = {
         "HCCL_BUFFSIZE": "1536",
         "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
         "TASK_QUEUE_ENABLE": "2",
-        "HCCL_SOCKET_IFNAME": "enp23s0f3",
-        "GLOO_SOCKET_IFNAME": "enp23s0f3",
+        "HCCL_SOCKET_IFNAME": NIC_NAME,
+        "GLOO_SOCKET_IFNAME": NIC_NAME,
     },
     "decode_envs": {
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -32,8 +33,8 @@ MODEL_CONFIG = {
         "HCCL_BUFFSIZE": "600",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "64",
         "TASK_QUEUE_ENABLE": "0",
-        "HCCL_SOCKET_IFNAME": "enp23s0f3",
-        "GLOO_SOCKET_IFNAME": "enp23s0f3",    
+        "HCCL_SOCKET_IFNAME": NIC_NAME,
+        "GLOO_SOCKET_IFNAME": NIC_NAME,    
     },
     "prefill_args": [
         "--nnodes",

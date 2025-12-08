@@ -39,7 +39,6 @@ Qwen3_Next_80B_A3B_OTHER_ARGS = [
 ]
 
 Qwen3_Next_80B_A3B_ENVS = {
-    "ASCEND_RT_VISIBLE_DEVICES": "12,13,14,15",
     "SGLANG_SET_CPU_AFFINITY": "0",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",

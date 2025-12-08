@@ -4,8 +4,9 @@ import socket
 import subprocess
 import threading
 import time
-
+import psutil
 import requests
+
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
@@ -23,6 +24,15 @@ LOACL_TIMEOUT = 6000
 config.load_kube_config(KUBE_CONFIG)
 v1 = client.CoreV1Api()
 
+def get_nic_name():
+    for nic, addrs in psutil.net_if_addrs().items():
+        for addr in addrs:
+            if addr.family == socket.AF_INET and addr.address.startswith("192."):
+                print("The nic name matched is {}".format(nic))
+                return nic
+    return None
+
+NIC_NAME = "lo" if get_nic_name() == None else get_nic_name()
 
 def run_command(cmd, shell=True):
     try:

@@ -2,6 +2,7 @@ import unittest
 
 from test_ascend_single_mix_utils import (
     TestSingleMixUtils,
+    NIC_NAME
 )
 
 # DEEPSEEK_R1_0528_W4A8_MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/DeepSeek-R1-0528-w4a8"
@@ -12,8 +13,8 @@ MODEL_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "0",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
-    "HCCL_SOCKET_IFNAME": "enp23s0f3",
-    "GLOO_SOCKET_IFNAME": "enp23s0f3",
+    "HCCL_SOCKET_IFNAME": NIC_NAME,
+    "GLOO_SOCKET_IFNAME": NIC_NAME,
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "8",
     "HCCL_BUFFSIZE": "1300",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",

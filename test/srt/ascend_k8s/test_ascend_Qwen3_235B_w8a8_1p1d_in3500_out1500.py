@@ -2,6 +2,7 @@ import unittest
 
 from test_ascend_disaggregation_utils import (
     TestAscendDisaggregationUtils,
+    NIC_NAME
 )
 
 MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/vllm-ascend/Qwen3-235B-A22B-W8A8"
@@ -14,8 +15,8 @@ MODEL_CONFIG = {
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
         "HCCL_BUFFSIZE": "3000",
         "TASK_QUEUE_ENABLE": "2",
-        "HCCL_SOCKET_IFNAME": "lo",
-        "GLOO_SOCKET_IFNAME": "lo",
+        "HCCL_SOCKET_IFNAME": NIC_NAME,
+        "GLOO_SOCKET_IFNAME": NIC_NAME,
         "STREAMS_PER_DEVICE": "32",
         "ENABLE_ASCEND_MOE_NZ": "1",
         "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
@@ -26,8 +27,8 @@ MODEL_CONFIG = {
         "DP_ROUND_ROBIN": "1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "30",
         "HCCL_BUFFSIZE": "512",
-        "HCCL_SOCKET_IFNAME": "enp23s0f3",
-        "GLOO_SOCKET_IFNAME": "enp23s0f3",
+        "HCCL_SOCKET_IFNAME": NIC_NAME,
+        "GLOO_SOCKET_IFNAME": NIC_NAME,
         "STREAMS_PER_DEVICE": "32",
     },
     "prefill_args": [
