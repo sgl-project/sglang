@@ -24,9 +24,11 @@ use sgl_model_gateway::{
     routers::RouterFactory,
 };
 use tokio::sync::oneshot;
+use tonic::metadata::MetadataMap;
 use tonic_v12::{transport::Server, Request as TonicRequest, Response, Status};
 use tower::ServiceExt;
 use tracing::info_span;
+use tracing_subscriber::prelude::*;
 
 #[derive(Clone)]
 struct TestOtelCollector {
@@ -246,4 +248,103 @@ async fn test_router_with_tracing() {
     mock_worker.stop().await;
 
     println!("Cleanup completed");
+}
+
+// ============================================================================
+// gRPC Trace Context Injection Tests
+// ============================================================================
+
+/// Comprehensive test for gRPC trace context injection.
+///
+/// This test validates:
+/// 1. W3C trace context headers are properly injected into gRPC metadata
+/// 2. traceparent format is correct (version-traceid-spanid-flags)
+/// 3. All metadata keys are lowercase (gRPC requirement)
+///
+/// Note: This is a single comprehensive test to avoid OTEL re-initialization
+/// issues since OTEL uses OnceLock for global state.
+#[tokio::test]
+#[serial]
+async fn test_grpc_trace_context_injection() {
+    // 1. Start the OTLP collector
+    let port = pick_unused_port().expect("Failed to pick unused port");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let _collector = start_collector(port, shutdown_rx)
+        .await
+        .expect("Failed to start collector");
+    let collector_endpoint = format!("0.0.0.0:{}", port);
+
+    // 2. Initialize OTEL
+    let init_result = otel_trace::otel_tracing_init(true, Some(&collector_endpoint));
+    assert!(init_result.is_ok(), "Failed to initialize OTEL");
+
+    // 3. Set up tracing subscriber with OTEL layer
+    let otel_layer = otel_trace::get_otel_layer().expect("Failed to get OTEL layer");
+    let subscriber = tracing_subscriber::registry().with(otel_layer);
+
+    // 4. Test within a span context
+    tracing::subscriber::with_default(subscriber, || {
+        // Create a span that will be exported to OTEL
+        let span = info_span!(target: "sgl_model_gateway::otel-trace", "test_grpc_span");
+        let _guard = span.enter();
+
+        // Create empty gRPC metadata
+        let mut metadata = MetadataMap::new();
+
+        // Inject trace context
+        otel_trace::inject_trace_context_grpc(&mut metadata);
+
+        // === Test 1: Verify traceparent header was injected ===
+        let traceparent = metadata.get("traceparent");
+        assert!(
+            traceparent.is_some(),
+            "traceparent header should be present in gRPC metadata"
+        );
+
+        // === Test 2: Verify traceparent format (version-traceid-spanid-flags) ===
+        let traceparent_value = traceparent.unwrap().to_str().unwrap();
+        let parts: Vec<&str> = traceparent_value.split('-').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "traceparent should have 4 parts: version-traceid-spanid-flags"
+        );
+        assert_eq!(parts[0], "00", "traceparent version should be 00");
+        assert_eq!(parts[1].len(), 32, "trace ID should be 32 hex characters");
+        assert_eq!(parts[2].len(), 16, "span ID should be 16 hex characters");
+
+        println!("Successfully injected traceparent: {}", traceparent_value);
+
+        // === Test 3: Verify all keys are lowercase (gRPC metadata requirement) ===
+        for key_and_value in metadata.iter() {
+            match key_and_value {
+                tonic::metadata::KeyAndValueRef::Ascii(key, _) => {
+                    let key_str = key.as_str();
+                    assert_eq!(
+                        key_str,
+                        key_str.to_lowercase(),
+                        "gRPC metadata key '{}' should be lowercase",
+                        key_str
+                    );
+                }
+                tonic::metadata::KeyAndValueRef::Binary(key, _) => {
+                    let key_str = key.as_str();
+                    assert_eq!(
+                        key_str,
+                        key_str.to_lowercase(),
+                        "gRPC metadata key '{}' should be lowercase",
+                        key_str
+                    );
+                }
+            }
+        }
+
+        println!("All gRPC metadata keys are lowercase as required");
+    });
+
+    // Cleanup
+    let _ = shutdown_tx.send(());
+    otel_trace::shutdown_otel();
+
+    println!("test_grpc_trace_context_injection: All assertions passed!");
 }
