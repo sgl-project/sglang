@@ -398,7 +398,10 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
+        self.is_ssm_model = (
+            self.tp_worker.model_runner.hybrid_gdn_config is not None
+            or self.tp_worker.model_runner.mamba2_config is not None
+        )
 
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -762,7 +765,7 @@ class Scheduler(
                 self.tree_cache = SWARadixCache(
                     params=params, sliding_window_size=self.sliding_window_size
                 )
-            elif self.is_hybrid_gdn:
+            elif self.is_ssm_model:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
                 self.tree_cache = MambaRadixCache(params)
@@ -1301,6 +1304,7 @@ class Scheduler(
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
+                reasoning=recv_req.reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
                 eos_token_ids=self.model_config.hf_eos_token_id,
@@ -1429,7 +1433,9 @@ class Scheduler(
                 elif req.sampling_params.structural_tag:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
-                value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+                value, cache_hit = self.grammar_backend.get_cached_or_future_value(
+                    key, req.reasoning
+                )
                 req.grammar = value
 
                 if not cache_hit:

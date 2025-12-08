@@ -52,6 +52,7 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.utils import get_compiler_backend, is_npu, support_triton
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -90,6 +91,9 @@ class ForwardMode(IntEnum):
     # Split Prefill for PD multiplexing
     SPLIT_PREFILL = auto()
 
+    # Used in diffusion LLM inference
+    DLLM_EXTEND = auto()
+
     def is_prefill(self):
         return self.is_extend()
 
@@ -101,6 +105,7 @@ class ForwardMode(IntEnum):
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.SPLIT_PREFILL
+            or self == ForwardMode.DLLM_EXTEND
         )
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
@@ -152,6 +157,7 @@ class ForwardMode(IntEnum):
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
             or self == ForwardMode.IDLE
+            or self == ForwardMode.DLLM_EXTEND
         )
 
     def is_cpu_graph(self):
@@ -169,6 +175,9 @@ class ForwardMode(IntEnum):
 
     def is_prebuilt(self):
         return self == ForwardMode.PREBUILT
+
+    def is_dllm_extend(self):
+        return self == ForwardMode.DLLM_EXTEND
 
 
 @total_ordering
@@ -445,8 +454,9 @@ class ForwardBatch:
             block_size = batch.dllm_config.block_size
             ret.positions = torch.tensor(
                 [
-                    [i for i in range(block_offset, block_offset + block_size)]
+                    i
                     for block_offset in batch.dllm_block_offsets
+                    for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=torch.int32,
             ).to(device, non_blocking=True)
@@ -735,9 +745,7 @@ class ForwardBatch:
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = (
-                (global_num_tokens[i] - 1) // attn_tp_size + 1
-            ) * attn_tp_size
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -768,7 +776,12 @@ class ForwardBatch:
 
         bs = self.batch_size
 
-        if self.forward_mode.is_decode():
+        if (
+            self.forward_mode.is_decode()
+            or self.forward_mode.is_target_verify()
+            or self.forward_mode.is_draft_extend(include_v2=True)
+            or self.forward_mode.is_idle()
+        ):
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
