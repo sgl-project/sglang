@@ -441,6 +441,7 @@ class Scheduler(
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
+        self.forward_ct_prefill = 0
         self.num_generated_tokens = 0
         self.last_prefill_tokens = 0
         self.return_health_check_ct = 0
@@ -1848,7 +1849,11 @@ class Scheduler(
             self.chunked_req.is_chunked += 1
 
         # Print stats
-        if self.current_scheduler_metrics_enabled():
+        self.forward_ct_prefill = (self.forward_ct_prefill + 1) % (1 << 30)
+        if (
+            self.current_scheduler_metrics_enabled()
+            and self.forward_ct_prefill % self.server_args.prefill_log_interval == 0
+        ):
             self.log_prefill_stats(adder, can_run_list, running_bs, 0)
 
         for req in can_run_list:
@@ -2241,6 +2246,7 @@ class Scheduler(
 
             self.num_generated_tokens = 0
             self.forward_ct_decode = 0
+            self.forward_ct_prefill = 0
             self.spec_num_accepted_tokens = 0
             self.spec_num_forward_ct = 0
             self.spec_total_num_accepted_tokens = 0

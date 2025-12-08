@@ -321,6 +321,7 @@ class ServerArgs:
     prompt_tokens_buckets: Optional[List[str]] = None
     generation_tokens_buckets: Optional[List[str]] = None
     gc_warning_threshold_secs: float = 0.0
+    prefill_log_interval: int = 1
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
     kv_events_config: Optional[str] = None
@@ -2648,10 +2649,16 @@ class ServerArgs:
             help="The threshold for long GC warning. If a GC takes longer than this, a warning will be logged. Set to 0 to disable.",
         )
         parser.add_argument(
+            "--prefill-log-interval",
+            type=int,
+            default=ServerArgs.prefill_log_interval,
+            help="The log interval of prefill batch. Logs every N prefill batches.",
+        )
+        parser.add_argument(
             "--decode-log-interval",
             type=int,
             default=ServerArgs.decode_log_interval,
-            help="The log interval of decode batch.",
+            help="The log interval of decode batch. Logs every N decode batches.",
         )
         parser.add_argument(
             "--enable-request-time-stats-logging",
