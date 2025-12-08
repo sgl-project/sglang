@@ -311,7 +311,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 matched_worker.to_string()
             } else {
                 RouterMetrics::record_cache_miss();
-                tree.get_smallest_tenant()
+                let min_load_idx = *healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())?;
+                workers[min_load_idx].url().to_string()
             };
 
             // Find the index of the selected worker
