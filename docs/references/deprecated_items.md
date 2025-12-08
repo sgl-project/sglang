@@ -123,15 +123,13 @@ These environment variables are deprecated in favor of new names (old names are 
 8. **For LoRA**: Remove `--enable-lora` flag and just use `--lora-paths` (it's automatically enabled)
 9. **For ModelOpt quantization**: Replace `--modelopt-quant` with `--quantization` flag
 
-## References
-
-- Server Arguments Documentation: [Server Arguments](../advanced_features/server_arguments.md)
-- Environment Variables Documentation: [Environment Variables](environment_variables.md)
-- Code Locations:
-  - Server Args: `python/sglang/srt/server_args.py`
-  - Environment Variables: `python/sglang/srt/environ.py`
-  - FP8 Utils: `python/sglang/srt/layers/quantization/fp8_utils.py`
+:::{seealso}
+- [Server Arguments](../advanced_features/server_arguments.md)
+- [Environment Variables](environment_variables.md)
+:::
 
 ## Deprecation Policy
 
-Deprecated features, server arguments, and environment variables will only be removed in major version releases. This ensures users have sufficient time to migrate to the recommended alternatives and provides a stable upgrade path between major versions.
+:::{important}
+Deprecated features, server arguments, and environment variables will only be removed in major version releases (e.g., v0.5.6 → v0.6.7). This ensures users have sufficient time to migrate to the recommended alternatives and provides a stable upgrade path between major versions.
+:::
