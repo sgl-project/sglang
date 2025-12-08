@@ -277,7 +277,7 @@ class InternVLImageProcessor(BaseMultimodalProcessor):
 
         return MultimodalInputs(
             mm_items=items,
-            input_ids=input_ids.tolist(),
+            input_ids=input_ids,
             im_token_id=self.mm_tokens.image_token_id,
             im_start_id=self.img_start_token_id,
             im_end_id=self.img_end_token_id,
