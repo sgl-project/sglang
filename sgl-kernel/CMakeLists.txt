@@ -595,7 +595,26 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     # flash_attn/cute
     install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
-            DESTINATION "flash_attn/cute"
+            DESTINATION "flash_attn_origin/cute"
             PATTERN ".git*" EXCLUDE
             PATTERN "__pycache__" EXCLUDE)
+
+    install(CODE "
+        set(TARGET_DIR \"\${CMAKE_INSTALL_PREFIX}/flash_attn_origin/cute\")
+        message(STATUS \"Post-install: Patching Python files in \${TARGET_DIR}\")
+
+        file(GLOB_RECURSE PY_FILES \"\${TARGET_DIR}/*.py\")
+
+        foreach(FILE_PATH \${PY_FILES})
+            file(READ \"\${FILE_PATH}\" FILE_CONTENT)
+
+            string(REGEX REPLACE \"\\\\bflash_attn\\\\b\" \"flash_attn_origin\" MODIFIED_CONTENT \"\${FILE_CONTENT}\")
+
+            if(NOT \"\${FILE_CONTENT}\" STREQUAL \"\${MODIFIED_CONTENT}\")
+                file(WRITE \"\${FILE_PATH}\" \"\${MODIFIED_CONTENT}\")
+                message(STATUS \"  - [Refactor] Patched: \${FILE_PATH}\")
+            endif()
+        endforeach()
+    ")
+
     endif()
