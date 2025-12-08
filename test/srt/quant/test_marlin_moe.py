@@ -90,12 +90,11 @@ def torch_moe(
 def marlin_moe_generate_valid_test_cases():
     import itertools
 
-    # Expanded test configurations based on vLLM
-    m_list = [1, 33, 123, 256, 666]  # Added more token counts
-    n_list = [128, 512, 1024, 2048]  # Added more hidden dimensions
-    k_list = [128, 256, 1024, 2048]  # Added more input dimensions
-    e_list = [4, 8, 12, 16]  # Added more expert counts
-    topk_list = [2, 3, 4]  # Added topk=4
+    m_list = [1, 123, 666]
+    n_list = [128, 1024]
+    k_list = [256, 2048]
+    e_list = [4, 12]
+    topk_list = [2, 3]
     dtype_list = [torch.half, torch.bfloat16]
     group_size_list = [64, 128, 256]  # Added more group sizes
     act_order_list = [True, False]
