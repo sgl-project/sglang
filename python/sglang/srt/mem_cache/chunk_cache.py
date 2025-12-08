@@ -2,7 +2,6 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -19,8 +18,6 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-
-logger = logging.getLogger(__name__)
 
 
 class ChunkCache(BasePrefixCache):
@@ -81,13 +78,6 @@ class ChunkCache(BasePrefixCache):
             self.req_to_token_pool.free(req.req_pool_idx)
             self.protected_size_ -= len(req.prefix_indices)
             self.token_to_kv_pool_allocator.free((kv_indices, index_k_indices))
-
-            logger.info(
-                f"Free KV and index_k cache for request {req.rid}: "
-                f"kv_shape={kv_indices.shape}, index_k_shape={index_k_indices.shape}, "
-                f"kv_committed={kv_committed_len}, prompt_len={len(req.origin_input_ids)}, "
-                f"output_len={len(req.output_ids)}"
-            )
         else:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -96,10 +86,6 @@ class ChunkCache(BasePrefixCache):
             self.req_to_token_pool.free(req.req_pool_idx)
             self.protected_size_ -= len(req.prefix_indices)
             self.token_to_kv_pool_allocator.free(kv_indices)
-
-            logger.info(
-                f"Free KV cache for request {req.rid}: kv_shape={kv_indices.shape}"
-            )
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, TypeAlias
@@ -193,8 +192,6 @@ _NSA_IMPL_T: TypeAlias = Literal["flashmla_sparse", "flashmla_kv", "fa3", "tilel
 
 NSA_PREFILL_IMPL: _NSA_IMPL_T
 NSA_DECODE_IMPL: _NSA_IMPL_T
-
-logger = logging.getLogger(__name__)
 
 
 class NativeSparseAttnBackend(AttentionBackend):
@@ -1072,7 +1069,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         if NSA_FUSE_TOPK:
             page_table_1 = topk_indices
         else:
-            # Reusing topk_indices for hierarchical NSA, as the sparse coodinator will transform the topk_indices to the indexer_k real table
+            # When hierarchical NSA is enabled, the sparse coordinator has already converted topk_indices into the actual page table.
             if self.use_hierarchical_nsa:
                 page_table_1 = topk_indices
             else:

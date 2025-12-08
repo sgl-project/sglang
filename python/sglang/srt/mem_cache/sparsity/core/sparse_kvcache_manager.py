@@ -130,7 +130,7 @@ class SparseKVCacheManager:
             layer_id,
             "kernel",
         )
-        
+
         return self.req_states.curr_device_indices[:bs, :-1]
 
     def offload_sparse_decode_req_tokens(

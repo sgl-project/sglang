@@ -126,10 +126,10 @@ class SchedulerOutputProcessorMixin:
                         if sparse_coordinator is not None:
                             sparse_coordinator.on_request_prefill_end(req)
 
-                        # Truncate KV cache after prefill completes
-                        truncate_kv_cache_after_prefill(
-                            req, batch.req_to_token_pool, self.tree_cache
-                        )
+                            # Truncate KV cache after prefill completes
+                            truncate_kv_cache_after_prefill(
+                                req, batch.req_to_token_pool, self.tree_cache
+                            )
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None

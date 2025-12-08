@@ -1676,12 +1676,6 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
-        """
-        Write index_k and scale to buffer
-
-        Args:
-            loc: indexer_k physical token IDs
-        """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
