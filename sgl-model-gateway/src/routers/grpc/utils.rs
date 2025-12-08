@@ -197,7 +197,7 @@ pub fn generate_tool_constraints(
             // Return the tool's parameters schema directly (not wrapped in array)
             let params_schema = serde_json::to_string(&tool.function.parameters)
                 .map_err(|e| format!("Failed to serialize tool parameters: {}", e))?;
-            Ok(Some(("json_schema".to_string(), params_schema)))
+            Ok(Some((String::from("json_schema"), params_schema)))
         }
 
         // Required: Array of tool calls with minItems: 1
