@@ -7,8 +7,7 @@ from sgl_kernel.scalar_type import ScalarType, scalar_types
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-
-from .test_marlin_utils import awq_marlin_quantize, marlin_quantize
+from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
 
 set_global_server_args_for_scheduler(object.__new__(ServerArgs))
 
@@ -126,7 +125,7 @@ def marlin_moe_generate_valid_test_cases():
     ):
         """
         Validate if a test case configuration is valid.
-        
+
         Rules:
         1. act_order only works with GPTQ (uint4b8) and valid group_size
         2. Group size must divide k evenly
@@ -154,7 +153,6 @@ def marlin_moe_generate_valid_test_cases():
         # Expert parallelism: e must be divisible by ep_size
         if ep_size > 1 and e % ep_size != 0:
             return False
-
 
         return True
 
@@ -336,9 +334,9 @@ def test_fused_marlin_moe(
 def test_fused_marlin_moe_expert_parallelism(m: int, e: int):
     if not torch.cuda.is_available():
         pytest.skip("CUDA device not available")
-    
+
     torch.manual_seed(100)
-    
+
     # Test configuration
     n, k = 256, 256
     topk = 2
@@ -346,23 +344,23 @@ def test_fused_marlin_moe_expert_parallelism(m: int, e: int):
     group_size = 128
     dtype = torch.bfloat16
     quant_type = scalar_types.uint4b8
-    
+
     # Simulate expert parallelism
     local_e = e // ep_size
     e_ids = torch.randperm(e, device="cuda", dtype=torch.int32)[:local_e]
     e_map = torch.full((e,), -1, device="cuda", dtype=torch.int32)
     e_map[e_ids] = torch.arange(local_e, device="cuda", dtype=torch.int32)
-    
+
     # Create test data
     a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
     w1_full = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
     w2_full = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
     score = torch.randn((m, e), device="cuda", dtype=dtype)
-    
+
     # Select local experts
     w1 = w1_full[e_ids]
     w2 = w2_full[e_ids]
-    
+
     # Quantize local expert weights
     w_ref1_l, qweight1_l, scales1_l = [], [], []
     for i in range(local_e):
@@ -373,7 +371,7 @@ def test_fused_marlin_moe_expert_parallelism(m: int, e: int):
         w_ref1_l.append(w_ref1.T)
         qweight1_l.append(qweight1)
         scales1_l.append(scales1)
-    
+
     w_ref2_l, qweight2_l, scales2_l = [], [], []
     for i in range(local_e):
         test_perm = torch.randperm(n)
@@ -383,18 +381,19 @@ def test_fused_marlin_moe_expert_parallelism(m: int, e: int):
         w_ref2_l.append(w_ref2.T)
         qweight2_l.append(qweight2)
         scales2_l.append(scales2)
-    
+
     w_ref1 = stack_and_dev(w_ref1_l)
     qweight1 = stack_and_dev(qweight1_l).contiguous()
     scales1 = stack_and_dev(scales1_l)
-    
+
     w_ref2 = stack_and_dev(w_ref2_l)
     qweight2 = stack_and_dev(qweight2_l).contiguous()
     scales2 = stack_and_dev(scales2_l)
-    
+
     from sglang.srt.layers.moe.topk import fused_topk_torch_native
+
     topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
-    
+
     # Reference (using full expert weights)
     w_ref1_full_l, w_ref2_full_l = [], []
     for i in range(e):
@@ -403,20 +402,20 @@ def test_fused_marlin_moe_expert_parallelism(m: int, e: int):
             w1_full[i].transpose(1, 0), quant_type, group_size, False, test_perm1
         )
         w_ref1_full_l.append(w_ref1_full.T)
-        
+
         test_perm2 = torch.randperm(n)
         w_ref2_full, _, _, _, _, _ = marlin_quantize(
             w2_full[i].transpose(1, 0), quant_type, group_size, False, test_perm2
         )
         w_ref2_full_l.append(w_ref2_full.T)
-    
+
     w_ref1_full = stack_and_dev(w_ref1_full_l)
     w_ref2_full = stack_and_dev(w_ref2_full_l)
-    
+
     torch_output = torch_moe(
         a, w_ref1_full, w_ref2_full, score, topk, global_num_experts=e, expert_map=e_map
     )
-    
+
     marlin_output = fused_marlin_moe(
         a,
         qweight1,
@@ -431,7 +430,7 @@ def test_fused_marlin_moe_expert_parallelism(m: int, e: int):
         num_bits=4,
         is_k_full=True,
     )
-    
+
     torch.testing.assert_close(marlin_output, torch_output, atol=5e-2, rtol=0)
 
 
