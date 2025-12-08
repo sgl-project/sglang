@@ -94,6 +94,12 @@ else
     $PIP_CMD uninstall flashinfer-python flashinfer-cubin flashinfer-jit-cache || true
 fi
 
+if [ "$IS_BLACKWELL" != "1" ]; then
+    # For lmms_evals evaluating MMMU
+    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+fi
+
 EXTRAS="dev"
 if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev,${OPTIONAL_DEPS}"
@@ -127,13 +133,14 @@ fi
 # Show current packages
 $PIP_CMD list
 
-$PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
-
-if [ "$IS_BLACKWELL" != "1" ]; then
-    # For lmms_evals evaluating MMMU
-    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+# flash_attn is required by transformer 5.x in case if not yet installed
+if python -c "import flash_attn" 2>/dev/null; then
+    echo "flash_attn already installed — skipping"
+else
+    $PIP_CMD install flash_attn $PIP_INSTALL_SUFFIX --no-build-isolation
 fi
+
+$PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
 # DeepEP depends on nvshmem 3.4.5
 $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
@@ -141,12 +148,6 @@ $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFI
 # Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
 $PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 
-# flash_attn is required by transformer 5.x in case if not yet installed
-if python -c "import flash_attn" 2>/dev/null; then
-    echo "flash_attn already installed — skipping"
-else
-    $PIP_CMD install flash_attn $PIP_INSTALL_SUFFIX --no-build-isolation
-fi
 $PIP_CMD uninstall xformers || true
 # Show current packages
 $PIP_CMD list
