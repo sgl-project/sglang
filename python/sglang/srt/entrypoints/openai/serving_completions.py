@@ -41,9 +41,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
         self,
         tokenizer_manager: TokenizerManager,
         template_manager: TemplateManager,
+        enable_force_include_usage: bool = False,
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        self.enable_force_include_usage = enable_force_include_usage
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
@@ -309,7 +311,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
-            if request.stream_options and request.stream_options.include_usage:
+            if self.enable_force_include_usage or (
+                request.stream_options and request.stream_options.include_usage
+            ):
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
