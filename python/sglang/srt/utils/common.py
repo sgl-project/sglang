@@ -315,7 +315,6 @@ try:
 except:
     is_intel_amx_backend_available = False
 
-
 try:
     # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
@@ -2703,6 +2702,8 @@ def is_no_spec_infer_or_topk_one(server_args):
 
 
 def is_fa3_default_architecture(hf_config):
+    if hf_config is None:
+        return None
     architectures = getattr(hf_config, "architectures", None)
     if not isinstance(architectures, list) or not architectures:
         return False
@@ -2720,6 +2721,7 @@ def is_fa3_default_architecture(hf_config):
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
+
     return architectures[0] in default_archs
 
 
@@ -3487,7 +3489,6 @@ def json_list_type(value):
 
 @contextmanager
 def maybe_reindex_device_id(gpu_id: int):
-
     if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() is False or not is_cuda_alike():
         yield gpu_id
         return
