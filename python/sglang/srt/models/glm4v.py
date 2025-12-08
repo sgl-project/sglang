@@ -124,6 +124,7 @@ class Glm4vVisionBlock(nn.Module):
         num_heads: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        attn_qkv_bias: bool = True,
         num_dummy_heads: int = 0,
         rms_norm_eps: float = 1e-5,
         use_data_parallel: bool = False,
@@ -137,7 +138,8 @@ class Glm4vVisionBlock(nn.Module):
             num_heads=num_heads,
             projection_size=dim,
             use_qkv_parallel=True,
-            proj_bias=True,
+            proj_bias=False,
+            qkv_bias=attn_qkv_bias,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -442,6 +444,7 @@ class Glm4vVisionModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
+                    attn_qkv_bias=vision_config.attention_bias,
                     use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(depth)
@@ -625,14 +628,27 @@ class Glm4vForConditionalGeneration(nn.Module):
             self.visual.dtype
         )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+
+        # reshape video_grid_thw -> [b, 3] -> [1, h, w] * frames
+        temp_frames_hw = []
+        for t, h, w in video_grid_thw:
+            repeated_row = (
+                torch.tensor([1, h.item(), w.item()]).unsqueeze(0).repeat(t, 1)
+            )
+            temp_frames_hw.append(repeated_row)
+        flattened_video_grid_thw = torch.cat(temp_frames_hw, dim=0)
+
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+                self.visual,
+                pixel_values,
+                flattened_video_grid_thw.tolist(),
+                rope_type="rope_3d",
             )
         else:
-            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+            video_embeds = self.visual(pixel_values, grid_thw=flattened_video_grid_thw)
         return video_embeds
 
     def get_input_embeddings(self):
