@@ -355,11 +355,15 @@ impl std::str::FromStr for RuntimeType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "sglang" => Ok(RuntimeType::Sglang),
-            "vllm" => Ok(RuntimeType::Vllm),
-            "external" => Ok(RuntimeType::External),
-            _ => Err(format!("Unknown runtime type: {}", s)),
+        // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
+        if s.eq_ignore_ascii_case("sglang") {
+            Ok(RuntimeType::Sglang)
+        } else if s.eq_ignore_ascii_case("vllm") {
+            Ok(RuntimeType::Vllm)
+        } else if s.eq_ignore_ascii_case("external") {
+            Ok(RuntimeType::External)
+        } else {
+            Err(format!("Unknown runtime type: {}", s))
         }
     }
 }
@@ -1111,7 +1115,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         worker_type: worker_type_str.to_string(),
         is_healthy: worker.is_healthy(),
         load: worker.load(),
-        connection_mode: format!("{:?}", worker.connection_mode()),
+        connection_mode: worker.connection_mode().to_string(),
         runtime_type,
         tokenizer_path: worker.tokenizer_path(model_id).map(String::from),
         reasoning_parser: worker.reasoning_parser(model_id).map(String::from),

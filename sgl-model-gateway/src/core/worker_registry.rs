@@ -350,7 +350,9 @@ impl WorkerRegistry {
         let mut prefill_count = 0;
         let mut decode_count = 0;
 
-        for worker in self.get_all() {
+        // Iterate DashMap directly to avoid cloning all workers via get_all()
+        for entry in self.workers.iter() {
+            let worker = entry.value();
             if worker.is_healthy() {
                 healthy_count += 1;
             }
