@@ -25,7 +25,7 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
 # Install apt packages
-apt install -y git libnuma-dev libssl-dev pkg-config
+apt install -y git libnuma-dev libssl-dev pkg-config libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
 
 # Check if protoc of correct architecture is already installed
 if command -v protoc >/dev/null 2>&1; then
@@ -134,6 +134,12 @@ if [ "$IS_BLACKWELL" != "1" ]; then
     git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
     $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
 fi
+
+# DeepEP depends on nvshmem 3.4.5
+$PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
+
+# Cudnn with version less than 9.16.0.29 will cause performance regression on Conv3D kernel
+$PIP_CMD install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall $PIP_INSTALL_SUFFIX
 $PIP_CMD uninstall xformers || true
 # Show current packages
 $PIP_CMD list
