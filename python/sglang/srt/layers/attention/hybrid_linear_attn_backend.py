@@ -58,7 +58,11 @@ elif is_npu():
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
-elif is_cpu() and cpu_has_amx_support():
+elif is_cpu():
+    assert (
+        cpu_has_amx_support()
+    ), "CPU requires AMX support for hybrid linear attn backend"
+    _use_cpu = True
     chunk_gated_delta_rule = torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu
     causal_conv1d_fn = torch.ops.sgl_kernel.causal_conv1d_fwd_cpu
     causal_conv1d_update = torch.ops.sgl_kernel.causal_conv1d_update_cpu
@@ -563,7 +567,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        if is_cpu() and cpu_has_amx_support():
+        if _use_cpu:
             mixed_qkv = causal_conv1d_update(
                 mixed_qkv,
                 conv_states,
@@ -690,7 +694,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
-            if is_cpu() and cpu_has_amx_support():
+            if _use_cpu:
                 mixed_qkv = causal_conv1d_fn(
                     mixed_qkv.transpose(0, 1),
                     conv_weights,
@@ -752,7 +756,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             recurrent_state = ssm_states[cache_indices]
-            if is_cpu() and cpu_has_amx_support():
+            if _use_cpu:
                 core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                     query=query,
                     key=key,

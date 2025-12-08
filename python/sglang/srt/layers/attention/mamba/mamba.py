@@ -70,16 +70,17 @@ def mamba_v2_sharded_weight_loader(
         boundary, loaded_boundary = 0, 0
 
         # Calculate padding size for CPU when TP odd size
-        full_dim_sum = 0
-        full_dim_list = []
-        weight_full_dim_list = []
-        for full_dim, _, _ in shard_spec:
-            full_dim_sum = full_dim_sum + full_dim
-            full_dim_list.append(full_dim)
-        for full_dim in full_dim_list:
-            weight_full_dim_list.append(
-                int(full_dim / full_dim_sum * loaded_weight.size(0))
-            )
+        if is_cpu():
+            full_dim_sum = 0
+            full_dim_list = []
+            weight_full_dim_list = []
+            for full_dim, _, _ in shard_spec:
+                full_dim_sum = full_dim_sum + full_dim
+                full_dim_list.append(full_dim)
+            for full_dim in full_dim_list:
+                weight_full_dim_list.append(
+                    int(full_dim / full_dim_sum * loaded_weight.size(0))
+                )
 
         # - iterate over the shard specs
         for full_dim, extra, duplicate_groups in shard_spec:

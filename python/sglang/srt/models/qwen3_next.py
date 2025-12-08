@@ -18,7 +18,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.layernorm import GemmaRMSNorm, Qwen3NextRMSNormGated
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -299,19 +299,15 @@ class Qwen3GatedDeltaNet(nn.Module):
         self.A_log._no_weight_decay = True
         set_weight_attrs(self.A_log, {"weight_loader": sharded_weight_loader(0)})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
-        if _is_cpu:
-            self.norm = Qwen3NextRMSNormGated(
-                self.head_v_dim, eps=self.layer_norm_epsilon
-            )
-        else:
-            self.norm = RMSNormGated(
-                self.head_v_dim,
-                eps=self.layer_norm_epsilon,
-                group_size=None,
-                norm_before_gate=True,
-                device=torch.get_device_module().current_device(),
-                dtype=config.torch_dtype,
-            )
+
+        self.norm = RMSNormGated(
+            self.head_v_dim,
+            eps=self.layer_norm_epsilon,
+            group_size=None,
+            norm_before_gate=True,
+            device=torch.get_device_module().current_device(),
+            dtype=config.torch_dtype,
+        )
 
         self.out_proj = RowParallelLinear(
             self.value_dim,
@@ -371,13 +367,13 @@ class Qwen3GatedDeltaNet(nn.Module):
         return query, key, value, z, b, a
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
-        if _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
+        if _is_cpu or _is_npu or get_global_server_args().enable_piecewise_cuda_graph:
             DUAL_STREAM_TOKEN_THRESHOLD = 0
         else:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
         seq_len, _ = hidden_states.shape
-        if seq_len < DUAL_STREAM_TOKEN_THRESHOLD and not _is_cpu:
+        if seq_len < DUAL_STREAM_TOKEN_THRESHOLD:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
