@@ -66,7 +66,7 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics};
+use crate::{core::Worker, observability::metrics::RouterMetrics};
 
 /// Cache-aware routing policy
 ///
@@ -322,6 +322,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     // Increment processed counter
                     workers[selected_idx].increment_processed();
                     RouterMetrics::record_processed_request(&selected_url);
+                    RouterMetrics::record_policy_decision(self.name(), &selected_url);
 
                     return Some(selected_idx);
                 }

@@ -152,6 +152,7 @@ def handle_rerun_stage(
         "unit-test-backend-4-gpu",
         "unit-test-backend-8-gpu-h200",
         "unit-test-backend-8-gpu-h20",
+        "unit-test-backend-8-gpu-b200",
         "performance-test-1-gpu-part-1",
         "performance-test-1-gpu-part-2",
         "performance-test-1-gpu-part-3",
