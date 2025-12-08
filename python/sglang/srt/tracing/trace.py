@@ -382,6 +382,7 @@ class SGLangTraceReqContext:
         trace_context = TracePropagateContext.instance_from_dict(trace_context)
         if not trace_context:
             self.tracing_enable = False
+            return
         else:
             self.root_span_context = trace_context.root_span_context
 
