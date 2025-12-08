@@ -120,7 +120,8 @@ class ComponentLoader(ABC):
         self.device = device
 
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        raise NotImplementedError()
+        # offload by default
+        return True
 
     def target_device(self, should_offload):
         if should_offload:
@@ -690,6 +691,11 @@ class TransformerLoader(ComponentLoader):
         ), "Model dtype does not match default dtype"
 
         model = model.eval()
+
+        if hasattr(model, "fuse_qkv_projections"):
+            logger.info("Fusing QKV projections for better performance")
+            model.fuse_qkv_projections()
+
         return model
 
 
