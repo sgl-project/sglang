@@ -304,7 +304,9 @@ class DecodePreallocQueue:
         if is_retracted:
             self.retracted_queue.append(req)
         else:
-            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+            # Auto enable FAKE mode if configured
+            if (req.bootstrap_host == FAKE_BOOTSTRAP_HOST or 
+                (req.bootstrap_host is None and self.scheduler.server_args.disaggregation_decode_enable_fake_auto)):
                 kv_receiver_class = get_kv_class(
                     TransferBackend.FAKE, KVClassType.RECEIVER
                 )

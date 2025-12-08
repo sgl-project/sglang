@@ -566,6 +566,8 @@ class ServerArgs:
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
+    # Enable auto FAKE mode for decode node testing, no need to pass bootstrap_host in request
+    disaggregation_decode_enable_fake_auto: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
@@ -3847,6 +3849,12 @@ class ServerArgs:
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-enable-fake-auto",
+            action="store_true",
+            help="Auto enable FAKE mode for decode node testing, "
+            "no need to pass bootstrap_host and bootstrap_room in request.",
         )
         parser.add_argument(
             "--num-reserved-decode-tokens",

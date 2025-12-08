@@ -473,6 +473,11 @@ class DataParallelController:
                 self.workers
             )
         else:
+            # Set default bootstrap_room if in FAKE auto mode and room is None
+            if (req.bootstrap_room is None and 
+                self.server_args.disaggregation_decode_enable_fake_auto):
+                req.bootstrap_room = 0  # Use default room 0 for FAKE auto mode
+                
             assert (
                 req.bootstrap_room is not None
             ), "req.bootstrap_room should not be None. Do not send requests directly to prefill or decode instances, but send to the router instead."
