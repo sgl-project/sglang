@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -183,6 +183,8 @@ class MindSporeForCausalLM(torch.nn.Module):
         )
         self.key_cache = []
         self.value_cache = []
+        if hasattr(self.model, "hot_token_id"):
+            self.hot_token_id = self.model.hot_token_id
 
     def get_arch(self, config):
         # Get all implemented models
@@ -297,11 +299,29 @@ class MindSporeForCausalLM(torch.nn.Module):
         # prepare model inputs
         model_inputs = self.model.prepare_inputs(forward_batch, model_inputs)
 
-        logits = self.model(**model_inputs)
+        # hidden_states is used for speculative decoding
+        logits, hidden_states = self.model(**model_inputs)
 
-        # TODO: npu tensor ms2torch error to be fix, remain issues of torch_npu to get tensor from dlpack
-        logits_result = LogitsProcessorOutput(next_token_logits=tensor_ms2torch(logits))
+        logits_result = LogitsProcessorOutput(
+            next_token_logits=tensor_ms2torch(logits), hidden_states=hidden_states
+        )
         return logits_result
+
+    # The following methods are used for speculative decoding
+    def get_embed_and_head(self):
+        return self.model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.model.set_embed_and_head(embed, head)
+
+    def get_embed(self):
+        return self.model.get_embed()
+
+    def set_embed(self, embed):
+        self.model.set_embed(embed)
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.model.set_eagle3_layers_to_capture(layer_ids)
 
 
 EntryClass = [MindSporeForCausalLM]
