@@ -334,8 +334,11 @@ impl Router {
             };
 
             if let Some(api_key) = worker.api_key() {
-                request_builder =
-                    request_builder.header("Authorization", format!("Bearer {}", api_key));
+                // Pre-allocate string with capacity to avoid reallocation
+                let mut auth_header = String::with_capacity(7 + api_key.len());
+                auth_header.push_str("Bearer ");
+                auth_header.push_str(api_key);
+                request_builder = request_builder.header("Authorization", auth_header);
             }
 
             // Apply pre-filtered headers
@@ -432,6 +435,9 @@ impl Router {
         let worker = self.worker_registry.get_by_url(worker_url);
         let api_key = worker.as_ref().and_then(|w| w.api_key().clone());
 
+        // Static key string to avoid per-request allocations
+        const DP_RANK_KEY: &str = "data_parallel_rank";
+
         let mut request_builder = if self.dp_aware {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
@@ -457,10 +463,8 @@ impl Router {
             };
 
             if let Some(map) = json_val.as_object_mut() {
-                map.insert(
-                    String::from("data_parallel_rank"),
-                    serde_json::json!(dp_rank),
-                );
+                // Use static key string to avoid allocation
+                map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
                 // Only serialize if debug logging is enabled to avoid CPU overhead
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(
@@ -486,7 +490,11 @@ impl Router {
         };
 
         if let Some(key) = api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
+            // Pre-allocate string with capacity to avoid reallocation
+            let mut auth_header = String::with_capacity(7 + key.len());
+            auth_header.push_str("Bearer ");
+            auth_header.push_str(&key);
+            request_builder = request_builder.header("Authorization", auth_header);
         }
 
         // Copy all headers from original request if provided

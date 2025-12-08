@@ -69,19 +69,24 @@ impl MessageContent {
     /// Returns the text content, cloning only when necessary.
     /// For simple text, returns a clone of the string.
     /// For parts, concatenates text parts with spaces.
+    /// Optimized to avoid intermediate Vec allocation.
     pub fn to_simple_string(&self) -> String {
         match self {
             MessageContent::Text(text) => text.clone(),
             MessageContent::Parts(parts) => {
-                // Pre-count text parts to avoid intermediate Vec allocation
-                let text_parts: Vec<&str> = parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                text_parts.join(" ")
+                // Use fold to build string directly without intermediate Vec allocation
+                let mut result = String::new();
+                let mut first = true;
+                for part in parts {
+                    if let ContentPart::Text { text } = part {
+                        if !first {
+                            result.push(' ');
+                        }
+                        result.push_str(text);
+                        first = false;
+                    }
+                }
+                result
             }
         }
     }
