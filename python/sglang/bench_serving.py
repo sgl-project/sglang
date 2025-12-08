@@ -2688,6 +2688,11 @@ if __name__ == "__main__":
         "--output-details", action="store_true", help="Output details of benchmarking."
     )
     parser.add_argument(
+        "--print-requests",
+        action="store_true",
+        help="Print requests immediately during benchmarking. Useful to quickly realize issues.",
+    )
+    parser.add_argument(
         "--disable-tqdm",
         action="store_true",
         help="Specify to disable tqdm progress bar.",
