@@ -1964,6 +1964,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             dcp_world_size=get_dcp_world_size(),
                         )
                     else:
+                        assert not self.is_hybrid_swa
                         self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                             self.max_total_num_tokens,
                             page_size=self.page_size,
