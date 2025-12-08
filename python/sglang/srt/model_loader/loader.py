@@ -61,6 +61,7 @@ from sglang.srt.connector.utils import parse_model_name
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -383,6 +384,10 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns = ["*.pt"]
         elif load_format == LoadFormat.NPCACHE:
             allow_patterns = ["*.bin"]
+        elif load_format == LoadFormat.DUMMY:
+            raise ValueError(
+                f"DUMMY load_format should use DummyModelLoader and not call _prepare_weights"
+            )
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
 
@@ -1859,7 +1864,10 @@ class ModelOptModelLoader(DefaultModelLoader):
             # Apply quantization
             mtq.quantize(model, quant_cfg, forward_loop=calibrate_loop)
 
-            if get_tensor_model_parallel_rank() == 0:
+            if (
+                not model_parallel_is_initialized()
+                or get_tensor_model_parallel_rank() == 0
+            ):
                 mtq.print_quant_summary(model)
 
             # Save checkpoint if path provided
@@ -2045,6 +2053,9 @@ def get_model_loader(
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
 
+    if load_config.load_format == LoadFormat.DUMMY:
+        return DummyModelLoader(load_config)
+
     if model_config and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization in ["modelopt_fp8", "modelopt_fp4", "modelopt"]
@@ -2070,9 +2081,6 @@ def get_model_loader(
 
     if isinstance(load_config.load_format, type):
         return load_config.load_format(load_config)
-
-    if load_config.load_format == LoadFormat.DUMMY:
-        return DummyModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)

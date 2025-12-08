@@ -20,9 +20,22 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.attention.nsa.utils import (
+    can_cp_split,
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    enable_prefill_cp,
+    is_nsa_enable_prefill_cp,
+    prepare_input_dp_with_cp_dsa,
+)
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import Fp8Config
@@ -55,7 +68,6 @@ class DeepseekModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
             # refer to real DeepSeek V3 quant config
             moe_quant_config = Fp8Config(
@@ -106,6 +118,11 @@ class DeepseekModelNextN(nn.Module):
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            self.cp_size = get_attention_tp_size()
+        else:
+            self.cp_size = None
 
     def forward(
         self,
@@ -138,10 +155,16 @@ class DeepseekModelNextN(nn.Module):
                 )
             )
 
+        if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
-                positions, hidden_states, forward_batch, residual, zero_allocator
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
             )
 
         if not forward_batch.forward_mode.is_idle():
@@ -149,6 +172,15 @@ class DeepseekModelNextN(nn.Module):
                 hidden_states, _ = self.shared_head.norm(hidden_states, residual)
             else:
                 hidden_states = self.shared_head.norm(hidden_states)
+
+            if enable_prefill_cp(forward_batch, self.nsa_enable_prefill_cp):
+                # allgather + rerrange
+                hidden_states = cp_all_gather_rerange_output(
+                    hidden_states,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
 
         return hidden_states
 
@@ -168,6 +200,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
+        self.use_nsa = is_deepseek_nsa(config)
+        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        if self.nsa_enable_prefill_cp:
+            self.cp_rank = get_attention_tp_rank()
+            self.cp_size = get_attention_tp_size()
+        else:
+            self.cp_rank = None
+            self.cp_size = None
 
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
@@ -188,6 +228,16 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+        if self.nsa_enable_prefill_cp:
+            cur_cp_seq_len = len(input_ids) // (self.cp_size * 2)
+            if can_cp_split(cur_cp_seq_len, self.cp_size, self.use_nsa, forward_batch):
+                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+                    torch.tensor(len(input_ids)),
+                    self.cp_rank,
+                    self.cp_size,
+                    forward_batch.seq_lens_cpu.tolist(),
+                )
         hidden_states = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

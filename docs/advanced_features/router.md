@@ -275,6 +275,7 @@ PD deployments can specify `--prefill-selector` and `--decode-selector` plus the
 | `memory` (default) | In-memory storage for quick prototyping. | `--history-backend memory` |
 | `none` | No persistence; APIs operate but store nothing. | `--history-backend none` |
 | `oracle` | Oracle Autonomous Database-backed storage (pooled connections). | `--history-backend oracle` |
+| `postgres` | PostgreSQL Database-backed storage (pooled connections). | `--history-backend postgres` |
 
 Oracle configuration (choose DSN *or* TNS alias):
 Install the Oracle Instant Client and set `LD_LIBRARY_PATH` accordingly.
@@ -435,6 +436,14 @@ Enable request ID propagation:
 python -m sglang_router.launch_router \
   --worker-urls http://worker1:8000 \
   --request-id-headers x-request-id x-trace-id
+```
+
+Enable opentelmetry tracing:
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --enable-trace \
+  --otlp-traces-endpoint 0.0.0.0:4317
 ```
 
 ---

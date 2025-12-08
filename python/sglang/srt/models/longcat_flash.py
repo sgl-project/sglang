@@ -32,7 +32,7 @@
 
 import concurrent.futures
 import logging
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -80,6 +80,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.utils import (
+    maybe_executor_submit,
+    should_async_load,
+    should_deepgemm_weight_requant_ue8m0,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.server_args import get_global_server_args
@@ -383,6 +388,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 layer_scatter_modes=self.mlp_layer_scatter_modes[i],
                 input_layernorm=self.input_layernorm[i],
                 post_attention_layernorm=self.post_attention_layernorm[i],
+                qkv_latent_func=self.self_attn[i].prepare_qkv_latent,
             )
             for i in range(2)
         ]
@@ -397,6 +403,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             layer_scatter_modes=self.moe_layer_scatter_modes,
             input_layernorm=self.input_layernorm[0],
             post_attention_layernorm=self.post_attention_layernorm[0],
+            qkv_latent_func=self.self_attn[0].prepare_qkv_latent,
         )
 
     def forward(
@@ -504,6 +511,7 @@ class LongcatFlashModel(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.layers_to_capture = []
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -529,7 +537,10 @@ class LongcatFlashModel(nn.Module):
 
         residual = None
 
+        aux_hidden_states = []
         for i in range(total_num_layers):
+            if i in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states + residual)
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
@@ -541,7 +552,11 @@ class LongcatFlashModel(nn.Module):
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+
+        return hidden_states, aux_hidden_states
 
 
 class LongcatFlashForCausalLM(nn.Module):
@@ -581,6 +596,7 @@ class LongcatFlashForCausalLM(nn.Module):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -595,8 +611,12 @@ class LongcatFlashForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def post_load_weights(self, weight_names=None):
@@ -773,11 +793,8 @@ class LongcatFlashForCausalLM(nn.Module):
         # TODO(linguoyuan) EPMoE not support DEEPGEMM_BLACKWELL, DeepEP needs to be supported in the future
         deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 = False
 
-        if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and hasattr(self.quant_config, "weight_block_size")
-            and self.quant_config.weight_block_size is not None
+        if should_deepgemm_weight_requant_ue8m0(
+            weight_block_size=getattr(self.quant_config, "weight_block_size", None)
         ):
             self._weight_requant_ue8m0()
 
@@ -854,6 +871,7 @@ class LongcatFlashForCausalLM(nn.Module):
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
+                use_async_loading = should_async_load(loaded_weight)
                 if "mtp" in name:
                     continue
                 weight_names.append(name)
@@ -877,8 +895,12 @@ class LongcatFlashForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    futures.append(
-                        executor.submit(weight_loader, param, loaded_weight, shard_id)
+                    maybe_executor_submit(
+                        executor=executor,
+                        futures=futures,
+                        use_async=use_async_loading,
+                        func=weight_loader,
+                        func_args=(param, loaded_weight, shard_id),
                     )
                     break
                 else:
@@ -889,15 +911,16 @@ class LongcatFlashForCausalLM(nn.Module):
                         name = name.replace(weight_name, param_name)
                         param = params_dict[name]
                         weight_loader = param.weight_loader
-                        futures.append(
-                            executor.submit(
-                                weight_loader,
-                                param,
-                                loaded_weight,
-                                name,
-                                shard_id=shard_id,
-                                expert_id=expert_id,
-                            )
+                        maybe_executor_submit(
+                            executor=executor,
+                            futures=futures,
+                            use_async=use_async_loading,
+                            func=weight_loader,
+                            func_args=(param, loaded_weight, name),
+                            func_kwargs={
+                                "shard_id": shard_id,
+                                "expert_id": expert_id,
+                            },
                         )
                         break
                     else:
@@ -951,8 +974,12 @@ class LongcatFlashForCausalLM(nn.Module):
                                 weight_loader = getattr(
                                     param, "weight_loader", default_weight_loader
                                 )
-                                futures.append(
-                                    executor.submit(weight_loader, param, fused_weight)
+                                maybe_executor_submit(
+                                    executor=executor,
+                                    futures=futures,
+                                    use_async=use_async_loading,
+                                    func=weight_loader,
+                                    func_args=(param, fused_weight),
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
@@ -977,8 +1004,12 @@ class LongcatFlashForCausalLM(nn.Module):
                             weight_loader = getattr(
                                 param, "weight_loader", default_weight_loader
                             )
-                            futures.append(
-                                executor.submit(weight_loader, param, loaded_weight)
+                            maybe_executor_submit(
+                                executor=executor,
+                                futures=futures,
+                                use_async=use_async_loading,
+                                func=weight_loader,
+                                func_args=(param, loaded_weight),
                             )
 
             # Wait for all tasks to complete and raise any exceptions.
@@ -1004,6 +1035,15 @@ class LongcatFlashForCausalLM(nn.Module):
             num_layers=config.num_hidden_layers,
             num_logical_experts=config.n_routed_experts,
         )
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        if layer_ids is None:
+            self.capture_aux_hidden_states = True
+            num_layers = self.config.num_hidden_layers
+            self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
+        else:
+            self.capture_aux_hidden_states = True
+            self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = [LongcatFlashForCausalLM]

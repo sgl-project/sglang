@@ -13,6 +13,7 @@ The file contains a series of key-value pairs, where the keys correspond to oper
 import logging
 import os
 from pathlib import Path
+from typing import List, Optional
 
 import torch
 
@@ -24,7 +25,12 @@ logger = logging.getLogger(__name__)
 
 class TensorDumper:
     def __init__(
-        self, dump_dir: str, dump_layers: int, tp_size: int, tp_rank: int, pp_rank: int
+        self,
+        dump_dir: str,
+        dump_layers: Optional[List[int]],
+        tp_size: int,
+        tp_rank: int,
+        pp_rank: int,
     ):
         self._dump_layers = dump_layers
         self._forward_pass_id = 0
@@ -94,11 +100,15 @@ class TensorDumper:
                     top_level_model = True
             else:
                 cur_name = prefix + "." + name
-            if self._dump_layers > 0 and name.isdigit() and prefix == layers_prefix:
+            if (
+                self._dump_layers is not None
+                and name.isdigit()
+                and prefix == layers_prefix
+            ):
                 # If we only need n layers, skip the reset layers.
                 # Most models' layout is like model.layers.0.
                 cur_layer = int(name)
-                if cur_layer >= self._dump_layers:
+                if cur_layer not in self._dump_layers:
                     continue
             if module is not None:
                 _, sub_count = self._add_hook_recursive(
@@ -129,7 +139,12 @@ class TensorDumper:
 
 
 def register_forward_hook_for_model(
-    model, dump_dir: str, dump_layers: int, tp_size: int, tp_rank: int, pp_rank: int
+    model,
+    dump_dir: str,
+    dump_layers: Optional[List[int]],
+    tp_size: int,
+    tp_rank: int,
+    pp_rank: int,
 ):
     tensor_dumper = TensorDumper(dump_dir, dump_layers, tp_size, tp_rank, pp_rank)
     # Most models have the layerout like:
