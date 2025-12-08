@@ -79,6 +79,7 @@ DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_loader.weight_remapper import WeightsMapper, get_weights_mapper
 from sglang.srt.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
@@ -328,6 +329,13 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{load_config.load_format}: "
                 f"{unexpected_keys}"
             )
+        
+        try:
+            from sglang.private.weights_mapping import register_private_weights_mapper
+            
+            register_private_weights_mapper()
+        except ImportError:
+            pass
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -605,6 +613,11 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        model_class_name = model.__class__.__name__
+        weights_mapper = get_weights_mapper(model_class_name)
+        if weights_mapper is not None:
+            logger.info(f"Applying weights mapper for model class: {model_class_name}")
+            weights = weights_mapper.apply(weights)
         model.load_weights(weights)
 
         for _, module in model.named_modules():
