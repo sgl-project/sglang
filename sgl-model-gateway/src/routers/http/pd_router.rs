@@ -14,17 +14,17 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::{
-    events::{self, Event},
-    pd_types::api_path,
-};
+use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
-    metrics::RouterMetrics,
-    otel_trace::inject_trace_context_http,
+    observability::{
+        events::{self, Event},
+        metrics::RouterMetrics,
+        otel_trace::inject_trace_context_http,
+    },
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},
@@ -396,10 +396,8 @@ impl PDRouter {
         };
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        let headers = match inject_trace_context_http(&mut headers_with_trace) {
-            Ok(()) => Some(&headers_with_trace),
-            Err(_) => headers,
-        };
+        inject_trace_context_http(&mut headers_with_trace);
+        let headers = Some(&headers_with_trace);
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(

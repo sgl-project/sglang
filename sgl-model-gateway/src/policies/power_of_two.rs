@@ -9,7 +9,7 @@ use rand::Rng;
 use tracing::info;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics};
+use crate::{core::Worker, observability::metrics::RouterMetrics};
 
 /// Power-of-two choices policy
 ///
