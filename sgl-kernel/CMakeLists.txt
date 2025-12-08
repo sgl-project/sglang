@@ -593,35 +593,42 @@ install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernel
 # ============================ Extra Install: FA4 ============================= #
 # TODO: find a better install condition.
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-    install(DIRECTORY "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute/"
+
+    set(FLASH_ATTN_CUTE_SRC "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute")
+    set(FLASH_ATTN_CUTE_DST "${CMAKE_CURRENT_BINARY_DIR}/flash_attn_origin/cute")
+
+    file(MAKE_DIRECTORY "${FLASH_ATTN_CUTE_DST}")
+
+    file(COPY "${FLASH_ATTN_CUTE_SRC}/"
+         DESTINATION "${FLASH_ATTN_CUTE_DST}"
+         PATTERN ".git*" EXCLUDE
+         PATTERN "__pycache__" EXCLUDE)
+
+    file(GLOB_RECURSE FLASH_ATTN_CUTE_DST_PY
+         "${FLASH_ATTN_CUTE_DST}/*.py")
+
+    foreach(FILE_PATH IN LISTS FLASH_ATTN_CUTE_DST_PY)
+        file(READ "${FILE_PATH}" FILE_CONTENT)
+
+        set(MODIFIED_CONTENT "${FILE_CONTENT}")
+
+        string(REPLACE "from flash_attn.cute import "
+                       "from flash_attn_origin.cute import "
+                       MODIFIED_CONTENT "${MODIFIED_CONTENT}")
+
+        string(REPLACE "import flash_attn.cute"
+                       "import flash_attn_origin.cute"
+                       MODIFIED_CONTENT "${MODIFIED_CONTENT}")
+
+        if (NOT FILE_CONTENT STREQUAL MODIFIED_CONTENT)
+            file(WRITE "${FILE_PATH}" "${MODIFIED_CONTENT}")
+            message(STATUS "  - [FA4 Patch] Patched: ${FILE_PATH}")
+        endif()
+    endforeach()
+
+    install(DIRECTORY "${FLASH_ATTN_CUTE_DST}/"
             DESTINATION "flash_attn_origin/cute"
             PATTERN ".git*" EXCLUDE
             PATTERN "__pycache__" EXCLUDE)
 
-    install(CODE [[
-        message(STATUS "======== FA4 flash_attn.cute patch is running ========")
-        set(TARGET_DIR "${CMAKE_INSTALL_PREFIX}/flash_attn_origin/cute")
-        message(STATUS "Post-install: Patching Python files in ${TARGET_DIR}")
-
-        file(GLOB_RECURSE PY_FILES "${TARGET_DIR}/*.py")
-
-        foreach(FILE_PATH IN LISTS PY_FILES)
-            file(READ "${FILE_PATH}" FILE_CONTENT)
-
-            set(MODIFIED_CONTENT "${FILE_CONTENT}")
-
-            string(REPLACE "from flash_attn.cute import "
-                           "from flash_attn_origin.cute import "
-                           MODIFIED_CONTENT "${MODIFIED_CONTENT}")
-
-            string(REPLACE "import flash_attn.cute"
-                           "import flash_attn_origin.cute"
-                           MODIFIED_CONTENT "${MODIFIED_CONTENT}")
-
-            if (NOT FILE_CONTENT STREQUAL MODIFIED_CONTENT)
-                file(WRITE "${FILE_PATH}" "${MODIFIED_CONTENT}")
-                message(STATUS "  - [Refactor] Patched: ${FILE_PATH}")
-            endif()
-        endforeach()
-    ]])
 endif()
