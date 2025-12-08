@@ -398,8 +398,17 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
     
     def notify_prefill_done(self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult) -> None:
+        """
+        Notify that prefill is done for a batch. This triggers KV transfer with overlap.
+        
+        For backends that support transfer_context (e.g., Mooncake), this sets up
+        TransferContext for async metadata buffer population by transfer workers.
+        
+        For other backends (nixl, fake, etc.), this is a no-op and they fallback to
+        the old overlap mode where send_kv_chunk is called in process_batch_result_disagg_prefill.
+        """
         # Create a shared TransferContext for all requests in this batch
-        # The context's lifecycle is managed by transfer_contexts dict in MooncakeKVManager,
+        # The context's lifecycle is managed by transfer_contexts dict in KVManager,
         # which will be cleaned up when transfer is complete
         transfer_context = TransferContext(
             batch=batch,
@@ -408,20 +417,25 @@ class SchedulerDisaggregationPrefillMixin:
             scheduler=self,
         )
         for i, req in enumerate(batch.reqs):
-            if hasattr(req.disagg_kv_sender, "transfer_context"):
-                if req.disagg_kv_sender.transfer_context is None:
-                    # First time: assign the shared context
-                    req.disagg_kv_sender.transfer_context = transfer_context
-                    self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
-                else:
-                    # Already has context: check if it's the last chunk
-                    if self.chunked_req is not None:
-                        assert req.rid == self.chunked_req.rid
-                    else:
-                        # Last chunk: send it
-                        self.send_kv_chunk(req, last_chunk=True)
-            else:
+            sender = req.disagg_kv_sender
+            # Check if sender supports transfer_context (new overlap mode)
+            # Use getattr with None default - if attr doesn't exist, we skip
+            if not hasattr(sender, 'transfer_context'):
+                # This sender doesn't support new overlap mode
+                # It will fallback to old overlap mode in process_batch_result_disagg_prefill
                 continue
+            ctx = sender.transfer_context
+            if ctx is None:
+                # First time: assign the shared context
+                sender.transfer_context = transfer_context
+                self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
+            else:
+                # Already has context (chunked prefill case)
+                if self.chunked_req is not None:
+                    assert req.rid == self.chunked_req.rid
+                else:
+                    # Last chunk: send it
+                    self.send_kv_chunk(req, last_chunk=True)
                 
 
     def process_batch_result_disagg_prefill(
@@ -493,7 +507,10 @@ class SchedulerDisaggregationPrefillMixin:
                     next_token_ids=[next_token_ids],
                     is_last_prefill_chunk=True,
                 )
-                if not self.enable_overlap:
+                # For backends that don't support transfer_context (new overlap mode),
+                # we need to call send_kv_chunk here (old overlap mode fallback)
+                use_new_overlap = self.enable_overlap and hasattr(req.disagg_kv_sender, 'transfer_context')
+                if not use_new_overlap:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
@@ -528,8 +545,11 @@ class SchedulerDisaggregationPrefillMixin:
                     is_last_prefill_chunk=False,
                 )
 
-                # if self.enable_overlap:
-                #     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                # For backends that don't support transfer_context (new overlap mode),
+                # we need to call send_kv_chunk here (old overlap mode fallback)
+                use_new_overlap = self.enable_overlap and hasattr(req.disagg_kv_sender, 'transfer_context')
+                if self.enable_overlap and not use_new_overlap:
+                    self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 trace_slice(
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
                 )
