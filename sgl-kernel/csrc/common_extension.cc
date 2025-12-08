@@ -89,6 +89,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("device_layernorm", torch::kCUDA, &device_layernorm);
   m.def("device_layernorm_fuse_scale_shift(Tensor x, Tensor gamma, Tensor beta, Tensor scale, Tensor shift) -> Tensor");
   m.impl("device_layernorm_fuse_scale_shift", torch::kCUDA, &device_layernorm_fuse_scale_shift);
+  m.def("device_scale_residual_layernorm_fuse_scale_shift(Tensor residual, Tensor x, Tensor gamma, Tensor beta, Tensor scale, Tensor shift, Tensor? gate=None) -> Tensor");
+  m.impl("device_scale_residual_layernorm_fuse_scale_shift", torch::kCUDA, &device_scale_residual_layernorm_fuse_scale_shift);
 
   m.def(
       "apply_rope_pos_ids_cos_sin_cache(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, Tensor cos_sin_cache, "
