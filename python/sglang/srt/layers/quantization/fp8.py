@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -33,12 +33,6 @@ except ImportError:
 
     apply_fp8_marlin_linear = prepare_fp8_layer_for_marlin = dummy_func
 
-
-from transformer_engine.pytorch.tensor.float8_blockwise_tensor import (
-    Float8BlockQuantizer,
-    Float8BlockwiseQTensor,
-)
-import transformer_engine_torch as tex
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -130,25 +124,6 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 
 
-def per_block_cast_to_fp8(
-    x: torch.Tensor, quantizer: Float8BlockQuantizer
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert not (
-        len(x.shape) > 2 and x.shape[-2] % 128
-    ), "The last two dimensions of input must be divisible by 128 when dimension is greater than 2."
-    x = x.clone().detach().to("cuda")
-    quantized_qtensor: Float8BlockwiseQTensor = quantizer.quantize(x)
-    scale_shapes = torch.tensor(x.shape[:-2]).tolist()
-    scale_shapes.extend([-1, quantized_qtensor._rowwise_scale_inv.shape[-1]])
-    scale = quantized_qtensor._rowwise_scale_inv.reshape(scale_shapes)
-    standard_scale_shape = -(torch.tensor(x.shape[-2:], dtype=torch.int64) // -128)
-    weight = quantized_qtensor._rowwise_data.view(torch.float8_e4m3fn).contiguous()
-    scale = scale[
-        ..., : standard_scale_shape[0], : standard_scale_shape[1]
-    ].contiguous()
-    return weight, scale
-
-
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -167,7 +142,7 @@ class Fp8Config(QuantizationConfig):
         self.activation_scheme = activation_scheme
         self.ignored_layers = ignored_layers or []
         if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized and weight_block_size != [128, 128]:
+            if not is_checkpoint_fp8_serialized:
                 raise ValueError(
                     f"The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
@@ -200,10 +175,7 @@ class Fp8Config(QuantizationConfig):
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> Fp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
-        is_checkpoint_fp8_serialized = (
-            "fp8" in quant_method
-            and cls.get_from_keys_or(config, ["origin_dtype"], None) is None
-        )
+        is_checkpoint_fp8_serialized = "fp8" in quant_method
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
         ignored_layers = cls.get_from_keys_or(config, ["ignored_layers"], None)
         weight_block_size = cls.get_from_keys_or(config, ["weight_block_size"], None)
@@ -266,69 +238,6 @@ class Fp8LinearMethod(LinearMethodBase):
 
         self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear()
 
-        self.quantizer = Float8BlockQuantizer(
-            fp8_dtype=tex.DType.kFloat8E4M3,
-            rowwise=True,
-            columnwise=False,
-            force_pow_2_scales=False,
-        )
-
-    @staticmethod
-    def _compute_block_partition_padding(
-        output_partition_sizes: List[int], block_n: int
-    ) -> Tuple[bool, List[int]]:
-        """Return whether padding is needed and the padded sizes for each partition."""
-        needs_padding = False
-        padded_sizes: List[int] = []
-        for size in output_partition_sizes:
-            remainder = size % block_n
-            if remainder != 0:
-                needs_padding = True
-                padded_sizes.append(size + block_n - remainder)
-            else:
-                padded_sizes.append(size)
-        return needs_padding, padded_sizes
-
-    @staticmethod
-    def _pad_weight_partitions(
-        weight: torch.Tensor,
-        logical_widths: List[int],
-        padded_widths: Optional[List[int]],
-    ) -> torch.Tensor:
-        if not padded_widths:
-            return weight
-        assert len(logical_widths) == len(
-            padded_widths
-        ), "logical_widths and padded_widths must match"
-        padded_chunks = []
-        offset = 0
-        for logical_width, padded_width in zip(logical_widths, padded_widths):
-            chunk = weight.narrow(0, offset, logical_width)
-            offset += logical_width
-            pad_rows = padded_width - logical_width
-            if pad_rows > 0:
-                padding = chunk.new_zeros(pad_rows, chunk.shape[1])
-                chunk = torch.cat([chunk, padding], dim=0)
-            padded_chunks.append(chunk)
-        return torch.cat(padded_chunks, dim=0)
-
-    @staticmethod
-    def _trim_output_partitions(
-        output: torch.Tensor,
-        logical_widths: List[int],
-        padded_widths: Optional[List[int]],
-    ) -> torch.Tensor:
-        if not padded_widths:
-            return output
-        if logical_widths == padded_widths:
-            return output
-        splits = torch.split(output, padded_widths, dim=-1)
-        trimmed = [
-            chunk[..., :logical_width]
-            for chunk, logical_width in zip(splits, logical_widths)
-        ]
-        return torch.cat(trimmed, dim=-1)
-
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -348,35 +257,23 @@ class Fp8LinearMethod(LinearMethodBase):
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            # Required by row parallel
-            if tp_size > 1 and input_size // input_size_per_partition == tp_size:
-                if input_size_per_partition % block_k != 0:
-                    raise ValueError(
-                        f"Weight input_size_per_partition = "
-                        f"{input_size_per_partition} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
-                    )
-            # Required by column parallel or enabling merged weights
-            if (
-                tp_size > 1 and output_size // output_size_per_partition == tp_size
-            ) or len(output_partition_sizes) > 1:
-                needs_padding, padded_sizes = self._compute_block_partition_padding(
-                    output_partition_sizes, block_n
-                )
-                if needs_padding and self.quant_config.is_checkpoint_fp8_serialized:
-                    raise ValueError(
-                        f"Weight output_partition_size = "
-                        f"{output_partition_sizes} requires padding to satisfy "
-                        f"block size {block_n}, which is unsupported for fp8 "
-                        f"serialized checkpoints."
-                    )
-                layer.block_padded_partition_sizes = (
-                    padded_sizes if needs_padding else None
-                )
-            else:
-                layer.block_padded_partition_sizes = None
-        else:
-            layer.block_padded_partition_sizes = None
+            # # Required by row parallel
+            # if tp_size > 1 and input_size // input_size_per_partition == tp_size:
+            #     if input_size_per_partition % block_k != 0:
+            #         raise ValueError(
+            #             f"Weight input_size_per_partition = "
+            #             f"{input_size_per_partition} is not divisible by "
+            #             f"weight quantization block_k = {block_k}."
+            #         )
+            # # Required by column parallel or enabling merged weights
+            # if tp_size > 1 and output_size // output_size_per_partition == tp_size:
+            #     for output_partition_size in output_partition_sizes:
+            #         if output_partition_size % block_n != 0:
+            #             raise ValueError(
+            #                 f"Weight output_partition_size = "
+            #                 f"{output_partition_size} is not divisible by "
+            #                 f"weight quantization block_n = {block_n}."
+            #             )
 
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
@@ -449,46 +346,28 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
-            if self.quant_config.is_checkpoint_fp8_serialized:
-                # If ROCm, normalize the weights and scales to e4m3fnuz
-                if _is_fp8_fnuz:
-                    # activation_scheme: dynamic
-                    weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                        weight=layer.weight,
-                        weight_scale=layer.weight_scale_inv,
-                        input_scale=None,
-                    )
-                    layer.input_scale = None
-                elif _is_cpu:
-                    assert (
-                        _is_cpu_amx_available
-                    ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
-                    _amx_process_weight_after_loading(layer, ["weight"])
-                    layer.weight_scale_inv = torch.nn.Parameter(
-                        layer.weight_scale_inv.data, requires_grad=False
-                    )
-                    return
-                else:
-                    weight, weight_scale = (
-                        layer.weight.data,
-                        layer.weight_scale_inv.data,
-                    )
-                layer.weight.data = weight.data
-                layer.weight_scale_inv.data = weight_scale.data
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if _is_fp8_fnuz:
+                # activation_scheme: dynamic
+                weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=None,
+                )
+                layer.input_scale = None
+            elif _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+                _amx_process_weight_after_loading(layer, ["weight"])
+                layer.weight_scale_inv = torch.nn.Parameter(
+                    layer.weight_scale_inv.data, requires_grad=False
+                )
+                return
             else:
-                padded_weight = self._pad_weight_partitions(
-                    layer.weight,
-                    layer.logical_widths,
-                    getattr(layer, "block_padded_partition_sizes", None),
-                )
-                weight, weight_scale = per_block_cast_to_fp8(
-                    padded_weight, self.quantizer
-                )
-                del layer.weight
-                weight = torch.nn.Parameter(weight, requires_grad=False)
-                weight_scale = torch.nn.Parameter(weight_scale, requires_grad=False)
-                layer.register_parameter("weight", weight)
-                layer.register_parameter("weight_scale_inv", weight_scale)
+                weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
+            layer.weight.data = weight.data
+            layer.weight_scale_inv.data = weight_scale.data
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
 
@@ -597,7 +476,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.block_quant:
             if use_intel_amx_backend(layer):
-                output = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
                     layer.weight,
                     layer.weight_scale_inv,
@@ -607,20 +486,13 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
-            else:
-                output = self.w8a8_block_fp8_linear(
-                    input=x,
-                    weight=layer.weight,
-                    block_size=self.quant_config.weight_block_size,
-                    weight_scale=layer.weight_scale_inv,
-                    input_scale=None,
-                    bias=bias,
-                )
-
-            return self._trim_output_partitions(
-                output,
-                layer.logical_widths,
-                getattr(layer, "block_padded_partition_sizes", None),
+            return self.w8a8_block_fp8_linear(
+                input=x,
+                weight=layer.weight,
+                block_size=self.quant_config.weight_block_size,
+                weight_scale=layer.weight_scale_inv,
+                input_scale=None,
+                bias=bias,
             )
 
         return apply_fp8_linear(
@@ -666,13 +538,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert is_sm100_supported() or is_sm90_supported()
-
-        self.quantizer = Float8BlockQuantizer(
-            fp8_dtype=tex.DType.kFloat8E4M3,
-            rowwise=True,
-            columnwise=False,
-            force_pow_2_scales=False,
-        )
 
     def create_weights(
         self,
@@ -858,98 +723,51 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
-
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
             return
 
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
-            if self.quant_config.is_checkpoint_fp8_serialized:
-                # If ROCm, normalize the weights and scales to e4m3fnuz
-                if _is_fp8_fnuz:
-                    # activation_scheme: dynamic
-                    w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                        weight=layer.w13_weight,
-                        weight_scale=layer.w13_weight_scale_inv,
-                        input_scale=None,
-                    )
-                    w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                        weight=layer.w2_weight,
-                        weight_scale=layer.w2_weight_scale_inv,
-                        input_scale=None,
-                    )
-                    # Reset the parameter
-                    layer.w13_weight = torch.nn.Parameter(
-                        w13_weight, requires_grad=False
-                    )
-                    layer.w13_weight_scale_inv = torch.nn.Parameter(
-                        w13_weight_scale, requires_grad=False
-                    )
-                    layer.w13_input_scale = None
-                    layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-                    layer.w2_weight_scale_inv = torch.nn.Parameter(
-                        w2_weight_scale, requires_grad=False
-                    )
-                    layer.w2_input_scale = None
+            # If ROCm, normalize the weights and scales to e4m3fnuz
+            if _is_fp8_fnuz:
+                # activation_scheme: dynamic
+                w13_weight, w13_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight,
+                    weight_scale=layer.w13_weight_scale_inv,
+                    input_scale=None,
+                )
+                w2_weight, w2_weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight,
+                    weight_scale=layer.w2_weight_scale_inv,
+                    input_scale=None,
+                )
+                # Reset the parameter
+                layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale_inv = torch.nn.Parameter(
+                    w13_weight_scale, requires_grad=False
+                )
+                layer.w13_input_scale = None
+                layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale_inv = torch.nn.Parameter(
+                    w2_weight_scale, requires_grad=False
+                )
+                layer.w2_input_scale = None
 
-                if _use_aiter:
-                    # Pre-shuffle weights
-                    layer.w13_weight.data = shuffle_weight(
-                        layer.w13_weight.contiguous(), (16, 16)
-                    )
-                    layer.w2_weight.data = shuffle_weight(
-                        layer.w2_weight.contiguous(), (16, 16)
-                    )
-
-                if _is_cpu:
-                    assert (
-                        _is_cpu_amx_available
-                    ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
-                    _amx_process_weight_after_loading(
-                        layer, ["w13_weight", "w2_weight"]
-                    )
-
-            else:
-                w13_weight, w13_scale = per_block_cast_to_fp8(
-                    layer.w13_weight.data, self.quantizer
+            if _use_aiter:
+                # Pre-shuffle weights
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
                 )
 
-                w2_weight, w2_scale = per_block_cast_to_fp8(
-                    layer.w2_weight.data, self.quantizer
-                )
-
-                # layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-                # layer.w13_weight_scale_inv = torch.nn.Parameter(
-                #     w13_scale, requires_grad=False
-                # )
-                # layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-                # layer.w2_weight_scale_inv = torch.nn.Parameter(
-                #     w2_scale, requires_grad=False
-                # )
-                del (
-                    layer.w13_weight,
-                    layer.w13_weight_scale_inv,
-                    layer.w2_weight,
-                    layer.w2_weight_scale_inv,
-                )
-
-                w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
-                w13_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
-                w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
-                w2_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
-
-                layer.register_parameter("w13_weight", w13_weight)
-                layer.register_parameter("w13_weight_scale_inv", w13_scale)
-                layer.register_parameter("w2_weight", w2_weight)
-                layer.register_parameter("w2_weight_scale_inv", w2_scale)
-
-                if hasattr(layer, "w13_weight_fp8"):
-                    del layer.w13_weight_fp8
-                    layer.w13_weight_fp8 = (w13_weight, w13_scale)
-                if hasattr(layer, "w2_weight_fp8"):
-                    del layer.w2_weight_fp8
-                    layer.w2_weight_fp8 = (w2_weight, w2_scale)
+            if _is_cpu:
+                assert (
+                    _is_cpu_amx_available
+                ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
 
             return
 
@@ -1173,6 +991,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states

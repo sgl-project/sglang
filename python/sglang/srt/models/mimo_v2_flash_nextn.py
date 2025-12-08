@@ -214,7 +214,6 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
-        self.v_scale = getattr(config, "attention_value_scale", None)
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
@@ -283,13 +282,6 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-
-                if (
-                    weight_name == "v_proj"
-                    and self.v_scale is not None
-                    and self.v_scale != 1.0
-                ):
-                    loaded_weight *= self.v_scale
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader

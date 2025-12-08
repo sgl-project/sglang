@@ -68,7 +68,6 @@ from sglang.srt.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
-    get_bool_env_var,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -446,8 +445,6 @@ class MiMoV2Attention(nn.Module):
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        if get_bool_env_var("SGLANG_O_PROJ_FP8_QUANT") == False:
-            quant_config = None
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
@@ -510,6 +507,7 @@ class MiMoV2Attention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
@@ -919,7 +917,6 @@ class MiMoV2FlashForCausalLM(nn.Module):
         self.model = MiMoV2Model(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.v_scale = getattr(config, "attention_value_scale", None)
 
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1053,13 +1050,6 @@ class MiMoV2FlashForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-
-                if (
-                    weight_name == "v_proj"
-                    and self.v_scale is not None
-                    and self.v_scale != 1.0
-                ):
-                    loaded_weight *= self.v_scale
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
