@@ -392,6 +392,14 @@ class LogitsProcessor(nn.Module):
                 input_ids, hidden_states, lm_head, logits_metadata, multi_item_delimiter
             )
 
+        if logits_metadata.forward_mode.is_dllm_extend():
+            assert self.return_full_logits
+            full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
+            return LogitsProcessorOutput(
+                full_logits=full_logits,
+                next_token_logits=None,
+            )
+
         # Get the last hidden states and last logits for the next token prediction
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
