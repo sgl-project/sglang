@@ -164,7 +164,7 @@ FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
 if [ -d "$FLASH_ATTN_PATH" ]; then
     echo "Directory $FLASH_ATTN_PATH exists. Removing..."
     rm -rf "$FLASH_ATTN_PATH"
-    echo "Bug this should not happen"
+    echo "error: this should not happen"
 else
-    echo "181 Directory $FLASH_ATTN_PATH does not exist."
+    echo "Directory $FLASH_ATTN_PATH does not exist."
 fi
