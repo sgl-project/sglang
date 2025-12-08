@@ -2,6 +2,7 @@ import unittest
 
 from test_ascend_single_mix_utils import (
     TestSingleMixUtils,
+    NIC_NAME
 )
 
 QWEN3_8B_ENVS = {
@@ -9,8 +10,8 @@ QWEN3_8B_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
     "HCCL_BUFFSIZE": "400",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",     
+    "HCCL_SOCKET_IFNAME": NIC_NAME,
+    "GLOO_SOCKET_IFNAME": NIC_NAME,     
     "HCCL_OP_EXPANSION_MODE": "AIV",
     
 }

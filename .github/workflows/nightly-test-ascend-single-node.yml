@@ -61,7 +61,7 @@ jobs:
           curl -o /tmp/test.jsonl -L https://gh-proxy.test.osinfra.cn/https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
 
           export PYTHONPATH=${current_path}/python:$PYTHONPATH
-          source /usr/local/Ascend/8.5.0/bisheng_toolkit/set_env.sh || true
+          . /usr/local/Ascend/8.5.0/bisheng_toolkit/set_env.sh || true
 
           echo "Running test case ${test_case}"
           python3 -u ${test_case}

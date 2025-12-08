@@ -9,7 +9,6 @@ MODEL_PATH = "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/vllm-asc
 MODEL_CONFIG = {
     "model_path": MODEL_PATH,
     "prefill_envs": {
-        "SGLANG_SET_CPU_AFFIMITY": "1",
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
@@ -22,7 +21,6 @@ MODEL_CONFIG = {
         "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     },
     "decode_envs": {
-        "SGLANG_SET_CPU_AFFIMITY": "1",
         "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",
         "DP_ROUND_ROBIN": "1",

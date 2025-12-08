@@ -1,30 +1,17 @@
-import argparse
 import os
 import re
 import socket
 import subprocess
 import threading
 import time
-import unittest
-from types import SimpleNamespace
-from urllib.parse import urlparse
 
 import requests
 from kubernetes import client, config
-from kubernetes.client import V1ConfigMap, V1ObjectMeta
 from kubernetes.client.rest import ApiException
 
-from sglang.bench_serving import run_benchmark
-from sglang.srt.utils import kill_process_tree
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
-from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
-    run_bench_offline_throughput,
 )
 
 

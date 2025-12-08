@@ -114,9 +114,12 @@ jobs:
           - name: test_ascend_qwen3_coder_480b_a35b_instruct_w8a8_quarot_in16k_out10k
             os: linux-aarch64-a3-16
             test_case: test/srt/ascend_k8s/test_ascend_qwen3_coder_480b_a35b_instruct_w8a8_quarot_in16k_out10k.py
-          - name: test_ascend_deepseek_r1_w4a8_single_in3500_out1500
+          - name: test_ascend_deepseek_r1_w4a8_1p1d_in2048_out2048_50ms
             os: linux-aarch64-a3-16
-            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_single_in3500_out1500.py
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in2048_out2048_50ms.py
+          - name: test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500_50ms
+            os: linux-aarch64-a3-16
+            test_case: test/srt/ascend_k8s/test_ascend_deepseek_r1_w4a8_1p1d_in3500_out1500_50ms.py
     uses: ./.github/workflows/nightly-test-ascend-single-node.yml
     with:
       runner:  ${{ matrix.test_config.os }}

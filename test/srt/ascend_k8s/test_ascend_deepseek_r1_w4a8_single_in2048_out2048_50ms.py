@@ -9,7 +9,7 @@ MODEL_PATH = "/root/.cache/modelscope/hub/models/Howeee/DeepSeek-R1-0528-w8a8"
 #MODEL_PATH = "/root/.cache/modelscope/hub/models/DeepSeek-R1-0528-w4a8"
 
 MODEL_ENVS = {
-    "SGLANG_SET_CPU_AFFINITY": "1",
+    "SGLANG_SET_CPU_AFFINITY": "0",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "enp23s0f3",
