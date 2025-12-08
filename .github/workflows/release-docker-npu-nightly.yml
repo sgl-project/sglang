@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        cann_version: ["8.3.rc1"]
+        cann_version: ["8.3.rc2"]
         device_type: ["910b", "a3"]
     steps:
       - name: Checkout repository
@@ -53,7 +53,7 @@ jobs:
       # https://github.com/docker/login-action
       - name: Log into docker hub
         uses: docker/login-action@v3
-        if: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+        if: ${{ github.repository == 'sgl-project/sglang' }}
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -70,9 +70,9 @@ jobs:
           platforms: linux/arm64
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.meta.outputs.tags }}
-          push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
+          push: ${{ github.repository == 'sgl-project/sglang' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=20251128
+            SGLANG_KERNEL_NPU_TAG=20251206
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}
