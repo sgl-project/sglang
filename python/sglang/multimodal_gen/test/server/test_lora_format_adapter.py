@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 """
 test_lora_format_adapter.py
 
@@ -8,7 +7,9 @@ It downloads several public LoRA checkpoints from Hugging Face, runs
 format detection and normalization, and prints a compact summary table.
 """
 
+import logging
 import os
+import tempfile
 from typing import Dict, List
 
 import torch
@@ -21,12 +22,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora_format_adapter import (
     normalize_lora_state_dict,
 )
 
-import logging
-
 logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger("lora_test")
 
-ROOT_DIR = "/data/fenglin/lora_tests"
+ROOT_DIR = os.path.join(tempfile.gettempdir(), "sglang_lora_tests")
 os.makedirs(ROOT_DIR, exist_ok=True)
 
 
@@ -114,10 +113,14 @@ def is_diffusers_style_keys(
     if not ok:
         print(f"[{debug_name}] diffusers-style check FAILED (relaxed):")
         print(f"  total keys = {total}")
-        print(f"  cond1(no banned prefixes)  = {cond1}, bad_prefix_keys={len(bad_prefix_keys)}")
+        print(
+            f"  cond1(no banned prefixes)  = {cond1}, bad_prefix_keys={len(bad_prefix_keys)}"
+        )
         if not cond1 and bad_prefix_keys:
             print("    example bad prefix key:", bad_prefix_keys[0])
-        print(f"  cond2(no banned suffixes)  = {cond2}, bad_suffix_keys={len(bad_suffix_keys)}")
+        print(
+            f"  cond2(no banned suffixes)  = {cond2}, bad_suffix_keys={len(bad_suffix_keys)}"
+        )
         if not cond2 and bad_suffix_keys:
             print("    example bad suffix key:", bad_suffix_keys[0])
         print(f"  cond3(allowed roots>=60%)  = {cond3}, root_ok_count={root_ok_count}")
@@ -151,10 +154,7 @@ def run_single_test(
     detected_after = detect_lora_format_from_state_dict(norm_state)
     standard_like = is_diffusers_style_keys(norm_state, debug_name=name)
 
-    passed = (
-        detected_before == expected_before
-        and detected_after == expected_after
-    )
+    passed = detected_before == expected_before and detected_after == expected_after
 
     return {
         "name": name,
@@ -169,11 +169,8 @@ def run_single_test(
     }
 
 
-def main():
-    """
-    Run all LoRA format adapter tests and print a summary table.
-    """
-    results = []
+def _run_all_tests() -> List[Dict]:
+    results: List[Dict] = []
 
     # SDXL LoRA that is already in diffusers/PEFT format.
     results.append(
@@ -271,6 +268,10 @@ def main():
         )
     )
 
+    return results
+
+
+def _print_summary(results: List[Dict]) -> None:
     print("\n================ LoRA format adapter test ================")
 
     header = (
@@ -301,6 +302,22 @@ def main():
         )
 
     print("=========================================================\n")
+
+
+def main() -> None:
+    results = _run_all_tests()
+    _print_summary(results)
+
+    if not all(r["pass"] for r in results):
+        raise SystemExit(1)
+
+
+class TestLoRAFormatAdapter:
+    def test_lora_format_adapter_all_formats(self):
+        results = _run_all_tests()
+        assert all(
+            r["pass"] for r in results
+        ), "At least one LoRA format adapter case failed"
 
 
 if __name__ == "__main__":
