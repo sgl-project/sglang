@@ -417,6 +417,7 @@ impl Router {
         is_stream: bool,
         load_incremented: bool, // Whether load was incremented for this request
     ) -> Response {
+        error!("hi send_typed_request worker_url={}", worker_url);
         // Get the worker's API key if available
         let api_key = self
             .worker_registry
