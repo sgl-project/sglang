@@ -167,17 +167,19 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
         content = []
         if image_id == 0:
+            image_path = self.get_or_download_file(IMAGE_MAN_IRONING_URL)
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                    "image_url": {"url": image_path},  # Use local file path
                 }
             )
         elif image_id == 1:
+            image_path = self.get_or_download_file(IMAGE_SGL_LOGO_URL)
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": IMAGE_SGL_LOGO_URL},
+                    "image_url": {"url": image_path},  # Use local file path
                 }
             )
         else:
@@ -236,6 +238,9 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
     def test_single_image_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        
+        # Download image locally first
+        image_path = self.get_or_download_file(IMAGE_MAN_IRONING_URL)
 
         response = client.chat.completions.create(
             model="default",
@@ -245,7 +250,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                            "image_url": {"url": image_path},  # Use local file path
                         },
                         {
                             "type": "text",
@@ -266,6 +271,9 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
     def test_multi_turn_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        
+        # Download image locally first
+        image_path = self.get_or_download_file(IMAGE_MAN_IRONING_URL)
 
         response = client.chat.completions.create(
             model="default",
@@ -275,7 +283,7 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                            "image_url": {"url": image_path},  # Use local file path
                         },
                         {
                             "type": "text",
@@ -317,6 +325,10 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
 
     def test_multi_images_chat_completion(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        
+        # Download images locally first
+        image_path1 = self.get_or_download_file(IMAGE_MAN_IRONING_URL)
+        image_path2 = self.get_or_download_file(IMAGE_SGL_LOGO_URL)
 
         response = client.chat.completions.create(
             model="default",
@@ -326,12 +338,12 @@ class ImageOpenAITestMixin(TestOpenAIMLLMServerBase):
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": IMAGE_MAN_IRONING_URL},
+                            "image_url": {"url": image_path1},  # Use local file path
                             "modalities": "multi-images",
                         },
                         {
                             "type": "image_url",
-                            "image_url": {"url": IMAGE_SGL_LOGO_URL},
+                            "image_url": {"url": image_path2},  # Use local file path
                             "modalities": "multi-images",
                         },
                         {

@@ -154,6 +154,13 @@ class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
         "--reasoning-parser=glm45",
     ]
 
+class TestGLM46VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
+    # model = "zai-org/GLM-4.6V-Flash"
+    model = "/shared/public/elr-models/zai-org/GLM-4.6V-Flash/"
+    extra_args = [
+        "--reasoning-parser=glm45",
+    ]
+
 
 class TestQwen2AudioServer(AudioOpenAITestMixin):
     model = "Qwen/Qwen2-Audio-7B-Instruct"
