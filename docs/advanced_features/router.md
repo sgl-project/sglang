@@ -133,14 +133,13 @@ python -m sglang_router.launch_router \
 > gRPC router supports both single-stage and PD serving. Provide `--tokenizer-path` or `--model-path` (HF repo or local directory) plus optional `--chat-template`.
 
 ### Prefill/Decode Disaggregation
-Split prefill and decode workers for PD-aware caching and balancing.
+Split prefill and decode workers for PD-aware caching and balancing. Specifying `--policy A` is equivalent to `--prefill-policy A --decode-policy A`.
 
 ```bash
 python -m sglang_router.launch_router \
   --pd-disaggregation \
   --prefill http://prefill1:30001 9001 \
   --decode http://decode1:30011 \
-  --policy cache_aware \
   --prefill-policy cache_aware \
   --decode-policy power_of_two
 ```
