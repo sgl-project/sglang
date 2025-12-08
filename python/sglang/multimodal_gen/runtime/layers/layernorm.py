@@ -389,27 +389,84 @@ class LayerNormScaleShift(nn.Module):
     def forward(
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
-        """Apply ln followed by scale and shift in a single fused operation."""
-        # x.shape: [batch_size, seq_len, inner_dim]
-        normalized = self.norm(x)
-        if self.compute_dtype == torch.float32:
-            normalized = normalized.float()
+        # """Apply ln followed by scale and shift in a single fused operation."""
+        # # x.shape: [batch_size, seq_len, inner_dim]
+        # normalized = self.norm(x)
+        # if self.compute_dtype == torch.float32:
+        #     normalized = normalized.float()
 
-        if scale.dim() == 4:
-            # scale.shape: [batch_size, num_frames, 1, inner_dim]
-            num_frames = scale.shape[1]
-            frame_seqlen = normalized.shape[1] // num_frames
-            output = (
-                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                * (1.0 + scale)
-                + shift
-            ).flatten(1, 2)
-        else:
-            # scale.shape: [batch_size, 1, inner_dim]
-            # shift.shape: [batch_size, 1, inner_dim]
-            output = normalized * (1.0 + scale) + shift
+        # if scale.dim() == 4:
+        #     # scale.shape: [batch_size, num_frames, 1, inner_dim]
+        #     num_frames = scale.shape[1]
+        #     frame_seqlen = normalized.shape[1] // num_frames
+        #     output = (
+        #         normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+        #         * (1.0 + scale)
+        #         + shift
+        #     ).flatten(1, 2)
+        # else:
+        #     # scale.shape: [batch_size, 1, inner_dim]
+        #     # shift.shape: [batch_size, 1, inner_dim]
+        #     output = normalized * (1.0 + scale) + shift
 
-        if self.compute_dtype == torch.float32:
-            output = output.to(x.dtype)
+        # if self.compute_dtype == torch.float32:
+        #     output = output.to(x.dtype)
 
-        return output
+        # return output
+
+        if (
+            x.is_cuda
+            and isinstance(self.norm, nn.LayerNorm)
+            and (x.shape[-1] % 4 == 0)
+        ):
+            batch_size, seq_len, hidden_size = x.shape
+            x_2d = x.view(-1, hidden_size).contiguous()
+            if scale.dim() == 4:
+                if self.norm.weight is not None:
+                    gamma = self.norm.weight.contiguous()
+                else:
+                    gamma = torch.ones(
+                        hidden_size, device=x.device, dtype=x.dtype
+                    )
+                if self.norm.bias is not None:
+                    beta = self.norm.bias.contiguous()
+                else:
+                    beta = torch.zeros(
+                        hidden_size, device=x.device, dtype=x.dtype
+                    )
+                y_2d = torch.ops.sgl_kernel.device_layernorm_fuse_scale_shift(
+                    x_2d, gamma, beta, scale.contiguous(), shift.contiguous()
+                )
+                return y_2d.view(batch_size, seq_len, hidden_size)
+            if scale.size(1) == 1:
+                scale_2d = (
+                    scale.expand(batch_size, seq_len, hidden_size)
+                    .contiguous()
+                    .view(-1, hidden_size)
+                )
+                shift_2d = (
+                    shift.expand(batch_size, seq_len, hidden_size)
+                    .contiguous()
+                    .view(-1, hidden_size)
+                )
+            else:
+                # Expect [batch_size, seq_len, hidden_size]
+                scale_2d = scale.view(-1, hidden_size).contiguous()
+                shift_2d = shift.view(-1, hidden_size).contiguous()
+
+            if self.norm.weight is not None:
+                gamma = self.norm.weight.contiguous()
+            else:
+                gamma = torch.ones(
+                    hidden_size, device=x.device, dtype=x.dtype
+                )
+            if self.norm.bias is not None:
+                beta = self.norm.bias.contiguous()
+            else:
+                beta = torch.zeros(
+                    hidden_size, device=x.device, dtype=x.dtype
+                )
+
+            y_2d = torch.ops.sgl_kernel.device_layernorm_fuse_scale_shift(x_2d, gamma, beta, scale_2d, shift_2d)
+            return y_2d.view(batch_size, seq_len, hidden_size)
+        
