@@ -633,7 +633,7 @@ mod tests {
         println!("Initial Loads -> W0: {}, W1: {}, W2: {}", workers[0].load(), workers[1].load(), workers[2].load());
 
 
-        let mut distribution = vec![0; 3];
+        let mut distribution = [0; 3];
 
         for i in 0..100 {
             // Simulate 80% Cache Misses (New traffic)
