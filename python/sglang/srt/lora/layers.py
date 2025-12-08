@@ -181,11 +181,9 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         if self.set_lora:
             # The backend's run_lora_a_embedding now handles both regular
             # and extra tokens efficiently with CUDA graph support
-            output = self.apply_lora(base_output, input_, batch_info)
-        else:
-            output = base_output
+            base_output = self.apply_lora(base_output, input_, batch_info)
 
-        return output
+        return base_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
@@ -276,7 +274,7 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
-        # For TP>1, would slice along vocab dimension, eed to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
+        # For TP>1, would slice along vocab dimension, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
         return B
 
 

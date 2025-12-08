@@ -306,9 +306,7 @@ class LoRAManager:
         # Update embedding layer if present - gotta merge (refer to PR codebase)
         if self.embed_tokens_module is not None:
             self.embed_tokens_module.set_lora_info(
-                self.memory_pool.get_embedding_tensor(
-                    "added_tokens", LoRAType.LORA_A
-                ),  # choose name: "added_tokens"
+                self.memory_pool.get_embedding_tensor("added_tokens", LoRAType.LORA_A),
                 self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_A),
                 self.memory_pool.get_embedding_tensor("embed_tokens", LoRAType.LORA_B),
             )

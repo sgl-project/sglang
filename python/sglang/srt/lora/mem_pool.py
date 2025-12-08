@@ -536,7 +536,10 @@ class LoRAMemoryPool:
         """
 
         if target_module == "added_tokens":
-            if self.lora_added_tokens_size > 0 and self.lora_added_tokens_size != None:
+            if (
+                self.lora_added_tokens_size is not None
+                and self.lora_added_tokens_size > 0
+            ):
                 return self.new_embeddings_buffer["input_embeddings"]
             return None
         elif target_module == "embed_tokens":
