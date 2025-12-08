@@ -93,7 +93,7 @@ python3 -m sglang.launch_server \
     --context-length 3800 \
     --chunked-prefill-size 57344 \
     --max-prefill-tokens 30400 \
-    --enable-hierarchical-cache \
+    --enable-hierarchical-cache-direct \
     --hicache-storage-backend memcache &
 ```
 1). The MMC_LOCAL_CONFIG_PATH environment variable specifies the configuration file of LocaService.

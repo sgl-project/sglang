@@ -273,7 +273,9 @@ class Scheduler(
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
-        self.enable_hierarchical_cache_direct = server_args.enable_hierarchical_cache_direct
+        self.enable_hierarchical_cache_direct = (
+            server_args.enable_hierarchical_cache_direct
+        )
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
 
@@ -1828,7 +1830,10 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache or self.enable_hierarchical_cache_direct:
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.enable_hierarchical_cache_direct
+                    ):
                         # Set batch_is_full after making sure there are requests that can be served
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list

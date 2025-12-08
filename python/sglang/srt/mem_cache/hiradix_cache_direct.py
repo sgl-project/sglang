@@ -157,8 +157,8 @@ class HiRadixCacheDirect(RadixCache):
             return None, last_hit_node
 
         if inserted_len != cached_token_len:
-            self.mem_pool_device_allocator.free(cached_device_indices[inserted_len :])
-            cached_device_indices = cached_device_indices[: inserted_len]
+            self.mem_pool_device_allocator.free(cached_device_indices[inserted_len:])
+            cached_device_indices = cached_device_indices[:inserted_len]
             cached_token_len = inserted_len
 
         self.ongoing_load_back[new_node.id] = new_node

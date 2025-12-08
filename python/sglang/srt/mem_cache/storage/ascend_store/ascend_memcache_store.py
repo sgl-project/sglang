@@ -142,7 +142,9 @@ class AscendMemCacheStore(HiCacheStorage):
                     buffer.numel() * buffer.element_size(),
                 )
             if ret_code:
-                logger.error(f"failed to register kv buffer for device rdma, error code: {ret_code}")
+                logger.error(
+                    f"failed to register kv buffer for device rdma, error code: {ret_code}"
+                )
             else:
                 logger.info(f"register kv buffer for device rdma success: {ret_code=}")
         except TypeError as err:
