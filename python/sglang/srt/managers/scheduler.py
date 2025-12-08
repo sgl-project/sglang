@@ -1266,7 +1266,11 @@ class Scheduler(
 
         return image_inputs
 
-    def _get_multimodal_inputs(self, mm_inputs_dict: dict):
+    def _get_multimodal_inputs(self, mm_inputs_dict):
+        if isinstance(mm_inputs_dict, MultimodalInputs):
+            mm_inputs_dict.ensure_pad_values()
+            return mm_inputs_dict
+
         if self.server_args.enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:

@@ -317,6 +317,9 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    # Temporarily store input_ids for transport from TokenizerManager to Scheduler
+    input_ids: Optional[List[int]] = None
+
     @staticmethod
     def from_dict(obj: dict):
         ret = MultimodalInputs(
@@ -369,6 +372,12 @@ class MultimodalInputs:
                 setattr(ret, arg, obj[arg])
 
         return ret
+
+    def ensure_pad_values(self):
+        """Ensure pad values are set for all items."""
+        for item in self.mm_items:
+            if item.pad_value is None:
+                item.set_pad_value()
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)

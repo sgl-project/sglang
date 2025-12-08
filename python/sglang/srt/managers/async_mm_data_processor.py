@@ -51,6 +51,34 @@ class AsyncMMDataProcessor:
             else None
         )
 
+    async def _invoke(self, image_data, audio_data, input_text_or_ids, request_obj, kwargs) -> Dict[str, Any]:
+        if self.is_async:
+            # Native async implementation
+            return await self._proc_async(
+                image_data=image_data,
+                audio_data=audio_data,
+                input_text=input_text_or_ids,
+                request_obj=request_obj,
+                **kwargs,
+            )
+
+        # Synchronous fallback
+        sync_fn = getattr(self.mm_processor, "process_mm_data", None)
+        if not callable(sync_fn):
+            raise RuntimeError(
+                "mm_processor has neither 'process_mm_data_async' nor 'process_mm_data'."
+            )
+        loop = asyncio.get_running_loop()
+        fn = partial(
+            sync_fn,
+            image_data=image_data,
+            audio_data=audio_data,
+            input_text=input_text_or_ids,
+            request_obj=request_obj,
+            **kwargs,
+        )
+        return await loop.run_in_executor(self.fallback_exec, fn)
+
     async def process(
         self,
         *,
@@ -64,45 +92,20 @@ class AsyncMMDataProcessor:
         Public entrypoint: process a single multimodal request without blocking the event loop.
         """
 
-        async def _invoke() -> Dict[str, Any]:
-            if self.is_async:
-                # Native async implementation
-                return await self._proc_async(
-                    image_data=image_data,
-                    audio_data=audio_data,
-                    input_text=input_text_or_ids,
-                    request_obj=request_obj,
-                    **kwargs,
-                )
-
-            # Synchronous fallback
-            sync_fn = getattr(self.mm_processor, "process_mm_data", None)
-            if not callable(sync_fn):
-                raise RuntimeError(
-                    "mm_processor has neither 'process_mm_data_async' nor 'process_mm_data'."
-                )
-            loop = asyncio.get_running_loop()
-            fn = partial(
-                sync_fn,
-                image_data=image_data,
-                audio_data=audio_data,
-                input_text=input_text_or_ids,
-                request_obj=request_obj,
-                **kwargs,
-            )
-            return await loop.run_in_executor(self.fallback_exec, fn)
-
         # Apply optional concurrency guard
         if self.semaphore is not None:
             async with self.semaphore:
                 if self.timeout_s is not None:
-                    return await asyncio.wait_for(_invoke(), timeout=self.timeout_s)
-                return await _invoke()
+                    return await asyncio.wait_for(
+                        self._invoke(image_data, audio_data, input_text_or_ids, request_obj, **kwargs),
+                        timeout=self.timeout_s)
+                return await self._invoke(image_data, audio_data, input_text_or_ids, request_obj, **kwargs)
 
         # No concurrency guard
         if self.timeout_s is not None:
-            return await asyncio.wait_for(_invoke(), timeout=self.timeout_s)
-        return await _invoke()
+            return await asyncio.wait_for(
+                self._invoke(image_data, audio_data, input_text_or_ids, request_obj, **kwargs), timeout=self.timeout_s)
+        return await self._invoke(image_data, audio_data, input_text_or_ids, request_obj, **kwargs)
 
     def shutdown(self) -> None:
         """Gracefully shutdown resources owned by this wrapper."""
