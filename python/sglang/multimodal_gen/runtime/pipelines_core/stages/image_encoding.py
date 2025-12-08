@@ -9,14 +9,16 @@ This module contains implementations of image encoding stages for diffusion pipe
 
 import PIL
 import torch
-from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    DiagonalGaussianDistribution,
+    ParallelTiledVAE,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     normalize,
     numpy_to_pt,
