@@ -35,12 +35,14 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    TransferContext,
     get_kv_class,
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
     prepare_abort,
+    process_logprobs_for_request,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
@@ -396,17 +398,27 @@ class SchedulerDisaggregationPrefillMixin:
             self.running_batch.batch_is_full = False
     
     def notify_prefill_done(self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult) -> None:
+        # Create a shared TransferContext for all requests in this batch
+        # The context's lifecycle is managed by transfer_contexts dict in MooncakeKVManager,
+        # which will be cleaned up when transfer is complete
+        transfer_context = TransferContext(
+            batch=batch,
+            result=result,
+            metadata_buffers=self.disagg_metadata_buffers,
+            scheduler=self,
+        )
         for i, req in enumerate(batch.reqs):
-            if hasattr(req.disagg_kv_sender, "result"):
-                if req.disagg_kv_sender.result is None:
-                    req.disagg_kv_sender.result = (batch.copy(), result)
+            if hasattr(req.disagg_kv_sender, "transfer_context"):
+                if req.disagg_kv_sender.transfer_context is None:
+                    # First time: assign the shared context
+                    req.disagg_kv_sender.transfer_context = transfer_context
                     self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
                 else:
-                    # 检查chunked_req是否存在，如果不存在说明这是最后一个chunk
+                    # Already has context: check if it's the last chunk
                     if self.chunked_req is not None:
                         assert req.rid == self.chunked_req.rid
                     else:
-                        # 最后一个chunk的情况，直接发送
+                        # Last chunk: send it
                         self.send_kv_chunk(req, last_chunk=True)
             else:
                 continue
@@ -470,22 +482,19 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 else:
                     req.hidden_states_tensor = None
-                if req.return_logprob:
-                    assert extend_logprob_start_len_per_req is not None
-                    assert extend_input_len_per_req is not None
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.add_logprob_return_values(
-                        i,
-                        req,
-                        logprob_pt,
-                        next_token_ids,
-                        num_input_logprobs,
-                        logits_output,
-                    )
-                    logprob_pt += num_input_logprobs
-                # self.send_kv_chunk(req, last_chunk=True)
+                logprob_pt = process_logprobs_for_request(
+                    self,
+                    req,
+                    i,
+                    logits_output,
+                    extend_input_len_per_req,
+                    extend_logprob_start_len_per_req,
+                    logprob_pt,
+                    next_token_ids=[next_token_ids],
+                    is_last_prefill_chunk=True,
+                )
+                if not self.enable_overlap:
+                    self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:
@@ -507,21 +516,17 @@ class SchedulerDisaggregationPrefillMixin:
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
 
-                if req.return_logprob:
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    if extend_logprob_start_len < extend_input_len:
-                        # Update input logprobs.
-                        num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_input_logprob_return_values(
-                            i,
-                            req,
-                            logits_output,
-                            logprob_pt,
-                            num_input_logprobs,
-                            last_prefill_chunk=False,
-                        )
-                        logprob_pt += num_input_logprobs
+                logprob_pt = process_logprobs_for_request(
+                    self,
+                    req,
+                    i,
+                    logits_output,
+                    extend_input_len_per_req,
+                    extend_logprob_start_len_per_req,
+                    logprob_pt,
+                    next_token_ids=None,
+                    is_last_prefill_chunk=False,
+                )
 
                 # if self.enable_overlap:
                 #     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
@@ -638,8 +643,7 @@ class SchedulerDisaggregationPrefillMixin:
                     len(self.chunked_req.origin_input_ids),
                 )
             else:
-                pass
-                # self.send_kv_chunk(self.chunked_req)
+                self.send_kv_chunk(self.chunked_req)
             # chunked request keeps its rid but will get a new req_pool_idx
             if self.tp_worker.model_runner.mambaish_config is not None:
                 self.req_to_token_pool.free(
@@ -671,7 +675,6 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
-        # logger.info(f"send_kv_chunk: {req=} {last_chunk=} {end_idx=}")
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         end_idx = (
