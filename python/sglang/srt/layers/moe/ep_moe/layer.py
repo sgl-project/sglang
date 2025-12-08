@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -303,8 +304,8 @@ class DeepEPMoE(FusedMoE):
     ):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
-        assert get_bool_env_var(
-            "SGLANG_DEEPEP_BF16_DISPATCH"
+        assert (
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
         return self.quant_method.apply_deepep_ll(
             layer=self,
@@ -318,6 +319,9 @@ class DeepEPMoE(FusedMoE):
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
 
+        from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+            npu_fused_moe_without_routing_weights_bf16,
+        )
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
@@ -388,33 +392,6 @@ class DeepEPMoE(FusedMoE):
         return hidden_states
 
 
-def npu_fused_moe_without_routing_weights_bf16(
-    layer, hidden_states, group_list_type, group_list, output_dtype
-):
-    # gmm1: gate_up_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[layer.w13_weight.permute(0, 2, 1)],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )[0]
-    hidden_states = torch_npu.npu_swiglu(hidden_states)
-    # gmm2: down_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[layer.w2_weight.permute(0, 2, 1)],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )[0]
-    return hidden_states
-
-
 class NpuFuseEPMoE(DeepEPMoE):
     def __init__(
         self,
@@ -429,6 +406,7 @@ class NpuFuseEPMoE(DeepEPMoE):
         prefix: str = "",
         activation: str = "silu",
         routed_scaling_factor: Optional[float] = None,
+        **kwargs,
     ):
         super().__init__(
             num_experts=num_experts,
@@ -442,6 +420,7 @@ class NpuFuseEPMoE(DeepEPMoE):
             prefix=prefix,
             activation=activation,
             routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
         )
 
         self.quant_method.process_weights_after_loading = (
