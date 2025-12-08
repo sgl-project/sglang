@@ -1,0 +1,110 @@
+name: Slash Command Handler
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  contents: write      # Required to push commits back to PR branch
+  actions: write       # Required to rerun workflows
+  issues: write        # Required for comment reactions in some contexts
+
+jobs:
+  slash_lint_codebase:
+    # Only run if it is a PR comment with a recognized command
+    if: >
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      (
+        contains(github.event.comment.body, '/tag-run-lint') ||
+        contains(github.event.comment.body, '/run-lint')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: React to command comment (ack)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commentId = context.payload.comment.id;
+            // Add an eyes reaction to acknowledge the command
+            await github.request('POST /repos/{owner}/{repo}/issues/comments/{comment_id}/reactions', {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId,
+              content: 'eyes'
+            });
+
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/pull/${{ github.event.issue.number }}/head    
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run pre-commit hooks
+        continue-on-error: true
+        uses: pre-commit/action@v3.0.1
+
+      - name: Get PR branch name
+        id: get_branch
+        run: |
+            BRANCH_NAME=$(gh pr view ${{ github.event.issue.number }} --json headRefName --jq '.headRefName')
+            echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if there are any changes
+        id: verify_diff
+        run: |
+            git diff --quiet . || echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Commit files
+        if: steps.verify_diff.outputs.changed == 'true'
+        run: |
+            git config --local user.email "action@github.com"
+            git config --local user.name "GitHub Action"
+            git add .
+            git commit -m "[CI-Lint] Fix code style issues with pre-commit ${{ github.sha }}" -a
+            git push origin HEAD:refs/heads/${{ steps.get_branch.outputs.branch_name }}
+
+  cleanup_reaction:
+    # Always run after the main job completes (success, failure, or cancelled)
+    if: always()
+    needs: slash_lint_codebase
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove initial ack reaction
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const commentId = context.payload.comment.id;
+            // List reactions on the comment
+            const reactions = await github.rest.reactions.listForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: commentId
+            }).then(r => r.data);
+            // Find the 'eyes' reaction added by this workflow bot
+            const target = reactions.find(r => r.content === 'eyes' && r.user && r.user.login === 'github-actions[bot]');
+            if (target) {
+              try {
+                await github.rest.reactions.deleteForIssueComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: commentId,
+                  reaction_id: target.id
+                });
+                core.info(`Successfully deleted eyes reaction (${target.id})`);
+              } catch (err) {
+                // Non-fatal: reaction may already be gone or inaccessible
+                core.info(`Could not delete eyes reaction (${target.id}): ${err.message || err.status || 'unknown error'}`);
+              }
+            } else {
+              core.info('No eyes reaction from github-actions[bot] found to remove.');
+            }
