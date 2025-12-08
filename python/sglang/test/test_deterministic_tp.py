@@ -249,7 +249,7 @@ def send_prefix(
         return ret_dict
 
 
-def compare_logprobs(logprobs1, logprobs2, tolerance=1e-6):
+def compare_logprobs(logprobs1, logprobs2, tolerance=0):
     """Compare two logprobs sequences with a tolerance."""
     if len(logprobs1) != len(logprobs2):
         return False, f"Length mismatch: {len(logprobs1)} vs {len(logprobs2)}"
