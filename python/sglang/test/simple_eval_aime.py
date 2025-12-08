@@ -35,28 +35,53 @@ def extract_boxed_answer(text: str) -> Optional[str]:
     """
     Extract answer from \\boxed{answer} format.
     Returns the numeric answer as a string, or None if not found.
+
+    Handles various formats:
+    - \\boxed{123}
+    - \\boxed{ 123 }
+    - boxed{123} (without backslash)
+    - Answer: 123
+    - The answer is 123
     """
-    # Try to find \\boxed{...} pattern
+    if not text:
+        return None
+
+    # Try to find \\boxed{...} pattern (most common)
     patterns = [
         r"\\boxed\{([^}]+)\}",  # Standard LaTeX boxed
         r"\\boxed\s*\{([^}]+)\}",  # With optional whitespace
         r"boxed\{([^}]+)\}",  # Without backslash (some models do this)
+        r"\\boxed\s*(\d+)",  # Sometimes models forget the braces
     ]
 
     for pattern in patterns:
-        matches = re.findall(pattern, text)
+        matches = re.findall(pattern, text, re.IGNORECASE)
         if matches:
             # Take the last occurrence (usually the final answer)
             answer = matches[-1].strip()
-            # Extract just the number
+            # Extract just the number from the answer
             num_match = re.search(r"\d+", answer)
             if num_match:
                 return num_match.group(0)
 
-    # Fallback: try to find any 3-digit number at the end
-    last_num = re.findall(r"\b\d{1,3}\b", text)
-    if last_num:
-        return last_num[-1]
+    # Fallback: Look for "Answer: 123" or "The answer is 123" patterns
+    answer_patterns = [
+        r"[Aa]nswer\s*:\s*(\d+)",
+        r"[Aa]nswer\s+is\s+(\d+)",
+        r"[Ff]inal\s+answer\s*:\s*(\d+)",
+    ]
+
+    for pattern in answer_patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return matches[-1]
+
+    # Last resort: try to find any number at the end of the text
+    # Look in the last 100 characters
+    text_end = text[-100:]
+    last_nums = re.findall(r"\b\d{1,3}\b", text_end)
+    if last_nums:
+        return last_nums[-1]
 
     return None
 
