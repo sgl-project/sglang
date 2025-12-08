@@ -7,15 +7,13 @@ import os
 import unittest
 
 import requests
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoTokenizer
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_IMAGE_URL,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    download_image_with_retry,
     popen_launch_server,
 )
 
@@ -23,11 +21,8 @@ from sglang.test.test_utils import (
 class TestDeepSeekOCR(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.image_url = DEFAULT_IMAGE_URL
-        cls.image = download_image_with_retry(cls.image_url)
         cls.model = "deepseek-ai/DeepSeek-OCR"
         cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
-        cls.processor = AutoProcessor.from_pretrained(cls.model, trust_remote_code=True)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.common_args = [
             "--device",
@@ -44,7 +39,6 @@ class TestDeepSeekOCR(CustomTestCase):
                 *cls.common_args,
             ],
         )
-        cls.eos_token_id = [cls.tokenizer.eos_token_id]
 
     @classmethod
     def tearDownClass(cls):
@@ -56,7 +50,7 @@ class TestDeepSeekOCR(CustomTestCase):
             self.base_url + "/generate",
             json={
                 "text": "<image>\n<|grounding|>Convert the document to pure text.",
-                "image_data": self.image,
+                "image_data": "../../examples/assets/example_image.png",
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": max_new_tokens,
@@ -96,7 +90,7 @@ class TestDeepSeekOCR(CustomTestCase):
 
         print("=" * 100)
 
-    def test_triton_moe(self):
+    def test_moe(self):
         self.run_decode()
 
 

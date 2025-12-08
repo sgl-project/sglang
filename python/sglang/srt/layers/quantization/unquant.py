@@ -500,15 +500,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
-            # syl-kernel-xpu path
+            # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
-            from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
-
             topk_weights, topk_ids, _ = topk_output
-            x, topk_weights = apply_topk_weights_cpu(
-                moe_runner_config.apply_router_weight_on_input, topk_weights, x
-            )
             output = fused_experts(
                 x,
                 layer.w13_weight,
