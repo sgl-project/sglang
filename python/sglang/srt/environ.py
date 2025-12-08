@@ -398,11 +398,15 @@ _convert_SGL_to_SGLANG()
 
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
-    "Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
 )
 _warn_deprecated_env_to_cli_flag(
     "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
-    "Please use '--fp8-gemm-backend=cutlass' instead.",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
 )
 
 
