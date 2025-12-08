@@ -84,7 +84,7 @@ class SparseKVCacheManager:
         self.bitmap = torch.full(
             (max_pool_size, server_args.model_config.context_len),
             -1,
-            dtype=torch.int32,
+            dtype=torch.int16,
             device=server_args.device,
         )
         self.req_states = None

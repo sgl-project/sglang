@@ -246,6 +246,7 @@ class SparseCoordinator:
                 forward_batch.out_cache_loc[offload_mask],
                 forward_batch.seq_lens[offload_mask] - 1,
             )
+            # self.sparse_kv_cache_manager.check_sparse_offload_progress()
 
     def _should_check_offload(self, forward_batch: "ForwardBatch") -> bool:
         return (

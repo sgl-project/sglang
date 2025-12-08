@@ -263,7 +263,7 @@ def truncate_kv_cache_after_prefill(req: "Req", req_to_token_pool, tree_cache):
 
     # Only truncate if the request's prompt length is greater than the HIERARCHICAL_NSA_DECODE_MAX_TOKENS
     current_len = len(req.origin_input_ids)
-    if current_len > HIERARCHICAL_NSA_DECODE_MAX_TOKENS:
+    if current_len >= HIERARCHICAL_NSA_DECODE_MAX_TOKENS:
         old_prefix_len = len(req.prefix_indices)
 
         page_size = tree_cache.page_size
@@ -616,7 +616,6 @@ def _write_index_k_indices(
             out_index_cache_loc[pt : pt + extend_len].to(torch.int32),
         )
         pt += extend_len
-        logger.info(f"[NSA Exten] write for req_idx: {req_idx}, prefix_len: {prefix_len}, seq_len: {seq_len}, extend_len: {extend_len}")
 
 
 def _alloc_decode_standard(batch: ScheduleBatch, token_per_req: int) -> tuple:
@@ -716,7 +715,8 @@ def _alloc_decode_nsa(batch: ScheduleBatch, token_per_req: int) -> tuple:
 
         out_cache_loc[non_truncated_indices] = non_truncated_out.to(torch.int32)
         batch.req_to_token_pool.write(
-            (batch.req_pool_indices, locs[non_truncated_indices]), out_cache_loc[non_truncated_indices]
+            (batch.req_pool_indices, locs[non_truncated_indices]),
+            out_cache_loc[non_truncated_indices],
         )
 
     # Allocate index_k for all requests
@@ -737,7 +737,6 @@ def _alloc_decode_nsa(batch: ScheduleBatch, token_per_req: int) -> tuple:
         )
         logger.error(error_msg)
         raise RuntimeError(error_msg)
-
 
     # Write index_k indices
     batch.req_to_token_pool.write_index_token(

@@ -64,7 +64,7 @@ def nsa_sparse_diff_triton_kernel(
     sparse_mask_val = tl.load(sparse_mask_ptr + bid)
 
     if sparse_mask_val == 0:
-        page_table_ptr = page_table_ptr + page_table_stride * bid
+        page_table_ptr = page_table_ptr + page_table_stride * req_pool_index
         topk_indices_ptr = curr_top_k_result_ptr + curr_top_k_result_stride * bid
         result_ptr = curr_device_indices_ptr + curr_device_indices_stride * bid
 
@@ -72,7 +72,6 @@ def nsa_sparse_diff_triton_kernel(
         mask = loaded_topk_indices >= 0
         loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
         tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
-        # tl.store(result_ptr + offset, -1, mask=~mask)
         return
 
     # Load current top-k (save for later update)
@@ -103,11 +102,9 @@ def nsa_sparse_diff_triton_kernel(
             mask=mask,
         )
     else:
-        # Use atomic_max to ensure deterministic result when prev_top_k_result has duplicates
-        tl.atomic_max(
-            bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset.to(tl.int32)
-        )
+        tl.store(bitmap_ptr + bitmap_stride * bid + prev_top_k_result, offset)
 
+        tl.debug_barrier()
         prev_out_cache_loc_index = tl.load(
             bitmap_ptr + bitmap_stride * bid + seq_len - 1
         )
@@ -272,6 +269,10 @@ def nsa_sparse_diff_triton_kernel(
 
     # Update state
     tl.store(prev_top_k_result_start_ptr + offset, tmp_curr_top_k_result)
+    tl.store(
+        curr_top_k_result_ptr + curr_top_k_result_stride * bid + offset,
+        tmp_curr_top_k_result,
+    )
     curr_device_indices = tl.load(
         curr_device_indices_ptr + curr_device_indices_stride * bid + offset
     )
