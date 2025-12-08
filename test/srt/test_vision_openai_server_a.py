@@ -145,16 +145,6 @@ class TestKimiVLServer(ImageOpenAITestMixin):
         pass
 
 
-@unittest.skip(
-    "Disabling this test to speed up CI. Prefer to test it within nightly test."
-)
-class TestGLM41VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
-    model = "zai-org/GLM-4.1V-9B-Thinking"
-    extra_args = [
-        "--reasoning-parser=glm45",
-    ]
-
-
 class TestGLM46VServer(ImageOpenAITestMixin, VideoOpenAITestMixin):
     model = "zai-org/GLM-4.6V-Flash"
     extra_args = [
