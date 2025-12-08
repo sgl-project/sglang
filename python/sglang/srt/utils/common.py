@@ -2720,7 +2720,8 @@ def is_fa3_default_architecture(hf_config):
         "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
-        "Qwen3VLForConditionalGeneration" "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
     }
 
     return architectures[0] in default_archs
