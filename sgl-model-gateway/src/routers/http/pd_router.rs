@@ -14,17 +14,17 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::{
-    events::{self, Event},
-    pd_types::api_path,
-};
+use super::pd_types::api_path;
 use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, RetryExecutor, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
     },
-    metrics::RouterMetrics,
-    otel_trace::inject_trace_context_http,
+    observability::{
+        events::{self, Event},
+        metrics::RouterMetrics,
+        otel_trace::inject_trace_context_http,
+    },
     policies::{LoadBalancingPolicy, PolicyRegistry},
     protocols::{
         chat::{ChatCompletionRequest, ChatMessage, MessageContent},

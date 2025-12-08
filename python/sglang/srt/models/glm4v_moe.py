@@ -38,9 +38,9 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
     ) -> None:
         nn.Module.__init__(self)
 
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         self.pp_group = get_pp_group()
         self.config = config
+        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config

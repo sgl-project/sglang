@@ -15,14 +15,16 @@ use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
-use super::events::{self, Event};
 use crate::{
     config::types::RetryConfig,
     core::{
         is_retryable_status, ConnectionMode, RetryExecutor, Worker, WorkerRegistry, WorkerType,
     },
-    metrics::RouterMetrics,
-    otel_trace::inject_trace_context_http,
+    observability::{
+        events::{self, Event},
+        metrics::RouterMetrics,
+        otel_trace::inject_trace_context_http,
+    },
     policies::PolicyRegistry,
     protocols::{
         chat::ChatCompletionRequest,
