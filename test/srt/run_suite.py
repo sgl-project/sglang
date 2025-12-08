@@ -180,8 +180,8 @@ suites = {
         TestFile("test_eagle_infer_beta_dp_attention.py", 300),
     ],
     # "per-commit-8-gpu-b200": [
-        # TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
-    ],
+    #     TestFile("test_mistral_large3_basic.py", 275),  # Moved to nightly - large model
+    # ],
     "per-commit-4-gpu-gb200": [
         TestFile("test_cutedsl_moe.py", 300),
         TestFile("test_deepseek_v3_cutedsl_4gpu.py", 590),
@@ -216,6 +216,7 @@ suites = {
         TestFile("test_vision_openai_server_common.py"),
         TestFile("test_profile_v2.py"),
         TestFile("models/test_ministral3_models.py"),
+        TestFile("test_mistral_large3_basic.py"),
     ],
 }
 
