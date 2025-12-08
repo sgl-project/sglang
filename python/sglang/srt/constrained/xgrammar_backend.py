@@ -73,16 +73,11 @@ class XGrammarGrammar(BaseGrammarObject):
     def accept_token(self, token: int):
         if not self.is_terminated():
             self.current_token = token
-            accepted = self.matcher.accept_token(token)
-            if not accepted:
-                # log for debugging
-                raise ValueError(
-                    f"Tokens not accepted: {token}\n"
-                    f"Accepted tokens: {self.accepted_tokens}\n"
-                    f"Key string: {self.key_string}"
-                )
-            else:
+            is_accepted = self.matcher.accept_token(token)
+            if is_accepted:
                 self.accepted_tokens.append(token)
+            return is_accepted
+        return False
 
     def rollback(self, k: int):
         self.matcher.rollback(k)
