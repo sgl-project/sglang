@@ -10,16 +10,16 @@ from diffusers.models.attention_processor import (
     AttnAddedKVProcessor,
     AttnProcessor,
 )
-from diffusers.models.autoencoders.vae import (
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
+
+from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
+from sglang.multimodal_gen.runtime.models.vaes.common import (
     Decoder,
     DecoderOutput,
     DiagonalGaussianDistribution,
     Encoder,
+    ParallelTiledVAE,
 )
-from diffusers.models.modeling_outputs import AutoencoderKLOutput
-
-from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
-from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
 
 class AutoencoderKLFlux2(nn.Module, ParallelTiledVAE):

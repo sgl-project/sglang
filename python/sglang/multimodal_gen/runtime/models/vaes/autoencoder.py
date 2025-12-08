@@ -12,16 +12,16 @@ from diffusers.models.attention_processor import (
     AttnProcessor,
     FusedAttnProcessor2_0,
 )
-from diffusers.models.autoencoders.vae import (
+from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from torch import nn
+
+from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
+from sglang.multimodal_gen.runtime.models.vaes.common import (
     Decoder,
     DecoderOutput,
     DiagonalGaussianDistribution,
     Encoder,
 )
-from diffusers.models.modeling_outputs import AutoencoderKLOutput
-from torch import nn
-
-from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 
 
 class AutoencoderKL(nn.Module):

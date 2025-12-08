@@ -6,14 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.activations import get_activation
-from diffusers.models.autoencoders.vae import (
-    DecoderOutput,
-    DiagonalGaussianDistribution,
-)
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.models.vaes.common import (
+    DecoderOutput,
+    DiagonalGaussianDistribution,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
