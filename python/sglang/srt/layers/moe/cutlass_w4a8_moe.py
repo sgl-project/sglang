@@ -291,12 +291,6 @@ def cutlass_w4a8_moe_deepep_normal(
     k = w1_q.size(2) * 2  # w1_q is transposed and packed
     n = w2_q.size(2) * 2  # w2_q is transposed and packed
     topk = topk_ids_.size(1)
-
-    num_experts = w1_q.size(0)
-    m = a.size(0)
-    k = w1_q.size(2) * 2
-    n = w2_q.size(2) * 2
-    topk = topk_ids_.size(1)
     device = a.device
 
     reorder_topk_ids, src2dst, _ = deepep_run_moe_deep_preprocess(
