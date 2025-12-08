@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     core::{BasicWorkerBuilder, CircuitState, DPAwareWorkerBuilder},
-    metrics::RouterMetrics,
+    observability::metrics::RouterMetrics,
     protocols::worker_spec::WorkerInfo,
     routers::grpc::client::GrpcClient,
 };
