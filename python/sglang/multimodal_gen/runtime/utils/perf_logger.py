@@ -1,3 +1,4 @@
+# Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import dataclasses
 import json
 import logging
@@ -183,7 +184,7 @@ class StageProfiler:
 
 class PerformanceLogger:
     """
-    A global utility class for logging performance metrics
+    A global utility class for logging performance metrics for all request, categorized by request-id.
 
     Serves both as a runtime logger (stream to file) and a dump utility.
 
@@ -198,7 +199,10 @@ class PerformanceLogger:
         meta: Optional[Dict[str, Any]] = None,
         tag: str = "benchmark_dump",
     ):
-        """Dumps the standardized benchmark report of a request to a single file."""
+        """
+        Static method to dump a standardized benchmark report to a file.
+        Eliminates duplicate logic in CLI/Client code.
+        """
         formatted_steps = [
             {"name": name, "duration_ms": duration_ms}
             for name, duration_ms in timings.stages.items()
@@ -230,7 +234,9 @@ class PerformanceLogger:
         timings: "RequestTimings",
         tag: str = "total_inference_time",
     ):
-        """Appends the log for a completed request to the performance_log file"""
+        """logs the stage metrics and total duration for a completed request
+        to the performance_log file.
+        """
         formatted_stages = [
             {"name": name, "execution_time_ms": duration_ms}
             for name, duration_ms in timings.stages.items()
