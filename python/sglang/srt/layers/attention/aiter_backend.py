@@ -1276,7 +1276,7 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=self.input_dtype,
             )
         else:
-            o = torch.empty_like(q, dtype=torch.bfloat16)
+            o = torch.empty_like(q, dtype=self.input_dtype)
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
