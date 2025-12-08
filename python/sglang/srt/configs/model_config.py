@@ -100,7 +100,7 @@ class ModelConfig:
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
         sampling_defaults: str = "openai",
         quantize_and_serve: bool = False,
-        moe_router_dtype: str = "float32",
+        moe_router_dtype: str = "auto",
         is_mtp: bool = False,
         draft_model_idx: int = 0,
     ) -> None:
@@ -232,19 +232,6 @@ class ModelConfig:
             "MiMoV2FlashForCausalLM",
             "MiMoV2MTP",
         ]
-        if self.is_hybrid_swa_compress:
-            self.attention_chunk_size = self.hf_text_config.sliding_window_size
-            # TODO(yingchun): seems useless, keep is_hybrid_swa as True is enough, the swa / full ratio
-            #  will be calculated automatically before allocating KV cache.
-            self.is_hybrid_swa = (
-                (
-                    self.hf_text_config.sliding_window_size
-                    * len(self.swa_attention_layer_ids)
-                    / (self.context_len * len(self.full_attention_layer_ids))
-                )
-                if len(self.full_attention_layer_ids) > 0
-                else True
-            )
 
         # Verify quantization
         self._verify_quantization()

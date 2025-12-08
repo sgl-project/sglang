@@ -253,7 +253,7 @@ class ServerArgs:
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
     trust_remote_code: bool = False
-    moe_router_dtype: str = "float32"
+    moe_router_dtype: str = "auto"
     context_length: Optional[int] = None
     is_embedding: bool = False
     enable_multimodal: Optional[bool] = None

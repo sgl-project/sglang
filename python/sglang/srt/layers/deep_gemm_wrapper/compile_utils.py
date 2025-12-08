@@ -108,7 +108,6 @@ def _maybe_compile_deep_gemm_one_type_all(
             f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
         )
 
-        start = time.time()
         _compile_deep_gemm_one_type_all(
             kernel_type=kernel_type,
             n=n,
@@ -116,11 +115,6 @@ def _maybe_compile_deep_gemm_one_type_all(
             num_groups=num_groups,
             m_list=_BUILTIN_M_LIST,
         )
-        cost = time.time() - start
-        if cost > 30:
-            logger.warning(
-                f"DeepGEMM JIT Compiling for {query_key} takes {cost:.2f}s, which may cause deepep timeout"
-            )
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced

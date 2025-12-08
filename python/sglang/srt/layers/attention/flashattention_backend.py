@@ -25,12 +25,6 @@ from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcach
 
 from sglang.srt.utils import get_bool_env_var
 
-_use_update_local_attn_cuda = get_bool_env_var(
-    "SGLANG_USE_UPDATE_LOCAL_ATTN_METADATA_CUDA"
-)
-if _use_update_local_attn_cuda:
-    pass
-
 
 @dataclass
 class FlashAttentionMetadata:
