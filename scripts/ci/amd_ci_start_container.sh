@@ -151,7 +151,7 @@ echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   $CACHE_VOLUME \
-  --ipc=host --group-add video \
+  --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
   -e HF_TOKEN="${HF_TOKEN:-}" \
