@@ -7,7 +7,11 @@ import numpy as np
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.dp_attention import get_dp_local_info, is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_rank,
+    get_dp_local_info,
+    is_dp_attention_enabled,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import get_global_server_args
 
@@ -121,7 +125,13 @@ class RoutedExpertsCapturer(ABC):
     ):
         raise NotImplementedError
 
-    def sync_fwd_experts_buffer_DtoH(self, batch: int, loc: torch.Tensor):
+    def sync_fwd_experts_buffer_DtoH(
+        self,
+        device_loc: torch.Tensor,
+        cpu_loc: torch.Tensor,
+        run_cuda_graph: bool,
+        cuda_graph_batch: int,
+    ):
         raise NotImplementedError
 
     @contextmanager
@@ -156,11 +166,20 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
 
     def sync_fwd_experts_buffer_DtoH(
-        self, device_loc: torch.Tensor, cpu_loc: torch.Tensor
+        self,
+        device_loc: torch.Tensor,
+        cpu_loc: torch.Tensor,
+        run_cuda_graph: bool,
+        cuda_graph_batch: int,
     ):
         if is_dp_attention_enabled():
             local_start_pos, local_num_tokens = get_dp_local_info(self.forward_batch)
-            local_end_pos = local_start_pos + local_num_tokens
+            # handle with cuda graph padding
+            if run_cuda_graph:
+                local_start_pos = get_attention_dp_rank() * cuda_graph_batch
+                local_end_pos = local_start_pos + local_num_tokens
+            else:
+                local_end_pos = local_start_pos + local_num_tokens
         else:
             local_start_pos = 0
             local_end_pos = device_loc.shape[0]
@@ -182,7 +201,6 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
     @contextmanager
     def with_forward(self, forward_batch):
-        self.forward_batch = None
         self.forward_batch = forward_batch
         yield
 
@@ -209,7 +227,11 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         pass
 
     def sync_fwd_experts_buffer_DtoH(
-        self, device_loc: torch.Tensor, cpu_loc: torch.Tensor
+        self,
+        device_loc: torch.Tensor,
+        cpu_loc: torch.Tensor,
+        run_cuda_graph: bool,
+        cuda_graph_batch: int,
     ):
         pass
 

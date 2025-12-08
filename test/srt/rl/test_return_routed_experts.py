@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import unittest
 from typing import List
 
 import aiohttp
@@ -36,12 +37,18 @@ class TestReturnRoutedExperts(CustomTestCase):
             "--disable-radix-cache",
             "--tp",
             4,
+            "--dp",
+            4,
+            "--enable-dp-attention",
         ]
         cls.reference_args = [
             "--enable-return-routed-experts",
             "--enable-deterministic-inference",
             "--tp",
             4,
+            "--dp",
+            4,
+            "--enable-dp-attention",
         ]
         cls.sampling_args = {
             "temperature": 0,
@@ -92,7 +99,9 @@ class TestReturnRoutedExperts(CustomTestCase):
         logger.info(
             f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
         )
-        # print(f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})")
+        print(
+            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+        )
         assert (
             num_mismatches / num_baseline_topks < 0.05
         ), f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
@@ -165,3 +174,7 @@ def compare_baseline_w_reference(baseline, reference):
                         f"Duplicates experts ids found: Baseline({len_bsl}): {bsl_topk} vs Reference({len_ref}): {ref_topk}"
                     )
     return num_total_mismatches
+
+
+if __name__ == "__main__":
+    unittest.main()
