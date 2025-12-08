@@ -119,7 +119,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     parameters[param_name] = param_value.strip()
         return parameters
 
-    def parse_parameters_partially(self, invoke_content: str) -> str:
+    def _parse_parameters_partially(self, invoke_content: str) -> str:
         invoke_content_stripped = invoke_content.strip()
         # 1. check json format
         if invoke_content_stripped.startswith("{"):
@@ -128,19 +128,22 @@ class DeepSeekV32Detector(BaseFormatDetector):
         # 2. check xml format
         xml_param_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)(</｜DSML｜parameter>|$)'
         xml_param_matches = re.findall(xml_param_regex, invoke_content, re.DOTALL)
-        parameters_str = "{"
+        parameters_str = "{"  # convert xml to json str
         for param_name, param_type, param_value, is_param_end in xml_param_matches:
             # Convert value based on type
             if param_type == "true":  # string type
-                parameters_str += f"{param_name}: {param_value}"
+                parameters_str += f'"{param_name}": "{param_value}'
             else:
                 # Try to parse as JSON for other types
                 try:
-                    parameters_str += f"{param_name}: {json.loads(param_value.strip())}"
+                    parameters_str += (
+                        f'"{param_name}": {json.loads(param_value.strip())}'
+                    )
                 except (json.JSONDecodeError, ValueError):
-                    parameters_str[param_name] = param_value.strip()
-
-        return ""
+                    parameters_str += f'"{param_name}": "{param_value.strip()}'
+            if is_param_end:
+                parameters_str += '"'
+        return parameters_str
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -229,87 +232,88 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         calls: list[ToolCallItem] = []
         try:
-            # Try to match an invoke block (may be partial)
-            invoke_match = re.search(
-                pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
-                string=current_text,
-                flags=re.DOTALL,
-            )
-
-            func_name = invoke_match.group(1).strip()
-            invoke_content = invoke_match.group(2)
-
-            def parse_invoke_content_increment(invoke_content: str):
-                pass
-
-            func_args_raw = parse_invoke_content_increment(invoke_content)
-
-            # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
-            is_tool_end = bool(invoke_match.group(3))
-
-            # Initialize state if this is the first tool call
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
-
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
-
-            if not self.current_tool_name_sent:
-                calls.append(
-                    ToolCallItem(
-                        tool_index=self.current_tool_id,
-                        name=func_name,
-                        parameter="",
-                    )
+            while True:
+                # Try to match an invoke block (may be partial)
+                invoke_match = re.search(
+                    pattern=r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)',
+                    string=current_text,
+                    flags=re.DOTALL,
                 )
-                self.current_tool_name_sent = True
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": func_name,
-                    "arguments": {},
-                }
-            else:
-                argument_diff = (
-                    func_args_raw[len(self._last_arguments) :]
-                    if func_args_raw.startswith(self._last_arguments)
-                    else func_args_raw
-                )
-                if argument_diff:
+                if not invoke_match:
+                    break
+
+                func_name = invoke_match.group(1).strip()
+                invoke_content = invoke_match.group(2)
+                # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
+                is_tool_end = bool(invoke_match.group(3))
+
+                func_args_raw = self._parse_parameters_partially(invoke_content)
+                if is_tool_end:
+                    func_args_raw += "}"
+
+                # Initialize state if this is the first tool call
+                if self.current_tool_id == -1:
+                    self.current_tool_id = 0
+                    self.prev_tool_call_arr = []
+                    self.streamed_args_for_tool = [""]
+
+                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                    self.prev_tool_call_arr.append({})
+                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                    self.streamed_args_for_tool.append("")
+
+                if not self.current_tool_name_sent:
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
-                            name=None,
-                            parameters=argument_diff,
+                            name=func_name,
+                            parameter="",
                         )
                     )
-                    self._last_arguments += argument_diff
-                    self.streamed_args_for_tool[self.current_tool_id] += argument_diff
+                    self.current_tool_name_sent = True
+                    self.prev_tool_call_arr[self.current_tool_id] = {
+                        "name": func_name,
+                        "arguments": {},
+                    }
+                else:
+                    argument_diff = (
+                        func_args_raw[len(self._last_arguments) :]
+                        if func_args_raw.startswith(self._last_arguments)
+                        else func_args_raw
+                    )
+                    if argument_diff:
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=None,
+                                parameters=argument_diff,
+                            )
+                        )
+                        self._last_arguments += argument_diff
+                        self.streamed_args_for_tool[
+                            self.current_tool_id
+                        ] += argument_diff
 
-                if _is_complete_json(func_args_raw):
-                    # Update the stored arguments
-                    try:
-                        parsed_args = json.loads(func_args_raw)
-                        self.prev_tool_call_arr[self.current_tool_id][
-                            "arguments"
-                        ] = parsed_args
-                    except json.JSONDecodeError:
-                        pass
+                    if _is_complete_json(func_args_raw):
+                        # Update the stored arguments
+                        try:
+                            parsed_args = json.loads(func_args_raw)
+                            self.prev_tool_call_arr[self.current_tool_id][
+                                "arguments"
+                            ] = parsed_args
+                        except json.JSONDecodeError:
+                            pass
 
-                    if is_tool_end:
-                        # Remove the completed tool call from buffer, keep any remaining content
-                        self._buffer = current_text[invoke_match.end(3) :]
-                    else:
-                        self._buffer = ""
+                        if is_tool_end:
+                            # Remove the completed tool call from buffer, keep any remaining content
+                            self._buffer = current_text[invoke_match.end(3) :]
+                        else:
+                            self._buffer = ""
 
-                    result = StreamingParseResult(normal_text="", calls=calls)
-                    # reset state
-                    self.current_tool_id += 1
-                    self._last_arguments = ""
-                    self.current_tool_name_sent = False
-                    return result
+                        # reset state
+                        self.current_tool_id += 1
+                        self._last_arguments = ""
+                        self.current_tool_name_sent = False
 
             # No more invoke blocks found
             return StreamingParseResult(normal_text="", calls=calls)
@@ -322,5 +326,5 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return lambda name: StructureInfo(
             begin=f'<｜DSML｜invoke name="{name}">',
             end="</｜DSML｜invoke>",
-            trigger=f'<｜DSML｜invoke name="{name}">',
+            trigger=f"<｜DSML｜",
         )
