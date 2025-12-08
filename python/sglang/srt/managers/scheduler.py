@@ -1204,12 +1204,11 @@ class Scheduler(
 
     def _process_and_broadcast_mm_inputs(
         self,
-        raw_mm_inputs: Optional[dict],
+        mm_inputs: MultimodalInputs | None,
     ):
         """Materialize MultimodalInputs once on the entry rank and broadcast to others.
 
         Entry rank:
-        - constructs MultimodalInputs.from_dict(raw_mm_inputs) once
         - broadcasts to other ranks in self.cpu_group (if world_size > 1)
 
         Non-entry ranks:
@@ -1219,7 +1218,7 @@ class Scheduler(
         Returns:
             MultimodalInputs | None
         """
-        if raw_mm_inputs is None:
+        if mm_inputs is None:
             return None
 
         group_world_size = 1
@@ -1244,15 +1243,13 @@ class Scheduler(
         # handling of other messages. For example, CPU hits 99.9% can significantly
         # increase the CUDA kernel launch time.
         if self.is_entry_rank:
-            # Only the entry rank materializes once from dict.
-            image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
             # Broadcast to other TP ranks (use src=0 within the group).
             if group_world_size > 1:
-                obj_list = [image_inputs]
+                obj_list = [mm_inputs]
                 torch.distributed.broadcast_object_list(
                     obj_list, src=self.entry_rank, group=self.cpu_group
                 )
-                image_inputs = obj_list[0]
+                mm_inputs = obj_list[0]
         else:
             # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
             if group_world_size > 1:
@@ -1260,21 +1257,17 @@ class Scheduler(
                 torch.distributed.broadcast_object_list(
                     obj_list, src=self.entry_rank, group=self.cpu_group
                 )
-                image_inputs = obj_list[0]
-            else:
-                image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
+                mm_inputs = obj_list[0]
 
-        return image_inputs
+        return mm_inputs
 
-    def _get_multimodal_inputs(self, mm_inputs_dict):
-        if isinstance(mm_inputs_dict, MultimodalInputs):
-            mm_inputs_dict.ensure_pad_values()
-            return mm_inputs_dict
+    def _get_multimodal_inputs(self, mm_inputs: MultimodalInputs):
+        mm_inputs.ensure_pad_values()
 
         if self.server_args.enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
+            return self._process_and_broadcast_mm_inputs(mm_inputs)
         else:
-            return MultimodalInputs.from_dict(mm_inputs_dict)
+            return mm_inputs
 
     def handle_generate_request(
         self,
@@ -1358,14 +1351,14 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            mm_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings
             req.origin_input_ids = self.pad_input_ids_func(
-                req.origin_input_ids, image_inputs
+                req.origin_input_ids, mm_inputs
             )
-            req.extend_image_inputs(image_inputs)
+            req.extend_mm_inputs(mm_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
@@ -1598,7 +1591,7 @@ class Scheduler(
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids, image_inputs
             )
-            req.extend_image_inputs(image_inputs)
+            req.extend_mm_inputs(image_inputs)
 
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(

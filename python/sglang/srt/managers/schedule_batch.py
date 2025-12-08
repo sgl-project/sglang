@@ -320,59 +320,6 @@ class MultimodalInputs:
     # Temporarily store input_ids for transport from TokenizerManager to Scheduler
     input_ids: Optional[List[int]] = None
 
-    @staticmethod
-    def from_dict(obj: dict):
-        ret = MultimodalInputs(
-            mm_items=obj["mm_items"],
-        )
-
-        assert isinstance(ret.mm_items, list)
-        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
-
-        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            from sglang.srt.managers.mm_utils import (
-                init_feature_buffer,
-                is_feature_buffer_initialized,
-                reset_buffer_offset,
-                try_add_to_buffer,
-            )
-
-            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-            if not is_feature_buffer_initialized():
-                init_feature_buffer(device)
-            reset_buffer_offset()
-            for item in ret.mm_items:
-                if item.feature is not None:
-                    if isinstance(item.feature, torch.Tensor):
-                        item.feature = try_add_to_buffer(item.feature)
-
-        for item in ret.mm_items:
-            item.set_pad_value()
-
-        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            for item in ret.mm_items:
-                if item.feature is not None:
-                    item.feature = item.feature.to("cpu", non_blocking=True)
-
-        optional_args = [
-            "mrope_positions",
-            "mrope_position_delta",
-            "im_token_id",
-            "im_start_id",
-            "im_end_id",
-            "video_token_id",
-            "slice_start_id",
-            "slice_end_id",
-            "audio_start_id",
-            "audio_end_id",
-            "audio_token_id",
-        ]
-        for arg in optional_args:
-            if arg in obj:
-                setattr(ret, arg, obj[arg])
-
-        return ret
-
     def ensure_pad_values(self):
         """Ensure pad values are set for all items."""
         for item in self.mm_items:
@@ -778,7 +725,7 @@ class Req:
         )
         self.last_tic = now
 
-    def extend_image_inputs(self, image_inputs):
+    def extend_mm_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
         else:
