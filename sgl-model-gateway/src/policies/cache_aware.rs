@@ -222,6 +222,7 @@ impl CacheAwarePolicy {
         min_load: usize,
     ) -> usize {
         // Log load balancing trigger
+        // TODO may use `&str`
         let worker_loads: Vec<(String, usize)> = workers
             .iter()
             .map(|w| (w.url().to_string(), w.load()))
