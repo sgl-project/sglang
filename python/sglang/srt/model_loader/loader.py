@@ -485,14 +485,20 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
         if self.load_config.draft_model_idx is not None:
+            draft_model_idx = (
+                self.load_config.draft_model_idx
+                if self.load_config.draft_model_idx < 3
+                else 2
+            )
             import re
+
             pattern = r"model.mtp.layers.(\d+)."
             filtered_weights = []
             for name, tensor in weights_iterator:
                 group = re.match(pattern, name)
                 if group is not None:
                     idx = int(group.group(1))
-                    if idx != self.load_config.draft_model_idx:
+                    if idx != draft_model_idx:
                         continue
                     new_name = name.replace(group.group(), "model.mtp.layers.0.")
                 else:
