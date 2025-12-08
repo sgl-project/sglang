@@ -1,18 +1,5 @@
 #!/bin/bash
 # Install the dependency in CI.
-
-PYTHON_LIB_PATH=$(python3 -c "import site; print(site.getsitepackages()[0])")
-FLASH_ATTN_PATH="${PYTHON_LIB_PATH}/flash_attn"
-
-if [ -d "$FLASH_ATTN_PATH" ]; then
-    echo "8 Directory $FLASH_ATTN_PATH exists. Removing..."
-    rm -rf "$FLASH_ATTN_PATH"
-else
-    echo "11 Directory $FLASH_ATTN_PATH does not exist."
-fi
-
-rm -rf $FLASH_ATTN_PATH
-
 set -euxo pipefail
 
 IS_BLACKWELL=${IS_BLACKWELL:-0}
