@@ -612,12 +612,8 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
 
         set(MODIFIED_CONTENT "${FILE_CONTENT}")
 
-        string(REPLACE "from flash_attn.cute import "
-                       "from flash_attn_origin.cute import "
-                       MODIFIED_CONTENT "${MODIFIED_CONTENT}")
-
-        string(REPLACE "import flash_attn.cute"
-                       "import flash_attn_origin.cute"
+        string(REPLACE "flash_attn.cute"
+                       "flash_attn_origin.cute"
                        MODIFIED_CONTENT "${MODIFIED_CONTENT}")
 
         if (NOT FILE_CONTENT STREQUAL MODIFIED_CONTENT)
