@@ -17,7 +17,6 @@ import os
 import random
 import unittest
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -125,8 +124,8 @@ class TestOriginalLogprob(unittest.TestCase):
         vocab_size = self.tokenizer.vocab_size
 
         for env_val in ["True", "False"]:
-            with self.subTest(return_original_logprob=env_val):
-                os.environ["RETURN_ORIGINAL_LOGPROB"] = env_val
+            with self.subTest(SGLANG_RETURN_ORIGINAL_LOGPROB=env_val):
+                os.environ["SGLANG_RETURN_ORIGINAL_LOGPROB"] = env_val
 
                 # ----- SGLang side -----
                 sgl_engine = sgl.Engine(

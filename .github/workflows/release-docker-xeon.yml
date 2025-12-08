@@ -31,5 +31,5 @@ jobs:
           version=$(cat python/sglang/version.py | cut -d'"' -f2)
           tag=v${version}-xeon
 
-          docker build . -f docker/Dockerfile.xeon  -t lmsysorg/sglang:${tag} --no-cache
+          docker build . -f docker/xeon.Dockerfile  -t lmsysorg/sglang:${tag} --no-cache
           docker push lmsysorg/sglang:${tag}

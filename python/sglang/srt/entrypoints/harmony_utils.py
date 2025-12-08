@@ -3,10 +3,10 @@
 # Adapted from vLLM: https://github.com/vllm-project/vllm/blob/1b9902806915040ac9b3029f2ab7522ec505afc3/vllm/entrypoints/harmony_utils.py
 # Slight differences in processing chat messages
 import datetime
-import json
 from collections.abc import Iterable
 from typing import Literal, Optional, Union
 
+import orjson
 from openai.types.responses import (
     ResponseOutputItem,
     ResponseOutputMessage,
@@ -228,7 +228,7 @@ def parse_output_message(message: Message):
         if len(message.content) != 1:
             raise ValueError("Invalid number of contents in browser message")
         content = message.content[0]
-        browser_call = json.loads(content.text)
+        browser_call = orjson.loads(content.text)
         # TODO: translate to url properly!
         if recipient == "browser.search":
             action = ActionSearch(
@@ -345,11 +345,7 @@ def parse_remaining_state(parser: StreamableParser):
         return [reasoning_item]
     elif parser.current_channel == "final":
         output_text = ResponseOutputText(
-            content=[
-                ResponseReasoningTextContent(
-                    text=parser.current_content, type="reasoning_text"
-                )
-            ],
+            text=parser.current_content,
             annotations=[],  # TODO
             type="output_text",
             logprobs=None,  # TODO

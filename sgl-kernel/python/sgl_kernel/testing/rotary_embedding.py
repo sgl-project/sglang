@@ -1,6 +1,5 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
-import pytest
 import torch
 from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
 
@@ -84,18 +83,19 @@ class RotaryEmbedding(torch.nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for native implementation"
+
         if offsets is not None:
             positions = positions + offsets
 
         positions = positions.flatten()
         num_tokens = positions.shape[0]
         cos_sin = self.cos_sin_cache.index_select(0, positions)
-
-        # Modification: float32 is required for the rotary embedding to work correctly
-        query = query.to(torch.float32)
-        key = key.to(torch.float32)
 
         cos, sin = cos_sin.chunk(2, dim=-1)
 
@@ -125,8 +125,8 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
         positions: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
-        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
         offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         apply_rope_with_cos_sin_cache_inplace(
@@ -139,6 +139,31 @@ class FlashInferRotaryEmbedding(RotaryEmbedding):
             is_neox=self.is_neox_style,
         )
 
+        return query, key
+
+
+class SglKernelRotaryEmbedding(RotaryEmbedding):
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert (
+            fused_set_kv_buffer_arg is None
+        ), "fused_set_kv_buffer_arg is not supported for sgl-kernel implementation"
+        if self.cos_sin_cache.dtype != query.dtype:
+            self.cos_sin_cache = self.cos_sin_cache.to(query.dtype)
+        torch.ops.sgl_kernel.rotary_embedding(
+            positions,
+            query,
+            key,
+            self.head_size,
+            self.cos_sin_cache,
+            self.is_neox_style,
+        )
         return query, key
 
 

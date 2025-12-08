@@ -1,6 +1,7 @@
 import argparse
 import copy
 import itertools
+import os
 
 import torch
 import triton
@@ -8,6 +9,12 @@ from sgl_kernel import (
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,
+)
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
 )
 
 
@@ -65,10 +72,17 @@ WEIGHT_SHAPES = {
 }
 
 
+# CI environment uses simplified parameters
+if IS_CI:
+    batch_sizes = [1, 16]  # Simplified for CI
+else:
+    batch_sizes = [1, 16, 32, 64, 128, 256, 512, 1024, 2048]
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=[1, 16, 32, 64, 128, 256, 512, 1024, 2048],
+        x_vals=batch_sizes,
         x_log=False,
         line_arg="provider",
         line_vals=["FP16", "W8A8", "Qserve_W4A8_Per_Channel", "Qserve_W4A8_Per_Group"],
@@ -117,17 +131,17 @@ def benchmark(batch_size, provider, N, K):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "FP16":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: torch.matmul(a_fp16, b_fp16),
             quantiles=quantiles,
         )
     if provider == "W8A8":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.float16),
             quantiles=quantiles,
         )
     if provider == "Qserve_W4A8_Per_Channel":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: qserve_w4a8_per_chn_gemm(
                 a_qserve_chn,
                 b_qserve_chn,
@@ -139,7 +153,7 @@ def benchmark(batch_size, provider, N, K):
             quantiles=quantiles,
         )
     if provider == "Qserve_W4A8_Per_Group":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: qserve_w4a8_per_group_gemm(
                 a_qserve_group,
                 b_qserve_group,
@@ -184,15 +198,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    KN_model_names = prepare_shapes(args)
-    for K, N, model_name in KN_model_names:
-        print(f"{model_name} N={N} K={K}: ")
-        benchmark.run(
-            print_data=True,
-            show_plots=True,
-            save_path="bench_qserve_w4a8_gemm_res",
-            N=N,
-            K=K,
-        )
+    # Skip in CI environment
+    if IS_CI:
+        print("Skipping QServe W4A8 GEMM benchmark in CI environment")
+        print("QServe operations may have compatibility issues in CI")
+    else:
+        KN_model_names = prepare_shapes(args)
 
-    print("Benchmark finished!")
+        for K, N, model_name in KN_model_names:
+            print(f"{model_name} N={N} K={K}: ")
+            benchmark.run(
+                print_data=True,
+                N=N,
+                K=K,
+            )
+
+        print("Benchmark finished!")

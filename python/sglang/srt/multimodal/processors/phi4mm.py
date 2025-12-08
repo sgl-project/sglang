@@ -3,7 +3,6 @@ from typing import List, Union
 
 from transformers.processing_utils import ProcessorMixin
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.models.phi4mm import Phi4MMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,

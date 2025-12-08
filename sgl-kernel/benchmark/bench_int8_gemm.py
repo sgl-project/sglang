@@ -1,11 +1,26 @@
 import argparse
 import copy
 import itertools
+import os
 
 import torch
 import triton
 from sgl_kernel import int8_scaled_mm
-from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
+
+# Optional vLLM import
+try:
+    from vllm._custom_ops import cutlass_scaled_mm as vllm_scaled_mm
+
+    VLLM_AVAILABLE = True
+except ImportError:
+    vllm_scaled_mm = None
+    VLLM_AVAILABLE = False
+
+# CI environment detection
+IS_CI = (
+    os.getenv("CI", "false").lower() == "true"
+    or os.getenv("GITHUB_ACTIONS", "false").lower() == "true"
+)
 
 
 def to_int8(tensor: torch.Tensor) -> torch.Tensor:
@@ -62,15 +77,32 @@ WEIGHT_SHAPES = {
 }
 
 
+# CI environment uses simplified parameters
+if IS_CI:
+    batch_sizes = [1]  # Single batch size for CI
+else:
+    batch_sizes = [1, 16, 32, 64, 128, 256, 512, 1024, 2048]
+
+# Filter providers based on vLLM availability
+if VLLM_AVAILABLE:
+    line_vals = ["vllm", "sgl-kernel"]
+    line_names = ["vllm int8 gemm", "sgl-kernel int8 gemm"]
+    styles = [("blue", "-"), ("orange", "-")]
+else:
+    line_vals = ["sgl-kernel"]
+    line_names = ["sgl-kernel int8 gemm"]
+    styles = [("orange", "-")]
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=[1, 16, 32, 64, 128, 256, 512, 1024, 2048],
+        x_vals=batch_sizes,
         x_log=False,
         line_arg="provider",
-        line_vals=["vllm", "sgl-kernel"],
-        line_names=["vllm int8 gemm", "sgl-kernel int8 gemm"],
-        styles=[("blue", "-"), ("orange", "-")],
+        line_vals=line_vals,
+        line_names=line_names,
+        styles=styles,
         ylabel="GB/s",
         plot_name="int8 scaled matmul",
         args={},
@@ -86,12 +118,14 @@ def benchmark(batch_size, provider, N, K):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "sgl-kernel":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: int8_scaled_mm(a, b, scale_a, scale_b, torch.float16, bias),
             quantiles=quantiles,
         )
-    if provider == "vllm":
-        ms, min_ms, max_ms = triton.testing.do_bench(
+    elif provider == "vllm":
+        if not VLLM_AVAILABLE:
+            return (0, 0, 0)
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
             lambda: vllm_scaled_mm(a, b, scale_a, scale_b, torch.float16, bias),
             quantiles=quantiles,
         )
@@ -136,11 +170,16 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    KN_model_names = prepare_shapes(args)
-    for K, N, model_name in KN_model_names:
-        print(f"{model_name} N={N} K={K}: ")
-        benchmark.run(
-            print_data=True, show_plots=True, save_path="bench_int8_res", N=N, K=K
+    # Skip in CI environment due to architecture compatibility issues
+    if IS_CI:
+        print(
+            "Skipping INT8 GEMM benchmark in CI environment due to architecture compatibility issues"
         )
+        print("INT8 operations may not be supported on all GPU architectures")
+    else:
+        KN_model_names = prepare_shapes(args)
+        for K, N, model_name in KN_model_names:
+            print(f"{model_name} N={N} K={K}: ")
+            benchmark.run(print_data=True, N=N, K=K)
 
-    print("Benchmark finished!")
+        print("Benchmark finished!")

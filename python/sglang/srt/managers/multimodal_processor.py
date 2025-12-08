@@ -12,8 +12,7 @@ logger = logging.getLogger(__name__)
 PROCESSOR_MAPPING = {}
 
 
-def import_processors():
-    package_name = "sglang.srt.multimodal.processors"
+def import_processors(package_name: str, overwrite: bool = False):
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
@@ -33,6 +32,11 @@ def import_processors():
             ):
                 assert hasattr(cls, "models")
                 for arch in getattr(cls, "models"):
+                    if overwrite:
+                        for model_cls, processor_cls in PROCESSOR_MAPPING.items():
+                            if model_cls.__name__ == arch.__name__:
+                                del PROCESSOR_MAPPING[model_cls]
+                                break
                     PROCESSOR_MAPPING[arch] = cls
 
 

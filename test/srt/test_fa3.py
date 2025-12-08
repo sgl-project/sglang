@@ -1,9 +1,9 @@
-import os
 import unittest
 from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -77,14 +77,16 @@ class BaseFlashAttentionTest(CustomTestCase):
     def setUpClass(cls):
         # disable deep gemm precompile to make launch server faster
         # please don't do this if you want to make your inference workload faster
-        os.environ["SGL_JIT_DEEPGEMM_PRECOMPILE"] = "false"
-        os.environ["SGL_ENABLE_JIT_DEEPGEMM"] = "false"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
-        )
+        with (
+            envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.override(False),
+            envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False),
+        ):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=cls.get_server_args(),
+            )
 
     @classmethod
     def tearDownClass(cls):

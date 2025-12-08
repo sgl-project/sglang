@@ -24,7 +24,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import torch
 from torch import nn
-from transformers import PretrainedConfig, SiglipVisionConfig
+from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (

@@ -1,19 +1,19 @@
 """Common utilities"""
 
-import functools
 import importlib
-import inspect
 import json
 import logging
 import os
 import random
 import socket
+import ssl
 import subprocess
 import sys
 import time
 import traceback
 import urllib.request
 import weakref
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
@@ -23,10 +23,11 @@ from typing import Any, Callable, List, Optional, Tuple, Type, Union
 import numpy as np
 import pybase64
 import requests
-import triton
 from IPython.display import HTML, display
 from pydantic import BaseModel
 from tqdm import tqdm
+
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,15 @@ def http_request(
             data = bytes(dumps(json), encoding="utf-8")
 
         try:
-            resp = urllib.request.urlopen(req, data=data, cafile=verify)
+            if sys.version_info >= (3, 13):
+                # Python 3.13+: Use SSL context (cafile removed)
+                if verify and isinstance(verify, str):
+                    context = ssl.create_default_context(cafile=verify)
+                else:
+                    context = ssl.create_default_context()
+                resp = urllib.request.urlopen(req, data=data, context=context)
+            else:
+                resp = urllib.request.urlopen(req, data=data, cafile=verify)
             return HttpResponse(resp)
         except urllib.error.HTTPError as e:
             return HttpResponse(e)
@@ -350,10 +359,8 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
-def is_in_ci():
-    from sglang.test.test_utils import is_in_ci
-
-    return is_in_ci()
+def is_in_ci() -> bool:
+    return envs.SGLANG_IS_IN_CI.get()
 
 
 def print_highlight(html_content: str):
@@ -474,20 +481,44 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
-        self._mapping = mapping
+        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
+        # to maintains registration order
+        self._mapping = OrderedDict(mapping)
+        # MRO cache for inheritance-based matching
+        self._mro_cache = {}
         self._fallback_fn = None
 
     def add_fallback_fn(self, fallback_fn: Callable):
         self._fallback_fn = fallback_fn
 
     def __iadd__(self, other: "TypeBasedDispatcher"):
-        self._mapping.extend(other._mapping)
+        for ty, fn in other._mapping.items():
+            if ty not in self._mapping:
+                self._mapping[ty] = fn
+
+        self._mro_cache.clear()
         return self
 
     def __call__(self, obj: Any):
-        for ty, fn in self._mapping:
+        obj_type = type(obj)
+        # 1. First try exact match(o(1))
+        fn = self._mapping.get(obj_type)
+        if fn is not None:
+            return fn(obj)
+
+        # 2. If exact match fails, check MRO cache
+        cached_fn = self._mro_cache.get(obj_type)
+        if cached_fn is not None:
+            return cached_fn(obj)
+
+        # 3.search in registration order for compatible type(maintains origin behavior)
+        for ty, fn in self._mapping.items():
             if isinstance(obj, ty):
+                self._mro_cache[obj_type] = fn
                 return fn(obj)
+
+        # 4. if no matching type found, cache this result
+        self._mro_cache[obj_type] = None
 
         if self._fallback_fn is not None:
             return self._fallback_fn(obj)
@@ -543,120 +574,3 @@ def resolve_obj_by_qualname(qualname: str) -> Any:
     module_name, obj_name = qualname.rsplit(".", 1)
     module = importlib.import_module(module_name)
     return getattr(module, obj_name)
-
-
-class CachedKernel:
-    """
-    Wrapper that allows kernel[grid](...) syntax with caching based on a key function.
-
-    This wrapper caches compiled Triton kernels based on keys extracted by a
-    user-provided key function to avoid redundant compilations.
-    """
-
-    def __init__(self, fn, key_fn=None):
-        self.fn = fn
-        assert isinstance(fn, triton.runtime.jit.JITFunction)
-
-        original_fn = fn.fn
-        self.signature = inspect.signature(original_fn)
-        self.param_names = tuple(self.signature.parameters.keys())
-        self.num_args = len(self.param_names)
-
-        # Check that no parameters have default values
-        for name, param in self.signature.parameters.items():
-            assert (
-                param.default is inspect.Parameter.empty
-            ), f"Parameter '{name}' has a default value. Default parameters are not supported in cached kernels."
-
-        functools.update_wrapper(self, original_fn)
-        self.kernel_cache = {}
-
-        # Store the key function
-        self.key_fn = key_fn
-
-    def __getitem__(self, grid):
-        """
-        Index with grid to get a launcher function.
-        Returns a launcher that will handle caching based on the key function.
-        """
-        assert (
-            isinstance(grid, tuple) and len(grid) <= 3
-        ), "Grid must be a tuple with at most 3 dimensions."
-
-        # Normalize grid once
-        if len(grid) < 3:
-            grid = grid + (1,) * (3 - len(grid))
-
-        def launcher(*args, **kwargs):
-            cache_key = self.key_fn(args, kwargs)
-
-            cached_kernel = self.kernel_cache.get(cache_key)
-
-            if cached_kernel is None:
-                # First time: compile and cache the kernel
-                cached_kernel = self.fn[grid](*args, **kwargs)
-                self.kernel_cache[cache_key] = cached_kernel
-                return cached_kernel
-            else:
-                # Use cached kernel
-                all_args = self._build_args(args, kwargs)
-                cached_kernel[grid](*all_args)
-                return cached_kernel
-
-        return launcher
-
-    def _build_args(self, args, kwargs):
-        """
-        Build the complete argument list for kernel invocation.
-        """
-        complete_args = list(args)
-
-        for i in range(len(args), self.num_args):
-            name = self.param_names[i]
-            value = kwargs.get(name, inspect.Parameter.empty)
-            if value is not inspect.Parameter.empty:
-                complete_args.append(value)
-            else:
-                raise ValueError(f"Missing argument: {name}")
-
-        return complete_args
-
-    def _clear_cache(self):
-        """
-        Clear the kernel cache for testing purposes.
-        """
-        self.kernel_cache.clear()
-
-
-def cached_triton_kernel(key_fn=None):
-    """
-    Decorator that enables key-based caching for Triton kernels using a key function.
-
-    It essentially bypasses Triton's built-in caching mechanism, allowing users to
-    define their own caching strategy based on kernel parameters. This helps reduce
-    the heavy overheads of Triton kernel launch when the kernel specialization dispatch
-    is simple.
-
-    Usage:
-        @cached_triton_kernel(key_fn=lambda args, kwargs: kwargs.get('BLOCK_SIZE', 1024))
-        @triton.jit
-        def my_kernel(x_ptr, y_ptr, BLOCK_SIZE: tl.constexpr):
-            ...
-
-        # Invoke normally
-        my_kernel[grid](x, y, BLOCK_SIZE=1024)
-
-    Args:
-        key_fn: A function that takes (args, kwargs) and returns the cache key(s).
-                The key can be a single value or a tuple of values.
-
-    Returns:
-        A decorator that wraps the kernel with caching functionality.
-
-    Note: Kernels with default parameter values are not supported and will raise an assertion error.
-    """
-
-    def decorator(fn):
-        return CachedKernel(fn, key_fn)
-
-    return decorator

@@ -6,17 +6,11 @@ python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinki
 python3 -m unittest openai_server.features.test_enable_thinking.TestEnableThinking.test_stream_chat_completion_without_reasoning
 """
 
-import asyncio
 import json
-import os
-import sys
-import time
 import unittest
 
-import openai
 import requests
 
-from sglang.srt.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST,

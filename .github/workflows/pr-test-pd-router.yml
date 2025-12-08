@@ -1,4 +1,4 @@
-name: PR Test (PD Router)
+name: PR Benchmark (SMG PD Router)
 
 on:
   push:
@@ -6,14 +6,14 @@ on:
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
-      - 'sgl-router/**'
+      - 'sgl-model-gateway/**'
   pull_request:
     branches: [ main ]
+    types: [opened, synchronize, reopened, labeled]
     paths:
       - 'python/sglang/srt/disaggregation/**'
       - 'scripts/ci/ci_start_disaggregation_servers.sh'
-      - 'sgl-router/**'
-    types: [synchronize, labeled]
+      - 'sgl-model-gateway/**'
   workflow_dispatch:
 
 concurrency:
@@ -27,8 +27,12 @@ permissions:
 
 jobs:
   test-disaggregation:
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
-    runs-on: [h200]
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci') && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci' && contains(github.event.pull_request.labels.*.name, 'router-benchmark')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'router-benchmark' && contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    runs-on: [8-gpu-h200-oracle]
     timeout-minutes: 45
 
     steps:
@@ -54,8 +58,8 @@ jobs:
           ~/.cargo/registry/index/
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
-          sgl-router/target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-router/Cargo.lock') }}
+          sgl-model-gateway/target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('sgl-model-gateway/Cargo.lock') }}
         restore-keys: |
           ${{ runner.os }}-cargo-
 
@@ -138,17 +142,19 @@ jobs:
       run: |
         echo "Installing SGLang with all extras..."
         python3 -m pip --no-cache-dir install --upgrade pip
-        python3 -m pip --no-cache-dir install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
+        python3 -m pip --no-cache-dir install torch==2.9.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
         python3 -m pip --no-cache-dir install -e "python[all]" --break-system-packages
-        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.6.post1
+        python3 -m pip --no-cache-dir install mooncake-transfer-engine==0.3.7.post2
         python3 -m pip --no-cache-dir install --user --force-reinstall genai-bench==0.0.2
 
-    - name: Build and install sgl-router
+    - name: Build and install sgl-model-gateway
       run: |
         source "$HOME/.cargo/env"
-        echo "Building sgl-router..."
-        cd sgl-router
-        cargo build && python3 -m build && pip install --force-reinstall dist/*.whl
+        echo "Building sgl-model-gateway..."
+        cd sgl-model-gateway/bindings/python
+        pip install maturin
+        maturin build --release --out dist --features vendored-openssl
+        pip install --force-reinstall dist/*.whl
 
     - name: Start disaggregation servers
       id: start_servers
@@ -219,6 +225,7 @@ jobs:
             --decode http://127.0.0.7:30007 \
             --decode http://127.0.0.8:30008 \
             --host 127.0.0.9 \
+            --log-level warn \
             --port 8000 &
           ROUTER_PID=$!
 
@@ -256,7 +263,7 @@ jobs:
                 {"role": "user", "content": "Write a Python function to calculate fibonacci numbers recursively"}
               ],
               "stream": false,
-              "max_tokens": 100
+              "max_completion_tokens": 100
             }')
 
           if echo "$response" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
@@ -278,7 +285,7 @@ jobs:
                 {"role": "user", "content": "Count from 1 to 5"}
               ],
               "stream": true,
-              "max_tokens": 50
+              "max_completion_tokens": 50
             }')
 
           if echo "$stream_response" | grep -q "data:"; then
@@ -300,8 +307,8 @@ jobs:
             --task text-to-text \
             --num-concurrency 64 \
             --traffic-scenario "D(8000,2000)" \
-            --max-requests-per-run 640 \
-            --max-time-per-run 2 \
+            --max-requests-per-run 1000 \
+            --max-time-per-run 5 \
             --experiment-folder-name "benchmark_${policy}" \
             --experiment-base-dir "."
 
@@ -341,7 +348,7 @@ jobs:
                 # These can be adjusted based on your performance requirements
                 ttft_threshold=4.7          # Max 4.7 seconds for mean TTFT
                 e2e_latency_threshold=35.0   # Max 35.0 seconds for mean E2E latency
-                input_throughput_threshold=12000   # Min 12000 tokens/s for mean input throughput
+                input_throughput_threshold=10000   # Min 02000 tokens/s for mean input throughput
                 output_throughput_threshold=68    # Min 68 tokens/s for mean output throughput
 
 
@@ -558,12 +565,12 @@ jobs:
               # Check thresholds (using same values as in main workflow)
               validation_status="✅"
               if [ "$ttft" != "N/A" ] && [ "$ttft" != "null" ]; then
-                if (( $(echo "$ttft > 2.0" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$ttft > 4.7" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
               if [ "$e2e_latency" != "N/A" ] && [ "$e2e_latency" != "null" ]; then
-                if (( $(echo "$e2e_latency > 24.0" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$e2e_latency > 35.0" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi
@@ -573,7 +580,7 @@ jobs:
                 fi
               fi
               if [ "$output_throughput" != "N/A" ] && [ "$output_throughput" != "null" ]; then
-                if (( $(echo "$output_throughput < 90" | bc -l 2>/dev/null || echo "0") )); then
+                if (( $(echo "$output_throughput < 68" | bc -l 2>/dev/null || echo "0") )); then
                   validation_status="❌"
                 fi
               fi

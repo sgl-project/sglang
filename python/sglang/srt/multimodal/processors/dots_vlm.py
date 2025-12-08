@@ -1,20 +1,16 @@
-import asyncio
-import math
 import re
 from typing import Dict, List, Union
 
-from PIL import Image
-
+from sglang.srt.models.dots_ocr import DotsOCRForCausalLM
 from sglang.srt.models.dots_vlm import DotsVLMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.qwen_vl import resize_image_async
 
 
 class DotsVLMImageProcessor(BaseMultimodalProcessor):
-    models = [DotsVLMForCausalLM]
+    models = [DotsVLMForCausalLM, DotsOCRForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -70,23 +66,9 @@ class DotsVLMImageProcessor(BaseMultimodalProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        # Qwen-specific: resize images if they are raw Image objects
-        if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [
-                resize_image_async(
-                    image,
-                    min_pixels=self.MIN_PIXELS,
-                    max_pixels=self.MAX_PIXELS,
-                    size_factor=self.IMAGE_FACTOR,
-                )
-                for image in base_output.images
-            ]
-            base_output.images = await asyncio.gather(*resize_tasks)
-
         combined_mm_item, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
-
         if combined_mm_item is None:
             return None
 

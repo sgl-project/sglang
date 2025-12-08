@@ -7,9 +7,12 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
+from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -25,6 +28,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     LogProbs,
     MessageProcessingResult,
     ToolCall,
+    ToolCallProcessingResult,
+    ToolChoice,
     TopLogprob,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -33,12 +38,14 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.utils import get_json_schema_constraint
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -58,6 +65,34 @@ class OpenAIServingChat(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+
+        # Get default sampling parameters from model's generation config
+        self.default_sampling_params = (
+            self.tokenizer_manager.model_config.get_default_sampling_params()
+        )
+        if self.default_sampling_params:
+            logger.info(
+                f"Using default chat sampling params from model generation config: {self.default_sampling_params}",
+            )
+
+        # Check if the model is a GPT-OSS model
+        self.is_gpt_oss = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
+        )
+
+        self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+
+    def _use_dpsk_v32_encoding(self) -> bool:
+        has_chat_template = (
+            self.tokenizer_manager.tokenizer is not None
+            and self.tokenizer_manager.tokenizer.chat_template is not None
+        )
+        architectures = self.tokenizer_manager.server_args.get_hf_config().architectures
+        is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
+        return not has_chat_template and is_dpsk_v32
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -73,6 +108,23 @@ class OpenAIServingChat(OpenAIServingBase):
             and not request.tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
+
+        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+            if not request.tools:
+                return "Tools cannot be empty if tool choice is set to a specific tool."
+            tool_name = request.tool_choice.function.name
+            tool_exists = any(tool.function.name == tool_name for tool in request.tools)
+            if not tool_exists:
+                return f"Tool '{tool_name}' not found in tools list."
+
+        # Validate tool definitions
+        for i, tool in enumerate(request.tools or []):
+            if tool.function.parameters is None:
+                continue
+            try:
+                Draft202012Validator.check_schema(tool.function.parameters)
+            except SchemaError as e:
+                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
@@ -113,10 +165,10 @@ class OpenAIServingChat(OpenAIServingBase):
         processed_messages = self._process_messages(request, is_multimodal)
 
         # Build sampling parameters
-        sampling_params = self._build_sampling_params(
-            request,
-            processed_messages.stop,
-            processed_messages.tool_call_constraint,
+        sampling_params = request.to_sampling_params(
+            stop=processed_messages.stop,
+            model_generation_config=self.default_sampling_params,
+            tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
         # Handle single vs multiple requests
@@ -128,8 +180,19 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
-        # Extract customer labels from raw request headers
-        customer_labels = self.extract_customer_labels(raw_request)
+        # Extract custom labels from raw request headers
+        custom_labels = self.extract_custom_labels(raw_request)
+
+        # Resolve LoRA adapter from model parameter or explicit lora_path
+        lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        if lora_path:
+            first_adapter = (
+                lora_path
+                if isinstance(lora_path, str)
+                else next((a for a in lora_path if a), None)
+            )
+            if first_adapter:
+                self._validate_lora_enabled(first_adapter)
 
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
@@ -143,14 +206,17 @@ class OpenAIServingChat(OpenAIServingBase):
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
-            lora_path=request.lora_path,
+            lora_path=lora_path,
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
+            extra_key=self._compute_extra_key(request),
+            reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
-            customer_labels=customer_labels,
+            custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
         )
 
         return adapted_request, request
@@ -159,14 +225,8 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
-        is_gpt_oss = (
-            hasattr(self.tokenizer_manager.model_config, "hf_config")
-            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
-            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
-        )
-
         # GptOss model needs to keep special tokens for harmony parsing
-        if is_gpt_oss:
+        if self.is_gpt_oss:
             request.skip_special_tokens = False
 
         tool_call_constraint = None
@@ -188,6 +248,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice
                 )
+            # Handle JSON schema constraint directly for required or named tool choice
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
+            ):
+                json_schema = get_json_schema_constraint(
+                    request.tools, request.tool_choice
+                )
+                tool_call_constraint = ("json_schema", json_schema)
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -215,90 +283,117 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        for message in request.messages:
-            if message.content is None:
-                message.content = ""
-            msg_dict = message.model_dump()
-
-            # Process content based on detected template format
-            processed_msg = process_content_for_template_format(
-                msg_dict,
-                template_content_format,
-                image_data,
-                video_data,
-                audio_data,
-                modalities,
-            )
-
-            # per the Transformers docs & maintainers, tool call arguments in
-            # assistant-role messages with tool_calls need to be dicts not JSON str -
-            # this is how tool-use chat templates will expect them moving forwards
-            # so, for messages that have tool_calls, parse the string (which we get
-            # from openAI format) to dict
-            if (
-                processed_msg["role"] == "assistant"
-                and "tool_calls" in processed_msg
-                and isinstance(processed_msg["tool_calls"], list)
+        if self.use_dpsk_v32_encoding:
+            if request.chat_template_kwargs and request.chat_template_kwargs.get(
+                "thinking"
             ):
-                for item in processed_msg["tool_calls"]:
-                    if "arguments" in item["function"] and isinstance(
-                        item["function"]["arguments"], str
-                    ):
-                        item["function"]["arguments"] = json.loads(
-                            item["function"]["arguments"]
-                        )
-
-            openai_compatible_messages.append(processed_msg)
-
-        # Handle assistant prefix for continue_final_message
-        assistant_prefix = None
-        if (
-            openai_compatible_messages
-            and openai_compatible_messages[-1]["role"] == "assistant"
-        ):
-            if request.continue_final_message:
-                assistant_prefix = openai_compatible_messages[-1]["content"]
-                openai_compatible_messages = openai_compatible_messages[:-1]
-
-        try:
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                openai_compatible_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=tools,
-                reasoning_effort=request.reasoning_effort,
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
+                thinking_mode = "thinking"
+            else:
+                thinking_mode = "chat"
+            messages = request.messages
+            messages = [msg.model_dump() for msg in messages]
+            if messages[0]["role"] != "system":
+                messages.insert(
+                    0, {"role": "system", "content": "You are a helpful Assistant."}
+                )
+            if request.tools:
+                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+            real_input = encode_messages(
+                messages, thinking_mode=thinking_mode, drop_thinking=False
             )
-        except Exception:
-            # This except branch will be triggered when the chosen model
-            # has a different tools input format that is not compatible
-            # with openAI's apply_chat_template tool_call format, like Mistral.
-            tools = (
-                [t if "function" in t else {"function": t} for t in tools]
-                if tools
-                else None
-            )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                openai_compatible_messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                tools=tools,
-                reasoning_effort=request.reasoning_effort,
-                **(
-                    request.chat_template_kwargs if request.chat_template_kwargs else {}
-                ),
-            )
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+        else:
+            for message in request.messages:
+                if message.content is None:
+                    message.content = ""
+                msg_dict = message.model_dump()
 
-        if assistant_prefix:
-            encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
-            if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
-                encoded = encoded[1:]
-            prompt_ids += encoded
+                # Process content based on detected template format
+                processed_msg = process_content_for_template_format(
+                    msg_dict,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                )
 
-        if is_multimodal:
-            prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                # per the Transformers docs & maintainers, tool call arguments in
+                # assistant-role messages with tool_calls need to be dicts not JSON str -
+                # this is how tool-use chat templates will expect them moving forwards
+                # so, for messages that have tool_calls, parse the string (which we get
+                # from openAI format) to dict
+                if (
+                    processed_msg["role"] == "assistant"
+                    and "tool_calls" in processed_msg
+                    and isinstance(processed_msg["tool_calls"], list)
+                ):
+                    for item in processed_msg["tool_calls"]:
+                        if "arguments" in item["function"] and isinstance(
+                            item["function"]["arguments"], str
+                        ):
+                            item["function"]["arguments"] = orjson.loads(
+                                item["function"]["arguments"]
+                            )
+
+                openai_compatible_messages.append(processed_msg)
+
+            # Handle assistant prefix for continue_final_message
+            assistant_prefix = None
+            if (
+                openai_compatible_messages
+                and openai_compatible_messages[-1]["role"] == "assistant"
+            ):
+                if request.continue_final_message:
+                    assistant_prefix = openai_compatible_messages[-1]["content"]
+                    openai_compatible_messages = openai_compatible_messages[:-1]
+
+            try:
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    reasoning_effort=request.reasoning_effort,
+                    **(
+                        request.chat_template_kwargs
+                        if request.chat_template_kwargs
+                        else {}
+                    ),
+                )
+            except Exception:
+                # This except branch will be triggered when the chosen model
+                # has a different tools input format that is not compatible
+                # with openAI's apply_chat_template tool_call format, like Mistral.
+                tools = (
+                    [t if "function" in t else {"function": t} for t in tools]
+                    if tools
+                    else None
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    reasoning_effort=request.reasoning_effort,
+                    **(
+                        request.chat_template_kwargs
+                        if request.chat_template_kwargs
+                        else {}
+                    ),
+                )
+
+            if assistant_prefix:
+                encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+                if (
+                    encoded
+                    and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id
+                ):
+                    encoded = encoded[1:]
+                prompt_ids += encoded
+
+            if is_multimodal:
+                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -349,7 +444,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
-            if self._get_enable_thinking_from_request(request):
+            if self._get_reasoning_from_request(
+                request
+            ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]:
+                # qwen3 and glm4 think internally without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
@@ -376,68 +474,6 @@ class OpenAIServingChat(OpenAIServingBase):
             modalities=modalities,
             stop=stop,
         )
-
-    def _build_sampling_params(
-        self,
-        request: ChatCompletionRequest,
-        stop: List[str],
-        tool_call_constraint: Optional[Any],
-    ) -> Dict[str, Any]:
-        """Build sampling parameters for the request"""
-
-        sampling_params = {
-            "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
-            "min_new_tokens": request.min_tokens,
-            "stop": stop,
-            "stop_token_ids": request.stop_token_ids,
-            "top_p": request.top_p,
-            "top_k": request.top_k,
-            "min_p": request.min_p,
-            "presence_penalty": request.presence_penalty,
-            "frequency_penalty": request.frequency_penalty,
-            "repetition_penalty": request.repetition_penalty,
-            "regex": request.regex,
-            "ebnf": request.ebnf,
-            "n": request.n,
-            "no_stop_trim": request.no_stop_trim,
-            "ignore_eos": request.ignore_eos,
-            "skip_special_tokens": request.skip_special_tokens,
-            "logit_bias": request.logit_bias,
-        }
-
-        if request.response_format and request.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                request.response_format.json_schema.schema_
-            )
-        elif request.response_format and request.response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
-        elif (
-            request.response_format and request.response_format.type == "structural_tag"
-        ):
-            sampling_params["structural_tag"] = convert_json_schema_to_str(
-                request.response_format.model_dump(by_alias=True)
-            )
-
-        # Check if there are already existing output constraints
-        has_existing_constraints = (
-            sampling_params.get("regex")
-            or sampling_params.get("ebnf")
-            or sampling_params.get("structural_tag")
-            or sampling_params.get("json_schema")
-        )
-
-        if tool_call_constraint and has_existing_constraints:
-            logger.warning("Constrained decoding is not compatible with tool calls.")
-        elif tool_call_constraint:
-            constraint_type, constraint_value = tool_call_constraint
-            if constraint_type == "structural_tag":
-                sampling_params[constraint_type] = convert_json_schema_to_str(
-                    constraint_value.model_dump(by_alias=True)
-                )
-            else:
-                sampling_params[constraint_type] = constraint_value
-        return sampling_params
 
     async def _handle_streaming_request(
         self,
@@ -532,10 +568,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffers[index] = stream_buffer + delta
 
                 # Handle reasoning content
-                if (
-                    self.tokenizer_manager.server_args.reasoning_parser
-                    and request.separate_reasoning
-                ):
+                if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
                     )
@@ -551,6 +584,17 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+
+                        # Add usage stats if continuous_usage_stats is enabled
+                        if (
+                            request.stream_options
+                            and request.stream_options.continuous_usage_stats
+                        ):
+                            chunk.usage = UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                completion_tokens=completion_tokens.get(index, 0),
+                            )
+
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
@@ -595,6 +639,17 @@ class OpenAIServingChat(OpenAIServingBase):
                             choices=[choice_data],
                             model=request.model,
                         )
+
+                        # Add usage stats if continuous_usage_stats is enabled
+                        if (
+                            request.stream_options
+                            and request.stream_options.continuous_usage_stats
+                        ):
+                            chunk.usage = UsageProcessor.calculate_token_usage(
+                                prompt_tokens=prompt_tokens.get(index, 0),
+                                completion_tokens=completion_tokens.get(index, 0),
+                            )
+
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
             # Send finish_reason chunks for each index that completed
@@ -723,11 +778,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Handle reasoning content
             reasoning_text = None
-            reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+            reasoning_parser = self.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
-                    or self._get_enable_thinking_from_request(request)
+                    or self._get_reasoning_from_request(request)
                 )
                 try:
                     parser = ReasoningParser(
@@ -751,8 +806,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 and request.tools
                 and self.tool_call_parser
             ):
+                history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
-                    text, request.tools, finish_reason
+                    text,
+                    request.tools,
+                    finish_reason,
+                    request.tool_choice,
+                    history_tool_calls_cnt,
                 )
 
             choice_data = ChatCompletionResponseChoice(
@@ -842,13 +902,76 @@ class OpenAIServingChat(OpenAIServingBase):
         token_logprobs = self._process_logprobs_tokens(logprobs, use_token_index=True)
         return ChoiceLogprobs(content=token_logprobs)
 
+    def _process_tool_call_id(
+        self,
+        call_item: ToolCallItem,
+        history_tool_calls_cnt: int,
+    ) -> str:
+        """Process for generating a new and unique `tool_call_id`"""
+        if self.tool_call_parser != "kimi_k2":
+            # A simple uuid is sufficient for all models except for Kimi-K2.
+            tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+            return tool_call_id
+        else:
+            # Align with Kimi-K2 format: functions.{name}:{index}
+            # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
+            # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
+            tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
+            logger.debug(
+                f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
+            )
+            return tool_call_id
+
     def _process_tool_calls(
         self,
         text: str,
         tools: List[Any],
         finish_reason: Dict[str, Any],
-    ) -> tuple[Optional[List[ToolCall]], str, Dict[str, Any]]:
+        tool_choice: Optional[Union[str, ToolChoice]] = None,
+        history_tool_calls_cnt: int = 0,
+    ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
+
+        # Handle required or named tool choice
+        if tool_choice == "required" or (
+            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
+        ):
+            # Set finish reason to tool_calls since we're processing tool calls
+            if finish_reason["type"] == "stop":
+                finish_reason["type"] = "tool_calls"
+                finish_reason["matched"] = None
+            try:
+                # For required tool choice, we expect a JSON array of tool calls
+                tool_call_data = orjson.loads(text)
+                tool_calls = []
+                for i, tool in enumerate(tool_call_data):
+                    # Create a ToolCallItem from the JSON data
+                    call_info = ToolCallItem(
+                        tool_index=i,  # Use the loop index as tool_index
+                        name=tool["name"],
+                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                    )
+                    tool_id = self._process_tool_call_id(
+                        call_info, history_tool_calls_cnt
+                    )
+                    tool_calls.append(
+                        ToolCall(
+                            id=tool_id,
+                            index=i,
+                            function=FunctionResponse(
+                                name=tool["name"],
+                                arguments=json.dumps(
+                                    tool["parameters"], ensure_ascii=False
+                                ),
+                            ),
+                        )
+                    )
+                return ToolCallProcessingResult(tool_calls, "", finish_reason)
+            except json.JSONDecodeError as e:
+                logger.error(f"Tool call parsing error: {e}")
+                return ToolCallProcessingResult(None, text, finish_reason)
+
+        # Use parser since output is not constrained by JSON schema
         parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
@@ -858,15 +981,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 text, call_info_list = parser.parse_non_stream(text)
                 tool_calls = []
                 for call_info in call_info_list:
-                    # For Kimi-K2, align tool_call_id with the model format: functions.{name}:{index}
-                    if (
-                        self.tool_call_parser == "kimi_k2"
-                        and call_info.name is not None
-                    ):
-                        tool_id = f"functions.{call_info.name}:{call_info.tool_index}"
-                    else:
-                        tool_id = f"call_{uuid.uuid4().hex[:24]}"
-
+                    tool_id = self._process_tool_call_id(
+                        call_info, history_tool_calls_cnt
+                    )
                     tool_calls.append(
                         ToolCall(
                             id=tool_id,
@@ -876,13 +993,13 @@ class OpenAIServingChat(OpenAIServingBase):
                             ),
                         )
                     )
-                return tool_calls, text, finish_reason
+                return ToolCallProcessingResult(tool_calls, text, finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
                 # Return error but don't fail the whole request
-                return None, text, finish_reason
+                return ToolCallProcessingResult(None, text, finish_reason)
 
-        return None, text, finish_reason
+        return ToolCallProcessingResult(None, text, finish_reason)
 
     def _process_streaming_logprobs(
         self, content: Dict[str, Any], n_prev_token: int
@@ -912,37 +1029,52 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
                 self.template_manager.force_reasoning
-                or self._get_enable_thinking_from_request(request)
+                or self._get_reasoning_from_request(request)
             )
             reasoning_parser_dict[index] = ReasoningParser(
-                self.tokenizer_manager.server_args.reasoning_parser,
+                self.reasoning_parser,
                 request.stream_reasoning,
                 is_force_reasoning,
             )
         reasoning_parser = reasoning_parser_dict[index]
         return reasoning_parser.parse_stream_chunk(delta)
 
-    def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+    def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
+        """Counts the number of tool calls in the request's message history.
 
-        NOTE: This parameter is only useful for models that support enable_thinking
-        flag, such as Qwen3.
+        NOTE: This method is only useful for models that include self-increasing
+        history tool call idx in tool calls id, such as kimi-k2
 
         Args:
-            request_obj: The request object (or an item from a list of requests).
+            request: The chat completion request object.
+
         Returns:
-            The boolean value of 'enable_thinking' if found, otherwise False.
+            The total number of tool calls in the history, or 0 if not applicable.
         """
-        if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
-            # For Qwen3 models, `enable_thinking` is supported.
-            if request.chat_template_kwargs.get("enable_thinking") is not None:
-                return request.chat_template_kwargs.get("enable_thinking")
-            # For DeepSeek-V3.1 models, `thinking` is supported.
-            elif request.chat_template_kwargs.get("thinking") is not None:
-                return request.chat_template_kwargs.get("thinking")
-            else:
-                return False
-        return False
+        messages = getattr(request, "messages", [])
+        idx = 0
+        for msg in messages:
+            if msg.role == "assistant":
+                tool_calls = getattr(msg, "tool_calls", None)
+                idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
+        return idx
+
+    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Judge whether the request needs reasoning"""
+        if not self.reasoning_parser:
+            return False
+        if self.reasoning_parser in ["deepseek-v3"]:
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser in ["qwen3", "glm45"]:
+            # qwen3 and glm45 are reasoning by default
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking", True) is True
+            )
+        return True  # default
 
     async def _process_tool_call_stream(
         self,
@@ -955,13 +1087,25 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
-            parser_dict[index] = FunctionCallParser(
-                tools=request.tools,
-                tool_call_parser=self.tool_call_parser,
-            )
+            # Use JSON detector directly for required or named tool choice
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
+            ):
+                parser_dict[index] = JsonArrayParser()
+            else:
+                parser_dict[index] = FunctionCallParser(
+                    tools=request.tools,
+                    tool_call_parser=self.tool_call_parser,
+                )
+
         parser = parser_dict[index]
 
-        normal_text, calls = parser.parse_stream_chunk(delta)
+        # Handle both FunctionCallParser and JsonArrayParser
+        if isinstance(parser, JsonArrayParser):
+            result = parser.parse_streaming_increment(delta, request.tools)
+            normal_text, calls = result.normal_text, result.calls
+        else:
+            normal_text, calls = parser.parse_stream_chunk(delta)
 
         # Yield normal text
         if normal_text:
@@ -976,9 +1120,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
+
+            # Add usage stats if continuous_usage_stats is enabled
+            if request.stream_options and request.stream_options.continuous_usage_stats:
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+
             yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Yield tool calls
+        history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
@@ -986,11 +1141,9 @@ class OpenAIServingChat(OpenAIServingBase):
             # Tool call ID should be generated only once per tool call
             if call_item.name:
                 # First chunk: include ID and function name
-                if self.tool_call_parser == "kimi_k2":
-                    # Align with Kimi-K2 format: functions.{name}:{index}
-                    tool_call_id = f"functions.{call_item.name}:{call_item.tool_index}"
-                else:
-                    tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
+                tool_call_id = self._process_tool_call_id(
+                    call_item, history_tool_calls_cnt
+                )
                 function_name = call_item.name
             else:
                 # Subsequent chunks: null ID and name for argument deltas
@@ -1017,11 +1170,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 choices=[choice_data],
                 model=request.model,
             )
+
+            # Add usage stats if continuous_usage_stats is enabled
+            if request.stream_options and request.stream_options.continuous_usage_stats:
+                prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                chunk.usage = UsageProcessor.calculate_token_usage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                )
+
             yield f"data: {chunk.model_dump_json()}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,
-        parser: FunctionCallParser,
+        parser: Union[FunctionCallParser, JsonArrayParser],
         content: Dict[str, Any],
         request: ChatCompletionRequest,
         index: int,
@@ -1031,30 +1194,31 @@ class OpenAIServingChat(OpenAIServingBase):
         when generation finishes. This ensures tool calls are properly completed
         even if the model generates the final arguments in the last chunk.
         """
-        # Only check if we have tool calls and the parser has tracked data
+        # Get the detector - either from FunctionCallParser or directly if json detector
+        detector = parser.detector if hasattr(parser, "detector") else parser
+
+        # Only check if we have tool calls and the detector has tracked data
         if (
-            not hasattr(parser.detector, "prev_tool_call_arr")
-            or not parser.detector.prev_tool_call_arr
+            not hasattr(detector, "prev_tool_call_arr")
+            or not detector.prev_tool_call_arr
         ):
             return None
 
         if (
-            not hasattr(parser.detector, "streamed_args_for_tool")
-            or not parser.detector.streamed_args_for_tool
+            not hasattr(detector, "streamed_args_for_tool")
+            or not detector.streamed_args_for_tool
         ):
             return None
 
         # Get the last tool call that was being processed
-        tool_index = len(parser.detector.prev_tool_call_arr) - 1
-        if tool_index < 0 or tool_index >= len(parser.detector.streamed_args_for_tool):
+        tool_index = len(detector.prev_tool_call_arr) - 1
+        if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
             return None
 
         # Get expected vs actual arguments
-        expected_args = parser.detector.prev_tool_call_arr[tool_index].get(
-            "arguments", {}
-        )
+        expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
         expected_call = json.dumps(expected_args, ensure_ascii=False)
-        actual_call = parser.detector.streamed_args_for_tool[tool_index]
+        actual_call = detector.streamed_args_for_tool[tool_index]
 
         # Check if there are remaining arguments to send
         remaining_call = (

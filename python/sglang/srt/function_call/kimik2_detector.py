@@ -11,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -50,6 +49,11 @@ class KimiK2Detector(BaseFormatDetector):
 
         self._last_arguments = ""
 
+        # Robust parser for ids like "functions.search:0" or fallback "search:0"
+        self.tool_call_id_regex = re.compile(
+            r"^(?:functions\.)?(?P<name>[\w\.]+):(?P<index>\d+)$"
+        )
+
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a KimiK2 format tool call."""
         return self.bot_token in text
@@ -76,14 +80,18 @@ class KimiK2Detector(BaseFormatDetector):
             tool_calls = []
             for match in function_call_tuples:
                 function_id, function_args = match
-                function_name = function_id.split(".")[1].split(":")[0]
-                function_idx = int(function_id.split(".")[1].split(":")[1])
+                m = self.tool_call_id_regex.match(function_id)
+                if not m:
+                    logger.warning("Unexpected tool_call_id format: %s", function_id)
+                    continue
+                function_name = m.group("name")
+                function_idx = int(m.group("index"))
 
                 logger.info(f"function_name {function_name}")
 
                 tool_calls.append(
                     ToolCallItem(
-                        tool_index=function_idx,  # Use the call index in the response, not tool position
+                        tool_index=function_idx,
                         name=function_name,
                         parameters=function_args,
                     )
@@ -128,7 +136,11 @@ class KimiK2Detector(BaseFormatDetector):
                 function_id = match.group("tool_call_id")
                 function_args = match.group("function_arguments")
 
-                function_name = function_id.split(".")[1].split(":")[0]
+                m = self.tool_call_id_regex.match(function_id)
+                if not m:
+                    logger.warning("Unexpected tool_call_id format: %s", function_id)
+                    return StreamingParseResult(normal_text="", calls=calls)
+                function_name = m.group("name")
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -225,21 +237,3 @@ class KimiK2Detector(BaseFormatDetector):
             )
 
         return get_info
-
-    def build_ebnf(self, tools: List[Tool]) -> str:
-        """
-        Build EBNF grammar for KimiK2 tool call format.
-
-        NOTE: The call_rule_fmt uses [0-9]+ for the function index to allow the grammar
-        to accept any numeric index (0, 1, 2, etc.) for proper sequential indexing in
-        multiple function call scenarios, while still maintaining the correct KimiK2
-        format structure for constrained generation.
-        """
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            tool_call_separator="",
-            call_rule_fmt='"<|tool_call_begin|>functions.{name}:"[0-9]+"<|tool_call_argument_begin|>"{arguments_rule}"<|tool_call_end|>"',
-            function_format="json",
-        )

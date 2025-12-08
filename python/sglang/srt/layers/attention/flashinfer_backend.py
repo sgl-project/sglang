@@ -7,6 +7,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -15,21 +16,15 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
-if os.environ["SGLANG_ENABLE_TORCH_COMPILE"] == "1":
-    import logging
-
-    torch._logging.set_logs(dynamo=logging.ERROR)
-    torch._dynamo.config.suppress_errors = True
-
-from sglang.global_config import global_config
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.lookahead_utils import LookaheadVerifyInput
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import (
     get_int_env_var,
     is_flashinfer_available,
@@ -41,20 +36,56 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
+logger = logging.getLogger(__name__)
+
+if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
+    torch._logging.set_logs(dynamo=logging.ERROR)
+    torch._dynamo.config.suppress_errors = True
+
 
 if is_flashinfer_available():
     from flashinfer import (
         BatchDecodeWithPagedKVCacheWrapper,
         BatchPrefillWithPagedKVCacheWrapper,
         BatchPrefillWithRaggedKVCacheWrapper,
+        fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
-    from flashinfer.decode import _get_range_buf, get_seq_lens
 
 
 class WrapperDispatch(Enum):
     SLIDING_WINDOW = auto()
     CROSS_ATTENTION = auto()
+
+
+@dataclass
+class MultiItemScoringParams:
+    """Parameters for multi-item scoring in attention computation.
+
+    Used when processing sequences with multiple items separated by delimiters,
+    where each item needs specific attention patterns that respect item boundaries.
+
+    Attributes:
+        prefix_len_ptr: A uint32 1D tensor indicating the prefix length of each prompt.
+                       The tensor size is equal to the batch size.
+        token_pos_in_items_ptr: A uint16 1D tensor indicating the token position of each item
+                               starting from 0 (delimiter) for each item. For batch size > 1,
+                               sequences are concatenated with zero padding to ensure same length.
+        token_pos_in_items_len: Zero padding length for token_pos_in_items_ptr to handle
+                               batch_size > 1 case. Defines the padded length for each sequence.
+        max_item_len_ptr: A uint16 tensor containing the max token length of all items
+                         for each prompt in the batch.
+
+    """
+
+    prefix_len_ptr: Optional[torch.Tensor] = None
+    token_pos_in_items_ptr: Optional[torch.Tensor] = None
+    token_pos_in_items_len: int = 0
+    max_item_len_ptr: Optional[torch.Tensor] = None
+
+    def is_enabled(self) -> bool:
+        """Check if multi-item scoring is enabled."""
+        return self.prefix_len_ptr is not None
 
 
 @dataclass
@@ -67,6 +98,7 @@ class PrefillMetadata:
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
     use_ragged: bool
     extend_no_prefix: bool
+    multi_item_params: Optional[MultiItemScoringParams] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -86,8 +118,18 @@ class FlashInferAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
+        init_new_workspace: bool = False,
     ):
         super().__init__()
+
+        # Store multi-item scoring delimiter for efficient access
+        self.multi_item_scoring_delimiter = (
+            model_runner.server_args.multi_item_scoring_delimiter
+        )
+
+        # FIXME: remove dllm workarounds from flashinfer
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm_model = self.dllm_config is not None
 
         # Parse constants
         self.decode_use_tensor_cores = should_use_tensor_core(
@@ -122,8 +164,12 @@ class FlashInferAttnBackend(AttentionBackend):
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
             or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
+            or "Qwen3VLForConditionalGeneration"
+            in model_runner.model_config.hf_config.architectures
+            or "Qwen3VLMoeForConditionalGeneration"
+            in model_runner.model_config.hf_config.architectures
         ):
-            global_config.flashinfer_workspace_size = 512 * 1024 * 1024
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(512 * 1024 * 1024)
 
         # When deterministic inference is enabled, tensor cores should be used for decode
         # Also set split tile sizes for prefill and decode from environment variables, and disable kv split for cuda graph
@@ -143,19 +189,26 @@ class FlashInferAttnBackend(AttentionBackend):
                 "SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE", 2048
             )
             self.disable_cuda_graph_kv_split = True
-            global_config.flashinfer_workspace_size = 2048 * 1024 * 1024
+            envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
             # different from flashinfer zero_init_global_workspace_buffer
-            global_workspace_size = global_config.flashinfer_workspace_size
+            global_workspace_size = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
             global_workspace_buffer = torch.empty(
                 global_workspace_size,
                 dtype=torch.uint8,
                 device=model_runner.device,
             )
-        self.workspace_buffer = global_workspace_buffer
+        if init_new_workspace:
+            self.workspace_buffer = torch.empty(
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        else:
+            self.workspace_buffer = global_workspace_buffer
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
             self.kv_indptr = [
@@ -186,7 +239,16 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if is_sm100_supported():
-            fmha_backend = "cutlass"
+            # Disable CUTLASS backend when piecewise cuda graph is enabled
+            # due to TMA descriptor initialization issues on B200
+            if model_runner.server_args.enable_piecewise_cuda_graph:
+                logger.warning(
+                    "CUTLASS backend is disabled when piecewise cuda graph is enabled "
+                    "due to TMA descriptor initialization issues on B200. "
+                    "Using auto backend instead for stability."
+                )
+            else:
+                fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
         )
@@ -228,9 +290,132 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
+
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
+
+    def _process_multi_item_scoring(
+        self, forward_batch: ForwardBatch
+    ) -> MultiItemScoringParams:
+        """Process multi-item scoring tensors for FlashInfer attention.
+
+        This method handles sequences containing multiple "items" separated by delimiter tokens,
+        where each item needs specific attention patterns that respect item boundaries.
+
+        The method produces four key tensors for FlashInfer:
+        - prefix_len_ptr: uint32 tensor with prefix length for each prompt in batch
+        - token_pos_in_items_ptr: uint16 tensor with token positions starting from 0 at delimiters
+        - token_pos_in_items_len: padding length for batch processing
+        - max_item_len_ptr: uint16 tensor with max item length for each prompt
+
+        Args:
+            forward_batch: The forward batch containing input sequences and delimiter info
+
+        Returns:
+            MultiItemScoringParams: The processed multi-item scoring parameters
+
+        Examples:
+            Following FlashInfer definition: for 3 items of length 3, 2, 4 respectively:
+            token_pos_in_items_ptr = [0, 1, 2, 3, 0, 1, 2, 0, 1, 2, 3, 4, 0]
+
+            Case 1: Single sequence
+            Text: "What is the capital of France? <delim> London <delim> Paris <delim> Berlin <delim>"
+            Tokens: [What, is, the, capital, of, France, ?, <delim>, London, <delim>, Paris, <delim>, Berlin, <delim>]
+            Indices: [ 0,   1,  2,   3,      4,  5,     6,   7,     8,      9,     10,    11,    12,     13]
+            - prefix_len_ptr: [7] (query length before first delimiter)
+            - token_pos_in_items_ptr: [0, 1, 0, 1, 0, 1, 0] (delim=0, London=1, delim=0, Paris=1, delim=0, Berlin=1, delim=0)
+            - token_pos_in_items_len: 7 (actual length)
+            - max_item_len_ptr: [1] (max item length is 1 token - all options are single tokens)
+
+            Case 2: Batch processing (batch_size=2)
+            Sequence 1: 2 items of length 2, 1 → [0, 1, 2, 0, 1, 0] (6 elements)
+            Sequence 2: 3 items of length 1, 3, 2 → [0, 1, 0, 1, 2, 3, 0, 1, 2, 0] (10 elements)
+            After padding both to length 10:
+            - token_pos_in_items_ptr: [0, 1, 2, 0, 1, 0, 0, 0, 0, 0,    0, 1, 0, 1, 2, 3, 0, 1, 2, 0]
+            - token_pos_in_items_len: 10 (padded length for batch processing)
+            - max_item_len_ptr: [2, 3] (max lengths per sequence)
+        """
+
+        delimiter = self.multi_item_scoring_delimiter
+        if delimiter is None or forward_batch.forward_mode == ForwardMode.DECODE:
+            return MultiItemScoringParams()
+
+        delimiter_mask = forward_batch.input_ids == delimiter
+        prefix_cache_lens = getattr(forward_batch, "extend_prefix_lens", None)
+        extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+        prefix_len_ptr, token_pos_in_items_ptr = [], []
+        token_pos_in_items_len = 0
+
+        # If no extend_seq_lens, treat whole batch as one sequence
+        if extend_seq_lens is None or len(extend_seq_lens) <= 1:
+            extend_seq_lens = [forward_batch.input_ids.size(0)]
+
+        seq_start = 0
+        for i, seq_len in enumerate(extend_seq_lens):
+            seq_end = seq_start + seq_len
+            mask = delimiter_mask[seq_start:seq_end]
+            pos = forward_batch.positions[seq_start:seq_end]
+            delimiter_indices = torch.nonzero(mask, as_tuple=True)[0]
+
+            if len(delimiter_indices) > 0:
+                first_delim = delimiter_indices[0]
+                # Prefix length: store as scalar
+                prefix_len = first_delim + (
+                    prefix_cache_lens[i] if prefix_cache_lens is not None else 0
+                )
+                prefix_len_ptr.append(
+                    prefix_len.item() if torch.is_tensor(prefix_len) else prefix_len
+                )
+
+                # Compute relative positions within items after delimiters
+                diff = pos[first_delim:] - torch.cummax(mask[first_delim:], 0)[1]
+                token_pos = (diff - pos[first_delim]).to(torch.uint16)
+                token_pos_in_items_ptr.append(token_pos)
+
+                # Update forward_batch positions in-place
+                pos[first_delim:] = diff - 1
+                forward_batch.positions[seq_start:seq_end] = pos
+
+            seq_start = seq_end
+
+        # Pad token_pos_in_items_ptr for batch processing
+        if token_pos_in_items_ptr:
+            token_pos_in_items_len = max(t.numel() for t in token_pos_in_items_ptr)
+            device = forward_batch.input_ids.device
+            token_pos_in_items_ptr = [
+                torch.cat(
+                    [
+                        t,
+                        torch.zeros(
+                            token_pos_in_items_len - t.numel(),
+                            dtype=torch.uint16,
+                            device=device,
+                        ),
+                    ]
+                )
+                for t in token_pos_in_items_ptr
+            ]
+
+        if not prefix_len_ptr or not token_pos_in_items_ptr:
+            return MultiItemScoringParams()
+
+        # Build final params
+        device = forward_batch.input_ids.device
+        return MultiItemScoringParams(
+            prefix_len_ptr=torch.tensor(
+                prefix_len_ptr, dtype=torch.uint32, device=device
+            ),
+            token_pos_in_items_ptr=torch.cat(token_pos_in_items_ptr, dim=0),
+            token_pos_in_items_len=token_pos_in_items_len & 0xFFFFFFFF,
+            max_item_len_ptr=torch.stack(
+                [
+                    t.to(torch.int32).max().to(torch.uint16)
+                    for t in token_pos_in_items_ptr
+                ],
+                dim=0,
+            ),
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -279,12 +464,25 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             prefix_lens = forward_batch.extend_prefix_lens
 
-            if self.is_multimodal:
+            # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
+            if self.is_multimodal or self.multi_item_scoring_delimiter is not None:
+                # use_ragged = False: Multi-item scoring requires the paged wrapper because:
+                # 1. Ragged wrapper doesn't support the specialized multi-item parameters
+                #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
+                # 2. Paged wrapper provides better control over attention masking needed
+                #    for respecting item boundaries in multi-item sequences
+                # 3. Custom masking logic conflicts with ragged wrapper's assumptions
                 use_ragged = False
                 extend_no_prefix = False
             else:
                 use_ragged = not self.enable_deterministic
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+
+            # Process multi-item scoring in attention backend instead of ForwardBatch
+            multi_item_params = MultiItemScoringParams()
+            if self.multi_item_scoring_delimiter is not None:
+                # Use new backend-specific implementation
+                multi_item_params = self._process_multi_item_scoring(forward_batch)
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -297,9 +495,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=forward_batch.encoder_lens,
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
+                multi_item_params=multi_item_params,
             )
             self.forward_metadata = PrefillMetadata(
-                self.prefill_wrappers_paged, use_ragged, extend_no_prefix
+                self.prefill_wrappers_paged,
+                use_ragged,
+                extend_no_prefix,
+                multi_item_params,
             )
 
     def init_cuda_graph_state(
@@ -344,9 +546,7 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -442,6 +642,35 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_dllm_extend():
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend="fa2",
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    )
+                )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),  # may add a little overhead in capture stage
+                seq_lens_sum,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=True,
+                encoder_lens=encoder_lens,
+                spec_info=None,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -453,9 +682,7 @@ class FlashInferAttnBackend(AttentionBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         if forward_mode.is_decode_or_idle():
@@ -493,6 +720,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+            )
+        elif forward_mode.is_dllm_extend():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                use_ragged=True,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=None,
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -534,7 +773,20 @@ class FlashInferAttnBackend(AttentionBackend):
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
-                window_left=layer.sliding_window_size,
+                # Disable sliding window attention for multi-item scoring:
+                # - Sliding window could cut across item boundaries, breaking semantic coherence
+                # - Multi-item sequences need full attention to properly handle delimiter tokens
+                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+                #   provide more precise attention control than simple sliding windows
+                # - Item-aware masking takes precedence over window-based masking
+                window_left=(
+                    layer.sliding_window_size
+                    if not (
+                        self.forward_metadata.multi_item_params
+                        and self.forward_metadata.multi_item_params.is_enabled()
+                    )
+                    else -1
+                ),
                 logits_soft_cap=logits_soft_cap,
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
@@ -542,9 +794,13 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             causal = True
-            if layer.attn_type == AttentionType.ENCODER_ONLY:
-                save_kv_cache = False
+            if (
+                layer.is_cross_attention
+                or layer.attn_type == AttentionType.ENCODER_ONLY
+            ):
                 causal = False
+            if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+                save_kv_cache = False
 
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
@@ -560,11 +816,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
+                if not self.is_dllm_model:
+                    # TODO: design a better interface
+                    # For other models, use causal attention for the ragged part as previously
+                    causal = True
+
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=True,
+                    causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
                 )
@@ -673,9 +934,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
@@ -690,9 +949,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
@@ -718,9 +975,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
@@ -770,9 +1025,7 @@ class FlashInferIndicesUpdaterDecode:
         seq_lens_sum: int,
         decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper],
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         disable_split_kv: Optional[bool] = None,
     ):
@@ -806,9 +1059,7 @@ class FlashInferIndicesUpdaterDecode:
         paged_kernel_lens_sum: int,
         kv_indptr: torch.Tensor,
         kv_start_idx: torch.Tensor,
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
@@ -856,22 +1107,50 @@ class FlashInferIndicesUpdaterDecode:
             global_override_indptr_cpu[0] = 0
             global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
 
-        wrapper.begin_forward(
-            kv_indptr,
-            kv_indices,
-            self.kv_last_page_len[:bs],
-            self.num_qo_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            1,
-            data_type=self.data_type,
-            q_data_type=self.q_data_type,
-            non_blocking=True,
-            fixed_split_size=fixed_split_size,
-            disable_split_kv=(
-                disable_split_kv if disable_split_kv is not None else False
-            ),
+        # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
+        # by checking if it's a partial function with fast_decode_plan as the func
+        wrapper_uses_fast_decode_plan = (
+            hasattr(wrapper.begin_forward, "func")
+            and wrapper.begin_forward.func == fast_decode_plan
         )
+
+        if wrapper_uses_fast_decode_plan:
+            # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
+            wrapper.begin_forward(
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                data_type=self.data_type,
+                q_data_type=self.q_data_type,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=(
+                    disable_split_kv if disable_split_kv is not None else False
+                ),
+                global_override_indptr_cpu=global_override_indptr_cpu,
+            )
+        else:
+            # When using original begin_forward, don't pass global_override_indptr_cpu
+            wrapper.begin_forward(
+                kv_indptr,
+                kv_indices,
+                self.kv_last_page_len[:bs],
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                1,
+                data_type=self.data_type,
+                q_data_type=self.q_data_type,
+                non_blocking=True,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=(
+                    disable_split_kv if disable_split_kv is not None else False
+                ),
+            )
 
         if locally_override:
             global_override_indptr_cpu = None
@@ -919,9 +1198,7 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
@@ -937,10 +1214,9 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
+        multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -965,6 +1241,7 @@ class FlashInferIndicesUpdaterPrefill:
             use_ragged,
             spec_info,
             fixed_split_size=fixed_split_size,
+            multi_item_params=multi_item_params,
         )
 
     def update_sliding_window(
@@ -977,10 +1254,9 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
+        multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1014,6 +1290,7 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 use_sliding_window_kv_pool=use_sliding_window_kv_pool,
+                multi_item_params=multi_item_params,
             )
 
     def update_cross_attention(
@@ -1026,10 +1303,9 @@ class FlashInferIndicesUpdaterPrefill:
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
+        multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1056,6 +1332,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.qo_indptr[wrapper_id],
                 use_ragged,
                 spec_info,
+                multi_item_params=multi_item_params,
             )
 
     def call_begin_forward(
@@ -1071,11 +1348,10 @@ class FlashInferIndicesUpdaterPrefill:
         kv_indptr: torch.Tensor,
         qo_indptr: torch.Tensor,
         use_ragged: bool,
-        spec_info: Optional[
-            Union[EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput]
-        ],
+        spec_info: Optional[SpecInput],
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
+        multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1101,9 +1377,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr = qo_indptr[: bs + 1]
             custom_mask = None
         else:
-            assert isinstance(
-                spec_info, (EagleDraftInput, EagleVerifyInput, LookaheadVerifyInput)
-            )
+            assert isinstance(spec_info, SpecInput)
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
@@ -1133,6 +1407,22 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
+        # Conditionally set multi-item parameters
+        if multi_item_params is not None and multi_item_params.is_enabled():
+            # Multi-item scoring is active - use specialized parameters and disable generic custom_mask
+            use_custom_mask = None
+            prefix_len_ptr = multi_item_params.prefix_len_ptr
+            token_pos_in_items_ptr = multi_item_params.token_pos_in_items_ptr
+            token_pos_in_items_len = multi_item_params.token_pos_in_items_len
+            max_item_len_ptr = multi_item_params.max_item_len_ptr
+        else:
+            # No multi-item scoring - use standard parameters
+            use_custom_mask = custom_mask
+            prefix_len_ptr = None
+            token_pos_in_items_ptr = None
+            token_pos_in_items_len = 0
+            max_item_len_ptr = None
+
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,
@@ -1144,9 +1434,13 @@ class FlashInferIndicesUpdaterPrefill:
             1,
             q_data_type=self.q_data_type,
             kv_data_type=self.data_type,
-            custom_mask=custom_mask,
+            custom_mask=use_custom_mask,
             non_blocking=True,
             fixed_split_size=fixed_split_size,
+            prefix_len_ptr=prefix_len_ptr,
+            token_pos_in_items_ptr=token_pos_in_items_ptr,
+            token_pos_in_items_len=token_pos_in_items_len,
+            max_item_len_ptr=max_item_len_ptr,
         )
 
 
@@ -1162,7 +1456,7 @@ class FlashInferMultiStepDraftBackend:
         topk: int,
         speculative_num_steps: int,
     ):
-        from sglang.srt.speculative.eagle_utils import generate_draft_decode_kv_indices
+        from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
@@ -1182,7 +1476,7 @@ class FlashInferMultiStepDraftBackend:
             (max_bs,), dtype=torch.int32, device=model_runner.device
         )
         self.attn_backends: List[FlashInferAttnBackend] = []
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
                 FlashInferAttnBackend(
                     model_runner,
@@ -1226,7 +1520,7 @@ class FlashInferMultiStepDraftBackend:
         )
 
         assert forward_batch.spec_info is not None
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
+        assert forward_batch.spec_info.is_draft_input()
 
         # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
         indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
@@ -1270,7 +1564,7 @@ class FlashInferMultiStepDraftBackend:
             device="cuda",
         )
 
-        for i in range(self.speculative_num_steps):
+        for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(
                 max_bs, max_num_tokens, kv_indices_buf=self.cuda_graph_kv_indices[i]
             )
@@ -1354,174 +1648,3 @@ def should_use_tensor_core(
         return gqa_group_size >= 4
     else:
         return False
-
-
-# Use as a fast path to override the indptr in flashinfer's plan function
-# This is used to remove some host-to-device copy overhead.
-global_override_indptr_cpu = None
-
-
-def fast_decode_plan(
-    self,
-    indptr: torch.Tensor,
-    indices: torch.Tensor,
-    last_page_len: torch.Tensor,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    pos_encoding_mode: str = "NONE",
-    window_left: int = -1,
-    logits_soft_cap: Optional[float] = None,
-    q_data_type: Optional[Union[str, torch.dtype]] = None,
-    kv_data_type: Optional[Union[str, torch.dtype]] = None,
-    data_type: Optional[Union[str, torch.dtype]] = None,
-    sm_scale: Optional[float] = None,
-    rope_scale: Optional[float] = None,
-    rope_theta: Optional[float] = None,
-    non_blocking: bool = True,
-    fixed_split_size: Optional[int] = None,
-    disable_split_kv: bool = False,
-) -> None:
-    """
-    A faster version of BatchDecodeWithPagedKVCacheWrapper::plan used for FlashInferMultiStepDraftBackend.
-    Modifications:
-    - Remove unnecessary device-to-device copy for the cuda graph buffers.
-    - Remove unnecessary host-to-device copy for the metadata buffers.
-    """
-    batch_size = len(last_page_len)
-    if logits_soft_cap is None:
-        logits_soft_cap = 0.0
-
-    # Handle data types consistently
-    if data_type is not None:
-        if q_data_type is None:
-            q_data_type = data_type
-        if kv_data_type is None:
-            kv_data_type = data_type
-    elif q_data_type is None:
-        q_data_type = "float16"
-
-    if kv_data_type is None:
-        kv_data_type = q_data_type
-
-    if self.use_tensor_cores:
-        qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
-        # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
-        if fixed_split_size is None:
-            fixed_split_size = -1
-
-    if self.is_cuda_graph_enabled:
-        if batch_size != self._fixed_batch_size:
-            raise ValueError(
-                "The batch size should be fixed in cudagraph mode, the runtime batch size {} "
-                " mismatches the batch size set during initialization {}".format(
-                    batch_size, self._fixed_batch_size
-                )
-            )
-        if len(indices) > len(self._paged_kv_indices_buf):
-            raise ValueError(
-                "The size of indices should be less than or equal to the allocated buffer"
-            )
-    else:
-        self._paged_kv_indptr_buf = indptr
-        self._paged_kv_indices_buf = indices
-        self._paged_kv_last_page_len_buf = last_page_len
-        if self.use_tensor_cores:
-            self._qo_indptr_buf = qo_indptr_host.to(
-                self.device, non_blocking=non_blocking
-            )
-
-    # Create empty tensors for dtype info if needed
-    empty_q_data = torch.empty(
-        0,
-        dtype=(
-            getattr(torch, q_data_type) if isinstance(q_data_type, str) else q_data_type
-        ),
-        device=self.device,
-    )
-
-    empty_kv_cache = torch.empty(
-        0,
-        dtype=(
-            getattr(torch, kv_data_type)
-            if isinstance(kv_data_type, str)
-            else kv_data_type
-        ),
-        device=self.device,
-    )
-
-    indptr_host = (
-        global_override_indptr_cpu
-        if global_override_indptr_cpu is not None
-        else indptr.cpu()
-    )
-
-    with torch.cuda.device(self.device):
-
-        if self.use_tensor_cores:
-            # ALSO convert last_page_len to CPU
-            if page_size == 1:
-                # When page size is 1, last_page_len is always 1.
-                # Directly construct the host tensor rather than executing a device-to-host copy.
-                last_page_len_host = torch.ones(
-                    (batch_size,), dtype=torch.int32, device="cpu"
-                )
-            else:
-                last_page_len_host = last_page_len.cpu()
-
-            kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
-
-            try:
-                # Make sure we pass exactly 15 arguments for tensor core version
-                self._plan_info = self._cached_module.plan(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    qo_indptr_host,
-                    indptr_host,
-                    kv_lens_arr_host,
-                    batch_size,  # total_num_rows
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    page_size,
-                    self.is_cuda_graph_enabled,
-                    head_dim,
-                    head_dim,
-                    False,  # causal
-                    window_left,
-                    fixed_split_size,
-                    disable_split_kv,
-                )
-            except Exception as e:
-                raise RuntimeError(f"Error in standard plan: {e}")
-        else:
-            try:
-                # Make sure we pass exactly 15 arguments for standard version
-                self._plan_info = self._cached_module.plan(
-                    self._float_workspace_buffer,
-                    self._int_workspace_buffer,
-                    self._pin_memory_int_workspace_buffer,
-                    indptr_host,
-                    batch_size,
-                    num_qo_heads,
-                    num_kv_heads,
-                    page_size,
-                    self.is_cuda_graph_enabled,
-                    window_left,
-                    logits_soft_cap,
-                    head_dim,
-                    head_dim,
-                    empty_q_data,
-                    empty_kv_cache,
-                )
-            except Exception as e:
-                raise RuntimeError(f"Error in standard plan: {e}")
-
-    self._pos_encoding_mode = pos_encoding_mode
-    self._window_left = window_left
-    self._logits_soft_cap = logits_soft_cap
-    self._sm_scale = sm_scale
-    self._rope_scale = rope_scale
-    self._rope_theta = rope_theta

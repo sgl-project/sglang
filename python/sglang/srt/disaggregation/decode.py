@@ -21,14 +21,16 @@ Life cycle of a request in the decode server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 import torch
 from torch.distributed import ProcessGroup
 
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -46,12 +48,21 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, RequestStage, ScheduleBatch
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import get_int_env_var, require_mlp_sync
+from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    KVCache,
+    NSATokenToKVPool,
+    ReqToTokenPool,
+    SWAKVPool,
+)
+from sglang.srt.tracing.trace import trace_event_batch, trace_slice_end
+from sglang.srt.utils import get_int_env_var
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -123,12 +134,46 @@ class DecodeReqToTokenPool:
         self.free_slots = list(range(self.size + self.pre_alloc_size))
 
 
+class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
+
+    def __init__(
+        self,
+        size: int,
+        max_context_len: int,
+        device: str,
+        enable_memory_saver: bool,
+        cache_params: "Mamba2CacheParams",
+        speculative_num_draft_tokens: int,
+        pre_alloc_size: int,
+    ):
+        DecodeReqToTokenPool.__init__(
+            self,
+            size=size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            pre_alloc_size=pre_alloc_size,
+        )
+        self.enable_memory_saver = enable_memory_saver
+        self._init_mamba_pool(
+            size + pre_alloc_size, cache_params, device, speculative_num_draft_tokens
+        )
+
+    def clear(self):
+        self.free_slots = list(range(self.size + self.pre_alloc_size))
+        self.mamba_pool.clear()
+
+
 @dataclass
 class DecodeRequest:
     req: Req
     kv_receiver: BaseKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+
+    @property
+    def seqlen(self) -> int:
+        return self.req.seqlen
 
 
 class DecodePreallocQueue:
@@ -216,6 +261,28 @@ class DecodePreallocQueue:
             self.metadata_buffers.get_buf_infos()
         )
 
+        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
+            state_data_ptrs, state_data_lens, state_item_lens = (
+                self.token_to_kv_pool.get_state_buf_infos()
+            )
+            kv_args.state_data_ptrs = state_data_ptrs
+            kv_args.state_data_lens = state_data_lens
+            kv_args.state_item_lens = state_item_lens
+
+            if isinstance(self.token_to_kv_pool, SWAKVPool):
+                kv_args.state_type = "swa"
+            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                kv_args.state_type = "mamba"
+            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+                kv_args.state_type = "nsa"
+            else:
+                kv_args.state_type = "none"
+        else:
+            kv_args.state_data_ptrs = []
+            kv_args.state_data_lens = []
+            kv_args.state_item_lens = []
+            kv_args.state_type = "none"
+
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class: Type[BaseKVManager] = get_kv_class(
@@ -254,6 +321,7 @@ class DecodePreallocQueue:
             )
 
             req.add_latency(RequestStage.DECODE_PREPARE)
+            trace_slice_end(RequestStage.DECODE_PREPARE, req.rid, auto_next_anon=True)
             self.queue.append(
                 DecodeRequest(req=req, kv_receiver=kv_receiver, waiting_for_input=False)
             )
@@ -413,18 +481,64 @@ class DecodePreallocQueue:
                 .cpu()
                 .numpy()
             )
+            page_size = self.token_to_kv_pool_allocator.page_size
+
+            # Prepare extra pool indices for hybrid models
+            if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+                # Mamba hybrid model: single mamba state index
+                state_indices = [
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        decode_req.req.req_pool_idx
+                    ]
+                    .cpu()
+                    .numpy()
+                ]
+            elif isinstance(self.token_to_kv_pool, SWAKVPool):
+                # SWA hybrid model: send decode-side SWA window indices
+                seq_len = len(decode_req.req.origin_input_ids)
+                window_size = self.scheduler.sliding_window_size
+
+                window_start = max(0, seq_len - window_size)
+                window_start = (window_start // page_size) * page_size
+                window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, window_start:seq_len
+                ]
+
+                # Translate to SWA pool indices
+                window_kv_indices_swa = (
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        window_kv_indices_full
+                    )
+                )
+                state_indices = window_kv_indices_swa.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+                seq_len = len(decode_req.req.origin_input_ids)
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, :seq_len
+                ]
+                state_indices = kv_indices_full.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, page_size)
+            else:
+                state_indices = None
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(
-                kv_indices, self.token_to_kv_pool_allocator.page_size
+            page_indices = kv_to_page_indices(kv_indices, page_size)
+            decode_req.kv_receiver.init(
+                page_indices, decode_req.metadata_buffer_index, state_indices
             )
-            decode_req.kv_receiver.init(page_indices, decode_req.metadata_buffer_index)
-            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
+            decode_req.req.time_stats.decode_transfer_queue_entry_time = (
+                time.perf_counter()
+            )
+            decode_req.req.add_latency(RequestStage.DECODE_BOOTSTRAP)
+            trace_slice_end(
+                RequestStage.DECODE_BOOTSTRAP, decode_req.req.rid, auto_next_anon=True
+            )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -455,7 +569,7 @@ class DecodePreallocQueue:
             else 0
         )
 
-        if self.scheduler.model_config.is_hybrid:
+        if self.scheduler.model_config.is_hybrid_swa:
             available_size = min(
                 self.token_to_kv_pool_allocator.full_available_size(),
                 self.token_to_kv_pool_allocator.swa_available_size(),
@@ -475,11 +589,11 @@ class DecodePreallocQueue:
             need_space_for_single_req,
         )
 
-        # Note: if the last fake extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
+        # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
         if (
             self.scheduler.last_batch
-            and self.scheduler.last_batch.forward_mode.is_extend()
+            and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
             allocatable_tokens -= self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
@@ -498,7 +612,10 @@ class DecodePreallocQueue:
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
-        req_pool_indices = self.req_to_token_pool.alloc(1)
+        if isinstance(self.req_to_token_pool, HybridMambaDecodeReqToTokenPool):
+            req_pool_indices = self.req_to_token_pool.alloc(1, [req])
+        else:
+            req_pool_indices = self.req_to_token_pool.alloc(1)
 
         assert (
             req_pool_indices is not None
@@ -506,29 +623,21 @@ class DecodePreallocQueue:
 
         req.req_pool_idx = req_pool_indices[0]
 
+        # Alloc all tokens for the prebuilt req (except for the reserved input token for decoding)
+        fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        req.kv_allocated_len = fill_len
+        req.kv_committed_len = fill_len
         if self.token_to_kv_pool_allocator.page_size == 1:
-            kv_loc = self.token_to_kv_pool_allocator.alloc(
-                len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-            )
+            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
-            num_tokens = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+            device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [0],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                seq_lens=torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                last_loc=torch.tensor(
-                    [-1],
-                    dtype=torch.int64,
-                    device=self.token_to_kv_pool_allocator.device,
-                ),
-                extend_num_tokens=num_tokens,
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
             )
 
         assert (
@@ -573,6 +682,50 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
+    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> None:
+        idx = decode_req.metadata_buffer_index
+        (
+            output_id,
+            cached_tokens,
+            output_token_logprobs_val,
+            output_token_logprobs_idx,
+            output_top_logprobs_val,
+            output_top_logprobs_idx,
+            output_topk_p,
+            output_topk_index,
+            output_hidden_states,
+        ) = self.metadata_buffers.get_buf(idx)
+
+        decode_req.req.output_ids.append(output_id[0].item())
+        decode_req.req.cached_tokens = cached_tokens[0].item()
+        if not self.spec_algorithm.is_none():
+            decode_req.req.output_topk_p = output_topk_p
+            decode_req.req.output_topk_index = output_topk_index
+            decode_req.req.hidden_states_tensor = output_hidden_states
+
+        if decode_req.req.return_logprob:
+            decode_req.req.output_token_logprobs_val.append(
+                output_token_logprobs_val[0].item()
+            )
+            decode_req.req.output_token_logprobs_idx.append(
+                output_token_logprobs_idx[0].item()
+            )
+            decode_req.req.output_top_logprobs_val.append(
+                output_top_logprobs_val[: decode_req.req.top_logprobs_num].tolist()
+            )
+            decode_req.req.output_top_logprobs_idx.append(
+                output_top_logprobs_idx[: decode_req.req.top_logprobs_num].tolist()
+            )
+
+        decode_req.kv_receiver.clear()
+        decode_req.kv_receiver = None
+        trace_slice_end(
+            RequestStage.DECODE_TRANSFERRED,
+            decode_req.req.rid,
+            auto_next_anon=True,
+        )
+        decode_req.req.time_stats.wait_queue_entry_time = time.perf_counter()
+
     def pop_transferred(self) -> List[Req]:
         if not self.queue:
             return []
@@ -598,60 +751,16 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
-                # unlock the kv cache or it will have memory leak
-                self.tree_cache.cache_finished_req(decode_req.req)
+                # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
-
-                idx = decode_req.metadata_buffer_index
-                (
-                    output_id,
-                    output_token_logprobs_val,
-                    output_token_logprobs_idx,
-                    output_top_logprobs_val,
-                    output_top_logprobs_idx,
-                    output_hidden_states,
-                ) = self.metadata_buffers.get_buf(idx)
-
-                decode_req.req.output_ids.append(output_id[0].item())
-                if not self.spec_algorithm.is_none():
-                    decode_req.req.hidden_states_tensor = output_hidden_states
-                if decode_req.req.return_logprob:
-                    decode_req.req.output_token_logprobs_val.append(
-                        output_token_logprobs_val[0].item()
-                    )
-                    decode_req.req.output_token_logprobs_idx.append(
-                        output_token_logprobs_idx[0].item()
-                    )
-                    decode_req.req.output_top_logprobs_val.append(
-                        output_top_logprobs_val[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-                    decode_req.req.output_top_logprobs_idx.append(
-                        output_top_logprobs_idx[
-                            : decode_req.req.top_logprobs_num
-                        ].tolist()
-                    )
-
-                if hasattr(decode_req.kv_receiver, "clear"):
-                    decode_req.kv_receiver.clear()
-
-                # special handling for sampling_params.max_new_tokens == 1
-                if decode_req.req.sampling_params.max_new_tokens == 1:
-                    # finish immediately
-                    decode_req.req.check_finished()
-                    self.scheduler.stream_output(
-                        [decode_req.req], decode_req.req.return_logprob
-                    )
-                    self.tree_cache.cache_finished_req(decode_req.req)
-                else:
-                    transferred_reqs.append(decode_req.req)
-
+                self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
+                transferred_reqs.append(decode_req.req)
             elif poll in [
                 KVPoll.Bootstrapping,
                 KVPoll.WaitingForInput,
@@ -688,126 +797,61 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
-
             if batch:
                 # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
-                    )
-                    if prepare_mlp_sync_flag:
-                        self._prepare_idle_batch_and_run(None)
-                else:
-                    if prepare_mlp_sync_flag:
-                        self.prepare_mlp_sync_batch(batch)
-                    result = self.run_batch(batch)
-                    self.process_batch_result(batch, result)
-            elif prepare_mlp_sync_flag:
-                batch, _ = self._prepare_idle_batch_and_run(None)
-
-            if batch is None and (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-                == 0
-            ):
+                result = self.run_batch(batch)
+                self.process_batch_result(batch, result)
+            else:
                 self.self_check_during_idle()
 
             self.last_batch = batch
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
-        result_queue = deque()
+        self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
-        self.last_batch_in_queue = False  # last batch is modified in-place, so we need another variable to track if it's extend
 
         while True:
+
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
-            last_batch_in_queue = False
 
-            prepare_mlp_sync_flag = require_mlp_sync(self.server_args)
-
+            batch_result = None
             if batch:
-                # Generate fake extend output.
-                if batch.forward_mode.is_extend():
-                    # Note: Logprobs should be handled on the prefill engine.
-                    self.stream_output(
-                        batch.reqs, any(req.return_logprob for req in batch.reqs)
-                    )
-                    if prepare_mlp_sync_flag:
-                        batch_, result = self._prepare_idle_batch_and_run(
-                            None, delay_process=True
-                        )
-                        if batch_:
-                            result_queue.append((batch_.copy(), result))
-                            last_batch_in_queue = True
-                else:
-                    if prepare_mlp_sync_flag:
-                        self.prepare_mlp_sync_batch(batch)
-                    result = self.run_batch(batch)
-                    result_queue.append((batch.copy(), result))
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
 
-                    if (self.last_batch is None) or (not self.last_batch_in_queue):
-                        # Create a dummy first batch to start the pipeline for overlap schedule.
-                        # It is now used for triggering the sampling_info_done event.
-                        tmp_batch = ScheduleBatch(
-                            reqs=None,
-                            forward_mode=ForwardMode.DUMMY_FIRST,
-                            next_batch_sampling_info=self.tp_worker.cur_sampling_info,
-                        )
-                        self.set_next_batch_sampling_info_done(tmp_batch)
-                    last_batch_in_queue = True
-
-            elif prepare_mlp_sync_flag:
-                batch, result = self._prepare_idle_batch_and_run(
-                    None, delay_process=True
-                )
-                if batch:
-                    result_queue.append((batch.copy(), result))
-                    last_batch_in_queue = True
-
-            # Process the results of the previous batch but skip if the last batch is extend
-            if self.last_batch and self.last_batch_in_queue:
-                tmp_batch, tmp_result = result_queue.popleft()
-                tmp_batch.next_batch_sampling_info = (
-                    self.tp_worker.cur_sampling_info if batch else None
-                )
+            if self.last_batch:
+                tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
-
-            if batch is None and (
-                len(self.waiting_queue)
-                + len(self.disagg_decode_transfer_queue.queue)
-                + len(self.disagg_decode_prealloc_queue.queue)
-                == 0
-            ):
+            elif batch is None:
                 self.self_check_during_idle()
 
+            self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
-            self.last_batch_in_queue = last_batch_in_queue
 
-    def _prepare_idle_batch_and_run(self: Scheduler, batch, delay_process=False):
-        batch = self.prepare_mlp_sync_batch(batch)
-        result = None
-        if batch:
-            result = self.run_batch(batch)
-            if not delay_process:
-                self.process_batch_result(batch, result)
-        return batch, result
+    def _run_batch_prebuilt(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> GenerationBatchResult:
+        if batch.inner_idle_batch is not None:
+            idle_batch = batch.inner_idle_batch
+            # Reset the inner idle batch to avoid reusing it.
+            batch.inner_idle_batch = None
+            return self.run_batch(idle_batch)
+
+        return GenerationBatchResult()
 
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
-    ) -> Optional[Tuple[ScheduleBatch, bool]]:
+    ) -> Optional[ScheduleBatch]:
         """Create fake completed prefill if possible and merge with running batch"""
         # Merge the prefill batch into the running batch
         last_batch = self.last_batch
-        if last_batch and last_batch.forward_mode.is_extend():
+        if last_batch and last_batch.forward_mode.is_prebuilt():
             # chunked prefill doesn't happen in decode instance.
             assert self.chunked_req is None
             # Filter finished batches.
@@ -831,6 +875,15 @@ class SchedulerDisaggregationDecodeMixin:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
 
+        # 1. decode + None -> decode + idle
+        # 2. decode + prebuilt -> decode + idle (idle forward, prebuilt returns)
+        # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
+        # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
+        if self.require_mlp_sync:
+            ret = self.prepare_mlp_sync_batch(ret)
+
+        if ret:
+            trace_event_batch("schedule", ret.reqs)
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -865,6 +918,9 @@ class SchedulerDisaggregationDecodeMixin:
         if len(can_run_list) == 0:
             return None
 
+        for req in can_run_list:
+            req.time_stats.forward_entry_time = time.perf_counter()
+
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -877,12 +933,15 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         # construct fake completed prefill
-        new_batch.prepare_for_prebuilt_extend()
-        new_batch.process_prebuilt_extend(self.server_args, self.model_config)
+        new_batch.prepare_for_prebuilt()
+        new_batch.process_prebuilt(self.server_args, self.future_map)
 
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            self.decode_offload_manager.check_offload_progress()
+
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)

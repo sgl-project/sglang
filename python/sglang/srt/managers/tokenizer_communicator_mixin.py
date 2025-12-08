@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-import os
 import time
+import uuid
 from collections import deque
 from typing import (
     TYPE_CHECKING,
@@ -22,12 +22,16 @@ import fastapi
 import zmq
 
 from sglang.srt.managers.io_struct import (
+    CheckWeightsReqInput,
+    CheckWeightsReqOutput,
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
+    CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     ExpertDistributionReq,
     ExpertDistributionReqOutput,
+    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -42,8 +46,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
-    LoRAUpdateResult,
-    MultiTokenizerWrapper,
+    LoRAUpdateOutput,
+    OpenSessionReqInput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -61,6 +65,8 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -78,8 +84,6 @@ logger = logging.getLogger(__name__)
 
 class _Communicator(Generic[T]):
     """Note: The communicator now only run up to 1 in-flight request at any time."""
-
-    enable_multi_tokenizer = False
 
     def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
         self._sender = sender
@@ -100,8 +104,6 @@ class _Communicator(Generic[T]):
             assert self._result_values is None
 
         if obj:
-            if _Communicator.enable_multi_tokenizer:
-                obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
             self._sender.send_pyobj(obj)
 
         self._result_event = asyncio.Event()
@@ -122,8 +124,6 @@ class _Communicator(Generic[T]):
             self._result_event = asyncio.Event()
 
             if obj:
-                if _Communicator.enable_multi_tokenizer:
-                    obj = MultiTokenizerWrapper(worker_id=os.getpid(), obj=obj)
                 self._sender.send_pyobj(obj)
 
         await self._result_event.wait()
@@ -141,6 +141,13 @@ class _Communicator(Generic[T]):
         self._result_values.append(recv_obj)
         if len(self._result_values) == self._fan_out:
             self._result_event.set()
+
+    @staticmethod
+    def merge_results(results):
+        all_success = all([r.success for r in results])
+        all_message = [r.message for r in results]
+        all_message = " | ".join(all_message)
+        return all_success, all_message
 
 
 class TokenizerCommunicatorMixin:
@@ -166,6 +173,9 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_tensor_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_weights_from_ipc_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -173,6 +183,9 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         self.resume_memory_occupation_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.check_weights_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.slow_down_communicator = _Communicator(
@@ -233,6 +246,10 @@ class TokenizerCommunicatorMixin:
                     self.update_weights_from_tensor_communicator.handle_recv,
                 ),
                 (
+                    UpdateWeightsFromIPCReqOutput,
+                    self.update_weights_from_ipc_communicator.handle_recv,
+                ),
+                (
                     GetWeightsByNameReqOutput,
                     self.get_weights_by_name_communicator.handle_recv,
                 ),
@@ -243,6 +260,10 @@ class TokenizerCommunicatorMixin:
                 (
                     ResumeMemoryOccupationReqOutput,
                     self.resume_memory_occupation_communicator.handle_recv,
+                ),
+                (
+                    CheckWeightsReqOutput,
+                    self.check_weights_communicator.handle_recv,
                 ),
                 (
                     SlowDownReqOutput,
@@ -273,7 +294,7 @@ class TokenizerCommunicatorMixin:
                     self.expert_distribution_communicator.handle_recv,
                 ),
                 (
-                    LoRAUpdateResult,
+                    LoRAUpdateOutput,
                     self.update_lora_adapter_communicator.handle_recv,
                 ),
                 (
@@ -302,10 +323,17 @@ class TokenizerCommunicatorMixin:
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
         profile_by_stage: bool = False,
+        merge_profiles: bool = False,
+        profile_prefix: Optional[str] = None,
+        profile_stages: Optional[List[str]] = None,
     ):
         self.auto_create_handle_loop()
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         with_stack = False if with_stack is False or env_with_stack is False else True
+        env_record_shapes: bool = get_bool_env_var(
+            "SGLANG_PROFILE_RECORD_SHAPES", "true"
+        )
+        record_shapes = (record_shapes is not False) and env_record_shapes
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -316,6 +344,9 @@ class TokenizerCommunicatorMixin:
             record_shapes=record_shapes,
             profile_by_stage=profile_by_stage,
             profile_id=str(time.time()),
+            merge_profiles=merge_profiles,
+            profile_prefix=profile_prefix,
+            profile_stages=profile_stages,
         )
         return await self._execute_profile(req)
 
@@ -332,15 +363,18 @@ class TokenizerCommunicatorMixin:
 
     async def start_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.START_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def stop_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.STOP_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def dump_expert_distribution_record(self: TokenizerManager):
         self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(ExpertDistributionReq.DUMP_RECORD)
+        req = ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
+        await self.expert_distribution_communicator(req)
 
     async def init_weights_update_group(
         self: TokenizerManager,
@@ -349,10 +383,11 @@ class TokenizerCommunicatorMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for init parameter update group"
-        result = (await self.init_weights_update_group_communicator(obj))[0]
-        return result.success, result.message
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+
+        results = await self.init_weights_update_group_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def destroy_weights_update_group(
         self,
@@ -361,10 +396,11 @@ class TokenizerCommunicatorMixin:
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for destroy parameter update group"
-        result = (await self.destroy_weights_update_group_communicator(obj))[0]
-        return result.success, result.message
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
+
+        results = await self.destroy_weights_update_group_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def update_weights_from_distributed(
         self: TokenizerManager,
@@ -379,11 +415,25 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
+                result = (await self.update_weights_from_distributed_communicator(obj))[
+                    0
+                ]
+                return result.success, result.message
+
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
-            result = (await self.update_weights_from_distributed_communicator(obj))[0]
-            return result.success, result.message
+            results = await self.update_weights_from_distributed_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
 
     async def init_weights_send_group_for_remote_instance(
         self,
@@ -426,11 +476,71 @@ class TokenizerCommunicatorMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        # Immediately update the weights if the engine is in paused state
+        async with self.is_pause_cond:
+            if self.is_pause:
+                result = (await self.update_weights_from_tensor_communicator(obj))[0]
+                return result.success, result.message
+
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
             result = (await self.update_weights_from_tensor_communicator(obj))[0]
-            return result.success, result.message
+            success, message = result.success, result.message
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
+
+    async def update_weights_from_ipc(
+        self,
+        obj: UpdateWeightsFromIPCReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Update weights via IPC for checkpoint-engine integration."""
+        self.auto_create_handle_loop()
+        try:
+            # For now, we only support single data parallel instance
+            assert (
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
+            logger.info("Starting IPC weight update")
+            # This means that weight sync cannot run while requests are in progress.
+            async with self.model_update_lock.writer_lock:
+                result = (await self.update_weights_from_ipc_communicator(obj))[0]
+                success, message = result.success, result.message
+        except Exception as e:
+            error_msg = f"IPC weight update failed: {str(e)}"
+            logger.error(error_msg)
+            success, message = False, error_msg
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
+
+    async def _unload_lora_adapter_locked(
+        self: TokenizerManager,
+        obj: UnloadLoRAAdapterReqInput,
+    ) -> UnloadLoRAAdapterReqOutput:
+        assert (
+            self.lora_update_lock.locked()
+        ), "self.lora_update_lock must be locked in order for self._unload_lora_adapter_locked() to be called"
+
+        # Unregister the LoRA adapter from the registry to stop new requests for this adapter
+        # from being started.
+        lora_id = await self.lora_registry.unregister(obj.lora_name)
+        obj.lora_id = lora_id
+
+        # Initiate the actual unloading operation at the backend processes only after all
+        # ongoing requests using this LoRA adapter are finished.
+        await self.lora_registry.wait_for_unload(lora_id)
+        result = (await self.update_lora_adapter_communicator(obj))[0]
+
+        return result
 
     async def load_lora_adapter(
         self: TokenizerManager,
@@ -457,17 +567,6 @@ class TokenizerCommunicatorMixin:
             )
 
             async with self.lora_update_lock:
-                if (
-                    self.server_args.max_loaded_loras is not None
-                    and self.lora_registry.num_registered_loras
-                    >= self.server_args.max_loaded_loras
-                ):
-                    raise ValueError(
-                        f"Cannot load LoRA adapter {obj.lora_name} at path {obj.lora_path}. "
-                        f"Maximum number of loaded LoRA adapters is {self.server_args.max_loaded_loras}. "
-                        "Please unload some LoRA adapters before loading new ones."
-                    )
-
                 # Generate new uniquely identifiable LoRARef object.
                 new_adapter = LoRARef(
                     lora_name=obj.lora_name,
@@ -482,6 +581,37 @@ class TokenizerCommunicatorMixin:
                 # Register the LoRA adapter only after loading is successful.
                 if result.success:
                     await self.lora_registry.register(new_adapter)
+                    self.lora_ref_cache[obj.lora_name] = new_adapter
+
+                if self.server_args.max_loaded_loras is not None:
+                    while (
+                        self.lora_registry.num_registered_loras
+                        > self.server_args.max_loaded_loras
+                    ):
+                        lru_lora_name = await self.lora_registry.lru_lora_name(
+                            exclude_pinned=True
+                        )
+                        if lru_lora_name is None:
+                            raise ValueError(
+                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                                f"LoRA registry is: {self.lora_registry._registry}"
+                            )
+
+                        logger.info(
+                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                            f"max allowed: {self.server_args.max_loaded_loras})"
+                        )
+
+                        unload_result = await self._unload_lora_adapter_locked(
+                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+                        )
+                        if not unload_result.success:
+                            raise ValueError(
+                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                                f"{unload_result.error_message}"
+                            )
+                        del result.loaded_adapters[lru_lora_name]
 
                 return result
         except ValueError as e:
@@ -518,17 +648,7 @@ class TokenizerCommunicatorMixin:
             )
 
             async with self.lora_update_lock:
-                # Unregister the LoRA adapter from the registry to stop new requests for this adapter
-                # from being started.
-                lora_id = await self.lora_registry.unregister(obj.lora_name)
-                obj.lora_id = lora_id
-
-                # Initiate the actual unloading operation at the backend processes only after all
-                # ongoing requests using this LoRA adapter are finished.
-                await self.lora_registry.wait_for_unload(lora_id)
-                result = (await self.update_lora_adapter_communicator(obj))[0]
-
-                return result
+                return await self._unload_lora_adapter_locked(obj)
         except ValueError as e:
             return UnloadLoRAAdapterReqOutput(success=False, error_message=str(e))
 
@@ -561,6 +681,15 @@ class TokenizerCommunicatorMixin:
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
 
+    async def check_weights(
+        self: TokenizerManager,
+        obj: CheckWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> CheckWeightsReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.check_weights_communicator(obj)
+        return _Communicator.merge_results(results)
+
     async def slow_down(
         self: TokenizerManager,
         obj: SlowDownReqInput,
@@ -588,3 +717,68 @@ class TokenizerCommunicatorMixin:
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
+
+    async def open_session(
+        self, obj: OpenSessionReqInput, request: Optional[fastapi.Request] = None
+    ):
+        self.auto_create_handle_loop()
+
+        if obj.session_id is None:
+            obj.session_id = uuid.uuid4().hex
+        elif obj.session_id in self.session_futures:
+            return None
+
+        self.send_to_scheduler.send_pyobj(obj)
+
+        self.session_futures[obj.session_id] = asyncio.Future()
+        session_id = await self.session_futures[obj.session_id]
+        del self.session_futures[obj.session_id]
+        return session_id
+
+    async def close_session(
+        self, obj: CloseSessionReqInput, request: Optional[fastapi.Request] = None
+    ):
+        await self.send_to_scheduler.send_pyobj(obj)
+
+    def get_log_request_metadata(self):
+        max_length = None
+        skip_names = None
+        out_skip_names = None
+        if self.log_requests:
+            if self.log_requests_level == 0:
+                max_length = 1 << 30
+                skip_names = {
+                    "text",
+                    "input_ids",
+                    "input_embeds",
+                    "image_data",
+                    "audio_data",
+                    "lora_path",
+                    "sampling_params",
+                }
+                out_skip_names = {"text", "output_ids", "embedding"}
+            elif self.log_requests_level == 1:
+                max_length = 1 << 30
+                skip_names = {
+                    "text",
+                    "input_ids",
+                    "input_embeds",
+                    "image_data",
+                    "audio_data",
+                    "lora_path",
+                }
+                out_skip_names = {"text", "output_ids", "embedding"}
+            elif self.log_requests_level == 2:
+                max_length = 2048
+            elif self.log_requests_level == 3:
+                max_length = 1 << 30
+            else:
+                raise ValueError(
+                    f"Invalid --log-requests-level: {self.log_requests_level=}"
+                )
+        return max_length, skip_names, out_skip_names
+
+    def _update_weight_version_if_provided(self, weight_version: Optional[str]) -> None:
+        """Update weight version if provided."""
+        if weight_version is not None:
+            self.server_args.weight_version = weight_version

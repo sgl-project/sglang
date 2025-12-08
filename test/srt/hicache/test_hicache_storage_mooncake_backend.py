@@ -4,21 +4,19 @@ Usage:
     python3.10 -m pytest test/srt/hicache/test_hicache_storage_mooncake_backend.py -v
 """
 
-import json
 import os
 import subprocess
 import time
 import unittest
-from types import SimpleNamespace
 
 import requests
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     find_available_port,
+    is_in_ci,
 )
 
 
@@ -191,7 +189,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         """Get additional server arguments specific to configuration - override in subclasses"""
 
         server_args = {
-            "--tp-size": 1,
+            "--tp-size": 2,
             "--hicache-ratio": 2,
             "--hicache-storage-backend": "mooncake",
         }
@@ -199,8 +197,9 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         # Set the environment variables for Mooncake using dynamic ports
         env_vars = {
             "MOONCAKE_MASTER": f"127.0.0.1:{cls.mooncake_master_port}",
-            "MOONCAKE_PROTOCOL": "rdma",
-            "MOONCAKE_DEVICE": "mlx5_roce0,mlx5_roce1",
+            "MOONCAKE_PROTOCOL": "tcp",
+            "MC_MS_AUTO_DISC": "0",
+            "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB
         }
@@ -225,6 +224,7 @@ class TestMooncakeBackendLayerFirstLayout(
 '''
 
 
+@unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
 class TestMooncakeBackendPageFirstLayout(
     HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
 ):
@@ -268,48 +268,15 @@ class TestMooncakeBackendAccuracy(
         server_args, env_vars = super()._get_additional_server_args_and_env()
         server_args["--hicache-ratio"] = 1.5
         server_args["--tp-size"] = 2
+        server_args["--hicache-mem-layout"] = "page_first_direct"
+        server_args["--hicache-io-backend"] = "direct"
         return server_args, env_vars
 
     def test_eval_accuracy(self):
         """Test eval accuracy with cache persistence across cache flushes"""
-        print("\n=== Testing Eval Accuracy with Cache Persistence ===")
+        from test_hicache_storage_file_backend import run_eval_accuracy_test
 
-        # First evaluation - populate cache
-        print("Phase 1: Running initial GSM8K evaluation to populate cache...")
-        args_initial = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=50,
-            max_new_tokens=512,
-            parallel=10,
-            host=f"http://{self.base_host}",
-            port=int(self.base_port),
-        )
-        metrics_initial = run_eval_few_shot_gsm8k(args_initial)
-
-        # Flush cache to force remote storage access
-        print("Phase 2: Flushing device cache...")
-        self.assertTrue(self.flush_cache(), "Cache flush should succeed")
-        time.sleep(2)
-
-        # Second evaluation - should use remote cache
-        print("Phase 3: Running second GSM8K evaluation using remote cache...")
-        metrics_cached = run_eval_few_shot_gsm8k(args_initial)
-
-        # Verify accuracy consistency
-        accuracy_diff = abs(metrics_initial["accuracy"] - metrics_cached["accuracy"])
-        print(f"Accuracy difference: {accuracy_diff:.4f}")
-
-        # Assertions
-        self.assertGreater(
-            metrics_initial["accuracy"], 0.6, "Initial accuracy should be reasonable"
-        )
-        self.assertGreater(
-            metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
-        )
-        self.assertLess(
-            accuracy_diff, 0.05, "Accuracy should be consistent between cache states"
-        )
+        run_eval_accuracy_test(self)
 
 
 if __name__ == "__main__":

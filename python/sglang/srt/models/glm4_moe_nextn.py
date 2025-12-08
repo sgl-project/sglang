@@ -12,7 +12,8 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.5 NextN Speculative Decoding."""
+"""Inference-only GLM-4.5, GLM-4.6 Speculative Decoding."""
+
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -30,10 +31,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ class Glm4MoeModelNextN(nn.Module):
         super().__init__()
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
-                "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 model."
+                "Overriding Glm4MoeForCausalLMNextN quant config for modelopt_fp4 GLM-4.5 / GLM-4.6 model."
             )
             quant_config = None
 
@@ -84,14 +85,6 @@ class Glm4MoeModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        zero_allocator = BumpAllocator(
-            buffer_size=2,
-            dtype=torch.float32,
-            device=(
-                input_embeds.device if input_embeds is not None else input_ids.device
-            ),
-        )
-
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -111,7 +104,7 @@ class Glm4MoeModelNextN(nn.Module):
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
-                positions, hidden_states, forward_batch, residual, zero_allocator
+                positions, hidden_states, forward_batch, residual
             )
 
         if not forward_batch.forward_mode.is_idle():
@@ -124,7 +117,6 @@ class Glm4MoeModelNextN(nn.Module):
 
 
 class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -135,8 +127,6 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.determine_num_fused_shared_experts("Glm4MoeForCausalLMNextN")
-
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -145,9 +135,13 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
+
+        self.num_fused_shared_experts = (
+            0 if get_global_server_args().disable_shared_experts_fusion else 1
+        )
 
     @torch.no_grad()
     def forward(

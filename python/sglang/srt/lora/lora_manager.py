@@ -16,29 +16,29 @@
 # and "Punica: Multi-Tenant LoRA Serving"
 
 import logging
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend.base_backend import BaseLoRABackend, get_backend_from_name
+from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.lora_registry import get_backend_from_name
 from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
-    LoRABatchInfo,
     LoRAType,
-    get_layer_id,
     get_normalized_target_modules,
     get_target_module_name,
 )
-from sglang.srt.managers.io_struct import LoRAUpdateResult
+from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import replace_submodule
+from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,9 @@ class LoRAManager:
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
 
+        # Store eviction policy from server args
+        self.eviction_policy = server_args.lora_eviction_policy
+
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
         backend_type = get_backend_from_name(lora_backend)
@@ -84,31 +87,19 @@ class LoRAManager:
             lora_paths=lora_paths,
         )
 
-    def init_cuda_graph_batch_info(self, max_bs_in_cuda_graph: int):
+    def init_cuda_graph_batch_info(
+        self, max_bs_in_cuda_graph: int, num_tokens_per_bs: int
+    ):
         self.max_bs_in_cuda_graph = max_bs_in_cuda_graph
-        with torch.device("cuda"):
-            self.cuda_graph_batch_info = LoRABatchInfo(
-                bs=max_bs_in_cuda_graph,
-                use_cuda_graph=True,
-                num_segments=None,
-                seg_lens=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
-                max_len=1,
-                weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                permutation=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
-                lora_ranks=torch.zeros(self.max_loras_per_batch, dtype=torch.int32),
-                scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
-            )
-
         self.lora_backend.init_cuda_graph_batch_info(
-            cuda_graph_batch_info=self.cuda_graph_batch_info,
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
+            num_tokens_per_bs=num_tokens_per_bs,
         )
 
     def create_lora_update_result(
         self, success: bool, error_message: str = ""
-    ) -> LoRAUpdateResult:
-        return LoRAUpdateResult(
+    ) -> LoRAUpdateOutput:
+        return LoRAUpdateOutput(
             success=success,
             error_message=error_message,
             loaded_adapters={
@@ -117,7 +108,7 @@ class LoRAManager:
             },
         )
 
-    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
+    def load_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Load a single LoRA adapter from the specified path.
 
@@ -156,6 +147,19 @@ class LoRAManager:
         Validate if an adapter can be loaded into the current LoRA memory pool and generate error if it is incompatible.
         """
 
+        # Check if this LoRA adapter is already loaded
+        for existing_lora_ref in self.lora_refs.values():
+            if lora_ref.lora_name == existing_lora_ref.lora_name:
+                raise ValueError(
+                    f"Failed to load LoRA adapter {lora_ref.lora_name} because it is already loaded"
+                )
+
+            if lora_ref.lora_path == existing_lora_ref.lora_path:
+                logger.warning(
+                    f"{lora_ref.lora_path} is already loaded with name: {existing_lora_ref.lora_name}, "
+                    f"but another copy is being loaded with name: {lora_ref.lora_name}"
+                )
+
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
@@ -174,7 +178,7 @@ class LoRAManager:
                 "`--max-loras-per-batch` or load it as unpinned LoRA adapters."
             )
 
-    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateResult:
+    def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         """
         Unload LoRA adapters by their names. This will remove the adapters from the memory pool and
         delete the corresponding LoRA modules.
@@ -267,7 +271,7 @@ class LoRAManager:
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,
             scalings=scalings,
-            batch_info=self.cuda_graph_batch_info if use_cuda_graph else None,
+            use_cuda_graph=use_cuda_graph,
         )
 
     def update_lora_info(self):
@@ -411,16 +415,13 @@ class LoRAManager:
             max_lora_rank=self.max_lora_rank,
             target_modules=self.target_modules,
             base_model=self.base_model,
+            eviction_policy=self.eviction_policy,
         )
 
     def set_lora_module(self, module_name, module):
         lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
-
-    def should_skip_lora_for_vision_model(self, module_name):
-        # TODO: support different vision models
-        return module_name.find("vision_model.model") != -1
 
     def init_lora_modules(self):
         # Look-up table that essentially maps (layer_index, module_name) to the corresponding LoRA module.
@@ -437,10 +438,6 @@ class LoRAManager:
             if getattr(
                 self.base_model, "should_apply_lora", None
             ) and not self.base_model.should_apply_lora(module_name):
-                continue
-
-            # Skip vision model
-            if self.should_skip_lora_for_vision_model(module_name):
                 continue
 
             # The module should be converted if it is included in target_names

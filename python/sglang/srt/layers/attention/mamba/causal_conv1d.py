@@ -10,7 +10,7 @@ import torch
 from sgl_kernel import causal_conv1d_fwd
 from sgl_kernel import causal_conv1d_update as causal_conv1d_update_kernel
 
-PAD_SLOT_ID = -1
+from .causal_conv1d_triton import PAD_SLOT_ID
 
 
 def causal_conv1d_fn(
