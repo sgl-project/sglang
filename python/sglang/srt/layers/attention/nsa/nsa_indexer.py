@@ -1031,7 +1031,6 @@ class Indexer(CustomOp):
         if _use_multi_stream:
             indexer_weight_stream = get_indexer_weight_stream()
             indexer_weight_stream.wait_stream(torch.npu.current_stream())
-            indexer_weight_stream.wait_event(wq_b_event)
             with torch.npu.stream(indexer_weight_stream):
                 indexer_weights = self.weights_proj(x)[0]
                 indexer_weights.record_stream(indexer_weight_stream)

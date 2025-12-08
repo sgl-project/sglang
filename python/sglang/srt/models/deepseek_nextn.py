@@ -102,7 +102,7 @@ class DeepseekModelNextN(nn.Module):
         elif _is_npu:
             self.alt_stream = torch.npu.Stream()
         else:
-            None
+            self.alt_stream = None
 
         layer_name = "decoder"
         if _is_npu and (

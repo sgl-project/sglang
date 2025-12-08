@@ -988,11 +988,10 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             if not self._fuse_shared_experts_inside_sbo:
                 if self._use_multi_stream:
-                    # prefetch and forward share experts on the same stream
-                    main_event = torch.npu.Event()
-                    main_event.record()
-                    with torch.npu.stream(self.alt_stream):
-                        self.alt_stream.wait_event(main_event)
+                    self.alt_stream.wait_stream(
+                        torch.get_device_module().current_stream()
+                    )
+                    with torch.get_device_module().stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
@@ -1121,7 +1120,7 @@ class DeepseekV2MoE(nn.Module):
             and not self._fuse_shared_experts_inside_sbo
             and self._use_multi_stream
         ):
-            torch.npu.current_stream().wait_event(shared_event)
+            torch.get_device_module().current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
             if self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -3012,7 +3011,7 @@ class DeepseekV2Model(nn.Module):
         elif _is_npu:
             self.alt_stream = torch.npu.Stream()
         else:
-            None
+            self.alt_stream = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,

@@ -113,7 +113,7 @@ def npu_format_cast(
     return torch_npu.npu_format_cast(tensor, acl_format.value)
 
 
-def get_indexer_weight_stream(device="cuda"):
+def get_indexer_weight_stream():
     global indexer_weight_stream
     if indexer_weight_stream is None:
         indexer_weight_stream = torch.npu.Stream()
