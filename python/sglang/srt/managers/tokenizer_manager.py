@@ -1023,9 +1023,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         )
 
     @staticmethod
-    def extract_feature_tensors(
-        tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
-    ):
+    def extract_feature_tensors(tokenized_obj):
+        if not isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            return False, None, None
+
         has_feature_tensors = False
         feature_wrappers = []
         feature_infos = []
@@ -1058,6 +1059,51 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
         return has_feature_tensors, feature_wrappers, feature_infos
 
+    def _send_multi_parts(self, sender, obj, copy=False):
+        has_feature_tensors = False
+        feature_wrappers = None
+        feature_infos = None
+        if not self.server_args.skip_tokenizer_init:
+            has_feature_tensors, feature_wrappers, feature_infos = (
+                TokenizerManager.extract_feature_tensors(obj)
+            )
+        if has_feature_tensors:
+            parts = [
+                b"FEAT",
+                pickle.dumps(obj),
+                pickle.dumps(feature_infos),
+            ]
+            # Add wrappers - they keep tensors alive and provide buffer interface
+            for wrapper in feature_wrappers:
+                parts.append(wrapper.__buffer__())
+            sender.send_multipart(parts, copy=copy)
+        else:
+            sender.send_multipart(
+                [
+                    b"NORM",
+                    pickle.dumps(obj),
+                ],
+                copy=False,
+            )
+
+    async def _send_multi_parts_async(self, sender, obj, copy=False):
+        has_feature_tensors = False
+        feature_wrappers = None
+        feature_infos = None
+
+        if not self.server_args.skip_tokenizer_init:
+            has_feature_tensors, feature_wrappers, feature_infos = (
+                TokenizerManager.extract_feature_tensors(obj)
+            )
+
+        if has_feature_tensors:
+            parts = [b"FEAT", pickle.dumps(obj), pickle.dumps(feature_infos)]
+            for wrapper in feature_wrappers:
+                parts.append(wrapper.__buffer__())
+            await sender.send_multipart(parts, copy=copy)
+        else:
+            await sender.send_multipart([b"NORM", pickle.dumps(obj)], copy=copy)
+
     def _send_one_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -1066,30 +1112,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
-        has_feature_tensors = False
-        if not self.server_args.skip_tokenizer_init:
-            has_feature_tensors, feature_wrappers, feature_infos = (
-                TokenizerManager.extract_feature_tensors(tokenized_obj)
-            )
-        # Send the request
-        if has_feature_tensors:
-            parts = [
-                b"FEAT",
-                pickle.dumps(tokenized_obj),
-                pickle.dumps(feature_infos),
-            ]
-            # Add wrappers - they keep tensors alive and provide buffer interface
-            for wrapper in feature_wrappers:
-                parts.append(wrapper.__buffer__())
-            self.send_to_scheduler.send_multipart(parts, copy=False)
-        else:
-            self.send_to_scheduler.send_multipart(
-                [
-                    b"NORM",
-                    pickle.dumps(tokenized_obj),
-                ],
-                copy=False,
-            )
+        self._send_multi_parts(self.send_to_scheduler, tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
@@ -1111,10 +1134,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             batch_req = BatchTokenizedGenerateReqInput(batch=tokenized_objs)
         else:
             batch_req = BatchTokenizedEmbeddingReqInput(batch=tokenized_objs)
-
-        self.send_to_scheduler.send_multipart(
-            [b"NORM", pickle.dumps(batch_req)], copy=False
-        )
+        self._send_multi_parts(self.send_to_scheduler, batch_req)
         # Create states for each individual request in the batch
         for i, tokenized_obj in enumerate(tokenized_objs):
             tmp_obj = obj[i]
@@ -1339,7 +1359,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         if not abort_all and rid not in self.rid_to_state:
             return
         req = AbortReq(rid=rid, abort_all=abort_all)
-        self.send_to_scheduler.send_multipart([b"NORM", pickle.dumps(req)], copy=False)
+        self._send_multi_parts(self.send_to_scheduler, req)
         if self.enable_metrics:
             # TODO: also use custom_labels from the request
             self.metrics_collector.observe_one_aborted_request(
@@ -1350,12 +1370,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         async with self.is_pause_cond:
             self.is_pause = True
             if obj.mode != "abort":
-                await self.send_to_scheduler.send_multipart(
-                    [
-                        b"NORM",
-                        pickle.dumps(obj),
-                    ]
-                )
+                await self._send_multi_parts_async(self.send_to_scheduler, obj)
             else:
                 # we are using the model_update_lock to check if there is still on-going requests.
                 while True:
@@ -1369,12 +1384,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False
-            await self.send_to_scheduler.send_multipart(
-                [
-                    b"NORM",
-                    pickle.dumps(obj),
-                ]
-            )
+            await self._send_multi_parts_async(self.send_to_scheduler, obj)
             self.is_pause_cond.notify_all()
 
     async def update_weights_from_disk(
@@ -1414,7 +1424,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
-        self.send_to_scheduler.send_multipart([b"NORM", pickle.dumps(obj)], copy=False)
+        self._send_multi_parts(self.send_to_scheduler, obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
@@ -1454,9 +1464,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
     async def freeze_gc(self):
         """Send a freeze_gc message to the scheduler first, then freeze locally."""
-        self.send_to_scheduler.send_multipart(
-            [b"NORM", pickle.dumps(FreezeGCReq())], copy=False
-        )
+        self._send_multi_parts(self.send_to_scheduler, FreezeGCReq())
         freeze_gc("Tokenizer Manager")
         return None
 
@@ -2513,9 +2521,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             await asyncio.sleep(self.server_args.load_watch_interval)
             loads = await self.get_load_communicator(GetLoadReqInput())
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
-            self.send_to_scheduler.send_multipart(
-                [b"NORM", pickle.dumps(load_udpate_req)], copy=False
-            )
+            self._send_multi_parts(self.send_to_scheduler, load_udpate_req)
 
     def _trace_request_start(
         self,
