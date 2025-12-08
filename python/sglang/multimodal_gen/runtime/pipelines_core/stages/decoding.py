@@ -9,11 +9,6 @@ import weakref
 
 import torch
 
-from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    QwenImageEditPipelineConfig,
-    QwenImagePipelineConfig,
-)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loader import VAELoader
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -30,6 +25,26 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+def _ensure_tensor_decode_output(decode_output):
+    """
+    Ensure VAE decode output is a tensor.
+
+    Some VAE implementations return DecoderOutput objects with a .sample attribute,
+    tuples, or tensors directly. This function normalizes the output to always be a tensor.
+
+    Args:
+        decode_output: Output from VAE.decode(), can be DecoderOutput, tuple, or torch.Tensor
+
+    Returns:
+        torch.Tensor: The decoded image tensor
+    """
+    if isinstance(decode_output, tuple):
+        return decode_output[0]
+    if hasattr(decode_output, "sample"):
+        return decode_output.sample
+    return decode_output
 
 
 class DecodingStage(PipelineStage):
@@ -64,36 +79,20 @@ class DecodingStage(PipelineStage):
         # result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
         return result
 
-    def scale_and_shift(
-        self, vae_arch_config: VAEArchConfig, latents: torch.Tensor, server_args
-    ):
-        # 1. scale
-        is_qwen_image = isinstance(
-            server_args.pipeline_config, QwenImagePipelineConfig
-        ) or isinstance(server_args.pipeline_config, QwenImageEditPipelineConfig)
-        if is_qwen_image:
-            scaling_factor = 1.0 / torch.tensor(
-                vae_arch_config.latents_std, device=latents.device
-            ).view(1, vae_arch_config.z_dim, 1, 1, 1).to(latents.device, latents.dtype)
-        else:
-            scaling_factor = vae_arch_config.scaling_factor
+    def scale_and_shift(self, latents: torch.Tensor, server_args):
+        scaling_factor, shift_factor = (
+            server_args.pipeline_config.get_decode_scale_and_shift(
+                latents.device, latents.dtype, self.vae
+            )
+        )
 
+        # 1. scale
         if isinstance(scaling_factor, torch.Tensor):
             latents = latents / scaling_factor.to(latents.device, latents.dtype)
         else:
             latents = latents / scaling_factor
 
-        # 2. shift
-        if is_qwen_image:
-            shift_factor = (
-                torch.tensor(vae_arch_config.latents_mean)
-                .view(1, vae_arch_config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-        else:
-            shift_factor = getattr(vae_arch_config, "shift_factor", None)
-
-        # Apply shifting if needed
+        # 2. apply shifting if needed
         if shift_factor is not None:
             if isinstance(shift_factor, torch.Tensor):
                 latents += shift_factor.to(latents.device, latents.dtype)
@@ -124,10 +123,13 @@ class DecodingStage(PipelineStage):
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
-        vae_arch_config = server_args.pipeline_config.vae_config.arch_config
 
         # scale and shift
-        latents = self.scale_and_shift(vae_arch_config, latents, server_args)
+        latents = self.scale_and_shift(latents, server_args)
+        # Preprocess latents before decoding (e.g., unpatchify for standard Flux2 VAE)
+        latents = server_args.pipeline_config.preprocess_decoding(
+            latents, server_args, vae=self.vae
+        )
 
         # Decode latents
         with torch.autocast(
@@ -141,7 +143,8 @@ class DecodingStage(PipelineStage):
                 pass
             if not vae_autocast_enabled:
                 latents = latents.to(vae_dtype)
-            image = self.vae.decode(latents)
+            decode_output = self.vae.decode(latents)
+            image = _ensure_tensor_decode_output(decode_output)
 
         # De-normalize image to [0, 1] range
         image = (image / 2 + 0.5).clamp(0, 1)
@@ -220,8 +223,7 @@ class DecodingStage(PipelineStage):
         )
 
         # Offload models if needed
-        if hasattr(self, "maybe_free_model_hooks"):
-            self.maybe_free_model_hooks()
+        self.maybe_free_model_hooks()
 
         if server_args.vae_cpu_offload:
             self.vae.to("cpu")

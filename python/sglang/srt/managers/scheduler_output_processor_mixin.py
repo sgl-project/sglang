@@ -281,6 +281,36 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+    def process_batch_result_dllm(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        next_token_ids = result.next_token_ids.tolist()
+        self.num_generated_tokens += len(next_token_ids)
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+
+        assert len(batch.reqs) == 1, "batch size is currently expected to be 1"
+        req = batch.reqs[0]
+
+        for next_token_id in next_token_ids:
+            req.output_ids.append(next_token_id)
+            req.check_finished()
+
+            if req.finished():
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.completion_time = time.perf_counter()
+                break
+
+            self.tree_cache.cache_unfinished_req(req)
+
+        self.stream_output(batch.reqs, batch.return_logprob)
+        self.token_to_kv_pool_allocator.free_group_end()
+
     def process_batch_result_decode(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -365,10 +395,16 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None and batch.spec_algorithm.is_none():
+            if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    req.grammar.accept_token(next_token_id)
+                    if batch.spec_algorithm.is_none():
+                        # Normal decode: single token
+                        req.grammar.accept_token(next_token_id)
+                    elif batch.is_v2_eagle:
+                        # Speculative decode: next_token_id is a list of accepted tokens
+                        for token_id in next_token_id:
+                            req.grammar.accept_token(token_id)
                 except ValueError as e:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.

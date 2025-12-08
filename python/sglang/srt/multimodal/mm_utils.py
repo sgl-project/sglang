@@ -428,6 +428,40 @@ def get_dp_encoder_lb_assignment(
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
+def run_dp_sharded_vision_model(
+    image_input: torch.Tensor, vision_model: torch.nn.Module
+) -> torch.Tensor:
+    """Run a vision model with data parallelism (DP) sharding. The function
+    will shard the input image tensor on the first dimension and run the vision
+    model
+
+    Args:
+        image_input (torch.Tensor): Image input tensor.
+        vision_model (torch.nn.Module): Vision model.
+    Returns:
+        torch.Tensor: Output image embeddings
+    """
+
+    num_chunks = image_input.shape[0]
+    mp_world_size = get_tensor_model_parallel_world_size()
+    num_chunks_per_rank = (num_chunks + mp_world_size - 1) // mp_world_size
+    num_padded_chunks = num_chunks_per_rank * mp_world_size - num_chunks
+    pad = (0,) * (2 * (image_input.dim() - 1)) + (0, num_padded_chunks)
+    image_input_padded = torch.nn.functional.pad(image_input, pad)
+    rank = get_tensor_model_parallel_rank()
+    image_input_per_rank = image_input_padded[
+        rank * num_chunks_per_rank : (rank + 1) * num_chunks_per_rank, ...
+    ]
+
+    vision_embeddings = vision_model(image_input_per_rank)
+    # Ensure tensor is contiguous before all_gather
+    vision_embeddings = vision_embeddings.last_hidden_state.contiguous()
+    vision_embeddings = tensor_model_parallel_all_gather(vision_embeddings, dim=0)
+    vision_embeddings = vision_embeddings[:num_chunks, ...]
+    return vision_embeddings
+
+
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/vision.py
 def run_dp_sharded_mrope_vision_model(
     vision_model: torch.nn.Module,
     pixel_values: torch.Tensor,

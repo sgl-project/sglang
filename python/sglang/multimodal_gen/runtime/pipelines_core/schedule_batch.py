@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.teacache import (
     TeaCacheParams,
     WanTeaCacheParams,
@@ -27,7 +27,6 @@ from sglang.multimodal_gen.configs.sample.teacache import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from torchcodec.decoders import VideoDecoder
 
     from sglang.multimodal_gen.runtime.utils.perf_logger import RequestTimings
 
@@ -55,7 +54,9 @@ class Req:
     image_path: str | None = None
     # Image encoder hidden states
     image_embeds: list[torch.Tensor] = field(default_factory=list)
-    pil_image: torch.Tensor | PIL.Image.Image | None = None
+
+    original_condition_image_size: tuple[int, int] = None
+    condition_image: torch.Tensor | PIL.Image.Image | None = None
     pixel_values: torch.Tensor | PIL.Image.Image | None = None
     preprocessed_image: torch.Tensor | None = None
 
@@ -87,15 +88,21 @@ class Req:
     num_outputs_per_prompt: int = 1
     seed: int | None = None
     seeds: list[int] | None = None
+    generator_device: str = "cuda"  # Device for random generator: "cuda" or "cpu"
 
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
 
     # Latent tensors
     latents: torch.Tensor | None = None
+    # Flux-2
+    latent_ids: torch.Tensor | None = None
+
     raw_latent_shape: torch.Tensor | None = None
     noise_pred: torch.Tensor | None = None
-    image_latent: torch.Tensor | None = None
+    # vae-encoded condition image
+    image_latent: torch.Tensor | list[torch.Tensor] | None = None
+    condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
 
     # Latent dimensions
     height_latents: list[int] | int | None = None
@@ -164,7 +171,8 @@ class Req:
 
     # profile
     profile: bool = False
-    num_profiled_timesteps: int = 8
+    profile_all_stages: bool = False
+    num_profiled_timesteps: int = None
 
     # debugging
     debug: bool = False
@@ -212,12 +220,6 @@ class Req:
 
     def adjust_size(self, server_args: ServerArgs):
         if self.height is None or self.width is None:
-            width, height = server_args.pipeline_config.adjust_size(
-                self.width, self.height, self.pil_image
-            )
-            self.width = width
-            self.height = height
-        if self.height is None or self.width is None:
             self.width = 1280
             self.height = 720
 
@@ -239,9 +241,3 @@ class OutputBatch:
 
     # logged timings info, directly from Req.timings
     timings: Optional["RequestTimings"] = None
-
-
-@dataclass
-class PreprocessBatch(Req):
-    video_loader: list["VideoDecoder"] | list[str] = field(default_factory=list)
-    video_file_name: list[str] = field(default_factory=list)

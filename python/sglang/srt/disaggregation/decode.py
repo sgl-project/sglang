@@ -171,6 +171,10 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
 
+    @property
+    def seqlen(self) -> int:
+        return self.req.seqlen
+
 
 class DecodePreallocQueue:
     """
@@ -565,7 +569,7 @@ class DecodePreallocQueue:
             else 0
         )
 
-        if self.scheduler.model_config.is_hybrid:
+        if self.scheduler.model_config.is_hybrid_swa:
             available_size = min(
                 self.token_to_kv_pool_allocator.full_available_size(),
                 self.token_to_kv_pool_allocator.swa_available_size(),

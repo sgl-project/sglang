@@ -30,6 +30,19 @@ def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     return hasher.hexdigest()
 
 
+def hash_str_to_int64(hash_str: str) -> int:
+    """Convert SHA256 hex string to signed 64-bit integer for events.
+
+    Takes first 16 hex characters (64 bits) and converts to signed int64 range.
+    """
+    # Take first 16 hex chars to get 64-bit value
+    uint64_val = int(hash_str[:16], 16)
+    # Convert to signed int64 range [-2^63, 2^63-1]
+    if uint64_val >= 2**63:
+        return uint64_val - 2**64
+    return uint64_val
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int

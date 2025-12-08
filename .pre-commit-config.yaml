@@ -31,7 +31,7 @@ repos:
         args:
           - --select=F401,F821
           - --fix
-        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-router/py_*|test/)
+        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
         exclude: |
           (?x)^(
           .*/__init__\.py$|
@@ -59,7 +59,8 @@ repos:
             python/sglang/srt/grpc/.*_pb2\.py|
             python/sglang/srt/grpc/.*_pb2_grpc\.py|
             python/sglang/srt/grpc/.*_pb2\.pyi|
-            python/sglang/srt/grpc/.*_pb2_grpc\.pyi
+            python/sglang/srt/grpc/.*_pb2_grpc\.pyi|
+            sgl-model-gateway/src/tokenizer/chat_template\.rs
           )$
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v18.1.8

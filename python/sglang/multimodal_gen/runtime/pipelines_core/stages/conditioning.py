@@ -91,7 +91,7 @@ class ConditioningStage(PipelineStage):
             batch.do_classifier_free_guidance,
             V.bool_value,
         )
-        result.add_check("guidance_scale", batch.guidance_scale, V.positive_float)
+        result.add_check("guidance_scale", batch.guidance_scale, V.non_negative_float)
         result.add_check("prompt_embeds", batch.prompt_embeds, V.list_not_empty)
         result.add_check(
             "negative_prompt_embeds",
