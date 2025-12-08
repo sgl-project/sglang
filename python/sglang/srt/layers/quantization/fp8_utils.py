@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -259,9 +260,18 @@ def _dispatch_auto_backend() -> Callable:
 
 
 def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
-    """Initialize FP8 GEMM configuration from server arguments."""
+    """Initialize FP8 GEMM configuration."""
     global FP8_GEMM_RUNNER_BACKEND
-    FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(server_args.fp8_gemm_runner_backend)
+
+    backend = server_args.fp8_gemm_runner_backend
+
+    # TODO(brayden): Remove env-based overrides in v0.5.7, they will be fully removed in v0.5.7.
+    if envs.SGLANG_ENABLE_FLASHINFER_FP8_GEMM.get():
+        backend = "flashinfer_trtllm"
+    elif envs.SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.get():
+        backend = "cutlass"
+
+    FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
 
 
 def get_fp8_gemm_runner_backend() -> Fp8GemmRunnerBackend:
