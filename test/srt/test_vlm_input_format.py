@@ -125,7 +125,7 @@ class VLMInputTestBase:
         output = await self.engine.async_generate(
             prompt=text,
             image_data=self.main_image,
-            sampling_params=dict(temperature=0.0),
+            sampling_params=dict(temperature=0.0, max_new_tokens=512),
         )
         self.verify_response(output)
 
@@ -141,7 +141,7 @@ class VLMInputTestBase:
             image_data=[
                 self._precomputed_image_data(processor_output, precomputed_embeddings)
             ],
-            sampling_params=dict(temperature=0.0),
+            sampling_params=dict(temperature=0.0, max_new_tokens=512),
         )
         self.verify_response(output)
 
@@ -151,7 +151,7 @@ class VLMInputTestBase:
         output = await self.engine.async_generate(
             input_ids=processor_output["input_ids"][0].detach().cpu().tolist(),
             image_data=[self._processor_output_image_data(processor_output)],
-            sampling_params=dict(temperature=0.0),
+            sampling_params=dict(temperature=0.0, max_new_tokens=512),
         )
         self.verify_response(output)
 
@@ -189,8 +189,7 @@ class TestQwenVLUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestC
         return dict(processor_output, format="processor_output")
 
 class TestGemmaUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
-    # model_path = "google/gemma-3-4b-it"
-    model_path = "/root/.cache/modelscope/hub/models/LLM-Research/gemma-3-4b-it"
+    model_path = "google/gemma-3-4b-it"
     chat_template = "gemma-it"
 
     @classmethod
