@@ -1058,6 +1058,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
         """Judge whether the request needs reasoning"""
+        if not self.reasoning_parser:
+            return False
         if self.reasoning_parser in ["deepseek-v3"]:
             return (
                 request.chat_template_kwargs is not None
