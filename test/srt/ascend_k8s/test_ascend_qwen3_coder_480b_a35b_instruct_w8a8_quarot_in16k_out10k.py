@@ -37,7 +37,7 @@ QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_OTHER_ARGS = (
         "--device",
         "npu",
         "--quantization",
-        "w8a8_int8",
+        "modelslim",
         "--enable-dp-attention",
         "--cuda-graph-bs",
         "8",
