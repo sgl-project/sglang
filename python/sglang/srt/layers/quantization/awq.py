@@ -757,10 +757,6 @@ class AWQMoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
 
-        device = layer.w13_qweight.device
-        if not _is_npu:
-            layer.workspace = marlin_make_workspace(device, 4)
-
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_qweight.shape[0]
         device = layer.w13_qweight.device
