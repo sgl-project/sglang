@@ -15,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     sudo
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation \
-    py-spy \
-    vllm \
-    nvtx \
+    py-spy==0.4.1 \
+    vllm==0.11.0 \
+    nvtx==0.2.13 \
     -i https://mirrors.aliyun.com/pypi/simple
 
 RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/mimo/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir  --no-dependencies --force-reinstall
