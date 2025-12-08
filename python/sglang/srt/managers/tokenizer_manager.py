@@ -631,10 +631,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             revised_input_token_num=input_token_num,
         )
         if error_msg:
-            raise ValueError(
-                f"The input ({input_token_num} tokens) is longer than the "
-                f"model's context length ({self.context_len} tokens)."
-            )
+            raise ValueError(error_msg)
 
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
