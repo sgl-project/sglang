@@ -2,7 +2,7 @@
 
 use tracing::{debug, event, Level};
 
-use crate::otel_trace::is_otel_enabled;
+use crate::observability::otel_trace::is_otel_enabled;
 
 pub fn get_module_path() -> &'static str {
     module_path!()
