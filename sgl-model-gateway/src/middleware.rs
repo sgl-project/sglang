@@ -70,10 +70,18 @@ impl Drop for TokenGuardBody {
                 "TokenGuardBody: stream ended, returning {} tokens to bucket",
                 tokens
             );
-            // Spawn a task to return tokens asynchronously since drop is sync
-            tokio::spawn(async move {
-                bucket.return_tokens(tokens).await;
-            });
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    bucket.return_tokens(tokens).await;
+                });
+            } else {
+                // Runtime not available (e.g., during shutdown)
+                // Tokens will be lost, but this is acceptable during shutdown
+                warn!(
+                    "TokenGuardBody: Cannot return {} tokens - no Tokio runtime available",
+                    tokens
+                );
+            }
         }
     }
 }
@@ -214,14 +222,10 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn poll_ready(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
