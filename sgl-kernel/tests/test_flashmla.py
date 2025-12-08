@@ -38,6 +38,12 @@ CAUSAL_TOPK = [(True, None), (False, None), (False, 128), (False, 2048)]
 DTYPE = [torch.float16, torch.bfloat16]
 
 
+def is_sm90_supported(device=None) -> bool:
+    return (torch.cuda.get_device_capability(device)[0] == 9) and (
+        torch.version.cuda >= "12.3"
+    )
+
+
 def quantize_k_cache(
     input_k_cache: torch.Tensor,  # (num_blocks, block_size, h_k, d)
     dv: int,
@@ -362,6 +368,7 @@ def test_flashmla_prefill(
     torch.testing.assert_close(ans_lse, ref_lse, atol=1e-6, rtol=2.01 / 65536)
 
 
+@pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")
 @pytest.mark.parametrize("b", B_DECODE)
 @pytest.mark.parametrize("s_q", S_Q_DECODE)
 @pytest.mark.parametrize("s_k", S_K_DECODE)
@@ -512,6 +519,7 @@ def test_flash_mla_decode(
     torch.testing.assert_close(lse_ans, lse_ref, atol=1e-6, rtol=8.01 / 65536)
 
 
+@pytest.mark.skipif(not is_sm90_supported(), reason="SM90 required for FP8 support")
 @pytest.mark.parametrize("b", [128])
 @pytest.mark.parametrize("s_q", [1, 2])
 @pytest.mark.parametrize("mean_sk", [4096, 8192, 16384])

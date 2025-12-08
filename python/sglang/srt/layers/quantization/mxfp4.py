@@ -47,6 +47,7 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     log_info_on_rank0,
     mxfp_supported,
+    next_power_of_2,
     round_up,
     set_weight_attrs,
 )
@@ -634,7 +635,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     )
             elif self.flashinfer_mxfp4_moe_precision == "default":
                 x_quant, x_scale = mxfp8_quantize(x, False, alignment=self.hidden_size)
-                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(-1)
+                x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
             else:
                 raise NotImplementedError()
 
@@ -684,6 +685,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 None,  # tile_tokens_dim
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
+                tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                 output=symm_output,
             )[0]
             return StandardCombineInput(hidden_states=trtllm_gen_output)
