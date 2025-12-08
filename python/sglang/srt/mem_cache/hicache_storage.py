@@ -31,19 +31,6 @@ def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
     return hasher.hexdigest()
 
 
-def hash_str_to_int64(hash_str: str) -> int:
-    """Convert SHA256 hex string to signed 64-bit integer for events.
-
-    Takes first 16 hex characters (64 bits) and converts to signed int64 range.
-    """
-    # Take first 16 hex chars to get 64-bit value
-    uint64_val = int(hash_str[:16], 16)
-    # Convert to signed int64 range [-2^63, 2^63-1]
-    if uint64_val >= 2**63:
-        return uint64_val - 2**64
-    return uint64_val
-
-
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -215,6 +202,12 @@ class HiCacheFile(HiCacheStorage):
         super().register_mem_pool_host(mem_pool_host)
         # Store layout for use in preprocessing
         self.mem_pool_layout = mem_pool_host.layout
+        # Determine if MLA backend by checking the type of mem_pool_host
+        # This ensures is_mla_backend is set even if storage_config was None
+        from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+
+        if not hasattr(self, "is_mla_backend"):
+            self.is_mla_backend = isinstance(mem_pool_host, MLATokenToKVPoolHost)
 
     def _batch_preprocess(self, keys, host_indices):
         """Preprocess keys and host_indices to get buffer metadata for zero-copy operations.
@@ -249,10 +242,12 @@ class HiCacheFile(HiCacheStorage):
     def _write_from_ptr(self, file_path: str, ptr: int, size: int) -> bool:
         """Write data from a memory pointer to a file using ctypes.
         This is a true zero-copy operation - no tensor operations involved.
+        Optimized with larger buffer size for better I/O performance.
         """
         try:
             buffer = (ctypes.c_uint8 * size).from_address(ptr)
-            with open(file_path, "wb", buffering=0) as f:
+            # Use larger buffer size (64KB) for better I/O performance
+            with open(file_path, "wb", buffering=64 * 1024) as f:
                 f.write(buffer)
             return True
         except Exception as e:
@@ -265,9 +260,11 @@ class HiCacheFile(HiCacheStorage):
         """Write K and V data from memory pointers to a single file.
         For MHA models, we need to write K and V together in one file.
         This is a true zero-copy operation.
+        Optimized with larger buffer size and single write operation.
         """
         try:
-            with open(file_path, "wb", buffering=0) as f:
+            # Use larger buffer size (64KB) for better I/O performance
+            with open(file_path, "wb", buffering=64 * 1024) as f:
                 # Write K data
                 k_buffer = (ctypes.c_uint8 * k_size).from_address(k_ptr)
                 f.write(k_buffer)
@@ -277,6 +274,25 @@ class HiCacheFile(HiCacheStorage):
             return True
         except Exception as e:
             logger.error(f"Failed to write KV pair from pointers to {file_path}: {e}")
+            return False
+
+    def _write_tensor_to_file_fast(self, file_path: str, tensor: torch.Tensor) -> bool:
+        """Write tensor to file using numpy tofile() for maximum performance.
+        Only use this if tensor is contiguous (checked by caller).
+        This is faster than ctypes approach for contiguous tensors.
+
+        Data layout for MHA:
+        - tensor from get_data_page(flat=True) has shape [2 * page_size * layer_num * head_num * head_dim]
+        - After flatten(), the layout is: [K_data, V_data]
+        - This matches _write_kv_pair_from_ptrs which writes K then V
+        """
+        try:
+            # Fast path: use numpy tofile() which is highly optimized C implementation
+            numpy_view = tensor.view(torch.uint8).numpy()
+            numpy_view.tofile(file_path)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to write tensor to {file_path}: {e}")
             return False
 
     def get(
@@ -396,58 +412,110 @@ class HiCacheFile(HiCacheStorage):
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
 
+    def _read_from_ptr(self, file_path: str, ptr: int, size: int) -> bool:
+        """Read data from a file to a memory pointer using ctypes.
+        This is a true zero-copy operation - no tensor operations involved.
+        """
+        try:
+            buffer = (ctypes.c_uint8 * size).from_address(ptr)
+            # Use larger buffer size (64KB) for better I/O performance
+            with open(file_path, "rb", buffering=64 * 1024) as f:
+                if f.readinto(buffer) != size:
+                    return False
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            logger.error(f"Failed to read from pointer to {file_path}: {e}")
+            return False
+
+    def _read_kv_pair_to_ptrs(
+        self, file_path: str, k_ptr: int, k_size: int, v_ptr: int, v_size: int
+    ) -> bool:
+        """Read K and V data from a file to memory pointers.
+        For MHA models, we read K and V together from one file.
+        This is a true zero-copy operation.
+        """
+        try:
+            # Use larger buffer size (64KB) for better I/O performance
+            with open(file_path, "rb", buffering=64 * 1024) as f:
+                # Read K data
+                k_buffer = (ctypes.c_uint8 * k_size).from_address(k_ptr)
+                if f.readinto(k_buffer) != k_size:
+                    return False
+                # Read V data
+                v_buffer = (ctypes.c_uint8 * v_size).from_address(v_ptr)
+                if f.readinto(v_buffer) != v_size:
+                    return False
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            logger.error(f"Failed to read KV pair from pointers to {file_path}: {e}")
+            return False
+
     def batch_get_v1(
         self,
         keys: List[str],
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        """True batch get: read multiple tensors from one batch file."""
+        """True batch get: read multiple tensors from one batch file.
+        Uses get_page_buffer_meta() to get memory pointers directly for zero-copy operations.
+        """
         if not keys or len(host_indices) == 0:
             return [False] * len(keys) if keys else []
 
-        # Optimized: inline preprocessing to avoid function call overhead
         assert len(keys) > 0
         assert len(host_indices) % self.mem_pool_host.page_size == 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
 
         page_num = len(keys)
-        results = []
 
-        for i in range(page_num):
-            key = keys[i]
+        # Stage 1: Get buffer metadata (pointers and sizes) using get_page_buffer_meta
+        ptr_list, element_size_list = self._batch_preprocess(keys, host_indices)
 
-            # Stage 1: Build file path
-            batch_file_path = os.path.join(
-                self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
-            )
+        # Stage 2: Ensure is_mla_backend is set
+        if not hasattr(self, "is_mla_backend"):
+            from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
 
-            # Stage 2: Get tensor from memory pool
-            page_start_idx = i * self.mem_pool_host.page_size
-            actual_idx = host_indices[page_start_idx].item()
-            page_tensor = self.mem_pool_host.get_data_page(actual_idx, flat=True)
+            self.is_mla_backend = isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
 
-            # Stage 3: Make contiguous
-            if not page_tensor.is_contiguous():
-                page_tensor = page_tensor.contiguous()
+        results = [False] * page_num
 
-            try:
-                # Stage 4: Convert to numpy view
-                numpy_view = page_tensor.view(torch.uint8).numpy()
-                expected_size = page_tensor.numel() * page_tensor.element_size()
-
-                # Stage 5: File I/O
-                with open(batch_file_path, "rb", buffering=0) as f:
-                    if f.readinto(memoryview(numpy_view)) != expected_size:
-                        results.append(False)
-                        continue
-
-                results.append(True)
-            except FileNotFoundError:
-                results.append(False)
-            except Exception as e:
-                logger.error(f"Failed to read batch file for {key}: {e}")
-                results.append(False)
+        if self.is_mla_backend:
+            # MLA: one pointer per page
+            for i, key in enumerate(keys):
+                batch_file_path = os.path.join(
+                    self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
+                )
+                try:
+                    ptr = ptr_list[i]
+                    size = element_size_list[i]
+                    results[i] = self._read_from_ptr(batch_file_path, ptr, size)
+                except Exception as e:
+                    logger.error(f"Failed to read batch for key {key}: {e}")
+                    results[i] = False
+        else:
+            # MHA: K and V pointer pairs per page
+            for i, key in enumerate(keys):
+                batch_file_path = os.path.join(
+                    self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
+                )
+                try:
+                    # MHA returns K and V as pairs: [K0, V0, K1, V1, ...]
+                    k_idx = i * 2
+                    v_idx = i * 2 + 1
+                    k_ptr = ptr_list[k_idx]
+                    k_size = element_size_list[k_idx]
+                    v_ptr = ptr_list[v_idx]
+                    v_size = element_size_list[v_idx]
+                    results[i] = self._read_kv_pair_to_ptrs(
+                        batch_file_path, k_ptr, k_size, v_ptr, v_size
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to read batch for key {key}: {e}")
+                    results[i] = False
 
         return results
 
@@ -470,14 +538,10 @@ class HiCacheFile(HiCacheStorage):
 
         page_num = len(keys)
 
-        # Stage 1: Get buffer metadata (pointers and sizes) using get_page_buffer_meta
-        # This is the key difference - we use the built-in method instead of manual address calculation
-        ptr_list, element_size_list = self._batch_preprocess(keys, host_indices)
-
-        # Stage 2: Check which files already exist (similar to mooncake_store's _batch_exist)
+        # Stage 1: Check which files already exist (similar to mooncake_store's _batch_exist)
         exist_results = self._batch_exist(keys)
 
-        # Stage 3: Prepare write operations only for non-existing keys
+        # Stage 2: Prepare write operations only for non-existing keys
         write_keys = []
         write_indices = []
         write_results = [False] * page_num
@@ -491,7 +555,19 @@ class HiCacheFile(HiCacheStorage):
                 write_keys.append(keys[i])
                 write_indices.append(i)
 
-        # Stage 4: Write only non-existing files using pointers directly
+        # Stage 3: Write only non-existing files
+        # Optimized approach: use get_data_page + tofile() for contiguous tensors (fastest),
+        # fallback to pointer-based approach for non-contiguous tensors (zero-copy)
+        # Ensure is_mla_backend is set (fallback check)
+        if not hasattr(self, "is_mla_backend"):
+            from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+
+            self.is_mla_backend = isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
+
+        # Lazy initialization of ptr_list - only compute if needed (non-contiguous tensors)
+        ptr_list = None
+        element_size_list = None
+
         if self.is_mla_backend:
             # MLA: one pointer per page
             for key, idx in zip(write_keys, write_indices):
@@ -499,10 +575,28 @@ class HiCacheFile(HiCacheStorage):
                     self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
                 )
                 try:
-                    # MLA returns one pointer per page
-                    ptr = ptr_list[idx]
-                    size = element_size_list[idx]
-                    success = self._write_from_ptr(batch_file_path, ptr, size)
+                    # Try fast path: use get_data_page + tofile() if tensor is contiguous
+                    page_start_idx = idx * self.mem_pool_host.page_size
+                    actual_idx = host_indices[page_start_idx].item()
+                    page_tensor = self.mem_pool_host.get_data_page(
+                        actual_idx, flat=True
+                    )
+
+                    if page_tensor.is_contiguous():
+                        # Fast path: use numpy tofile() which is highly optimized
+                        success = self._write_tensor_to_file_fast(
+                            batch_file_path, page_tensor
+                        )
+                    else:
+                        # Fallback: use pointer-based approach for non-contiguous tensors
+                        # Lazy compute ptr_list only when needed
+                        if ptr_list is None:
+                            ptr_list, element_size_list = self._batch_preprocess(
+                                keys, host_indices
+                            )
+                        ptr = ptr_list[idx]
+                        size = element_size_list[idx]
+                        success = self._write_from_ptr(batch_file_path, ptr, size)
                     write_results[idx] = success
                 except Exception as e:
                     logger.error(f"Failed to write batch for key {key}: {e}")
@@ -514,17 +608,37 @@ class HiCacheFile(HiCacheStorage):
                     self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
                 )
                 try:
-                    # MHA returns K and V as pairs: [K0, V0, K1, V1, ...]
-                    # For each page, we have K and V pointers
-                    k_idx = idx * 2
-                    v_idx = idx * 2 + 1
-                    k_ptr = ptr_list[k_idx]
-                    k_size = element_size_list[k_idx]
-                    v_ptr = ptr_list[v_idx]
-                    v_size = element_size_list[v_idx]
-                    success = self._write_kv_pair_from_ptrs(
-                        batch_file_path, k_ptr, k_size, v_ptr, v_size
+                    # Try fast path: use get_data_page + tofile() if tensor is contiguous
+                    page_start_idx = idx * self.mem_pool_host.page_size
+                    actual_idx = host_indices[page_start_idx].item()
+                    page_tensor = self.mem_pool_host.get_data_page(
+                        actual_idx, flat=True
                     )
+
+                    if page_tensor.is_contiguous():
+                        # Fast path: use numpy tofile() which is highly optimized
+                        # For MHA, page_tensor from get_data_page(flat=True) has layout:
+                        # [K_data (all layers), V_data (all layers)]
+                        # This matches _write_kv_pair_from_ptrs which writes K then V
+                        success = self._write_tensor_to_file_fast(
+                            batch_file_path, page_tensor
+                        )
+                    else:
+                        # Fallback: use pointer-based approach for non-contiguous tensors
+                        # Lazy compute ptr_list only when needed
+                        if ptr_list is None:
+                            ptr_list, element_size_list = self._batch_preprocess(
+                                keys, host_indices
+                            )
+                        k_idx = idx * 2
+                        v_idx = idx * 2 + 1
+                        k_ptr = ptr_list[k_idx]
+                        k_size = element_size_list[k_idx]
+                        v_ptr = ptr_list[v_idx]
+                        v_size = element_size_list[v_idx]
+                        success = self._write_kv_pair_from_ptrs(
+                            batch_file_path, k_ptr, k_size, v_ptr, v_size
+                        )
                     write_results[idx] = success
                 except Exception as e:
                     logger.error(f"Failed to write batch for key {key}: {e}")
