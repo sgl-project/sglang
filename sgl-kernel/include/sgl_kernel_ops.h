@@ -879,6 +879,15 @@ int64_t ggml_moe_get_block_size(int64_t type);
 std::vector<int64_t> create_greenctx_stream_by_value(int64_t smA, int64_t smB, int64_t device);
 
 /*
+ * From csrc/memory
+ */
+void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
+
+void allocate_decode(at::Tensor& seq_lens, at::Tensor& last_loc, at::Tensor& free_page, at::Tensor& out_indices, int64_t page_size);
+
+void allocate_extend(at::Tensor& pre_lens, at::Tensor& seq_lens, at::Tensor& last_loc, at::Tensor& free_pages, at::Tensor& out_indices, int64_t page_size);
+
+/*
  * From csrc/mamba
  */
 void causal_conv1d_update(

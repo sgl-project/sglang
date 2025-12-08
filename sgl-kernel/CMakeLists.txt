@@ -316,6 +316,7 @@ set(SOURCES
     "csrc/kvcacheio/transfer.cu"
     "csrc/mamba/causal_conv1d.cu"
     "csrc/memory/store.cu"
+    "csrc/memory/allocator.cu"
     "csrc/memory/weak_ref_tensor.cpp"
 
     "csrc/moe/cutlass_moe/w4a8/scaled_mm_entry.cu"
@@ -335,6 +336,8 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/quantization/gguf/gguf_kernel.cu"
+
+
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"
