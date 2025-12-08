@@ -217,6 +217,7 @@ impl CacheAwarePolicy {
         request_text: &Option<&str>,
         healthy_indices: &Vec<usize>,
         model_id: &str,
+        // TODO may skip passing this arg (and compute inside function) if this is not bottleneck
         max_load: usize,
         min_load: usize,
     ) -> usize {
