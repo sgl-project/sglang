@@ -85,8 +85,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gelu_and_mul", torch::kCUDA, &gelu_and_mul);
 
   // Device LayerNorm and fused LayerNorm+ScaleShift
-  m.def("device_layernorm(Tensor x, Tensor? gamma, Tensor? beta) -> Tensor");
-  m.impl("device_layernorm", torch::kCUDA, &device_layernorm);
   m.def("device_layernorm_fuse_scale_shift(Tensor x, Tensor gamma, Tensor beta, Tensor scale, Tensor shift) -> Tensor");
   m.impl("device_layernorm_fuse_scale_shift", torch::kCUDA, &device_layernorm_fuse_scale_shift);
   m.def("device_scale_residual_layernorm_fuse_scale_shift(Tensor residual, Tensor x, Tensor gamma, Tensor beta, Tensor scale, Tensor shift, Tensor? gate=None) -> Tensor");

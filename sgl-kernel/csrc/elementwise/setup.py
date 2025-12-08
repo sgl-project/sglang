@@ -13,6 +13,17 @@ def gather_include_dirs():
     sgl_include = os.path.normpath(os.path.join(this_dir, "..", "..", "include"))
     if os.path.isdir(sgl_include):
         includes.append(sgl_include)
+    # Prefer CUTLASS under diffusion/sglang/ (repo root)
+    sglang_root = os.path.normpath(os.path.join(this_dir, "..", "..", ".."))
+    for cutlass_root in (
+        os.path.join(sglang_root, "cutlass"),
+        os.path.join(sglang_root, "third_party", "cutlass"),
+    ):
+        c_inc = os.path.join(cutlass_root, "include")
+        c_util = os.path.join(cutlass_root, "tools", "util", "include")
+        for p in (c_inc, c_util):
+            if os.path.isdir(p):
+                includes.append(p)
     # CUTLASS from local third_party/cmake deps (if present)
     cutlass_root = os.path.normpath(os.path.join(this_dir, "..", "..", "build", "_deps", "repo-cutlass-src"))
     cutlass_include = os.path.join(cutlass_root, "include")
