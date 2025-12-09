@@ -118,14 +118,14 @@ def _get_status_emoji_from_diff_percent(diff_pct):
         return "⚪️"
 
 
-def _print_single_comparison_report(others_data, base_e2e, combined_order, base_durations, others_processed,
-                                    base_counts):
-    # mode 1: single comparison
+def _print_single_comparison_report(
+    others_data, base_e2e, combined_order, base_durations, others_processed, base_counts
+):
     new_data = others_data[0]
     new_e2e = new_data.get("total_duration_ms", 0)
     diff_ms, diff_pct = calculate_diff(base_e2e, new_e2e)
-
     status = _get_status_emoji_from_diff_percent(diff_pct)
+
     print("#### 1. High-level Summary")
     print("| Metric | Baseline | New | Diff | Status |")
     print("| :--- | :--- | :--- | :--- | :--- |")
@@ -165,10 +165,15 @@ def _print_single_comparison_report(others_data, base_e2e, combined_order, base_
         )
 
 
-def _print_multi_comparison_report(base_e2e, others_data, other_labels, combined_order, base_durations,
-                                   others_processed):
+def _print_multi_comparison_report(
+    base_e2e,
+    others_data,
+    other_labels,
+    combined_order,
+    base_durations,
+    others_processed,
+):
     print("#### 1. High-level Summary")
-    # Header
     header = "| Metric | Baseline | " + " | ".join(other_labels) + " |"
     sep = "| :--- | :--- | " + " | ".join([":---"] * len(other_labels)) + " |"
     print(header)
@@ -206,9 +211,7 @@ def _print_multi_comparison_report(base_e2e, others_data, other_labels, combined
         print(row_str)
 
 
-def compare_benchmarks(
-    file_paths: List[str], output_format: str = "markdown"
-):
+def compare_benchmarks(file_paths: List[str], output_format: str = "markdown"):
     """
     Compares benchmark JSON files and prints a report.
     First file is baseline, others will be compared against it.
@@ -254,11 +257,23 @@ def compare_benchmarks(
         print("### Performance Comparison Report\n")
 
         if len(others_data) == 1:
-            _print_single_comparison_report(others_data, base_e2e, combined_order, base_durations, others_processed,
-                                            base_counts)
+            _print_single_comparison_report(
+                others_data,
+                base_e2e,
+                combined_order,
+                base_durations,
+                others_processed,
+                base_counts,
+            )
         else:
-            _print_multi_comparison_report(base_e2e, others_data, other_labels, combined_order, base_durations,
-                                           others_processed)
+            _print_multi_comparison_report(
+                base_e2e,
+                others_data,
+                other_labels,
+                combined_order,
+                base_durations,
+                others_processed,
+            )
 
         print("\n")
         # Metadata
@@ -279,7 +294,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "files",
         nargs="+",
-        help="List of JSON files. First is baseline, others are compared against it."
+        help="List of JSON files. First is baseline, others are compared against it.",
     )
     args = parser.parse_args()
 
