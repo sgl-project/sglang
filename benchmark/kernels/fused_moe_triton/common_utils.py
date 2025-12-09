@@ -73,11 +73,17 @@ def get_model_config(
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
         "Glm4MoeForCausalLM",
+        "MistralLarge3ForCausalLM",
     ]:
         E = (config.n_routed_experts // ep_size) + (
             0
             if disable_shared_experts_fusion
-            or architecture not in ["DeepseekV3ForCausalLM", "Glm4MoeForCausalLM"]
+            or architecture
+            not in [
+                "DeepseekV3ForCausalLM",
+                "Glm4MoeForCausalLM",
+                "MistralLarge3ForCausalLM",
+            ]
             else 1
         )
         topk = config.num_experts_per_tok + (
