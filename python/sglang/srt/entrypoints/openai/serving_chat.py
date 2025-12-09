@@ -472,7 +472,6 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
-        reasoning_tokens = {}
 
         try:
             async for content in self.tokenizer_manager.generate_request(
@@ -530,11 +529,6 @@ class OpenAIServingChat(OpenAIServingBase):
                         index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
-                        # Get reasoning tokens from meta_info
-                        if index not in reasoning_tokens:
-                            reasoning_tokens[index] = 0
-                        reasoning_tokens[index] = content["meta_info"].get("reasoning_tokens", 0)
-
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=DeltaMessage(reasoning_content=reasoning_text),
@@ -555,7 +549,6 @@ class OpenAIServingChat(OpenAIServingBase):
                             chunk.usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
-                                reasoning_tokens=reasoning_tokens.get(index, 0),
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
@@ -673,9 +666,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Additional usage chunk
             if request.stream_options and request.stream_options.include_usage:
-                # Calculate reasoning tokens from reasoning_tokens dict
-                total_reasoning_tokens = sum(reasoning_tokens.values())
-
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
                     completion_tokens,
@@ -683,10 +673,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
                 )
-
-                # Update usage with reasoning tokens
-                usage.reasoning_tokens = total_reasoning_tokens
-
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -805,11 +791,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 hidden_states=hidden_states,
             )
             choices.append(choice_data)
-
-        # Calculate reasoning tokens from meta_info
-        reasoning_tokens = 0
-        for ret_item in ret:
-            reasoning_tokens += ret_item["meta_info"].get("reasoning_tokens", 0)
 
         # Calculate usage
         usage = UsageProcessor.calculate_response_usage(

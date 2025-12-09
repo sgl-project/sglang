@@ -74,7 +74,6 @@ from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -279,9 +278,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
         else:
             self.async_dynamic_batch_tokenizer = None
-
-        # Initialize reasoning parser if available
-        self.reasoning_parser = getattr(server_args, "reasoning_parser", None)
 
         # Init inter-process communication
         context = zmq.asyncio.Context(2)
@@ -1480,34 +1476,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                         "cached_tokens": recv_obj.cached_tokens[i],
                     }
                 )
-
-            # Calculate reasoning tokens if reasoning parser is available
-            reasoning_tokens = 0
-            if (
-                self.reasoning_parser
-                and isinstance(recv_obj, BatchStrOutput)
-            ):
-                try:
-                    # Get the current text
-                    current_text = state.text
-
-                    # Create reasoning parser
-                    is_force_reasoning = getattr(state.obj, "force_reasoning", False)
-                    parser = ReasoningParser(
-                        model_type=self.reasoning_parser,
-                        stream_reasoning=False,
-                        force_reasoning=is_force_reasoning,
-                    )
-
-                    # Parse reasoning content
-                    reasoning_text, _ = parser.parse_non_stream(current_text)
-                    if reasoning_text and self.tokenizer:
-                        reasoning_tokens = len(self.tokenizer.encode(reasoning_text))
-                except Exception as e:
-                    logger.debug(f"Error calculating reasoning tokens: {e}")
-
-            # Add reasoning_tokens to meta_info
-            meta_info["reasoning_tokens"] = reasoning_tokens
 
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
