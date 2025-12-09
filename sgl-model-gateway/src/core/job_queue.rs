@@ -24,7 +24,7 @@ use crate::{
         WorkflowContext, WorkflowEngine, WorkflowId, WorkflowInstanceId, WorkflowStatus,
     },
     mcp::McpConfig,
-    metrics::RouterMetrics,
+    observability::metrics::RouterMetrics,
     protocols::worker_spec::{JobStatus, WorkerConfigRequest},
 };
 

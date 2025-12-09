@@ -325,8 +325,31 @@ class MultimodalInputs:
 
         assert isinstance(ret.mm_items, list)
         ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            from sglang.srt.managers.mm_utils import (
+                init_feature_buffer,
+                is_feature_buffer_initialized,
+                reset_buffer_offset,
+                try_add_to_buffer,
+            )
+
+            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
+            if not is_feature_buffer_initialized():
+                init_feature_buffer(device)
+            reset_buffer_offset()
+            for item in ret.mm_items:
+                if item.feature is not None:
+                    if isinstance(item.feature, torch.Tensor):
+                        item.feature = try_add_to_buffer(item.feature)
+
         for item in ret.mm_items:
             item.set_pad_value()
+
+        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
+            for item in ret.mm_items:
+                if item.feature is not None:
+                    item.feature = item.feature.to("cpu", non_blocking=True)
 
         optional_args = [
             "mrope_positions",
@@ -449,6 +472,7 @@ class Req:
         token_type_ids: List[int] = None,
         session_id: Optional[str] = None,
         custom_logit_processor: Optional[str] = None,
+        reasoning: bool = False,
         return_hidden_states: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -493,6 +517,9 @@ class Req:
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+
+        # For reasoning
+        self.reasoning = reasoning
 
         # Sampling info
         if isinstance(sampling_params.custom_params, dict):
@@ -1295,7 +1322,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
     def prepare_for_extend(self):
-        self.forward_mode = ForwardMode.EXTEND
+        self.forward_mode = (
+            ForwardMode.DLLM_EXTEND if self.is_dllm() else ForwardMode.EXTEND
+        )
 
         # Init tensors
         reqs = self.reqs

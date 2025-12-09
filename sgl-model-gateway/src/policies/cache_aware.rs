@@ -66,7 +66,7 @@ use rand::Rng;
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, tree::Tree, CacheAwareConfig, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics};
+use crate::{core::Worker, observability::metrics::RouterMetrics};
 
 /// Cache-aware routing policy
 ///
@@ -233,10 +233,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             first_model
         };
 
-        // Get current load statistics
-        let loads: Vec<usize> = workers.iter().map(|w| w.load()).collect();
-        let max_load = *loads.iter().max().unwrap_or(&0);
-        let min_load = *loads.iter().min().unwrap_or(&0);
+        // Get current load statistics - compute min/max in single pass without allocation
+        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
+            let load = w.load();
+            (min.min(load), max.max(load))
+        });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
@@ -309,7 +311,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 matched_worker.to_string()
             } else {
                 RouterMetrics::record_cache_miss();
-                tree.get_smallest_tenant()
+                let min_load_idx = *healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())?;
+                workers[min_load_idx].url().to_string()
             };
 
             // Find the index of the selected worker
@@ -322,6 +327,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     // Increment processed counter
                     workers[selected_idx].increment_processed();
                     RouterMetrics::record_processed_request(&selected_url);
+                    RouterMetrics::record_policy_decision(self.name(), &selected_url);
 
                     return Some(selected_idx);
                 }
@@ -344,37 +350,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let random_idx = rng.random_range(0..healthy_indices.len());
             Some(healthy_indices[random_idx])
         }
-    }
-
-    fn select_worker_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<(usize, usize)> {
-        // DEPRECATED: This method is no longer used when separate policies are configured.
-        // The PD router now uses separate policies for prefill and decode selection.
-        // This implementation remains for backward compatibility when a single policy is used.
-
-        // In PD mode with single policy:
-        // - Prefill: Use cache-aware routing for better cache utilization
-        // - Decode: Use least-load routing for better load distribution
-
-        // Select prefill worker using cache-aware logic
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-
-        // Select decode worker using least-load logic
-        let healthy_decode = get_healthy_worker_indices(decode_workers);
-        if healthy_decode.is_empty() {
-            return None;
-        }
-
-        let decode_idx = healthy_decode
-            .iter()
-            .min_by_key(|&&idx| decode_workers[idx].load())
-            .copied()?;
-
-        Some((prefill_idx, decode_idx))
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {

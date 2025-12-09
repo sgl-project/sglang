@@ -18,7 +18,10 @@ import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     _SGLDiffusionLogger,
     get_is_main_process,
+    init_logger,
 )
+
+logger = init_logger(__name__)
 
 
 @dataclasses.dataclass

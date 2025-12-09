@@ -10,11 +10,15 @@
 //! 5. ValidateWasmComponent - Validate WASM component format
 //! 6. RegisterModule - Register module in WasmModuleManager
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Component as PathComponent, Path},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use wasmtime::{component::Component, Config, Engine};
 
@@ -29,6 +33,34 @@ use crate::{
 pub struct WasmModuleConfigRequest {
     /// Module descriptor containing name, file_path, attach_points, etc.
     pub descriptor: WasmModuleDescriptor,
+}
+
+/// Sensitive system directories that WASM modules cannot be loaded from.
+/// These are blocked to prevent information disclosure attacks.
+const BLOCKED_PATH_PREFIXES: &[&str] = &[
+    "/etc/",
+    "/proc/",
+    "/sys/",
+    "/dev/",
+    "/boot/",
+    "/root/",
+    "/var/log/",
+    "/var/run/",
+];
+
+/// Check if a path starts with any blocked prefix.
+/// Returns the matched prefix if found, None otherwise.
+fn find_blocked_prefix(path: &str) -> Option<&'static str> {
+    BLOCKED_PATH_PREFIXES
+        .iter()
+        .find(|&&prefix| path.starts_with(prefix))
+        .copied()
+}
+
+/// Check if a path has a .wasm extension (case-insensitive).
+fn has_wasm_extension(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
 }
 
 /// Step 1: Validate module descriptor
@@ -67,6 +99,64 @@ impl StepExecutor for ValidateDescriptorStep {
             });
         }
 
+        // Security: Validate path to prevent path traversal attacks
+        let path = Path::new(&descriptor.file_path);
+
+        // Must be an absolute path
+        if !path.is_absolute() {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("validate_descriptor"),
+                message: format!(
+                    "Module file path must be absolute, got: {}",
+                    descriptor.file_path
+                ),
+            });
+        }
+
+        // Check for path traversal components (.. or symbolic links that could escape)
+        for component in path.components() {
+            match component {
+                PathComponent::ParentDir => {
+                    warn!(
+                        "Path traversal attempt detected in WASM module path: {}",
+                        descriptor.file_path
+                    );
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("validate_descriptor"),
+                        message: "Path traversal (..) not allowed in module file path".to_string(),
+                    });
+                }
+                PathComponent::CurDir => {
+                    return Err(WorkflowError::StepFailed {
+                        step_id: StepId::new("validate_descriptor"),
+                        message: "Current directory (.) not allowed in module file path"
+                            .to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Require .wasm extension to prevent loading arbitrary files
+        if !has_wasm_extension(path) {
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("validate_descriptor"),
+                message: "Module file must have .wasm extension".to_string(),
+            });
+        }
+
+        // Block access to sensitive system directories
+        if let Some(prefix) = find_blocked_prefix(&descriptor.file_path) {
+            warn!(
+                "Attempt to access blocked directory in WASM module path: {}",
+                descriptor.file_path
+            );
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("validate_descriptor"),
+                message: format!("Access to {} directory is not allowed", prefix),
+            });
+        }
+
         // Check if file exists and get size
         let metadata = tokio::fs::metadata(&descriptor.file_path)
             .await
@@ -79,6 +169,45 @@ impl StepExecutor for ValidateDescriptorStep {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("validate_descriptor"),
                 message: "Module file size cannot be 0".to_string(),
+            });
+        }
+
+        // Canonicalize the path to resolve symlinks and verify final location is safe
+        let canonical_path = tokio::fs::canonicalize(&descriptor.file_path)
+            .await
+            .map_err(|e| WorkflowError::StepFailed {
+                step_id: StepId::new("validate_descriptor"),
+                message: format!(
+                    "Failed to canonicalize path {}: {}",
+                    descriptor.file_path, e
+                ),
+            })?;
+
+        // Re-check blocked directories after symlink resolution
+        let canonical_str = canonical_path.to_string_lossy();
+        if let Some(prefix) = find_blocked_prefix(&canonical_str) {
+            warn!(
+                "Symlink resolved to blocked directory: {} -> {}",
+                descriptor.file_path, canonical_str
+            );
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("validate_descriptor"),
+                message: format!(
+                    "Path resolves to blocked directory {} (via symlink)",
+                    prefix
+                ),
+            });
+        }
+
+        // Ensure canonicalized path still has .wasm extension (symlink target check)
+        if !has_wasm_extension(&canonical_path) {
+            warn!(
+                "Symlink target is not a .wasm file: {} -> {}",
+                descriptor.file_path, canonical_str
+            );
+            return Err(WorkflowError::StepFailed {
+                step_id: StepId::new("validate_descriptor"),
+                message: "Symlink target must be a .wasm file".to_string(),
             });
         }
 

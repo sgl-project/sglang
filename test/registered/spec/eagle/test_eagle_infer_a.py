@@ -7,6 +7,7 @@ import torch
 import sglang as sgl
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_EAGLE_DRAFT_MODEL_FOR_TEST,
     DEFAULT_EAGLE_TARGET_MODEL_FOR_TEST,
@@ -19,6 +20,8 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_server,
 )
+
+register_cuda_ci(est_time=470, suite="stage-b-test-small-1-gpu")
 
 torch_dtype = torch.float16
 prefill_tolerance = 5e-2

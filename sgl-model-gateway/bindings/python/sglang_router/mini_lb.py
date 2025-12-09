@@ -341,8 +341,7 @@ async def get_server_info():
         }
 
 
-@app.get("/get_model_info")
-async def get_model_info():
+async def _get_model_info_impl():
     if not lb or not lb.prefill_urls:
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE,
@@ -350,7 +349,7 @@ async def get_model_info():
         )
 
     target_server_url = lb.prefill_urls[0]
-    endpoint_url = f"{target_server_url}/get_model_info"
+    endpoint_url = f"{target_server_url}/model_info"
 
     async with aiohttp.ClientSession() as session:
         try:
@@ -373,6 +372,16 @@ async def get_model_info():
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 detail=f"Failed to get model info from backend",
             )
+
+
+@app.get("/model_info")
+async def model_info():
+    return await _get_model_info_impl()
+
+
+@app.get("/get_model_info")
+async def get_model_info():
+    return await _get_model_info_impl()
 
 
 @app.post("/generate")

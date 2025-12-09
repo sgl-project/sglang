@@ -41,7 +41,7 @@ def run_profile(
     # Dump server args.
     file_path = Path(output_dir) / "server_args.json"
     if not file_path.exists():
-        response = requests.get(url + "/server_info")
+        response = requests.get(url + "/get_server_info")
         response.raise_for_status()
         server_args_data = response.json()
         with open(file_path, "w") as file:
@@ -116,7 +116,7 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         type=bool,
         default=False,
-        help="Whether to memory usage (https://pytorch.org/memory_viz)",
+        help="Whether to profile memory usage (https://pytorch.org/memory_viz)",
     )
     parser.add_argument(
         "--rpd",

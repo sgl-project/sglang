@@ -1,7 +1,7 @@
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     HistoryBackend, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RetryConfig,
-    RouterConfig, RoutingMode, TokenizerCacheConfig,
+    RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
 };
 use crate::{core::ConnectionMode, mcp::McpConfig};
 
@@ -297,6 +297,24 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ===================== Otel Trace ====================
+
+    pub fn enable_trace<S: Into<String>>(mut self, endpoint: S) -> Self {
+        self.config.trace_config = Some(TraceConfig {
+            enable_trace: true,
+            otlp_traces_endpoint: endpoint.into(),
+        });
+        self
+    }
+
+    pub fn disable_trace(mut self) -> Self {
+        self.config.trace_config = Some(TraceConfig {
+            enable_trace: false,
+            otlp_traces_endpoint: "".to_string(),
+        });
+        self
+    }
+
     // ==================== Logging ====================
 
     pub fn log_dir<S: Into<String>>(mut self, dir: S) -> Self {
@@ -458,6 +476,11 @@ impl RouterConfigBuilder {
 
     pub fn maybe_metrics(mut self, metrics: Option<MetricsConfig>) -> Self {
         self.config.metrics = metrics;
+        self
+    }
+
+    pub fn maybe_trace(mut self, trace_config: Option<TraceConfig>) -> Self {
+        self.config.trace_config = trace_config;
         self
     }
 
@@ -703,11 +726,13 @@ mod tests {
             .to_builder()
             .port(4000)
             .enable_metrics("0.0.0.0", 29000)
+            .enable_trace("localhost:4317")
             .build()
             .unwrap();
 
         assert_eq!(modified.port, 4000);
         assert!(modified.metrics.is_some());
+        assert!(modified.trace_config.is_some());
     }
 
     /// Test complex routing mode helper method
