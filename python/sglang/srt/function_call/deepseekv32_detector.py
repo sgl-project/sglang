@@ -11,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -265,11 +264,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
                 is_tool_end = bool(invoke_match.group(3))
 
-                print(f"\033[42m {current_text=} \033[0m")
-                print(f"\033[42m {func_name=} {invoke_content=} {is_tool_end=} \033[0m")
-                print("-" * 80)
+                # print(f"\033[42m {current_text=} \033[0m")
+                # print(f"\033[42m {func_name=} {invoke_content=} {is_tool_end=} \033[0m")
+                # print("-" * 80)
                 func_args_raw, format = self._parse_parameters_partially(invoke_content)
-                # print(f"\033[42m {func_args_raw=} \033[0m")
                 if is_tool_end and format == "xml":
                     func_args_raw += "}"
 
@@ -317,7 +315,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                             self.current_tool_id
                         ] += argument_diff
 
-                    if _is_complete_json(func_args_raw) and is_tool_end:
+                    if is_tool_end:
                         # Update the stored arguments
                         try:
                             parsed_args = json.loads(func_args_raw)
@@ -330,12 +328,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         # Remove the completed tool call from buffer, keep any remaining content
                         self._buffer = current_text[invoke_match.end(3) :]
                         current_text = self._buffer
-                        print(f"\033[41m send over, clear buffer \033[0m")
 
-                        # reset state
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
+                        # update state
+                        self.update_state()
 
                 if not is_tool_end:
                     # if current tool is not end, it means the following content is definitely not a tool call, so break the loop
@@ -354,3 +349,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             end="</｜DSML｜invoke>",
             trigger=f"<｜DSML｜",
         )
+
+    def update_state(self):
+        self.current_tool_id += 1
+        self._last_arguments = ""
+        self.current_tool_name_sent = False

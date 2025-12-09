@@ -1201,10 +1201,12 @@ class TestDeepSeekV32Detector(unittest.TestCase):
 
     def test_streaming_xml_format(self):
         """Test streaming parsing of XML format"""
-        text = """<｜DSML｜function_calls>
+        text = f"""<｜DSML｜function_calls>
             <｜DSML｜invoke name="get_favorite_tourist_spot">
                 <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
                 <｜DSML｜parameter name="second" string="true">London</｜DSML｜parameter>
+                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+                <｜DSML｜parameter name="obj" string="false">{{"name": "John", "age": 30}}</｜DSML｜parameter>
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
