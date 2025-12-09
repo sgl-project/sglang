@@ -27,3 +27,4 @@ python3 -m sglang.launch_server \
 - Qwen2.5-VL (<https://github.com/sgl-project/sglang/pull/13126>)
 - Qwen3-VL (<https://github.com/sgl-project/sglang/pull/13724>)
 - InternVL (<https://github.com/sgl-project/sglang/pull/13925>)
+- GLM-4.5V & GLM-4.6V (<https://github.com/sgl-project/sglang/pull/14097>)

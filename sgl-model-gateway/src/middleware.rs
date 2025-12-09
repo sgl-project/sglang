@@ -22,7 +22,7 @@ use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
-    metrics::RouterMetrics,
+    observability::metrics::RouterMetrics,
     server::AppState,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -79,6 +79,9 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// Alphanumeric characters for request ID generation (as bytes for O(1) indexing)
+const REQUEST_ID_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
 /// Generate OpenAI-compatible request ID based on endpoint
 fn generate_request_id(path: &str) -> String {
     let prefix = if path.contains("/chat/completions") {
@@ -94,12 +97,12 @@ fn generate_request_id(path: &str) -> String {
     };
 
     // Generate a random string similar to OpenAI's format
-    let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    // Use byte array indexing (O(1)) instead of chars().nth() (O(n))
     let mut rng = rand::rng();
     let random_part: String = (0..24)
         .map(|_| {
-            let idx = rng.random_range(0..chars.len());
-            chars.chars().nth(idx).unwrap()
+            let idx = rng.random_range(0..REQUEST_ID_CHARS.len());
+            REQUEST_ID_CHARS[idx] as char
         })
         .collect();
 
@@ -263,7 +266,8 @@ impl<B> OnResponse<B> for ResponseLogger {
 
         // Record these in the span for structured logging/observability tools
         span.record("status_code", status.as_u16());
-        span.record("latency", format!("{:?}", latency));
+        // Use microseconds as integer to avoid format! string allocation
+        span.record("latency", latency.as_micros() as u64);
 
         // Log the response completion
         let _enter = span.enter();
@@ -612,7 +616,8 @@ pub async fn wasm_middleware(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let mut headers = request.headers().clone();
-    let body_bytes = match axum::body::to_bytes(request.into_body(), usize::MAX).await {
+    let max_body_size = wasm_manager.get_max_body_size();
+    let body_bytes = match axum::body::to_bytes(request.into_body(), max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
             error!("Failed to read request body: {}", e);
@@ -628,13 +633,18 @@ pub async fn wasm_middleware(
     // Process each OnRequest module
     let mut modified_body = body_bytes;
 
+    // Pre-compute strings once before the loop to avoid repeated allocations
+    let method_str = method.to_string();
+    let path_str = uri.path().to_string();
+    let query_str = uri.query().unwrap_or("").to_string();
+
     for module in modules_on_request {
         // Build WebAssembly request from collected data
         let wasm_headers = build_wasm_headers_from_axum_headers(&headers);
         let wasm_request = WasmRequest {
-            method: method.to_string(),
-            path: uri.path().to_string(),
-            query: uri.query().unwrap_or("").to_string(),
+            method: method_str.clone(),
+            path: path_str.clone(),
+            query: query_str.clone(),
             headers: wasm_headers,
             body: modified_body.clone(),
             request_id: request_id.clone(),
@@ -708,7 +718,7 @@ pub async fn wasm_middleware(
     // Extract response data once before processing modules
     let mut status = response.status();
     let mut headers = response.headers().clone();
-    let mut body_bytes = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+    let mut body_bytes = match axum::body::to_bytes(response.into_body(), max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
             error!("Failed to read response body: {}", e);
