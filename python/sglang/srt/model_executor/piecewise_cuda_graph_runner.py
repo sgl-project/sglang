@@ -45,7 +45,6 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -395,9 +394,6 @@ class PiecewiseCudaGraphRunner:
 
                 with set_compiled(True):
                     self.capture_one_batch_size(num_tokens)
-
-                # Save gemlite cache after each capture
-                save_gemlite_cache()
 
     def capture_one_batch_size(self, num_tokens: int):
         bs = 1

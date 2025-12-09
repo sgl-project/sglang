@@ -315,7 +315,6 @@ try:
 except:
     is_intel_amx_backend_available = False
 
-
 try:
     # move torch._C._cpu._is_amx_tile_supported() from cpu_has_amx_support
     # to support torch compile
@@ -1840,7 +1839,7 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "Habana frameworks detected, but failed to import 'habana_frameworks.torch.hpu'."
             )
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU) is available.")
+    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU) is available.")
 
 
 @lru_cache(maxsize=1)
@@ -2707,15 +2706,18 @@ def is_fa3_default_architecture(hf_config):
     if not isinstance(architectures, list) or not architectures:
         return False
     default_archs = {
-        "Qwen2ForCausalLM",
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "Olmo2ForCausalLM",
         "Gemma2ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3MoeForCausalLM",
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
         "Glm4MoeForCausalLM",
+        "Glm4vForConditionalGeneration",
         "Glm4vMoeForConditionalGeneration",
         "Step3VLForConditionalGeneration",
     }
@@ -2797,6 +2799,8 @@ def require_mlp_tp_gather(server_args: ServerArgs):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     if server_args.enable_dp_attention:
         assert server_args.dp_size > 1, "dp_size must be greater than 1"
         if (
@@ -2805,7 +2809,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
             return True
         elif not server_args.enable_dp_lm_head:
             return True
-        elif server_args.moe_a2a_backend == "none":
+        elif get_moe_a2a_backend().is_none():
             return True
         else:
             return (
@@ -2820,8 +2824,10 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     assert server_args.moe_dense_tp_size in [1, None]
-    if server_args.moe_a2a_backend != "none" or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:
