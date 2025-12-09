@@ -17,7 +17,7 @@ for wheel in "${wheel_files[@]}"; do
 
     # Detect ROCm version and add appropriate suffix
     if ls /opt | grep -q "6.3"; then
-        new_wheel="${intermediate_wheel/-cp${cp_version}/+rocm630-cp${cp_version}}"
+        new_wheel="${intermediate_wheel/-cp${cp_version}/+rocm640-cp${cp_version}}"
     elif ls /opt | grep -q "7.0"; then
         new_wheel="${intermediate_wheel/-cp${cp_version}/+rocm700-cp${cp_version}}"
     else
