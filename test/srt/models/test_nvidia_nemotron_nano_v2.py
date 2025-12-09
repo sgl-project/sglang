@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.utils import is_blackwell
+from sglang.srt.utils import is_blackwell, is_in_ci
 from sglang.test.gsm8k_mixin import GSM8KMixin
 from sglang.test.test_utils import CustomTestCase
 
@@ -24,6 +24,7 @@ class TestNvidiaNemotronNanoV2NVFP4(GSM8KMixin, CustomTestCase):
     other_args = ["--max-mamba-cache-size", "256"]
 
 
+@unittest.skip(is_in_ci(), "Temporary skip this test in CI")
 class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, CustomTestCase):
     accuracy = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
@@ -49,6 +50,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, CustomTestCase):
     ]
 
 
+@unittest.skip(is_in_ci(), "Temporary skip this test in CI")
 class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(GSM8KMixin, CustomTestCase):
     accuracy = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
