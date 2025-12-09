@@ -65,6 +65,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -305,6 +306,9 @@ class Scheduler(
         # Init moe config
         self.init_moe_config()
 
+        # Init GEMM config (FP8 GEMM, etc.)
+        self.init_gemm_config()
+
         # Check whether overlap can be enabled
         if not self.is_generation:
             self.enable_overlap = False
@@ -398,7 +402,10 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        self.is_hybrid_gdn = self.tp_worker.model_runner.hybrid_gdn_config is not None
+        self.is_ssm_model = (
+            self.tp_worker.model_runner.hybrid_gdn_config is not None
+            or self.tp_worker.model_runner.mamba2_config is not None
+        )
 
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -762,7 +769,7 @@ class Scheduler(
                 self.tree_cache = SWARadixCache(
                     params=params, sliding_window_size=self.sliding_window_size
                 )
-            elif self.is_hybrid_gdn:
+            elif self.is_ssm_model:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
                 self.tree_cache = MambaRadixCache(params)
@@ -962,6 +969,12 @@ class Scheduler(
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
+
+    def init_gemm_config(self):
+        # Initialize GEMM-related configuration (currently FP8 Blockwise GEMM backend).
+        # Other GEMM backends (e.g. FP4, BF16, etc.) can be added here in the future.
+        # This is needed for FP8 quantization.
+        initialize_fp8_gemm_config(self.server_args)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1301,6 +1314,7 @@ class Scheduler(
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
                 custom_logit_processor=recv_req.custom_logit_processor,
+                reasoning=recv_req.reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -1428,7 +1442,9 @@ class Scheduler(
                 elif req.sampling_params.structural_tag:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
-                value, cache_hit = self.grammar_backend.get_cached_or_future_value(key)
+                value, cache_hit = self.grammar_backend.get_cached_or_future_value(
+                    key, req.reasoning
+                )
                 req.grammar = value
 
                 if not cache_hit:
