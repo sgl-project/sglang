@@ -214,7 +214,7 @@ def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor = 
         torch.bfloat16: {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 256,
+            "BLOCK_SIZE_K": 128,
             "GROUP_SIZE_M": 8,
             "num_stages": 2,
             "num_warps": 8,
@@ -222,7 +222,7 @@ def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor = 
         torch.float16: {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K": 256,
+            "BLOCK_SIZE_K": 128,
             "GROUP_SIZE_M": 8,
             "num_stages": 2,
             "num_warps": 8,
@@ -246,7 +246,9 @@ def matmul_tp_persistent(A: torch.Tensor, B: torch.Tensor, bias: torch.Tensor = 
 
     M, K = A.shape
     _, N = B.shape
-    assert K % BLOCK_K == 0
+    assert (
+        K % BLOCK_K == 0
+    ), f"Dimension K should be divisible by BLOCK_K. Got K={K}, BLOCK_K={BLOCK_K}."
     T = K // BLOCK_K
     FIRST_LEVEL_BLOCK = T
 
