@@ -122,6 +122,9 @@ class APIServingTimingMixin:
     received_time_perf: Optional[float] = None
 
 
+_API_SERVING_TIMING_MIXIN_FIELDS = APIServingTimingMixin.__dataclass_fields__.keys()
+
+
 # Parameters for a session
 @dataclass
 class SessionParams:
@@ -582,7 +585,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
     def __getitem__(self, i):
-        timing_keys = APIServingTimingMixin.__dataclass_fields__.keys()
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -644,7 +646,10 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             http_worker_ipc=self.http_worker_ipc,
-            **{key: getattr(self, key) for key in timing_keys},
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
@@ -842,8 +847,6 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
                 http_worker_ipc=self.http_worker_ipc,
             )
 
-        timing_keys = APIServingTimingMixin.__dataclass_fields__.keys()
-
         return EmbeddingReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -854,7 +857,10 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             rid=self.rid[i],
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
-            **{key: getattr(self, key) for key in timing_keys},
+            **{
+                field: getattr(self, field)
+                for field in _API_SERVING_TIMING_MIXIN_FIELDS
+            },
         )
 
 
