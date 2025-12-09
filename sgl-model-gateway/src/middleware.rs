@@ -332,9 +332,12 @@ impl Default for ResponseLogger {
 impl<B> OnResponse<B> for ResponseLogger {
     fn on_response(self, response: &Response<B>, latency: Duration, span: &Span) {
         let status = response.status();
+        let status_code = status.as_u16();
+
+        RouterMetrics::record_http_status_code(status_code);
 
         // Record these in the span for structured logging/observability tools
-        span.record("status_code", status.as_u16());
+        span.record("status_code", status_code);
         // Use microseconds as integer to avoid format! string allocation
         span.record("latency", latency.as_micros() as u64);
 
