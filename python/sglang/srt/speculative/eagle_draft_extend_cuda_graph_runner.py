@@ -98,27 +98,26 @@ class EAGLEDraftExtendCudaGraphRunner:
                 (3, self.max_num_token), dtype=torch.int64
             )
 
-            # Use target model's hidden size for hidden_states since they're used during verification
+            # For EAGLE models, use target_hidden_size from hf_config since EAGLE head uses target's hidden states
+            # For STANDALONE mode, use draft model's hidden_size since draft model produces its own hidden states
             if hasattr(
                 self.model_runner.model_config.hf_config,
                 "target_hidden_size",
             ):
-                target_hidden_size = (
+                draft_hidden_size = (
                     self.model_runner.model_config.hf_config.target_hidden_size
                 )
             else:
-                target_hidden_size = (
-                    self.eagle_worker.target_worker.model_runner.model_config.hidden_size
-                )
+                draft_hidden_size = self.model_runner.model_config.hidden_size
 
             if self.eagle_worker.speculative_algorithm.is_eagle3():
                 self.hidden_states = torch.zeros(
-                    (self.max_num_token, target_hidden_size * 3),
+                    (self.max_num_token, draft_hidden_size * 3),
                     dtype=self.model_runner.dtype,
                 )
             else:
                 self.hidden_states = torch.zeros(
-                    (self.max_num_token, target_hidden_size),
+                    (self.max_num_token, draft_hidden_size),
                     dtype=self.model_runner.dtype,
                 )
             self.seq_len_fill_value = (

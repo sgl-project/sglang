@@ -101,21 +101,20 @@ class EAGLEDraftCudaGraphRunner:
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
 
-            # Use target model's hidden size for hidden_states since they're used during verification
+            # For EAGLE models, use target_hidden_size from hf_config since EAGLE head uses target's hidden states
+            # For STANDALONE mode, use draft model's hidden_size since draft model produces its own hidden states
             if hasattr(
                 self.model_runner.model_config.hf_config,
                 "target_hidden_size",
             ):
-                target_hidden_size = (
+                draft_hidden_size = (
                     self.model_runner.model_config.hf_config.target_hidden_size
                 )
             else:
-                target_hidden_size = (
-                    self.eagle_worker.target_worker.model_runner.model_config.hidden_size
-                )
+                draft_hidden_size = self.model_runner.model_config.hidden_size
 
             self.hidden_states = torch.zeros(
-                (self.max_bs, target_hidden_size),
+                (self.max_bs, draft_hidden_size),
                 dtype=self.model_runner.dtype,
             )
 
@@ -360,7 +359,13 @@ class EAGLEDraftCudaGraphRunner:
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
-        self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        # Only copy hidden_states if dimensions match (may differ in STANDALONE mode
+        # where target and draft models have different hidden sizes)
+        if (
+            forward_batch.spec_info.hidden_states.shape[1]
+            == self.hidden_states.shape[1]
+        ):
+            self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
