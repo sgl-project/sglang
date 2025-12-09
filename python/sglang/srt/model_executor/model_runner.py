@@ -498,9 +498,12 @@ class ModelRunner:
             enable_batch_invariant_mode()
 
         # Init memory pool and attention backends
+        max_num_reqs = server_args.max_running_requests // (
+            server_args.dp_size if server_args.enable_dp_attention else 1
+        )
         self.init_memory_pool(
             min_per_gpu_memory,
-            server_args.max_running_requests,
+            max_num_reqs,
             server_args.max_total_tokens,
         )
         if self.device == "cuda":
