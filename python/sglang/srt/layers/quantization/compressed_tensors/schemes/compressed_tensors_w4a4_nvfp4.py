@@ -2,12 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 from collections.abc import Callable
+from typing import Optional
 
 import torch
-from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.attention.flashinfer_ops import flashinfer_scaled_fp4_mm
 from sglang.srt.layers.parameter import (
     GroupQuantScaleParameter,
     ModelWeightParameter,
@@ -16,8 +15,13 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
+from sglang.srt.layers.quantization.modelopt_quant import (
+    FLASHINFER_FP4_GEMM_BACKEND,
+    _sglang_fp4_gemm,
+    enable_flashinfer_fp4_gemm,
+    fp4_quantize,
+)
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
-from sglang.srt.utils import cutlass_fp4_supported, is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 
@@ -26,21 +30,6 @@ __all__ = ["CompressedTensorsW4A4Fp4"]
 
 class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
     def __init__(self):
-        self.backend = "none"
-        if is_flashinfer_available():
-            self.backend = "flashinfer-cutlass"
-        elif cutlass_fp4_supported():
-            self.backend = "cutlass"
-        else:
-            self.backend = "none"
-
-        if self.backend == "none":
-            raise ValueError(
-                "No valid NVFP4 GEMM backend found. "
-                "Please check your platform capability."
-            )
-
-        logger.info_once(f"Using {self.backend} for NVFP4 GEMM")
         self.group_size = 16
 
     @classmethod
@@ -109,7 +98,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if self.backend == "flashinfer-trtllm":
+        if FLASHINFER_FP4_GEMM_BACKEND == "trtllm":
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
             # FlashInfer provides nvfp4_quantize to quantize + shuffle the
             # layout but we use our own quantization so we have to call
@@ -131,8 +120,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.weight_packed = Parameter(weight, requires_grad=False)
         else:
             swizzled_weight_scale = swizzle_blockscale(layer.weight_scale)
-            if self.backend == "fbgemm":
-                swizzled_weight_scale = swizzled_weight_scale.view(-1).view(torch.uint8)
             layer.weight_scale = Parameter(swizzled_weight_scale, requires_grad=False)
             layer.weight_packed = Parameter(
                 layer.weight_packed.data, requires_grad=False
@@ -147,38 +134,35 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: torch.Tensor | None = None,
+        bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         output_dtype = x.dtype
-        output_shape = [x.shape[0], layer.weight_packed.shape[0]]
+        w_n, _ = layer.weight_packed.shape
+        output_shape = [x.shape[0], w_n]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
-        x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_global_scale)
+        x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
 
-        mm_args = (
+        assert x_fp4.dtype == torch.uint8
+        assert layer.weight_packed.dtype == torch.uint8
+        assert layer.weight_scale.dtype == torch.float8_e4m3fn
+        assert layer.alpha.dtype == torch.float32
+
+        w = layer.weight_packed
+        w_blockscale = layer.weight_scale
+        if enable_flashinfer_fp4_gemm:
+            w = layer.weight_packed.T
+            w_blockscale = layer.weight_scale.T
+
+        out = _sglang_fp4_gemm(
             x_fp4,
-            layer.weight_packed,
+            w,
             x_blockscale,
-            layer.weight_scale,
+            w_blockscale,
             layer.alpha,
             output_dtype,
+            w_n,
         )
-        if self.backend.startswith("flashinfer-"):
-            backend_name = self.backend[len("flashinfer-") :]
-            out = flashinfer_scaled_fp4_mm(*mm_args, backend=backend_name)
-        elif self.backend == "fbgemm":
-            out = torch.ops.fbgemm.f4f4bf16(
-                x_fp4,
-                layer.weight_packed,
-                x_blockscale.view(-1).view(torch.uint8),
-                layer.weight_scale,
-                layer.alpha,
-                use_mx=False,
-            ).to(output_dtype)
-        else:
-            assert self.backend == "cutlass"
-            out = cutlass_scaled_fp4_mm(*mm_args)
-
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)

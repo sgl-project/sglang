@@ -44,7 +44,6 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import cutlass_fp4_supported
 
 logger = logging.getLogger(__name__)
 
@@ -469,14 +468,15 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if is_activation_quantization_format(self.quant_format):
             if self._is_fp4a4_nvfp4(weight_quant, input_quant):
-                if cutlass_fp4_supported():
+                is_fp4a4_nvfp4_supported = self._check_scheme_supported(
+                    CompressedTensorsW4A4Fp4.get_min_capability(), error=False
+                )
+                if is_fp4a4_nvfp4_supported:
                     return CompressedTensorsW4A4Fp4()
                 else:
-                    logger.warning_once(
-                        "Current platform does not support cutlass NVFP4."
-                        " Running CompressedTensorsW4A16Fp4."
+                    raise NotImplementedError(
+                        "Current platform does not support w4a4 nvfp4 quantization."
                     )
-                    return CompressedTensorsW4A16Fp4(has_input_global_scale=True)
 
             if self._is_fp8_w8a8(weight_quant, input_quant):
                 is_fp8_w8a8_supported = self._check_scheme_supported(
