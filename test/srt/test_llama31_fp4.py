@@ -14,7 +14,7 @@ MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-FP4"
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestLlama31FP4B200(unittest.TestCase):
+class TestLlama31FP4(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL_PATH
@@ -40,11 +40,11 @@ class TestLlama31FP4B200(unittest.TestCase):
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
-            num_shots=4,
+            num_shots=5,
             data_path=None,
-            num_questions=100,
+            num_questions=1319,
             max_new_tokens=512,
-            parallel=128,
+            parallel=200,
             host=f"{parsed_url.scheme}://{parsed_url.hostname}",
             port=parsed_url.port,
         )
