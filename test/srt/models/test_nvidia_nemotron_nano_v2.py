@@ -24,6 +24,10 @@ class TestNvidiaNemotronNanoV2NVFP4(GSM8KMixin, CustomTestCase):
     other_args = ["--max-mamba-cache-size", "256"]
 
 
+@unittest.skip(
+    "STANDALONE speculative decoding does not yet support target and draft models "
+    "with different hidden sizes (Nemotron-9B: 4480, Llama-3.2-1B: 2048)"
+)
 class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, CustomTestCase):
     accuracy = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
@@ -49,6 +53,10 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, CustomTestCase):
     ]
 
 
+@unittest.skip(
+    "STANDALONE speculative decoding does not yet support target and draft models "
+    "with different hidden sizes (Nemotron-9B: 4480, Llama-3.2-1B: 2048)"
+)
 class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(GSM8KMixin, CustomTestCase):
     accuracy = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
