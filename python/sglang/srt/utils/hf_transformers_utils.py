@@ -517,6 +517,39 @@ class TokenizerWarningsFilter(logging.Filter):
         return "Calling super().encode with" not in record.getMessage()
 
 
+def _check_tokenizer_cache(
+    tokenizer_name: str,
+    cache_dir: Optional[str],
+    revision: Optional[str],
+    include_processor_files: bool = False,
+) -> str:
+    """Check local cache for tokenizer files and return local path if found.
+
+    Args:
+        tokenizer_name: Model name or path
+        cache_dir: Optional custom cache directory
+        revision: Optional model revision
+        include_processor_files: Whether to include processor-specific files (*.py, preprocessor_config.json)
+
+    Returns:
+        Local path if found in cache, otherwise returns original tokenizer_name
+    """
+    allow_patterns = [
+        "*.json",
+        "*.model",
+        "*.txt",
+        "tokenizer.model",
+        "tokenizer_config.json",
+    ]
+    if include_processor_files:
+        allow_patterns.extend(["*.py", "preprocessor_config.json"])
+
+    local_path = find_local_tokenizer_snapshot_dir(
+        tokenizer_name, cache_dir, allow_patterns, revision
+    )
+    return local_path if local_path is not None else tokenizer_name
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -554,19 +587,9 @@ def get_tokenizer(
         tokenizer_name = client.get_local_dir()
 
     # Check if tokenizer files are already in local cache (CI only)
-    cache_dir = kwargs.get("cache_dir", None)
-    allow_patterns = [
-        "*.json",
-        "*.model",
-        "*.txt",
-        "tokenizer.model",
-        "tokenizer_config.json",
-    ]
-    local_path = find_local_tokenizer_snapshot_dir(
-        tokenizer_name, cache_dir, allow_patterns, tokenizer_revision
+    tokenizer_name = _check_tokenizer_cache(
+        tokenizer_name, kwargs.get("cache_dir"), tokenizer_revision
     )
-    if local_path is not None:
-        tokenizer_name = local_path
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -636,21 +659,12 @@ def get_processor(
     revision = kwargs.pop("revision", tokenizer_revision)
 
     # Check if processor/tokenizer files are already in local cache (CI only)
-    cache_dir = kwargs.get("cache_dir", None)
-    allow_patterns = [
-        "*.json",
-        "*.model",
-        "*.txt",
-        "*.py",
-        "tokenizer.model",
-        "tokenizer_config.json",
-        "preprocessor_config.json",
-    ]
-    local_path = find_local_tokenizer_snapshot_dir(
-        tokenizer_name, cache_dir, allow_patterns, revision
+    tokenizer_name = _check_tokenizer_cache(
+        tokenizer_name,
+        kwargs.get("cache_dir"),
+        revision,
+        include_processor_files=True,
     )
-    if local_path is not None:
-        tokenizer_name = local_path
 
     if "mistral-large-3" in str(tokenizer_name).lower():
         config = _load_mistral_large_3_for_causal_LM(
