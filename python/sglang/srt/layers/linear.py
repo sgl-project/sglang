@@ -305,7 +305,7 @@ class ColumnParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
-        skip_block_quant_check: bool=False
+        skip_block_quant_check: bool = False,
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -818,7 +818,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
         v_head_size: Optional[int] = None,
-        skip_block_quant_check: bool=False,
+        skip_block_quant_check: bool = False,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size

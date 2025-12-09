@@ -247,7 +247,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
             if skip_block_quant_check:
-                logger.warning(f"Skipping block quantization checks for weight partition.")
+                logger.warning(
+                    f"Skipping block quantization checks for weight partition."
+                )
             else:
                 # Required by row parallel
                 if tp_size > 1 and input_size // input_size_per_partition == tp_size:
