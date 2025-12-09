@@ -4171,6 +4171,9 @@ class ServerArgs:
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
 
     def check_torch_2_9_1_cudnn_compatibility(self):
+        if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):
+            return
+
         if self.get_model_config().is_multimodal:
             import torch
 
@@ -4198,7 +4201,8 @@ class ServerArgs:
                             "Reference: https://github.com/pytorch/pytorch/issues/168167\n\n"
                             "Solution:  You MUST upgrade CuDNN to version 9.15+ to ensure correctness.\n\n"
                             "Run the following command immediately to fix:\n"
-                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n"
+                            "    pip install nvidia-cudnn-cu12==9.16.0.29\n\n"
+                            "Or you can disable this check by setting env var SGLANG_DISABLE_CUDNN_CHECK=1\n"
                             "--------------------------------------------------------------------------------\n"
                             f"{RESET}"
                         )
