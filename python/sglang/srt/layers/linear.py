@@ -305,6 +305,7 @@ class ColumnParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        skip_block_quant_check: bool=False
     ):
         super().__init__(
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
@@ -338,6 +339,7 @@ class ColumnParallelLinear(LinearBase):
             input_size=self.input_size,
             output_size=self.output_size,
             params_dtype=self.params_dtype,
+            skip_block_quant_check=skip_block_quant_check,
             weight_loader=(
                 self.weight_loader_v2
                 if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
@@ -816,6 +818,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
         v_head_size: Optional[int] = None,
+        skip_block_quant_check: bool=False,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -866,6 +869,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             tp_rank=tp_rank,
             tp_size=tp_size,
             use_presharded_weights=self.use_presharded_weights,
+            skip_block_quant_check=skip_block_quant_check,
         )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):

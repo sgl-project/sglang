@@ -370,6 +370,7 @@ class MiMoV2Attention(nn.Module):
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             prefix=add_prefix("qkv_proj", prefix),
+            skip_block_quant_check=True,
         )
 
         self.o_proj = RowParallelLinear(
