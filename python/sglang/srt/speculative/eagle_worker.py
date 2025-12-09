@@ -729,13 +729,27 @@ class EAGLEWorker(TpModelWorker):
         if self.enable_nan_detection:
             detect_nan(logits_output)
 
-        spec_info.hidden_states = logits_output.hidden_states
+        # For STANDALONE mode, create placeholder with draft model's hidden_size
+        # since the draft model produces its own hidden_states (not using target's)
+        if self.speculative_algorithm.is_standalone():
+            spec_info.hidden_states = torch.zeros(
+                (logits_output.hidden_states.shape[0], self.model_config.hidden_size),
+                dtype=logits_output.hidden_states.dtype,
+                device=logits_output.hidden_states.device,
+            )
+        else:
+            spec_info.hidden_states = logits_output.hidden_states
         res: EagleVerifyOutput = spec_info.verify(
             batch,
             logits_output,
             self.token_to_kv_pool_allocator,
             self.page_size,
             vocab_mask,
+            draft_hidden_size=(
+                self.model_config.hidden_size
+                if self.speculative_algorithm.is_standalone()
+                else None
+            ),
         )
 
         # Post process based on verified outputs.

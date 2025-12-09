@@ -192,6 +192,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
+        draft_hidden_size: Optional[int] = None,  # For STANDALONE mode
     ) -> torch.Tensor:
         """
         Verify and find accepted tokens based on logits output and batch
@@ -202,12 +203,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         This API updates values inside logits_output based on the accepted
         tokens. I.e., logits_output.next_token_logits only contains
         accepted token logits.
+
+        Args:
+            draft_hidden_size: Hidden size of the draft model. Required for STANDALONE
+                mode where draft and target models have different hidden sizes.
         """
+        # Use draft_hidden_size if provided (STANDALONE mode), otherwise use target's
+        hidden_size = draft_hidden_size or batch.model_config.hidden_size
         if batch.forward_mode.is_idle():
             return EagleVerifyOutput(
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
-                    hidden_size=batch.model_config.hidden_size,
+                    hidden_size=hidden_size,
                     dtype=batch.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
