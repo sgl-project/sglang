@@ -122,11 +122,11 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_api_key_middleware,
     add_prometheus_middleware,
+    add_prometheus_track_response_middleware,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
-    add_prometheus_track_response_middleware,
 )
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
