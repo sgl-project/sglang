@@ -14,8 +14,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
-from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.utils import get_int_env_var, is_flashinfer_available
+from sglang.srt.utils import get_int_env_var, is_flashinfer_available, round_up
 
 if TYPE_CHECKING:
     pass
@@ -85,7 +84,10 @@ class FlashinferDispatcher(BaseDispatcher):
         try:
             from flashinfer.comm.mapping import Mapping
             from flashinfer.comm.mnnvl import MnnvlConfig
-            from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll
+            from flashinfer.comm.trtllm_moe_alltoall import (
+                MoeAlltoAll,
+                moe_a2a_get_workspace_size_per_rank,
+            )
         except ImportError:
             raise ImportError(
                 "Flashinfer is not installed or does not support A2A. "
@@ -97,11 +99,27 @@ class FlashinferDispatcher(BaseDispatcher):
         self.num_experts = num_experts
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
-        self.max_num_tokens = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+        self.max_num_tokens = (
+            get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024)
+            * self.group.size()
         )
-        self.workspace_mb = get_int_env_var("TRTLLM_MOE_A2A_WORKSPACE_MB", 2048)
 
+        # Calculate workspace size
+        total_dispatch_payload_size_per_token = (
+            hidden_size // 2  # nvfp4 hidden states
+            + hidden_size // 16  # fp8 scaling factors
+            + self.router_topk * 4  # int32 topks ids
+            + self.router_topk * 4  # float32 topk weights
+        )
+        combine_payload_size_per_token = hidden_size * 2  # bf16 hidden states
+        self.workspace_size = moe_a2a_get_workspace_size_per_rank(
+            ep_size=self.group.size(),
+            max_num_tokens=self.max_num_tokens,
+            total_dispatch_payload_size_per_token=total_dispatch_payload_size_per_token,
+            combine_payload_size_per_token=combine_payload_size_per_token,
+        )
+        # Pad to required alignment for mnnvl memory
+        self.workspace_size = round_up(self.workspace_size, 1 << 29)
         self.mapping = Mapping(
             rank=self.group.rank(),
             tp_size=self.group.size(),
@@ -116,7 +134,7 @@ class FlashinferDispatcher(BaseDispatcher):
             max_num_tokens=self.max_num_tokens,
             top_k=self.router_topk,
             num_experts=self.num_experts,
-            workspace_size_per_rank=self.workspace_mb * 1024 * 1024,
+            workspace_size_per_rank=self.workspace_size,
             mnnvl_config=MnnvlConfig(
                 comm_backend=TorchDistributedCommBackend(self.group)
             ),
