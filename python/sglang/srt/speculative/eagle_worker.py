@@ -907,6 +907,14 @@ class EAGLEWorker(TpModelWorker):
             hidden_states: Hidden states from the target model forward
             next_token_ids: Next token ids generated from the target forward.
         """
+        # For STANDALONE mode, create placeholder with draft model's hidden_size
+        # since the draft model produces its own hidden_states (not using target's)
+        if self.speculative_algorithm.is_standalone():
+            hidden_states = torch.zeros(
+                (hidden_states.shape[0], self.model_config.hidden_size),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             verified_id=next_token_ids,
