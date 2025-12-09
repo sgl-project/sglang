@@ -21,7 +21,7 @@ if _is_npu:
     import mindspore as ms
     import numpy as np
     import torch_npu
-    from mindspore import Tensor, mint, mutable
+    from mindspore import Tensor, mint, mutable, ops
 
 logger = logging.getLogger(__name__)
 
@@ -247,30 +247,28 @@ class MindSporeForCausalLM(torch.nn.Module):
         is_prefill = forward_batch.forward_mode.is_extend()
         is_prefill = is_prefill and forward_batch.extend_prefix_lens.sum().item() == 0
 
-        batch_valid_length = forward_batch.seq_lens.cpu().numpy()
+        batch_valid_length = forward_batch.seq_lens
 
         if forward_batch.extend_seq_lens is not None:
-            q_seq_lens = forward_batch.extend_seq_lens.cpu().numpy()
+            q_seq_lens = forward_batch.extend_seq_lens.to(ms.int32)
         else:
-            q_seq_lens = np.ones([forward_batch.batch_size], dtype=np.int32)
+            q_seq_lens = mint.ones([forward_batch.batch_size], dtype=ms.int32)
 
         page_size = forward_batch.token_to_kv_pool.page_size
-        block_tables = tensor_torch2ms(
-            (
-                forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : forward_batch.seq_lens.max()
-                ][:, ::page_size]
-                // page_size
-            )
-        ).to(ms.int32)
+
+        max_seq_lens = mint.max(tensor_torch2ms(forward_batch.seq_lens).to(ms.int32))
+        col_indices = ops.arange(0, max_seq_lens, page_size, dtype=ms.int32)
+        req_to_token_ids = tensor_torch2ms(forward_batch.req_to_token_pool.req_to_token[forward_batch.req_pool_indices])
+        req_to_token_ids = tensor_torch2ms(req_to_token_ids).to(ms.int32)
+
+        block_tables = ops.gather(
+            req_to_token_ids, col_indices, axis=1)//page_size
 
         model_inputs = {}
         model_inputs["input_ids"] = tensor_torch2ms(input_ids).to(ms.int32)
-        model_inputs["batch_valid_length"] = ms.Tensor(
-            batch_valid_length, dtype=ms.int32
-        )
+        model_inputs["batch_valid_length"] = tensor_torch2ms(batch_valid_length).to(ms.int32)
         model_inputs["position_ids"] = tensor_torch2ms(positions)
-        model_inputs["q_seq_lens"] = ms.Tensor(q_seq_lens, dtype=ms.int32)
+        model_inputs["q_seq_lens"] = q_seq_lens
         model_inputs["attention_mask"] = self.casual_mask.gen_attention_mask(
             is_prefill, model_inputs["position_ids"], q_seq_lens, batch_valid_length
         ).contiguous()
