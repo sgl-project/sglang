@@ -549,6 +549,9 @@ class ServerArgs:
     dynamic_batch_tokenizer_batch_size: int = 32
     dynamic_batch_tokenizer_batch_timeout: float = 0.002
 
+    # Parallel tokenizer
+    enable_parallel_tokenizer: bool = False
+
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
     # None means dump all layers.
@@ -3771,6 +3774,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.dynamic_batch_tokenizer_batch_timeout,
             help="[Only used if --enable-dynamic-batch-tokenizer is set] Timeout in seconds for batching tokenization requests.",
+        )
+
+        # Parallel tokenizer
+        parser.add_argument(
+            "--enable-parallel-tokenizer",
+            action="store_true",
+            help="Enable parallel tokenizer for accelerating tokenization of long text.",
         )
 
         # Debug tensor dumps

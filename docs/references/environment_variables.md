@@ -130,3 +130,10 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_TOOL_STRICT_LEVEL` | Controls the strictness level of tool call parsing and validation. <br>**Level 0**: Off - No strict validation <br>**Level 1**: Function strict - Enables structural tag constraints for all tools (even if none have `strict=True` set) <br>**Level 2**: Parameter strict - Enforces strict parameter validation for all tools, treating them as if they all have `strict=True` set | `0` |
+
+## Tokenizer
+
+| Environment Variable | Description | Default Value |
+| --- | --- | --- |
+| `SGLANG_MAX_PARALLEL_TOKENIZER_CHUNK_SIZE` | ParallelTokenizer text chunk size (characters) for splitting long prompts | `4096` |
+| `SGLANG_MAX_PARALLEL_TOKENIZER_OVERLAP_LEN` | ParallelTokenizer overlap window (tokens) used for LCS-based merge | `64` |
