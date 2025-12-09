@@ -7,6 +7,7 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_ACCURACY_TEST_FP8,
     DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8,
     DEFAULT_MODEL_NAME_FOR_TEST,
+    DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -107,6 +108,14 @@ class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             other_args=[],
             expected_score=0.64,
+        )
+
+    def test_mmlu_online_only_with_moe_model(self):
+        """Test with online quantization only in MOE Model."""
+        self._run_test(
+            model=DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE,
+            other_args=["--quantization", "w8a8_fp8"],
+            expected_score=0.5,
         )
 
 
