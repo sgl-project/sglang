@@ -35,6 +35,19 @@ class OpenAIServingBase(ABC):
             and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
             else None
         )
+        
+        # Initialize load balancing for bootstrap_room using round-robin counter
+        self._bootstrap_room_counter = 0
+
+    def _get_balanced_bootstrap_room(self) -> int:
+        """Get a balanced bootstrap_room value for load distribution (round-robin version)"""
+        dp_size = self.tokenizer_manager.server_args.dp_size
+        if dp_size > 1:
+            # Use simple round-robin distribution across DP ranks
+            room = self._bootstrap_room_counter
+            self._bootstrap_room_counter = (self._bootstrap_room_counter + 1) % dp_size
+            return room
+        return 0
 
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
         """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
