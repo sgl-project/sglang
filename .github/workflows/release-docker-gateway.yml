@@ -4,7 +4,7 @@ on:
     branches:
       - main
     paths:
-      - "sgl-router/bindings/python/sglang_router/version.py"
+      - sgl-model-gateway/bindings/python/pyproject.toml
   workflow_dispatch:
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
 
       - name: Build and Push
         run: |
-          version=$(cat sgl-router/bindings/python/sglang_router/version.py | cut -d'"' -f2)
+          version=$(cat sgl-model-gateway/bindings/python/sglang_router/version.py | cut -d'"' -f2)
           tag=v${version}
 
           docker build . -f docker/gateway.Dockerfile -t lmsysorg/sglang-router:${tag} --no-cache

@@ -196,6 +196,10 @@ class GenerateReqInput(BaseReq):
     bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
+    decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+
+    # For reasoning
+    reasoning: bool = False
 
     # Validation step duration
     validation_time: Optional[float] = None
@@ -622,6 +626,9 @@ class GenerateReqInput(BaseReq):
                 if self.bootstrap_pair_key is not None
                 else None
             ),
+            decode_tp_size=(
+                self.decode_tp_size[i] if self.decode_tp_size is not None else None
+            ),
             validation_time=self.validation_time,
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
@@ -680,6 +687,10 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_port: Optional[int] = None
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
+    decode_tp_size: Optional[int] = None
+
+    # For reasoning
+    reasoning: bool = False
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None

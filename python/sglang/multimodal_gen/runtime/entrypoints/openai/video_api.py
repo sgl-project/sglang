@@ -73,6 +73,8 @@ def _build_sampling_params_from_request(
         save_output=True,
         server_args=server_args,
         output_file_name=request_id,
+        seed=request.seed,
+        generator_device=request.generator_device,
     )
 
     return sampling_params
