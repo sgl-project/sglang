@@ -1289,6 +1289,148 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(params_str)
         self.assertEqual(params["city"], "San Francisco")
 
+    def test_detect_and_parse_no_parameters(self):
+        """Test parsing function calls with no parameters (non-streaming)"""
+        # Add a no-parameter tool
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """Let me get the current date for you.
+
+<｜DSML｜function_calls>
+<｜DSML｜invoke name="get_date">
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"""
+
+        result = self.detector.detect_and_parse(text, tools_with_no_param)
+
+        self.assertIn("Let me get the current date", result.normal_text)
+        self.assertEqual(len(result.calls), 1)
+
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_date")
+        params = json.loads(call.parameters)
+        self.assertEqual(params, {})
+
+    def test_streaming_no_parameters(self):
+        """Test streaming parsing of function calls with no parameters.
+
+        This test verifies the fix for the bug where functions with no parameters
+        were being silently skipped in streaming mode.
+        """
+        # Add a no-parameter tool
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """<｜DSML｜function_calls>
+<｜DSML｜invoke name="get_date">
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"""
+
+        # Reset detector state
+        self.detector = DeepSeekV32Detector()
+
+        # Simulate streaming by splitting into small chunks
+        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_param)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        # Verify that the no-parameter function was correctly parsed
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
+
+        # Parameters should be empty JSON object
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+        self.assertEqual(params, {})
+
+    def test_streaming_no_parameters_with_whitespace(self):
+        """Test streaming parsing when invoke content has only whitespace (newlines)."""
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        # This format has newlines inside the invoke tag (common model output)
+        text = """<｜DSML｜function_calls>
+<｜DSML｜invoke name="get_date">
+
+</｜DSML｜invoke>
+</｜DSML｜function_calls>"""
+
+        # Reset detector state
+        self.detector = DeepSeekV32Detector()
+
+        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_param)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        # Should still parse correctly even with whitespace-only content
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params, {})
+
 
 class TestQwen3CoderDetector(unittest.TestCase):
     def setUp(self):

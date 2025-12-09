@@ -264,9 +264,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
                 is_tool_end = bool(invoke_match.group(3))
 
-                # print(f"\033[42m {current_text=} \033[0m")
-                # print(f"\033[42m {func_name=} {invoke_content=} {is_tool_end=} \033[0m")
-                # print("-" * 80)
                 func_args_raw, format = self._parse_parameters_partially(invoke_content)
                 if is_tool_end and format == "xml":
                     func_args_raw += "}"
