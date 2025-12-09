@@ -156,6 +156,11 @@ name = "tool_parser_benchmark"
 harness = false
 path = "benches/tool_parser_benchmark.rs"
 
+[[bench]]
+name = "tree_benchmark"
+harness = false
+path = "benches/tree_benchmark.rs"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = "fat"         # Full LTO for smaller binaries
