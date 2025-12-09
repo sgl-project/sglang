@@ -20,6 +20,9 @@ on:
         required: false
         type: string
         default: ""
+  repository_dispatch:
+    types: [rerun-stage]
+    # Expected client_payload: { "target_stage": "stage-name", "pr_number": 12345 }
 
 concurrency:
   group: pr-test-${{ github.ref }}
@@ -33,18 +36,25 @@ jobs:
   check-changes:
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }}
-      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }}
-      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package || steps.repo_dispatch.outputs.main_package }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel || steps.repo_dispatch.outputs.sgl_kernel }}
+      multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen || steps.repo_dispatch.outputs.multimodal_gen }}
       max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
-        if: github.event_name != 'schedule'
+        if: github.event_name != 'schedule' && github.event_name != 'repository_dispatch'
         with:
           filters: |
             main_package:
@@ -69,6 +79,14 @@ jobs:
           echo "sgl_kernel=false" >> $GITHUB_OUTPUT
           echo "multimodal_gen=true" >> $GITHUB_OUTPUT
 
+      - name: Set all changes to true for repository_dispatch (rerun-stage)
+        id: repo_dispatch
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          echo "main_package=true" >> $GITHUB_OUTPUT
+          echo "sgl_kernel=true" >> $GITHUB_OUTPUT
+          echo "multimodal_gen=true" >> $GITHUB_OUTPUT
+
       - name: Set max-parallel based on high-priority label
         id: set-parallel
         run: |
@@ -87,9 +105,9 @@ jobs:
             echo ""
             echo "| Component       | Changed |"
             echo "|----------------|---------|"
-            echo "| main_package   | ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package }} |"
-            echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel }} |"
-            echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen }} |"
+            echo "| main_package   | ${{ steps.filter.outputs.main_package || steps.scheduled.outputs.main_package || steps.repo_dispatch.outputs.main_package }} |"
+            echo "| sgl_kernel     | ${{ steps.filter.outputs.sgl_kernel || steps.scheduled.outputs.sgl_kernel || steps.repo_dispatch.outputs.sgl_kernel }} |"
+            echo "| multimodal_gen | ${{ steps.filter.outputs.multimodal_gen || steps.scheduled.outputs.multimodal_gen || steps.repo_dispatch.outputs.multimodal_gen }} |"
             echo "| max_parallel   | ${{ steps.set-parallel.outputs.max_parallel }} |"
           } >> $GITHUB_STEP_SUMMARY
 
@@ -362,8 +380,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'stage-a-test-1') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'stage-a-test-1') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -373,7 +393,14 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -402,8 +429,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'multimodal-gen-test-1-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'multimodal-gen-test-1-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
@@ -415,7 +444,14 @@ jobs:
         part: [0, 1]
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Cleanup
         run: |
@@ -449,8 +485,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'multimodal-gen-test-2-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'multimodal-gen-test-2-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           needs.check-changes.outputs.multimodal_gen == 'true'
         )
@@ -462,7 +500,14 @@ jobs:
         part: [0, 1]
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Cleanup
         run: |
@@ -496,8 +541,10 @@ jobs:
         always() &&
         (
           (inputs.target_stage == 'quantization-test') ||
+          (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'quantization-test') ||
           (
             !inputs.target_stage &&
+            github.event_name != 'repository_dispatch' &&
             (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
             ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
           )
@@ -505,7 +552,14 @@ jobs:
       runs-on: 1-gpu-runner
       steps:
         - name: Checkout code
+          if: github.event_name != 'repository_dispatch'
           uses: actions/checkout@v4
+
+        - name: Checkout PR code (repository_dispatch)
+          if: github.event_name == 'repository_dispatch'
+          uses: actions/checkout@v4
+          with:
+            ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
         - name: Download artifacts
           if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -531,8 +585,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-1-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-1-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -547,7 +603,14 @@ jobs:
         part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -573,8 +636,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-2-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-2-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -588,7 +653,14 @@ jobs:
         part: [0, 1]
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -614,8 +686,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-4-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -629,7 +703,14 @@ jobs:
         part: [0, 1, 2]
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -655,8 +736,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-h200') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-8-gpu-h200') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -670,7 +753,14 @@ jobs:
         part: [0, 1, 2]
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -696,8 +786,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-h20') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-8-gpu-h20') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -712,7 +804,14 @@ jobs:
         part: [0, 1]
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -738,8 +837,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-1') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'performance-test-1-gpu-part-1') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -749,7 +850,14 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -807,8 +915,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-2') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'performance-test-1-gpu-part-2') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -818,7 +928,14 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -868,8 +985,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-3') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'performance-test-1-gpu-part-3') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -879,7 +998,14 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -923,8 +1049,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'performance-test-2-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'performance-test-2-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -934,7 +1062,14 @@ jobs:
       RUNNER_LABELS: 2-gpu-runner
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -990,8 +1125,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'accuracy-test-1-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'accuracy-test-1-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1001,7 +1138,14 @@ jobs:
       RUNNER_LABELS: 1-gpu-runner
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1030,8 +1174,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'accuracy-test-2-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'accuracy-test-2-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1041,7 +1187,14 @@ jobs:
       RUNNER_LABELS: 2-gpu-runner
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1070,8 +1223,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-deepep-4-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-deepep-4-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1081,7 +1236,14 @@ jobs:
       RUNNER_LABELS: 4-gpu-h100
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1107,8 +1269,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-deepep-8-gpu') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-deepep-8-gpu') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1118,7 +1282,14 @@ jobs:
       RUNNER_LABELS: 8-gpu-h200
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1144,8 +1315,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu-b200') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-4-gpu-b200') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1160,7 +1333,14 @@ jobs:
 
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1186,8 +1366,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-4-gpu-gb200') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-4-gpu-gb200') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1199,7 +1381,14 @@ jobs:
       fail-fast: false
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Download artifacts
         if: needs.check-changes.outputs.sgl_kernel == 'true'
@@ -1225,8 +1414,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-b200') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-8-gpu-b200') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (github.event_name == 'schedule' || (!failure() && !cancelled())) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -1236,7 +1427,14 @@ jobs:
       RUNNER_LABELS: 8-gpu-b200
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Install dependencies
         run: |

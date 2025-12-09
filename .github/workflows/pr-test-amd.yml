@@ -26,6 +26,9 @@ on:
         required: false
         type: string
         default: ""
+  repository_dispatch:
+    types: [rerun-stage-amd]
+    # Expected client_payload: { "target_stage": "stage-name", "pr_number": 12345 }
 
 concurrency:
   group: pr-test-amd-${{ github.ref }}
@@ -39,14 +42,23 @@ jobs:
     needs: [call-gate]
     runs-on: ubuntu-latest
     outputs:
-      main_package: ${{ steps.filter.outputs.main_package }}
-      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
+      main_package: ${{ steps.filter.outputs.main_package || steps.repo_dispatch.outputs.main_package }}
+      sgl_kernel: ${{ steps.filter.outputs.sgl_kernel || steps.repo_dispatch.outputs.sgl_kernel }}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
+
       - name: Detect file changes
         id: filter
         uses: dorny/paths-filter@v3
+        if: github.event_name != 'repository_dispatch'
         with:
           filters: |
             main_package:
@@ -57,6 +69,13 @@ jobs:
             sgl_kernel:
               - "sgl-kernel/**"
 
+      - name: Set all changes to true for repository_dispatch (rerun-stage)
+        id: repo_dispatch
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          echo "main_package=true" >> $GITHUB_OUTPUT
+          echo "sgl_kernel=true" >> $GITHUB_OUTPUT
+
   # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-amd:
     needs: [check-changes]
@@ -64,8 +83,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'sgl-kernel-unit-test-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'sgl-kernel-unit-test-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           needs.check-changes.outputs.sgl_kernel == 'true'
         )
       )
@@ -76,7 +97,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -108,8 +136,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'stage-a-test-1-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'stage-a-test-1-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -121,7 +151,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -146,8 +183,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-1-gpu-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-1-gpu-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -160,7 +199,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -184,8 +230,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-2-gpu-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-2-gpu-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -198,7 +246,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -223,9 +278,11 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'unit-test-backend-8-gpu-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'unit-test-backend-8-gpu-amd') ||
         (
           false &&
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -240,7 +297,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -270,8 +334,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-1-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'performance-test-1-gpu-part-1-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -283,7 +349,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -323,8 +396,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'performance-test-1-gpu-part-2-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'performance-test-1-gpu-part-2-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -336,7 +411,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -370,8 +452,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'performance-test-2-gpu-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'performance-test-2-gpu-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -383,7 +467,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -427,8 +518,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'accuracy-test-1-gpu-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'accuracy-test-1-gpu-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -440,7 +533,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
@@ -466,8 +566,10 @@ jobs:
       always() &&
       (
         (inputs.target_stage == 'accuracy-test-2-gpu-amd') ||
+        (github.event_name == 'repository_dispatch' && github.event.client_payload.target_stage == 'accuracy-test-2-gpu-amd') ||
         (
           !inputs.target_stage &&
+          github.event_name != 'repository_dispatch' &&
           (!failure() && !cancelled()) &&
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
@@ -479,7 +581,14 @@ jobs:
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
+        if: github.event_name != 'repository_dispatch'
         uses: actions/checkout@v4
+
+      - name: Checkout PR code (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ github.event.client_payload.pr_number }}/merge
 
       - name: Ensure VRAM is clear
         run: bash scripts/ensure_vram_clear.sh rocm
