@@ -50,11 +50,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.tokens_after_think_end -= 1
 
     def accept_token(self, token: int):
-        is_accepted = True
         if self.tokens_after_think_end >= 0:
-            is_accepted = self.grammar.accept_token(token)
+            self.grammar.accept_token(token)
         self.transfer_state(token)
-        return is_accepted
 
     def is_terminated(self):
         return self.grammar.is_terminated()

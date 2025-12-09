@@ -175,12 +175,15 @@ class NgramVerifyInput(SpecInput):
                     break
                 else:
                     if req.grammar is not None:
-                        is_accepted = req.grammar.accept_token(id)
-                        assert is_accepted is not None
-                        if not is_accepted:
-                            has_finished = True
-                            self.accept_index[i, j+1:] = -1
-                            break
+                        try:
+                            req.grammar.accept_token(id)
+                        except ValueError as e:
+                            logger.info(
+                                f"{i=}, {req=}\n"
+                                f"{self.accept_index=}\n"
+                                f"{self.predict=}\n"
+                            )
+                            raise e
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += (
                 sum(1 for idx in accept_index_row if idx != -1) - 1
