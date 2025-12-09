@@ -299,11 +299,16 @@ class MindSporeForCausalLM(torch.nn.Module):
         # prepare model inputs
         model_inputs = self.model.prepare_inputs(forward_batch, model_inputs)
 
-        # hidden_states is used for speculative decoding
-        logits, hidden_states = self.model(**model_inputs)
+        # Used by speculative decoding (EAGLE)
+        if self.model.capture_aux_hidden_states:
+            logits, hidden_states = self.model(**model_inputs)
+        else:
+            logits = self.model(**model_inputs)
+            hidden_states = None
 
         logits_result = LogitsProcessorOutput(
-            next_token_logits=tensor_ms2torch(logits), hidden_states=hidden_states
+            next_token_logits=tensor_ms2torch(logits),
+            hidden_states=tensor_ms2torch(hidden_states),
         )
         return logits_result
 
