@@ -434,8 +434,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
-        # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-        # Other quantization methods (e.g., GPTQ, AWQ, etc.) are untested and may not be supported.
         if (
             hasattr(quant_config, "modules_to_not_convert")
             and "visual" in quant_config.modules_to_not_convert
