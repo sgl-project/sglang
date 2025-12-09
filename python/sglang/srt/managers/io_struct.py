@@ -110,6 +110,18 @@ class SpeculativeDecodingMetricsMixin:
     spec_accepted_tokens: List[int]
 
 
+@dataclass
+class APIServingTimingMixin:
+    # Validation step duration
+    validation_time: Optional[float] = None
+
+    # For metrics
+    received_time: Optional[float] = None
+
+    # Perf_counter equivalents for accurate time calculations
+    received_time_perf: Optional[float] = None
+
+
 # Parameters for a session
 @dataclass
 class SessionParams:
@@ -138,7 +150,7 @@ MultimodalDataInputFormat = Union[
 
 
 @dataclass
-class GenerateReqInput(BaseReq):
+class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text; one can specify either text or input_ids
@@ -200,15 +212,6 @@ class GenerateReqInput(BaseReq):
 
     # For reasoning
     reasoning: bool = False
-
-    # Validation step duration
-    validation_time: Optional[float] = None
-
-    # For metrics
-    received_time: Optional[float] = None
-
-    # Perf_counter equivalents for accurate time calculations
-    received_time_perf: Optional[float] = None
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
