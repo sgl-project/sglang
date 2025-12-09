@@ -413,10 +413,12 @@ class HiCacheFile(HiCacheStorage):
             return False
 
     def _read_from_ptr(self, file_path: str, ptr: int, size: int) -> bool:
-        """Read data from a file to a memory pointer using ctypes.
+        """Read data from a file to a memory pointer using optimized readinto.
         This is a true zero-copy operation - no tensor operations involved.
+        Optimized: use ctypes buffer with larger file buffer for better I/O performance.
         """
         try:
+            # Create ctypes buffer from pointer (minimal overhead)
             buffer = (ctypes.c_uint8 * size).from_address(ptr)
             # Use larger buffer size (64KB) for better I/O performance
             with open(file_path, "rb", buffering=64 * 1024) as f:
@@ -435,16 +437,18 @@ class HiCacheFile(HiCacheStorage):
         """Read K and V data from a file to memory pointers.
         For MHA models, we read K and V together from one file.
         This is a true zero-copy operation.
+        Optimized: pre-create buffers and use larger file buffer.
         """
         try:
+            # Pre-create buffers to avoid repeated from_address calls
+            k_buffer = (ctypes.c_uint8 * k_size).from_address(k_ptr)
+            v_buffer = (ctypes.c_uint8 * v_size).from_address(v_ptr)
             # Use larger buffer size (64KB) for better I/O performance
             with open(file_path, "rb", buffering=64 * 1024) as f:
                 # Read K data
-                k_buffer = (ctypes.c_uint8 * k_size).from_address(k_ptr)
                 if f.readinto(k_buffer) != k_size:
                     return False
                 # Read V data
-                v_buffer = (ctypes.c_uint8 * v_size).from_address(v_ptr)
                 if f.readinto(v_buffer) != v_size:
                     return False
             return True
@@ -452,6 +456,26 @@ class HiCacheFile(HiCacheStorage):
             return False
         except Exception as e:
             logger.error(f"Failed to read KV pair from pointers to {file_path}: {e}")
+            return False
+
+    def _read_tensor_from_file_fast(self, file_path: str, tensor: torch.Tensor) -> bool:
+        """Read data from file to tensor using numpy readinto for maximum performance.
+        Only use this if tensor is contiguous (checked by caller).
+        This is faster than ctypes approach for contiguous tensors.
+        """
+        try:
+            expected_size = tensor.numel() * tensor.element_size()
+            # Fast path: use numpy memoryview + readinto which is highly optimized
+            numpy_view = tensor.view(torch.uint8).numpy()
+            buf = memoryview(numpy_view)
+            with open(file_path, "rb", buffering=64 * 1024) as f:
+                if f.readinto(buf) != expected_size:
+                    return False
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            logger.error(f"Failed to read tensor from {file_path}: {e}")
             return False
 
     def batch_get_v1(
@@ -462,6 +486,7 @@ class HiCacheFile(HiCacheStorage):
     ) -> List[bool]:
         """True batch get: read multiple tensors from one batch file.
         Uses get_page_buffer_meta() to get memory pointers directly for zero-copy operations.
+        Optimized: pre-compute file paths and use efficient pointer-based reading.
         """
         if not keys or len(host_indices) == 0:
             return [False] * len(keys) if keys else []
@@ -481,40 +506,40 @@ class HiCacheFile(HiCacheStorage):
 
             self.is_mla_backend = isinstance(self.mem_pool_host, MLATokenToKVPoolHost)
 
+        # Stage 3: Pre-compute file paths to avoid repeated os.path.join calls
+        file_paths = [
+            os.path.join(self.file_path, f"{self._get_suffixed_key(key)}.batch.bin")
+            for key in keys
+        ]
+
         results = [False] * page_num
 
         if self.is_mla_backend:
             # MLA: one pointer per page
-            for i, key in enumerate(keys):
-                batch_file_path = os.path.join(
-                    self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
-                )
+            for i in range(page_num):
                 try:
-                    ptr = ptr_list[i]
-                    size = element_size_list[i]
-                    results[i] = self._read_from_ptr(batch_file_path, ptr, size)
+                    results[i] = self._read_from_ptr(
+                        file_paths[i], ptr_list[i], element_size_list[i]
+                    )
                 except Exception as e:
-                    logger.error(f"Failed to read batch for key {key}: {e}")
+                    logger.error(f"Failed to read batch for key {keys[i]}: {e}")
                     results[i] = False
         else:
             # MHA: K and V pointer pairs per page
-            for i, key in enumerate(keys):
-                batch_file_path = os.path.join(
-                    self.file_path, f"{self._get_suffixed_key(key)}.batch.bin"
-                )
+            for i in range(page_num):
                 try:
                     # MHA returns K and V as pairs: [K0, V0, K1, V1, ...]
                     k_idx = i * 2
                     v_idx = i * 2 + 1
-                    k_ptr = ptr_list[k_idx]
-                    k_size = element_size_list[k_idx]
-                    v_ptr = ptr_list[v_idx]
-                    v_size = element_size_list[v_idx]
                     results[i] = self._read_kv_pair_to_ptrs(
-                        batch_file_path, k_ptr, k_size, v_ptr, v_size
+                        file_paths[i],
+                        ptr_list[k_idx],
+                        element_size_list[k_idx],
+                        ptr_list[v_idx],
+                        element_size_list[v_idx],
                     )
                 except Exception as e:
-                    logger.error(f"Failed to read batch for key {key}: {e}")
+                    logger.error(f"Failed to read batch for key {keys[i]}: {e}")
                     results[i] = False
 
         return results
@@ -594,9 +619,9 @@ class HiCacheFile(HiCacheStorage):
                             ptr_list, element_size_list = self._batch_preprocess(
                                 keys, host_indices
                             )
-                        ptr = ptr_list[idx]
-                        size = element_size_list[idx]
-                        success = self._write_from_ptr(batch_file_path, ptr, size)
+                        success = self._write_from_ptr(
+                            batch_file_path, ptr_list[idx], element_size_list[idx]
+                        )
                     write_results[idx] = success
                 except Exception as e:
                     logger.error(f"Failed to write batch for key {key}: {e}")
@@ -630,14 +655,15 @@ class HiCacheFile(HiCacheStorage):
                             ptr_list, element_size_list = self._batch_preprocess(
                                 keys, host_indices
                             )
+                        # MHA returns K and V as pairs: [K0, V0, K1, V1, ...]
                         k_idx = idx * 2
                         v_idx = idx * 2 + 1
-                        k_ptr = ptr_list[k_idx]
-                        k_size = element_size_list[k_idx]
-                        v_ptr = ptr_list[v_idx]
-                        v_size = element_size_list[v_idx]
                         success = self._write_kv_pair_from_ptrs(
-                            batch_file_path, k_ptr, k_size, v_ptr, v_size
+                            batch_file_path,
+                            ptr_list[k_idx],
+                            element_size_list[k_idx],
+                            ptr_list[v_idx],
+                            element_size_list[v_idx],
                         )
                     write_results[idx] = success
                 except Exception as e:

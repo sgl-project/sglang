@@ -272,17 +272,33 @@ class TestHiCacheFilePerformanceComparison(unittest.TestCase):
         return end_time - start_time
 
     def _measure_batch_get_performance(
-        self, storage: HiCacheFile, keys: List[str]
+        self, storage: HiCacheFile, keys: List[str], host_indices: torch.Tensor
     ) -> float:
-        """Measure batch_get performance (including get_dummy_flat_data_page, matching cache_controller logic)."""
+        """Measure batch_get performance (including get_dummy_flat_data_page and set_from_flat_data_page, matching cache_controller._generic_page_get logic)."""
         # Warm up (matching cache_controller._generic_page_get logic)
         dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page() for _ in keys]
-        storage.batch_get(keys=keys, target_locations=dummy_page_dst)
+        page_data = storage.batch_get(keys=keys, target_locations=dummy_page_dst)
+        # Set data back to memory pool (matching _generic_page_get logic)
+        if page_data is not None:
+            for i in range(len(keys)):
+                if page_data[i] is not None:
+                    self.mem_pool_host.set_from_flat_data_page(
+                        host_indices[i * self.mem_pool_host.page_size].item(),
+                        page_data[i],
+                    )
 
-        # Measure - include get_dummy_flat_data_page time (matching cache_controller._generic_page_get)
+        # Measure - include get_dummy_flat_data_page and set_from_flat_data_page time (matching cache_controller._generic_page_get)
         start_time = time.perf_counter()
         dummy_page_dst = [self.mem_pool_host.get_dummy_flat_data_page() for _ in keys]
-        storage.batch_get(keys=keys, target_locations=dummy_page_dst)
+        page_data = storage.batch_get(keys=keys, target_locations=dummy_page_dst)
+        # Set data back to memory pool (matching _generic_page_get logic)
+        if page_data is not None:
+            for i in range(len(keys)):
+                if page_data[i] is not None:
+                    self.mem_pool_host.set_from_flat_data_page(
+                        host_indices[i * self.mem_pool_host.page_size].item(),
+                        page_data[i],
+                    )
         end_time = time.perf_counter()
 
         return end_time - start_time
@@ -464,7 +480,9 @@ class TestHiCacheFilePerformanceComparison(unittest.TestCase):
             print(f"\n[Old Interface] batch_set: {write_time_old*1000:.3f} ms")
 
             # Read performance (matching cache_controller._generic_page_get logic)
-            read_time_old = self._measure_batch_get_performance(storage_old, keys)
+            read_time_old = self._measure_batch_get_performance(
+                storage_old, keys, host_indices
+            )
             print(f"[Old Interface] batch_get: {read_time_old*1000:.3f} ms")
 
         # Test new interface (batch_set_v1/batch_get_v1) if needed
@@ -525,7 +543,9 @@ class TestHiCacheFilePerformanceComparison(unittest.TestCase):
             write_time_old = self._measure_batch_set_performance(
                 storage_old, keys, host_indices
             )
-            read_time_old = self._measure_batch_get_performance(storage_old, keys)
+            read_time_old = self._measure_batch_get_performance(
+                storage_old, keys, host_indices
+            )
             print(f"\n[Old Interface] batch_set: {write_time_old*1000:.3f} ms")
             print(f"[Old Interface] batch_get: {read_time_old*1000:.3f} ms")
 
@@ -583,7 +603,9 @@ class TestHiCacheFilePerformanceComparison(unittest.TestCase):
             write_time_old = self._measure_batch_set_performance(
                 storage_old, keys, host_indices
             )
-            read_time_old = self._measure_batch_get_performance(storage_old, keys)
+            read_time_old = self._measure_batch_get_performance(
+                storage_old, keys, host_indices
+            )
             print(f"\n[Old Interface] batch_set: {write_time_old*1000:.3f} ms")
             print(f"[Old Interface] batch_get: {read_time_old*1000:.3f} ms")
 
@@ -645,7 +667,9 @@ class TestHiCacheFilePerformanceComparison(unittest.TestCase):
                 write_time_old = self._measure_batch_set_performance(
                     storage_old, keys, host_indices
                 )
-                read_time_old = self._measure_batch_get_performance(storage_old, keys)
+                read_time_old = self._measure_batch_get_performance(
+                    storage_old, keys, host_indices
+                )
                 write_times_old.append(write_time_old)
                 read_times_old.append(read_time_old)
 
