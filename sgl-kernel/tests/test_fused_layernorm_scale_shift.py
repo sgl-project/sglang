@@ -31,9 +31,7 @@ def run_case_fused_accuracy(
     y_ln32 = y_ln32 * w32 + b32
     y_gt_fused = (y_ln32 * (1.0 + s32) + sh32).to(dtype)
 
-    dev_max_abs_err = (y_dev_fused - y_gt_fused).abs().max().item()
-    print(f"[Fused] dtype={dtype}, M={M}, N={N} -> dev_max_abs_err={dev_max_abs_err:.3e}")
-    return dev_max_abs_err
+    return y_dev_fused, y_gt_fused
 
 
 @torch.no_grad()
@@ -77,9 +75,7 @@ def run_case_fused_4d_scale_accuracy(
         y_ref[m] = y_ln32[m] * (1.0 + sc4[b, f, 0]) + sh4[b, f, 0]
     y_ref = y_ref.to(dtype)
 
-    dev_max_abs_err = (y_dev_fused - y_ref).abs().max().item()
-    print(f"[Fused-4D-Scale] dtype={dtype}, B={B}, F={F}, S={S}, N={N} -> dev_max_abs_err={dev_max_abs_err:.3e}")
-    return dev_max_abs_err
+    return y_dev_fused, y_ref
 
 
 @torch.no_grad()
@@ -114,10 +110,7 @@ def run_case_residual_gate_int(
     y_ref = (y_ln32 * (1.0 + scale.float()) + shift.float()).to(dtype)
     residual_ref = out32.to(dtype)
 
-    err_y = (y_dev - y_ref).abs().max().item()
-    err_res = (residual_out_dev - residual_ref).abs().max().item()
-    print(f"[ResGate-int] dtype={dtype}, B={B}, S={S}, N={N} -> y_err={err_y:.3e}, residual_err={err_res:.3e}")
-    return max(err_y, err_res)
+    return y_dev, residual_out_dev, y_ref, residual_ref
 
 
 @torch.no_grad()
@@ -155,10 +148,7 @@ def run_case_residual_gate_3d(
     y_ref = (y_ln32 * (1.0 + scale.float()) + shift.float()).to(dtype)
     residual_ref = out32.to(dtype)
 
-    err_y = (y_dev - y_ref).abs().max().item()
-    err_res = (residual_out_dev - residual_ref).abs().max().item()
-    print(f"[ResGate-3D Bx1xN] dtype={dtype}, B={B}, S={S}, N={N} -> y_err={err_y:.3e}, residual_err={err_res:.3e}")
-    return max(err_y, err_res)
+    return y_dev, residual_out_dev, y_ref, residual_ref
 
 
 @torch.no_grad()
@@ -210,10 +200,7 @@ def run_case_residual_gate_4d(
     y_ref = y_ref.to(dtype)
     residual_ref = out32.to(dtype)
 
-    err_y = (y_dev - y_ref).abs().max().item()
-    err_res = (residual_out_dev - residual_ref).abs().max().item()
-    print(f"[ResGate-4D BxFx1xN] dtype={dtype}, B={B}, F={F}, S={S}, N={N} -> y_err={err_y:.3e}, residual_err={err_res:.3e}")
-    return max(err_y, err_res)
+    return y_dev, residual_out_dev, y_ref, residual_ref
 
 
 # -------------------------
@@ -243,48 +230,55 @@ def test_fused_layernorm_scale_shift_2d(dtype, M, N):
     torch.backends.cudnn.allow_tf32 = True
     if (N % 4) != 0:
         pytest.skip("Vectorized kernel requires N % 4 == 0")
-    err = run_case_fused_accuracy(dtype=dtype, M=M, N=N, eps=1e-5)
-    assert err < _tol(dtype)
+    y_dev, y_ref = run_case_fused_accuracy(dtype=dtype, M=M, N=N, eps=1e-5)
+    torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_fused_layernorm_scale_shift_4d(dtype):
+@pytest.mark.parametrize("B,F,S,N", [(2, 3, 4, 1024)])
+def test_fused_layernorm_scale_shift_4d(dtype, B, F, S, N):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.cuda.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    err = run_case_fused_4d_scale_accuracy(dtype=dtype, B=2, F=3, S=4, N=1024, eps=1e-5)
-    assert err < _tol(dtype)
+    y_dev, y_ref = run_case_fused_4d_scale_accuracy(dtype=dtype, B=B, F=F, S=S, N=N, eps=1e-5)
+    torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_residual_gate_int(dtype):
+@pytest.mark.parametrize("B,S,N", [(2, 5, 1024)])
+def test_residual_gate_int(dtype, B, S, N):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.cuda.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    err = run_case_residual_gate_int(dtype=dtype, B=2, S=5, N=1024, eps=1e-5)
-    assert err < _tol(dtype)
+    y_dev, residual_out_dev, y_ref, residual_ref = run_case_residual_gate_int(dtype=dtype, B=B, S=S, N=N, eps=1e-5)
+    torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(residual_out_dev, residual_ref, atol=_tol(dtype), rtol=_tol(dtype))
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_residual_gate_3d(dtype):
+@pytest.mark.parametrize("B,S,N", [(2, 5, 1024)])
+def test_residual_gate_3d(dtype, B, S, N):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.cuda.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    err = run_case_residual_gate_3d(dtype=dtype, B=2, S=5, N=1024, eps=1e-5)
-    assert err < _tol(dtype)
+    y_dev, residual_out_dev, y_ref, residual_ref = run_case_residual_gate_3d(dtype=dtype, B=B, S=S, N=N, eps=1e-5)
+    torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(residual_out_dev, residual_ref, atol=_tol(dtype), rtol=_tol(dtype))
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_residual_gate_4d(dtype):
+@pytest.mark.parametrize("B,F,S,N", [(2, 3, 4, 1024)])
+def test_residual_gate_4d(dtype, B, F, S, N):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     torch.cuda.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    err = run_case_residual_gate_4d(dtype=dtype, B=2, F=3, S=4, N=1024, eps=1e-5)
-    assert err < _tol(dtype)
+    y_dev, residual_out_dev, y_ref, residual_ref = run_case_residual_gate_4d(dtype=dtype, B=B, F=F, S=S, N=N, eps=1e-5)
+    torch.testing.assert_close(y_dev, y_ref, atol=_tol(dtype), rtol=_tol(dtype))
+    torch.testing.assert_close(residual_out_dev, residual_ref, atol=_tol(dtype), rtol=_tol(dtype))
 
 if __name__ == "__main__":
     pytest.main([__file__])
