@@ -143,7 +143,7 @@ torch::Tensor device_layernorm_fuse_scale_shift(torch::Tensor x,
                                                 torch::Tensor shift);
 
 // LayerNorm fused with residual + gate (gate shapes: [M,N], [B,1,N], or [B,F,1,N]) and then scale/shift ([M,N] or [B,F,1,N])
-torch::Tensor device_scale_residual_layernorm_fuse_scale_shift(torch::Tensor residual,
+std::tuple<torch::Tensor, torch::Tensor> device_scale_residual_layernorm_fuse_scale_shift(torch::Tensor residual,
                                                                torch::Tensor x,
                                                                torch::Tensor gamma,
                                                                torch::Tensor beta,
