@@ -162,6 +162,7 @@ class NgramVerifyInput(SpecInput):
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
         for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            is_accepting = False
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
@@ -175,15 +176,31 @@ class NgramVerifyInput(SpecInput):
                     break
                 else:
                     if req.grammar is not None:
+                        # prevent server crashs due to grammar error
                         try:
-                            req.grammar.accept_token(id)
-                        except ValueError as e:
-                            logger.info(
-                                f"{i=}, {req=}\n"
-                                f"{self.accept_index=}\n"
-                                f"{self.predict=}\n"
-                            )
-                            raise e
+                            is_accepted = req.grammar.accept_token(id)
+                        except ValueError as ex:
+                            logger.error(f"Grammar checker raised error, but silently ignored: {ex}")
+                            is_accepted = False
+
+                        # if inner grammar does not return is_accepted, assume token is accepted
+                        is_accepted = True if is_accepted is None else is_accepted
+
+                        # rejecting when previously the stream is accepting tokens
+                        # (handle prefix of grammar, like thinking)
+                        if is_accepting and not is_accepted:
+                            has_finished = True
+
+                            # BUG current token was not accepted, therefore we ignore j'th index too...
+                            # but if ignore j'th token, then following error happens:
+                            # ```
+                            # ValueError: token_to_kv_pool_allocator memory leak detected! self.max_tot
+                            # al_num_tokens=462400, available_size=378013, evictable_size=84388, protec
+                            # ted_size=0
+                            # ```
+                            self.accept_index[i, j + 1:] = -1
+                            break
+                        is_accepting = is_accepted
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += (
                 sum(1 for idx in accept_index_row if idx != -1) - 1
