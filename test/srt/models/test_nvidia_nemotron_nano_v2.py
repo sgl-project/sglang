@@ -24,7 +24,7 @@ class TestNvidiaNemotronNanoV2NVFP4(GSM8KMixin, CustomTestCase):
     other_args = ["--max-mamba-cache-size", "256"]
 
 
-@unittest.skip(is_in_ci(), "Temporary skip this test in CI")
+@unittest.skipIf(is_in_ci(), "Temporary skip this test in CI")
 class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, CustomTestCase):
     accuracy = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
@@ -50,7 +50,7 @@ class TestNvidiaNemotronNanoV2SpeculativeDecoding(GSM8KMixin, CustomTestCase):
     ]
 
 
-@unittest.skip(is_in_ci(), "Temporary skip this test in CI")
+@unittest.skipIf(is_in_ci(), "Temporary skip this test in CI")
 class TestNvidiaNemotronNanoV2SpeculativeDecodingBF16Cache(GSM8KMixin, CustomTestCase):
     accuracy = 0.87
     model = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
