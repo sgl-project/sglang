@@ -615,6 +615,22 @@ impl Tree {
         used_size_per_tenant
     }
 
+    /// Returns the tenant (worker_url) with the smallest cache usage.
+    /// This is used by the CacheAwarePolicy to load balance new requests.
+    pub fn get_smallest_tenant(&self) -> String {
+        let mut min_count = usize::MAX;
+        let mut min_tenant = None;
+
+        for entry in self.tenant_char_count.iter() {
+            if *entry.value() < min_count {
+                min_count = *entry.value();
+                min_tenant = Some(entry.key().clone());
+            }
+        }
+
+        min_tenant.unwrap_or_else(|| "empty".to_string())
+    }
+
     #[allow(dead_code)]
     fn node_to_string(node: &NodeRef, prefix: &str, is_last: bool) -> String {
         let mut result = String::new();
