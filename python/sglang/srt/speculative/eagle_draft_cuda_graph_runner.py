@@ -33,10 +33,6 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
-import logging
-
-logger = logging.getLogger(__name__)
-
 
 class EAGLEDraftCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
@@ -51,28 +47,28 @@ class EAGLEDraftCudaGraphRunner:
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
-        self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
         self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
-        self.dp_size = self.model_runner.dp_size
         self.tp_size = self.model_runner.tp_size
-        self.topk = model_runner.server_args.speculative_eagle_topk
+        self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.topk = model_runner.server_args.speculative_eagle_topk
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_pdmux = False
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
-        server_args = model_runner.server_args
 
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
-        self.num_tokens_per_bs = server_args.speculative_eagle_topk
 
         # Attention backend
+        self.num_tokens_per_bs = self.topk
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+
         self.model_runner.draft_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
@@ -88,13 +84,9 @@ class EAGLEDraftCudaGraphRunner:
             set_torch_compile_config()
 
         # Graph inputs
-        with torch.device("cuda"):
+        with torch.device(model_runner.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
-            self.seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
-            )
-            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.zeros(
                 (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
             )
@@ -102,6 +94,10 @@ class EAGLEDraftCudaGraphRunner:
             self.mrope_positions = torch.zeros(
                 (3, self.max_num_token), dtype=torch.int64
             )
+            self.seq_lens = torch.full(
+                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+            )
+            self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             self.hidden_states = torch.zeros(
@@ -157,11 +153,30 @@ class EAGLEDraftCudaGraphRunner:
 
         return is_bs_supported
 
+    def _create_graph(self):
+        return torch.cuda.CUDAGraph()
+
+    def _capture_init(self, run_once_fn):
+        for _ in range(2):
+            torch.cuda.synchronize()
+            self.model_runner.tp_group.barrier()
+            run_once_fn()
+
+    def _capture_graph(self, graph, pool, stream, run_once_fn):
+        with torch.cuda.graph(graph, pool=pool, stream=stream):
+            out = run_once_fn()
+        return out
+
+    def _replay(self, forward_batch: ForwardBatch):
+        self.graphs[self.bs].replay()
+
     def capture(self):
         CudaGraphRunner.capture(self)
 
-    def capture_one_batch_size(self, num_seqs: int, forward: Callable):
-        graph = torch.cuda.CUDAGraph()
+    def capture_one_batch_size(
+        self, num_seqs: int, forward: Callable, stream_idx: int = 0
+    ):
+        graph = self._create_graph()
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
 
@@ -174,9 +189,9 @@ class EAGLEDraftCudaGraphRunner:
         out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
+        hidden_states = self.hidden_states[:num_seqs]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
-        hidden_states = self.hidden_states[:num_seqs]
 
         if self.require_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(
@@ -244,6 +259,7 @@ class EAGLEDraftCudaGraphRunner:
             positions=positions,
             mrope_positions=mrope_positions,
             global_num_tokens_gpu=global_num_tokens,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             spec_algorithm=self.model_runner.spec_algorithm,
@@ -251,7 +267,6 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
-            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
         )
 
         # Attention backend
@@ -282,16 +297,11 @@ class EAGLEDraftCudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        for _ in range(2):
-            torch.cuda.synchronize()
-            self.model_runner.tp_group.barrier()
+        self._capture_init(run_once)
 
-            run_once()
-
-        with torch.cuda.graph(
-            graph, pool=get_global_graph_memory_pool(), stream=stream
-        ):
-            out = run_once()
+        out = self._capture_graph(
+            graph, get_global_graph_memory_pool(), stream, run_once
+        )
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out
@@ -319,6 +329,7 @@ class EAGLEDraftCudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
+
         bs = self.capture_bs[index]
         if bs != raw_bs:
             self.seq_lens.fill_(self.seq_len_fill_value)
@@ -328,7 +339,6 @@ class EAGLEDraftCudaGraphRunner:
         num_tokens = bs * self.num_tokens_per_bs
 
         # Common inputs
-        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
             forward_batch.out_cache_loc
@@ -337,6 +347,7 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
+        self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -359,10 +370,12 @@ class EAGLEDraftCudaGraphRunner:
         self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )
+        self.raw_bs = raw_bs
+        self.bs = bs
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph
 
         # Replay
-        self.graphs[bs].replay()
+        self._replay(forward_batch)
         out = self.output_buffers[bs]
 
         if bs != raw_bs:

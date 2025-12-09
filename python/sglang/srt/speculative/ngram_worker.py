@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -15,11 +16,9 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_cache import NgramCache
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-RETURN_ORIGINAL_LOGPROB = get_bool_env_var("RETURN_ORIGINAL_LOGPROB")
 
 USE_FULL_MASK = True
 
@@ -216,7 +215,7 @@ class NGRAMWorker:
         # acceptance indices are the indices in a "flattened" batch.
         # dividing it to num_draft_tokens will yield the actual batch index.
         temperatures = temperatures[accepted_indices // num_draft_tokens]
-        if RETURN_ORIGINAL_LOGPROB:
+        if envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get():
             logprobs = torch.nn.functional.log_softmax(
                 logits_output.next_token_logits, dim=-1
             )
@@ -296,6 +295,7 @@ class NGRAMWorker:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
         num_accepted_tokens = 0
+        accept_lens = None
 
         if model_worker_batch.forward_mode.is_target_verify():
             batch_result = self.target_worker.forward_batch_generation(
@@ -309,6 +309,8 @@ class NGRAMWorker:
             logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
                 batch, logits_output, self.page_size
             )
+            # Store accept_lens for per-request metrics
+            accept_lens = verify_input.accept_length
             if batch.return_logprob:
                 self.add_logprob_values(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)
@@ -329,4 +331,5 @@ class NGRAMWorker:
             next_token_ids=next_token_ids,
             num_accepted_tokens=num_accepted_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
+            accept_lens=accept_lens,
         )

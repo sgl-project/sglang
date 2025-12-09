@@ -1,31 +1,34 @@
 #!/bin/bash
-
 echo "Starting server"
 
-SERVER_ARGS="--host 0.0.0.0 --port 8080"
+PREFIX="SM_SGLANG_"
+ARG_PREFIX="--"
 
-if [ -n "$TENSOR_PARALLEL_DEGREE" ]; then
-    SERVER_ARGS="${SERVER_ARGS} --tp-size ${TENSOR_PARALLEL_DEGREE}"
+ARGS=()
+
+while IFS='=' read -r key value; do
+    arg_name=$(echo "${key#"${PREFIX}"}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')
+
+    ARGS+=("${ARG_PREFIX}${arg_name}")
+    if [ -n "$value" ]; then
+        ARGS+=("$value")
+    fi
+done < <(env | grep "^${PREFIX}")
+
+# Add default port only if not already set
+if ! [[ " ${ARGS[@]} " =~ " --port " ]]; then
+    ARGS+=(--port "${SM_SGLANG_PORT:-8080}")
 fi
 
-if [ -n "$DATA_PARALLEL_DEGREE" ]; then
-    SERVER_ARGS="${SERVER_ARGS} --dp-size ${DATA_PARALLEL_DEGREE}"
+# Add default host only if not already set
+if ! [[ " ${ARGS[@]} " =~ " --host " ]]; then
+    ARGS+=(--host "${SM_SGLANG_HOST:-0.0.0.0}")
 fi
 
-if [ -n "$EXPERT_PARALLEL_DEGREE" ]; then
-    SERVER_ARGS="${SERVER_ARGS} --ep-size ${EXPERT_PARALLEL_DEGREE}"
+# Add default model-path only if not already set
+if ! [[ " ${ARGS[@]} " =~ " --model-path " ]]; then
+    ARGS+=(--model-path "${SM_SGLANG_MODEL_PATH:-/opt/ml/model}")
 fi
 
-if [ -n "$MEM_FRACTION_STATIC" ]; then
-    SERVER_ARGS="${SERVER_ARGS} --mem-fraction-static ${MEM_FRACTION_STATIC}"
-fi
-
-if [ -n "$QUANTIZATION" ]; then
-    SERVER_ARGS="${SERVER_ARGS} --quantization ${QUANTIZATION}"
-fi
-
-if [ -n "$CHUNKED_PREFILL_SIZE" ]; then
-    SERVER_ARGS="${SERVER_ARGS} --chunked-prefill-size ${CHUNKED_PREFILL_SIZE}"
-fi
-
-python3 -m sglang.launch_server --model-path /opt/ml/model $SERVER_ARGS
+echo "Running command: exec python3 -m sglang.launch_server ${ARGS[@]}"
+exec python3 -m sglang.launch_server "${ARGS[@]}"

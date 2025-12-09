@@ -13,6 +13,7 @@ import time
 import traceback
 import urllib.request
 import weakref
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
@@ -480,20 +481,44 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
 
 class TypeBasedDispatcher:
     def __init__(self, mapping: List[Tuple[Type, Callable]]):
-        self._mapping = mapping
+        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
+        # to maintains registration order
+        self._mapping = OrderedDict(mapping)
+        # MRO cache for inheritance-based matching
+        self._mro_cache = {}
         self._fallback_fn = None
 
     def add_fallback_fn(self, fallback_fn: Callable):
         self._fallback_fn = fallback_fn
 
     def __iadd__(self, other: "TypeBasedDispatcher"):
-        self._mapping.extend(other._mapping)
+        for ty, fn in other._mapping.items():
+            if ty not in self._mapping:
+                self._mapping[ty] = fn
+
+        self._mro_cache.clear()
         return self
 
     def __call__(self, obj: Any):
-        for ty, fn in self._mapping:
+        obj_type = type(obj)
+        # 1. First try exact match(o(1))
+        fn = self._mapping.get(obj_type)
+        if fn is not None:
+            return fn(obj)
+
+        # 2. If exact match fails, check MRO cache
+        cached_fn = self._mro_cache.get(obj_type)
+        if cached_fn is not None:
+            return cached_fn(obj)
+
+        # 3.search in registration order for compatible type(maintains origin behavior)
+        for ty, fn in self._mapping.items():
             if isinstance(obj, ty):
+                self._mro_cache[obj_type] = fn
                 return fn(obj)
+
+        # 4. if no matching type found, cache this result
+        self._mro_cache[obj_type] = None
 
         if self._fallback_fn is not None:
             return self._fallback_fn(obj)

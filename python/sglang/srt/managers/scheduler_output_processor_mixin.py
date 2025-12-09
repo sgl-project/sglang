@@ -263,7 +263,6 @@ class SchedulerOutputProcessorMixin:
         """Resolve the padding next token ids for speculative decoding with overlap."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
-        assert result.allocate_lens.is_cpu
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
@@ -271,7 +270,9 @@ class SchedulerOutputProcessorMixin:
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
+
         for i, req in enumerate(batch.reqs):
+            req.kv_committed_len += accept_lens[i]
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
@@ -279,6 +280,36 @@ class SchedulerOutputProcessorMixin:
             req.spec_accepted_tokens += accept_lens[i] - 1
 
         return predict_tokens
+
+    def process_batch_result_dllm(
+        self: Scheduler,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
+    ):
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+
+        next_token_ids = result.next_token_ids.tolist()
+        self.num_generated_tokens += len(next_token_ids)
+
+        self.token_to_kv_pool_allocator.free_group_begin()
+
+        assert len(batch.reqs) == 1, "batch size is currently expected to be 1"
+        req = batch.reqs[0]
+
+        for next_token_id in next_token_ids:
+            req.output_ids.append(next_token_id)
+            req.check_finished()
+
+            if req.finished():
+                release_kv_cache(req, self.tree_cache)
+                req.time_stats.completion_time = time.perf_counter()
+                break
+
+            self.tree_cache.cache_unfinished_req(req)
+
+        self.stream_output(batch.reqs, batch.return_logprob)
+        self.token_to_kv_pool_allocator.free_group_end()
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -300,8 +331,6 @@ class SchedulerOutputProcessorMixin:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
         elif batch.is_v2_eagle:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
-            allocate_lens_list = result.allocate_lens.tolist()
-            accept_lens_list = result.accept_lens.tolist()
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
@@ -366,10 +395,16 @@ class SchedulerOutputProcessorMixin:
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
 
-            if req.grammar is not None and batch.spec_algorithm.is_none():
+            if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
-                    req.grammar.accept_token(next_token_id)
+                    if batch.spec_algorithm.is_none():
+                        # Normal decode: single token
+                        req.grammar.accept_token(next_token_id)
+                    elif batch.is_v2_eagle:
+                        # Speculative decode: next_token_id is a list of accepted tokens
+                        for token_id in next_token_id:
+                            req.grammar.accept_token(token_id)
                 except ValueError as e:
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
@@ -724,8 +759,8 @@ class SchedulerOutputProcessorMixin:
 
         queue_times = []
         forward_entry_times = []
-        prefill_delays = []
-        prefill_latencies = []
+        prefill_launch_delays = []
+        prefill_launch_latencies = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -830,24 +865,10 @@ class SchedulerOutputProcessorMixin:
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
 
-                if req.time_stats.prefill_start_time > 0.0:
-                    prefill_delays.append(
-                        req.time_stats.prefill_start_time
-                        - req.time_stats.forward_entry_time
-                    )
-                else:
-                    prefill_delays.append(None)
-
-                if (
-                    req.time_stats.prefill_start_time > 0.0
-                    and req.time_stats.prefill_end_time > 0.0
-                ):
-                    prefill_latencies.append(
-                        req.time_stats.prefill_end_time
-                        - req.time_stats.prefill_start_time
-                    )
-                else:
-                    prefill_latencies.append(None)
+                prefill_launch_delays.append(req.time_stats.get_prefill_launch_delay())
+                prefill_launch_latencies.append(
+                    req.time_stats.get_prefill_launch_latency()
+                )
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -928,7 +949,7 @@ class SchedulerOutputProcessorMixin:
 
             if (
                 req.finished()
-                and self.tp_rank == 0
+                and self.attn_tp_rank == 0
                 and self.server_args.enable_request_time_stats_logging
             ):
                 req.log_time_stats()
@@ -946,8 +967,8 @@ class SchedulerOutputProcessorMixin:
                     spec_accepted_tokens=spec_accepted_tokens,
                     queue_time=queue_times,
                     forward_entry_time=forward_entry_times,
-                    prefill_delay=prefill_delays,
-                    prefill_latency=prefill_latencies,
+                    prefill_launch_delay=prefill_launch_delays,
+                    prefill_launch_latency=prefill_launch_latencies,
                     finished_reasons=finished_reasons,
                     decoded_texts=decoded_texts,
                     decode_ids=decode_ids_list,
@@ -989,8 +1010,8 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         queue_times = []
         forward_entry_times = []
-        prefill_delays = []
-        prefill_latencies = []
+        prefill_launch_delays = []
+        prefill_launch_latencies = []
         retraction_counts = []
         for req in reqs:
             if req.finished():
@@ -1004,24 +1025,10 @@ class SchedulerOutputProcessorMixin:
                 queue_times.append(req.time_stats.get_queueing_time())
                 forward_entry_times.append(req.time_stats.forward_entry_time)
 
-                if req.time_stats.prefill_start_time > 0.0:
-                    prefill_delays.append(
-                        req.time_stats.prefill_start_time
-                        - req.time_stats.forward_entry_time
-                    )
-                else:
-                    prefill_delays.append(None)
-
-                if (
-                    req.time_stats.prefill_start_time > 0.0
-                    and req.time_stats.prefill_end_time > 0.0
-                ):
-                    prefill_latencies.append(
-                        req.time_stats.prefill_end_time
-                        - req.time_stats.prefill_start_time
-                    )
-                else:
-                    prefill_latencies.append(None)
+                prefill_launch_delays.append(req.time_stats.get_prefill_launch_delay())
+                prefill_launch_latencies.append(
+                    req.time_stats.get_prefill_launch_latency()
+                )
                 retraction_counts.append(req.retraction_count)
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
@@ -1029,8 +1036,8 @@ class SchedulerOutputProcessorMixin:
                 http_worker_ipcs=http_worker_ipcs,
                 queue_time=queue_times,
                 forward_entry_time=forward_entry_times,
-                prefill_delay=prefill_delays,
-                prefill_latency=prefill_latencies,
+                prefill_launch_delay=prefill_launch_delays,
+                prefill_launch_latency=prefill_launch_latencies,
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,

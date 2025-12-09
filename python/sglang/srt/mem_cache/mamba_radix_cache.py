@@ -28,7 +28,6 @@ from numpy import float64
 
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
@@ -37,6 +36,7 @@ from sglang.srt.mem_cache.radix_cache import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 import logging
 
@@ -320,28 +320,23 @@ class LRUList:
 
 
 class MambaRadixCache(BasePrefixCache):
-    def __init__(
-        self,
-        req_to_token_pool: HybridReqToTokenPool,
-        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
-        page_size: int,
-        disable: bool = False,
-        enable_metrics: bool = False,
-    ):
-        assert isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator)
-        self.req_to_token_pool = req_to_token_pool
-        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+    def __init__(self, params: CacheInitParams):
+        assert isinstance(params.token_to_kv_pool_allocator, TokenToKVPoolAllocator)
+        self.req_to_token_pool = params.req_to_token_pool
+        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 
-        assert page_size == 1, "Only support page_size=1 in mamba radix cache now."
-        self.page_size = page_size
-        self.disable = disable
+        assert (
+            params.page_size == 1
+        ), "Only support page_size=1 in mamba radix cache now."
+        self.page_size = params.page_size
+        self.disable = params.disable
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
 
-        if enable_metrics:
+        if params.enable_metrics:
             self.init_metrics_collector()
 
         self.key_match_fn = _key_match_page_size1
@@ -520,8 +515,12 @@ class MambaRadixCache(BasePrefixCache):
             self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
 
         # The prefix indices could be updated, reuse it
-        new_indices, new_last_node, _, _ = self.match_prefix(
+        match_result = self.match_prefix(
             RadixKey(page_aligned_token_ids, req.extra_key)
+        )
+        (new_indices, new_last_node) = (
+            match_result.device_indices,
+            match_result.last_device_node,
         )
 
         if not mamba_exist:
@@ -919,10 +918,10 @@ class MambaRadixCache(BasePrefixCache):
             node.mamba_value is not None
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
         self.full_evictable_size_ -= len(node.key)
         self.mamba_evictable_size_ -= len(node.mamba_value)
 
@@ -936,10 +935,10 @@ class MambaRadixCache(BasePrefixCache):
             node.mamba_value is None
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
         self.full_evictable_size_ -= len(node.key)
 
     def _collect_leaves(self) -> List[TreeNode]:
