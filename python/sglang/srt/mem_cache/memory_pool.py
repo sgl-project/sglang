@@ -151,13 +151,10 @@ class MambaPool:
         intermediate_ssm: torch.Tensor
         intermediate_conv_window: List[torch.Tensor]
 
-        _fields = ("intermediate_ssm", "intermediate_conv_window")
-
         def at_layer_idx(self, layer: int):
             kwargs = {}
-            for k in self._fields:
-                v = getattr(self, k)
-                if k == "intermediate_conv_window":
+            for k, v in vars(self).items():
+                if k == "conv" or k == "intermediate_conv_window":
                     kwargs[k] = [conv[layer] for conv in v]
                 else:
                     kwargs[k] = v[layer]
