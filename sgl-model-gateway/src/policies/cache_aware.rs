@@ -220,7 +220,7 @@ impl CacheAwarePolicy {
         // TODO may skip passing this arg (and compute inside function) if this is not bottleneck
         max_load: usize,
         min_load: usize,
-    ) -> usize {
+    ) -> Option<usize> {
         // Log load balancing trigger
         // TODO may use `&str`
         let worker_loads: Vec<(String, usize)> = workers
@@ -265,7 +265,7 @@ impl CacheAwarePolicy {
         RouterMetrics::record_processed_request(workers[min_load_idx].url());
         RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
 
-        min_load_idx
+        Some(min_load_idx)
     }
 }
 
@@ -300,14 +300,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
-            return Some(self.select_worker_min_load(
+            return self.select_worker_min_load(
                 workers,
                 &request_text,
                 &healthy_indices,
                 model_id,
                 max_load,
                 min_load,
-            ));
+            );
         }
 
         // Use cache-aware routing when balanced
