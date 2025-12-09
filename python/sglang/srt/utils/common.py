@@ -1508,7 +1508,7 @@ def add_prometheus_track_response_middleware(app):
     from prometheus_client import Counter
 
     http_response_status_counter = Counter(
-        name="sglang:http_response_status_total",
+        name="sglang:http_responses_total",
         documentation="Total number of HTTP responses by endpoint and status code",
         labelnames=["endpoint", "status_code", "method"],
     )
