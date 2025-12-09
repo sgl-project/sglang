@@ -84,6 +84,7 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
+from sglang.srt.layers.attention.attn_backend_support import validate_attention_backends
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -325,6 +326,14 @@ class ModelRunner:
         # Model-specific adjustment
         self.model_specific_adjustment()
         self.check_quantized_moe_compatibility()
+
+        # Validate attention backend compatibility (after adjustments)
+
+        validate_attention_backends(
+            self.server_args,
+            use_mla=self.use_mla_backend,
+            sliding_window_size=getattr(self, "sliding_window_size", None),
+        )
 
         # Set the global server_args in the scheduler process
         set_global_server_args_for_scheduler(server_args)
