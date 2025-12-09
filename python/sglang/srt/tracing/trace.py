@@ -498,6 +498,9 @@ class SGLangTraceReqContext:
         if not self.tracing_enable:
             return
 
+        if not self.thread_context:
+            return
+
         ts = ts or get_cur_time_ns()
 
         cur_slice = SGLangTraceSliceContext(
@@ -635,6 +638,9 @@ class SGLangTraceReqContext:
         if not self.tracing_enable:
             return
 
+        if not self.thread_context:
+            return
+
         if not self.thread_context.cur_slice:
             logger.warning(f"No slice is currently being traced.")
             return
@@ -650,6 +656,9 @@ class SGLangTraceReqContext:
     # Add attrs to the current slice on the same thread with the same rid.
     def trace_slice_add_attr(self, attrs: Dict[str, Any]):
         if not self.tracing_enable:
+            return
+
+        if not self.thread_context:
             return
 
         if not self.thread_context.cur_slice:

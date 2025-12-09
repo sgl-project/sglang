@@ -1531,9 +1531,6 @@ class Scheduler(
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
         ):
-            recv_req.trace_metric_ctx.abort(
-                abort_info={"abort_info": "Queue limit exceeded"}
-            )
             return False
 
         # Reject the incoming request by default.
@@ -1569,6 +1566,7 @@ class Scheduler(
             ),
             req_to_abort,
         )
+        req_to_abort.trace_metric_ctx.abort(abort_info={"abort_info": message})
         return req_to_abort.rid == recv_req.rid
 
     def handle_embedding_request(
