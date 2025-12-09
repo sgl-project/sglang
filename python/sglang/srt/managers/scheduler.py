@@ -256,6 +256,9 @@ class Scheduler(
         )
         self.enable_lora = server_args.enable_lora
         self.max_loras_per_batch = server_args.max_loras_per_batch
+        self.max_loras_prefetch = server_args.max_loras_prefetch
+        self.prefetch_loras_in_flight = set()
+        self.lora_prefetch_executor = futures.ThreadPoolExecutor(max_workers=1)
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_pdmux = server_args.enable_pdmux
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -446,6 +449,7 @@ class Scheduler(
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
+        self.last_batch_end_time = None
         self.last_prefill_tokens = 0
         self.return_health_check_ct = 0
         self.num_retracted_reqs: int = 0
@@ -1707,6 +1711,8 @@ class Scheduler(
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+
+                self.prefetch_loras()
             else:
                 ret = None
 
@@ -1911,6 +1917,8 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
+        self.prefetch_loras_in_flight -= {req.lora_id for req in new_batch.reqs}
+
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
@@ -1958,6 +1966,50 @@ class Scheduler(
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
+
+    def prefetch_loras(self):
+        """Prefetch LoRA adapters for next batch in waiting queue"""
+        upper_bound_bs = min(
+            self.max_loras_prefetch,
+            get_global_server_args().pp_max_micro_batch_size,
+        )
+        prefetch_lora_capacity = upper_bound_bs - len(self.prefetch_loras_in_flight)
+
+        running_batch_lora_ids = {req.lora_id for req in self.running_batch.reqs}
+        prefetch_lora_reqs = []
+        for req in self.waiting_queue:
+            if len(prefetch_lora_reqs) >= prefetch_lora_capacity:
+                break
+
+            if (
+                req.lora_id is not None
+                and req.lora_id not in running_batch_lora_ids
+                and req.lora_id not in self.prefetch_loras_in_flight
+            ):
+                prefetch_lora_reqs.append(req)
+
+        if len(prefetch_lora_reqs) == 0:
+            return
+
+        prefetch_batch = ScheduleBatch.init_new(
+            prefetch_lora_reqs,
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            self.tree_cache,
+            self.model_config,
+            self.enable_overlap,
+            self.spec_algorithm,
+        )
+        prefetch_batch.prepare_for_lora_prefetch()
+        prefetch_model_worker_batch = prefetch_batch.get_model_worker_batch()
+        prefetch_model_worker_batch.is_lora_prefetch = True
+
+        self.prefetch_loras_in_flight |= {req.lora_id for req in prefetch_lora_reqs}
+
+        self.lora_prefetch_executor.submit(
+            self.tp_worker.prefetch_lora_adapters,
+            prefetch_model_worker_batch,
+        )
 
     # placeholder for override
     def update_cache_from_scheduler(

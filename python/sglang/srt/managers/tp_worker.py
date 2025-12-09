@@ -191,6 +191,10 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
+    def prefetch_lora_adapters(self, prefetch_lora_batch: ModelWorkerBatch):
+        prefetch_fwd = ForwardBatch.init_new(prefetch_lora_batch, self.model_runner)
+        self.model_runner.prefetch_lora_batch(prefetch_fwd)
+
     def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
         return self.model_runner.lora_manager.validate_lora_batch(lora_ids)
 

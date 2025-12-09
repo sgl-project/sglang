@@ -12,11 +12,12 @@ class BaseLoRABackend:
     Args:
         max_loras_per_batch: maximum number of different lora weights
                              that can be applied in a single forward batch.
+        max_loras_prefetch:  maximum number of lora weights in a prefetch batch.
         device: the device where the backend runs.
     """
 
-    def __init__(self, max_loras_per_batch: int, device: torch.device):
-        self.max_loras_per_batch = max_loras_per_batch
+    def __init__(self, max_loras_total: int, device: torch.device):
+        self.max_loras_total = max_loras_total
         self.device = device
 
     def run_lora_a_sgemm(
