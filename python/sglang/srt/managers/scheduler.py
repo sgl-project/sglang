@@ -210,12 +210,19 @@ class EmbeddingBatchResult:
 
     def copy_to_cpu(self):
         """Copy embeddings tensor to CPU in overlap scheduling."""
+
         if isinstance(self.embeddings, torch.Tensor):
+            self.copy_done = torch.get_device_module(self.embeddings.device).Event()
             self.embeddings = self.embeddings.to("cpu", non_blocking=True)
-            if self.copy_done is not None:
-                self.copy_done.record()
-        # For sparse embeddings or lists, we keep them on GPU for now
-        # as the .indices() and .values() calls will handle the transfer
+        else:
+            assert isinstance(self.embeddings, list)
+            if len(self.embeddings) == 0:
+                return
+
+            self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
+            self.embeddings = [emb.to("cpu", non_blocking=True) for emb in self.embeddings]
+
+        self.copy_done.record()
 
 
 class Scheduler(
@@ -2095,13 +2102,7 @@ class Scheduler(
                         model_worker_batch
                     )
                     ret = EmbeddingBatchResult(embeddings=embeddings)
-                    ret.copy_done = (
-                        torch.get_device_module(embeddings.device).Event()
-                        if isinstance(embeddings, torch.Tensor)
-                        else None
-                    )
-                    if ret.copy_done is not None:
-                        ret.copy_to_cpu()
+                    ret.copy_to_cpu()
             else:
                 embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
                 ret = EmbeddingBatchResult(embeddings=embeddings)

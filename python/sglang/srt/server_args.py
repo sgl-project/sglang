@@ -2086,6 +2086,16 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.skip_server_warmup = True
 
+        if self.enable_embedding_schedule_overlap and self.disable_overlap_schedule:
+            raise ValueError(
+                "Cannot enable both --enable-embedding-schedule-overlap and --disable-overlap-schedule."
+            )
+        
+        if self.enable_embedding_schedule_overlap and envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
+            raise ValueError(
+                "--enable-embedding-schedule-overlap is not supported with sparse heads. Please disable one of them."
+            )
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
 
