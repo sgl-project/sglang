@@ -80,7 +80,7 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
-def handle_rope_parameters(config: PretrainedConfig) -> PretrainedConfig:
+def handle_rope_parameters(config: PretrainedConfig):
     if hasattr(config, "rope_scaling"):
         rope_scaling = config.rope_scaling
         if isinstance(rope_scaling, dict):
