@@ -886,13 +886,13 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             """Get tp sharded scale from full scale tensor"""
             if tp_size == 1:
                 return full_scale_tensor
-            
+
             full_dim = full_scale_tensor.shape[0]
             shard_dim = full_dim // tp_size
             start_idx = tp_rank * shard_dim
             end_idx = start_idx + shard_dim
             return full_scale_tensor[start_idx:end_idx]
-        
+
         if param_name.endswith(".weight"):
             scale_param_name = f"{param_name[:-7]}.weight_scale"
         else:
