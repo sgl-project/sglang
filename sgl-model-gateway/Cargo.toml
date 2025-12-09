@@ -70,6 +70,7 @@ parking_lot = "0.12.4"
 rayon = "1.10"
 thiserror = "2.0.12"
 regex = "1.10"
+memchr = "2.7"  # SIMD-optimized byte pattern searching
 url = "2.5.4"
 validator = { version = "0.20.0", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
