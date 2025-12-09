@@ -55,6 +55,7 @@ impl PipelineStage for HarmonyRequestBuildingStage {
         let builder_client = match clients {
             ClientSelection::Single { client } => client,
             ClientSelection::Dual { prefill, .. } => prefill,
+            ClientSelection::Triple { encode, .. } => encode,
         };
 
         // Harmony model support not yet implemented for vLLM
@@ -154,8 +155,17 @@ impl PipelineStage for HarmonyRequestBuildingStage {
 
         // Inject PD metadata if needed
         if self.inject_pd_metadata {
-            if let Some(WorkerSelection::Dual { prefill, .. }) = ctx.state.workers.as_ref() {
-                helpers::inject_bootstrap_metadata(&mut proto_request, prefill);
+            if let Some(prefill_worker) =
+                ctx.state
+                    .workers
+                    .as_ref()
+                    .and_then(|selection| match selection {
+                        WorkerSelection::Dual { prefill, .. } => Some(prefill),
+                        WorkerSelection::Triple { prefill, .. } => Some(prefill),
+                        _ => None,
+                    })
+            {
+                helpers::inject_bootstrap_metadata(&mut proto_request, prefill_worker);
             }
         }
 

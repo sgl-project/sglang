@@ -83,9 +83,7 @@ impl RouterFactory {
                     .await
                 }
 
-                RoutingMode::OpenAI { worker_urls } => {
-                    Self::create_openai_router(worker_urls.clone(), ctx).await
-                }
+                RoutingMode::OpenAI { .. } => Self::create_openai_router(ctx).await,
             },
         }
     }

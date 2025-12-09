@@ -17,6 +17,9 @@ use crate::{
     },
 };
 
+/// Type alias for EPD (Encode-Prefill-Decode) worker triple selection result
+type EpdWorkerTriple = (Arc<dyn Worker>, Arc<dyn Worker>, Arc<dyn Worker>);
+
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
@@ -29,6 +32,8 @@ pub enum WorkerSelectionMode {
     Regular,
     /// PD mode: select prefill + decode workers
     PrefillDecode,
+    /// EPD mode: select encode + prefill + decode workers
+    EncodePrefillDecode,
 }
 
 impl WorkerSelectionStage {
@@ -102,6 +107,27 @@ impl PipelineStage for WorkerSelectionStage {
                                 ctx.input.model_id
                             ),
                         ));
+                    }
+                }
+            }
+            WorkerSelectionMode::EncodePrefillDecode => {
+                match self.select_epd_triple(ctx.input.model_id.as_deref(), text) {
+                    Some((encode, prefill, decode)) => WorkerSelection::Triple {
+                        encode,
+                        prefill,
+                        decode,
+                    },
+                    None => {
+                        error!(
+                            function = "WorkerSelectionStage::execute",
+                            mode = "EncodePrefillDecode",
+                            model_id = ?ctx.input.model_id,
+                            "No available EPD worker triple for model"
+                        );
+                        return Err(error::service_unavailable(format!(
+                            "No available Encode-Prefill-Decode workers for model: {:?}",
+                            ctx.input.model_id
+                        )));
                     }
                 }
             }
@@ -224,6 +250,64 @@ impl WorkerSelectionStage {
         );
 
         Some((
+            available_prefill[prefill_idx].clone(),
+            available_decode[decode_idx].clone(),
+        ))
+    }
+
+    fn select_epd_triple(
+        &self,
+        model_id: Option<&str>,
+        text: Option<&str>,
+    ) -> Option<EpdWorkerTriple> {
+        let all_workers = self.worker_registry.get_workers_filtered(
+            model_id,
+            None,
+            Some(ConnectionMode::Grpc { port: None }), // Match any gRPC worker
+            None,
+            false,
+        );
+
+        let (available_encode, available_prefill, available_decode): (Vec<_>, Vec<_>, Vec<_>) =
+            all_workers
+                .into_iter()
+                .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, w| {
+                    if w.is_available() {
+                        match w.metadata().worker_type {
+                            WorkerType::Encode { .. } => acc.0.push(w),
+                            WorkerType::Prefill { .. } => acc.1.push(w),
+                            WorkerType::Decode => acc.2.push(w),
+                            _ => {}
+                        }
+                    }
+                    acc
+                });
+
+        if available_encode.is_empty() {
+            warn!("No available encode workers");
+            return None;
+        }
+
+        if available_prefill.is_empty() {
+            warn!("No available prefill workers");
+            return None;
+        }
+
+        if available_decode.is_empty() {
+            warn!("No available decode workers");
+            return None;
+        }
+
+        let encode_policy = self.policy_registry.get_encode_policy();
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
+
+        let encode_idx = encode_policy.select_worker(&available_encode, text)?;
+        let prefill_idx = prefill_policy.select_worker(&available_prefill, text)?;
+        let decode_idx = decode_policy.select_worker(&available_decode, text)?;
+
+        Some((
+            available_encode[encode_idx].clone(),
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
         ))

@@ -32,6 +32,9 @@ pub struct PolicyRegistry {
 
     /// Decode policy for PD mode (set once at startup, lock-free reads via OnceLock)
     decode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
+
+    /// Encode policy for EPD mode (set once at startup, lock-free reads via OnceLock)
+    encode_policy: Arc<OnceLock<Arc<dyn LoadBalancingPolicy>>>,
 }
 
 impl PolicyRegistry {
@@ -45,6 +48,7 @@ impl PolicyRegistry {
             default_policy,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
+            encode_policy: Arc::new(OnceLock::new()),
         }
     }
 
@@ -248,6 +252,13 @@ impl PolicyRegistry {
         let _ = self.decode_policy.set(policy);
     }
 
+    /// Set the encode policy for EPD mode (lock-free, set once at startup)
+    pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
+        // OnceLock::set returns Err if already set, which we ignore since
+        // the policy should only be set once at startup
+        let _ = self.encode_policy.set(policy);
+    }
+
     /// Get the prefill policy for PD mode, or default if not set (lock-free)
     pub fn get_prefill_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         self.prefill_policy
@@ -259,6 +270,14 @@ impl PolicyRegistry {
     /// Get the decode policy for PD mode, or default if not set (lock-free)
     pub fn get_decode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
         self.decode_policy
+            .get()
+            .map(Arc::clone)
+            .unwrap_or_else(|| self.get_default_policy())
+    }
+
+    /// Get the encode policy for EPD mode, or default if not set (lock-free)
+    pub fn get_encode_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
+        self.encode_policy
             .get()
             .map(Arc::clone)
             .unwrap_or_else(|| self.get_default_policy())
@@ -286,6 +305,21 @@ impl PolicyRegistry {
             if policy.name() == "power_of_two"
                 && !Arc::ptr_eq(policy, &self.default_policy)
                 && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
+            {
+                power_of_two_policies.push(Arc::clone(policy));
+            }
+        }
+
+        // Get encode policy (lock-free via OnceLock::get)
+        let encode_policy_opt = self.encode_policy.get();
+
+        if let Some(policy) = encode_policy_opt {
+            let already_present = power_of_two_policies
+                .iter()
+                .any(|existing| Arc::ptr_eq(existing, policy));
+            if policy.name() == "power_of_two"
+                && !Arc::ptr_eq(policy, &self.default_policy)
+                && !already_present
             {
                 power_of_two_policies.push(Arc::clone(policy));
             }

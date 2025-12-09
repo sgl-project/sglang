@@ -47,6 +47,7 @@ impl PipelineStage for DispatchMetadataStage {
             .map(|w| match w {
                 WorkerSelection::Single { worker } => worker,
                 WorkerSelection::Dual { decode, .. } => decode,
+                WorkerSelection::Triple { decode, .. } => decode,
             })
             .and_then(|w| w.metadata().labels.get("weight_version").cloned())
             .unwrap_or_else(|| "default".to_string());

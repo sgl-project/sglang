@@ -55,6 +55,29 @@ pub async fn collect_responses(
 
             decode_responses
         }
+        ExecutionResult::Triple {
+            mut encode,
+            mut prefill,
+            decode,
+        } => {
+            let encode_responses = utils::collect_stream_responses(&mut encode, "Encode").await?;
+            let prefill_responses =
+                utils::collect_stream_responses(&mut prefill, "Prefill").await?;
+
+            let mut decode_stream = *decode;
+            let mut decode_responses =
+                utils::collect_stream_responses(&mut decode_stream, "Decode").await?;
+
+            encode.mark_completed();
+            prefill.mark_completed();
+            decode_stream.mark_completed();
+
+            if merge_logprobs && !merge_input_logprobs(&encode_responses, &mut decode_responses) {
+                merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
+            }
+
+            decode_responses
+        }
     };
 
     if all_responses.is_empty() {
@@ -80,12 +103,25 @@ fn merge_prefill_logprobs(
     if let Some(ProtoGenerateComplete::Sglang(prefill_first)) = prefill_responses.first() {
         // Use ref to borrow input_logprobs instead of cloning upfront
         // This avoids one allocation when the Option is Some
-        if let Some(ref prefill_input_logprobs) = prefill_first.input_logprobs {
-            for response in decode_responses.iter_mut() {
-                if let ProtoGenerateComplete::Sglang(decode_resp) = response {
-                    decode_resp.input_logprobs = Some(prefill_input_logprobs.clone());
-                }
-            }
+        if prefill_first.input_logprobs.is_some() {
+            let _ = merge_input_logprobs(prefill_responses, decode_responses);
         }
     }
+}
+
+fn merge_input_logprobs(
+    source_responses: &[ProtoGenerateComplete],
+    decode_responses: &mut [ProtoGenerateComplete],
+) -> bool {
+    if let Some(ProtoGenerateComplete::Sglang(source_first)) = source_responses.first() {
+        if let Some(input_logprobs) = source_first.input_logprobs.clone() {
+            for response in decode_responses.iter_mut() {
+                if let ProtoGenerateComplete::Sglang(decode_resp) = response {
+                    decode_resp.input_logprobs = Some(input_logprobs.clone());
+                }
+            }
+            return true;
+        }
+    }
+    false
 }

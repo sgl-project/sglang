@@ -175,6 +175,9 @@ impl HarmonyStreamingProcessor {
                     let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
                 });
             }
+            context::ExecutionResult::Triple { .. } => {
+                unreachable!("EPD Harmony streaming chat pipeline is not wired yet");
+            }
         }
 
         // Return SSE response
@@ -643,6 +646,9 @@ impl HarmonyStreamingProcessor {
                     mcp_tool_names,
                 )
                 .await
+            }
+            context::ExecutionResult::Triple { .. } => {
+                unreachable!("EPD Harmony streaming responses mode is not wired yet");
             }
         }
     }

@@ -57,6 +57,33 @@ impl PipelineStage for ClientAcquisitionStage {
                     decode: decode_client,
                 }
             }
+            WorkerSelection::Triple {
+                encode,
+                prefill,
+                decode,
+            } => {
+                let encode_client = utils::get_grpc_client_from_worker(encode).await?;
+                let prefill_client = utils::get_grpc_client_from_worker(prefill).await?;
+                let decode_client = utils::get_grpc_client_from_worker(decode).await?;
+
+                if encode_client.is_vllm() || prefill_client.is_vllm() || decode_client.is_vllm() {
+                    // TODO: I am not sure about this restriction for vLLM, need to verify
+                    error!(
+                        function = "ClientAcquisitionStage::execute",
+                        "vLLM backend does not support encode/prefill/decode disaggregated mode"
+                    );
+                    return Err(error::bad_request(
+                        "vLLM backend does not support encode/prefill/decode disaggregated mode. \
+                         Please use runtime_type: sglang for EPD mode, or use a regular worker configuration."
+                    ));
+                }
+
+                ClientSelection::Triple {
+                    encode: encode_client,
+                    prefill: prefill_client,
+                    decode: decode_client,
+                }
+            }
         };
 
         ctx.state.clients = Some(clients);

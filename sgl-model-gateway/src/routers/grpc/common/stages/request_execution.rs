@@ -26,6 +26,8 @@ pub enum ExecutionMode {
     Single,
     /// PD mode: dual dispatch to prefill + decode workers
     DualDispatch,
+    /// EPD mode: encode + prefill + decode workers
+    TripleDispatch,
 }
 
 impl RequestExecutionStage {
@@ -100,6 +102,9 @@ impl PipelineStage for RequestExecutionStage {
                 ExecutionMode::DualDispatch => {
                     self.execute_dual_dispatch(proto_request, clients, workers)
                         .await
+                }
+                ExecutionMode::TripleDispatch => {
+                    self.execute_triple_dispatch(proto_request, clients).await
                 }
             }
         }
@@ -216,6 +221,88 @@ impl RequestExecutionStage {
 
         Ok(ExecutionResult::Dual {
             prefill: prefill_stream,
+            decode: Box::new(decode_stream),
+        })
+    }
+
+    async fn execute_triple_dispatch(
+        &self,
+        proto_request: ProtoGenerateRequest,
+        clients: &mut ClientSelection,
+    ) -> Result<ExecutionResult, Response> {
+        let (encode_client, prefill_client, decode_client) =
+            clients.triple_mut().ok_or_else(|| {
+                error!(
+                    function = "execute_triple_dispatch",
+                    "Expected triple clients but selection differed"
+                );
+                error::internal_error(
+                    "Expected encode/prefill/decode clients but selection differed",
+                )
+            })?;
+
+        let encode_request = proto_request.clone_inner();
+        let prefill_request = proto_request.clone_inner();
+        let decode_request = proto_request;
+
+        let encode_future = encode_client.generate(encode_request);
+        let prefill_future = prefill_client.generate(prefill_request);
+        let decode_future = decode_client.generate(decode_request);
+
+        let (encode_result, prefill_result, decode_result): (
+            StreamResult,
+            StreamResult,
+            StreamResult,
+        ) = tokio::join!(encode_future, prefill_future, decode_future);
+
+        let encode_stream = match encode_result {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    function = "execute_triple_dispatch",
+                    error = %e,
+                    "Encode worker failed to start"
+                );
+                return Err(error::internal_error(format!(
+                    "Encode worker failed to start: {}",
+                    e
+                )));
+            }
+        };
+
+        let prefill_stream = match prefill_result {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    function = "execute_triple_dispatch",
+                    error = %e,
+                    "Prefill worker failed to start"
+                );
+                return Err(error::internal_error(format!(
+                    "Prefill worker failed to start: {}",
+                    e
+                )));
+            }
+        };
+
+        let decode_stream = match decode_result {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    function = "execute_triple_dispatch",
+                    error = %e,
+                    "Decode worker failed to start"
+                );
+                return Err(error::internal_error(format!(
+                    "Decode worker failed to start: {}",
+                    e
+                )));
+            }
+        };
+
+        Ok(ExecutionResult::Triple {
+            encode: Box::new(encode_stream),
+            prefill: Box::new(prefill_stream),
             decode: Box::new(decode_stream),
         })
     }
