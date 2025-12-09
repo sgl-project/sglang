@@ -464,10 +464,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         if not (self.quant_config.quant_format
                 == CompressionFormat.pack_quantized.value
                 and self.num_bits in WNA16_SUPPORTED_BITS):
-            raise ValueError("For Fused MoE layers, only ",
-                             f"{CompressionFormat.pack_quantized.value} ",
-                             "is supported for the following bits: ",
-                             f"{WNA16_SUPPORTED_BITS}")
+            raise ValueError(
+                f"For Fused MoE layers, only "
+                f"{CompressionFormat.pack_quantized.value} "
+                f"is supported for the following bits: "
+                f"{WNA16_SUPPORTED_BITS}"
+            )
 
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
@@ -733,6 +735,16 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 self.moe_runner_config.activation == "silu"
             ), "Only SiLU activation is supported."
 
+            # Get expert_map for EP support
+            expert_map = None
+            global_num_experts = -1
+            if hasattr(layer, "dispatcher") and hasattr(
+                layer.dispatcher, "local_expert_mapping"
+            ):
+                expert_map = layer.dispatcher.local_expert_mapping
+                if expert_map is not None:
+                    global_num_experts = self.moe_runner_config.num_experts
+
             return StandardCombineInput(hidden_states=fused_marlin_moe(
                 x,
                 layer.w13_weight_packed,
@@ -742,6 +754,8 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
                 router_logits,
                 topk_weights,
                 topk_ids,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
                 g_idx1=layer.w13_weight_g_idx,
                 g_idx2=layer.w2_weight_g_idx,
                 sort_indices1=layer.w13_g_idx_sort_indices,
