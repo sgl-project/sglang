@@ -82,6 +82,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libnuma1 \
     libnuma-dev \
     numactl \
+    # transformers multimodal VLM
+    ffmpeg \
     # InfiniBand/RDMA
     libibverbs-dev \
     libibverbs1 \
