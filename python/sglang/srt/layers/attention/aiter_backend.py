@@ -29,6 +29,7 @@ try:
     from aiter import (
         flash_attn_varlen_func,
         get_mla_metadata_info_v1,
+        get_mla_metadata_v1,
         mha_batch_prefill_func,
         paged_attention_ragged,
     )
@@ -38,23 +39,21 @@ except ImportError:
         "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
     )
 
-
-from aiter import get_mla_metadata_v1
-
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-_use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST")
+# Use aiter mla persist design for fp8-kv cache
+_use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 
 # Persist
 # fast_mode=True if _use_mla_ps_kernel else False
 # intra_batch_mode=False if _use_mla_ps_kernel else True
 
-# fake non-ps
-fast_mode = False if _use_mla_ps_kernel else False
+# fake non-ps, intra_batch_mode needs to be True for non-ps-mode
+fast_mode = False
 intra_batch_mode = True if _use_mla_ps_kernel else False
 
 
@@ -1235,6 +1234,7 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
+            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
                 dtype = q.dtype
                 k_cache = k_cache.to(dtype)
@@ -1341,6 +1341,7 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
+            # TODO kkhuang-amd need to remove it when paged_attention_ragged support fp8-kv
             if self.kv_cache_dtype == fp8_dtype:
                 dtype = q.dtype
 
