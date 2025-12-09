@@ -8,6 +8,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Flag to log hidden_states size mismatch warning only once
+_hidden_states_mismatch_warned = False
+
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -404,10 +407,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         ):
             self.hidden_states[:num_tokens].copy_(forward_batch.spec_info.hidden_states)
         else:
-            logger.warning(
-                f"Skipping hidden_states copy due to size mismatch: "
-                f"expected {self.hidden_states.shape[1]}, got {forward_batch.spec_info.hidden_states.shape[1]}"
-            )
+            global _hidden_states_mismatch_warned
+            if not _hidden_states_mismatch_warned:
+                logger.warning(
+                    f"Skipping hidden_states copy due to size mismatch: "
+                    f"expected {self.hidden_states.shape[1]}, got {forward_batch.spec_info.hidden_states.shape[1]}"
+                )
+                _hidden_states_mismatch_warned = True
         if forward_batch.spec_info.accept_length is not None:
             self.accept_length[:raw_bs].copy_(forward_batch.spec_info.accept_length)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
