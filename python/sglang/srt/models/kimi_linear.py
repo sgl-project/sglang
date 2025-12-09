@@ -125,13 +125,11 @@ class KimiMoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
 
         shared_output = None
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024
 
         if (
             self.alt_stream is not None
             and self.num_shared_experts is not None
             and hidden_states.shape[0] > 0
-            and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             and get_is_capture_mode()
         ):
             current_stream = torch.cuda.current_stream()
