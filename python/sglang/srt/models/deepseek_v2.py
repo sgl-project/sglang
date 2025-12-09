@@ -105,6 +105,7 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
+    fp8_dtype,
     is_fp8_fnuz,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -188,7 +189,7 @@ if _use_aiter_gfx95:
     )
     from sglang.srt.layers.rocm_linear_utils import (
         aiter_dsv3_router_gemm,
-        fused_qk_rope_cat,
+        fused_qk_rope_cat_and_cache_mla,
         get_dsv3_gemm_output_zero_allocator_size,
     )
 
@@ -1839,7 +1840,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 current_stream.wait_stream(self.alt_stream)
             else:
                 if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, k_nope, *_ = fused_rms_mxfp4_quant(
+                    q, _, k_nope, *_ = fused_rms_mxfp4_quant(
                         q,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.variance_epsilon,
@@ -2006,6 +2007,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         topk_indices,
         llama_4_scaling,
     ):
+        save_kv_cache = True
+
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
             if self._fuse_rope_for_trtllm_mla(forward_batch):
@@ -2029,16 +2032,29 @@ class DeepseekV2AttentionMLA(nn.Module):
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
-                q, k = fused_qk_rope_cat(
+
+                kv_cache_dtype = (
+                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+                )
+
+                q, _, _, k = fused_qk_rope_cat_and_cache_mla(
                     q_nope_out,
                     q_pe,
                     k_nope,
                     k_pe,
+                    forward_batch.token_to_kv_pool.get_key_buffer(
+                        self.attn_mqa.layer_id
+                    ),
+                    forward_batch.out_cache_loc,
                     positions,
                     cos,
                     sin,
+                    self.attn_mqa.k_scale,
                     self.rotary_emb.is_neox_style,
+                    q_out_dtype=kv_cache_dtype,
                 )
+
+                save_kv_cache = False
             else:
                 q = torch.cat([q_nope_out, q_pe], dim=-1)
                 k = torch.cat([k_nope, k_pe], dim=-1)
@@ -2052,6 +2068,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 k,
                 k_nope,
                 forward_batch,
+                save_kv_cache=save_kv_cache,
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
