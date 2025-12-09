@@ -1519,7 +1519,6 @@ def add_prometheus_track_response_middleware(app):
 
         route = request.scope.get("route")
         endpoint = route.path if route else "Unknown"
-        print(f"hi middleware {request.scope=} {route=} {type(route)=}")
 
         http_response_status_counter.labels(
             endpoint=endpoint,
