@@ -1502,6 +1502,61 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
+def launch_metrics_server(host: str, port: int):
+    """Launch a separate metrics server on the specified port.
+
+    This function starts a lightweight HTTP server that serves only the
+    /metrics endpoint for Prometheus scraping on a dedicated port.
+    """
+    import asyncio
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    # Ensure PROMETHEUS_MULTIPROC_DIR is set BEFORE importing prometheus_client
+    # The multiprocess module checks for this env var at import time
+    if "PROMETHEUS_MULTIPROC_DIR" not in os.environ:
+        set_prometheus_multiproc_dir()
+
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    metrics_app = FastAPI()
+
+    # Create prometheus metrics endpoint
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
+    metrics_app.routes.append(metrics_route)
+
+    config = uvicorn.Config(
+        metrics_app,
+        host=host,
+        port=port,
+        timeout_keep_alive=5,
+        loop="auto",
+        log_config=None,
+        log_level="warning",
+    )
+    server = uvicorn.Server(config=config)
+
+    # Run server in a background daemon thread with its own event loop
+    def run_server():
+        try:
+            asyncio.run(server.serve())
+        except Exception as e:
+            logger.error(f"Metrics server failed to start: {e}")
+            raise
+        finally:
+            logger.info(f"Metrics server stopped at {host}:{port}")
+
+    thread = threading.Thread(target=run_server, daemon=True, name="metrics-server")
+    thread.start()
+    logger.info(f"Metrics server started in background thread at {host}:{port}")
+
+
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2371,7 +2426,7 @@ def configure_ipv6(dist_init_addr):
     return port, host
 
 
-def launch_dummy_health_check_server(host, port, enable_metrics):
+def launch_dummy_health_check_server(host, port, enable_metrics, metrics_port=None):
     import asyncio
 
     import uvicorn
@@ -2394,9 +2449,14 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         """Check the health of the http server."""
         return Response(status_code=200)
 
-    # Add prometheus middleware
+    # Add prometheus middleware or launch separate metrics server
     if enable_metrics:
-        add_prometheus_middleware(app)
+        if metrics_port is not None:
+            # Launch metrics on a separate port
+            launch_metrics_server(host, metrics_port)
+        else:
+            # Add metrics endpoint to the main server
+            add_prometheus_middleware(app)
         enable_func_timer()
 
     config = uvicorn.Config(
