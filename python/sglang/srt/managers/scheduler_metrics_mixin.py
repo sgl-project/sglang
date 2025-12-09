@@ -415,12 +415,21 @@ class SchedulerMetricsMixin:
             waiting_queues.append(self.disagg_decode_transfer_queue.queue)
             waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
 
+        # Running prefill requests are neither in waiting queues nor in running batch
+        running_prefill_reqs = []
+        if self.cur_batch.forward_mode.is_extend():
+            running_prefill_reqs = self.cur_batch.reqs
+
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
 
         return GetLoadReqOutput(
             dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
+            num_reqs=(
+                len(self.running_batch.reqs)
+                + num_waiting_reqs
+                + len(running_prefill_reqs)
+            ),
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
         )
