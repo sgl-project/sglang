@@ -1,13 +1,15 @@
+import itertools
+import unittest
 from typing import Optional
 
-import pytest
 import torch
-from sgl_kernel.scalar_type import ScalarType, scalar_types
+from sgl_kernel.scalar_type import scalar_types
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
+from sglang.test.test_utils import CustomTestCase
 
 set_global_server_args_for_scheduler(object.__new__(ServerArgs))
 
@@ -88,8 +90,6 @@ def torch_moe(
 
 
 def marlin_moe_generate_valid_test_cases():
-    import itertools
-
     m_list = [1, 123, 666]
     n_list = [128, 1024]
     k_list = [256, 2048]
@@ -139,233 +139,300 @@ def marlin_moe_generate_valid_test_cases():
     return cases
 
 
-@pytest.mark.parametrize(
-    ("m, n, k, e, topk, dtype, group_size," "act_order, quant_type, is_k_full"),
-    marlin_moe_generate_valid_test_cases(),
-)
-def test_fused_marlin_moe(
-    m: int,
-    n: int,
-    k: int,
-    e: int,
-    topk: int,
-    dtype: torch.dtype,
-    group_size: int,
-    act_order: bool,
-    quant_type: ScalarType,
-    is_k_full: bool,
-):
-    torch.manual_seed(0)
+class TestFusedMarlinMoe(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("This test requires a CUDA device.")
+        torch.set_default_device("cuda")
 
-    has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
+    def test_fused_marlin_moe(self):
+        test_cases = marlin_moe_generate_valid_test_cases()
 
-    if act_order:
-        if group_size == -1:
-            return
-        if group_size in (k, n):
-            return
-        if has_zp:
-            return
-    else:
-        if not is_k_full:
-            return
+        for (
+            m,
+            n,
+            k,
+            e,
+            topk,
+            dtype,
+            group_size,
+            act_order,
+            quant_type,
+            is_k_full,
+        ) in test_cases:
+            with self.subTest(
+                m=m,
+                n=n,
+                k=k,
+                e=e,
+                topk=topk,
+                dtype=dtype,
+                group_size=group_size,
+                act_order=act_order,
+                quant_type=quant_type,
+                is_k_full=is_k_full,
+            ):
+                torch.manual_seed(0)
 
-    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-    w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
-    w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
+                has_zp = quant_type in [scalar_types.uint4, scalar_types.uint8]
 
-    e_map = None
+                if act_order:
+                    if group_size == -1:
+                        continue
+                    if group_size in (k, n):
+                        continue
+                    if has_zp:
+                        continue
+                else:
+                    if not is_k_full:
+                        continue
 
-    w_ref1_l = []
-    qweight1_l = []
-    scales1_l = []
-    zeros1_l = []
-    g_idx1_l = []
-    sort_indices1_l = []
+                a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+                w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
+                w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
 
-    for i in range(w1.shape[0]):
-        if has_zp:
-            w_ref1, qweight1, scales1, zeros1 = awq_marlin_quantize(
-                w1[i].transpose(1, 0), quant_type, group_size
-            )
+                e_map = None
 
-            w_ref1_l.append(w_ref1.T)
-            qweight1_l.append(qweight1)
-            scales1_l.append(scales1)
-            zeros1_l.append(zeros1)
-        else:
-            test_perm = torch.randperm(k)
-            w_ref1, qweight1, scales1, g_idx1, sort_indices1, _ = marlin_quantize(
-                w1[i].transpose(1, 0), quant_type, group_size, act_order, test_perm
-            )
+                w_ref1_l = []
+                qweight1_l = []
+                scales1_l = []
+                zeros1_l = []
+                g_idx1_l = []
+                sort_indices1_l = []
 
-            w_ref1_l.append(w_ref1.T)
-            qweight1_l.append(qweight1)
-            scales1_l.append(scales1)
-            g_idx1_l.append(g_idx1)
-            sort_indices1_l.append(sort_indices1)
+                for i in range(w1.shape[0]):
+                    if has_zp:
+                        w_ref1, qweight1, scales1, zeros1 = awq_marlin_quantize(
+                            w1[i].transpose(1, 0), quant_type, group_size
+                        )
 
-    w_ref1 = stack_and_dev(w_ref1_l)
-    qweight1 = stack_and_dev(qweight1_l).contiguous()
-    scales1 = stack_and_dev(scales1_l)
-    g_idx1 = stack_and_dev(g_idx1_l) if g_idx1_l else None
-    zeros1 = stack_and_dev(zeros1_l) if zeros1_l else None
-    sort_indices1 = stack_and_dev(sort_indices1_l) if sort_indices1_l else None
+                        w_ref1_l.append(w_ref1.T)
+                        qweight1_l.append(qweight1)
+                        scales1_l.append(scales1)
+                        zeros1_l.append(zeros1)
+                    else:
+                        test_perm = torch.randperm(k)
+                        w_ref1, qweight1, scales1, g_idx1, sort_indices1, _ = (
+                            marlin_quantize(
+                                w1[i].transpose(1, 0),
+                                quant_type,
+                                group_size,
+                                act_order,
+                                test_perm,
+                            )
+                        )
 
-    w_ref2_l = []
-    qweight2_l = []
-    scales2_l = []
-    zeros2_l = []
-    g_idx2_l = []
-    sort_indices2_l = []
+                        w_ref1_l.append(w_ref1.T)
+                        qweight1_l.append(qweight1)
+                        scales1_l.append(scales1)
+                        g_idx1_l.append(g_idx1)
+                        sort_indices1_l.append(sort_indices1)
 
-    for i in range(w2.shape[0]):
-        if has_zp:
-            w_ref2, qweight2, scales2, zeros2 = awq_marlin_quantize(
-                w2[i].transpose(1, 0), quant_type, group_size
-            )
+                w_ref1 = stack_and_dev(w_ref1_l)
+                qweight1 = stack_and_dev(qweight1_l).contiguous()
+                scales1 = stack_and_dev(scales1_l)
+                g_idx1 = stack_and_dev(g_idx1_l) if g_idx1_l else None
+                zeros1 = stack_and_dev(zeros1_l) if zeros1_l else None
+                sort_indices1 = (
+                    stack_and_dev(sort_indices1_l) if sort_indices1_l else None
+                )
 
-            w_ref2_l.append(w_ref2.T)
-            qweight2_l.append(qweight2)
-            scales2_l.append(scales2)
-            zeros2_l.append(zeros2)
-        else:
-            test_perm = torch.randperm(n)
-            w_ref2, qweight2, scales2, g_idx2, sort_indices2, _ = marlin_quantize(
-                w2[i].transpose(1, 0), quant_type, group_size, act_order, test_perm
-            )
+                w_ref2_l = []
+                qweight2_l = []
+                scales2_l = []
+                zeros2_l = []
+                g_idx2_l = []
+                sort_indices2_l = []
 
-            w_ref2_l.append(w_ref2.T)
-            qweight2_l.append(qweight2)
-            scales2_l.append(scales2)
-            g_idx2_l.append(g_idx2)
-            sort_indices2_l.append(sort_indices2)
+                for i in range(w2.shape[0]):
+                    if has_zp:
+                        w_ref2, qweight2, scales2, zeros2 = awq_marlin_quantize(
+                            w2[i].transpose(1, 0), quant_type, group_size
+                        )
 
-    w_ref2 = stack_and_dev(w_ref2_l)
-    qweight2 = stack_and_dev(qweight2_l).contiguous()
-    scales2 = stack_and_dev(scales2_l)
-    g_idx2 = stack_and_dev(g_idx2_l) if g_idx2_l else None
-    zeros2 = stack_and_dev(zeros2_l) if zeros2_l else None
-    sort_indices2 = stack_and_dev(sort_indices2_l) if sort_indices2_l else None
+                        w_ref2_l.append(w_ref2.T)
+                        qweight2_l.append(qweight2)
+                        scales2_l.append(scales2)
+                        zeros2_l.append(zeros2)
+                    else:
+                        test_perm = torch.randperm(n)
+                        w_ref2, qweight2, scales2, g_idx2, sort_indices2, _ = (
+                            marlin_quantize(
+                                w2[i].transpose(1, 0),
+                                quant_type,
+                                group_size,
+                                act_order,
+                                test_perm,
+                            )
+                        )
 
-    score = torch.randn((m, e), device="cuda", dtype=dtype)
-    from sglang.srt.layers.moe.topk import fused_topk_torch_native
+                        w_ref2_l.append(w_ref2.T)
+                        qweight2_l.append(qweight2)
+                        scales2_l.append(scales2)
+                        g_idx2_l.append(g_idx2)
+                        sort_indices2_l.append(sort_indices2)
 
-    topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
+                w_ref2 = stack_and_dev(w_ref2_l)
+                qweight2 = stack_and_dev(qweight2_l).contiguous()
+                scales2 = stack_and_dev(scales2_l)
+                g_idx2 = stack_and_dev(g_idx2_l) if g_idx2_l else None
+                zeros2 = stack_and_dev(zeros2_l) if zeros2_l else None
+                sort_indices2 = (
+                    stack_and_dev(sort_indices2_l) if sort_indices2_l else None
+                )
 
-    torch_output = torch_moe(
-        a, w_ref1, w_ref2, score, topk, global_num_experts=e, expert_map=e_map
-    )
+                score = torch.randn((m, e), device="cuda", dtype=dtype)
+                from sglang.srt.layers.moe.topk import fused_topk_torch_native
 
-    marlin_output = fused_marlin_moe(
-        a,
-        qweight1,
-        qweight2,
-        scales1,
-        scales2,
-        score,
-        topk_weights,
-        topk_ids,
-        global_num_experts=e,
-        expert_map=e_map,
-        g_idx1=g_idx1,
-        g_idx2=g_idx2,
-        sort_indices1=sort_indices1,
-        sort_indices2=sort_indices2,
-        w1_zeros=zeros1,
-        w2_zeros=zeros2,
-        num_bits=4,
-        is_k_full=is_k_full,
-    )
+                topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
 
-    torch.testing.assert_close(marlin_output, torch_output, atol=5e-2, rtol=0)
+                torch_output = torch_moe(
+                    a,
+                    w_ref1,
+                    w_ref2,
+                    score,
+                    topk,
+                    global_num_experts=e,
+                    expert_map=e_map,
+                )
 
+                marlin_output = fused_marlin_moe(
+                    a,
+                    qweight1,
+                    qweight2,
+                    scales1,
+                    scales2,
+                    score,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts=e,
+                    expert_map=e_map,
+                    g_idx1=g_idx1,
+                    g_idx2=g_idx2,
+                    sort_indices1=sort_indices1,
+                    sort_indices2=sort_indices2,
+                    w1_zeros=zeros1,
+                    w2_zeros=zeros2,
+                    num_bits=4,
+                    is_k_full=is_k_full,
+                )
 
-@pytest.mark.parametrize("m", [1, 16, 128])
-@pytest.mark.parametrize("e", [8, 16])
-def test_fused_marlin_moe_expert_parallelism(m: int, e: int):
-    torch.manual_seed(100)
+                torch.testing.assert_close(
+                    marlin_output, torch_output, atol=5e-2, rtol=0
+                )
 
-    n, k = 256, 256
-    topk = 2
-    ep_size = 2
-    group_size = 128
-    dtype = torch.bfloat16
-    quant_type = scalar_types.uint4b8
+    def test_fused_marlin_moe_expert_parallelism(self):
+        m_list = [1, 16, 128]
+        e_list = [8, 16]
 
-    local_e = e // ep_size
-    e_ids = torch.arange(local_e, device="cuda", dtype=torch.int32)
-    e_map = torch.full((e,), -1, device="cuda", dtype=torch.int32)
-    e_map[e_ids] = torch.arange(local_e, device="cuda", dtype=torch.int32)
+        for m in m_list:
+            for e in e_list:
+                with self.subTest(m=m, e=e):
+                    torch.manual_seed(100)
 
-    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-    w1_full = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
-    w2_full = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
+                    n, k = 256, 256
+                    topk = 2
+                    ep_size = 2
+                    group_size = 128
+                    dtype = torch.bfloat16
+                    quant_type = scalar_types.uint4b8
 
-    score = torch.randn((m, e), device="cuda", dtype=dtype)
-    score[:, e_ids] += 10.0
+                    local_e = e // ep_size
+                    e_ids = torch.arange(local_e, device="cuda", dtype=torch.int32)
+                    e_map = torch.full((e,), -1, device="cuda", dtype=torch.int32)
+                    e_map[e_ids] = torch.arange(
+                        local_e, device="cuda", dtype=torch.int32
+                    )
 
-    w1 = w1_full[e_ids]
-    w2 = w2_full[e_ids]
+                    a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+                    w1_full = (
+                        torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
+                    )
+                    w2_full = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
 
-    w_ref1_l, qweight1_l, scales1_l = [], [], []
-    for i in range(local_e):
-        test_perm = torch.randperm(k)
-        w_ref1, qweight1, scales1, _, _, _ = marlin_quantize(
-            w1[i].transpose(1, 0), quant_type, group_size, False, test_perm
-        )
-        w_ref1_l.append(w_ref1.T)
-        qweight1_l.append(qweight1)
-        scales1_l.append(scales1)
+                    score = torch.randn((m, e), device="cuda", dtype=dtype)
+                    score[:, e_ids] += 10.0
 
-    w_ref2_l, qweight2_l, scales2_l = [], [], []
-    for i in range(local_e):
-        test_perm = torch.randperm(n)
-        w_ref2, qweight2, scales2, _, _, _ = marlin_quantize(
-            w2[i].transpose(1, 0), quant_type, group_size, False, test_perm
-        )
-        w_ref2_l.append(w_ref2.T)
-        qweight2_l.append(qweight2)
-        scales2_l.append(scales2)
+                    w1 = w1_full[e_ids]
+                    w2 = w2_full[e_ids]
 
-    w_ref1 = stack_and_dev(w_ref1_l)
-    qweight1 = stack_and_dev(qweight1_l).contiguous()
-    scales1 = stack_and_dev(scales1_l)
+                    w_ref1_l, qweight1_l, scales1_l = [], [], []
+                    for i in range(local_e):
+                        test_perm = torch.randperm(k)
+                        w_ref1, qweight1, scales1, _, _, _ = marlin_quantize(
+                            w1[i].transpose(1, 0),
+                            quant_type,
+                            group_size,
+                            False,
+                            test_perm,
+                        )
+                        w_ref1_l.append(w_ref1.T)
+                        qweight1_l.append(qweight1)
+                        scales1_l.append(scales1)
 
-    w_ref2 = stack_and_dev(w_ref2_l)
-    qweight2 = stack_and_dev(qweight2_l).contiguous()
-    scales2 = stack_and_dev(scales2_l)
+                    w_ref2_l, qweight2_l, scales2_l = [], [], []
+                    for i in range(local_e):
+                        test_perm = torch.randperm(n)
+                        w_ref2, qweight2, scales2, _, _, _ = marlin_quantize(
+                            w2[i].transpose(1, 0),
+                            quant_type,
+                            group_size,
+                            False,
+                            test_perm,
+                        )
+                        w_ref2_l.append(w_ref2.T)
+                        qweight2_l.append(qweight2)
+                        scales2_l.append(scales2)
 
-    from sglang.srt.layers.moe.topk import fused_topk_torch_native
+                    w_ref1 = stack_and_dev(w_ref1_l)
+                    qweight1 = stack_and_dev(qweight1_l).contiguous()
+                    scales1 = stack_and_dev(scales1_l)
 
-    topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
+                    w_ref2 = stack_and_dev(w_ref2_l)
+                    qweight2 = stack_and_dev(qweight2_l).contiguous()
+                    scales2 = stack_and_dev(scales2_l)
 
-    w_ref1_full = w1_full.clone()
-    w_ref2_full = w2_full.clone()
-    w_ref1_full[e_ids] = w_ref1
-    w_ref2_full[e_ids] = w_ref2
+                    from sglang.srt.layers.moe.topk import fused_topk_torch_native
 
-    torch_output = torch_moe(
-        a, w_ref1_full, w_ref2_full, score, topk, global_num_experts=e, expert_map=e_map
-    )
+                    topk_weights, topk_ids = fused_topk_torch_native(
+                        a, score, topk, False
+                    )
 
-    marlin_output = fused_marlin_moe(
-        a,
-        qweight1,
-        qweight2,
-        scales1,
-        scales2,
-        score,
-        topk_weights,
-        topk_ids,
-        global_num_experts=e,
-        expert_map=e_map,
-        num_bits=4,
-        is_k_full=True,
-    )
+                    w_ref1_full = w1_full.clone()
+                    w_ref2_full = w2_full.clone()
+                    w_ref1_full[e_ids] = w_ref1
+                    w_ref2_full[e_ids] = w_ref2
 
-    torch.testing.assert_close(marlin_output, torch_output, atol=5e-2, rtol=0)
+                    torch_output = torch_moe(
+                        a,
+                        w_ref1_full,
+                        w_ref2_full,
+                        score,
+                        topk,
+                        global_num_experts=e,
+                        expert_map=e_map,
+                    )
+
+                    marlin_output = fused_marlin_moe(
+                        a,
+                        qweight1,
+                        qweight2,
+                        scales1,
+                        scales2,
+                        score,
+                        topk_weights,
+                        topk_ids,
+                        global_num_experts=e,
+                        expert_map=e_map,
+                        num_bits=4,
+                        is_k_full=True,
+                    )
+
+                    torch.testing.assert_close(
+                        marlin_output, torch_output, atol=5e-2, rtol=0
+                    )
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    unittest.main(verbosity=2)
