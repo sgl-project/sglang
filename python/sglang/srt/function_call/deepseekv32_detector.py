@@ -72,15 +72,24 @@ class DeepSeekV32Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<｜DSML｜function_calls>"
         self.eot_token = "</｜DSML｜function_calls>"
+
         self.invoke_begin_regex = r'<｜DSML｜invoke\s+name="([^"]+)"\s*>'
         self.invoke_end_token = "</｜DSML｜invoke>"
+        self.invoke_end_token_prefixes = [
+            "<",
+            "</",
+            "</｜DSML｜",
+            "</｜DSML｜inv",
+            "</｜DSML｜invoke",
+        ]
+
         self.xml_parameter_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</｜DSML｜parameter>'
         self._last_arguments = ""
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
-        return self.bot_token in text
+        return self.bot_token in text or "<｜DSML｜invoke" in text
 
     def _parse_parameters_from_xml(self, invoke_content: str) -> dict:
         """
@@ -129,13 +138,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return invoke_content_stripped, "json"
 
         # 2. check xml format
-        xml_param_regex = r'<｜DSML｜parameter\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)(</｜DSML｜parameter>|$)'
-        xml_param_matches = re.findall(xml_param_regex, invoke_content, re.DOTALL)
+        xml_param_matches = re.findall(
+            self.xml_parameter_regex, invoke_content, re.DOTALL
+        )
         parameters_str = "{"  # convert xml to json str
-        for param_name, param_type, param_value, is_param_end in xml_param_matches:
+        for i, (param_name, param_type, param_value) in enumerate(xml_param_matches):
             # Convert value based on type
             if param_type == "true":  # string type
-                parameters_str += f'"{param_name}": "{param_value}'
+                parameters_str += f'"{param_name}": "{param_value.strip()}"'
             else:
                 # Try to parse as JSON for other types
                 try:
@@ -143,10 +153,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         f'"{param_name}": {json.loads(param_value.strip())}'
                     )
                 except (json.JSONDecodeError, ValueError):
-                    parameters_str += f'"{param_name}": "{param_value.strip()}'
-            if is_param_end:
-                parameters_str += '"'
-
+                    parameters_str += f'"{param_name}": "{param_value.strip()}"'
+            if i < len(xml_param_matches) - 1:
+                parameters_str += ", "
         return parameters_str, "xml"
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -206,13 +215,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self._buffer += new_text
         current_text = self._buffer
 
-        # Check if we have a tool call or any DSML-related content
-        # Key insight: DSML tags contain distinctive markers like "｜DSML｜"
-        # If we see these markers anywhere, we should keep buffering
-        has_tool_call = (
-            self.bot_token in current_text or "<｜DSML｜invoke" in current_text
-        )
-
         # Check if buffer contains any DSML markers or ends with potential tag prefix
         # This handles partial/streaming DSML content
         dsml_markers = ["｜DSML｜", "<｜", "</｜"]
@@ -224,7 +226,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
         )
 
-        if not has_tool_call and not potentially_dsml and not ends_with_prefix:
+        if (
+            not self.has_tool_call(current_text)
+            and not potentially_dsml
+            and not ends_with_prefix
+        ):
             self._buffer = ""
             for e_token in [self.eot_token, self.invoke_end_token]:
                 if e_token in new_text:
@@ -248,10 +254,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
                 func_name = invoke_match.group(1).strip()
                 invoke_content = invoke_match.group(2)
+
+                if any(
+                    invoke_content.endswith(end)
+                    for end in self.invoke_end_token_prefixes
+                ):
+                    break
+
                 # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
                 is_tool_end = bool(invoke_match.group(3))
 
+                print(f"\033[42m {current_text=} \033[0m")
                 print(f"\033[42m {func_name=} {invoke_content=} {is_tool_end=} \033[0m")
+                print("-" * 80)
                 func_args_raw, format = self._parse_parameters_partially(invoke_content)
                 # print(f"\033[42m {func_args_raw=} \033[0m")
                 if is_tool_end and format == "xml":
@@ -269,6 +284,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     self.streamed_args_for_tool.append("")
 
                 if not self.current_tool_name_sent:
+                    # send tool name first
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -300,7 +316,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                             self.current_tool_id
                         ] += argument_diff
 
-                    if _is_complete_json(func_args_raw):
+                    if _is_complete_json(func_args_raw) and is_tool_end:
                         # Update the stored arguments
                         try:
                             parsed_args = json.loads(func_args_raw)
@@ -310,12 +326,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         except json.JSONDecodeError:
                             pass
 
-                        if is_tool_end:
-                            # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[invoke_match.end(3) :]
-                            print(f"\033[41m send over, clear buffer \033[0m")
-                        else:
-                            self._buffer = ""
+                        # Remove the completed tool call from buffer, keep any remaining content
+                        self._buffer = current_text[invoke_match.end(3) :]
+                        current_text = self._buffer
+                        print(f"\033[41m send over, clear buffer \033[0m")
 
                         # reset state
                         self.current_tool_id += 1
@@ -323,6 +337,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self.current_tool_name_sent = False
 
                 if not is_tool_end:
+                    # if current tool is not end, it means the following content is definitely not a tool call
+                    # so break the loop
                     break
 
             # No more invoke blocks found

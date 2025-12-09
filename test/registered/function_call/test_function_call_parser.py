@@ -1124,6 +1124,9 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV32Detector()
+        from transformers import AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-V3.2")
 
     def test_detect_and_parse_xml_format(self):
         """Test parsing standard XML format (DSML)"""
@@ -1201,17 +1204,20 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         text = """<｜DSML｜function_calls>
             <｜DSML｜invoke name="get_favorite_tourist_spot">
                 <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
+                <｜DSML｜parameter name="second" string="true">London</｜DSML｜parameter>
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [input_ids[i : i + 5] for i in range(0, len(input_ids), 5)]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
-        accumulated_calls = []
         tool_calls_by_index = {}
 
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for call in result.calls:
+                print(f"\033[41m {call=} \033[0m")
                 if call.tool_index is not None:
                     if call.tool_index not in tool_calls_by_index:
                         tool_calls_by_index[call.tool_index] = {
@@ -1234,6 +1240,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         try:
             params = json.loads(tool_calls_by_index[0]["parameters"])
             self.assertEqual(params["city"], "San Francisco")
+            print(f"\033[41m {params=} \033[0m")
         except json.JSONDecodeError:
             # In streaming XML, parameters might be constructed differently or incrementally
             pass
@@ -1248,13 +1255,16 @@ class TestDeepSeekV32Detector(unittest.TestCase):
             </｜DSML｜invoke>
         </｜DSML｜function_calls>"""
 
-        chunks = [text[i : i + 5] for i in range(0, len(text), 5)]
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [input_ids[i : i + 5] for i in range(0, len(input_ids), 5)]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
 
         tool_calls_by_index = {}
 
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for call in result.calls:
+                print(f"\033[41m {call=} \033[0m")
                 if call.tool_index is not None:
                     if call.tool_index not in tool_calls_by_index:
                         tool_calls_by_index[call.tool_index] = {
