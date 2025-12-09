@@ -343,9 +343,7 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
-        return F.layer_norm(
-            x, (self.hidden_size,), self.weight, self.bias, self.variance_epsilon
-        )
+        return self.forward_native(x)
 
     def forward_cpu(
         self,

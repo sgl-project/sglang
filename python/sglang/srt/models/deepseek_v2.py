@@ -984,8 +984,8 @@ class DeepseekV2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
-            if not self._fuse_shared_experts_inside_sbo:
+            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
+            if not sbo_enabled_flag:
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -1114,7 +1114,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             hidden_states.shape[0] > 0
-            and not self._fuse_shared_experts_inside_sbo
+            and not sbo_enabled_flag
             and self.alt_stream is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
@@ -1277,7 +1277,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
-        self.alt_stream = alt_stream
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
@@ -3003,7 +3002,7 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.stream() if _is_cuda or _is_npu else None
+        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_npu else None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,

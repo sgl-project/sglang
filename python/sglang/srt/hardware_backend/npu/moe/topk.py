@@ -49,7 +49,9 @@ def fused_topk_npu(
             group_select_mode=1,
             renorm=0,
             norm_type=1,
-            routed_scaling_factor=1,
+            routed_scaling_factor=(
+                1 if renormalize else topk_config.routed_scaling_factor
+            ),
             eps=float(1e-20),
         )
 
