@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
@@ -21,7 +22,6 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.piecewise_cuda_graph_runner import use_original_ca_comm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
@@ -36,6 +36,59 @@ _is_npu = is_npu()
 # TODO(mick): nccl
 # cuda_ipc: for intranode tensor sharing
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
+
+
+_GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
+_BUFFER_OFFSET = 0
+
+
+def init_feature_buffer(device):
+    global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET
+    if (
+        device == "cpu"
+        or envs.SGLANG_MM_BUFFER_SIZE_MB.get() == 0
+        or _GPU_FEATURE_BUFFER is not None
+    ):
+        return
+    try:
+        size_mb = envs.SGLANG_MM_BUFFER_SIZE_MB.get()
+        num_elements = int(size_mb * 1024 * 1024 / 4)
+        _GPU_FEATURE_BUFFER = torch.empty(
+            num_elements, dtype=torch.float32, device=device
+        )
+        logger.info(f"Preallocated {size_mb}MB GPU buffer")
+    except RuntimeError as e:
+        _GPU_FEATURE_BUFFER = None
+
+
+def reset_buffer_offset():
+    global _BUFFER_OFFSET
+    _BUFFER_OFFSET = 0
+
+
+def is_feature_buffer_initialized():
+    global _GPU_FEATURE_BUFFER
+    if _GPU_FEATURE_BUFFER is None:
+        return False
+    return True
+
+
+def try_add_to_buffer(tensor: torch.Tensor) -> Optional[torch.Tensor]:
+    global _BUFFER_OFFSET
+
+    if _GPU_FEATURE_BUFFER is None:
+        return tensor
+
+    tensor_size = tensor.numel()
+
+    if _BUFFER_OFFSET + tensor_size <= _GPU_FEATURE_BUFFER.numel():
+        buffer_view = _GPU_FEATURE_BUFFER[_BUFFER_OFFSET : _BUFFER_OFFSET + tensor_size]
+        buffer_view.copy_(tensor.flatten(), non_blocking=True)
+        result = buffer_view.view(tensor.shape)
+        _BUFFER_OFFSET += tensor_size
+        return result
+    else:
+        return tensor
 
 
 class TransportProxyTensor(torch.Tensor):
@@ -660,6 +713,10 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
+    # Lazy import to allow some monkey patch of piecewise_cuda_graph_runner
+    from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+        use_original_ca_comm,
+    )
 
     tp_group = get_tp_group()
 
