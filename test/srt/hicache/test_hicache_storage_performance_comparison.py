@@ -232,20 +232,10 @@ class TestHiCacheFilePerformanceComparison(unittest.TestCase):
         self, storage: HiCacheFile, keys: List[str], host_indices: torch.Tensor
     ) -> float:
         """Measure batch_set_v1 performance (matching cache_controller logic)."""
-        # Clear batch chunk files first (new format: {key}_batch_{count}_chunk_{idx}.bin)
-        batch_size = int(os.getenv("SGLANG_HICACHE_FILE_BATCH_SIZE", "4"))
-        num_batches = (len(keys) + batch_size - 1) // batch_size
-        suffixed_key = storage._get_suffixed_key(keys[0])
-
-        # Clear all possible chunk files
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(keys))
-            batch_count = end_idx - start_idx
-            batch_file_path = os.path.join(
-                self.test_dir,
-                f"{suffixed_key}_batch_{batch_count}_chunk_{batch_idx}.bin",
-            )
+        # Clear batch files first (format: {suffixed_key}.batch.bin)
+        for key in keys:
+            suffixed_key = storage._get_suffixed_key(key)
+            batch_file_path = os.path.join(self.test_dir, f"{suffixed_key}.batch.bin")
             if os.path.exists(batch_file_path):
                 os.remove(batch_file_path)
 
@@ -253,14 +243,9 @@ class TestHiCacheFilePerformanceComparison(unittest.TestCase):
         storage.batch_set_v1(keys=keys, host_indices=host_indices)
 
         # Clear files for measurement
-        for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(keys))
-            batch_count = end_idx - start_idx
-            batch_file_path = os.path.join(
-                self.test_dir,
-                f"{suffixed_key}_batch_{batch_count}_chunk_{batch_idx}.bin",
-            )
+        for key in keys:
+            suffixed_key = storage._get_suffixed_key(key)
+            batch_file_path = os.path.join(self.test_dir, f"{suffixed_key}.batch.bin")
             if os.path.exists(batch_file_path):
                 os.remove(batch_file_path)
 
