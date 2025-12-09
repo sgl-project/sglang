@@ -362,9 +362,9 @@ class ModelConfig:
                 )
                 scaling_factor = self.hf_config.rope_scaling.get("factor")
                 print(f"364 {scaling_factor=}", flush=True)
-                if scaling_factor is not None:
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
