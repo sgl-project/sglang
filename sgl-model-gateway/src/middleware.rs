@@ -1,8 +1,10 @@
 use std::{
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
@@ -13,6 +15,8 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use http_body::Frame;
 use rand::Rng;
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
@@ -35,6 +39,75 @@ use crate::{
         types::WasmComponentInput,
     },
 };
+
+/// A body wrapper that holds a token and returns it when the body is fully consumed or dropped.
+/// This ensures that for streaming responses, the token is only returned after the entire
+/// stream has been sent to the client.
+pub struct TokenGuardBody {
+    inner: Body,
+    /// The token bucket to return tokens to. Uses Option so we can take() on drop.
+    token_bucket: Option<Arc<TokenBucket>>,
+    /// Number of tokens to return.
+    tokens: f64,
+}
+
+impl TokenGuardBody {
+    /// Create a new TokenGuardBody that will return tokens when dropped.
+    pub fn new(inner: Body, token_bucket: Arc<TokenBucket>, tokens: f64) -> Self {
+        Self {
+            inner,
+            token_bucket: Some(token_bucket),
+            tokens,
+        }
+    }
+}
+
+impl Drop for TokenGuardBody {
+    fn drop(&mut self) {
+        if let Some(bucket) = self.token_bucket.take() {
+            let tokens = self.tokens;
+            debug!(
+                "TokenGuardBody: stream ended, returning {} tokens to bucket",
+                tokens
+            );
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    bucket.return_tokens(tokens).await;
+                });
+            } else {
+                // Runtime not available (e.g., during shutdown)
+                // Tokens will be lost, but this is acceptable during shutdown
+                warn!(
+                    "TokenGuardBody: Cannot return {} tokens - no Tokio runtime available",
+                    tokens
+                );
+            }
+        }
+    }
+}
+
+impl http_body::Body for TokenGuardBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // SAFETY: We never move the inner body, and Body is Unpin
+        // (it's a type alias for UnsyncBoxBody which is Unpin)
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -152,14 +225,10 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
+    type Future =
+        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
@@ -496,10 +565,12 @@ pub async fn concurrency_limit_middleware(
         debug!("Acquired token immediately");
         let response = next.run(request).await;
 
-        // Return the token to the bucket
-        token_bucket.return_tokens(1.0).await;
-
-        response
+        // Wrap the response body with TokenGuardBody to return token when stream ends
+        // This ensures that for streaming responses, the token is only returned
+        // after the entire stream has been sent to the client.
+        let (parts, body) = response.into_parts();
+        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        Response::from_parts(parts, Body::new(guarded_body))
     } else {
         // No tokens available, try to queue if enabled
         if let Some(queue_tx) = &app_state.concurrency_queue_tx {
@@ -535,10 +606,10 @@ pub async fn concurrency_limit_middleware(
 
                             let response = next.run(request).await;
 
-                            // Return the token to the bucket
-                            token_bucket.return_tokens(1.0).await;
-
-                            response
+                            // Wrap the response body with TokenGuardBody to return token when stream ends
+                            let (parts, body) = response.into_parts();
+                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
                             warn!("Queue returned error status: {}", status);
