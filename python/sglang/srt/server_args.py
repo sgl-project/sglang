@@ -170,6 +170,15 @@ MOE_RUNNER_BACKEND_CHOICES = [
 
 MOE_A2A_BACKEND_CHOICES = ["none", "deepep", "mooncake", "ascend_fuseep"]
 
+FP8_GEMM_RUNNER_BACKEND_CHOICES = [
+    "auto",
+    "deep_gemm",
+    "flashinfer_trtllm",
+    "cutlass",
+    "triton",
+    "aiter",
+]
+
 MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16"]
 
 
@@ -196,6 +205,10 @@ def add_grammar_backend_choices(choices):
 
 def add_moe_runner_backend_choices(choices):
     MOE_RUNNER_BACKEND_CHOICES.extend(choices)
+
+
+def add_fp8_gemm_runner_backend_choices(choices):
+    FP8_GEMM_RUNNER_BACKEND_CHOICES.extend(choices)
 
 
 def add_deterministic_attention_backend_choices(choices):
@@ -380,6 +393,7 @@ class ServerArgs:
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
+    fp8_gemm_runner_backend: str = "auto"
     nsa_prefill_backend: str = "flashmla_sparse"
     nsa_decode_backend: str = "fa3"
     enable_flashinfer_autotune: bool = False
@@ -2951,6 +2965,22 @@ class ServerArgs:
             default=ServerArgs.nsa_decode_backend,
             type=str,
             choices=NSA_CHOICES,
+        )
+        parser.add_argument(
+            "--fp8-gemm-backend",
+            type=str,
+            choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
+            default=ServerArgs.fp8_gemm_runner_backend,
+            dest="fp8_gemm_runner_backend",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. "
+            "Options: 'auto' (default, auto-selects based on hardware), "
+            "'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), "
+            "'flashinfer_trtllm' (optimal for Blackwell and low-latency), "
+            "'cutlass' (optimal for Hopper/Blackwell GPUs and high-throughput), "
+            "'triton' (fallback, widely compatible), "
+            "'aiter' (ROCm only). "
+            "NOTE: This replaces the deprecated environment variables "
+            "SGLANG_ENABLE_FLASHINFER_FP8_GEMM and SGLANG_SUPPORT_CUTLASS_BLOCK_FP8.",
         )
         parser.add_argument(
             "--enable-flashinfer-autotune",

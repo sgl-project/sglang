@@ -65,6 +65,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BaseBatchReq,
@@ -304,6 +305,9 @@ class Scheduler(
 
         # Init moe config
         self.init_moe_config()
+
+        # Init GEMM config (FP8 GEMM, etc.)
+        self.init_gemm_config()
 
         # Check whether overlap can be enabled
         if not self.is_generation:
@@ -965,6 +969,12 @@ class Scheduler(
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
+
+    def init_gemm_config(self):
+        # Initialize GEMM-related configuration (currently FP8 Blockwise GEMM backend).
+        # Other GEMM backends (e.g. FP4, BF16, etc.) can be added here in the future.
+        # This is needed for FP8 quantization.
+        initialize_fp8_gemm_config(self.server_args)
 
     @DynamicGradMode()
     def event_loop_normal(self):
