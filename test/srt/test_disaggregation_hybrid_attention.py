@@ -1,8 +1,6 @@
-import os
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.environ import envs
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_disaggregation_utils import TestDisaggregationBase
 from sglang.test.test_utils import (

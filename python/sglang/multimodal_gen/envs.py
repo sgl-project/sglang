@@ -12,29 +12,52 @@ import diffusers
 import torch
 from packaging import version
 
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    SGL_DIFFUSION_RINGBUFFER_WARNING_INTERVAL: int = 60
-    SGL_DIFFUSION_NCCL_SO_PATH: str | None = None
+    SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL: int = 60
+    SGLANG_DIFFUSION_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     LOCAL_RANK: int = 0
     CUDA_VISIBLE_DEVICES: str | None = None
-    SGL_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
-    SGL_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
-    SGL_DIFFUSION_CONFIGURE_LOGGING: int = 1
-    SGL_DIFFUSION_LOGGING_LEVEL: str = "INFO"
-    SGL_DIFFUSION_LOGGING_PREFIX: str = ""
-    SGL_DIFFUSION_LOGGING_CONFIG_PATH: str | None = None
-    SGL_DIFFUSION_TRACE_FUNCTION: int = 0
-    SGL_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
-    SGL_DIFFUSION_TARGET_DEVICE: str = "cuda"
+    SGLANG_DIFFUSION_CACHE_ROOT: str = os.path.expanduser("~/.cache/sgl_diffusion")
+    SGLANG_DIFFUSION_CONFIG_ROOT: str = os.path.expanduser("~/.config/sgl_diffusion")
+    SGLANG_DIFFUSION_CONFIGURE_LOGGING: int = 1
+    SGLANG_DIFFUSION_LOGGING_LEVEL: str = "INFO"
+    SGLANG_DIFFUSION_LOGGING_PREFIX: str = ""
+    SGLANG_DIFFUSION_LOGGING_CONFIG_PATH: str | None = None
+    SGLANG_DIFFUSION_TRACE_FUNCTION: int = 0
+    SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD: str = "fork"
+    SGLANG_DIFFUSION_TARGET_DEVICE: str = "cuda"
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
     CMAKE_BUILD_TYPE: str | None = None
     VERBOSE: bool = False
-    SGL_DIFFUSION_SERVER_DEV_MODE: bool = False
-    SGL_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
+    SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    # cache-dit env vars (primary transformer)
+    SGLANG_CACHE_DIT_ENABLED: bool = False
+    SGLANG_CACHE_DIT_FN: int = 1
+    SGLANG_CACHE_DIT_BN: int = 0
+    SGLANG_CACHE_DIT_WARMUP: int = 4
+    SGLANG_CACHE_DIT_RDT: float = 0.24
+    SGLANG_CACHE_DIT_MC: int = 3
+    SGLANG_CACHE_DIT_TAYLORSEER: bool = False
+    SGLANG_CACHE_DIT_TS_ORDER: int = 1
+    SGLANG_CACHE_DIT_SCM_PRESET: str = "none"
+    SGLANG_CACHE_DIT_SCM_COMPUTE_BINS: str | None = None
+    SGLANG_CACHE_DIT_SCM_CACHE_BINS: str | None = None
+    SGLANG_CACHE_DIT_SCM_POLICY: str = "dynamic"
+    # cache-dit env vars (secondary transformer, e.g., Wan2.2 low-noise expert)
+    SGLANG_CACHE_DIT_SECONDARY_FN: int = 1
+    SGLANG_CACHE_DIT_SECONDARY_BN: int = 0
+    SGLANG_CACHE_DIT_SECONDARY_WARMUP: int = 4
+    SGLANG_CACHE_DIT_SECONDARY_RDT: float = 0.24
+    SGLANG_CACHE_DIT_SECONDARY_MC: int = 3
+    SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER: bool = False
+    SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
 
 
 def _is_hip():
@@ -163,10 +186,10 @@ def maybe_convert_int(value: str | None) -> int | None:
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
-    # Target device of sgl-diffusion, supporting [cuda (by default),
+    # Target device of sglang-diffusion, supporting [cuda (by default),
     # rocm, neuron, cpu, openvino]
-    "SGL_DIFFUSION_TARGET_DEVICE": lambda: os.getenv(
-        "SGL_DIFFUSION_TARGET_DEVICE", "cuda"
+    "SGLANG_DIFFUSION_TARGET_DEVICE": lambda: os.getenv(
+        "SGLANG_DIFFUSION_TARGET_DEVICE", "cuda"
     ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
@@ -176,10 +199,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
     "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS", None),
     # If set, sgl_diffusion will use precompiled binaries (*.so)
-    "SGL_DIFFUSION_USE_PRECOMPILED": lambda: bool(
-        os.environ.get("SGL_DIFFUSION_USE_PRECOMPILED")
+    "SGLANG_DIFFUSION_USE_PRECOMPILED": lambda: bool(
+        os.environ.get("SGLANG_DIFFUSION_USE_PRECOMPILED")
     )
-    or bool(os.environ.get("SGL_DIFFUSION_PRECOMPILED_WHEEL_LOCATION")),
+    or bool(os.environ.get("SGLANG_DIFFUSION_PRECOMPILED_WHEEL_LOCATION")),
     # CMake build type
     # If not set, defaults to "Debug" or "RelWithDebInfo"
     # Available options: "Debug", "Release", "RelWithDebInfo"
@@ -191,36 +214,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Note that this not only affects how sgl_diffusion finds its configuration files
     # during runtime, but also affects how sgl_diffusion installs its configuration
     # files during **installation**.
-    "SGL_DIFFUSION_CONFIG_ROOT": lambda: os.path.expanduser(
+    "SGLANG_DIFFUSION_CONFIG_ROOT": lambda: os.path.expanduser(
         os.getenv(
-            "SGL_DIFFUSION_CONFIG_ROOT",
+            "SGLANG_DIFFUSION_CONFIG_ROOT",
             os.path.join(get_default_config_root(), "sgl_diffusion"),
         )
     ),
     # ================== Runtime Env Vars ==================
     # Root directory for FASTVIDEO cache files
     # Defaults to `~/.cache/sgl_diffusion` unless `XDG_CACHE_HOME` is set
-    "SGL_DIFFUSION_CACHE_ROOT": lambda: os.path.expanduser(
+    "SGLANG_DIFFUSION_CACHE_ROOT": lambda: os.path.expanduser(
         os.getenv(
-            "SGL_DIFFUSION_CACHE_ROOT",
+            "SGLANG_DIFFUSION_CACHE_ROOT",
             os.path.join(get_default_cache_root(), "sgl_diffusion"),
         )
     ),
     # Interval in seconds to log a warning message when the ring buffer is full
-    "SGL_DIFFUSION_RINGBUFFER_WARNING_INTERVAL": lambda: int(
-        os.environ.get("SGL_DIFFUSION_RINGBUFFER_WARNING_INTERVAL", "60")
+    "SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL": lambda: int(
+        os.environ.get("SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL", "60")
     ),
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
-    "SGL_DIFFUSION_NCCL_SO_PATH": lambda: os.environ.get(
-        "SGL_DIFFUSION_NCCL_SO_PATH", None
+    "SGLANG_DIFFUSION_NCCL_SO_PATH": lambda: os.environ.get(
+        "SGLANG_DIFFUSION_NCCL_SO_PATH", None
     ),
-    # when `SGL_DIFFUSION_NCCL_SO_PATH` is not set, sgl_diffusion will try to find the nccl
+    # when `SGLANG_DIFFUSION_NCCL_SO_PATH` is not set, sgl_diffusion will try to find the nccl
     # library file in the locations specified by `LD_LIBRARY_PATH`
     "LD_LIBRARY_PATH": lambda: os.environ.get("LD_LIBRARY_PATH", None),
     # Internal flag to enable Dynamo fullgraph capture
-    "SGL_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE": lambda: bool(
-        os.environ.get("SGL_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE", "1") != "0"
+    "SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE": lambda: bool(
+        os.environ.get("SGLANG_DIFFUSION_TEST_DYNAMO_FULLGRAPH_CAPTURE", "1") != "0"
     ),
     # local rank of the process in the distributed setting, used to determine
     # the GPU device id
@@ -228,62 +251,146 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # used to control the visible devices in the distributed setting
     "CUDA_VISIBLE_DEVICES": lambda: os.environ.get("CUDA_VISIBLE_DEVICES", None),
     # timeout for each iteration in the engine
-    "SGL_DIFFUSION_ENGINE_ITERATION_TIMEOUT_S": lambda: int(
-        os.environ.get("SGL_DIFFUSION_ENGINE_ITERATION_TIMEOUT_S", "60")
+    "SGLANG_DIFFUSION_ENGINE_ITERATION_TIMEOUT_S": lambda: int(
+        os.environ.get("SGLANG_DIFFUSION_ENGINE_ITERATION_TIMEOUT_S", "60")
     ),
     # Logging configuration
     # If set to 0, sgl_diffusion will not configure logging
     # If set to 1, sgl_diffusion will configure logging using the default configuration
-    #    or the configuration file specified by SGL_DIFFUSION_LOGGING_CONFIG_PATH
-    "SGL_DIFFUSION_CONFIGURE_LOGGING": lambda: int(
-        os.getenv("SGL_DIFFUSION_CONFIGURE_LOGGING", "1")
+    #    or the configuration file specified by SGLANG_DIFFUSION_LOGGING_CONFIG_PATH
+    "SGLANG_DIFFUSION_CONFIGURE_LOGGING": lambda: int(
+        os.getenv("SGLANG_DIFFUSION_CONFIGURE_LOGGING", "1")
     ),
-    "SGL_DIFFUSION_LOGGING_CONFIG_PATH": lambda: os.getenv(
-        "SGL_DIFFUSION_LOGGING_CONFIG_PATH"
+    "SGLANG_DIFFUSION_LOGGING_CONFIG_PATH": lambda: os.getenv(
+        "SGLANG_DIFFUSION_LOGGING_CONFIG_PATH"
     ),
     # this is used for configuring the default logging level
-    "SGL_DIFFUSION_LOGGING_LEVEL": lambda: os.getenv(
-        "SGL_DIFFUSION_LOGGING_LEVEL", "INFO"
+    "SGLANG_DIFFUSION_LOGGING_LEVEL": lambda: os.getenv(
+        "SGLANG_DIFFUSION_LOGGING_LEVEL", "INFO"
     ),
-    # if set, SGL_DIFFUSION_LOGGING_PREFIX will be prepended to all log messages
-    "SGL_DIFFUSION_LOGGING_PREFIX": lambda: os.getenv(
-        "SGL_DIFFUSION_LOGGING_PREFIX", ""
+    # if set, SGLANG_DIFFUSION_LOGGING_PREFIX will be prepended to all log messages
+    "SGLANG_DIFFUSION_LOGGING_PREFIX": lambda: os.getenv(
+        "SGLANG_DIFFUSION_LOGGING_PREFIX", ""
     ),
     # Trace function calls
     # If set to 1, sgl_diffusion will trace function calls
     # Useful for debugging
-    "SGL_DIFFUSION_TRACE_FUNCTION": lambda: int(
-        os.getenv("SGL_DIFFUSION_TRACE_FUNCTION", "0")
+    "SGLANG_DIFFUSION_TRACE_FUNCTION": lambda: int(
+        os.getenv("SGLANG_DIFFUSION_TRACE_FUNCTION", "0")
     ),
     # Path to the attention configuration file. Only used for sliding tile
     # attention for now.
-    "SGL_DIFFUSION_ATTENTION_CONFIG": lambda: (
+    "SGLANG_DIFFUSION_ATTENTION_CONFIG": lambda: (
         None
-        if os.getenv("SGL_DIFFUSION_ATTENTION_CONFIG", None) is None
-        else os.path.expanduser(os.getenv("SGL_DIFFUSION_ATTENTION_CONFIG", "."))
+        if os.getenv("SGLANG_DIFFUSION_ATTENTION_CONFIG", None) is None
+        else os.path.expanduser(os.getenv("SGLANG_DIFFUSION_ATTENTION_CONFIG", "."))
     ),
     # Use dedicated multiprocess context for workers.
     # Both spawn and fork work
-    "SGL_DIFFUSION_WORKER_MULTIPROC_METHOD": lambda: os.getenv(
-        "SGL_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
+    "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD": lambda: os.getenv(
+        "SGLANG_DIFFUSION_WORKER_MULTIPROC_METHOD", "fork"
     ),
     # Enables torch profiler if set. Path to the directory where torch profiler
     # traces are saved. Note that it must be an absolute path.
-    "SGL_DIFFUSION_TORCH_PROFILER_DIR": lambda: (
+    "SGLANG_DIFFUSION_TORCH_PROFILER_DIR": lambda: (
         None
-        if os.getenv("SGL_DIFFUSION_TORCH_PROFILER_DIR", None) is None
-        else os.path.expanduser(os.getenv("SGL_DIFFUSION_TORCH_PROFILER_DIR", "."))
+        if os.getenv("SGLANG_DIFFUSION_TORCH_PROFILER_DIR", None) is None
+        else os.path.expanduser(os.getenv("SGLANG_DIFFUSION_TORCH_PROFILER_DIR", "."))
     ),
     # If set, sgl_diffusion will run in development mode, which will enable
     # some additional endpoints for developing and debugging,
     # e.g. `/reset_prefix_cache`
-    "SGL_DIFFUSION_SERVER_DEV_MODE": lambda: bool(
-        int(os.getenv("SGL_DIFFUSION_SERVER_DEV_MODE", "0"))
+    "SGLANG_DIFFUSION_SERVER_DEV_MODE": lambda: get_bool_env_var(
+        "SGLANG_DIFFUSION_SERVER_DEV_MODE"
     ),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
-    "SGL_DIFFUSION_STAGE_LOGGING": lambda: bool(
-        int(os.getenv("SGL_DIFFUSION_STAGE_LOGGING", "0"))
+    "SGLANG_DIFFUSION_STAGE_LOGGING": lambda: get_bool_env_var(
+        "SGLANG_DIFFUSION_STAGE_LOGGING"
+    ),
+    # ================== cache-dit Env Vars ==================
+    # Enable cache-dit acceleration for DiT inference
+    "SGLANG_CACHE_DIT_ENABLED": lambda: get_bool_env_var("SGLANG_CACHE_DIT_ENABLED"),
+    # Number of first blocks to always compute (DBCache F parameter)
+    "SGLANG_CACHE_DIT_FN": lambda: int(os.getenv("SGLANG_CACHE_DIT_FN", "1")),
+    # Number of last blocks to always compute (DBCache B parameter)
+    "SGLANG_CACHE_DIT_BN": lambda: int(os.getenv("SGLANG_CACHE_DIT_BN", "0")),
+    # Warmup steps before caching (DBCache W parameter)
+    "SGLANG_CACHE_DIT_WARMUP": lambda: int(os.getenv("SGLANG_CACHE_DIT_WARMUP", "4")),
+    # Residual difference threshold (DBCache R parameter)
+    "SGLANG_CACHE_DIT_RDT": lambda: float(os.getenv("SGLANG_CACHE_DIT_RDT", "0.24")),
+    # Maximum continuous cached steps (DBCache MC parameter)
+    "SGLANG_CACHE_DIT_MC": lambda: int(os.getenv("SGLANG_CACHE_DIT_MC", "3")),
+    # Enable TaylorSeer calibrator
+    "SGLANG_CACHE_DIT_TAYLORSEER": lambda: get_bool_env_var(
+        "SGLANG_CACHE_DIT_TAYLORSEER", default="false"
+    ),
+    # TaylorSeer order (1 or 2)
+    "SGLANG_CACHE_DIT_TS_ORDER": lambda: int(
+        os.getenv("SGLANG_CACHE_DIT_TS_ORDER", "1")
+    ),
+    # SCM preset: none, slow, medium, fast, ultra
+    "SGLANG_CACHE_DIT_SCM_PRESET": lambda: os.getenv(
+        "SGLANG_CACHE_DIT_SCM_PRESET", "none"
+    ),
+    # SCM custom compute bins (e.g., "8,3,3,2,2")
+    "SGLANG_CACHE_DIT_SCM_COMPUTE_BINS": lambda: os.getenv(
+        "SGLANG_CACHE_DIT_SCM_COMPUTE_BINS", None
+    ),
+    # SCM custom cache bins (e.g., "1,2,2,2,3")
+    "SGLANG_CACHE_DIT_SCM_CACHE_BINS": lambda: os.getenv(
+        "SGLANG_CACHE_DIT_SCM_CACHE_BINS", None
+    ),
+    # SCM policy: dynamic or static
+    "SGLANG_CACHE_DIT_SCM_POLICY": lambda: os.getenv(
+        "SGLANG_CACHE_DIT_SCM_POLICY", "dynamic"
+    ),
+    # ================== cache-dit Secondary Transformer Env Vars ==================
+    # For dual-transformer models like Wan2.2 (high-noise + low-noise experts)
+    # These parameters configure the secondary transformer (transformer_2)
+    # If not set, they inherit from the primary transformer settings
+    # Number of first blocks to always compute for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_FN": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_FN", os.getenv("SGLANG_CACHE_DIT_FN", "1")
+        )
+    ),
+    # Number of last blocks to always compute for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_BN": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_BN", os.getenv("SGLANG_CACHE_DIT_BN", "0")
+        )
+    ),
+    # Warmup steps before caching for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_WARMUP": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_WARMUP",
+            os.getenv("SGLANG_CACHE_DIT_WARMUP", "4"),
+        )
+    ),
+    # Residual difference threshold for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_RDT": lambda: float(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_RDT", os.getenv("SGLANG_CACHE_DIT_RDT", "0.24")
+        )
+    ),
+    # Maximum continuous cached steps for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_MC": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_MC", os.getenv("SGLANG_CACHE_DIT_MC", "3")
+        )
+    ),
+    # Enable TaylorSeer for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER": lambda: get_bool_env_var(
+        "SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER",
+        default=os.getenv("SGLANG_CACHE_DIT_TAYLORSEER", "false"),
+    ),
+    # TaylorSeer order for secondary transformer
+    "SGLANG_CACHE_DIT_SECONDARY_TS_ORDER": lambda: int(
+        os.getenv(
+            "SGLANG_CACHE_DIT_SECONDARY_TS_ORDER",
+            os.getenv("SGLANG_CACHE_DIT_TS_ORDER", "1"),
+        )
     ),
 }
 

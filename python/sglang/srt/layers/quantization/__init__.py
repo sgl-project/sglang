@@ -35,10 +35,11 @@ from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config
 from sglang.srt.layers.quantization.qoq import QoQConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
 from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.utils import is_cuda, is_hip, mxfp_supported
+from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
 
 _is_mxfp_supported = mxfp_supported()
 
@@ -65,24 +66,24 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "w4afp8": W4AFp8Config,
     "petit_nvfp4": PetitNvFp4Config,
     "fbgemm_fp8": FBGEMMFp8Config,
+    "quark": QuarkConfig,
     "auto-round": AutoRoundConfig,
 }
 
 
-if is_cuda():
+if is_cuda() or (_is_mxfp_supported and is_hip()):
     BASE_QUANTIZATION_METHODS.update(
         {
-            "quark": Mxfp4Config,
             "mxfp4": Mxfp4Config,
         }
     )
-elif _is_mxfp_supported and is_hip():
-    from sglang.srt.layers.quantization.quark.quark import QuarkConfig
+
+if is_npu():
+    from sglang.srt.hardware_backend.npu.quantization.modelslim import ModelSlimConfig
 
     BASE_QUANTIZATION_METHODS.update(
         {
-            "quark": QuarkConfig,
-            "mxfp4": Mxfp4Config,
+            "modelslim": ModelSlimConfig,
         }
     )
 

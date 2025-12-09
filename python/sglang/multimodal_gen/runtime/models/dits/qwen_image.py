@@ -14,7 +14,7 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
@@ -282,14 +282,14 @@ class QwenImageCrossAttention(nn.Module):
         self.norm_added_k = RMSNorm(head_dim, eps=eps)
 
         # Scaled dot product attention
-        self.attn = LocalAttention(
+        self.attn = USPAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
             supported_attention_backends={
-                AttentionBackendEnum.FA3,
+                AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
             },
         )
@@ -301,7 +301,7 @@ class QwenImageCrossAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         **cross_attention_kwargs,
     ):
-        seq_txt = encoder_hidden_states.shape[1]
+        seq_len_txt = encoder_hidden_states.shape[1]
 
         # Compute QKV for image stream (sample projections)
         img_query, _ = self.to_q(hidden_states)
@@ -366,8 +366,8 @@ class QwenImageCrossAttention(nn.Module):
         joint_hidden_states = joint_hidden_states.to(joint_query.dtype)
 
         # Split attention outputs back
-        txt_attn_output = joint_hidden_states[:, :seq_txt, :]  # Text part
-        img_attn_output = joint_hidden_states[:, seq_txt:, :]  # Image part
+        txt_attn_output = joint_hidden_states[:, :seq_len_txt, :]  # Text part
+        img_attn_output = joint_hidden_states[:, seq_len_txt:, :]  # Image part
 
         # Apply output projections
         img_attn_output, _ = self.to_out[0](img_attn_output)
@@ -568,7 +568,6 @@ class QwenImageTransformer2DModel(CachableDiT):
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         timestep: torch.LongTensor = None,
-        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
         txt_seq_lens: Optional[List[int]] = None,
         freqs_cis: tuple[torch.Tensor, torch.Tensor] = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed

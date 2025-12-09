@@ -27,7 +27,7 @@ class FlashAttention2Backend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "FA3"
+        return "FA"
 
     @staticmethod
     def get_impl_cls() -> type["FlashAttention2Impl"]:

@@ -8,24 +8,12 @@ from unittest.mock import patch
 
 import torch
 import torch.fx as fx
+from sgl_kernel import weak_ref_tensor
 
-import sglang.srt.compilation.weak_ref_tensor_jit  # noqa: F401
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 
 logger = logging.getLogger(__name__)
-
-
-def weak_ref_tensor(tensor: Any) -> Any:
-    """
-    Create a weak reference to a tensor.
-    The new tensor will share the same data as the original tensor,
-    but will not keep the original tensor alive.
-    """
-    if isinstance(tensor, torch.Tensor):
-        # TODO(yuwei): introduce weak_ref_tensor from sgl_kernel
-        return torch.ops.jit_weak_ref_tensor.weak_ref_tensor(tensor)
-    return tensor
 
 
 def weak_ref_tensors(
@@ -108,8 +96,6 @@ class CUDAPiecewiseBackend:
 
         self.sym_shape_indices = sym_shape_indices
 
-        self.is_debugging_mode = True
-
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
         self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}
@@ -173,10 +159,11 @@ class CUDAPiecewiseBackend:
                 entry.num_finished_warmup += 1
                 return entry.runnable(*args)
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
-            entry.input_addresses = input_addresses
+            if self.compile_config.get_enable_debug_mode():
+                input_addresses = [
+                    x.data_ptr() for x in args if isinstance(x, torch.Tensor)
+                ]
+                entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
             with ExitStack() as stack:
@@ -214,7 +201,7 @@ class CUDAPiecewiseBackend:
             # manage the memory during cuda graph capture
             return output
 
-        if self.is_debugging_mode:
+        if self.compile_config.get_enable_debug_mode():
             # check if the input addresses are the same
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)

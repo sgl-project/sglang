@@ -3,7 +3,10 @@ import itertools
 
 import torch
 import triton
-from sgl_kernel import scaled_fp4_grouped_quant, silu_and_mul_scaled_fp4_grouped_quant
+from flashinfer import (
+    scaled_fp4_grouped_quantize,
+    silu_and_mul_scaled_nvfp4_experts_quantize,
+)
 from sgl_kernel.elementwise import silu_and_mul
 
 from sglang.srt.layers import deep_gemm_wrapper
@@ -14,11 +17,11 @@ def _test_accuracy_once(E, M, K, input_dtype, device):
     x = torch.randn(E, M, K, device=device, dtype=input_dtype)
     glb_scales = torch.ones((E,), dtype=torch.float32, device=device)
     masks = torch.full((E,), M, dtype=torch.int32, device=device)
-    out, blk_scales = silu_and_mul_scaled_fp4_grouped_quant(x, glb_scales, masks)
-    out1, blk_scales1 = scaled_fp4_grouped_quant(
+    out, blk_scales = silu_and_mul_scaled_nvfp4_experts_quantize(x, masks, glb_scales)
+    out1, blk_scales1 = scaled_fp4_grouped_quantize(
         silu_and_mul(x),
-        glb_scales,
         masks,
+        glb_scales,
     )
 
     torch.testing.assert_close(out, out1)
@@ -87,19 +90,19 @@ def benchmark(M, K, provider):
         )
     if provider == "cuda_unfused_fp4":
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            lambda: scaled_fp4_grouped_quant(
+            lambda: scaled_fp4_grouped_quantize(
                 silu_and_mul(x),
-                glb_scales,
                 masks,
+                glb_scales,
             ),
             quantiles=quantiles,
         )
     if provider == "cuda_fused_fp4":
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
-            lambda: silu_and_mul_scaled_fp4_grouped_quant(
+            lambda: silu_and_mul_scaled_nvfp4_experts_quantize(
                 x,
-                glb_scales,
                 masks,
+                glb_scales,
             ),
             quantiles=quantiles,
         )

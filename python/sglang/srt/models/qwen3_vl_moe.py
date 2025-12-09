@@ -22,10 +22,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_rank,
-)
+from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -127,34 +124,16 @@ def load_fused_expert_weights(
     param = params_dict[name]
     # weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
     weight_loader = param.weight_loader
-    ep_rank = get_tensor_model_parallel_rank()
-    ep_size = get_moe_expert_parallel_world_size()
-    if ep_size == 1:
-        for expert_id in range(num_experts):
-            curr_expert_weight = loaded_weight[expert_id]
-            weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                expert_id,
-            )
-    else:
-        experts_per_ep = num_experts // ep_size
-        start_expert = ep_rank * experts_per_ep
-        end_expert = (
-            (ep_rank + 1) * experts_per_ep if ep_rank != ep_size - 1 else num_experts
+    # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
+    for expert_id in range(num_experts):
+        curr_expert_weight = loaded_weight[expert_id]
+        weight_loader(
+            param,
+            curr_expert_weight,
+            name,
+            shard_id,
+            expert_id,
         )
-
-        for idx, expert_id in enumerate(range(start_expert, end_expert)):
-            curr_expert_weight = loaded_weight[expert_id]
-            weight_loader(
-                param,
-                curr_expert_weight,
-                name,
-                shard_id,
-                idx,
-            )
     return True
 
 
@@ -347,6 +326,14 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         #         for layer_id in range(self.start_layer, self.end_layer)
         #         if isinstance(self.model.layers[layer_id].mlp, Qwen3MoeSparseMoeBlock)
         #     }
+
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.text_config.num_hidden_layers,
+            num_logical_experts=config.text_config.num_experts,
+            num_groups=None,
+        )
 
 
 EntryClass = Qwen3VLMoeForConditionalGeneration

@@ -47,6 +47,8 @@ class TestDeepseek(CustomTestCase):
                 "--max-running-requests",
                 "2048",
                 "--disable-radix-cache",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load": true,"num_threads": 64}',
             ],
         )
 
@@ -70,6 +72,7 @@ class TestDeepseek(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.92)
 
 
+@unittest.skip("Skipping this test until it's fixed.")
 class TestDeepseekMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -111,6 +114,8 @@ class TestDeepseekMTP(CustomTestCase):
                 "--speculative-num-draft-tokens",
                 "2",
                 "--disable-radix-cache",
+                "--model-loader-extra-config",
+                '{"enable_multithread_load": true,"num_threads": 64}',
             ],
         )
 

@@ -1,22 +1,23 @@
-name: Release Docker Images (Ascend NPU)
+name: Release Docker Images (NPU)
 on:
   push:
-    tags:
-      - "*" # Trigger on all tags and filterred by pep440 later
-  workflow_dispatch:
+    tags-ignore:
+      - "gateway-*" # Exclude gateway/router tags
+      - "router-*" # Exclude router tags
   pull_request:
     branches:
       - main
     paths:
       - ".github/workflows/release-docker-npu.yml"
       - "docker/npu.Dockerfile"
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
-        cann_version: ["8.2.rc1"]
+        cann_version: ["8.3.rc2"]
         device_type: ["910b", "a3"]
     steps:
       - name: Checkout repository
@@ -69,6 +70,6 @@ jobs:
           push: ${{ github.repository == 'sgl-project/sglang' && github.event_name != 'pull_request' }}
           provenance: false
           build-args: |
-            SGLANG_KERNEL_NPU_TAG=20251030
+            SGLANG_KERNEL_NPU_TAG=20251206
             CANN_VERSION=${{ matrix.cann_version }}
             DEVICE_TYPE=${{ matrix.device_type }}

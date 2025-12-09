@@ -7,6 +7,7 @@ from transformers import AutoConfig
 from transformers import __version__ as TRANSFORMERS_VERSION
 
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -76,7 +77,7 @@ num_tokens_list = [11, 8192]
     ],
 )
 @pytest.mark.parametrize("tp_size", [1, 2])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
 def test_mrope(
     model_name: str,
@@ -85,6 +86,8 @@ def test_mrope(
     dtype: torch.dtype,
     num_tokens: int,
 ):
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
     atol = model_info.atol
     rtol = model_info.rtol
 
@@ -124,7 +127,7 @@ def test_mrope(
         num_tokens, num_heads, num_kv_heads, head_dim, max_position, dtype, device
     )
 
-    query_native, key_native = mrope_helper_class.forward_native(
+    query_native, key_native = mrope_helper_class._forward_native(
         positions,
         query.clone(),
         key.clone(),

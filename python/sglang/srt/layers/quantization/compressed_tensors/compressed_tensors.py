@@ -91,7 +91,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.sparsity_ignore_list = sparsity_ignore_list
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
-        # FP8 config for linear layers, compressed tensor currently does not support block fp8, this is used for ktransformers
         self.linear_fp8_config = linear_fp8_config
 
     def get_linear_method(self) -> CompressedTensorsLinearMethod:
@@ -140,6 +139,15 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             return CompressedTensorsMoEMethod.get_moe_method(self, layer, prefix)
+        return None
+
+    @property
+    def weight_block_size(self) -> Optional[List[int]]:
+        """Get the weight block size from the quantization config."""
+        if "Linear" in self.target_scheme_map:
+            weights_config = self.target_scheme_map["Linear"].get("weights")
+            if weights_config and hasattr(weights_config, "block_structure"):
+                return weights_config.block_structure
         return None
 
     @classmethod
@@ -306,7 +314,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Only symmetric weight quantization supported.
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
 
-    def _is_fp8_w8a8(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
+    def _is_fp8_w8a8(
+        self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
         # Confirm weights and activations quantized.
         if weight_quant is None or input_quant is None:
             return False
@@ -318,15 +328,16 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         is_symmetric_weight = weight_quant.symmetric
         is_static_weight = not weight_quant.dynamic
-        is_per_tensor_or_channel_weight = weight_quant.strategy in [
+        is_tensor_or_channel_or_block_weight = weight_quant.strategy in [
             QuantizationStrategy.TENSOR,
             QuantizationStrategy.CHANNEL,
+            QuantizationStrategy.BLOCK,
         ]
         if not (
             is_floating_point
             and is_symmetric_weight
             and is_static_weight
-            and is_per_tensor_or_channel_weight
+            and is_tensor_or_channel_or_block_weight
         ):
             return False
 
@@ -406,7 +417,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                 )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
-                        strategy=weight_quant.strategy,
+                        weight_quant=weight_quant,
                         is_static_input_scheme=(
                             input_quant and not input_quant.dynamic
                         ),
@@ -608,6 +619,7 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: CompressedTensorsConfig):
         self.quantization_config = quantization_config
+        self.quant_config = quantization_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)

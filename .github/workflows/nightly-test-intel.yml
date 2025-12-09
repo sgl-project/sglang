@@ -1,0 +1,26 @@
+name: Nightly Test (Intel)
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - "python/sglang/version.py"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-test-intel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Placeholder for Intel GPU tests
+  # Add Intel-specific nightly test workflows here when available
+
+  placeholder:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "Intel nightly tests will be added here"

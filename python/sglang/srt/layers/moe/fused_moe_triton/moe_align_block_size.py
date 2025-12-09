@@ -69,11 +69,6 @@ def moe_align_block_size(
         (num_experts + 2,), dtype=torch.int32, device=topk_ids.device
     )
 
-    # Threshold based on benchmark results
-    fuse_sorted_ids_padding = sorted_ids.shape[0] <= 4096
-    if not fuse_sorted_ids_padding:
-        sorted_ids.fill_(topk_ids.numel())
-
     sgl_moe_align_block_size(
         topk_ids,
         num_experts + 1,
@@ -82,6 +77,6 @@ def moe_align_block_size(
         expert_ids,
         num_tokens_post_pad,
         cumsum_buffer,
-        fuse_sorted_ids_padding,
+        True,
     )
     return sorted_ids, expert_ids, num_tokens_post_pad

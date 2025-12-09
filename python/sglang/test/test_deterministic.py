@@ -151,7 +151,10 @@ def send_single(
 
     if profile:
         run_profile(
-            base_url, profile_steps, ["CPU", "GPU"], None, None, profile_by_stage
+            url=base_url,
+            num_steps=profile_steps,
+            activities=["CPU", "GPU"],
+            profile_by_stage=profile_by_stage,
         )
 
     response = requests.post(
@@ -325,32 +328,66 @@ class TokenIdsAndLogprobs:
 
     @classmethod
     def compare(cls, a: "TokenIdsAndLogprobs", b: "TokenIdsAndLogprobs"):
+        import numpy as np
+
         assert len(a.token_ids) == len(b.token_ids)
         token_match = a.token_ids == b.token_ids
         logprobs_match = a.logprobs == b.logprobs
 
         if token_match:
-            print(f"Token match: {a.token_ids}")
+            print(f"✅ Token match")
         else:
-            print(f"❗Token mismatch: {a.token_ids=} {b.token_ids=}")
+            print(f"❌ Token mismatch: {a.token_ids=} {b.token_ids=}")
 
         if logprobs_match:
-            print(f"Logprobs match:", a.logprobs)
+            print(f"✅ Logprobs match:", a.logprobs[:5])
         else:
-            print(f"❗Logprobs mismatch")
+            print(f"❌ Logprobs mismatch")
+            # Only print first 5 elements for readability
+            n_show = 5
+            a_show = a.logprobs[:n_show]
+            b_show = b.logprobs[:n_show]
             print(
                 "    A:   ",
-                [f"{x:.10f}" if x is not None else "None" for x in a.logprobs],
+                [f"{x:.10f}" if x is not None else "None" for x in a_show],
+                f"... ({len(a.logprobs)} total)" if len(a.logprobs) > n_show else "",
             )
             print(
                 "    B:   ",
-                [f"{x:.10f}" if x is not None else "None" for x in b.logprobs],
+                [f"{x:.10f}" if x is not None else "None" for x in b_show],
+                f"... ({len(b.logprobs)} total)" if len(b.logprobs) > n_show else "",
             )
             diff = [
                 abs(x - y) if x is not None else float("nan")
                 for x, y in zip(a.logprobs, b.logprobs)
             ]
-            print("    Diff:", [f"{x:.10e}" for x in diff])
+            print(
+                "    Diff:",
+                [f"{x:.10e}" for x in diff[:n_show]],
+                f"... ({len(diff)} total)" if len(diff) > n_show else "",
+            )
+
+            # Compute KL-divergence using K3 approximation
+            # KL(P||Q) ≈ (exp(log(P) - log(Q)) - 1) - (log(P) - log(Q))
+            # This is based on selected token logprobs only
+            valid_pairs = [
+                (lp_a, lp_b)
+                for lp_a, lp_b in zip(a.logprobs, b.logprobs)
+                if lp_a is not None and lp_b is not None
+            ]
+            if valid_pairs and token_match:
+                logprobs_a = np.array([lp for lp, _ in valid_pairs])
+                logprobs_b = np.array([lp for _, lp in valid_pairs])
+
+                # K3 approximation: KL(A||B) ≈ (exp(logr) - 1) - logr, where logr = log_a - log_b
+                logr = logprobs_a - logprobs_b
+                kl_per_token = (np.exp(logr) - 1) - logr
+                kl_mean = np.mean(kl_per_token)
+                kl_max = np.max(kl_per_token)
+
+                print(f"    KL(A||B) mean: {kl_mean:.10e}")
+                print(f"    KL(A||B) max : {kl_max:.10e}")
+                print(f"    Mean absolute logprob diff: {np.mean(np.abs(logr)):.10e}")
 
         return token_match and logprobs_match
 
