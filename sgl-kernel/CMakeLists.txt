@@ -333,6 +333,7 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/memory/store.cu"
+    "csrc/memory/allocator.cu"
     "csrc/kvcacheio/transfer.cu"
 
     "csrc/speculative/eagle_utils.cu"

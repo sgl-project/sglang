@@ -484,17 +484,14 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        alloc_extend_kernel[(bs,)](
+        torch.ops.sgl_kernel.allocate_extend(
             prefix_lens,
             seq_lens,
-            last_loc,
+            last_loc.to(torch.long),
             self.free_pages,
             out_indices,
-            next_power_of_2(bs),
             self.page_size,
-            self.seen_max_num_extend_tokens_next_power_of_2,
         )
-
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
@@ -525,12 +522,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel[(bs,)](
+        torch.ops.sgl_kernel.allocate_decode(
             seq_lens,
-            last_loc,
+            last_loc.to(torch.long),
             self.free_pages,
             out_indices,
-            next_power_of_2(bs),
             self.page_size,
         )
 

@@ -101,6 +101,14 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("topk_softmax", torch::kCUDA, &topk_softmax);
 
   /*
+   * From csrc/memory
+   */
+  m.def("allocate_decode(Tensor seq_lens, Tensor k_cache, Tensor free_page, Tensor! out_loc, int page_size) -> ()");
+  m.impl("allocate_decode", &allocate_decode);
+  m.def("allocate_extend(Tensor pre_lens, Tensor seq_lens, Tensor last_loc, Tensor free_page, Tensor! out_loc, int page_size) -> ()");
+  m.impl("allocate_extend", &allocate_extend);
+
+  /*
    * From csrc/speculative
    */
   m.def(
