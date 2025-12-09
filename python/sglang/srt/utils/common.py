@@ -1517,15 +1517,16 @@ def _register_promethus_middleware_counter(app):
 
     @app.middleware("http")
     async def track_http_status_code(request, call_next):
-        endpoint = request.url.path
-        method = request.method
-
         response = await call_next(request)
+
+        route = request.scope.get("route")
+        endpoint = route.path if route else "Unknown"
+        print(f"hi middleware {request.scope=} {route=} {type(route)=}")
 
         http_response_status_counter.labels(
             endpoint=endpoint,
             status_code=str(response.status_code),
-            method=method,
+            method=request.method,
         ).inc()
 
         return response
