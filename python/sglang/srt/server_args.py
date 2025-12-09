@@ -1195,21 +1195,22 @@ class ServerArgs:
             )
             self.disable_radix_cache = True
         elif model_arch in ["NemotronHForCausalLM"]:
-            if self.model_config.quantization in [
+            model_config = self.get_model_config()
+            if model_config.quantization in [
                 "modelopt",
                 "modelopt_fp8",
                 "modelopt_fp4",
             ]:
-                assert self.model_config.hf_config.mlp_hidden_act == "relu2"
-                if self.model_config.quantization == "modelopt":
+                assert model_config.hf_config.mlp_hidden_act == "relu2"
+                if model_config.quantization == "modelopt":
                     self.quantization = (
                         "modelopt_fp4"
-                        if self.model_config.hf_config.quantization_config["quant_algo"]
+                        if model_config.hf_config.quantization_config["quant_algo"]
                         == "NVFP4"
                         else "modelopt_fp8"
                     )
                 else:
-                    self.quantization = self.model_config.quantization
+                    self.quantization = model_config.quantization
                 self.moe_runner_backend = "flashinfer_cutlass"
         elif model_arch in [
             "Qwen3MoeForCausalLM",
