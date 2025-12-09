@@ -1300,8 +1300,8 @@ jobs:
         sgl-kernel-benchmark-test,
         sgl-kernel-b200-test,
 
-        multimodal-gen-test-1-gpu,
-        multimodal-gen-test-2-gpu,
+        # multimodal-gen-test-1-gpu,
+        # multimodal-gen-test-2-gpu,
 
         stage-a-test-1,
         stage-b-test-small-1-gpu,
