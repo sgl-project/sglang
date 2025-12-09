@@ -18,6 +18,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -37,7 +38,10 @@ except ImportError:
     )
 
 from sglang.srt.configs.model_config import AttentionArch
-USING_PRESHUFFLE_LAYOUT = True
+
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER")
+USING_PRESHUFFLE_LAYOUT = _use_aiter and get_bool_env_var("SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT")
+
 import triton
 import triton.language as tl
 
