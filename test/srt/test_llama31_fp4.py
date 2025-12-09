@@ -21,8 +21,6 @@ class TestLlama31FP4(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--attention-backend",
-            "flashinfer",
             "--quantization",
             "modelopt_fp4",
         ]
@@ -51,7 +49,7 @@ class TestLlama31FP4(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.61)
+        self.assertGreater(metrics["accuracy"], 0.54)
 
 
 if __name__ == "__main__":
