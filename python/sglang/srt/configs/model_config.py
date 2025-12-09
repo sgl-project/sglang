@@ -80,6 +80,16 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def handle_rope_parameters(config: PretrainedConfig):
+    if hasattr(config, "rope_scaling"):
+        rope_scaling = config.rope_scaling
+        if isinstance(rope_scaling, dict):
+            for k, v in rope_scaling.items():
+                if not hasattr(config, k):
+                    setattr(config, k, v)
+    return
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -129,6 +139,8 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        handle_rope_parameters(self.hf_text_config)
+        handle_rope_parameters(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -989,6 +1001,7 @@ multimodal_model_archs = [
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
+    "PaddleOCRVLForConditionalGeneration",
 ]
 
 if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
