@@ -138,18 +138,17 @@ class DmdDenoisingStage(DenoisingStage):
         prompt_embeds = prepared_vars["prompt_embeds"]
 
         # Warmup
-        if server_args.enable_warmup:
-            self._warmup(
-                batch,
-                server_args,
-                latents,
-                timesteps[0:1],
-                target_dtype,
-                autocast_enabled,
-                image_kwargs,
-                pos_cond_kwargs,
-                prompt_embeds,
-            )
+        self.warmup(
+            batch,
+            server_args,
+            latents=latents,
+            first_timestep=timesteps[0:1],
+            target_dtype=target_dtype,
+            autocast_enabled=autocast_enabled,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            prompt_embeds=prompt_embeds,
+        )
 
         denoising_loop_start_time = time.time()
         self.start_profile(batch=batch)

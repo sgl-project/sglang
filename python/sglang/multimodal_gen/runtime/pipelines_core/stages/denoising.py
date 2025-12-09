@@ -147,7 +147,7 @@ class DenoisingStage(PipelineStage):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
-        
+
     def torch_compile_module(self, module):
         """
         Compile a module's forward with torch.compile, and enable inductor overlap tweak if available.
@@ -167,7 +167,6 @@ class DenoisingStage(PipelineStage):
         compiled_forward = torch.compile(getattr(module, "forward"), mode=mode)
         setattr(module, "forward", compiled_forward)
         return module
-
 
     def _maybe_enable_cache_dit(self, num_inference_steps: int) -> None:
         """Enable cache-dit on the transformers if configured (idempotent).
@@ -1033,8 +1032,7 @@ class DenoisingStage(PipelineStage):
         trajectory_latents: list[torch.Tensor] = []
 
         # Warmup
-        if server_args.enable_warmup:
-            self._warmup(batch, server_args, prepared_vars)
+        self.warmup(batch, server_args, prepared_vars=prepared_vars)
 
         # Run denoising loop
         denoising_start_time = time.time()
@@ -1168,11 +1166,23 @@ class DenoisingStage(PipelineStage):
             func: The function to prepare kwargs for.
             kwargs: The kwargs to prepare.
         """
+        import functools
+
         extra_step_kwargs = {}
+        # Handle cache-dit's partial wrapping logic.
+        # Cache-dit wraps the forward method with functools.partial where args[0] is the instance.
+        # We access `_original_forward` if available to inspect the underlying signature.
+        # See: https://github.com/vipshop/cache-dit
+        if isinstance(func, functools.partial) and func.args:
+            func = getattr(func.args[0], "_original_forward", func)
+
+        # Unwrap any decorators (e.g. functools.wraps)
+        target_func = inspect.unwrap(func)
         accepted_params: set[str] = set()
         # Try to inspect the callable directly
         try:
             accepted_params |= set(inspect.signature(func).parameters.keys())
+            accepted_params |= set(inspect.signature(target_func).parameters.keys())
         except Exception:
             pass
         # If it's a module-like object, also try its forward
@@ -1194,21 +1204,6 @@ class DenoisingStage(PipelineStage):
             if k in accepted_params:
                 extra_step_kwargs[k] = v
         return extra_step_kwargs
-        import functools
-
-        # Handle cache-dit's partial wrapping logic.
-        # Cache-dit wraps the forward method with functools.partial where args[0] is the instance.
-        # We access `_original_forward` if available to inspect the underlying signature.
-        # See: https://github.com/vipshop/cache-dit
-        if isinstance(func, functools.partial) and func.args:
-            func = getattr(func.args[0], "_original_forward", func)
-
-        # Unwrap any decorators (e.g. functools.wraps)
-        target_func = inspect.unwrap(func)
-
-        # Filter kwargs based on the signature
-        params = inspect.signature(target_func).parameters
-        return {k: v for k, v in kwargs.items() if k in params}
 
     def progress_bar(
         self, iterable: Iterable | None = None, total: int | None = None
