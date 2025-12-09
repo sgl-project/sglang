@@ -17,7 +17,6 @@ import asyncio
 import copy
 import dataclasses
 import logging
-import math
 import os
 import pickle
 import signal
@@ -438,89 +437,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj.normalize_batch_and_arguments()
 
         if self.enable_trace:
-            external_trace_header = None
-            if request:
-                if "trace_context" in request.headers:
-                    trace_set_remote_propagate_context(request.headers["trace_context"])
-                else:
-                    external_trace_header = extract_trace_headers(request.headers)
-
-            self._trace_request_start(obj, created_time, external_trace_header)
-
+            self._trace_request_start(obj, created_time, request)
         if self.server_args.tokenizer_worker_num > 1:
             self._attach_multi_http_worker_info(obj)
-
         if self.log_requests:
-            max_length, skip_names, _ = self.log_request_metadata
-            logger.info(
-                f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
-            )
-
-            # FIXME: This is a temporary fix to get the text from the input ids.
-            # We should remove this once we have a proper way.
-            if (
-                self.log_requests_level >= 2
-                and obj.text is None
-                and obj.input_ids is not None
-                and self.tokenizer is not None
-            ):
-                decoded = self.tokenizer.decode(
-                    obj.input_ids, skip_special_tokens=False
-                )
-                obj.text = decoded
+            self._log_received_request(obj)
 
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
         async with self.model_update_lock.reader_lock:
             if self.server_args.enable_lora and obj.lora_path:
-                if isinstance(obj.lora_path, str):
-                    unique_lora_paths = set([obj.lora_path])
-                else:
-                    unique_lora_paths = set(obj.lora_path)
-
-                if (
-                    self.server_args.max_loaded_loras is not None
-                    and len(unique_lora_paths) > self.server_args.max_loaded_loras
-                ):
-                    raise ValueError(
-                        f"Received request with {len(unique_lora_paths)} unique loras requested "
-                        f"but max loaded loras is {self.server_args.max_loaded_loras}"
-                    )
-
-                # Reload all existing LoRA adapters that have been dynamically unloaded
-                unregistered_loras = await self.lora_registry.get_unregistered_loras(
-                    unique_lora_paths
-                )
-                for lora_path in unregistered_loras:
-                    if lora_path is None:
-                        continue
-
-                    if lora_path not in self.lora_ref_cache:
-                        raise ValueError(
-                            f"Got LoRA adapter that has never been loaded: {lora_path}\n"
-                            f"All loaded adapters: {self.lora_ref_cache.keys()}."
-                        )
-
-                    logger.info(f"Reloading evicted adapter: {lora_path}")
-                    new_lora_ref = self.lora_ref_cache[lora_path]
-                    load_result = await self.load_lora_adapter(
-                        LoadLoRAAdapterReqInput(
-                            lora_name=new_lora_ref.lora_name,
-                            lora_path=new_lora_ref.lora_path,
-                            pinned=new_lora_ref.pinned,
-                        )
-                    )
-                    if (
-                        not load_result.success
-                        and "already loaded" not in load_result.error_message
-                    ):
-                        raise ValueError(
-                            f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
-                        )
-
-                # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
-                obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+                await self._resolve_lora_path(obj)
 
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
@@ -2124,12 +2052,85 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
             self.send_to_scheduler.send_pyobj(load_udpate_req)
 
+    async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        if isinstance(obj.lora_path, str):
+            unique_lora_paths = set([obj.lora_path])
+        else:
+            unique_lora_paths = set(obj.lora_path)
+
+        if (
+            self.server_args.max_loaded_loras is not None
+            and len(unique_lora_paths) > self.server_args.max_loaded_loras
+        ):
+            raise ValueError(
+                f"Received request with {len(unique_lora_paths)} unique loras requested "
+                f"but max loaded loras is {self.server_args.max_loaded_loras}"
+            )
+
+        # Reload all existing LoRA adapters that have been dynamically unloaded
+        unregistered_loras = await self.lora_registry.get_unregistered_loras(
+            unique_lora_paths
+        )
+        for lora_path in unregistered_loras:
+            if lora_path is None:
+                continue
+
+            if lora_path not in self.lora_ref_cache:
+                raise ValueError(
+                    f"Got LoRA adapter that has never been loaded: {lora_path}\n"
+                    f"All loaded adapters: {self.lora_ref_cache.keys()}."
+                )
+
+            logger.info(f"Reloading evicted adapter: {lora_path}")
+            new_lora_ref = self.lora_ref_cache[lora_path]
+            load_result = await self.load_lora_adapter(
+                LoadLoRAAdapterReqInput(
+                    lora_name=new_lora_ref.lora_name,
+                    lora_path=new_lora_ref.lora_path,
+                    pinned=new_lora_ref.pinned,
+                )
+            )
+            if (
+                not load_result.success
+                and "already loaded" not in load_result.error_message
+            ):
+                raise ValueError(
+                    f"Failed to implicitly load LoRA adapter {lora_path}: {load_result.error_message}"
+                )
+
+        # Look up the LoRA ID from the registry and start tracking ongoing LoRA requests.
+        obj.lora_id = await self.lora_registry.acquire(obj.lora_path)
+
+    def _log_received_request(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
+        max_length, skip_names, _ = self.log_request_metadata
+        logger.info(
+            f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
+        )
+
+        # FIXME: This is a temporary fix to get the text from the input ids.
+        # We should remove this once we have a proper way.
+        if (
+            self.log_requests_level >= 2
+            and obj.text is None
+            and obj.input_ids is not None
+            and self.tokenizer is not None
+        ):
+            decoded = self.tokenizer.decode(obj.input_ids, skip_special_tokens=False)
+            obj.text = decoded
+
     def _trace_request_start(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         created_time: Optional[float] = None,
-        external_trace_header: Optional[Dict] = None,
+        request: Optional[fastapi.Request] = None,
     ):
+        external_trace_header = None
+        if request:
+            if "trace_context" in request.headers:
+                trace_set_remote_propagate_context(request.headers["trace_context"])
+            else:
+                external_trace_header = extract_trace_headers(request.headers)
+
         if obj.is_single:
             bootstrap_room = (
                 obj.bootstrap_room if hasattr(obj, "bootstrap_room") else None
