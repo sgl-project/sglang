@@ -905,7 +905,6 @@ class QuantizedRLModelLoader(DefaultModelLoader):
             )
             return
         if isinstance(scale_info, torch.Tensor):
-            new_scale = _get_tp_sharded_scale(scale_info)
             new_scale = scale_info.t().contiguous()
             if scale_param.data.shape == new_scale.shape:
                 scale_param.data.copy_(new_scale)
