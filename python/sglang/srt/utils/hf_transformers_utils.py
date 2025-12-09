@@ -408,6 +408,43 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
+def _validate_tokenizer_file(file_path: str) -> bool:
+    """
+    Validate that a tokenizer file is readable and not corrupted.
+
+    Args:
+        file_path: Path to the tokenizer file
+
+    Returns:
+        True if the file is valid, False if corrupted
+    """
+    try:
+        # For JSON files, validate they're parseable
+        if file_path.endswith(".json"):
+            with open(file_path, "r") as f:
+                json.load(f)
+            return True
+        # For .model files (SentencePiece), just check readability
+        elif file_path.endswith(".model"):
+            with open(file_path, "rb") as f:
+                # Read first few bytes to verify file is readable
+                _ = f.read(100)
+            return True
+        # For other files, just check they exist and are readable
+        else:
+            with open(file_path, "rb") as f:
+                _ = f.read(100)
+            return True
+    except Exception as e:
+        logger.warning(
+            "Corrupted tokenizer file detected: %s - %s: %s",
+            file_path,
+            type(e).__name__,
+            str(e),
+        )
+        return False
+
+
 def find_local_tokenizer_snapshot_dir(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -421,13 +458,13 @@ def find_local_tokenizer_snapshot_dir(
         return None
 
     if os.path.isdir(model_name_or_path):
-        if is_in_ci():
-            print(
-                f"[TOKENIZER CACHE] {model_name_or_path} is already a local directory, skipping cache check"
-            )
+        logger.info(
+            "Tokenizer path %s is already a local directory, skipping cache check",
+            model_name_or_path,
+        )
         return None
 
-    print(f"[TOKENIZER CACHE] Checking for cached tokenizer: {model_name_or_path}")
+    logger.info("Checking for cached tokenizer: %s", model_name_or_path)
     found_local_snapshot_dir = None
 
     # Check custom cache_dir (if provided)
@@ -470,12 +507,34 @@ def find_local_tokenizer_snapshot_dir(
     if found_local_snapshot_dir is None:
         return None
 
+    # Layer 0: Check for incomplete files (corruption indicator)
+    repo_folder = os.path.abspath(os.path.join(found_local_snapshot_dir, "..", ".."))
+    blobs_dir = os.path.join(repo_folder, "blobs")
+    if os.path.isdir(blobs_dir) and glob.glob(os.path.join(blobs_dir, "*.incomplete")):
+        logger.info(
+            "Found .incomplete files in %s for %s. Considering local snapshot incomplete.",
+            blobs_dir,
+            model_name_or_path,
+        )
+        return None
+
     local_tokenizer_files: List[str] = []
     try:
         for pattern in allow_patterns:
-            local_tokenizer_files.extend(
-                glob.glob(os.path.join(found_local_snapshot_dir, pattern))
-            )
+            matched_files = glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+            for f in matched_files:
+                # Layer 1: Check symlink target exists (broken symlink check)
+                if not os.path.exists(f):
+                    continue
+                # Layer 2: Validate file content is not corrupted
+                if not _validate_tokenizer_file(f):
+                    logger.info(
+                        "Found corrupted tokenizer file %s for %s. Will re-download.",
+                        f,
+                        model_name_or_path,
+                    )
+                    return None
+                local_tokenizer_files.append(f)
     except Exception as e:
         logger.warning(
             "Failed to scan local snapshot %s with patterns %s: %s",
@@ -491,11 +550,6 @@ def find_local_tokenizer_snapshot_dir(
             model_name_or_path,
             found_local_snapshot_dir,
         )
-        if is_in_ci():
-            print(
-                f"[TOKENIZER CACHE] Found local snapshot for {model_name_or_path}, "
-                f"skipping HF API call. Cache: {found_local_snapshot_dir}"
-            )
         return found_local_snapshot_dir
     else:
         logger.info(
@@ -503,11 +557,6 @@ def find_local_tokenizer_snapshot_dir(
             found_local_snapshot_dir,
             allow_patterns,
         )
-        if is_in_ci():
-            print(
-                f"[TOKENIZER CACHE] No cached files for {model_name_or_path}, "
-                f"will download from HuggingFace"
-            )
     return None
 
 
