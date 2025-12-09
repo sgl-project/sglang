@@ -1366,6 +1366,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
+            print(f"1369 {rope_scaling=}", flush=True)
             self.rotary_emb = get_rope_wrapper(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
