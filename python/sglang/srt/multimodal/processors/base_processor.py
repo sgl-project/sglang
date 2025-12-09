@@ -232,19 +232,22 @@ class BaseMultimodalProcessor(ABC):
                 kwargs["audios"] = audios
 
         processor = self._processor
-        if (
-            hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessorFast)
-            and not self.server_args.disable_fast_image_processor
-        ):
-            if not _is_npu:
-                kwargs["device"] = "cuda"
-            elif processor.__class__.__name__ not in {
-                "Qwen2_5_VLProcessor",
-                "Qwen3VLProcessor",
-            }:
-                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
-                kwargs["device"] = "npu"
+        # Only apply default device logic if mm_processor_kwargs was not set by user
+        if not self.server_args.mm_processor_kwargs:
+            if (
+                hasattr(processor, "image_processor")
+                and isinstance(processor.image_processor, BaseImageProcessorFast)
+                and not self.server_args.disable_fast_image_processor
+            ):
+                if not _is_npu:
+                    kwargs["device"] = "cuda"
+                elif processor.__class__.__name__ not in {
+                    "Qwen2_5_VLProcessor",
+                    "Qwen3VLProcessor",
+                }:
+                    # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
+                    kwargs["device"] = "npu"
+        print("process_mm_data kwargs:", kwargs)
         result = processor.__call__(
             text=[input_text],
             padding=True,

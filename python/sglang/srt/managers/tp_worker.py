@@ -258,6 +258,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    mm_processor_kwargs_set=bool(server_args.mm_processor_kwargs),
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
