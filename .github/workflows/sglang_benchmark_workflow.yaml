@@ -55,7 +55,7 @@ jobs:
 
           RUN git clone https://github.com/ZLkanyo009/aiter.git /aiter && \
             cd /aiter && \
-            git checkout "qwen3vl-project" && \
+            git checkout caa3a9b404b757f15effb7acfafb1bfa7573ecac && \
             git submodule sync && git submodule update --init --recursive && \
             python3 setup.py develop
 
