@@ -100,12 +100,6 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 echo "Installing python extras: [${EXTRAS}]"
 
-if [ "$IS_BLACKWELL" != "1" ]; then
-    # For lmms_evals evaluating MMMU
-    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
-fi
-
 # Install the main package
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
@@ -144,6 +138,14 @@ fi
 $PIP_CMD list
 
 $PIP_CMD install mooncake-transfer-engine==0.3.7.post2 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+
+if [ "$IS_BLACKWELL" != "1" ]; then
+    # For lmms_evals evaluating MMMU
+    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+    # Pin transformers to prevent downgrade while installing lmms-eval dependencies
+    echo "transformers==5.0.0rc0" > /tmp/lmms-constraints.txt
+    $PIP_CMD install -e lmms-eval/ --constraint /tmp/lmms-constraints.txt $PIP_INSTALL_SUFFIX
+fi
 
 # DeepEP depends on nvshmem 3.4.5
 $PIP_CMD install nvidia-nvshmem-cu12==3.4.5 --force-reinstall $PIP_INSTALL_SUFFIX
