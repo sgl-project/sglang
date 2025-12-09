@@ -3304,8 +3304,13 @@ class ServerArgs:
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
         )
-        # MTP
-        parser.add_argument("--enable-mtp", action="store_true")
+
+        # # Speculative decoding (MTP)
+        parser.add_argument(
+            "--enable-mtp",
+            action="store_true",
+            help="Enable multi-layer MTP speculative decoding.",
+        )
 
         # Expert parallelism
         parser.add_argument(
