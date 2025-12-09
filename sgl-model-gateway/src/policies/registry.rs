@@ -283,19 +283,20 @@ impl PolicyRegistry {
             power_of_two_policies.push(Arc::clone(&self.default_policy));
         }
 
-        if let Some(ref policy) = *self.prefill_policy.read().unwrap() {
+        // Cache prefill and decode policies to avoid double-locking prefill_policy
+        let prefill_policy_opt = self.prefill_policy.read().unwrap().clone();
+        let decode_policy_opt = self.decode_policy.read().unwrap().clone();
+
+        if let Some(ref policy) = prefill_policy_opt {
             if policy.name() == "power_of_two" && !Arc::ptr_eq(policy, &self.default_policy) {
                 power_of_two_policies.push(Arc::clone(policy));
             }
         }
 
-        if let Some(ref policy) = *self.decode_policy.read().unwrap() {
+        if let Some(ref policy) = decode_policy_opt {
             if policy.name() == "power_of_two"
                 && !Arc::ptr_eq(policy, &self.default_policy)
-                && !self
-                    .prefill_policy
-                    .read()
-                    .unwrap()
+                && !prefill_policy_opt
                     .as_ref()
                     .is_some_and(|p| Arc::ptr_eq(p, policy))
             {

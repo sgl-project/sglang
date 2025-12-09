@@ -17,6 +17,7 @@ use opentelemetry_sdk::{
     Resource,
 };
 use tokio::task::spawn_blocking;
+use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing::{Metadata, Subscriber};
 use tracing_opentelemetry::{self, OpenTelemetrySpanExt};
 use tracing_subscriber::{
@@ -238,5 +239,34 @@ pub fn inject_trace_context_http(headers: &mut HeaderMap) {
 
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&context, &mut HeaderInjector(headers));
+    });
+}
+
+/// Inject W3C trace context into gRPC metadata.
+///
+/// This propagates the current span context to downstream gRPC services.
+/// Does nothing if OTEL is not enabled.
+pub fn inject_trace_context_grpc(metadata: &mut MetadataMap) {
+    if !is_otel_enabled() {
+        return;
+    }
+
+    let context = tracing::Span::current().context();
+
+    struct MetadataInjector<'a>(&'a mut MetadataMap);
+
+    impl opentelemetry::propagation::Injector for MetadataInjector<'_> {
+        fn set(&mut self, key: &str, value: String) {
+            // gRPC metadata keys must be lowercase ASCII
+            if let Ok(metadata_key) = MetadataKey::from_bytes(key.to_lowercase().as_bytes()) {
+                if let Ok(metadata_value) = MetadataValue::try_from(&value) {
+                    self.0.insert(metadata_key, metadata_value);
+                }
+            }
+        }
+    }
+
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut MetadataInjector(metadata));
     });
 }

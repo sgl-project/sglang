@@ -575,12 +575,6 @@ impl ConfigValidator {
             }
         }
 
-        if has_service_discovery && config.dp_aware {
-            return Err(ConfigError::IncompatibleConfig {
-                reason: "DP-aware routing is not compatible with service discovery".to_string(),
-            });
-        }
-
         Ok(())
     }
 
