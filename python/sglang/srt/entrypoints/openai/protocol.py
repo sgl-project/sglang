@@ -495,6 +495,7 @@ class ChatCompletionRequest(BaseModel):
         "result in faster responses and fewer tokens used on reasoning in a response. "
         "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
     )
+    parallel_tool_calls: bool = True
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: Optional[int] = None

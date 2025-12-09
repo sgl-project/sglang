@@ -26,6 +26,13 @@ from sglang.srt.function_call.qwen25_detector import Qwen25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.utils import get_json_schema_constraint
 
+try:
+    from xgrammar import StructuralTag
+
+    is_xgrammar_available = True
+except:
+    is_xgrammar_available = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -129,7 +136,9 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
+    def get_structure_tag(
+        self, parallel_tool_calls, grammar_backend
+    ) -> LegacyStructuralTagResponseFormat:
         """
         Generate a structural tag response format for all available tools.
 
@@ -162,14 +171,29 @@ class FunctionCallParser:
 
         # TODO(dark): move this into new structural tag format
         # This requires all grammar backend support the new format
-        return LegacyStructuralTagResponseFormat(
+        legacy_structural_tag = LegacyStructuralTagResponseFormat(
             type="structural_tag",
             structures=tool_structures,
             triggers=list(tool_trigger_set),
         )
+        if grammar_backend == "xgrammar" and is_xgrammar_available:
+            structural_tag = StructuralTag.from_legacy_structural_tag(
+                tags=tool_structures, triggers=list(tool_trigger_set)
+            )
+            structural_tag.format.stop_after_first = not parallel_tool_calls
+            return structural_tag
+        else:
+            if parallel_tool_calls is False:
+                logger.warning(
+                    "parallel_tool_calls is currently only supported by the xgrammar backend due to the new structural_tag format. This setting will be ignored."
+                )
+            return legacy_structural_tag
 
     def get_structure_constraint(
-        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
+        self,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]],
+        parallel_tool_calls: bool,
+        grammar_backend: str,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -192,8 +216,10 @@ class FunctionCallParser:
                 or self.tool_strict_level >= ToolStrictLevel.FUNCTION
             )
         ):
-            tag = self.get_structure_tag()
+            tag = self.get_structure_tag(parallel_tool_calls, grammar_backend)
             return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            json_schema = get_json_schema_constraint(
+                self.tools, tool_choice, parallel_tool_calls
+            )
             return ("json_schema", json_schema)
