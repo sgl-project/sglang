@@ -1282,11 +1282,11 @@ jobs:
         run: |
           IS_BLACKWELL=1 bash scripts/ci/ci_install_dependency.sh
 
-      - name: Run test
-        timeout-minutes: 45
-        run: |
-          cd test/srt
-          python3 run_suite.py --suite per-commit-8-gpu-b200 --timeout-per-file 1800
+      # - name: Run test
+      #   timeout-minutes: 45
+      #   run: |
+      #     cd test/srt
+      #     python3 run_suite.py --suite per-commit-8-gpu-b200 --timeout-per-file 1800
 
   pr-test-finish:
     needs:
@@ -1321,7 +1321,7 @@ jobs:
         unit-test-deepep-8-gpu,
         unit-test-backend-4-gpu-b200,
         unit-test-backend-4-gpu-gb200,
-        unit-test-backend-8-gpu-b200,
+        # unit-test-backend-8-gpu-b200,  # Moved to nightly - large models only
       ]
     if: always()
     runs-on: ubuntu-latest
