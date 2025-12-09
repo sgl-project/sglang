@@ -434,13 +434,22 @@ class Qwen2VLForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
 
+        # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+        # Other quantization methods (e.g., GPTQ, AWQ, etc.) are untested and may not be supported.
+        if (
+            hasattr(quant_config, "modules_to_not_convert")
+            and "visual" in quant_config.modules_to_not_convert
+        ) or quant_config.get_name() == "gptq_marlin":
+            logger.info("Disabling quantization for vision encoder")
+            visual_quant_config = None
+        else:
+            visual_quant_config = quant_config
+
         self.config = config
         self.visual = Qwen2VisionTransformer(
             config.vision_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            # NOTE: Qwen2-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=quant_config,
+            quant_config=visual_quant_config,
             prefix=add_prefix("visual", prefix),
         )
 
