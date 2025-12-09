@@ -364,6 +364,7 @@ class ModelConfig:
             else:
                 rope_scaling = self.hf_config.rope_scaling
             if rope_scaling:
+                assert rope_scaling["rope_type"] == "yarn"
                 mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
                 scaling_factor = rope_scaling["factor"]
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
