@@ -100,7 +100,7 @@ def run_case_residual_gate_int(
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
     # gate == 1 (no gate tensor)
-    y_dev = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev, residual_out_dev = torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
         residual, x, weight, bias, scale, shift, None
     )
 
@@ -112,10 +112,12 @@ def run_case_residual_gate_int(
     y_ln32 = (out32 - mean) * inv_std
     y_ln32 = y_ln32 * weight.float() + bias.float()
     y_ref = (y_ln32 * (1.0 + scale.float()) + shift.float()).to(dtype)
+    residual_ref = out32.to(dtype)
 
-    err = (y_dev - y_ref).abs().max().item()
-    print(f"[ResGate-int] dtype={dtype}, B={B}, S={S}, N={N} -> max_abs_err={err:.3e}")
-    return err
+    err_y = (y_dev - y_ref).abs().max().item()
+    err_res = (residual_out_dev - residual_ref).abs().max().item()
+    print(f"[ResGate-int] dtype={dtype}, B={B}, S={S}, N={N} -> y_err={err_y:.3e}, residual_err={err_res:.3e}")
+    return max(err_y, err_res)
 
 
 @torch.no_grad()
@@ -136,7 +138,7 @@ def run_case_residual_gate_3d(
     scale = torch.randn(M, N, device=device, dtype=dtype)
     shift = torch.randn(M, N, device=device, dtype=dtype)
 
-    y_dev = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev, residual_out_dev = torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
         residual, x, weight, bias, scale, shift, gate
     )
 
@@ -151,10 +153,12 @@ def run_case_residual_gate_3d(
     y_ln32 = (out32 - mean) * inv_std
     y_ln32 = y_ln32 * weight.float() + bias.float()
     y_ref = (y_ln32 * (1.0 + scale.float()) + shift.float()).to(dtype)
+    residual_ref = out32.to(dtype)
 
-    err = (y_dev - y_ref).abs().max().item()
-    print(f"[ResGate-3D Bx1xN] dtype={dtype}, B={B}, S={S}, N={N} -> max_abs_err={err:.3e}")
-    return err
+    err_y = (y_dev - y_ref).abs().max().item()
+    err_res = (residual_out_dev - residual_ref).abs().max().item()
+    print(f"[ResGate-3D Bx1xN] dtype={dtype}, B={B}, S={S}, N={N} -> y_err={err_y:.3e}, residual_err={err_res:.3e}")
+    return max(err_y, err_res)
 
 
 @torch.no_grad()
@@ -176,7 +180,7 @@ def run_case_residual_gate_4d(
     scale4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
     shift4d = torch.randn(B, F, 1, N, device=device, dtype=dtype)
 
-    y_dev = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+    y_dev, residual_out_dev = torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
         residual, x, weight, bias, scale4d, shift4d, gate4d
     )
 
@@ -204,10 +208,12 @@ def run_case_residual_gate_4d(
         f = s_in_b // S
         y_ref[m] = y_ln32[m] * (1.0 + sc4[b, f, 0]) + sh4[b, f, 0]
     y_ref = y_ref.to(dtype)
+    residual_ref = out32.to(dtype)
 
-    err = (y_dev - y_ref).abs().max().item()
-    print(f"[ResGate-4D BxFx1xN] dtype={dtype}, B={B}, F={F}, S={S}, N={N} -> max_abs_err={err:.3e}")
-    return err
+    err_y = (y_dev - y_ref).abs().max().item()
+    err_res = (residual_out_dev - residual_ref).abs().max().item()
+    print(f"[ResGate-4D BxFx1xN] dtype={dtype}, B={B}, F={F}, S={S}, N={N} -> y_err={err_y:.3e}, residual_err={err_res:.3e}")
+    return max(err_y, err_res)
 
 
 # -------------------------

@@ -16,8 +16,24 @@ from sglang.multimodal_gen.runtime.layers.triton_ops import (
     norm_infer,
     rms_norm_fn,
 )
-from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
+from sglang.multimodal_gen.runtime.utils.common import (
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_npu = is_npu()
+_is_cpu = is_cpu()
+_is_xpu = is_xpu()
+
+import sgl_kernel
+from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 # Copied and adapted from sglang
 @CustomOp.register("rms_norm")
@@ -314,45 +330,45 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
               but before normalization)
         """
 
-        can_use_kernel = (
+        can_use_cuda = (
             x.is_cuda
             and (x.shape[-1] % 4 == 0)
             and not isinstance(self.norm, RMSNorm)
         )
-        if can_use_kernel:
-            B, S, N = x.shape
-            M = B * S
-            x_2d = x.contiguous().view(-1, N)
-            residual_2d = residual.contiguous().view(-1, N)
+        can_use_cuda = False
+        if can_use_cuda:
+            B, L, C = x.shape
+            M = B * L
+            x_2d = x.contiguous().view(-1, C)
+            residual_2d = residual.contiguous().view(-1, C)
 
             # gamma/beta
             if getattr(self.norm, "weight", None) is not None:
                 gamma = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
             else:
-                gamma = torch.ones(N, device=x.device, dtype=x.dtype)
+                gamma = torch.ones(C, device=x.device, dtype=x.dtype)
             if getattr(self.norm, "bias", None) is not None:
                 beta = self.norm.bias.contiguous().to(dtype=x.dtype, device=x.device)
             else:
-                beta = torch.zeros(N, device=x.device, dtype=x.dtype)
+                beta = torch.zeros(C, device=x.device, dtype=x.dtype)
 
             # scale/shift: 2D [M,N] or 4D [B,F,1,N]
-            print("scale.dim(), shift.dim(), ", scale.dim(), shift.dim())
-            print("scale.shape, shift.shape, ", scale.shape, shift.shape)
-            print("scale, shift, ", scale, shift)
-            # scale.dim(), shift.dim(),  1 1
-            import sys
-            sys.stdout.flush()
+            # print("scale.dim(), shift.dim(), ", scale.dim(), shift.dim())
+            # print("scale.shape, shift.shape, ", scale.shape, shift.shape)
+            # print("scale, shift, ", scale, shift)
+            # import sys
+            # sys.stdout.flush()
 
             if scale.dim() == 4 and shift.dim() == 4:
                 # scale/shift: [B, F, 1, C]
-                y_2d = torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+                y_2d, residual_output = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
                     x_2d,
                     gamma,
                     beta,
-                    scale.contiguous(),
-                    shift.contiguous(),
+                    scale.contiguous().to(dtype=x.dtype, device=x.device),
+                    shift.contiguous().to(dtype=x.dtype, device=x.device),
                 )
-                return y_2d.view(B, S, N)
+                return y_2d.view(B, L, C), residual_output.view(B, L, C)
 
             # Also support scalar (0D or 1-element)
             if scale.dim() == 0 or (scale.dim() == 1 and scale.numel() == 1):
@@ -384,33 +400,33 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
                 shift_exp = shift_blc.expand(B, L, C)
             else:
                 sh_sb = sh_sl = sh_sc = 0
-            scale_arg = scale_blc if need_scale_scalar else scale_exp.contiguous().view(M, N)
-            shift_arg = shift_blc if need_shift_scalar else shift_exp.contiguous().view(M, N)
+            scale_arg = scale_blc.to(dtype=x.dtype, device=x.device) if need_scale_scalar else scale_exp.contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
+            shift_arg = shift_blc.to(dtype=x.dtype, device=x.device) if need_shift_scalar else shift_exp.contiguous().view(M, C).to(dtype=x.dtype, device=x.device)
 
             gate_opt = None
             if isinstance(gate, int):
                 # used by cross-attention, should be 1
                 assert gate == 1
-                gate_opt = torch.ones(M, N, device=x.device, dtype=x.dtype)
+                gate_opt = torch.ones(M, C, device=x.device, dtype=x.dtype)
 
             elif isinstance(gate, torch.Tensor):
                 if gate.dim() == 4:
                     # gate.shape: [batch_size, num_frames, 1, inner_dim]
-                    gate_opt = gate.contiguous()
+                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
                 else:
                     # gate.shape: [batch_size, 1, inner_dim]
-                    gate_opt = gate.contiguous()
+                    gate_opt = gate.contiguous().to(dtype=x.dtype, device=x.device)
             else:
                 raise ValueError(f"Gate type {type(gate)} not supported")    
             
             if scale_arg is not None and shift_arg is not None:
-                y_2d = torch.ops.sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+                # print(f"gate_opt.dtype, {gate_opt.dtype}, x.dtype, {x.dtype}") # fp32, bf16
+                y_2d, residual_output = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
                     residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
                 )
-                return y_2d.view(B, S, N), residual_output
+                return y_2d.view(B, L, C), residual_output.view(B, L, C)
 
         else:
-            print("Fallback path")
             # x.shape: [batch_size, seq_len, inner_dim]
             # Compute residual_output to return (kernel also computes this internally)
             if isinstance(gate, int):
@@ -475,35 +491,37 @@ class LayerNormScaleShift(nn.Module):
         self, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
     ) -> torch.Tensor:
         """Apply ln followed by scale and shift in a single fused operation."""
-        if (
+        can_use_cuda = (
             x.is_cuda
             and self.norm_type == "layer"
             and (x.shape[-1] % 4 == 0) # x.shape[-1]: hidden_size
-        ):
-            B, S, N = x.shape
-            M = B * S
-            x_2d = x.contiguous().view(-1, N)
+        )
+        can_use_cuda = False
+        if can_use_cuda:
+            B, L, C = x.shape
+            M = B * L
+            x_2d = x.contiguous().view(-1, C)
 
             if self.norm.weight is not None:
                 gamma = self.norm.weight.contiguous().to(dtype=x.dtype, device=x.device)
             else:
-                gamma = torch.ones(N, device=x.device, dtype=x.dtype)
+                gamma = torch.ones(C, device=x.device, dtype=x.dtype)
             if self.norm.bias is not None:
                 beta = self.norm.bias.contiguous().to(dtype=x.dtype, device=x.device)
             else:
-                beta = torch.zeros(N, device=x.device, dtype=x.dtype)
+                beta = torch.zeros(C, device=x.device, dtype=x.dtype)
 
 
             if scale.dim() == 4 and shift.dim() == 4:
                 # scale/shift: [B, F, 1, C]
-                y_2d = torch.ops.sgl_kernel.device_layernorm_fuse_scale_shift(
+                y_2d = sgl_kernel.device_layernorm_fuse_scale_shift(
                     x_2d,
                     gamma,
                     beta,
                     scale.contiguous().to(dtype=x.dtype, device=x.device),
                     shift.contiguous().to(dtype=x.dtype, device=x.device),
                 )
-                return y_2d.view(B, S, N)
+                return y_2d.view(B, L, C)
 
             # Also support scalar (0D or 1-element)
             if scale.dim() == 0 or (scale.dim() == 1 and scale.numel() == 1):
@@ -536,24 +554,24 @@ class LayerNormScaleShift(nn.Module):
             else:
                 sh_sb = sh_sl = sh_sc = 0
 
-            y_2d = torch.ops.sgl_kernel.device_layernorm_fuse_scale_shift(x_2d, gamma, beta, scale_blc if need_scale_scalar else scale_exp.contiguous().view(M, N), shift_blc if need_shift_scalar else shift_exp.contiguous().view(M, N))
-            return y_2d.view(B, S, N)
+            y_2d = sgl_kernel.device_layernorm_fuse_scale_shift(x_2d, gamma, beta, scale_blc if need_scale_scalar else scale_exp.contiguous().view(M, C), shift_blc if need_shift_scalar else shift_exp.contiguous().view(M, C))
+            return y_2d.view(B, L, C)
 
-        # Fallback (RMSNorm or FP32 compute)
-        print("Fallback path")
-        normalized = self.norm(x)
-        if self.compute_dtype == torch.float32:
-            normalized = normalized.float()
-        if scale.dim() == 4:
-            num_frames = scale.shape[1]
-            frame_seqlen = normalized.shape[1] // num_frames
-            output = (
-                normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                * (1.0 + scale)
-                + shift
-            ).flatten(1, 2)
         else:
-            output = normalized * (1.0 + scale) + shift
-        if self.compute_dtype == torch.float32:
-            output = output.to(x.dtype)
-        return output
+            # Fallback (RMSNorm or FP32 compute)
+            normalized = self.norm(x)
+            if self.compute_dtype == torch.float32:
+                normalized = normalized.float()
+            if scale.dim() == 4:
+                num_frames = scale.shape[1]
+                frame_seqlen = normalized.shape[1] // num_frames
+                output = (
+                    normalized.unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+                    * (1.0 + scale)
+                    + shift
+                ).flatten(1, 2)
+            else:
+                output = normalized * (1.0 + scale) + shift
+            if self.compute_dtype == torch.float32:
+                output = output.to(x.dtype)
+            return output
