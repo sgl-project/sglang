@@ -213,7 +213,7 @@ class SchedulerRuntimeCheckerMixin:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise_error_or_warn(
                 self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
                 "count_memory_leak_warnings",
                 msg,
             )
