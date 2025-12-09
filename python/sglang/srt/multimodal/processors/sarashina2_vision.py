@@ -1,5 +1,6 @@
 from typing import List, Union
 
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.sarashina2_vision import Sarashina2VisionForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -72,10 +73,10 @@ class Sarashina2VisionProcessor(BaseMultimodalProcessor):
             mm_tokens=self.mm_tokens,
         )
 
-        return {
-            "mm_items": mm_items,
-            "input_ids": input_ids.tolist(),
-            "im_token_id": self.mm_tokens.image_token_id,
-            "im_start_id": self.IM_START_ID,
-            "im_end_id": self.IM_END_ID,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.mm_tokens.image_token_id,
+            im_start_id=self.IM_START_ID,
+            im_end_id=self.IM_END_ID,
+        )

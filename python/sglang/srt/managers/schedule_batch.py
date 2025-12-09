@@ -317,15 +317,11 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
-    @staticmethod
-    def from_dict(obj: dict):
-        ret = MultimodalInputs(
-            mm_items=obj["mm_items"],
-        )
+    # Temporarily store input_ids for transport from TokenizerManager to Scheduler
+    input_ids: Optional[List[int]] = None
 
-        assert isinstance(ret.mm_items, list)
-        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
-
+    def ensure_pad_values(self):
+        """Ensure pad values are set for all items."""
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             from sglang.srt.managers.mm_utils import (
                 init_feature_buffer,
@@ -338,37 +334,19 @@ class MultimodalInputs:
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()
-            for item in ret.mm_items:
+            for item in self.mm_items:
                 if item.feature is not None:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
 
-        for item in ret.mm_items:
-            item.set_pad_value()
+        for item in self.mm_items:
+            if item.pad_value is None:
+                item.set_pad_value()
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            for item in ret.mm_items:
+            for item in self.mm_items:
                 if item.feature is not None:
                     item.feature = item.feature.to("cpu", non_blocking=True)
-
-        optional_args = [
-            "mrope_positions",
-            "mrope_position_delta",
-            "im_token_id",
-            "im_start_id",
-            "im_end_id",
-            "video_token_id",
-            "slice_start_id",
-            "slice_end_id",
-            "audio_start_id",
-            "audio_end_id",
-            "audio_token_id",
-        ]
-        for arg in optional_args:
-            if arg in obj:
-                setattr(ret, arg, obj[arg])
-
-        return ret
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)
@@ -773,7 +751,7 @@ class Req:
         )
         self.last_tic = now
 
-    def extend_image_inputs(self, image_inputs):
+    def extend_mm_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
             self.multimodal_inputs = image_inputs
         else:

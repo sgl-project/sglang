@@ -3,6 +3,7 @@ from typing import List, Union
 
 from transformers.processing_utils import ProcessorMixin
 
+from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.models.phi4mm import Phi4MMForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -92,9 +93,9 @@ class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
             base_output, self.mm_tokens
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "audio_token_id": self.mm_tokens.audio_token_id,
-        }
+        return MultimodalInputs(
+            mm_items=mm_items,
+            input_ids=input_ids.tolist(),
+            im_token_id=self.mm_tokens.image_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+        )

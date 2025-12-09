@@ -2,7 +2,11 @@ from typing import List, Union
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.minicpmo import MiniCPMO
 from sglang.srt.models.minicpmv import MiniCPMV
 from sglang.srt.multimodal.processors.base_processor import (
@@ -131,14 +135,15 @@ class MiniCPMMultimodalProcessor(BaseMultimodalProcessor):
                 modality=Modality.AUDIO,
             )
             items += [item]
-        return {
-            "mm_items": items,
-            "input_ids": input_ids.tolist(),
-            "audio_start_id": self.audio_start_id,
-            "audio_end_id": self.audio_end_id,
-            "im_token_id": self.im_token_id,
-            "im_start_id": self.im_start_id,
-            "im_end_id": self.im_end_id,
-            "slice_start_id": self.slice_start_id,
-            "slice_end_id": self.slice_end_id,
-        }
+
+        return MultimodalInputs(
+            mm_items=items,
+            input_ids=input_ids.tolist(),
+            audio_start_id=self.audio_start_id,
+            audio_end_id=self.audio_end_id,
+            im_token_id=self.im_token_id,
+            im_start_id=self.im_start_id,
+            im_end_id=self.im_end_id,
+            slice_start_id=self.slice_start_id,
+            slice_end_id=self.slice_end_id,
+        )
