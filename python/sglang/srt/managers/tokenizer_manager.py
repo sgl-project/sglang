@@ -455,6 +455,19 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 f"Receive: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}"
             )
 
+            # FIXME: This is a temporary fix to get the text from the input ids.
+            # We should remove this once we have a proper way.
+            if (
+                self.log_requests_level >= 2
+                and obj.text is None
+                and obj.input_ids is not None
+                and self.tokenizer is not None
+            ):
+                decoded = self.tokenizer.decode(
+                    obj.input_ids, skip_special_tokens=False
+                )
+                obj.text = decoded
+
         async with self.is_pause_cond:
             await self.is_pause_cond.wait_for(lambda: not self.is_pause)
 
@@ -829,6 +842,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
             )
 
+    def _get_sampling_params(self, sampling_kwargs: Dict) -> SamplingParams:
+        return SamplingParams(**sampling_kwargs)
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -846,7 +862,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
-        sampling_params = SamplingParams(**sampling_kwargs)
+        sampling_params = self._get_sampling_params(sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
@@ -875,6 +891,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 input_embeds=input_embeds,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
+                reasoning=obj.reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
@@ -1611,7 +1628,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
-                if state.obj.stream:
+                if self.server_args.stream_output and state.obj.stream:
                     state.output_ids.extend(recv_obj.output_ids[i])
                     output_token_ids = state.output_ids[state.last_output_offset :]
                     state.last_output_offset = len(state.output_ids)

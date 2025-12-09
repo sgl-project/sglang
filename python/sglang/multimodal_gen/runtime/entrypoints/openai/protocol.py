@@ -26,6 +26,8 @@ class ImageGenerationsRequest(BaseModel):
     style: Optional[str] = "vivid"
     background: Optional[str] = "auto"  # transparent | opaque | auto
     output_format: Optional[str] = None  # png | jpeg | webp
+    seed: Optional[int] = 1024
+    generator_device: Optional[str] = "cuda"
     user: Optional[str] = None
 
 
@@ -54,6 +56,8 @@ class VideoGenerationsRequest(BaseModel):
     size: Optional[str] = "720x1280"
     fps: Optional[int] = None
     num_frames: Optional[int] = None
+    seed: Optional[int] = 1024
+    generator_device: Optional[str] = "cuda"
 
 
 class VideoListResponse(BaseModel):

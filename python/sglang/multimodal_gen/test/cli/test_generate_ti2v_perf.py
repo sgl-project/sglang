@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.multimodal_gen.configs.sample.base import DataType
+from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.test_utils import TestGenerateBase
 

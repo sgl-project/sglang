@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers.models.attention import AttentionModuleMixin
-from diffusers.models.attention_dispatch import dispatch_attention_fn
-from diffusers.models.embeddings import TimestepEmbedding, Timesteps
+from diffusers.models.embeddings import (
+    TimestepEmbedding,
+    Timesteps,
+    get_1d_rotary_pos_embed,
+)
 from diffusers.models.normalization import AdaLayerNormContinuous
-from diffusers.models.transformers.transformer_flux2 import Flux2PosEmbed
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -49,13 +52,13 @@ def _get_projections(attn: "Flux2Attention", hidden_states, encoder_hidden_state
 def _get_fused_projections(
     attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
 ):
-    query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+    qkv = attn.to_qkv(hidden_states)
+    query, key, value = qkv.chunk(3, dim=-1)
 
-    encoder_query = encoder_key = encoder_value = (None,)
+    encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
-        encoder_query, encoder_key, encoder_value = attn.to_added_qkv(
-            encoder_hidden_states
-        ).chunk(3, dim=-1)
+        added_qkv = attn.to_added_qkv(encoder_hidden_states)
+        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -110,42 +113,155 @@ class Flux2FeedForward(nn.Module):
         return x
 
 
-class Flux2AttnProcessor:
-    _attention_backend = None
-    _parallel_config = None
+class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
+    _supports_qkv_fusion = True
 
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError(
-                f"{self.__class__.__name__} requires PyTorch 2.0. Please upgrade your pytorch version."
-            )
-
-    def __call__(
+    def __init__(
         self,
-        attn: "Flux2Attention",
+        query_dim: int,
+        num_heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+        bias: bool = False,
+        added_kv_proj_dim: Optional[int] = None,
+        added_proj_bias: Optional[bool] = True,
+        out_bias: bool = True,
+        eps: float = 1e-5,
+        out_dim: int = None,
+        elementwise_affine: bool = True,
+    ):
+        super().__init__()
+
+        self.head_dim = dim_head
+        self.inner_dim = out_dim if out_dim is not None else dim_head * num_heads
+        self.query_dim = query_dim
+        self.out_dim = out_dim if out_dim is not None else query_dim
+        self.heads = out_dim // dim_head if out_dim is not None else num_heads
+
+        self.use_bias = bias
+        self.dropout = dropout
+
+        self.added_kv_proj_dim = added_kv_proj_dim
+        self.added_proj_bias = added_proj_bias
+
+        self.to_q = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
+        self.to_k = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
+        self.to_v = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
+
+        # QK Norm
+        self.norm_q = RMSNorm(dim_head, eps=eps)
+        self.norm_k = RMSNorm(dim_head, eps=eps)
+
+        self.to_out = torch.nn.ModuleList([])
+        self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
+        self.to_out.append(torch.nn.Dropout(dropout))
+
+        if added_kv_proj_dim is not None:
+            self.norm_added_q = RMSNorm(dim_head, eps=eps)
+            self.norm_added_k = RMSNorm(dim_head, eps=eps)
+            self.add_q_proj = torch.nn.Linear(
+                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            )
+            self.add_k_proj = torch.nn.Linear(
+                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            )
+            self.add_v_proj = torch.nn.Linear(
+                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
+            )
+            self.to_add_out = torch.nn.Linear(self.inner_dim, query_dim, bias=out_bias)
+
+        self.attn = USPAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
+            },
+        )
+
+        self.fused_projections = False
+
+    @torch.no_grad()
+    def fuse_projections(self):
+        if self.fused_projections:
+            return
+
+        device = self.to_q.weight.data.device
+        dtype = self.to_q.weight.data.dtype
+
+        concatenated_weights = torch.cat(
+            [self.to_q.weight.data, self.to_k.weight.data, self.to_v.weight.data]
+        )
+        in_features = concatenated_weights.shape[1]
+        out_features = concatenated_weights.shape[0]
+
+        self.to_qkv = torch.nn.Linear(in_features, out_features, bias=self.use_bias)
+        self.to_qkv.weight.data = concatenated_weights.to(device=device, dtype=dtype)
+        if self.use_bias:
+            concatenated_bias = torch.cat(
+                [self.to_q.bias.data, self.to_k.bias.data, self.to_v.bias.data]
+            )
+            self.to_qkv.bias.data = concatenated_bias.to(device=device, dtype=dtype)
+
+        if self.added_kv_proj_dim is not None:
+            concatenated_weights = torch.cat(
+                [
+                    self.add_q_proj.weight.data,
+                    self.add_k_proj.weight.data,
+                    self.add_v_proj.weight.data,
+                ]
+            )
+            in_features = concatenated_weights.shape[1]
+            out_features = concatenated_weights.shape[0]
+
+            self.to_added_qkv = torch.nn.Linear(
+                in_features, out_features, bias=self.added_proj_bias
+            )
+            self.to_added_qkv.weight.data = concatenated_weights.to(
+                device=device, dtype=dtype
+            )
+            if self.added_proj_bias:
+                concatenated_bias = torch.cat(
+                    [
+                        self.add_q_proj.bias.data,
+                        self.add_k_proj.bias.data,
+                        self.add_v_proj.bias.data,
+                    ]
+                )
+                self.to_added_qkv.bias.data = concatenated_bias.to(
+                    device=device, dtype=dtype
+                )
+
+        self.fused_projections = True
+
+    def forward(
+        self,
         hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         query, key, value, encoder_query, encoder_key, encoder_value = (
-            _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
         )
 
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
+        query = query.unflatten(-1, (self.heads, -1))
+        key = key.unflatten(-1, (self.heads, -1))
+        value = value.unflatten(-1, (self.heads, -1))
 
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
+        query = self.norm_q(query)
+        key = self.norm_k(key)
 
-        if attn.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+        if self.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
 
-            encoder_query = attn.norm_added_q(encoder_query)
-            encoder_key = attn.norm_added_k(encoder_key)
+            encoder_query = self.norm_added_q(encoder_query)
+            encoder_key = self.norm_added_k(encoder_key)
 
             query = torch.cat([encoder_query, query], dim=1)
             key = torch.cat([encoder_key, key], dim=1)
@@ -160,14 +276,8 @@ class Flux2AttnProcessor:
                 key, cos, sin, is_neox_style=False, interleaved=True
             )
 
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+        hidden_states = self.attn(query, key, value)
+
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -179,174 +289,15 @@ class Flux2AttnProcessor:
                 ],
                 dim=1,
             )
-            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
 
-        hidden_states = attn.to_out[0](hidden_states)
-        hidden_states = attn.to_out[1](hidden_states)
+        hidden_states = self.to_out[0](hidden_states)
+        hidden_states = self.to_out[1](hidden_states)
 
         if encoder_hidden_states is not None:
             return hidden_states, encoder_hidden_states
         else:
             return hidden_states
-
-
-class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
-    _default_processor_cls = Flux2AttnProcessor
-    _available_processors = [Flux2AttnProcessor]
-
-    def __init__(
-        self,
-        query_dim: int,
-        heads: int = 8,
-        dim_head: int = 64,
-        dropout: float = 0.0,
-        bias: bool = False,
-        added_kv_proj_dim: Optional[int] = None,
-        added_proj_bias: Optional[bool] = True,
-        out_bias: bool = True,
-        eps: float = 1e-5,
-        out_dim: int = None,
-        elementwise_affine: bool = True,
-        processor=None,
-    ):
-        super().__init__()
-
-        self.head_dim = dim_head
-        self.inner_dim = out_dim if out_dim is not None else dim_head * heads
-        self.query_dim = query_dim
-        self.out_dim = out_dim if out_dim is not None else query_dim
-        self.heads = out_dim // dim_head if out_dim is not None else heads
-
-        self.use_bias = bias
-        self.dropout = dropout
-
-        self.added_kv_proj_dim = added_kv_proj_dim
-        self.added_proj_bias = added_proj_bias
-
-        self.to_q = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_k = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
-        self.to_v = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
-
-        # QK Norm
-        self.norm_q = torch.nn.RMSNorm(
-            dim_head, eps=eps, elementwise_affine=elementwise_affine
-        )
-        self.norm_k = torch.nn.RMSNorm(
-            dim_head, eps=eps, elementwise_affine=elementwise_affine
-        )
-
-        self.to_out = torch.nn.ModuleList([])
-        self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
-        self.to_out.append(torch.nn.Dropout(dropout))
-
-        if added_kv_proj_dim is not None:
-            self.norm_added_q = torch.nn.RMSNorm(dim_head, eps=eps)
-            self.norm_added_k = torch.nn.RMSNorm(dim_head, eps=eps)
-            self.add_q_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_k_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.add_v_proj = torch.nn.Linear(
-                added_kv_proj_dim, self.inner_dim, bias=added_proj_bias
-            )
-            self.to_add_out = torch.nn.Linear(self.inner_dim, query_dim, bias=out_bias)
-
-        if processor is None:
-            processor = self._default_processor_cls()
-        self.set_processor(processor)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        attn_parameters = set(
-            inspect.signature(self.processor.__call__).parameters.keys()
-        )
-        unused_kwargs = [k for k, _ in kwargs.items() if k not in attn_parameters]
-        if len(unused_kwargs) > 0:
-            logger.warning(
-                f"joint_attention_kwargs {unused_kwargs} are not expected by {self.processor.__class__.__name__} and will be ignored."
-            )
-        kwargs = {k: w for k, w in kwargs.items() if k in attn_parameters}
-        return self.processor(
-            self,
-            hidden_states,
-            encoder_hidden_states,
-            attention_mask,
-            freqs_cis,
-            **kwargs,
-        )
-
-
-class Flux2ParallelSelfAttnProcessor:
-    _attention_backend = None
-    _parallel_config = None
-
-    def __init__(self):
-        if not hasattr(F, "scaled_dot_product_attention"):
-            raise ImportError(
-                f"{self.__class__.__name__} requires PyTorch 2.0. Please upgrade your pytorch version."
-            )
-
-    def __call__(
-        self,
-        attn: "Flux2ParallelSelfAttention",
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        # Parallel in (QKV + MLP in) projection
-        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
-        qkv, mlp_hidden_states = torch.split(
-            hidden_states,
-            [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor],
-            dim=-1,
-        )
-
-        # Handle the attention logic
-        query, key, value = qkv.chunk(3, dim=-1)
-
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
-
-        query = attn.norm_q(query)
-        key = attn.norm_k(key)
-
-        if freqs_cis is not None:
-            cos, sin = freqs_cis
-            query = _apply_rotary_emb(
-                query, cos, sin, is_neox_style=False, interleaved=True
-            )
-            key = _apply_rotary_emb(
-                key, cos, sin, is_neox_style=False, interleaved=True
-            )
-
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
-        hidden_states = hidden_states.flatten(2, 3)
-        hidden_states = hidden_states.to(query.dtype)
-
-        # Handle the feedforward (FF) logic
-        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
-
-        # Concatenate and parallel output projection
-        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
-        hidden_states = attn.to_out(hidden_states)
-
-        return hidden_states
 
 
 class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
@@ -358,15 +309,13 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
     paper](https://arxiv.org/abs/2302.05442) for a visual depiction of this type of transformer block.
     """
 
-    _default_processor_cls = Flux2ParallelSelfAttnProcessor
-    _available_processors = [Flux2ParallelSelfAttnProcessor]
     # Does not support QKV fusion as the QKV projections are always fused
     _supports_qkv_fusion = False
 
     def __init__(
         self,
         query_dim: int,
-        heads: int = 8,
+        num_heads: int = 8,
         dim_head: int = 64,
         dropout: float = 0.0,
         bias: bool = False,
@@ -376,15 +325,14 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
-        processor=None,
     ):
         super().__init__()
 
         self.head_dim = dim_head
-        self.inner_dim = out_dim if out_dim is not None else dim_head * heads
+        self.inner_dim = out_dim if out_dim is not None else dim_head * num_heads
         self.query_dim = query_dim
         self.out_dim = out_dim if out_dim is not None else query_dim
-        self.heads = out_dim // dim_head if out_dim is not None else heads
+        self.heads = out_dim // dim_head if out_dim is not None else num_heads
 
         self.use_bias = bias
         self.dropout = dropout
@@ -402,21 +350,26 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         self.mlp_act_fn = Flux2SwiGLU()
 
         # QK Norm
-        self.norm_q = torch.nn.RMSNorm(
-            dim_head, eps=eps, elementwise_affine=elementwise_affine
-        )
-        self.norm_k = torch.nn.RMSNorm(
-            dim_head, eps=eps, elementwise_affine=elementwise_affine
-        )
+        self.norm_q = RMSNorm(dim_head, eps=eps)
+        self.norm_k = RMSNorm(dim_head, eps=eps)
 
         # Fused attention output projection + MLP output projection
         self.to_out = torch.nn.Linear(
             self.inner_dim + self.mlp_hidden_dim, self.out_dim, bias=out_bias
         )
 
-        if processor is None:
-            processor = self._default_processor_cls()
-        self.set_processor(processor)
+        self.attn = USPAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+            dropout_rate=0,
+            softmax_scale=None,
+            causal=False,
+            supported_attention_backends={
+                AttentionBackendEnum.FA,
+                AttentionBackendEnum.TORCH_SDPA,
+                AttentionBackendEnum.SAGE_ATTN,
+            },
+        )
 
     def forward(
         self,
@@ -425,16 +378,44 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
-        attn_parameters = set(
-            inspect.signature(self.processor.__call__).parameters.keys()
+        # Parallel in (QKV + MLP in) projection
+        hidden_states = self.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states,
+            [3 * self.inner_dim, self.mlp_hidden_dim * self.mlp_mult_factor],
+            dim=-1,
         )
-        unused_kwargs = [k for k, _ in kwargs.items() if k not in attn_parameters]
-        if len(unused_kwargs) > 0:
-            logger.warning(
-                f"joint_attention_kwargs {unused_kwargs} are not expected by {self.processor.__class__.__name__} and will be ignored."
+
+        # Handle the attention logic
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (self.heads, -1))
+        key = key.unflatten(-1, (self.heads, -1))
+        value = value.unflatten(-1, (self.heads, -1))
+
+        query = self.norm_q(query)
+        key = self.norm_k(key)
+
+        if freqs_cis is not None:
+            cos, sin = freqs_cis
+            query = _apply_rotary_emb(
+                query, cos, sin, is_neox_style=False, interleaved=True
             )
-        kwargs = {k: w for k, w in kwargs.items() if k in attn_parameters}
-        return self.processor(self, hidden_states, attention_mask, freqs_cis, **kwargs)
+            key = _apply_rotary_emb(
+                key, cos, sin, is_neox_style=False, interleaved=True
+            )
+        hidden_states = self.attn(query, key, value)
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # Handle the feedforward (FF) logic
+        mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
+
+        # Concatenate and parallel output projection
+        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        hidden_states = self.to_out(hidden_states)
+
+        return hidden_states
 
 
 class Flux2SingleTransformerBlock(nn.Module):
@@ -457,14 +438,13 @@ class Flux2SingleTransformerBlock(nn.Module):
         self.attn = Flux2ParallelSelfAttention(
             query_dim=dim,
             dim_head=attention_head_dim,
-            heads=num_attention_heads,
+            num_heads=num_attention_heads,
             out_dim=dim,
             bias=bias,
             out_bias=bias,
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
-            processor=Flux2ParallelSelfAttnProcessor(),
         )
 
     def forward(
@@ -529,13 +509,12 @@ class Flux2TransformerBlock(nn.Module):
             query_dim=dim,
             added_kv_proj_dim=dim,
             dim_head=attention_head_dim,
-            heads=num_attention_heads,
+            num_heads=num_attention_heads,
             out_dim=dim,
             bias=bias,
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
-            processor=Flux2AttnProcessor(),
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -674,6 +653,38 @@ class Flux2Modulation(nn.Module):
         )
 
 
+class Flux2PosEmbed(nn.Module):
+    # modified from https://github.com/black-forest-labs/flux/blob/c00d7c60b085fce8058b9df845e036090873f2ce/src/flux/modules/layers.py#L11
+    def __init__(self, theta: int, axes_dim: list[int]):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        # Expected ids shape: [S, len(self.axes_dim)]
+        cos_out = []
+        sin_out = []
+        pos = ids.float()
+        is_mps = ids.device.type == "mps"
+        is_npu = ids.device.type == "npu"
+        freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
+        # Unlike Flux 1, loop over len(self.axes_dim) rather than ids.shape[-1]
+        for i in range(len(self.axes_dim)):
+            cos, sin = get_1d_rotary_pos_embed(
+                self.axes_dim[i],
+                pos[..., i],
+                theta=self.theta,
+                repeat_interleave_real=True,
+                use_real=True,
+                freqs_dtype=freqs_dtype,
+            )
+            cos_out.append(cos)
+            sin_out.append(sin)
+        freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
+        freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
+        return freqs_cos, freqs_sin
+
+
 class Flux2Transformer2DModel(CachableDiT):
     """
     The Transformer model introduced in Flux 2.
@@ -701,7 +712,6 @@ class Flux2Transformer2DModel(CachableDiT):
         self.inner_dim = num_attention_heads * attention_head_dim
 
         # 1. Sinusoidal positional embedding for RoPE on image and text tokens
-        # self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
         self.rotary_emb = Flux2PosEmbed(theta=rope_theta, axes_dim=axes_dims_rope)
 
         # 2. Combined timestep + guidance embedding
@@ -773,6 +783,19 @@ class Flux2Transformer2DModel(CachableDiT):
         )
 
         self.gradient_checkpointing = False
+
+    def fuse_qkv_projections(self):
+        for block in self.transformer_blocks:
+            if hasattr(block.attn, "fuse_projections") and getattr(
+                block.attn, "_supports_qkv_fusion", True
+            ):
+                block.attn.fuse_projections()
+
+        for block in self.single_transformer_blocks:
+            if hasattr(block.attn, "fuse_projections") and getattr(
+                block.attn, "_supports_qkv_fusion", True
+            ):
+                block.attn.fuse_projections()
 
     def forward(
         self,
