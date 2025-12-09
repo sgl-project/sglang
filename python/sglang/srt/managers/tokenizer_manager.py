@@ -162,6 +162,14 @@ class ReqState:
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
 
+class InputFormat(Enum):
+    """Input format types for tokenization handling."""
+
+    SINGLE_STRING = 1  # Regular single text like "Hello world"
+    BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
+    CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
 class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -2150,14 +2158,6 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
-
-
-class InputFormat(Enum):
-    """Input format types for tokenization handling."""
-
-    SINGLE_STRING = 1  # Regular single text like "Hello world"
-    BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
-    CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
 def _get_processor_wrapper(server_args):
