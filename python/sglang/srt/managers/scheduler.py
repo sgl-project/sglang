@@ -220,7 +220,9 @@ class EmbeddingBatchResult:
                 return
 
             self.copy_done = torch.get_device_module(self.embeddings[0].device).Event()
-            self.embeddings = [emb.to("cpu", non_blocking=True) for emb in self.embeddings]
+            self.embeddings = [
+                emb.to("cpu", non_blocking=True) for emb in self.embeddings
+            ]
 
         self.copy_done.record()
 

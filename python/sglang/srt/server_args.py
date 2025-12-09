@@ -2090,8 +2090,11 @@ class ServerArgs:
             raise ValueError(
                 "Cannot enable both --enable-embedding-schedule-overlap and --disable-overlap-schedule."
             )
-        
-        if self.enable_embedding_schedule_overlap and envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set():
+
+        if (
+            self.enable_embedding_schedule_overlap
+            and envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+        ):
             raise ValueError(
                 "--enable-embedding-schedule-overlap is not supported with sparse heads. Please disable one of them."
             )
