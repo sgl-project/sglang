@@ -302,6 +302,23 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             output_size="848x480",
         ),
     ),
+    # LoRA test case for single transformer + merge/unmerge API test
+    DiffusionTestCase(
+        "wan2_1_t2v_1_3b_lora_1gpu",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=1,
+            lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
+        ),
+        DiffusionSamplingParams(
+            prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
+            output_size="848x480",
+        ),
+    ),
     # NOTE(mick): flaky
     # DiffusionTestCase(
     #     id="hunyuan_video",

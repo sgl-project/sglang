@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 import openai
 import pytest
+import requests
 from openai import OpenAI
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -361,6 +362,30 @@ Consider updating perf_baselines.json with the snippets below:
 """
         logger.error(output)
 
+    def _test_lora_api_functionality(self, ctx: ServerContext, case_id: str) -> None:
+        """
+        Test LoRA API functionality: merge, unmerge, and set_lora.
+        This test is only run for test cases with LoRA enabled.
+        """
+        base_url = f"http://localhost:{ctx.port}/v1"
+
+        # Test 1: unmerge_lora_weights
+        logger.info("[LoRA API Test] Testing unmerge_lora_weights for %s", case_id)
+        resp = requests.post(f"{base_url}/unmerge_lora_weights")
+        assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
+
+        # Test 2: merge_lora_weights
+        logger.info("[LoRA API Test] Testing merge_lora_weights for %s", case_id)
+        resp = requests.post(f"{base_url}/merge_lora_weights")
+        assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
+
+        # Test 3: set_lora (re-set the same adapter)
+        logger.info("[LoRA API Test] Testing set_lora for %s", case_id)
+        resp = requests.post(f"{base_url}/set_lora", json={"lora_nickname": "default"})
+        assert resp.status_code == 200, f"set_lora failed: {resp.text}"
+
+        logger.info("[LoRA API Test] All LoRA API tests passed for %s", case_id)
+
     def test_diffusion_perf(
         self,
         case: DiffusionTestCase,
@@ -385,3 +410,7 @@ Consider updating perf_baselines.json with the snippets below:
             generate_fn,
         )
         self._validate_and_record(case, perf_record)
+
+        # LoRA API functionality test (only for LoRA-enabled cases)
+        if case.server_args.lora_path:
+            self._test_lora_api_functionality(diffusion_server, case.id)
