@@ -154,3 +154,7 @@ class BaseDispatcher(ABC):
     @abstractmethod
     def combine(self, combine_input: CombineInput, **kwargs) -> torch.Tensor:
         pass
+
+    @abstractmethod
+    def get_buffer(self):
+        pass

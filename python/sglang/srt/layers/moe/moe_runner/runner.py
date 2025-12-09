@@ -4,15 +4,18 @@ import logging
 import os
 from typing import TYPE_CHECKING
 
+import torch
 from sglang.srt.layers.moe.moe_runner.base import (
     FusedOpPool,
     MoeRunnerConfig,
     PermuteMethodPool,
 )
-from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
+from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore, PeoDeepGemmRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
 from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+from python.sglang.srt.layers.moe.utils import is_peo_enabled, get_peo_num_rounds
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.base import MoeQuantInfo
@@ -35,7 +38,10 @@ class MoeRunner:
         elif runner_backend.is_triton_kernels():
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
-            self.runner_core = DeepGemmRunnerCore(config)
+            if is_peo_enabled():
+                self.runner_core = PeoDeepGemmRunnerCore(config, get_peo_num_rounds())
+            else:
+                self.runner_core = DeepGemmRunnerCore(config)
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
@@ -56,7 +62,7 @@ class MoeRunner:
             self.fused_func = None
 
     def run(
-        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo
+        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo,
     ) -> CombineInput:
 
         if self.fused_func is not None:
@@ -68,11 +74,10 @@ class MoeRunner:
             dispatch_format, runner_format
         )
 
-        running_state = {}
         runner_input = self.pre_permute_func(
-            dispatch_output, quant_info, self.config, running_state
+            dispatch_output, quant_info, self.config
         )
-        runner_output = self.runner_core.run(runner_input, quant_info, running_state)
+        runner_output = self.runner_core.run(runner_input, quant_info)
 
         runner_format = self.runner_core.runner_backend.value
         combine_format = dispatch_output.format.value
@@ -80,7 +85,7 @@ class MoeRunner:
             runner_format, combine_format
         )
         combine_input = self.post_permute_func(
-            runner_output, quant_info, self.config, running_state
+            runner_output, quant_info, self.config
         )
 
         return combine_input

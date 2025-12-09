@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 import torch
 import torch.distributed as dist
 
-from sglang.srt import single_batch_overlap
+from sglang.srt import single_batch_overlap, per_expert_overlap
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -19,6 +19,13 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
 )
 from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import (
+    is_peo_enabled,
+    get_peo_deepep_send_num_sms,
+    get_peo_deepep_recv_num_sms,
+    get_peo_up_deepgemm_num_sms,
+    get_peo_down_deepgemm_num_sms,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -26,7 +33,7 @@ from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
 from sglang.srt.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
-from python.sglang.srt.layers.moe.utils import is_sbo_enabled
+from sglang.srt.per_expert_overlap import GemmArgs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -546,54 +553,24 @@ class PeoDeepEPMoE(DeepEPMoE):
         self.down_input_scale: torch.Tensor = None
         self.down_output: torch.Tensor = None
 
+        self.comm_stream = self.dispatcher.get_buffer().get_comm_stream()
+
     def run_moe_core(
         self,
         dispatch_output: DispatchOutput,
-        down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None,
         start_idx: torch.Tensor = None,
         end_idx: torch.Tensor = None,
     ):
 
         if self.deprecate_flag:
-            assert down_gemm_overlap_args is None
-            return super().run_moe_core(
+            return FusedMoE.run_moe_core(
+                self,
                 dispatch_output,
+                start_idx=start_idx,
+                end_idx=end_idx,
             )
-
-        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
-
-        if _use_aiter:
-            raise NotImplementedError("Not supported for AITER")
-        elif _is_npu:
-            raise NotImplementedError("Not supported for NPU")
-        elif DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
-            raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
-        elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-            if (
-                get_moe_runner_backend().is_flashinfer_cutedsl()
-                and self.quant_config.get_name() == "modelopt_fp4"
-            ):
-                output = self.forward_flashinfer_cutedsl_peo(
-                    dispatch_output,
-                    down_gemm_overlap_args=down_gemm_overlap_args,
-                    start_idx=start_idx,
-                    end_idx=end_idx,
-                )
-            elif self.use_w4afp8:
-                output = self.forward_cutlass_w4afp8_masked_peo(dispatch_output)
-            else:
-                assert False, "forward_deepgemm_masked is deprecated"
-
-        combine_input_wrapper = (
-            DeepEPNormalCombineInput
-            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
-            else DeepEPLLCombineInput
-        )
-        return combine_input_wrapper(
-            hidden_states=output,
-            topk_ids=dispatch_output.topk_ids,
-            topk_weights=dispatch_output.topk_weights,
-        )
+        else:
+            raise NotImplementedError("Not supported for PEO")
 
     def forward_flashinfer_cutedsl_peo(
         self,
@@ -630,7 +607,7 @@ class PeoDeepEPMoE(DeepEPMoE):
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-        if is_sbo_enabled():
+        if is_peo_enabled():
             return PeoDeepEPMoE
         else:
             return DeepEPMoE
