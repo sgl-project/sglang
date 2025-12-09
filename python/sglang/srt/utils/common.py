@@ -1503,10 +1503,8 @@ def add_prometheus_middleware(app):
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
 
-    _register_promethus_middleware_counter(app)
 
-
-def _register_promethus_middleware_counter(app):
+def add_prometheus_track_response_middleware(app):
     from prometheus_client import Counter
 
     http_response_status_counter = Counter(

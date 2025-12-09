@@ -126,6 +126,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     kill_process_tree,
     set_uvicorn_logging_configs,
+    add_prometheus_track_response_middleware,
 )
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -1396,6 +1397,9 @@ def launch_server(
             scheduler_info=scheduler_info,
         )
     )
+
+    if server_args.enable_metrics:
+        add_prometheus_track_response_middleware(app)
 
     # Pass additional arguments to the lifespan function.
     # They will be used for additional initialization setups.
