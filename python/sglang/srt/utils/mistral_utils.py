@@ -11,7 +11,7 @@ from sglang.srt.utils import logger
 
 def adapt_config_dict(
     config_dict: dict[str, Any], model: str, **kwargs
-) -> PretrainedConfig:
+) -> tuple[dict, PretrainedConfig]:
     config_dict.update(kwargs)
     config_dict = _remap_general_mistral_args(config_dict)
 
@@ -127,7 +127,7 @@ def _remap_mistral_yarn_args(config: dict) -> dict:
         if old_name in yarn_config:
             value = yarn_config.pop(old_name)
             if new_name is not None:
-                config["rope_scaling"][new_name] = value
+                config["rope_scaling"][new_name] = float(value)
 
     assert len(yarn_config) == 0, f"Unparsed yarn config: {yarn_config}"
 

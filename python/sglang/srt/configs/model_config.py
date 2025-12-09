@@ -354,14 +354,20 @@ class ModelConfig:
 
             # Handle rope scaling with yarn
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                mscale_all_dim = self.hf_config.rope_scaling.get(
-                    "mscale_all_dim", False
-                )
-                scaling_factor = self.hf_config.rope_scaling.get("factor")
-                if scaling_factor is not None:
-                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                    self.scaling = self.scaling * mscale * mscale
+
+            if (
+                "MistralLarge3ForCausalLM" in self.hf_config.architectures
+                or "PixtralForConditionalGeneration" in self.hf_config.architectures
+                or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
+            ):
+                rope_scaling = self.hf_text_config.rope_scaling
+            else:
+                rope_scaling = self.hf_config.rope_scaling
+            if rope_scaling:
+                mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+                scaling_factor = rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
