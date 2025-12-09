@@ -266,7 +266,10 @@ class HiRadixCache(RadixCache):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        del self.ongoing_write_through[ack_id]
+                        backuped_node = self.ongoing_write_through.pop(ack_id)
+                        self.dec_lock_ref(backuped_node)
+                        if self.enable_storage:
+                            self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
