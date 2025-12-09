@@ -100,8 +100,22 @@ class EAGLEDraftCudaGraphRunner:
             self.extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             self.topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             self.topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
+
+            # Use target model's hidden size for hidden_states since they're used during verification
+            if hasattr(
+                self.model_runner.model_config.hf_config,
+                "target_hidden_size",
+            ):
+                target_hidden_size = (
+                    self.model_runner.model_config.hf_config.target_hidden_size
+                )
+            else:
+                target_hidden_size = (
+                    self.eagle_worker.target_worker.model_runner.model_config.hidden_size
+                )
+
             self.hidden_states = torch.zeros(
-                (self.max_bs, self.model_runner.model_config.hidden_size),
+                (self.max_bs, target_hidden_size),
                 dtype=self.model_runner.dtype,
             )
 
