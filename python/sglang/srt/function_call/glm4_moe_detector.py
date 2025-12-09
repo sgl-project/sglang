@@ -399,10 +399,14 @@ class Glm4MoeDetector(BaseFormatDetector):
 
             if not is_potential_start:
                 # Not a potential tool call, return as normal text
+                # Must return the entire buffer (current_text), not just new_text,
+                # because buffer may contain previously accumulated characters like '<'
+                # that turned out not to be part of a tool call
+                output_text = current_text
                 self._buffer = ""
-                if self.eot_token in new_text:
-                    new_text = new_text.replace(self.eot_token, "")
-                return StreamingParseResult(normal_text=new_text)
+                if self.eot_token in output_text:
+                    output_text = output_text.replace(self.eot_token, "")
+                return StreamingParseResult(normal_text=output_text)
             else:
                 # Could be start of tool call, keep buffering
                 return StreamingParseResult(normal_text="", calls=[])
