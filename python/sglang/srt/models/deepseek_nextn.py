@@ -97,12 +97,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        if _is_cuda:
-            self.alt_stream = torch.cuda.Stream()
-        elif _is_npu:
-            self.alt_stream = torch.npu.Stream()
-        else:
-            self.alt_stream = None
+        self.alt_stream = torch.cuda.stream() if _is_cuda or _is_npu else None
 
         layer_name = "decoder"
         if _is_npu and (

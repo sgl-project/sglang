@@ -737,7 +737,6 @@ class DeepseekV2MoE(nn.Module):
                     )
 
         self.top_k = config.num_experts_per_tok
-        self._use_multi_stream = get_bool_env_var("USE_MULTI_STREAM", "0")
 
         if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
             # TODO: we will support tp < ep in the future
@@ -987,11 +986,9 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             if not self._fuse_shared_experts_inside_sbo:
-                if self._use_multi_stream:
-                    self.alt_stream.wait_stream(
-                        torch.get_device_module().current_stream()
-                    )
-                    with torch.get_device_module().stream(self.alt_stream):
+                if self.alt_stream is not None:
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
                         shared_output.record_stream(self.alt_stream)
                         shared_event = self.alt_stream.record_event()
@@ -1118,9 +1115,9 @@ class DeepseekV2MoE(nn.Module):
         if (
             hidden_states.shape[0] > 0
             and not self._fuse_shared_experts_inside_sbo
-            and self._use_multi_stream
+            and self.alt_stream is not None
         ):
-            torch.get_device_module().current_stream().wait_event(shared_event)
+            torch.cuda.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
             if self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -3006,12 +3003,7 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        if _is_cuda:
-            self.alt_stream = torch.cuda.Stream()
-        elif _is_npu:
-            self.alt_stream = torch.npu.Stream()
-        else:
-            self.alt_stream = None
+        self.alt_stream = torch.cuda.stream() if _is_cuda or _is_npu else None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,

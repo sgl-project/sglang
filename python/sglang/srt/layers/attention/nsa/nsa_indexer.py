@@ -8,17 +8,9 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.utils import (
-    add_prefix,
-    ceil_align,
-    get_bool_env_var,
-    is_cuda,
-    is_hip,
-    is_npu,
-)
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
 
 global _use_multi_stream
-_use_multi_stream = get_bool_env_var("USE_MULTI_STREAM", "0")
 
 if is_cuda():
     try:
@@ -994,7 +986,7 @@ class Indexer(CustomOp):
         sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
 
         bs = x.shape[0]
-        if _use_multi_stream:
+        if self.alt_stream is not None:
             self.alt_stream.wait_stream(torch.npu.current_stream())
             with torch.npu.stream(self.alt_stream):
                 q = self.wq_b(q_lora)[
@@ -1028,15 +1020,12 @@ class Indexer(CustomOp):
             )  # [bs, n, d]
             q = torch.cat([q_pe, q_nope], dim=-1)
 
-        if _use_multi_stream:
-            indexer_weight_stream = get_indexer_weight_stream()
-            indexer_weight_stream.wait_stream(torch.npu.current_stream())
-            with torch.npu.stream(indexer_weight_stream):
-                indexer_weights = self.weights_proj(x)[0]
-                indexer_weights.record_stream(indexer_weight_stream)
-                weights_event = indexer_weight_stream.record_event()
-        else:
-            indexer_weights = None
+        indexer_weight_stream = get_indexer_weight_stream()
+        indexer_weight_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(indexer_weight_stream):
+            weights = self.weights_proj(x)[0]
+            weights.record_stream(indexer_weight_stream)
+            weights_event = indexer_weight_stream.record_event()
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
@@ -1116,15 +1105,10 @@ class Indexer(CustomOp):
 
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
 
-        if _use_multi_stream:
+        if self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
-            torch.npu.current_stream().wait_event(weights_event)
+        torch.npu.current_stream().wait_event(weights_event)
 
-        if indexer_weights is None:
-            x = x.view(-1, self.hidden_size)
-            weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
-        else:
-            weights = indexer_weights
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         if (
             is_prefill
