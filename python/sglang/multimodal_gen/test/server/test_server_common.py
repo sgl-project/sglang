@@ -54,6 +54,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     extra_args += (
         f" --num-gpus {server_args.num_gpus} --ulysses-degree {server_args.num_gpus}"
     )
+    # LoRA support
+    if server_args.lora_path:
+        extra_args += f" --lora-path {server_args.lora_path}"
 
     # start server
     manager = ServerManager(

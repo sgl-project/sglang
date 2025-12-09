@@ -119,6 +119,8 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
+    # LoRA
+    lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
 
 
 @dataclass(frozen=True)
@@ -399,6 +401,23 @@ TWO_GPU_CASES_A = [
         ),
         DiffusionSamplingParams(
             prompt="A curious raccoon",
+            output_size="720x480",
+        ),
+    ),
+    # LoRA test case for transformer_2 support
+    DiffusionTestCase(
+        "wan2_2_t2v_a14b_lora_2gpu",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=2,
+            lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
+        ),
+        DiffusionSamplingParams(
+            prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
             output_size="720x480",
         ),
     ),
