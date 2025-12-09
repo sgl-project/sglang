@@ -517,6 +517,14 @@ class Req:
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+        self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
+        self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
+        self.mamba_last_track_seqlen: Optional[int] = (
+            None  # seq len of the last cached mamba state
+        )
+        # the branching point seqlen to track mamba state. If set, given by prefix match,
+        # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
+        self.mamba_branching_seqlen: Optional[int] = None
 
         # Check finish
         self.tokenizer = None
@@ -1004,6 +1012,10 @@ class Req:
         self.extend_logprob_start_len = 0
         self.is_chunked = 0
         self.mamba_pool_idx = None
+        self.mamba_ping_pong_track_buffer = None
+        self.mamba_next_track_idx = None
+        self.mamba_last_track_seqlen = None
+        self.mamba_branching_seqlen = None
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0

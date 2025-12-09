@@ -284,6 +284,7 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    mamba_track_interval: int = 256
 
     # Runtime options
     device: Optional[str] = None
