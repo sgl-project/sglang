@@ -118,16 +118,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 logger = logging.getLogger(__name__)
 
 
-def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
-    is_cross_node = server_args.dist_init_addr
-
-    if is_cross_node:
-        # Fallback to default CPU transport for multi-node
-        return "default"
-    else:
-        return "cuda_ipc"
-
-
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -463,16 +453,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
-    ) -> str:
+    ) -> InputFormat:
         """Detect the format of input texts for proper tokenization handling.
 
         Returns:
-            - "single_string": Regular single text like "Hello world"
-            - "batch_strings": Regular batch like ["Hello", "World"]
-            - "cross_encoder_pairs": Cross-encoder pairs like [["query", "document"]]
+            - InputFormat.SINGLE_STRING: Regular single text like "Hello world"
+            - InputFormat.BATCH_STRINGS: Regular batch like ["Hello", "World"]
+            - InputFormat.CROSS_ENCODER_PAIRS: Cross-encoder pairs like [["query", "document"]]
         """
         if isinstance(texts, str):
-            return "single_string"
+            return InputFormat.SINGLE_STRING
 
         if (
             is_cross_encoder
@@ -480,26 +470,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and isinstance(texts[0], list)
             and len(texts[0]) == 2
         ):
-            return "cross_encoder_pairs"
+            return InputFormat.CROSS_ENCODER_PAIRS
 
-        return "batch_strings"
+        return InputFormat.BATCH_STRINGS
 
     def _prepare_tokenizer_input(
-        self, texts: Union[str, List[str]], input_format: str
+        self, texts: Union[str, List[str]], input_format: InputFormat
     ) -> Union[List[str], List[List[str]]]:
         """Prepare input for the tokenizer based on detected format."""
-        if input_format == "single_string":
+        if input_format == InputFormat.SINGLE_STRING:
             return [texts]  # Wrap single string for batch processing
-        elif input_format == "cross_encoder_pairs":
+        elif input_format == InputFormat.CROSS_ENCODER_PAIRS:
             return texts  # Already in correct format: [["query", "doc"]]
-        else:  # batch_strings
+        else:  # BATCH_STRINGS
             return texts  # Already in correct format: ["text1", "text2"]
 
     def _extract_tokenizer_results(
         self,
         input_ids: List[List[int]],
         token_type_ids: Optional[List[List[int]]],
-        input_format: str,
+        input_format: InputFormat,
         original_batch_size: int,
     ) -> Union[
         Tuple[List[int], Optional[List[int]]],
@@ -509,7 +499,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # For single inputs (string or single cross-encoder pair), extract first element
         if (
-            input_format in ["single_string", "cross_encoder_pairs"]
+            input_format in [InputFormat.SINGLE_STRING, InputFormat.CROSS_ENCODER_PAIRS]
             and original_batch_size == 1
         ):
             single_input_ids = input_ids[0] if input_ids else []
@@ -573,7 +563,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # Step 3: Choose tokenization strategy
         use_async_tokenizer = (
             self.async_dynamic_batch_tokenizer is not None
-            and input_format == "single_string"
+            and input_format == InputFormat.SINGLE_STRING
         )
 
         if use_async_tokenizer:
@@ -2182,6 +2172,24 @@ async def print_exception_wrapper(func):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(1)
+
+
+class InputFormat(Enum):
+    """Input format types for tokenization handling."""
+
+    SINGLE_STRING = 1  # Regular single text like "Hello world"
+    BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
+    CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
+def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+    is_cross_node = server_args.dist_init_addr
+
+    if is_cross_node:
+        # Fallback to default CPU transport for multi-node
+        return "default"
+    else:
+        return "cuda_ipc"
 
 
 class SignalHandler:
