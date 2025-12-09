@@ -21,6 +21,8 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+MARLIN_MOE_WORKSPACE: Optional[torch.Tensor] = None
+
 
 @dataclass
 class MarlinRunnerInput(RunnerInput):
@@ -75,50 +77,19 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
 class MarlinRunnerCore(MoeRunnerCore):
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
-        self.workspace: Optional[torch.Tensor] = None
 
     def run(
         self,
-        runner_input: MarlinRunnerInput,
-        quant_info: MarlinMoeQuantInfo,
+        runner_input: RunnerInput,
+        quant_info: MoeQuantInfo,
         running_state: dict,
-    ) -> MarlinRunnerOutput:
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            fused_marlin_moe,
+    ) -> RunnerOutput:
+        # Marlin backend always uses the fused path (fused_experts_none_to_marlin).
+        # This method should never be called directly.
+        raise NotImplementedError(
+            "MarlinRunnerCore.run() should not be called directly. "
+            "Use the fused path via fused_experts_none_to_marlin instead."
         )
-        from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
-
-        x = runner_input.hidden_states
-
-        assert self.config.activation == "silu", "Only SiLU activation is supported."
-
-        if self.workspace is None:
-            self.workspace = marlin_make_workspace(x.device, max_blocks_per_sm=4)
-
-        output = fused_marlin_moe(
-            hidden_states=x,
-            w1=quant_info.w13_qweight,
-            w2=quant_info.w2_qweight,
-            w1_scale=quant_info.w13_scales,
-            w2_scale=quant_info.w2_scales,
-            gating_output=runner_input.router_logits,
-            topk_weights=runner_input.topk_weights,
-            topk_ids=runner_input.topk_ids,
-            expert_map=quant_info.expert_map,
-            g_idx1=quant_info.w13_g_idx,
-            g_idx2=quant_info.w2_g_idx,
-            sort_indices1=quant_info.w13_g_idx_sort_indices,
-            sort_indices2=quant_info.w2_g_idx_sort_indices,
-            w1_zeros=quant_info.w13_qzeros,
-            w2_zeros=quant_info.w2_qzeros,
-            workspace=self.workspace,
-            num_bits=quant_info.weight_bits,
-            is_k_full=quant_info.is_k_full,
-            inplace=self.config.inplace,
-            routed_scaling_factor=self.config.routed_scaling_factor,
-        ).to(x.dtype)
-
-        return MarlinRunnerOutput(hidden_states=output)
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -131,6 +102,7 @@ def fused_experts_none_to_marlin(
     quant_info: MarlinMoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
+    global MARLIN_MOE_WORKSPACE
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
@@ -140,7 +112,13 @@ def fused_experts_none_to_marlin(
 
     assert runner_config.activation == "silu", "Only SiLU activation is supported."
 
-    workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
+    if (
+        MARLIN_MOE_WORKSPACE is None
+        or MARLIN_MOE_WORKSPACE.device != hidden_states.device
+    ):
+        MARLIN_MOE_WORKSPACE = marlin_make_workspace(
+            hidden_states.device, max_blocks_per_sm=4
+        )
 
     output = fused_marlin_moe(
         hidden_states=hidden_states,
@@ -158,7 +136,7 @@ def fused_experts_none_to_marlin(
         sort_indices2=quant_info.w2_g_idx_sort_indices,
         w1_zeros=quant_info.w13_qzeros,
         w2_zeros=quant_info.w2_qzeros,
-        workspace=workspace,
+        workspace=MARLIN_MOE_WORKSPACE,
         num_bits=quant_info.weight_bits,
         is_k_full=quant_info.is_k_full,
         inplace=runner_config.inplace,
