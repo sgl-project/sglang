@@ -195,6 +195,7 @@ class MambaPool:
             ]
 
             if _is_cpu and _cpu_has_amx_support:
+                # CPU uses a different layout of conv_state for kernel optimization
                 conv_state_cpu = []
                 for conv_shape_t in conv_state:
                     conv_shape_new = conv_shape_t.as_strided_(

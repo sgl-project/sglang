@@ -62,10 +62,15 @@ elif is_cpu():
     assert (
         cpu_has_amx_support()
     ), "CPU requires AMX support for hybrid linear attn backend"
-    _use_cpu = True
-    chunk_gated_delta_rule = torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu
-    causal_conv1d_fn = torch.ops.sgl_kernel.causal_conv1d_fwd_cpu
-    causal_conv1d_update = torch.ops.sgl_kernel.causal_conv1d_update_cpu
+    from sgl_kernel.mamba import (
+        causal_conv1d_fn_cpu,
+        causal_conv1d_update_cpu,
+        chunk_gated_delta_rule_cpu,
+    )
+
+    chunk_gated_delta_rule = chunk_gated_delta_rule_cpu
+    causal_conv1d_fn = causal_conv1d_fn_cpu
+    causal_conv1d_update = causal_conv1d_update_cpu
     fused_sigmoid_gating_delta_rule_update = (
         torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
     )
@@ -567,27 +572,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        if _use_cpu:
-            mixed_qkv = causal_conv1d_update(
-                mixed_qkv,
-                conv_states,
-                conv_weights,
-                bias,
-                activation == "silu",
-                None,
-                cache_indices,
-                self.pad_slot_id,
-                True,
-            )
-        else:
-            mixed_qkv = causal_conv1d_update(
-                mixed_qkv,
-                conv_states,
-                conv_weights,
-                bias,
-                activation,
-                conv_state_indices=cache_indices,
-            )
+        mixed_qkv = causal_conv1d_update(
+            mixed_qkv,
+            conv_states,
+            conv_weights,
+            bias,
+            activation,
+            conv_state_indices=cache_indices,
+        )
 
         query, key, value = torch.split(
             mixed_qkv,
@@ -694,31 +686,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
-            if _use_cpu:
-                mixed_qkv = causal_conv1d_fn(
-                    mixed_qkv.transpose(0, 1),
-                    conv_weights,
-                    bias,
-                    conv_states,
-                    query_start_loc,
-                    cache_indices,
-                    has_initial_states,
-                    activation == "silu",
-                    self.pad_slot_id,
-                    True,
-                ).transpose(0, 1)[:seq_len]
-            else:
-                mixed_qkv = causal_conv1d_fn(
-                    mixed_qkv.transpose(0, 1),
-                    conv_weights,
-                    bias,
-                    activation=activation,
-                    conv_states=conv_states,
-                    has_initial_state=has_initial_states,
-                    cache_indices=cache_indices,
-                    query_start_loc=query_start_loc,
-                    seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-                ).transpose(0, 1)[:seq_len]
+
+            mixed_qkv = causal_conv1d_fn(
+                mixed_qkv.transpose(0, 1),
+                conv_weights,
+                bias,
+                activation=activation,
+                conv_states=conv_states,
+                has_initial_state=has_initial_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            ).transpose(0, 1)[:seq_len]
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -756,35 +735,20 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             recurrent_state = ssm_states[cache_indices]
-            if _use_cpu:
-                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                    query=query,
-                    key=key,
-                    value=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    output_final_state=True,
-                    cu_seqlens=query_start_loc,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            else:
-                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                    q=query,
-                    k=key,
-                    v=value,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    output_final_state=True,
-                    cu_seqlens=query_start_loc,
-                    head_first=False,
-                    use_qk_l2norm_in_kernel=True,
-                )
-                last_recurrent_state = last_recurrent_state.to(
-                    ssm_states.dtype, copy=False
-                )
+
+            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=True,
+                cu_seqlens=query_start_loc,
+                head_first=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 
         return core_attn_out
