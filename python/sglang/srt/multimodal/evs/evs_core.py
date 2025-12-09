@@ -120,57 +120,47 @@ def tokens_per_frame(
 
 
 def replace_offsets_with_tokens_per_frame(
-    input_ids: torch.Tensor,
     *,
-    frame_offsets_inclusive: list[tuple[int, int]],
+    pre_chunked_input_ids: list[int],
     num_tokens_per_frame: list[int],
-) -> torch.Tensor:
+    frame_offsets_inclusive: list[tuple[int, int]],
+    filler_token_id: int,
+) -> list[int]:
     """
     Given a single video, after EVS pruning of redundant tokens, we have a new `num_tokens_per_frame`, therefore the existing input_ids and offsets are stale.
     We need to replace all stale offsets with new offsets that reflect the new `num_tokens_per_frame`, respectively.
-
-    Args:
-        input_ids: The original input token IDs with placeholder spans.
-        frame_offsets_inclusive: List of (start, end) positions for each frame's
-            placeholder span in input_ids. Both start and end are inclusive.
-        num_tokens_per_frame: The actual number of tokens per frame after EVS pruning.
 
     Returns:
         Modified input_ids with offsets replaced with new offsets.
 
     Examples:
-    >>> MEDIA = 0
-    >>> assert torch.equal(replace_offsets_with_tokens_per_frame(
-    ...     torch.tensor([1, MEDIA, MEDIA, 4, 5, MEDIA, MEDIA, MEDIA, 9, 10, MEDIA, MEDIA, 12, 13]),
+    >>> assert replace_offsets_with_tokens_per_frame(
+    ...     pre_chunked_input_ids=[1, 0, 0, 4, 5, 0, 0, 0, 9, 10, 0, 0, 12, 13],
     ...     frame_offsets_inclusive=[(1, 2), (5, 7), (10, 11)],
     ...     num_tokens_per_frame=[1, 4, 2],
-    ... ),  torch.tensor([1, MEDIA, 4, 5, MEDIA, MEDIA, MEDIA, MEDIA, 9, 10, MEDIA, MEDIA, 12, 13]))
+    ...     filler_token_id=0,
+    ... ) ==                      [1, 0, 4, 5, 0, 0, 0, 0, 9, 10, 0, 0, 12, 13]
 
-    >>> assert torch.equal(replace_offsets_with_tokens_per_frame(
-    ...     torch.tensor([1, MEDIA, MEDIA, 4, 5, 9, 10, MEDIA, MEDIA, MEDIA]),
+    >>> assert replace_offsets_with_tokens_per_frame(
+    ...     pre_chunked_input_ids=[1, 0, 0, 4, 5, 9, 10, 0, 0, 0],
     ...     frame_offsets_inclusive=[(1, 2), (7, 9)],
     ...     num_tokens_per_frame=[1, 4],
-    ... ),  torch.tensor([1, MEDIA, 4, 5, 9, 10, MEDIA, MEDIA, MEDIA, MEDIA]))
+    ...     filler_token_id=0,
+    ... ) ==                      [1, 0, 4, 5, 9, 10, 0, 0, 0, 0]
 
-    >>> assert torch.equal(replace_offsets_with_tokens_per_frame(
-    ...     torch.tensor([MEDIA, MEDIA, 1, 4, MEDIA, MEDIA, MEDIA, 5, 9, 10]),
+    >>> assert replace_offsets_with_tokens_per_frame(
+    ...     pre_chunked_input_ids=[0, 0, 1, 4, 0, 0, 0, 5, 9, 10],
     ...     frame_offsets_inclusive=[(0, 1), (4, 6)],
     ...     num_tokens_per_frame=[1, 4],
-    ... ),  torch.tensor([MEDIA, 1, 4, MEDIA, MEDIA, MEDIA, MEDIA, 5, 9, 10]))
-
-    >>> assert torch.equal(replace_offsets_with_tokens_per_frame(
-    ...     torch.tensor([1, 4, MEDIA, MEDIA, MEDIA, MEDIA, MEDIA, MEDIA, 5, 9, 10]),
-    ...     frame_offsets_inclusive=[(2, 7)], # single frame, or multiple frames with no frame separators
-    ...     num_tokens_per_frame=[1, 4],
-    ... ), torch.tensor([1, 4, MEDIA, MEDIA, MEDIA, MEDIA, MEDIA, 5, 9, 10]))
-
+    ...     filler_token_id=0,
+    ... ) ==                      [0, 1, 4, 0, 0, 0, 0, 5, 9, 10]
     """
-    input_ids_list: list[int] = input_ids.tolist()
-    filler_token_id = input_ids_list[frame_offsets_inclusive[0][0]]
+    assert isinstance(pre_chunked_input_ids, list)
+    ids = pre_chunked_input_ids
 
     if len(frame_offsets_inclusive) == 1:
         """There might be no frame separators, in which case there will be one contiguous span of tokens"""
-        final = input_ids_list[0 : frame_offsets_inclusive[0][0]]
+        final = ids[0 : frame_offsets_inclusive[0][0]]
         frames = [filler_token_id] * sum(num_tokens_per_frame)
         final.extend(frames)
     else:
@@ -179,10 +169,8 @@ def replace_offsets_with_tokens_per_frame(
         for (start, end), num_tokens in zip(
             frame_offsets_inclusive, num_tokens_per_frame, strict=True
         ):
-            final.extend(input_ids_list[cursor:start])
+            final.extend(ids[cursor:start])
             final.extend([filler_token_id] * num_tokens)
             cursor = end + 1
-    final.extend(input_ids_list[frame_offsets_inclusive[-1][1] + 1 :])
-
-    final_tensor = torch.tensor(final, device=input_ids.device, dtype=input_ids.dtype)
-    return final_tensor
+    final.extend(ids[frame_offsets_inclusive[-1][1] + 1 :])
+    return final

@@ -20,7 +20,7 @@ from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.utils import logger
 
 from .evs_core import tokens_per_frame
-from .evs_module import EVS, EVSConfig, EVSDataItem
+from .evs_module import EVS, EVSConfig, EVSDataItem, VideoEVSDataItem
 
 
 def _non_evs_data_items(
@@ -29,6 +29,7 @@ def _non_evs_data_items(
     image_offsets: list[tuple[int, int]],
     video: torch.Tensor | None,
     video_offsets: list[tuple[int, int]],
+    input_ids_list: list[int],
 ):
     items: list[MultimodalDataItem] = []
     if image is not None:
@@ -89,6 +90,7 @@ class EVSProcessor:
 
         def create_evs_data_items(
             *,
+            input_ids_list: list[int],
             image: torch.Tensor | None,
             image_offsets: list[tuple[int, int]],
             video: torch.Tensor | None,
@@ -108,11 +110,12 @@ class EVSProcessor:
                 video_thw_grids = [
                     (num_frames, rows, cols) for num_frames in frames_per_video
                 ]
-                item = EVSDataItem(
+                item = VideoEVSDataItem(
                     modality=Modality.VIDEO,
                     feature=video,
                     offsets=video_offsets,
                     thw_grids=video_thw_grids,
+                    pre_chunked_input_ids=input_ids_list,
                 )
                 items.append(item)
             return items

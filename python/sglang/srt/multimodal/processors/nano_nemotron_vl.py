@@ -190,15 +190,18 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         # Cleanup:
         prompt_ids[prompt_ids == self.PLACEHOLDER_ID] = self.img_start_token_id
 
+        prompt_ids_list = prompt_ids.tolist()
+
         items = create_data_items(
             image=image_feature,
             image_offsets=img_offsets,
             video=video_feature,
             video_offsets=video_offsets,
+            input_ids_list=prompt_ids_list,
         )
 
         return {
-            "input_ids": prompt_ids.tolist(),
+            "input_ids": prompt_ids_list,
             "mm_items": items,
             "im_start_id": self.img_start_token_id,
             "im_end_id": self.img_end_token_id,

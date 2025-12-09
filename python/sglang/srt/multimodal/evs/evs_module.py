@@ -21,8 +21,9 @@ from dataclasses import dataclass
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.utils import logger
 
 from .evs_core import compute_retention_mask, replace_offsets_with_tokens_per_frame
@@ -31,6 +32,14 @@ from .evs_core import compute_retention_mask, replace_offsets_with_tokens_per_fr
 @dataclasses.dataclass(kw_only=True)
 class EVSDataItem(MultimodalDataItem):
     thw_grids: list[tuple[int, int, int]]
+
+
+@dataclasses.dataclass(kw_only=True)
+class VideoEVSDataItem(EVSDataItem):
+    pre_chunked_input_ids: torch.Tensor
+
+    def __post_init__(self):
+        assert self.is_video()
 
 
 @dataclass(kw_only=True)
@@ -50,20 +59,32 @@ class EVSEmbeddingResult(EmbeddingResult):
     """
 
     num_tokens_per_frame: list[int]
+    pre_chunked_input_ids: list[int]
 
-    def prune_input_ids(
-        self, input_ids: torch.Tensor, offsets: list[tuple[int, int]]
+    def redistribute_pruned_frames_placeholders(
+        self,
+        input_ids: torch.Tensor,
+        offsets: list[tuple[int, int]],
+        *,
+        extend_prefix_len: int,
+        extend_seq_len: int,
+        filler_token_id: int,
     ) -> torch.Tensor:
-        length_before_redistribute = len(input_ids)
-        input_ids = replace_offsets_with_tokens_per_frame(
-            input_ids,
-            frame_offsets_inclusive=offsets,
+        assert len(input_ids) == extend_seq_len
+        input_ids_list = replace_offsets_with_tokens_per_frame(
+            pre_chunked_input_ids=self.pre_chunked_input_ids,
             num_tokens_per_frame=self.num_tokens_per_frame,
+            frame_offsets_inclusive=offsets,
+            filler_token_id=filler_token_id,
         )
-        assert (
-            len(input_ids) == length_before_redistribute
-        ), f"Input ids length changed after redistribution, got {len(input_ids)} != {length_before_redistribute}"
-        return input_ids
+        input_ids = torch.tensor(
+            input_ids_list, dtype=input_ids.dtype, device=input_ids.device
+        )
+        offsets = BaseMultimodalProcessor.get_mm_items_offset(
+            input_ids, filler_token_id
+        )
+        input_ids = input_ids[extend_prefix_len : extend_prefix_len + extend_seq_len]
+        return input_ids, offsets
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -133,9 +154,9 @@ class EVS(torch.nn.Module, ABC):
         )
         assert len(items) == 1, f"Expected 1 item, got {len(items)}"
         item = items[0]
-        assert (
-            isinstance(item, EVSDataItem) and item.modality == Modality.VIDEO
-        ), f"Expected EVSDataItem with modality VIDEO, got {item}"
+        assert isinstance(
+            item, VideoEVSDataItem
+        ), f"Expected VideoEVSDataItem with modality VIDEO, got {item}"
 
         q = self.evs_config.video_pruning_rate
         merge = self.evs_config.spatial_merge_size
@@ -170,4 +191,5 @@ class EVS(torch.nn.Module, ABC):
         return EVSEmbeddingResult(
             embedding=final_embeddings_tensor,
             num_tokens_per_frame=num_tokens_per_frame,
+            pre_chunked_input_ids=item.pre_chunked_input_ids,
         )
