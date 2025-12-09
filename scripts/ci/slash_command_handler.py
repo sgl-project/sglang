@@ -198,7 +198,9 @@ def handle_rerun_stage(
     try:
         # Check if PR is from a fork
         is_fork = pr.head.repo.full_name != gh_repo.full_name
-        print(f"PR head repo: {pr.head.repo.full_name}, main repo: {gh_repo.full_name}, is_fork: {is_fork}")
+        print(
+            f"PR head repo: {pr.head.repo.full_name}, main repo: {gh_repo.full_name}, is_fork: {is_fork}"
+        )
 
         if is_fork:
             # For fork PRs, use repository_dispatch since workflow_dispatch can't target fork branches
@@ -216,7 +218,9 @@ def handle_rerun_stage(
                 },
             )
 
-            print(f"Successfully triggered repository_dispatch for stage '{stage_name}'")
+            print(
+                f"Successfully triggered repository_dispatch for stage '{stage_name}'"
+            )
             if react_on_success:
                 comment.create_reaction("+1")
                 pr.create_issue_comment(
