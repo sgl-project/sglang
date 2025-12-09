@@ -332,57 +332,72 @@ class Ernie4_5_VLMoeMoE(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if visual_token_mask is not None and visual_token_mask.all():
+        capturing = torch.cuda.is_current_stream_capturing()
+
+        if visual_token_mask is not None and not capturing:
+            # Safe to compute boolean value on CPU
+            all_visual = visual_token_mask.all().item()
+            any_visual = visual_token_mask.any().item()
+        else:
+            # During CUDA Graph capture, forbid CPU sync ops
+            # Fallback: treat as "not all visual"
+            all_visual = False
+            any_visual = visual_token_mask is not None  # mixed tokens path
+            any_visual = False
+        # print("orig:", orig_shape)
+        # print("hs after flatten:", hidden_states.shape)
+        # print("visual mask:", visual_token_mask.shape)
+        # print("any_visual:", any_visual, "all_visual:", all_visual)
+
+        if all_visual:
             # vision modal input processing directly
-            vision_router_logits, _ = self.vision_experts_gate(hidden_states)
+            vision_router_logits, _ = self.vision_experts_gate(
+                hidden_states.to(dtype=torch.float32)
+            )
             vision_topk_output = self.vision_experts_topk(
                 hidden_states, vision_router_logits
             )
             final_hidden_states = self.vision_experts(
                 hidden_states=hidden_states, topk_output=vision_topk_output
             )
-        elif visual_token_mask is not None and visual_token_mask.any():
-            # assert visual_token_mask.shape[0] != hidden_states.shape[0]
-            visual_token_mask = visual_token_mask.repeat(1, self.hidden_size).bool()
-            text_token_mask = ~visual_token_mask
-            final_hidden_states = torch.zeros_like(hidden_states)
+        elif any_visual:
+            # Mixed tokens (or we are in capture and mask exists) — avoid boolean indexing.
+            # Compute both experts on the full hidden_states and then select per-token results with torch.where.
+            # This avoids hidden_states[mask] style indexing which may not be allowed in CUDA Graph capture.
+            # Make sure mask has shape [N, 1] for broadcasting
+            mask = visual_token_mask.view(-1).bool().unsqueeze(-1)  # [N, 1]
 
-            text_hidden_states = hidden_states[text_token_mask].reshape(
-                -1, self.hidden_size
+            # Text branch computed on full sequence
+            text_router_logits, _ = self.text_experts_gate(
+                hidden_states.to(dtype=torch.float32)
             )
-            vision_hidden_states = hidden_states[visual_token_mask].reshape(
-                -1, self.hidden_size
-            )
+            text_topk_output = self.text_experts_topk(hidden_states, text_router_logits)
+            text_out = self.text_experts(
+                hidden_states=hidden_states, topk_output=text_topk_output
+            )  # [N, H]
 
-            text_router_logits, _ = self.text_experts_gate(text_hidden_states)
-            text_topk_output = self.text_experts_topk(
-                text_hidden_states, text_router_logits
+            # Vision branch computed on full sequence
+            vision_router_logits, _ = self.vision_experts_gate(
+                hidden_states.to(dtype=torch.float32)
             )
-            final_hidden_states[text_token_mask] = self.text_experts(
-                hidden_states=text_hidden_states, topk_output=text_topk_output
-            ).flatten()
-
-            vision_router_logits, _ = self.vision_experts_gate(vision_hidden_states)
             vision_topk_output = self.vision_experts_topk(
-                vision_hidden_states, vision_router_logits
+                hidden_states, vision_router_logits
             )
-            final_hidden_states[visual_token_mask] = self.vision_experts(
-                hidden_states=vision_hidden_states, topk_output=vision_topk_output
-            ).flatten()
+            vision_out = self.vision_experts(
+                hidden_states=hidden_states, topk_output=vision_topk_output
+            )  # [N, H]
+
+            # Merge per-token outputs: for visual tokens take vision_out, else text_out
+            final_hidden_states = torch.where(mask, vision_out, text_out)
         else:
             # text modal input processing directly
-            text_router_logits, _ = self.text_experts_gate(hidden_states)
+            text_router_logits, _ = self.text_experts_gate(
+                hidden_states.to(dtype=torch.float32)
+            )
             topk_output = self.text_experts_topk(hidden_states, text_router_logits)
             final_hidden_states = self.text_experts(
                 hidden_states=hidden_states, topk_output=topk_output
             )
-
-        # # router_logits: (num_tokens, n_experts)
-        # router_logits = self.gate(hidden_states)
-        # topk_output = self.topk(hidden_states, router_logits)
-        # final_hidden_states = self.experts(
-        #     hidden_states=hidden_states, topk_output=topk_output
-        # )
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -542,8 +557,8 @@ class Ernie4_5_VLMoeModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+    def get_input_embeddings(self) -> torch.Tensor:
+        return self.embed_tokens
 
     @torch.no_grad()
     def forward(
@@ -553,11 +568,12 @@ class Ernie4_5_VLMoeModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        visual_token_mask: torch.Tensor | None = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
 
         if self.pp_group.is_first_rank:
             if input_embeds is None:
-                hidden_states = self.get_input_embeddings(input_ids)
+                hidden_states = self.embed_tokens(input_ids)
             else:
                 hidden_states = input_embeds
             residual = None
@@ -572,6 +588,7 @@ class Ernie4_5_VLMoeModel(nn.Module):
                 hidden_states,
                 forward_batch,
                 residual,
+                visual_token_mask,
             )
 
         if not self.pp_group.is_last_rank:
@@ -669,8 +686,8 @@ class Ernie4_5_VLMoeForCausalLM(nn.Module):
             if "mtp" in name or "vision_model" in name or "resampler_model" in name:
                 continue
 
-            if "moe_statics.e_score_correction_bias" in name:
-                name = name.replace("moe_statics", "gate")
+            # if "moe_statics.e_score_correction_bias" in name:
+            #     name = name.replace("moe_statics", "gate")
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue

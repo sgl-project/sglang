@@ -28,6 +28,7 @@ from typing import Iterable, List, Optional, Tuple, Type, TypedDict
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
@@ -36,6 +37,7 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
@@ -45,7 +47,7 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeForCausalLM
+from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeModel
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -195,19 +197,17 @@ class Ernie4_5_VisionPatchEmbed(nn.Module):
     ) -> None:
         super().__init__()
         self.patch_size = patch_size
-        self.temporal_patch_size = temporal_patch_size
+        self.in_channels = in_chans
         self.embed_dim = embed_dim
 
-        kernel_size = [temporal_patch_size, patch_size, patch_size]
-        self.proj = nn.Conv3d(
-            in_chans, embed_dim, kernel_size=kernel_size, stride=kernel_size, bias=False
-        )
+        self.proj = nn.Linear(in_chans * patch_size * patch_size, embed_dim, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        L, C = x.shape
-        x = x.view(L, -1, self.temporal_patch_size, self.patch_size, self.patch_size)
-        x = self.proj(x).view(L, self.embed_dim)
-        return x
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        target_dtype = self.proj.weight.dtype
+        hidden_states = hidden_states.to(target_dtype)
+        hidden_states = self.proj(hidden_states)
+
+        return hidden_states
 
 
 class Ernie4_5_VisionPatchMerger(nn.Module):
@@ -488,7 +488,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
         super().__init__()
 
         patch_size: int = vision_config.patch_size
-        temporal_patch_size: int = vision_config.temporal_patch_size
+        # temporal_patch_size: int = vision_config.temporal_patch_size
         spatial_merge_size: int = vision_config.spatial_merge_size
         in_chans: int = vision_config.in_chans
         hidden_size: int = vision_config.hidden_size
@@ -501,7 +501,7 @@ class Ernie4_5_VisionTransformer(nn.Module):
 
         self.patch_embed = Ernie4_5_VisionPatchEmbed(
             patch_size=patch_size,
-            temporal_patch_size=temporal_patch_size,
+            # temporal_patch_size=temporal_patch_size,
             in_chans=in_chans,
             embed_dim=embed_dim,
         )
@@ -523,13 +523,25 @@ class Ernie4_5_VisionTransformer(nn.Module):
                 for i in range(depth)
             ]
         )
-        self.merger = Ernie4_5_VisionPatchMerger(
-            d_model=hidden_size,
-            context_dim=embed_dim,
-            norm_layer=norm_layer,
-            quant_config=quant_config,
-            prefix=add_prefix("merger", prefix),
-        )
+
+        self.norm = nn.LayerNorm(hidden_size, eps=1e-6)
+
+        # self.resampler_model = VariableResolutionResamplerModel(
+        #     self.config.pixel_hidden_size,
+        #     self.config.hidden_size,
+        #     self.config.spatial_conv_size,
+        #     self.config.temporal_conv_size,
+        #     config=self.config,
+        #     prefix=add_prefix("resampler_model", prefix),
+        # )
+
+        # self.merger = Ernie4_5_VisionPatchMerger(
+        #     d_model=hidden_size,
+        #     context_dim=embed_dim,
+        #     norm_layer=norm_layer,
+        #     quant_config=quant_config,
+        #     prefix=add_prefix("merger", prefix),
+        # )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -596,9 +608,16 @@ class Ernie4_5_VisionTransformer(nn.Module):
         for blk in self.blocks:
             x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings)
 
+        final_output = self.ln(x)
+
+        if final_output.ndim == 3:
+            final_output = final_output.squeeze(dim=1)
+
+        return final_output
+
         # adapter
-        x = self.merger(x)
-        return x
+        # x = self.merger(x)
+        # return x
 
 
 cached_get_processor = lru_cache(get_processor)
@@ -640,7 +659,7 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
             prefix=add_prefix("vision_model", prefix),
         )
 
-        self.model = Ernie4_5_VLMoeForCausalLM(
+        self.model = Ernie4_5_VLMoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
 
@@ -689,31 +708,57 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def _vision_forward(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: torch.Tensor,
+    ) -> torch.Tensor:
+        if grid_thw is not None:
+            grid_thw = grid_thw[grid_thw > 0]
+            if grid_thw.numel() % 3 != 0:
+                raise ValueError(
+                    f"grid_thw has {grid_thw.numel()} elements after filtering,"
+                    "which is not divisible by 3."
+                )
+            grid_thw = grid_thw.reshape(-1, 3)
+            # example: [[1,64,64],[2,80,80]] -> [[1,64,64],[1,80,80],[1,80,80]]
+            grid_thw = F.pad(
+                torch.repeat_interleave(grid_thw[:, 1:], grid_thw[:, 0], 0),
+                [1, 0, 0, 0],
+                value=1,
+            )
+        image_features = self.vision_model(pixel_values, grid_thw)
+        return image_features
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+            self.vision_model.dtype
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        image_feature = self._vision_forward(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = self.resampler_model(image_feature, image_grid_thw)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+            self.vision_model.dtype
         )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
-        video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+        video_feature = self._vision_forward(pixel_values, grid_thw=video_grid_thw)
+        video_embeds = self.resampler_model(video_feature, video_grid_thw)
         return video_embeds
 
     def _process_video_input(self, video_input: Ernie4_5_VLVideoInputs) -> torch.Tensor:
-        pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
-        video_embeds = self.visual(
+        pixel_values_videos = video_input["pixel_values_videos"].type(
+            self.vision_model.dtype
+        )
+        video_embeds = self.vision_model(
             pixel_values_videos, grid_thw=video_input["video_grid_thw"]
         )
         return video_embeds
@@ -807,6 +852,13 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
             ("gate_up_proj", "up_proj", 1),
             ("gate_up_proj", "gate_proj", 0),
         ]
+
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=max(self.config.moe_num_experts),
+        )
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -816,6 +868,9 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
+                    continue
+
+                if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
 
@@ -827,21 +882,86 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                if "visual" in name:
+                if "vision_model" in name:
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                # Distinguish between vision experts and text experts
+                if "mlp.experts" in name:
+                    moe_offset = int(name.split(".")[-3])
+                    vision_expert_start_idx = self.config.moe_num_experts[0]
+                    is_text_expert = moe_offset <= vision_expert_start_idx - 1
+                    if is_text_expert:
+                        name = name.replace(".experts.", ".text_experts.")
+                    else:
+                        name = name.replace(
+                            f".experts.{moe_offset}",
+                            f".vision_experts.{moe_offset - vision_expert_start_idx}",
+                        )
 
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+
+                    # Distinguish between vision experts and text experts
+                    moe_offset = int(name.split(".")[-3])
+                    is_text_expert = moe_offset <= self.config.moe_num_experts[0] - 1
+
+                    name = name.replace(weight_name, param_name)
+                    if is_text_expert:
+                        name = name.replace(".experts.", ".text_experts.")
+                    else:
+                        name = name.replace(".experts.", ".vision_experts.")
+
+                    # Skip loading extra bias for GPTQ models.
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
+
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                    else:
+                        logger.warning(f"Parameter {name} not found in params_dict")
+                    break
+                else:
+                    # Distinguish between vision expert gate
+                    # and text expert gate
+                    if name.endswith("mlp.gate.weight"):
+                        name = name.replace("gate.weight", "text_experts_gate.weight")
+                        loaded_weight = loaded_weight.T
+                    elif name.endswith("mlp.gate.weight_1"):
+                        name = name.replace(
+                            "gate.weight_1", "vision_experts_gate.weight"
+                        )
+                        loaded_weight = loaded_weight.T
+
+                    if "e_score_correction_bias" in name:
+                        name = name.replace(".moe_statics.", ".")
+
+                    # Skip loading extra bias for GPTQ models.
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
+
+                    if name in params_dict.keys():
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
+                    else:
+                        logger.warning(f"Parameter {name} not found in params_dict")
 
 
 EntryClass = Ernie4_5_VLMoeForConditionalGeneration

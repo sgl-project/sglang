@@ -1,7 +1,6 @@
 import asyncio
 import math
 import os
-import re
 import time
 from typing import List, Union
 
@@ -13,12 +12,6 @@ from torchvision.transforms import InterpolationMode
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-
-# from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
-# from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
-# from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
-# from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
-# from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -101,18 +94,15 @@ def resize_image(
     return image
 
 
-def round_by_factor(number: int, factor: int) -> int:
-    """Returns the closest integer to 'number' that is divisible by 'factor'."""
+def round_by_factor(number: int | float, factor: int) -> int:
     return round(number / factor) * factor
 
 
-def ceil_by_factor(number: int, factor: int) -> int:
-    """Returns the smallest integer greater than or equal to 'number' that is divisible by 'factor'."""
+def ceil_by_factor(number: int | float, factor: int) -> int:
     return math.ceil(number / factor) * factor
 
 
-def floor_by_factor(number: int, factor: int) -> int:
-    """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
+def floor_by_factor(number: int | float, factor: int) -> int:
     return math.floor(number / factor) * factor
 
 
@@ -243,46 +233,24 @@ async def preprocess_video(
     return video, video_metadata
 
 
-# Compatible with Qwen-VL & Qwen-Omni Series
+# Compatible with Ernie-VL Series
 class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
-    models = [
-        # Qwen2VLForConditionalGeneration,
-        # Qwen2_5_VLForConditionalGeneration,
-        # Qwen3VLForConditionalGeneration,
-        # Qwen3VLMoeForConditionalGeneration,
-        # Qwen3OmniMoeForConditionalGeneration,
-        Ernie4_5_VLMoeForConditionalGeneration
-    ]
+    models = [Ernie4_5_VLMoeForConditionalGeneration]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        self.model_type = hf_config.model_type
-        if hf_config.model_type == "qwen3_omni_moe":
-            hf_config = hf_config.thinker_config
-
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
-
-        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
-        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
+        self.model_type = hf_config.model_type
         self.vision_start_token_id = hf_config.vision_start_token_id
         self.vision_end_token_id = hf_config.vision_end_token_id
 
-        self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
-        self.audio_token_id = getattr(hf_config, "audio_token_id", None)
-
-        self.NUM_TOKEN_PER_FRAME = 770
         self.IMAGE_FACTOR = 28
         self.MIN_PIXELS = 4 * 28 * 28
         self.MAX_PIXELS = 16384 * 28 * 28
         self.MAX_RATIO = 200
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<|vision_start|><|image_pad|><|vision_end|>",
+            image_token="<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>",
             image_token_id=hf_config.image_token_id,
-            # The regex that matches expanded image tokens.
-            image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
-            ),
             video_token_id=hf_config.video_token_id,
-            audio_token_id=self.audio_token_id,
         ).build(_processor)
 
     async def process_mm_data_async(
@@ -318,30 +286,8 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
 
         preprocess_time = time.perf_counter()
 
-        # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
-        if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output,
-                self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
-            )
-        else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
-            )
-
-        audio_feature_lengths = None
-
-        if self.model_type == "qwen3_omni_moe":
-            audio_item = next((mm for mm in mm_items if mm.is_audio()), None)
-            if audio_item:
-                audio_feature_lengths = torch.sum(
-                    audio_item.feature_attention_mask, dim=1
-                )
-
-        second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
-            ret, "video_second_per_grid", None
+        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
         )
 
         process_time = time.perf_counter()
@@ -377,15 +323,3 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         }
 
         return mm_inputs
-
-        # return {
-        #     "input_ids": input_ids.tolist(),
-        #     "mm_items": mm_items,
-        #     "im_start_id": self.IM_START_TOKEN_ID,
-        #     "im_end_id": self.IM_END_TOKEN_ID,
-        #     "im_token_id": self.mm_tokens.image_token_id,
-        #     "video_token_id": self.mm_tokens.video_token_id,
-        #     "audio_token_id": self.mm_tokens.audio_token_id,
-        #     "mrope_positions": mrope_positions,
-        #     "mrope_position_delta": mrope_position_delta,
-        # }
