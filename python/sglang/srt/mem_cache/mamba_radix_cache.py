@@ -325,9 +325,6 @@ class MambaRadixCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
 
-        assert (
-            params.page_size == 1
-        ), "Only support page_size=1 in mamba radix cache now."
         self.page_size = params.page_size
         self.disable = params.disable
 

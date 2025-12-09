@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
@@ -1091,6 +1092,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
     output_ids: torch.Tensor = None  # shape: [b], int64
 
+    # For hybrid GDN prefix cache
+    is_hybrid_gdn_cache: bool = False
+    mamba_track_indices: torch.Tensor = None  # shape: [b], int64
+    mamba_track_mask: torch.Tensor = None  # shape: [b], bool
+    mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
 
@@ -1192,12 +1199,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             ), "SWARadixCache or SWAChunkCache is required for SWATokenToKVPoolAllocator"
             is_hybrid_swa = True
 
+        is_hybrid_gdn_cache = False
+        if isinstance(tree_cache, MambaRadixCache) and not tree_cache.disable:
+            is_hybrid_gdn_cache = True
+
         return cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
             is_hybrid_swa=is_hybrid_swa,
+            is_hybrid_gdn_cache=is_hybrid_gdn_cache,
             model_config=model_config,
             enable_overlap=enable_overlap,
             return_logprob=return_logprob,
@@ -1352,6 +1364,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_embeds = []
         extend_input_logprob_token_ids = []
         multimodal_inputs = []
+        mamba_track_mask_cpu = []
+        mamba_track_indices_cpu = []
+        mamba_track_seqlens_cpu = []
 
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             req.req_pool_idx = req_pool_indices[i]
@@ -1374,6 +1389,54 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req.cached_tokens += pre_len - req.already_computed
                 req.already_computed = seq_len
             req.is_retracted = False
+
+            if self.is_hybrid_gdn_cache:
+                mask = (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE > 0
+                mamba_track_mask_cpu.append(mask)
+                mamba_track_indices_cpu.append(
+                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
+                )
+                mamba_track_seqlen = -1
+                if mask:
+                    # mamba_track_seqlen is used to calculate the indices to track in
+                    # hybrid_linear_attn_backend's _init_track_ssm_indices. Due to the
+                    # fact that the ssm state between aligned and non-aligned are retrieved differently,
+                    # if 1) last pos and 2) is aligned, then retrieved from the last_recurrent_state,
+                    # otherwise retrieved from h (i.e. unaligned).
+                    # We need to pass the non-aligned seqlen to the calculation. Even though
+                    # we pass in mamba_track_seqlen, the actual tracked seqlen is mamba_last_track_seqlen.
+                    mamba_track_seqlen = len(req.prefix_indices) + req.extend_input_len
+                    # mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
+                    # mamba radix cache to track which seqlen this mamba state should store at.
+                    mamba_track_seqlen_aligned = (
+                        len(req.prefix_indices)
+                        + (req.extend_input_len // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+                    )
+                    req.mamba_next_track_idx = (
+                        self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                            req.mamba_next_track_idx
+                        )
+                    )
+                    if req.mamba_branching_seqlen is not None:
+                        # track branching point in this forward if the branching point
+                        # is within the current extend batch.
+                        branching_seqlen_aligned_mask = (
+                            req.mamba_branching_seqlen - len(req.prefix_indices)
+                        ) % FLA_CHUNK_SIZE == 0
+                        if (
+                            req.mamba_branching_seqlen > len(req.prefix_indices)
+                            and req.mamba_branching_seqlen < mamba_track_seqlen
+                            and branching_seqlen_aligned_mask
+                        ):
+                            # NOTE: See the comment above for mamba_track_seqlen, the +1 is necessary
+                            # because the branching point is not the last aligned position, so we need
+                            # to retrieve its state from h. Adding 1 will give us the correct index in h,
+                            # otherwise the calculation will retrieve the state from the last_recurrent_state,
+                            # which is not correct.
+                            mamba_track_seqlen = req.mamba_branching_seqlen + 1
+                            mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+                    req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+                mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
             # Compute the relative logprob_start_len in an extend batch
             #
@@ -1483,6 +1546,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+
+        if self.is_hybrid_gdn_cache:
+            self.mamba_track_indices = torch.tensor(
+                mamba_track_indices_cpu,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.mamba_track_mask = torch.tensor(
+                mamba_track_mask_cpu,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            self.mamba_track_seqlens = torch.tensor(
+                mamba_track_seqlens_cpu,
+                dtype=torch.int64,
+                device=self.device,
+            )
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -1754,6 +1834,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+
+        if self.is_hybrid_gdn_cache:
+            self.mamba_track_indices = torch.tensor(
+                [
+                    req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx]
+                    for req in self.reqs
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self.mamba_track_mask = torch.tensor(
+                [
+                    sl % get_global_server_args().mamba_track_interval == 0
+                    for sl in self.seq_lens_cpu
+                ],
+                dtype=torch.bool,
+                device=self.device,
+            )
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:

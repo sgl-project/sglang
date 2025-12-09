@@ -362,7 +362,7 @@ class PrefillAdder:
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
-        self.is_ssm_radix_cache = isinstance(self.tree_cache, MambaRadixCache)
+        self.is_hybrid_gdn_cache = isinstance(self.tree_cache, MambaRadixCache)
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -387,7 +387,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
-        elif self.is_ssm_radix_cache:
+        elif self.is_hybrid_gdn_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
@@ -409,7 +409,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.swa_available_size()
                 + self.tree_cache.swa_evictable_size(),
             )
-        elif self.is_ssm_radix_cache:
+        elif self.is_hybrid_gdn_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.full_evictable_size()
