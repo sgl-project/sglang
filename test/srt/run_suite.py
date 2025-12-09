@@ -204,6 +204,7 @@ suites = {
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
+        TestFile("lora/test_lora_hf_sgl_logprob_diff.py"),  # Nightly test
         TestFile("models/test_dummy_grok_models.py"),
         TestFile(
             "rl/test_update_weights_from_disk.py"
