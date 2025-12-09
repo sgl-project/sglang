@@ -261,13 +261,12 @@ def truncate_kv_cache_after_prefill(req: "Req", req_to_token_pool, tree_cache):
     if req.is_chunked > 0:
         return
 
-    # Only truncate if the request's prompt length is greater than the HIERARCHICAL_NSA_DECODE_MAX_TOKENS
-    current_len = len(req.origin_input_ids)
-    if current_len >= HIERARCHICAL_NSA_DECODE_MAX_TOKENS:
-        old_prefix_len = len(req.prefix_indices)
 
-        page_size = tree_cache.page_size
-        kv_keep_len = ceil_align(HIERARCHICAL_NSA_DECODE_MAX_TOKENS, page_size)
+    current_len = len(req.origin_input_ids)
+    page_size = tree_cache.page_size
+    kv_keep_len = ceil_align(HIERARCHICAL_NSA_DECODE_MAX_TOKENS, page_size)
+    if current_len > kv_keep_len:
+        old_prefix_len = len(req.prefix_indices)
 
         free_indices = req_to_token_pool.req_to_token[
             req.req_pool_idx, kv_keep_len:current_len
@@ -279,10 +278,6 @@ def truncate_kv_cache_after_prefill(req: "Req", req_to_token_pool, tree_cache):
             req.req_pool_idx, :kv_keep_len
         ].to(dtype=torch.int64, copy=True)
         tree_cache.protected_size_ -= old_prefix_len - kv_keep_len
-
-        logger.info(
-            f"Truncate request {req.rid} KV cache from {current_len} to {kv_keep_len} (page-aligned) after prefill completes."
-        )
 
 
 def alloc_paged_token_slots_extend(
@@ -459,6 +454,16 @@ def alloc_for_extend(
             extend_lens_cpu,
             out_index_cache_loc,
         )
+
+    # Log allocation info per request
+    if is_enable_hierarchical_nsa(batch.tree_cache.token_to_kv_pool_allocator):
+        allocator = batch.tree_cache.token_to_kv_pool_allocator
+        for i, req in enumerate(batch.reqs):
+            logger.info(
+                f"[KV_ALLOC] req={req.rid[:8]}, extend_len={batch.extend_lens[i]}, "
+                f"prefix_len={batch.prefix_lens[i]}, seq_len={batch.seq_lens_cpu[i].item()}, "
+                f"kv_avail={allocator.kv_allocator.available_size()}/{allocator._size_kv}"
+            )
 
     return out_cache_loc, req_pool_indices_device, req_pool_indices, out_index_cache_loc
 
@@ -669,6 +674,8 @@ def _alloc_decode_nsa(batch: ScheduleBatch, token_per_req: int) -> tuple:
     """
     bs = batch.seq_lens.shape[0]
     seq_lens_next = batch.seq_lens + token_per_req
+    allocator = batch.tree_cache.token_to_kv_pool_allocator
+    kv_avail_before = allocator.kv_allocator.available_size()
 
     if batch.model_config.is_encoder_decoder:
         locs = batch.encoder_lens + batch.seq_lens
@@ -683,6 +690,9 @@ def _alloc_decode_nsa(batch: ScheduleBatch, token_per_req: int) -> tuple:
     )
     truncated_mask = kv_prompt_lens >= HIERARCHICAL_NSA_DECODE_MAX_TOKENS
     out_cache_loc = torch.empty(bs, dtype=torch.int32, device=batch.device)
+
+    num_truncated = truncated_mask.sum().item()
+    num_non_truncated = bs - num_truncated
 
     # Handle truncated requests: use fixed position
     if truncated_mask.any():
@@ -717,6 +727,13 @@ def _alloc_decode_nsa(batch: ScheduleBatch, token_per_req: int) -> tuple:
         batch.req_to_token_pool.write(
             (batch.req_pool_indices, locs[non_truncated_indices]),
             out_cache_loc[non_truncated_indices],
+        )
+
+    kv_avail_after = allocator.kv_allocator.available_size()
+    if kv_avail_before != kv_avail_after:
+        logger.info(
+            f"[KV_ALLOC_DECODE] bs={bs}, truncated={num_truncated}, non_truncated={num_non_truncated}, "
+            f"kv_avail={kv_avail_before}->{kv_avail_after}"
         )
 
     # Allocate index_k for all requests

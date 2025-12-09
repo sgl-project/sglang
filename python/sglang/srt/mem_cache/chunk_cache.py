@@ -19,7 +19,6 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-
 class ChunkCache(BasePrefixCache):
     def __init__(
         self,
@@ -58,16 +57,15 @@ class ChunkCache(BasePrefixCache):
         kv_committed_len = req.pop_committed_kv_cache()
 
         if is_enable_hierarchical_nsa(self.token_to_kv_pool_allocator):
-            if len(req.origin_input_ids) >= HIERARCHICAL_NSA_DECODE_MAX_TOKENS:
-                kv_free_len = ceil_align(
-                    HIERARCHICAL_NSA_DECODE_MAX_TOKENS, self.page_size
-                )
-            else:
-                kv_free_len = kv_committed_len
-
-            index_k_free_len = len(req.origin_input_ids) + max(
-                len(req.output_ids) - 1, 0
+            prompt_len = len(req.origin_input_ids)
+            kv_keep_len = ceil_align(
+                HIERARCHICAL_NSA_DECODE_MAX_TOKENS, self.page_size
             )
+            # Normal: use kv_committed_len; Truncated: use min(prompt_len, kv_keep_len)
+            is_truncated = prompt_len >= HIERARCHICAL_NSA_DECODE_MAX_TOKENS
+            kv_free_len = min(prompt_len, kv_keep_len) if is_truncated else kv_committed_len
+
+            index_k_free_len = prompt_len + max(len(req.output_ids) - 1, 0)
 
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_free_len

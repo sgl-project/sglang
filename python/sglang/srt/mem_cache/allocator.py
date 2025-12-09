@@ -297,19 +297,9 @@ class NSAHybridTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if kv_indices.numel() == 0:
             return
 
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-        index_k_before = self.index_k_allocator.available_size()
         self.kv_allocator.free(kv_indices)
         if index_k_indices is not None and index_k_indices.numel() > 0:
             self.index_k_allocator.free(index_k_indices)
-        index_k_after = self.index_k_allocator.available_size()
-
-        logger.info(
-            f"[INDEX_K_FREE] freed={index_k_after - index_k_before}, count={len(index_k_indices) if index_k_indices is not None else 0}"
-        )
 
     def available_size(self):
         """Return KV allocator's available size (for scheduler memory check)"""
