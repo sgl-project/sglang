@@ -157,7 +157,7 @@ class TestLayerNorm(CustomTestCase):
         else:
             return x, residual
 
-    def _norm_test(self, m, n, dtype):
+    def _norm_test(self, m: int, n: int, dtype: torch.dtype) -> None:
         x_ln = torch.randn([m, n], dtype=dtype)
         x_ln = make_non_contiguous(x_ln)
         ref_x_ln = x_ln.clone()
@@ -187,7 +187,7 @@ class TestLayerNorm(CustomTestCase):
         torch.testing.assert_close(x_add_ln, ref_add_ln_out, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
-    def test_norm(self):
+    def test_norm(self) -> None:
         for params in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=params[0], n=params[1], dtype=params[2]):
                 self._norm_test(*params)
