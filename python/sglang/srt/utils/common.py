@@ -1503,6 +1503,33 @@ def add_prometheus_middleware(app):
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
 
+    _register_promethus_middleware_counter(app)
+
+
+def _register_promethus_middleware_counter(app):
+    from prometheus_client import Counter
+
+    http_response_status_counter = Counter(
+        name="sglang:http_response_status_total",
+        documentation="Total number of HTTP responses by endpoint and status code",
+        labelnames=["endpoint", "status_code", "method"],
+    )
+
+    @app.middleware("http")
+    async def track_http_status_code(request, call_next):
+        endpoint = request.url.path
+        method = request.method
+
+        response = await call_next(request)
+
+        http_response_status_counter.labels(
+            endpoint=endpoint,
+            status_code=str(response.status_code),
+            method=method,
+        ).inc()
+
+        return response
+
 
 def bind_port(port):
     """Bind to a specific port, assuming it's available."""
