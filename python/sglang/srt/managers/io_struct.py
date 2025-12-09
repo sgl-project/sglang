@@ -197,6 +197,9 @@ class GenerateReqInput(BaseReq):
     bootstrap_room: Optional[Union[List[int], int]] = None
     bootstrap_pair_key: Optional[Union[List[str], str]] = None
 
+    # For reasoning
+    reasoning: bool = False
+
     # Validation step duration
     validation_time: Optional[float] = None
 
@@ -675,6 +678,9 @@ class TokenizedGenerateReqInput(BaseReq):
     bootstrap_room: Optional[int] = None
     bootstrap_pair_key: Optional[str] = None
 
+    # For reasoning
+    reasoning: bool = False
+
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
@@ -1144,6 +1150,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional format specification for loading
+    load_format: Optional[str] = None
 
 
 @dataclass
@@ -1310,6 +1318,17 @@ class ResumeMemoryOccupationReqOutput(BaseReq):
 
 
 @dataclass
+class CheckWeightsReqInput(BaseReq):
+    action: str
+
+
+@dataclass
+class CheckWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
 class SlowDownReqInput(BaseReq):
     forward_sleep_time: Optional[float]
 
@@ -1376,6 +1395,8 @@ class ProfileReqInput(BaseReq):
     merge_profiles: bool = False
     # The prefix of the profile filenames
     profile_prefix: Optional[str] = None
+    # Only profile these stages and ignore others
+    profile_stages: Optional[List[str]] = None
 
 
 class ProfileReqType(Enum):
@@ -1396,6 +1417,7 @@ class ProfileReq(BaseReq):
     profile_id: Optional[str] = None
     merge_profiles: bool = False
     profile_prefix: Optional[str] = None
+    profile_stages: Optional[List[str]] = None
 
 
 @dataclass
