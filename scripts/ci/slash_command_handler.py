@@ -122,9 +122,7 @@ def handle_rerun_stage(
 ):
     """
     Handles the /rerun-stage <stage-name> command.
-    Triggers a workflow to run only the specified stage, skipping dependencies.
-    - For branches in the main repo: uses workflow_dispatch
-    - For fork PRs: uses repository_dispatch (since workflow_dispatch can't target fork branches)
+    Triggers a workflow_dispatch to run only the specified stage, skipping dependencies.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_stage", False):
@@ -140,7 +138,7 @@ def handle_rerun_stage(
         )
         return False
 
-    print(f"Permission granted. Triggering stage '{stage_name}'.")
+    print(f"Permission granted. Triggering workflow_dispatch for stage '{stage_name}'.")
 
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
@@ -196,31 +194,36 @@ def handle_rerun_stage(
         return False
 
     try:
-        # Check if PR is from a fork
-        is_fork = pr.head.repo.full_name != gh_repo.full_name
-        print(
-            f"PR head repo: {pr.head.repo.full_name}, main repo: {gh_repo.full_name}, is_fork: {is_fork}"
+        # Get the appropriate workflow based on stage type
+        workflow_name = "PR Test (AMD)" if is_amd_stage else "PR Test"
+        workflows = gh_repo.get_workflows()
+        target_workflow = None
+        for wf in workflows:
+            if wf.name == workflow_name:
+                target_workflow = wf
+                break
+
+        if not target_workflow:
+            print(f"Error: {workflow_name} workflow not found")
+            return False
+
+        # Trigger workflow_dispatch on the PR's head branch
+        ref = pr.head.ref
+        print(f"Triggering {workflow_name} workflow on branch: {ref}")
+
+        # AMD workflow doesn't have version input, only target_stage
+        if is_amd_stage:
+            inputs = {"target_stage": stage_name}
+        else:
+            inputs = {"version": "release", "target_stage": stage_name}
+
+        success = target_workflow.create_dispatch(
+            ref=ref,
+            inputs=inputs,
         )
 
-        if is_fork:
-            # For fork PRs, use repository_dispatch since workflow_dispatch can't target fork branches
-            print(f"Using repository_dispatch for fork PR #{pr.number}")
-
-            # Determine the event type based on stage type
-            event_type = "rerun-stage-amd" if is_amd_stage else "rerun-stage"
-
-            # Create repository_dispatch event
-            gh_repo.create_repository_dispatch(
-                event_type=event_type,
-                client_payload={
-                    "target_stage": stage_name,
-                    "pr_number": pr.number,
-                },
-            )
-
-            print(
-                f"Successfully triggered repository_dispatch for stage '{stage_name}'"
-            )
+        if success:
+            print(f"Successfully triggered workflow for stage '{stage_name}'")
             if react_on_success:
                 comment.create_reaction("+1")
                 pr.create_issue_comment(
@@ -229,55 +232,14 @@ def handle_rerun_stage(
                 )
             return True
         else:
-            # For branches in the main repo, use workflow_dispatch (more direct)
-            print(f"Using workflow_dispatch for main repo branch: {pr.head.ref}")
-
-            # Get the appropriate workflow based on stage type
-            workflow_name = "PR Test (AMD)" if is_amd_stage else "PR Test"
-            workflows = gh_repo.get_workflows()
-            target_workflow = None
-            for wf in workflows:
-                if wf.name == workflow_name:
-                    target_workflow = wf
-                    break
-
-            if not target_workflow:
-                print(f"Error: {workflow_name} workflow not found")
-                return False
-
-            # Trigger workflow_dispatch on the PR's head branch
-            ref = pr.head.ref
-            print(f"Triggering {workflow_name} workflow on branch: {ref}")
-
-            # AMD workflow doesn't have version input, only target_stage
-            if is_amd_stage:
-                inputs = {"target_stage": stage_name}
-            else:
-                inputs = {"version": "release", "target_stage": stage_name}
-
-            success = target_workflow.create_dispatch(
-                ref=ref,
-                inputs=inputs,
-            )
-
-            if success:
-                print(f"Successfully triggered workflow for stage '{stage_name}'")
-                if react_on_success:
-                    comment.create_reaction("+1")
-                    pr.create_issue_comment(
-                        f"✅ Triggered `{stage_name}` to run independently (skipping dependencies).\n\n"
-                        f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
-                    )
-                return True
-            else:
-                print("Failed to trigger workflow_dispatch")
-                return False
+            print("Failed to trigger workflow_dispatch")
+            return False
 
     except Exception as e:
-        print(f"Error triggering stage: {e}")
+        print(f"Error triggering workflow_dispatch: {e}")
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Failed to trigger stage: {str(e)}\n\n"
+            f"❌ Failed to trigger workflow: {str(e)}\n\n"
             f"Please check the logs or contact maintainers."
         )
         return False
