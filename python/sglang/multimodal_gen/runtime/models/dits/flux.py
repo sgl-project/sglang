@@ -32,7 +32,7 @@ from diffusers.models.normalization import (
 from torch.nn import LayerNorm as LayerNorm
 
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 
 # from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm as LayerNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
@@ -69,13 +69,13 @@ def _get_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states
 def _get_fused_projections(
     attn: "FluxAttention", hidden_states, encoder_hidden_states=None
 ):
-    query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
+    qkv, _ = attn.to_qkv(hidden_states)
+    query, key, value = qkv.chunk(3, dim=-1)
 
     encoder_query = encoder_key = encoder_value = None
     if encoder_hidden_states is not None and hasattr(attn, "to_added_qkv"):
-        encoder_query, encoder_key, encoder_value = attn.to_added_qkv(
-            encoder_hidden_states
-        ).chunk(3, dim=-1)
+        added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
+        encoder_query, encoder_key, encoder_value = added_qkv.chunk(3, dim=-1)
 
     return query, key, value, encoder_query, encoder_key, encoder_value
 
@@ -89,6 +89,7 @@ def _get_qkv_projections(
 
 
 class FluxAttention(torch.nn.Module, AttentionModuleMixin):
+    _supports_qkv_fusion = True
 
     def __init__(
         self,
@@ -148,19 +149,73 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             )
             self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
 
-        # Scaled dot product attention
-        self.attn = LocalAttention(
+        self.attn = USPAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends=(
+            supported_attention_backends={
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.TORCH_SDPA,
                 AttentionBackendEnum.SAGE_ATTN,
-            ),
+            },
         )
+
+        self.fused_projections = False
+
+    @torch.no_grad()
+    def fuse_projections(self):
+        if self.fused_projections:
+            return
+
+        device = self.to_q.weight.data.device
+        dtype = self.to_q.weight.data.dtype
+
+        concatenated_weights = torch.cat(
+            [self.to_q.weight.data, self.to_k.weight.data, self.to_v.weight.data]
+        )
+        in_features = concatenated_weights.shape[1]
+        out_features = concatenated_weights.shape[0]
+
+        self.to_qkv = ReplicatedLinear(in_features, out_features, bias=self.use_bias)
+        self.to_qkv.weight.data = concatenated_weights.to(device=device, dtype=dtype)
+        if self.use_bias:
+            concatenated_bias = torch.cat(
+                [self.to_q.bias.data, self.to_k.bias.data, self.to_v.bias.data]
+            )
+            self.to_qkv.bias.data = concatenated_bias.to(device=device, dtype=dtype)
+
+        if self.added_kv_proj_dim is not None:
+            concatenated_weights = torch.cat(
+                [
+                    self.add_q_proj.weight.data,
+                    self.add_k_proj.weight.data,
+                    self.add_v_proj.weight.data,
+                ]
+            )
+            in_features = concatenated_weights.shape[1]
+            out_features = concatenated_weights.shape[0]
+
+            self.to_added_qkv = ReplicatedLinear(
+                in_features, out_features, bias=self.added_proj_bias
+            )
+            self.to_added_qkv.weight.data = concatenated_weights.to(
+                device=device, dtype=dtype
+            )
+            if self.added_proj_bias:
+                concatenated_bias = torch.cat(
+                    [
+                        self.add_q_proj.bias.data,
+                        self.add_k_proj.bias.data,
+                        self.add_v_proj.bias.data,
+                    ]
+                )
+                self.to_added_qkv.bias.data = concatenated_bias.to(
+                    device=device, dtype=dtype
+                )
+
+        self.fused_projections = True
 
     def forward(
         self,
@@ -473,6 +528,19 @@ class FluxTransformer2DModel(CachableDiT):
             self.config.patch_size * self.config.patch_size * self.out_channels,
             bias=True,
         )
+
+    def fuse_qkv_projections(self):
+        for block in self.transformer_blocks:
+            if hasattr(block.attn, "fuse_projections") and getattr(
+                block.attn, "_supports_qkv_fusion", True
+            ):
+                block.attn.fuse_projections()
+
+        for block in self.single_transformer_blocks:
+            if hasattr(block.attn, "fuse_projections") and getattr(
+                block.attn, "_supports_qkv_fusion", True
+            ):
+                block.attn.fuse_projections()
 
     def forward(
         self,

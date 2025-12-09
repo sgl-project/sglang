@@ -384,7 +384,7 @@ class HiCacheController:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
-        # Currently, AscendMLAPagedTokenToKVPool is the subclass of MLATokenToKVPool.
+        # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
 
         return HiCacheStorageConfig(
@@ -503,7 +503,7 @@ class HiCacheController:
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
         elif self.io_backend == "kernel_ascend":
-            return host_indices, device_indices
+            return host_indices, device_indices.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -646,11 +646,6 @@ class HiCacheController:
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
-
-        # release pre-allocated memory
-        self.append_host_mem_release(
-            operation.host_indices[operation.completed_tokens :]
-        )
 
     def prefetch_io_aux_func(self):
         """

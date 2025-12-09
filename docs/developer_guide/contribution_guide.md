@@ -68,21 +68,43 @@ You can follow the pull request merge process described in [MAINTAINER.md](https
 You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals.
 Then your PR can be merged.
 
-## How to trigger CI
+## How to Trigger CI Tests
 
-To trigger CI, the pull request must have the "run-ci" label.
+We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
+Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
-- The "run-ci" label is not added automatically to new pull requests.
-- Only collaborators with triage or higher permission can add the "run-ci" label.
-- If you have triage/write/maintain/admin access, you can manually add the label by clicking "Labels" on the right side of the pull request.
-- If you do not have triage or higher permission, please request a review and ask a collaborator to add the label for you.
+For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
-After the "run-ci" label is added, the PR author can trigger CI by:
+- `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI.
+- `/rerun-failed-ci`: Reruns the failed or flaky tests from the most recent commit.
+- `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
+- `/rerun-stage <stage-name>`: Reruns a specific test stage without waiting for its dependencies. This is useful when you want to quickly validate a fix for a specific test failure instead of waiting ~30 minutes for preceding stages to complete.
 
-1. Pushing new commits, or
-2. Clicking "Re-run" / retrigger on the workflow page.
+If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
-## General code style
+To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
+
+Example of rerunning a single test stage: `/rerun-stage unit-test-backend-4-gpu`.
+
+If you don’t have permission, please ask maintainers to trigger CI for you.
+
+### CI rate limits
+
+We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
+
+Each CI workflow has a default limit defined in its workflow configuration file. For example, in [pr-gate.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/pr-gate.yml), the default cooldown period is 120 minutes, and each workflow can override it via the `cool-down-minutes` input parameter:
+
+```yaml
+cool-down-minutes:
+  description: "Default cooldown period in minutes; 0 disables rate limiting"
+  type: number
+  default: 120
+```
+
+Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
+
+
+## Code style guidance
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
@@ -116,6 +138,6 @@ Follow these steps:
 
 If you want to contribute but don’t have a specific idea in mind, pick issues labeled [“good first issue” or “help wanted”](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase. Also check out this [code walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
 
-If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://slack.sglang.ai).
+If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://slack.sglang.io).
 
 Thank you for your interest in SGLang. Happy coding!

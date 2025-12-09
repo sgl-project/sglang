@@ -2,41 +2,50 @@
 /docker @Fridge003 @ispobock @HaiShaw @ishandhanani
 /docker/npu.Dockerfile @ping1jing2 @iforgetmyname
 /python/pyproject.toml @merrymercy @Fridge003 @ispobock
-/python/sglang/multimodal_gen @mickqian
+/python/sglang/multimodal_gen @mickqian @yhyang201
+/python/sglang/srt/batch_invariant_ops @Fridge003 @hebiao064
 /python/sglang/srt/constrained @hnyls2002 @DarkSharpness
+/python/sglang/srt/compilation @hebiao064
 /python/sglang/srt/disaggregation @ByronHsu @hnyls2002 @ShangmingCai
 /python/sglang/srt/disaggregation/ascend @ping1jing2 @iforgetmyname
 /python/sglang/srt/distributed @yizhang2077 @merrymercy @ch-wan
 /python/sglang/srt/entrypoints @ispobock @CatherineSue @slin1237 @merrymercy @JustinTong0323
+/python/sglang/srt/entrypoints/grpc_server.py @CatherineSue @slin1237
 /python/sglang/srt/eplb @fzyzcjy @ch-wan
 /python/sglang/srt/function_call @CatherineSue @JustinTong0323
-/python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @kushanam @Edwardf0t1
+/python/sglang/srt/grpc @CatherineSue @slin1237
+/python/sglang/srt/hardware_backend/npu @ping1jing2 @iforgetmyname
+/python/sglang/srt/layers @merrymercy @Ying1123 @Fridge003 @ispobock @HaiShaw @ch-wan @BBuf @Edwardf0t1
+/python/sglang/srt/layers/attention/fla @yizhang2077 @hebiao064
+/python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py @yizhang2077 @hebiao064 @hanming-lu
+/python/sglang/srt/layers/attention/mamba @yizhang2077 @hebiao064
 /python/sglang/srt/layers/quantization @ch-wan @BBuf @Edwardf0t1 @FlamingoPg @AniZpZ
-/python/sglang/srt/layers/attention/ascend_backend.py @ping1jing2 @iforgetmyname
 /python/sglang/srt/lora @Ying1123 @Fridge003 @lifuhuang
 /python/sglang/srt/managers @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @zhyncs
-/python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann
-/python/sglang/srt/mem_cache/allocator_ascend.py @ping1jing2 @iforgetmyname
+/python/sglang/srt/mem_cache @merrymercy @Ying1123 @hnyls2002 @xiezhq-hermann @hanming-lu @yizhang2077
 /python/sglang/srt/model_executor @merrymercy @Ying1123 @hnyls2002 @Fridge003 @ispobock
-/python/sglang/srt/model_executor/npu_graph_runner.py @ping1jing2 @iforgetmyname
-/python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201
+/python/sglang/srt/model_executor/piecewise_cuda_graph_runner.py @hebiao064
+/python/sglang/srt/models/deepseek_v2.py @fzyzcjy @zhyncs @ispobock @ch-wan @merrymercy @Fridge003
+/python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
 /sgl-kernel @zhyncs @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
-/sgl-router @slin1237 @ByronHsu @CatherineSue
-/sgl-router/benches @slin1237
-/sgl-router/py_src @CatherineSue @key4ng @slin1237
-/sgl-router/py_test @CatherineSue @key4ng
-/sgl-router/src/config @slin1237
-/sgl-router/src/core @slin1237
-/sgl-router/src/data_connector @key4ng
-/sgl-router/src/grpc_client @CatherineSue @slin1237
-/sgl-router/src/mcp @key4ng @slin1237
-/sgl-router/src/policies @slin1237 @ByronHsu
-/sgl-router/src/proto @CatherineSue @slin1237
-/sgl-router/src/protocols @CatherineSue @key4ng
-/sgl-router/src/reasoning_parser @CatherineSue
-/sgl-router/src/routers @CatherineSue @key4ng @slin1237
-/sgl-router/src/tokenizer @slin1237 @CatherineSue
-/sgl-router/src/tool_parser @slin1237 @CatherineSue
+/sgl-model-gateway @slin1237 @CatherineSue
+/sgl-model-gateway/benches @slin1237
+/sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237
+/sgl-model-gateway/py_test @CatherineSue @key4ng
+/sgl-model-gateway/src/config @slin1237
+/sgl-model-gateway/src/core @slin1237
+/sgl-model-gateway/src/data_connector @key4ng
+/sgl-model-gateway/src/grpc_client @CatherineSue @slin1237
+/sgl-model-gateway/src/mcp @key4ng @slin1237
+/sgl-model-gateway/src/policies @slin1237 @ByronHsu
+/sgl-model-gateway/src/proto @CatherineSue @slin1237
+/sgl-model-gateway/src/protocols @CatherineSue @key4ng
+/sgl-model-gateway/src/reasoning_parser @CatherineSue
+/sgl-model-gateway/src/routers @CatherineSue @key4ng @slin1237
+/sgl-model-gateway/src/tokenizer @slin1237 @CatherineSue
+/sgl-model-gateway/src/tool_parser @slin1237 @CatherineSue
+/sgl-model-gateway/src/wasm @slin1237
+/sgl-model-gateway/examples/wasm @slin1237
 /test/srt/ascend @ping1jing2 @iforgetmyname
 /test/srt/test_modelopt* @Edwardf0t1

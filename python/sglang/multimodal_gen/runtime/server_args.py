@@ -2,7 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Inspired by SGLang: https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/server_args.py
-"""The arguments of sgl-diffusion Inference."""
+"""The arguments of sglang-diffusion Inference."""
+
 import argparse
 import dataclasses
 import inspect
@@ -15,10 +16,9 @@ from dataclasses import field
 from enum import Enum
 from typing import Any, Optional
 
-from sglang.multimodal_gen.configs.configs import PreprocessConfig
-from sglang.multimodal_gen.configs.pipelines import FluxPipelineConfig
-from sglang.multimodal_gen.configs.pipelines.base import PipelineConfig, STA_Mode
-from sglang.multimodal_gen.configs.pipelines.qwen_image import (
+from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
@@ -157,9 +157,6 @@ class ExecutionMode(str, Enum):
     """
 
     INFERENCE = "inference"
-    PREPROCESS = "preprocess"
-    FINETUNING = "finetuning"
-    DISTILLATION = "distillation"
 
     @classmethod
     def from_string(cls, value: str) -> "ExecutionMode":
@@ -251,12 +248,14 @@ class ServerArgs:
     dist_timeout: int | None = None  # timeout for torch.distributed
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
-    preprocess_config: PreprocessConfig | None = None
 
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
     lora_nickname: str = "default"  # for swapping adapters in the pipeline
+
+    # VAE parameters
+    vae_path: str | None = None  # Custom VAE path (e.g., for distilled autoencoder)
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -379,6 +378,12 @@ class ServerArgs:
             type=str,
             help="Directory containing StepVideo model",
         )
+        parser.add_argument(
+            "--vae-path",
+            type=str,
+            default=ServerArgs.vae_path,
+            help="Custom path to VAE model (e.g., for distilled autoencoder). If not specified, VAE will be loaded from the main model path.",
+        )
 
         # attention
         parser.add_argument(
@@ -395,7 +400,7 @@ class ServerArgs:
             type=str,
             choices=ExecutionMode.choices(),
             default=ServerArgs.mode.value,
-            help="The mode to run sgl-diffusion",
+            help="The mode to run SGLang-diffusion",
         )
 
         # Workload type
@@ -538,7 +543,6 @@ class ServerArgs:
             help="Use torch.compile to speed up DiT inference."
             + "However, will likely cause precision drifts. See (https://github.com/pytorch/pytorch/issues/145213)",
         )
-
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -623,11 +627,21 @@ class ServerArgs:
             default=ServerArgs.override_transformer_cls_name,
             help="Override transformer cls name",
         )
+        # LoRA
+        parser.add_argument(
+            "--lora-path",
+            type=str,
+            default=ServerArgs.lora_path,
+            help="The path to the LoRA adapter weights (can be local file path or HF hub id) to launch with",
+        )
+        parser.add_argument(
+            "--lora-nickname",
+            type=str,
+            default=ServerArgs.lora_nickname,
+            help="The nickname for the LoRA adapter to launch with",
+        )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
-
-        # Add preprocessing configuration arguments
-        PreprocessConfig.add_cli_args(parser)
 
         # Logging
         parser.add_argument(
@@ -734,9 +748,6 @@ class ServerArgs:
                 pipeline_config = PipelineConfig.from_kwargs(kwargs)
                 logger.debug(f"Using PipelineConfig: {type(pipeline_config)}")
                 server_args_kwargs["pipeline_config"] = pipeline_config
-            elif attr == "preprocess_config":
-                preprocess_config = PreprocessConfig.from_kwargs(kwargs)
-                server_args_kwargs["preprocess_config"] = preprocess_config
             elif attr in kwargs:
                 server_args_kwargs[attr] = kwargs[attr]
 
@@ -772,7 +783,6 @@ class ServerArgs:
             kwargs["workload_type"] = WorkloadType.from_string(kwargs["workload_type"])
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
-        kwargs["preprocess_config"] = PreprocessConfig.from_kwargs(kwargs)
         return cls(**kwargs)
 
     @staticmethod
@@ -802,18 +812,6 @@ class ServerArgs:
         return provided_args
 
     def check_server_sp_args(self):
-
-        if self.pipeline_config.task_type.is_image_gen():
-            if (
-                (self.sp_degree and self.sp_degree > 1)
-                or (self.ulysses_degree and self.ulysses_degree > 1)
-                or (self.ring_degree and self.ring_degree > 1)
-            ):
-                raise ValueError(
-                    "SP is not supported for image generation models for now"
-                )
-            self.sp_degree = self.ulysses_degree = self.ring_degree = 1
-
         if self.sp_degree == -1:
             # assume we leave all remaining gpus to sp
             num_gpus_per_group = self.dp_size * self.tp_size
@@ -836,17 +834,15 @@ class ServerArgs:
         if self.ulysses_degree is None:
             self.ulysses_degree = 1
             logger.info(
-                f"Ulysses degree not set, " f"using default value {self.ulysses_degree}"
+                f"Ulysses degree not set, using default value {self.ulysses_degree}"
             )
 
         if self.ring_degree is None:
             self.ring_degree = 1
-            logger.info(
-                f"Ring degree not set, " f"using default value {self.ring_degree}"
-            )
+            logger.info(f"Ring degree not set, using default value {self.ring_degree}")
 
         if self.ring_degree > 1:
-            if self.attention_backend != None and self.attention_backend != "fa":
+            if self.attention_backend is not None and self.attention_backend != "fa":
                 raise ValueError(
                     "Ring Attention is only supported for flash attention backend for now"
                 )
@@ -870,8 +866,11 @@ class ServerArgs:
     def check_server_dp_args(self):
         assert self.num_gpus % self.dp_size == 0, f"{self.num_gpus=}, {self.dp_size=}"
         assert self.dp_size >= 1, "--dp-size must be natural number"
-        self.dp_degree = self.num_gpus // self.dp_size
+        # NOTE: disable temporarily
+        # self.dp_degree = self.num_gpus // self.dp_size
         logger.info(f"Setting dp_degree to: {self.dp_degree}")
+        if self.dp_size > 1:
+            raise ValueError("DP is not yet supported")
 
     def check_server_args(self) -> None:
         """Validate inference arguments for consistency"""
@@ -928,18 +927,6 @@ class ServerArgs:
             raise ValueError("pipeline_config is not set in ServerArgs")
 
         self.pipeline_config.check_pipeline_config()
-
-        # Add preprocessing config validation if needed
-        if self.mode == ExecutionMode.PREPROCESS:
-            if self.preprocess_config is None:
-                raise ValueError(
-                    "preprocess_config is not set in ServerArgs when mode is PREPROCESS"
-                )
-            if self.preprocess_config.model_path == "":
-                self.preprocess_config.model_path = self.model_path
-            if not self.pipeline_config.vae_config.load_encoder:
-                self.pipeline_config.vae_config.load_encoder = True
-            self.preprocess_config.check_preprocess_config()
 
         # parallelism
         self.check_server_dp_args()

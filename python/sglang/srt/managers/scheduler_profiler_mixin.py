@@ -6,10 +6,13 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.srt.utils.profile_utils import ProfileManager
 
 _is_npu = is_npu()
 if _is_npu:
@@ -27,21 +30,33 @@ logger = logging.getLogger(__name__)
 
 class SchedulerProfilerMixin:
     def init_profiler(self):
+        if envs.SGLANG_PROFILE_V2.get():
+            self._profile_manager = ProfileManager(
+                tp_rank=self.tp_rank,
+                cpu_group=self.cpu_group,
+                gpu_id=self.gpu_id,
+            )
+            return
+
         self.torch_profiler = None
         self.torch_profiler_output_dir: Optional[Path] = None
         self.profiler_activities: Optional[List[str]] = None
         self.profile_id: Optional[str] = None
+
         self.profiler_start_forward_ct: Optional[int] = None
         self.profiler_target_forward_ct: Optional[int] = None
-        self.profiler_target_prefill_ct: Optional[int] = None
-        self.profiler_target_decode_ct: Optional[int] = None
+
         self.profiler_prefill_ct: Optional[int] = None
         self.profiler_decode_ct: Optional[int] = None
+        self.profiler_target_prefill_ct: Optional[int] = None
+        self.profiler_target_decode_ct: Optional[int] = None
+
         self.profile_by_stage: bool = False
-        self.profile_steps: Optional[int] = None
         self.profile_in_progress: bool = False
-        self.rpd_profiler = None
         self.merge_profiles = False
+
+        # For ROCM
+        self.rpd_profiler = None
 
     def init_profile(
         self,
@@ -54,7 +69,24 @@ class SchedulerProfilerMixin:
         profile_by_stage: bool,
         profile_id: str,
         merge_profiles: bool = False,
+        profile_prefix: str = "",
+        profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
+        if envs.SGLANG_PROFILE_V2.get():
+            return self._profile_manager.configure(
+                output_dir=output_dir,
+                start_step=start_step,
+                num_steps=num_steps,
+                activities=activities,
+                with_stack=with_stack,
+                record_shapes=record_shapes,
+                profile_by_stage=profile_by_stage,
+                profile_id=profile_id,
+                merge_profiles=merge_profiles,
+                profile_prefix=profile_prefix,
+                profile_stages=profile_stages,
+            )
+
         if self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
@@ -74,17 +106,17 @@ class SchedulerProfilerMixin:
         self.torch_profiler_record_shapes = record_shapes
         self.profiler_activities = activities
         self.profile_id = profile_id
+        self.profile_prefix = profile_prefix
 
         if start_step:
             self.profiler_start_forward_ct = max(start_step, self.forward_ct + 1)
 
         if num_steps:
-            self.profile_steps = num_steps
             if self.profile_by_stage:
-                self.profiler_target_prefill_ct = num_steps
-                self.profiler_target_decode_ct = num_steps
                 self.profiler_prefill_ct = 0
                 self.profiler_decode_ct = 0
+                self.profiler_target_prefill_ct = num_steps
+                self.profiler_target_decode_ct = num_steps
             elif start_step:
                 self.profiler_target_forward_ct = (
                     self.profiler_start_forward_ct + num_steps
@@ -100,6 +132,9 @@ class SchedulerProfilerMixin:
     def start_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        if envs.SGLANG_PROFILE_V2.get():
+            return self._profile_manager.manual_start()
+
         stage_str = f" for {stage.name}" if stage else ""
         logger.info(
             f"Profiling starts{stage_str}. Traces will be saved to: {self.torch_profiler_output_dir} (with profile id: {self.profile_id})",
@@ -117,7 +152,7 @@ class SchedulerProfilerMixin:
             activity_map[a] for a in activities if a in activity_map
         ]
 
-        if "RPD" in activities:
+        if "RPD" in activities:  # for ROCM
             from rpdTracerControl import rpdTracerControl
 
             rpdTracerControl.skipCreate()
@@ -167,7 +202,8 @@ class SchedulerProfilerMixin:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            torch.cuda.cudart().cudaProfilerStart()
+            if self.gpu_id == get_global_server_args().base_gpu_id:
+                torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
         return ProfileReqOutput(success=True, message="Succeeded")
@@ -207,6 +243,9 @@ class SchedulerProfilerMixin:
     def stop_profile(
         self, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
+        if envs.SGLANG_PROFILE_V2.get():
+            return self._profile_manager.manual_stop()
+
         if not self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
@@ -214,6 +253,11 @@ class SchedulerProfilerMixin:
             )
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.profile_prefix:
+            stage_prefix = self.profile_prefix + "-"
+        else:
+            stage_prefix = ""
 
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
@@ -231,7 +275,12 @@ class SchedulerProfilerMixin:
                 if getattr(self, "moe_ep_size", 1) > 1:
                     filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
 
-                filename = "-".join(filename_parts) + stage_suffix + ".trace.json.gz"
+                filename = (
+                    stage_prefix
+                    + "-".join(filename_parts)
+                    + stage_suffix
+                    + ".trace.json.gz"
+                )
 
                 self.torch_profiler.export_chrome_trace(
                     os.path.join(self.torch_profiler_output_dir, filename)
@@ -249,7 +298,7 @@ class SchedulerProfilerMixin:
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
             self.rpd_profiler = None
-            self.rpd_profiler_path = None
+            self.rpd_profile_path = None
 
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
@@ -263,7 +312,8 @@ class SchedulerProfilerMixin:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            torch.cuda.cudart().cudaProfilerStop()
+            if self.gpu_id == get_global_server_args().base_gpu_id:
+                torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()
 
@@ -279,6 +329,10 @@ class SchedulerProfilerMixin:
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch):
+        if envs.SGLANG_PROFILE_V2.get():
+            self._profile_manager.step(forward_mode=batch.forward_mode)
+            return
+
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
                 if self.profiler_prefill_ct == 0:
@@ -327,6 +381,8 @@ class SchedulerProfilerMixin:
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
                     recv_req.merge_profiles,
+                    recv_req.profile_prefix,
+                    recv_req.profile_stages,
                 )
             else:
                 self.init_profile(
@@ -339,6 +395,7 @@ class SchedulerProfilerMixin:
                     recv_req.profile_by_stage,
                     recv_req.profile_id,
                     recv_req.merge_profiles,
+                    recv_req.profile_prefix,
                 )
                 return self.start_profile()
         else:

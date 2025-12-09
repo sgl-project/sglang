@@ -47,6 +47,7 @@ class ModelImpl(str, Enum):
     AUTO = "auto"
     SGLANG = "sglang"
     TRANSFORMERS = "transformers"
+    MINDSPORE = "mindspore"
 
 
 def is_deepseek_nsa(config: PretrainedConfig) -> bool:
@@ -57,6 +58,8 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
         ]
         and getattr(config, "index_topk", None) is not None
     )
@@ -153,13 +156,13 @@ class ModelConfig:
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None
         )
-        self.is_hybrid = is_hybrid_model(
+        self.is_hybrid_swa = is_hybrid_model(
             self.hf_config.architectures,
             hybrid_kvcache_ratio=hybrid_kvcache_ratio,
             context_length=context_length,
             attention_chunk_size=self.attention_chunk_size,
         )
-        if self.is_hybrid is not None:
+        if self.is_hybrid_swa is not None:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures, self.hf_text_config.num_hidden_layers
@@ -333,6 +336,9 @@ class ModelConfig:
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
+            or "MistralLarge3ForCausalLM" in self.hf_config.architectures
+            or "PixtralForConditionalGeneration" in self.hf_config.architectures
+            or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -352,9 +358,10 @@ class ModelConfig:
                 mscale_all_dim = self.hf_config.rope_scaling.get(
                     "mscale_all_dim", False
                 )
-                scaling_factor = self.hf_config.rope_scaling["factor"]
-                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-                self.scaling = self.scaling * mscale * mscale
+                scaling_factor = self.hf_config.rope_scaling.get("factor")
+                if scaling_factor is not None:
+                    mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                    self.scaling = self.scaling * mscale * mscale
 
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
@@ -697,7 +704,16 @@ class ModelConfig:
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
-                if (
+                # Allow auto-detection of quantization from checkpoint for draft model
+                # even if it differs from main model's quantization
+                if self.is_draft_model:
+                    logger.info(
+                        f"Draft model quantization ({quant_method}) differs from "
+                        f"main model quantization ({self.quantization}). "
+                        f"Using draft model's detected quantization: {quant_method}"
+                    )
+                    self.quantization = quant_method
+                elif (
                     self.quantization not in compatible_quantization_methods
                     or quant_method
                     not in compatible_quantization_methods[self.quantization]
@@ -937,6 +953,8 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "NemotronH_Nano_VL_V2",
+    "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
     "Qwen2_5_VLForConditionalGeneration",
@@ -957,6 +975,9 @@ multimodal_model_archs = [
     "DeepseekOCRForCausalLM",
     "JetVLMForConditionalGeneration",
 ]
+
+if envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value:
+    multimodal_model_archs.append(envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.value)
 
 
 def is_multimodal_model(model_architectures: List[str]):

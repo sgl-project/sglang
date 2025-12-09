@@ -69,11 +69,21 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-    elif architecture in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
+    elif architecture in [
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "Glm4MoeForCausalLM",
+        "MistralLarge3ForCausalLM",
+    ]:
         E = (config.n_routed_experts // ep_size) + (
             0
             if disable_shared_experts_fusion
-            or architecture not in ["DeepseekV3ForCausalLM"]
+            or architecture
+            not in [
+                "DeepseekV3ForCausalLM",
+                "Glm4MoeForCausalLM",
+                "MistralLarge3ForCausalLM",
+            ]
             else 1
         )
         topk = config.num_experts_per_tok + (
@@ -104,7 +114,7 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
-    elif architecture in ["Glm4MoeForCausalLM"]:
+    elif architecture == "NemotronHForCausalLM":
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size

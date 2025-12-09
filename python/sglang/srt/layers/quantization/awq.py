@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    npu_fused_experts,
+)
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -31,7 +34,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
-from sglang.srt.layers.quantization.w8a8_int8 import npu_fused_experts
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -52,12 +54,7 @@ if _is_npu:
     import torch_npu
 
 if _is_cuda:
-    from sgl_kernel import (
-        awq_dequantize,
-        awq_marlin_moe_repack,
-        awq_marlin_repack,
-        fused_marlin_moe,
-    )
+    from sgl_kernel import awq_dequantize, awq_marlin_moe_repack, awq_marlin_repack
 
 
 elif _is_hip:
@@ -835,6 +832,9 @@ class AWQMoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         assert (

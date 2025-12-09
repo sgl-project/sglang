@@ -18,10 +18,12 @@
 """Inference-only Qwen3MoE model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import math
+from typing import Any, Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
@@ -49,6 +51,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
@@ -69,7 +72,15 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_non_idle_and_non_empty,
+    is_npu,
 )
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel import fused_qk_norm_rope
+
+TConfig = TypeVar("TConfig", bound=PretrainedConfig)
 
 Qwen3MoeConfig = None
 
@@ -77,6 +88,122 @@ _is_flashinfer_available = is_flashinfer_available()
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+def compute_yarn_parameters(
+    config: PretrainedConfig,
+) -> tuple[float, float, float, float]:
+    """
+    Refer to https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py#L197C1-L288C1
+    Computes the inverse frequencies with NTK scaling. Please refer to the
+    [original paper](https://huggingface.co/papers/2309.00071)
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+    Returns:
+        factor: float, the scaling factor for the RoPE embeddings
+        low: float, the lower bound of the dimension range
+        high: float, the upper bound of the dimension range
+        attention_factor: float, the post-processing scaling factor applied to the computed cos/sin
+    """
+
+    # The config does not contain rope_scaling, which means the model is not using yarn
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling is None:
+        return 1.0, 0, 0, 1.0
+
+    base = config.rope_theta
+    partial_rotary_factor = (
+        config.partial_rotary_factor
+        if hasattr(config, "partial_rotary_factor")
+        else 1.0
+    )
+    head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    dim = int(head_dim * partial_rotary_factor)
+    factor = getattr(rope_scaling, "factor", 1.0)
+    attention_factor = rope_scaling.get("attention_factor")
+    mscale = rope_scaling.get("mscale")
+    mscale_all_dim = rope_scaling.get("mscale_all_dim")
+
+    if "original_max_position_embeddings" in rope_scaling:
+        original_max_position_embeddings = rope_scaling[
+            "original_max_position_embeddings"
+        ]
+        factor = config.max_position_embeddings / original_max_position_embeddings
+    else:
+        original_max_position_embeddings = config.max_position_embeddings
+
+    def get_mscale(scale, mscale=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    # Sets the attention factor as suggested in the paper
+    if attention_factor is None:
+        if mscale and mscale_all_dim:
+            attention_factor = float(
+                get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim)
+            )
+        else:
+            attention_factor = get_mscale(factor)
+
+    # Optional config options
+    # beta_fast/beta_slow: as suggested in the paper, default to 32/1 (correspondingly)
+    beta_fast = rope_scaling.get("beta_fast") or 32
+    beta_slow = rope_scaling.get("beta_slow") or 1
+
+    # Compute the inverse frequencies
+    def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
+        """Inverse dimension formula to find the dimension based on the number of rotations"""
+        return (
+            dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))
+        ) / (2 * math.log(base))
+
+    def find_correction_range(
+        low_rot, high_rot, dim, base, max_position_embeddings, truncate
+    ):
+        """Find dimension range bounds based on rotations"""
+        low = find_correction_dim(low_rot, dim, base, max_position_embeddings)
+        high = find_correction_dim(high_rot, dim, base, max_position_embeddings)
+        if truncate:
+            low = math.floor(low)
+            high = math.ceil(high)
+        return max(low, 0), min(high, dim - 1)
+
+    truncate = rope_scaling.get("truncate", True)
+    low, high = find_correction_range(
+        beta_fast, beta_slow, dim, base, original_max_position_embeddings, truncate
+    )
+
+    # These parts are implemented in the fusedQKNormRopeKernel.cu
+    # # def linear_ramp_factor(min, max, dim):
+    # #     if min == max:
+    # #         max += 0.001  # Prevent singularity
+
+    # #     linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    # #     ramp_func = torch.clamp(linear_func, 0, 1)
+    # #     return ramp_func
+
+    # # Note on variable naming: "interpolation" comes from the original technique, where we interpolate the position IDs
+    # # to expand the possible context length. In other words, interpolation = apply scaling factor.
+    # # pos_freqs = base ** (torch.arange(0, dim, 2).to(device=device, dtype=torch.float) / dim)
+    # # inv_freq_extrapolation = 1.0 / pos_freqs
+    # # inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+
+    # # # Get n-dimensional rotational scaling corrected for extrapolation
+    # # inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).to(device=device, dtype=torch.float)
+    # # inv_freq = (
+    # #     inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
+    # #     + inv_freq_extrapolation * inv_freq_extrapolation_factor
+    # # )
+    # # return inv_freq, attention_factor
+    return factor, low, high, attention_factor
 
 
 class Qwen3MoeSparseMoeBlock(nn.Module):
@@ -111,6 +238,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
+            routing_method_type=RoutingMethodType.Renormalize,
         )
 
         self.gate = ReplicatedLinear(
@@ -137,7 +265,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
 
-        if not get_moe_a2a_backend().is_deepep():
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_fuseep()
+        ):
             return self.forward_normal(
                 hidden_states, should_allreduce_fusion, use_reduce_scatter
             )
@@ -276,6 +407,7 @@ class Qwen3MoeAttention(nn.Module):
         head_dim: Optional[int] = None,
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
+        config: Optional[TConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
@@ -287,6 +419,7 @@ class Qwen3MoeAttention(nn.Module):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
+        self.config = config
         self.total_num_heads = num_heads
         assert self.total_num_heads % attn_tp_size == 0
         self.num_heads = self.total_num_heads // attn_tp_size
@@ -342,6 +475,14 @@ class Qwen3MoeAttention(nn.Module):
         self.compatible_with_fused_kv_buffer = (
             False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
         )
+        self.compatible_with_fused_qk_norm_rope = (
+            not isinstance(self.rotary_emb, MRotaryEmbedding)
+        ) and self.head_dim in (64, 128, 256)
+        self.use_fused_qk_norm_rope = (
+            get_global_server_args().enable_fused_qk_norm_rope
+            and self.compatible_with_fused_qk_norm_rope
+        )
+        self._used_fused_qk_norm_rope_last_call = False
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -369,6 +510,9 @@ class Qwen3MoeAttention(nn.Module):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
+            q = q_by_head.view(q.shape)
+            k = k_by_head.view(k.shape)
+            return q, k
         else:
             q_by_head = q.reshape(-1, self.head_dim)
             q_by_head = self.q_norm(q_by_head)
@@ -390,6 +534,94 @@ class Qwen3MoeAttention(nn.Module):
             state.pop("attn_intermediate_state")
         )
 
+    def forward_prepare_npu(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn.layer_id == 0:
+            self.rotary_emb.get_cos_sin_with_position(positions)
+        q, k, v = split_qkv_rmsnorm_rope(
+            qkv,
+            self.rotary_emb.position_sin,
+            self.rotary_emb.position_cos,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_size,
+            self.kv_size,
+            self.head_dim,
+            self.q_norm.variance_epsilon,
+            q_bias=getattr(self.q_norm, "bias", None),
+            k_bias=getattr(self.k_norm, "bias", None),
+        )
+
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
+    def forward_prepare_native(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+
+        q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
+
+        inner_state = q, k, v, forward_batch
+        return None, forward_batch, inner_state
+
+    def apply_qk_norm_rope(self, qkv, positions, forward_batch):
+        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        if use_fused:
+            theta = getattr(self.config, "rope_theta", 10000.0)
+            positions = (
+                positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
+            )
+            factor, low, high, attention_factor = compute_yarn_parameters(self.config)
+            fused_qk_norm_rope(
+                qkv,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                theta,
+                self.rotary_emb.is_neox_style,
+                positions,
+                factor,
+                low,
+                high,
+                attention_factor,
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            self._used_fused_qk_norm_rope_last_call = True
+        else:
+            # Fallback to non-fused QK Norm & RoPE implementation
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self._apply_qk_norm(q, k)
+            q, k = self.rotary_emb(
+                positions,
+                q,
+                k,
+                fused_set_kv_buffer_arg=(
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
+                    and self.compatible_with_fused_kv_buffer
+                    else None
+                ),
+            )
+            self._used_fused_qk_norm_rope_last_call = False
+        return q, k, v
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -398,37 +630,37 @@ class Qwen3MoeAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                and self.compatible_with_fused_kv_buffer
-                else None
-            ),
-        )
-        inner_state = q, k, v, forward_batch
-        return None, forward_batch, inner_state
+        if not _is_npu:
+            return self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+        else:
+            return self.forward_prepare_npu(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+
+        q, k, v, fb = inner_state
+
+        must_save_kv = self._used_fused_qk_norm_rope_last_call
+        save_kv_cache = must_save_kv or not (
+            enable_fused_set_kv_buffer(forward_batch)
+            and self.compatible_with_fused_kv_buffer
+        )
         attn_output = self.attn(
-            *inner_state,
-            save_kv_cache=not (
-                enable_fused_set_kv_buffer(forward_batch)
-                and self.compatible_with_fused_kv_buffer
-            ),
+            q,
+            k,
+            v,
+            fb,
+            save_kv_cache=save_kv_cache,
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -481,6 +713,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=head_dim,
             rms_norm_eps=rms_norm_eps,
             attention_bias=attention_bias,
+            config=config,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
             dual_chunk_attention_config=dual_chunk_attention_config,
