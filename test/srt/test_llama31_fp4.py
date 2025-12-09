@@ -21,8 +21,8 @@ class TestLlama31FP4(unittest.TestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--mem-fraction-static",
-            "0.8",
+            "--attention-backend",
+            "flashinfer",
             "--quantization",
             "modelopt_fp4",
         ]
