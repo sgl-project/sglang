@@ -532,8 +532,7 @@ class ServerArgs:
     enable_per_expert_overlap: Optional[bool] = False
     peo_overlap_method: Optional[int] = 4
     peo_num_rounds: Optional[int] = 2
-    peo_deepep_send_num_sms: Optional[int] = -1
-    peo_deepep_recv_num_sms: Optional[int] = -1
+    peo_deepep_num_sms: Optional[int] = -1
     peo_up_deepgemm_num_sms: Optional[int] = -1
     peo_down_deepgemm_num_sms: Optional[int] = -1
 
@@ -3040,16 +3039,10 @@ class ServerArgs:
             help="PEO: Number of rounds for splitting dispatch/combine.",
         )
         parser.add_argument(
-            "--peo-deepep-send-num-sms",
+            "--peo-deepep-num-sms",
             type=int,
-            default=ServerArgs.peo_deepep_send_num_sms,
-            help="PEO: Number of SMs used for dispatch/combine send.",
-        )
-        parser.add_argument(
-            "--peo-deepep-recv-num-sms",
-            type=int,
-            default=ServerArgs.peo_deepep_recv_num_sms,
-            help="PEO: Number of SMs used for dispatch/combine recv.",
+            default=ServerArgs.peo_deepep_num_sms,
+            help="PEO: Number of SMs used for some dispatch/combine.",
         )
         parser.add_argument(
             "--peo-up-deepgemm-num-sms",

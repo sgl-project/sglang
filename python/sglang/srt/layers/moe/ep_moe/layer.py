@@ -21,8 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     is_peo_enabled,
-    get_peo_deepep_send_num_sms,
-    get_peo_deepep_recv_num_sms,
+    get_peo_deepep_num_sms,
     get_peo_up_deepgemm_num_sms,
     get_peo_down_deepgemm_num_sms,
 )
@@ -537,8 +536,7 @@ class PeoDeepEPMoE(DeepEPMoE):
 
         self.num_rounds = num_rounds
         self.num_device_sms = get_num_device_sms()
-        self.num_deepep_send_sms = get_peo_deepep_send_num_sms()
-        self.num_deepep_recv_sms = get_peo_deepep_recv_num_sms()
+        self.num_deepep_sms = get_peo_deepep_num_sms()
         self.num_up_deepgemm_sms = get_peo_up_deepgemm_num_sms()
         self.num_down_deepgemm_sms = get_peo_down_deepgemm_num_sms()
         self.num_ranks = dist.get_world_size()

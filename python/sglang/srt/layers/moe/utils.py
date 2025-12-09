@@ -126,8 +126,7 @@ DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 IS_PEO_ENABLED: Optional[bool] = None
 PEO_NUM_ROUNDS: Optional[int] = None
-PEO_DEEPEP_SEND_NUM_SMS: Optional[int] = None
-PEO_DEEPEP_RECV_NUM_SMS: Optional[int] = None
+PEO_DEEPEP_NUM_SMS: Optional[int] = None
 PEO_UP_DEEPGEMM_NUM_SMS: Optional[int] = None
 PEO_DOWN_DEEPGEMM_NUM_SMS: Optional[int] = None
 
@@ -144,8 +143,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global IS_PEO_ENABLED
     global PEO_NUM_ROUNDS
-    global PEO_DEEPEP_SEND_NUM_SMS
-    global PEO_DEEPEP_RECV_NUM_SMS
+    global PEO_DEEPEP_NUM_SMS
     global PEO_UP_DEEPGEMM_NUM_SMS
     global PEO_DOWN_DEEPGEMM_NUM_SMS
 
@@ -166,8 +164,7 @@ def initialize_moe_config(server_args: ServerArgs):
     )
     IS_PEO_ENABLED = server_args.enable_per_expert_overlap
     PEO_NUM_ROUNDS = server_args.peo_num_rounds
-    PEO_DEEPEP_SEND_NUM_SMS = server_args.peo_deepep_send_num_sms
-    PEO_DEEPEP_RECV_NUM_SMS = server_args.peo_deepep_recv_num_sms
+    PEO_DEEPEP_NUM_SMS = server_args.peo_deepep_num_sms
     PEO_UP_DEEPGEMM_NUM_SMS = server_args.peo_up_deepgemm_num_sms
     PEO_DOWN_DEEPGEMM_NUM_SMS = server_args.peo_down_deepgemm_num_sms
 
@@ -252,17 +249,11 @@ def get_peo_num_rounds() -> int:
         PEO_NUM_ROUNDS = 2
     return PEO_NUM_ROUNDS
 
-def get_peo_deepep_send_num_sms() -> int:
-    global PEO_DEEPEP_SEND_NUM_SMS
-    if PEO_DEEPEP_SEND_NUM_SMS is None:
-        PEO_DEEPEP_SEND_NUM_SMS = -1
-    return PEO_DEEPEP_SEND_NUM_SMS
-
-def get_peo_deepep_recv_num_sms() -> int:
-    global PEO_DEEPEP_RECV_NUM_SMS
-    if PEO_DEEPEP_RECV_NUM_SMS is None:
-        PEO_DEEPEP_RECV_NUM_SMS = -1
-    return PEO_DEEPEP_RECV_NUM_SMS
+def get_peo_deepep_num_sms() -> int:
+    global PEO_DEEPEP_NUM_SMS
+    if PEO_DEEPEP_NUM_SMS is None:
+        PEO_DEEPEP_NUM_SMS = -1
+    return PEO_DEEPEP_NUM_SMS
 
 def get_peo_up_deepgemm_num_sms() -> int:
     global PEO_UP_DEEPGEMM_NUM_SMS
