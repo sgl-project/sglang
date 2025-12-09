@@ -66,7 +66,7 @@ jobs:
     if: ${{ (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') }}
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         test_config:
           - name: test_ascend_qwen3_8b_in1000_out300_bs8
