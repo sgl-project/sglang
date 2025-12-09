@@ -12,7 +12,6 @@
 # limitations under the License.
 # ==============================================================================
 
-import functools
 import json
 import logging
 import os
@@ -115,6 +114,36 @@ if supports_custom_op():
         op_func=deep_gemm_fp8_fp8_bf16_nt,
         mutates_args=["C"],
         fake_impl=deep_gemm_fp8_fp8_bf16_nt_fake,
+    )
+
+    def w8a8_block_fp8_matmul_func(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        block_size: List[int],
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Custom op entrypoint that wraps the Triton w8a8 block FP8 matmul."""
+        return w8a8_block_fp8_matmul_triton(A, B, As, Bs, block_size, output_dtype)
+
+    def w8a8_block_fp8_matmul_fake(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        block_size: List[int],
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Fake implementation for meta / fake tensor usage."""
+        c_shape = A.shape[:-1] + (B.shape[0],)
+        return A.new_empty(c_shape, dtype=output_dtype)
+
+    direct_register_custom_op(
+        op_name="w8a8_block_fp8_matmul",
+        op_func=w8a8_block_fp8_matmul_func,
+        mutates_args=[],
+        fake_impl=w8a8_block_fp8_matmul_fake,
     )
 
 
@@ -956,7 +985,7 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@functools.lru_cache
+@lru_cache()
 def get_w8a8_block_fp8_configs(
     N: int, K: int, block_n: int, block_k: int
 ) -> Optional[Dict[int, Any]]:
