@@ -192,10 +192,8 @@ class SamplingParams:
 
         if self.width is None:
             self.width_not_provided = True
-            self.width = 1280
         if self.height is None:
             self.height_not_provided = True
-            self.height = 720
 
     def check_sampling_param(self):
         if self.prompt_path and not self.prompt_path.endswith(".txt"):

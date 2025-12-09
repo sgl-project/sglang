@@ -210,9 +210,11 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
+            data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
+            reasoning=self._get_reasoning_from_request(request),
             priority=request.priority,
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
@@ -443,7 +445,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
-            if self._get_enable_thinking_from_request(request):
+            if self._get_reasoning_from_request(
+                request
+            ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]:
+                # qwen3 and glm4 think internally without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
@@ -775,7 +780,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if reasoning_parser and request.separate_reasoning:
                 is_force_reasoning = (
                     self.template_manager.force_reasoning
-                    or self._get_enable_thinking_from_request(request)
+                    or self._get_reasoning_from_request(request)
                 )
                 try:
                     parser = ReasoningParser(
@@ -1022,7 +1027,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
                 self.template_manager.force_reasoning
-                or self._get_enable_thinking_from_request(request)
+                or self._get_reasoning_from_request(request)
             )
             reasoning_parser_dict[index] = ReasoningParser(
                 self.reasoning_parser,
@@ -1052,27 +1057,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
-    def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
-
-        NOTE: This parameter is only useful for models that support enable_thinking
-        flag, such as Qwen3.
-
-        Args:
-            request_obj: The request object (or an item from a list of requests).
-        Returns:
-            The boolean value of 'enable_thinking' if found, otherwise False.
-        """
-        if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
-            # For Qwen3 models, `enable_thinking` is supported.
-            if self.reasoning_parser in ["qwen3", "glm45"]:
-                return request.chat_template_kwargs.get("enable_thinking", False)
-            # For DeepSeek-V3.1 models, `thinking` is supported.
-            elif self.reasoning_parser in ["deepseek-v3"]:
-                return request.chat_template_kwargs.get("thinking", False)
-            else:
-                return False
-        return False
+    def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Judge whether the request needs reasoning"""
+        if not self.reasoning_parser:
+            return False
+        if self.reasoning_parser in ["deepseek-v3"]:
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser in ["qwen3", "glm45"]:
+            # qwen3 and glm45 are reasoning by default
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking", True) is True
+            )
+        return True  # default
 
     async def _process_tool_call_stream(
         self,
