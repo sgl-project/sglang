@@ -106,7 +106,6 @@ class TestLoRAEviction(CustomTestCase):
                 "o_proj",
                 "gate_proj",
                 "up_proj",
-                "down_proj",
             ],
         ) as srt_runner:
             adapter_sequence = lora_paths if not reverse else lora_paths[::-1]

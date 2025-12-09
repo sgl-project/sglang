@@ -347,6 +347,8 @@ TARGET_MODULE_TESTS = [
         description="Test explicitly specified lora-target-modules.",
         base="meta-llama/Llama-3.1-8B-Instruct",
         max_loras_per_batch=3,
+        # Need to list all lora modules, or "all" might include lora modules without assigning lora weights
+        # lora_target_modules=["all"],
         lora_target_modules=[
             "q_proj",
             "k_proj",

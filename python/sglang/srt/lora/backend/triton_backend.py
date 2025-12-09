@@ -133,7 +133,6 @@ class TritonLoRABackend(BaseLoRABackend):
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 permutation=None,
             )
-            # self.cuda_graph_batch_info.seg_indptr[0] = 0
 
             # Initialize seg_indptr for CUDA graph as they remain constant
             # across batches.

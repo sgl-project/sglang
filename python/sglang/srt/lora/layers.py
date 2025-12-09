@@ -189,13 +189,23 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         # For TP=1, no slicing needed
         # LoRA A weights (rank, vocab_size) are not sliced for embedding
         # For TP>1, Need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        return A
+        # return A
+        if tp_rank > 1:
+            raise NotImplementedError(
+                f"VocabParallelEmbeddingWithLoRA does not support tensor parallelism > 1. "
+                f"Got tp_size={tp_rank}"
+            )
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
         # LoRA B weights (embedding_dim, rank) would be sliced along embedding dimension for TP>1
         # For TP>1, Need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        return B
+        # return B
+        if tp_rank > 1:
+            raise NotImplementedError(
+                f"VocabParallelEmbeddingWithLoRA does not support tensor parallelism > 1. "
+                f"Got tp_size={tp_rank}"
+            )
 
 
 class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
@@ -270,12 +280,22 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
         # For TP>1, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        return A
+        # return A
+        if tp_rank > 1:
+            raise NotImplementedError(
+                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
+                f"Got tp_size={tp_rank}"
+            )
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
         # For TP=1, no slicing needed
         # For TP>1, would slice along vocab dimension, need to modify code in: sglang/python/sglang/srt/lora/mem_pool.py
-        return B
+        # return B
+        if tp_rank > 1:
+            raise NotImplementedError(
+                f"ParallelLMHeadWithLoRA does not support tensor parallelism > 1. "
+                f"Got tp_size={tp_rank}"
+            )
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
