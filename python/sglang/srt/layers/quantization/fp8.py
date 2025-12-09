@@ -16,6 +16,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 
+from sglang.srt.layers.moe.utils import is_peo_enabled
+from sglang.srt.per_expert_overlap import GemmArgs
+
 try:
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         apply_fp8_marlin_linear,
@@ -196,7 +199,11 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return Fp8LinearMethod(self)
         elif isinstance(layer, FusedMoE):
-            return Fp8MoEMethod(self)
+            if is_peo_enabled():
+                return PeoFp8MoEMethod(self)
+            else:
+                return Fp8MoEMethod(self)
+
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -1313,6 +1320,77 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     expert_mask=layer.expert_mask_gpu,
                 )
         return None
+
+class PeoFp8MoEMethod(Fp8MoEMethod):
+    """MoE method for FP8.
+    Supports loading FP8 checkpoints with static weight scale and
+    dynamic/static activation scale.
+
+    Also supports loading quantized FP16/BF16 model checkpoints with dynamic
+    activation scaling. The weight scaling factor will be initialized after
+    the model weights are loaded.
+
+    Args:
+        quant_config: The quantization config.
+    """
+
+    def __init__(self, quant_config: Fp8Config):
+        self.quant_config = quant_config
+        self.block_quant = self.quant_config.weight_block_size is not None
+        if _is_hip and _use_hip_int4:
+            raise NotImplementedError("HIP int4 is not supported.")
+        if self.block_quant and (_use_aiter or _is_cpu):
+            raise NotImplementedError("aiter and cpu Block quant is not supported.")
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: DispatchOutput,
+        start_idx: torch.Tensor,
+        end_idx: torch.Tensor,
+    ) -> CombineInput:
+        if self.runner.runner_backend.is_deep_gemm():
+            w13_weight = layer.w13_weight[start_idx:end_idx]
+            w2_weight = layer.w2_weight[start_idx:end_idx]
+
+            if self.block_quant:
+                block_shape = self.quant_config.weight_block_size
+                w13_scale = layer.w13_weight_scale_inv[start_idx:end_idx]
+                w2_scale = layer.w2_weight_scale_inv[start_idx:end_idx]
+            else:
+                # Convert per-tensor quant to per-block quant by repeating scales for forward_deepgemm
+                scale_block_size = 128
+                block_shape = [scale_block_size, scale_block_size]
+                w13_scale_n = (w13_weight.shape[1] - 1) // scale_block_size + 1
+                w13_scale_k = (w13_weight.shape[2] - 1) // scale_block_size + 1
+                w13_scale = (
+                    layer.w13_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w13_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w13_scale_k, dim=2)
+                )[start_idx:end_idx]
+                w2_scale_n = (w2_weight.shape[1] - 1) // scale_block_size + 1
+                w2_scale_k = (w2_weight.shape[2] - 1) // scale_block_size + 1
+                w2_scale = (
+                    layer.w2_weight_scale.unsqueeze(1)
+                    .repeat_interleave(w2_scale_n, dim=1)
+                    .unsqueeze(2)
+                    .repeat_interleave(w2_scale_k, dim=2)
+                )[start_idx:end_idx]
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=True,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                block_shape=block_shape,
+            )
+        else:
+            raise NotImplementedError(
+                "Unsupported runner backend: %s" % self.runner.runner_backend
+            )
+
+        return self.runner.run(dispatch_output, quant_info)
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):

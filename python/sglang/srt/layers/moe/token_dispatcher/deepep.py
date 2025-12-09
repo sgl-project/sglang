@@ -809,3 +809,6 @@ class DeepEPDispatcher(BaseDispatcher):
             self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
             self._normal_dispatcher.set_quant_config(quant_config)
+
+    def get_buffer(self):
+        return self._low_latency_dispatcher._get_buffer()
