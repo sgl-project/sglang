@@ -490,6 +490,7 @@ def download_weights_from_hf(
     allow_patterns: List[str],
     revision: Optional[str] = None,
     ignore_patterns: Optional[Union[str, List[str]]] = None,
+    max_retries: int = 3,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -504,6 +505,8 @@ def download_weights_from_hf(
         ignore_patterns (Optional[Union[str, List[str]]]): The patterns to
             filter out the weight files. Files matched by any of the patterns
             will be ignored.
+        max_retries (int): Maximum number of retry attempts for corrupted downloads.
+            Defaults to 3.
 
     Returns:
         str: The path to the downloaded model weights.
@@ -533,23 +536,59 @@ def download_weights_from_hf(
                 break
 
     log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
-    # Use file lock to prevent multiple processes from
-    # downloading the same model weights at the same time.
-    with get_lock(model_name_or_path, cache_dir):
-        hf_folder = snapshot_download(
-            model_name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            tqdm_class=DisabledTqdm,
-            revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        )
 
-    # Validate downloaded files to catch corruption early
-    _validate_weights_after_download(hf_folder, allow_patterns, model_name_or_path)
+    # Retry loop for handling corrupted downloads
+    for attempt in range(max_retries):
+        try:
+            # Use file lock to prevent multiple processes from
+            # downloading the same model weights at the same time.
+            with get_lock(model_name_or_path, cache_dir):
+                hf_folder = snapshot_download(
+                    model_name_or_path,
+                    allow_patterns=allow_patterns,
+                    ignore_patterns=ignore_patterns,
+                    cache_dir=cache_dir,
+                    tqdm_class=DisabledTqdm,
+                    revision=revision,
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+                )
 
-    return hf_folder
+            # Validate downloaded files to catch corruption early
+            _validate_weights_after_download(
+                hf_folder, allow_patterns, model_name_or_path
+            )
+
+            # If validation passes, return the folder
+            return hf_folder
+
+        except RuntimeError as e:
+            # Check if this is a corruption error
+            if "Downloaded model files are corrupted" in str(e):
+                if attempt < max_retries - 1:
+                    log_info_on_rank0(
+                        logger,
+                        f"Attempt {attempt + 1}/{max_retries} failed due to corrupted files. "
+                        f"Retrying download for {model_name_or_path}...",
+                    )
+                    # Corrupted files have already been cleaned up by _validate_weights_after_download
+                    # Continue to next retry attempt
+                    continue
+                else:
+                    # Final attempt failed, re-raise the error
+                    log_info_on_rank0(
+                        logger,
+                        f"All {max_retries} download attempts failed for {model_name_or_path} "
+                        "due to corrupted files.",
+                    )
+                    raise
+            else:
+                # Not a corruption error, re-raise immediately
+                raise
+
+    # This should never be reached, but added for completeness
+    raise RuntimeError(
+        f"Failed to download weights for {model_name_or_path} after {max_retries} attempts"
+    )
 
 
 def download_safetensors_index_file_from_hf(
