@@ -1,8 +1,8 @@
 import unittest
 
-from sglang.srt.utils import is_blackwell, is_in_ci
+from sglang.srt.utils import is_blackwell
 from sglang.test.gsm8k_mixin import GSM8KMixin
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 
 class TestNvidiaNemotronNanoV2BF16(GSM8KMixin, CustomTestCase):
