@@ -74,7 +74,9 @@ fn merge_prefill_logprobs(
 ) {
     // Only SGLang supports PD mode and has input_logprobs
     if let Some(ProtoGenerateComplete::Sglang(prefill_first)) = prefill_responses.first() {
-        if let Some(prefill_input_logprobs) = prefill_first.input_logprobs.clone() {
+        // Use ref to borrow input_logprobs instead of cloning upfront
+        // This avoids one allocation when the Option is Some
+        if let Some(ref prefill_input_logprobs) = prefill_first.input_logprobs {
             for response in decode_responses.iter_mut() {
                 if let ProtoGenerateComplete::Sglang(decode_resp) = response {
                     decode_resp.input_logprobs = Some(prefill_input_logprobs.clone());
