@@ -285,7 +285,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
         if get_global_server_args().rl_on_policy_target is not None:
             norm_kwargs = dict(dtype=torch.float32)
-            norm_layer = LayerNorm(self.hidden_size, eps=norm_eps, **norm_kwargs)
+            norm_layer = partial(LayerNorm, eps=norm_eps, **norm_kwargs)
         else:
             norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
