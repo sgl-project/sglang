@@ -582,6 +582,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 raise ValueError("Session params must be a dict or a list of dicts.")
 
     def __getitem__(self, i):
+        timing_keys = APIServingTimingMixin.__dataclass_fields__.keys()
         return GenerateReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -632,7 +633,6 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             decode_tp_size=(
                 self.decode_tp_size[i] if self.decode_tp_size is not None else None
             ),
-            validation_time=self.validation_time,
             data_parallel_rank=(
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
@@ -644,6 +644,7 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
             return_bytes=self.return_bytes,
             return_entropy=self.return_entropy,
             http_worker_ipc=self.http_worker_ipc,
+            **{key: getattr(self, key) for key in timing_keys},
         )
 
 
@@ -733,7 +734,7 @@ class BatchTokenizedGenerateReqInput(BaseBatchReq):
 
 
 @dataclass
-class EmbeddingReqInput(BaseReq):
+class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[List[str]], List[str], str]] = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
@@ -841,6 +842,8 @@ class EmbeddingReqInput(BaseReq):
                 http_worker_ipc=self.http_worker_ipc,
             )
 
+        timing_keys = APIServingTimingMixin.__dataclass_fields__.keys()
+
         return EmbeddingReqInput(
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
@@ -849,9 +852,9 @@ class EmbeddingReqInput(BaseReq):
             video_data=self.video_data[i] if self.video_data is not None else None,
             sampling_params=self.sampling_params[i],
             rid=self.rid[i],
-            validation_time=self.validation_time,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
+            **{key: getattr(self, key) for key in timing_keys},
         )
 
 
