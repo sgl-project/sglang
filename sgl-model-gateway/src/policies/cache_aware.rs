@@ -210,6 +210,63 @@ impl CacheAwarePolicy {
             );
         }
     }
+
+    fn select_worker_min_load(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_text: &Option<&str>,
+        healthy_indices: &[usize],
+        model_id: &str,
+        // TODO may skip passing this arg (and compute inside function) if this is not bottleneck
+        max_load: usize,
+        min_load: usize,
+    ) -> Option<usize> {
+        // Log load balancing trigger
+        // TODO may use `&str`
+        let worker_loads: Vec<(String, usize)> = workers
+            .iter()
+            .map(|w| (w.url().to_string(), w.load()))
+            .collect();
+
+        // TODO may change text
+        debug!(
+            "Load balancing triggered | max: {} | min: {} | workers: {:?}",
+            max_load, min_load, worker_loads
+        );
+
+        RouterMetrics::record_load_balancing_event();
+        RouterMetrics::set_load_range(max_load, min_load);
+
+        // Use shortest queue when imbalanced
+        let min_load_idx = healthy_indices
+            .iter()
+            .min_by_key(|&&idx| workers[idx].load())
+            .copied()?;
+
+        // Even in imbalanced mode, update the tree to maintain cache state
+        if let Some(text) = request_text {
+            // Get the tree reference without locking the entire HashMap
+            // DashMap only locks the specific shard containing this key
+            let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
+
+            if let Some(tree) = tree {
+                // Now we can work with the tree without holding the HashMap lock
+                tree.insert(text, workers[min_load_idx].url());
+            } else {
+                debug!(
+                    "Warning: No tree found for model '{}', skipping cache update",
+                    model_id
+                );
+            }
+        }
+
+        // Increment processed counter
+        workers[min_load_idx].increment_processed();
+        RouterMetrics::record_processed_request(workers[min_load_idx].url());
+        RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
+
+        Some(min_load_idx)
+    }
 }
 
 impl LoadBalancingPolicy for CacheAwarePolicy {
@@ -233,59 +290,26 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             first_model
         };
 
-        // Get current load statistics
-        let loads: Vec<usize> = workers.iter().map(|w| w.load()).collect();
-        let max_load = *loads.iter().max().unwrap_or(&0);
-        let min_load = *loads.iter().min().unwrap_or(&0);
+        // Get current load statistics - compute min/max in single pass without allocation
+        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
+            let load = w.load();
+            (min.min(load), max.max(load))
+        });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
         if is_imbalanced {
-            // Log load balancing trigger
-            let worker_loads: Vec<(String, usize)> = workers
-                .iter()
-                .map(|w| (w.url().to_string(), w.load()))
-                .collect();
-
-            debug!(
-                "Load balancing triggered | max: {} | min: {} | workers: {:?}",
-                max_load, min_load, worker_loads
+            return self.select_worker_min_load(
+                workers,
+                &request_text,
+                &healthy_indices,
+                model_id,
+                max_load,
+                min_load,
             );
-
-            RouterMetrics::record_load_balancing_event();
-            RouterMetrics::set_load_range(max_load, min_load);
-
-            // Use shortest queue when imbalanced
-            let min_load_idx = healthy_indices
-                .iter()
-                .min_by_key(|&&idx| workers[idx].load())
-                .copied()?;
-
-            // Even in imbalanced mode, update the tree to maintain cache state
-            if let Some(text) = request_text {
-                // Get the tree reference without locking the entire HashMap
-                // DashMap only locks the specific shard containing this key
-                let tree = self.trees.get(model_id).map(|entry| entry.value().clone());
-
-                if let Some(tree) = tree {
-                    // Now we can work with the tree without holding the HashMap lock
-                    tree.insert(text, workers[min_load_idx].url());
-                } else {
-                    debug!(
-                        "Warning: No tree found for model '{}', skipping cache update",
-                        model_id
-                    );
-                }
-            }
-
-            // Increment processed counter
-            workers[min_load_idx].increment_processed();
-            RouterMetrics::record_processed_request(workers[min_load_idx].url());
-            RouterMetrics::record_policy_decision(self.name(), workers[min_load_idx].url());
-
-            return Some(min_load_idx);
         }
 
         // Use cache-aware routing when balanced
@@ -309,7 +333,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 matched_worker.to_string()
             } else {
                 RouterMetrics::record_cache_miss();
-                tree.get_smallest_tenant()
+                let min_load_idx = *healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())?;
+                workers[min_load_idx].url().to_string()
             };
 
             // Find the index of the selected worker
@@ -345,37 +372,6 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             let random_idx = rng.random_range(0..healthy_indices.len());
             Some(healthy_indices[random_idx])
         }
-    }
-
-    fn select_worker_pair(
-        &self,
-        prefill_workers: &[Arc<dyn Worker>],
-        decode_workers: &[Arc<dyn Worker>],
-        request_text: Option<&str>,
-    ) -> Option<(usize, usize)> {
-        // DEPRECATED: This method is no longer used when separate policies are configured.
-        // The PD router now uses separate policies for prefill and decode selection.
-        // This implementation remains for backward compatibility when a single policy is used.
-
-        // In PD mode with single policy:
-        // - Prefill: Use cache-aware routing for better cache utilization
-        // - Decode: Use least-load routing for better load distribution
-
-        // Select prefill worker using cache-aware logic
-        let prefill_idx = self.select_worker(prefill_workers, request_text)?;
-
-        // Select decode worker using least-load logic
-        let healthy_decode = get_healthy_worker_indices(decode_workers);
-        if healthy_decode.is_empty() {
-            return None;
-        }
-
-        let decode_idx = healthy_decode
-            .iter()
-            .min_by_key(|&&idx| decode_workers[idx].load())
-            .copied()?;
-
-        Some((prefill_idx, decode_idx))
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
