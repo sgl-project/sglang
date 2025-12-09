@@ -460,12 +460,24 @@ def _get_chunked_prefill_embedding(
                     "embedding size."
                 )
 
+        extend_prefix_len = prefix_length[i]
+        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
+
         if isinstance(embedding_per_req, EVSEmbeddingResult):
-            input_ids = embedding_per_req.prune_input_ids(input_ids, items_offset)
+            input_ids, items_offset = (
+                embedding_per_req.redistribute_pruned_frames_placeholders(
+                    input_ids,
+                    items_offset,
+                    extend_prefix_len=extend_prefix_len,
+                    extend_seq_len=extend_seq_len,
+                    filler_token_id=embedding_items_per_req[0].pad_value,
+                )
+            )
+
         embedding_per_req_chunk, _, _ = get_embedding_chunk(
             embedding=embedding_per_req.embedding,
-            extend_prefix_len=prefix_length[i],
-            extend_seq_len=extend_length[i] if i < len(extend_length) else 0,
+            extend_prefix_len=extend_prefix_len,
+            extend_seq_len=extend_seq_len,
             items_offset=items_offset,
         )
         embedding_list.append(embedding_per_req_chunk)
