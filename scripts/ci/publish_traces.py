@@ -345,9 +345,7 @@ def publish_traces(traces_dir, run_id, run_number):
                 and e.code in [403, 429]
                 and "rate limit exceeded" in getattr(e, "error_body", "").lower()
             ):
-                warnings.warn(
-                    "GitHub API rate limit exceeded. Skipping trace upload."
-                )
+                warnings.warn("GitHub API rate limit exceeded. Skipping trace upload.")
                 return
 
             if is_retryable and attempt < max_retries - 1:
