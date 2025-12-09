@@ -354,11 +354,14 @@ class ModelConfig:
 
             # Handle rope scaling with yarn
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            print(f"357 {self.hf_config=}", flush=True)
             if self.hf_config.rope_scaling:
+                print(f"359 {self.hf_config.rope_scaling=}", flush=True)
                 mscale_all_dim = self.hf_config.rope_scaling.get(
                     "mscale_all_dim", False
                 )
                 scaling_factor = self.hf_config.rope_scaling.get("factor")
+                print(f"364 {scaling_factor=}", flush=True)
                 if scaling_factor is not None:
                     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                     self.scaling = self.scaling * mscale * mscale
