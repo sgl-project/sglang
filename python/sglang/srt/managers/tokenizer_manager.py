@@ -210,29 +210,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 import_processors(
                     envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.value, overwrite=True
                 )
-            try:
-                _processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    use_fast=not server_args.disable_fast_image_processor,
-                )
-            except ValueError as e:
-                error_message = str(e)
-                if "does not have a slow version" in error_message:
-                    logger.info(
-                        f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-                    )
-                    _processor = get_processor(
-                        server_args.tokenizer_path,
-                        tokenizer_mode=server_args.tokenizer_mode,
-                        trust_remote_code=server_args.trust_remote_code,
-                        revision=server_args.revision,
-                        use_fast=True,
-                    )
-                else:
-                    raise e
+            _processor = _get_processor_wrapper(server_args)
             transport_mode = _determine_tensor_transport_mode(self.server_args)
 
             # We want to parallelize the image pre-processing so we create an executor for it
@@ -2180,6 +2158,33 @@ class InputFormat(Enum):
     SINGLE_STRING = 1  # Regular single text like "Hello world"
     BATCH_STRINGS = 2  # Regular batch like ["Hello", "World"]
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
+
+
+def _get_processor_wrapper(server_args):
+    try:
+        processor = get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            use_fast=not server_args.disable_fast_image_processor,
+        )
+    except ValueError as e:
+        error_message = str(e)
+        if "does not have a slow version" in error_message:
+            logger.info(
+                f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
+            )
+            processor = get_processor(
+                server_args.tokenizer_path,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                use_fast=True,
+            )
+        else:
+            raise e
+    return processor
 
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
