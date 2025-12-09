@@ -33,7 +33,10 @@ def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
 
     for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
         # Skip the wheel if mismatches the passed in cuda_version
-        if not check_wheel_cuda_version(path.name, cuda_version):
+        if (
+            not check_wheel_cuda_version(path.name, cuda_version)
+            and rocm_version is None
+        ):
             continue
         with open(path, "rb") as f:
             sha256 = hashlib.sha256(f.read()).hexdigest()
