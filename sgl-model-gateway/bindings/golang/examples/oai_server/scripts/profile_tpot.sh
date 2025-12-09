@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# TPOT 性能分析脚本
-# 快速收集和分析 TPOT 相关的性能数据
+# TPOT performance analysis script
+# Quickly collect and analyze TPOT-related performance data
 
 set -e
 
@@ -60,7 +60,7 @@ for i in $(seq 1 $NUM_REQUESTS); do
     -H "Content-Type: application/json" \
     -d "{
       \"model\": \"default\",
-      \"messages\": [{\"role\": \"user\", \"content\": \"写一个故事\"}],
+      \"messages\": [{\"role\": \"user\", \"content\": \"Write a story\"}],
       \"stream\": true,
       \"max_tokens\": 200
     }" > /dev/null &
@@ -138,5 +138,3 @@ echo "Run: go tool pprof -http=:8081 ${OUTPUT_DIR}/cpu_${DURATION}s.pb.gz"
 echo "Then visit: http://localhost:8081/ui/flamegraph"
 echo ""
 echo "Profile files saved to: ${OUTPUT_DIR}"
-
-

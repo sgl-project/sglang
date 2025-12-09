@@ -1,23 +1,23 @@
-# Go SGLang Router - OpenAI 兼容 API 服务器
+# Go SGLang Router - OpenAI Compatible API Server
 
-Go SGLang Router 是一个高性能的 OpenAI 兼容 API 服务器，使用 gRPC 与 SGLang 后端通信，并通过 Rust FFI 进行高效的预处理和后处理。
+Go SGLang Router is a high-performance OpenAI-compatible API server that communicates with the SGLang backend via gRPC and performs efficient preprocessing and postprocessing through Rust FFI.
 
-## 特性
+## Features
 
-- ✅ **OpenAI API 兼容**: 完全兼容 OpenAI Chat Completions API
-- ✅ **高性能**: 使用 gRPC 和 Rust FFI 实现低延迟和高吞吐
-- ✅ **流式传输**: 支持 Server-Sent Events (SSE) 流式响应
-- ✅ **线程安全**: 预创建的 tokenizer handle，无锁并发
-- ✅ **优雅关闭**: 使用 context 取消机制，避免资源泄漏和 panic
-- ✅ **可配置**: 支持配置 channel 缓冲区大小和超时时间
+- ✅ **OpenAI API Compatible**: Fully compatible with OpenAI Chat Completions API
+- ✅ **High Performance**: Low latency and high throughput using gRPC and Rust FFI
+- ✅ **Streaming Support**: Server-Sent Events (SSE) streaming responses
+- ✅ **Thread-Safe**: Pre-created tokenizer handle, lock-free concurrency
+- ✅ **Graceful Shutdown**: Context cancellation mechanism to avoid resource leaks and panics
+- ✅ **Configurable**: Supports configuring channel buffer sizes and timeout durations
 
-## 架构概览
+## Architecture Overview
 
-**重要说明**：gRPC 模式**仍然会调用 FFI**，FFI 用于：
-- **预处理**：chat_template 和 tokenization（请求阶段）
-- **后处理**：token decoding 和 tool parsing（响应阶段）
+**Important Note**: gRPC mode **still calls FFI**, which is used for:
+- **Preprocessing**: chat_template and tokenization (request phase)
+- **Postprocessing**: token decoding and tool parsing (response phase)
 
-gRPC 仅用于与 SGLang 后端通信，输入输出的处理完全依赖 Rust FFI。
+gRPC is only used for communication with the SGLang backend, while input/output processing completely relies on Rust FFI.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -152,17 +152,17 @@ gRPC 仅用于与 SGLang 后端通信，输入输出的处理完全依赖 Rust F
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 快速开始
+## Quick Start
 
-### 启动服务器
+### Start Server
 
 ```bash
 ./run.sh
 ```
 
-服务器将在 `:8080` 端口启动。
+The server will start on port `:8080`.
 
-### 使用示例
+### Usage Example
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
@@ -174,134 +174,132 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-## 关键设计
+## Key Design
 
-### 1. 线程安全的 Tokenizer
-- 启动时预创建 `TokenizerHandle`
-- Rust 端使用 `Arc<dyn TokenizerTrait>`，线程安全
-- 无锁并发，消除锁竞争
+### 1. Thread-Safe Tokenizer
+- Pre-create `TokenizerHandle` at startup
+- Rust side uses `Arc<dyn TokenizerTrait>`, thread-safe
+- Lock-free concurrency, eliminating lock contention
 
-### 2. Context 取消机制（优雅关闭）
-- 使用 `context.Context` 的取消机制
-- `readLoop` 的 `defer` 中：先取消 context，然后等待所有 goroutine 完成，最后关闭 channel
-- `processAndSendResponse` 在函数开始时检查 `ctx.Done()`，所有 `select` 语句都包含 `case <-s.ctx.Done()`
-- 避免了 "send on closed channel" panic
+### 2. Context Cancellation Mechanism (Graceful Shutdown)
+- Use `context.Context` cancellation mechanism
+- In `readLoop`'s `defer`: cancel context first, then wait for all goroutines to complete, finally close channels
+- `processAndSendResponse` checks `ctx.Done()` at function start, all `select` statements include `case <-s.ctx.Done()`
+- Avoids "send on closed channel" panic
 
-### 3. 可取消的 Recv()
-- 使用专门的 goroutine 执行 `Recv()`
-- 通过 `recvChan` 传递结果
-- Context 取消时调用 `CloseSend()` 使 `Recv()` 返回错误
+### 3. Cancellable Recv()
+- Use dedicated goroutine to execute `Recv()`
+- Pass results through `recvChan`
+- Call `CloseSend()` when context is cancelled to make `Recv()` return error
 
-### 4. 简化的 Channel 设计
-- `resultJSONChan`: 主要数据通道（gRPC 层）
-- `errChan`: 错误通道（gRPC 层）
-- `recvChan`: 内部通信通道（gRPC 层）
-- 移除了冗余的 channel 和重复读取
+### 4. Simplified Channel Design
+- `resultJSONChan`: Main data channel (gRPC layer)
+- `errChan`: Error channel (gRPC layer)
+- `recvChan`: Internal communication channel (gRPC layer)
+- Removed redundant channels and duplicate reads
 
-## 配置
+## Configuration
 
-### Channel 缓冲区大小
+### Channel Buffer Sizes
 
 ```go
 type ChannelBufferSizes struct {
-    ResultJSONChan int // 默认: 10000
-    ErrChan        int // 默认: 100
-    RecvChan       int // 默认: 2000
+    ResultJSONChan int // Default: 10000
+    ErrChan        int // Default: 100
+    RecvChan       int // Default: 2000
 }
 ```
 
-### 超时配置
+### Timeout Configuration
 
 ```go
 type Timeouts struct {
-    KeepaliveTime    time.Duration // 默认: 300s
-    KeepaliveTimeout time.Duration // 默认: 20s
-    CloseTimeout     time.Duration // 默认: 5s
+    KeepaliveTime    time.Duration // Default: 300s
+    KeepaliveTimeout time.Duration // Default: 20s
+    CloseTimeout     time.Duration // Default: 5s
 }
 ```
 
-## 性能优化
+## Performance Optimizations
 
-1. **预创建 Tokenizer**: 启动时创建，避免首次请求延迟
-2. **无锁并发**: Tokenizer 线程安全，无需锁
-3. **Lazy Parsing**: JSON 解析延迟到需要时
-4. **直接 JSON 传递**: `RecvJSON()` 避免解析/序列化开销
-5. **立即批处理**: batchSize=1，无延迟
-6. **异步处理**: `readLoop` 在后台处理，不阻塞请求处理
-7. **可配置的缓冲区**: 根据并发需求调整 channel 大小
+1. **Pre-create Tokenizer**: Created at startup to avoid first request latency
+2. **Lock-Free Concurrency**: Tokenizer is thread-safe, no locks needed
+3. **Lazy Parsing**: JSON parsing deferred until needed
+4. **Direct JSON Passing**: `RecvJSON()` avoids parse/serialize overhead
+5. **Immediate Batching**: batchSize=1, no delay
+6. **Async Processing**: `readLoop` processes in background, doesn't block request handling
+7. **Configurable Buffers**: Adjust channel sizes based on concurrency needs
 
-## 文件结构
+## File Structure
 
 ```
 sgl-model-gateway/bindings/golang/
-├── client.go                          # 高级客户端 API
+├── client.go                          # High-level client API
 ├── internal/
 │   ├── grpc/
-│   │   └── client_grpc.go            # gRPC 客户端实现
-│   ├── ffi/                          # FFI 绑定（Rust）
-│   └── proto/                        # Protobuf 定义
+│   │   └── client_grpc.go            # gRPC client implementation
+│   ├── ffi/                          # FFI bindings (Rust)
+│   └── proto/                        # Protobuf definitions
 └── examples/
     └── oai_server/
         ├── handlers/
-        │   └── chat.go               # HTTP 请求处理
+        │   └── chat.go               # HTTP request handling
         ├── models/
-        │   └── chat.go               # 请求/响应模型
+        │   └── chat.go               # Request/response models
         └── service/
-            └── sglang_service.go      # 服务层
+            └── sglang_service.go      # Service layer
 ```
 
-## 错误处理
+## Error Handling
 
-### Context 取消机制
-1. **客户端断开连接** → `SetBodyStreamWriter` 检测到 flush 错误
-2. **取消 streamCtx** → `readLoop` 检测到 `ctx.Done()`
-3. **调用 stream.CloseSend()** → `Recv()` goroutine 返回错误
-4. **readLoop defer 执行**：
-   - 设置 `closed` 标志
-   - 取消 context（如果还没有被取消）
-   - 等待所有 `processAndSendResponse` goroutine 完成（`processWg.Wait()`）
-   - 关闭所有 channel（`resultJSONChan`, `errChan`, `readLoopDone`）
-5. **清理资源并退出**
+### Context Cancellation Mechanism
+1. **Client disconnects** → `SetBodyStreamWriter` detects flush error
+2. **Cancel streamCtx** → `readLoop` detects `ctx.Done()`
+3. **Call stream.CloseSend()** → `Recv()` goroutine returns error
+4. **readLoop defer executes**:
+   - Set `closed` flag
+   - Cancel context (if not already cancelled)
+   - Wait for all `processAndSendResponse` goroutines to complete (`processWg.Wait()`)
+   - Close all channels (`resultJSONChan`, `errChan`, `readLoopDone`)
+5. **Clean up resources and exit**
 
-### Channel 阻塞和竞态条件防护
-- **Context 取消机制**：所有 channel 发送都使用 `select` 语句，包含 `case <-s.ctx.Done()`
-- **优雅退出**：当 context 被取消时，所有阻塞的发送操作都能立即返回
-- **WaitGroup 同步**：`readLoop` 的 `defer` 中使用 `processWg.Wait()` 确保所有 goroutine 完成后再关闭 channel
-- **避免 panic**：通过 context 取消和 WaitGroup 同步，避免了 "send on closed channel" panic
+### Channel Blocking and Race Condition Prevention
+- **Context cancellation mechanism**: All channel sends use `select` statements with `case <-s.ctx.Done()`
+- **Graceful exit**: When context is cancelled, all blocking send operations can return immediately
+- **WaitGroup synchronization**: `readLoop`'s `defer` uses `processWg.Wait()` to ensure all goroutines complete before closing channels
+- **Avoid panic**: Through context cancellation and WaitGroup synchronization, avoids "send on closed channel" panic
 
-## 关键函数
+## Key Functions
 
 ### CreateChatCompletionStream
-**位置**: `internal/grpc/client_grpc.go:108`
-- 预处理请求（FFI）
-- 构建 gRPC 请求
-- 创建 converter 和 batch processor
-- 启动 `readLoop`
+**Location**: `internal/grpc/client_grpc.go:108`
+- Preprocess request (FFI)
+- Build gRPC request
+- Create converter and batch processor
+- Start `readLoop`
 
 ### readLoop
-**位置**: `internal/grpc/client_grpc.go:290`
-- 启动 Recv() goroutine（持续调用 `stream.Recv()`）
-- 处理 proto 响应
-- 异步调用 `processAndSendResponse`（使用 `processWg` 跟踪）
-- **defer 中的优雅关闭**：
-  - 设置 `closed` 标志
-  - 取消 context（如果还没有被取消）
-  - 等待所有 `processAndSendResponse` goroutine 完成（`processWg.Wait()`）
-  - 关闭所有 channel（`resultJSONChan`, `errChan`, `readLoopDone`）
+**Location**: `internal/grpc/client_grpc.go:290`
+- Start Recv() goroutine (continuously calls `stream.Recv()`)
+- Process proto responses
+- Asynchronously call `processAndSendResponse` (tracked with `processWg`)
+- **Graceful shutdown in defer**:
+  - Set `closed` flag
+  - Cancel context (if not already cancelled)
+  - Wait for all `processAndSendResponse` goroutines to complete (`processWg.Wait()`)
+  - Close all channels (`resultJSONChan`, `errChan`, `readLoopDone`)
 
 ### processAndSendResponse
-**位置**: `internal/grpc/client_grpc.go:379`
-- 在函数开始时检查 `ctx.Done()`，如果已取消则立即返回
-- 转换 proto 到 JSON
-- 调用 FFI batch processor
-- 所有 `select` 语句都包含 `case <-s.ctx.Done()` 来优雅处理关闭
-- 发送 JSON 到 channel
+**Location**: `internal/grpc/client_grpc.go:379`
+- Check `ctx.Done()` at function start, return immediately if cancelled
+- Convert proto to JSON
+- Call FFI batch processor
+- All `select` statements include `case <-s.ctx.Done()` for graceful shutdown handling
+- Send JSON to channel
 
 ### RecvJSON
-**位置**: 
-- `internal/grpc/client_grpc.go:412`: gRPC 层实现
-- `client.go:410`: 客户端包装层
-- 从 `resultJSONChan` 读取
-- 直接返回 JSON 字符串，无需解析
-
-
+**Location**: 
+- `internal/grpc/client_grpc.go:412`: gRPC layer implementation
+- `client.go:410`: Client wrapper layer
+- Read from `resultJSONChan`
+- Directly return JSON string, no parsing needed

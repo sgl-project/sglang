@@ -42,26 +42,58 @@ go get github.com/sglang/sglang-go-grpc-sdk
 
 ### Sync Dependencies
 
-After cloning the repository or when dependencies are missing, run `go mod tidy` to download and sync all required dependencies:
-
 ```bash
 cd sgl-model-gateway/bindings/golang
 go mod tidy
 ```
 
-This will automatically:
-- Download missing dependencies (gRPC, protobuf, etc.)
-- Update `go.sum` with checksums
-- Remove unused dependencies
-
 ### Build Requirements
 
-- Go 1.21 or later
-- Rust toolchain (for building the FFI library)
-- Python 3.x (for Python bindings in Rust FFI)
-- Tokio runtime for async operations
+- Go 1.21+, Rust toolchain, Python 3.x
 
 ## Quick Start
+
+### Benchmark
+
+Run the OpenAI-compatible server and benchmark:
+
+```bash
+# Set environment variables
+export SGL_TOKENIZER_PATH="/Users/yangyanbo/tokenizer"
+export SGL_GRPC_ENDPOINT="grpc://10.109.185.20:8001"
+
+# Run server
+cd examples/oai_server
+bash run.sh
+
+# Run E2E benchmark
+cd ../..
+make e2e E2E_MODEL=/work/models/qwencoder-3b E2E_TOKENIZER=/Users/yangyanbo/tokenizer E2E_INPUT_LEN=1024 E2E_OUTPUT_LEN=512
+```
+
+## Examples
+
+The SDK includes several examples in the `examples/` directory:
+
+- **simple**: Basic non-streaming chat completion example
+- **streaming**: Real-time streaming with performance metrics
+
+### Running Examples
+
+```bash
+# Run simple example
+cd bindings/golang/examples/simple
+bash run.sh
+
+# Run streaming example
+cd bindings/golang/examples/streaming
+bash run.sh
+
+# Or use Makefile from bindings/golang directory
+cd bindings/golang
+make run-simple
+make run-streaming
+```
 
 ### Basic Usage (Non-streaming)
 
@@ -176,29 +208,7 @@ func float32Ptr(f float32) *float32 {
 }
 ```
 
-## Examples
 
-The SDK includes several examples in the `examples/` directory:
-
-- **simple**: Basic non-streaming chat completion example
-- **streaming**: Real-time streaming with performance metrics
-
-### Running Examples
-
-```bash
-# Run simple example
-cd bindings/golang/examples/simple
-bash run.sh
-
-# Run streaming example
-cd bindings/golang/examples/streaming
-bash run.sh
-
-# Or use Makefile from bindings/golang directory
-cd bindings/golang
-make run-simple
-make run-streaming
-```
 
 Examples automatically detect the server endpoint and tokenizer path via environment variables or defaults.
 
@@ -300,15 +310,8 @@ go tool cover -html=coverage.out -o coverage.html
 
 #### Unit Test Coverage
 
-- **Configuration validation** (`TestClientConfig`) - Validates ClientConfig requirements
-- **Type structures** - Verifying all struct types work correctly
-- **Response handling** - Testing response parsing and validation
-- **Concurrent operations** (`TestConcurrentClientOperations`) - Thread-safety verification
-- **Benchmarks** (`BenchmarkChatCompletionRequest`) - Performance measurement
-
-**Test Files**:
+- Configuration validation, type structures, response handling, concurrent operations, and benchmarks
 - `client_test.go` - 10 unit tests covering core functionality
-- Tests cover: config validation, message types, request validation, close operations, response types, streaming, tools, concurrency, and context cancellation
 
 ### Integration Tests
 
@@ -316,28 +319,12 @@ Integration tests require a running SGLang server and test the full client-serve
 
 #### Prerequisites
 
-1. Start an SGLang server:
-
-```bash
-# Using Python (requires sglang package installed)
-python -m sglang.launch_server --model-path meta-llama/Llama-2-7b-hf
-
-# Or using pre-built Docker image
-docker run -p 20000:20000 lmsys/sglang:latest
-
-# Or build your own
-sglang launch_server --model-path <model_path>
-```
-
-2. Set required environment variables:
-
-```bash
-# Set the gRPC endpoint (default: grpc://localhost:20000)
-export SGL_GRPC_ENDPOINT=grpc://localhost:20000
-
-# Set the tokenizer path (required)
-export SGL_TOKENIZER_PATH=/path/to/tokenizer
-```
+1. Start SGLang server: `python -m sglang.launch_server --model-path <model_path>`
+2. Set environment variables:
+   ```bash
+   export SGL_GRPC_ENDPOINT=grpc://localhost:20000
+   export SGL_TOKENIZER_PATH=/path/to/tokenizer
+   ```
 
 #### Running Integration Tests
 
@@ -366,54 +353,13 @@ go test -tags=integration -race ./...
 
 ### Benchmarks
 
-Measure performance of SDK operations:
-
 ```bash
-# Run all benchmarks
 go test -bench=. -benchmem ./...
-
-# Run specific benchmark
-go test -bench=BenchmarkChatCompletionRequest -benchmem
-
-# Run for longer duration
-go test -bench=. -benchtime=10s ./...
-```
-
-Current benchmarks:
-- `BenchmarkChatCompletionRequest` - Measures request creation performance
-
-### CI/CD Integration
-
-Add to your GitHub Actions workflow:
-
-```yaml
-- name: Run Go tests
-  run: |
-    go test -race -cover ./...
-
-- name: Run integration tests (on main branch)
-  if: github.ref == 'refs/heads/main'
-  env:
-    SGL_GRPC_ENDPOINT: grpc://localhost:20000
-    SGL_TOKENIZER_PATH: /path/to/tokenizer
-  run: go test -tags=integration ./...
 ```
 
 ## Documentation
 
-### Code Documentation
-
-All public types and functions include comprehensive documentation:
-
-1. **Package-level documentation** in `client.go` with usage examples
-2. **Type documentation** for all structs with field descriptions
-3. **Function documentation** with:
-   - Purpose and behavior description
-   - Parameter documentation with types and constraints
-   - Return value documentation
-   - Error cases and handling
-   - Safety notes (for FFI functions)
-   - Usage examples
+All public types and functions include comprehensive documentation with usage examples.
 
 ### Key Documented Components
 
@@ -427,45 +373,19 @@ All public types and functions include comprehensive documentation:
 
 ### Viewing Documentation
 
-Generate and view HTML documentation:
-
 ```bash
-# Install godoc (if not already installed)
-go install golang.org/x/tools/cmd/godoc@latest
-
-# Generate and serve documentation
 godoc -http=:6060
-
 # Visit: http://localhost:6060/pkg/github.com/sglang/sglang-go-grpc-sdk/
 ```
 
 ## Development
 
-### Building
-
 ```bash
 cd bindings/golang
-
-# Build the Go bindings (compiles Rust FFI library)
-make build
-
-# Clean build
-make clean && make build
-```
-
-### Code Quality
-
-Ensure code quality before committing:
-
-```bash
-# Run Go vet (check for potential bugs)
-go vet ./...
-
-# Format code
-go fmt ./...
-
-# Run all tests with race detection
-go test -race ./...
+make build          # Build Go bindings
+go vet ./...        # Check code quality
+go fmt ./...        # Format code
+go test -race ./... # Run tests
 ```
 
 ### Project Structure
@@ -494,35 +414,15 @@ bindings/golang/
 
 ### Missing Dependencies
 
-**Error**: `missing go.sum entry for module providing package` or `missing go.sum entry`
-
-**Solution**:
-1. Run `go mod tidy` to download and sync all dependencies:
-   ```bash
-   cd sgl-model-gateway/bindings/golang
-   go mod tidy
-   ```
-2. This will automatically:
-   - Download missing dependencies (google.golang.org/grpc, google.golang.org/protobuf, etc.)
-   - Update `go.sum` with checksums
-   - Resolve all import dependencies
-3. If errors persist, ensure you're in the correct directory and have network access
+Run `go mod tidy` to sync dependencies.
 
 ### Connection Errors
 
-**Error**: `connection refused` or `failed to dial`
-
-**Solution**:
-1. Ensure SGLang server is running: `python -m sglang.launch_server`
-2. Check endpoint: `echo $SGL_GRPC_ENDPOINT`
-3. Verify port is not blocked: `nc -zv localhost 20000`
+Ensure SGLang server is running and check `SGL_GRPC_ENDPOINT`.
 
 ### Tokenizer Not Found
 
-**Error**: `tokenizer path not found` or `tokenizer configuration missing`
-
-**Solution**:
-1. Set `SGL_TOKENIZER_PATH` environment variable
+Set `SGL_TOKENIZER_PATH` environment variable.
 2. Verify path contains required files: `ls $SGL_TOKENIZER_PATH`
 3. Files should include: `tokenizer.json`, `vocab.json`, `config.json`
 

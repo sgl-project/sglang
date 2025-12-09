@@ -1,17 +1,17 @@
 #!/bin/bash
 
-# TPOT 性能瓶颈分析脚本
-# 专门用于分析 Go Router 相比 Rust Router 慢一倍的原因
+# TPOT performance bottleneck analysis script
+# Specifically designed to analyze why Go Router is twice as slow as Rust Router
 # 
 # Usage:
 #   ./scripts/analyze_tpot.sh [options]
 #
 # Options:
-#   --duration SECONDS     CPU profile 持续时间 (default: 60)
-#   --requests NUM        请求数量 (default: 100)
-#   --concurrency NUM     并发数 (default: 20)
-#   --pprof-port PORT     pprof 端口 (default: 6060)
-#   --server-url URL      服务器 URL (default: http://localhost:8080)
+#   --duration SECONDS     CPU profile duration (default: 60)
+#   --requests NUM        Number of requests (default: 100)
+#   --concurrency NUM     Concurrency level (default: 20)
+#   --pprof-port PORT     pprof port (default: 6060)
+#   --server-url URL      Server URL (default: http://localhost:8080)
 
 set -e
 
@@ -163,7 +163,7 @@ run_streaming_request() {
         -H "Content-Type: application/json" \
         -d "{
             \"model\": \"default\",
-            \"messages\": [{\"role\": \"user\", \"content\": \"写一个500字的故事，包含人物对话和场景描写\"}],
+            \"messages\": [{\"role\": \"user\", \"content\": \"Write a 500-word story with character dialogue and scene descriptions\"}],
             \"stream\": true,
             \"max_tokens\": 300,
             \"temperature\": 0.7
