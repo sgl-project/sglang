@@ -276,7 +276,6 @@ set(SOURCES
     "csrc/elementwise/cast.cu"
     "csrc/elementwise/concat_mla.cu"
     "csrc/elementwise/copy.cu"
-    "csrc/elementwise/fused_layernorm_scale_shift.cu"
     "csrc/elementwise/fused_add_rms_norm_kernel.cu"
     "csrc/elementwise/rope.cu"
     "csrc/elementwise/pos_enc.cu"
@@ -333,6 +332,7 @@ set(SOURCES
     "csrc/moe/prepare_moe_input.cu"
 
     "csrc/quantization/gguf/gguf_kernel.cu"
+    "csrc/sgl_diffusion/elementwise/fused_layernorm_scale_shift.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
     "csrc/speculative/packbit.cu"

@@ -335,7 +335,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             and (x.shape[-1] % 4 == 0)
             and not isinstance(self.norm, RMSNorm)
         )
-        can_use_cuda = False
+        # can_use_cuda = False
         if can_use_cuda:
             B, L, C = x.shape
             M = B * L
@@ -361,7 +361,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
 
             if scale.dim() == 4 and shift.dim() == 4:
                 # scale/shift: [B, F, 1, C]
-                y_2d, residual_output = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+                y_2d, residual_output = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
                     x_2d,
                     gamma,
                     beta,
@@ -421,7 +421,7 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
             
             if scale_arg is not None and shift_arg is not None:
                 # print(f"gate_opt.dtype, {gate_opt.dtype}, x.dtype, {x.dtype}") # fp32, bf16
-                y_2d, residual_output = sgl_kernel.device_scale_residual_layernorm_fuse_scale_shift(
+                y_2d, residual_output = sgl_kernel.fused_scale_residual_layernorm_scale_shift(
                     residual_2d, x_2d, gamma, beta, scale_arg, shift_arg, gate_opt
                 )
                 return y_2d.view(B, L, C), residual_output.view(B, L, C)
@@ -496,7 +496,7 @@ class LayerNormScaleShift(nn.Module):
             and self.norm_type == "layer"
             and (x.shape[-1] % 4 == 0) # x.shape[-1]: hidden_size
         )
-        can_use_cuda = False
+        # can_use_cuda = False
         if can_use_cuda:
             B, L, C = x.shape
             M = B * L
@@ -514,7 +514,7 @@ class LayerNormScaleShift(nn.Module):
 
             if scale.dim() == 4 and shift.dim() == 4:
                 # scale/shift: [B, F, 1, C]
-                y_2d = sgl_kernel.device_layernorm_fuse_scale_shift(
+                y_2d = sgl_kernel.fused_layernorm_scale_shift(
                     x_2d,
                     gamma,
                     beta,
@@ -554,7 +554,7 @@ class LayerNormScaleShift(nn.Module):
             else:
                 sh_sb = sh_sl = sh_sc = 0
 
-            y_2d = sgl_kernel.device_layernorm_fuse_scale_shift(x_2d, gamma, beta, scale_blc if need_scale_scalar else scale_exp.contiguous().view(M, C), shift_blc if need_shift_scalar else shift_exp.contiguous().view(M, C))
+            y_2d = sgl_kernel.fused_layernorm_scale_shift(x_2d, gamma, beta, scale_blc if need_scale_scalar else scale_exp.contiguous().view(M, C), shift_blc if need_shift_scalar else shift_exp.contiguous().view(M, C))
             return y_2d.view(B, L, C)
 
         else:

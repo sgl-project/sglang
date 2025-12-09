@@ -595,11 +595,11 @@ torch::Tensor device_layernorm(torch::Tensor x,
   return y;
 }
 
-torch::Tensor device_layernorm_fuse_scale_shift(torch::Tensor x,
-                                                torch::Tensor gamma,
-                                                torch::Tensor beta,
-                                                torch::Tensor scale,
-                                                torch::Tensor shift) {
+torch::Tensor fused_layernorm_scale_shift(torch::Tensor x,
+                                          torch::Tensor gamma,
+                                          torch::Tensor beta,
+                                          torch::Tensor scale,
+                                          torch::Tensor shift) {
   CHECK_CUDA(x);
   CHECK_CUDA(scale);
   CHECK_CUDA(shift);
@@ -1194,13 +1194,13 @@ static void layernorm_fused_res_gate_scale_shift_launch_with_residual(
   }
 }
 
-std::tuple<torch::Tensor, torch::Tensor> device_scale_residual_layernorm_fuse_scale_shift(torch::Tensor residual,
-                                                                                                        torch::Tensor x,
-                                                                                                        torch::Tensor gamma,
-                                                                                                        torch::Tensor beta,
-                                                                                                        torch::Tensor scale,
-                                                                                                        torch::Tensor shift,
-                                                                                                        const c10::optional<torch::Tensor>& gate_opt) {
+std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_layernorm_scale_shift(torch::Tensor residual,
+                                                                                     torch::Tensor x,
+                                                                                     torch::Tensor gamma,
+                                                                                     torch::Tensor beta,
+                                                                                     torch::Tensor scale,
+                                                                                     torch::Tensor shift,
+                                                                                     const c10::optional<torch::Tensor>& gate_opt) {
   CHECK_CUDA(x);
   CHECK_CUDA(residual);
   CHECK_CUDA(scale);

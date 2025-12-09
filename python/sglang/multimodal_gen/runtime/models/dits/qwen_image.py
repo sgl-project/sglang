@@ -15,7 +15,7 @@ from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm
+from sglang.multimodal_gen.runtime.layers.layernorm import LayerNorm, RMSNorm, LayerNormScaleShift
 from sglang.multimodal_gen.runtime.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -416,7 +416,9 @@ class QwenImageTransformerBlock(nn.Module):
                 dim, 6 * dim, bias=True
             ),  # For scale, shift, gate for norm1 and norm2
         )
-        self.img_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.img_norm1 = LayerNormScaleShift(
+            hidden_size=dim, norm_type="layer", eps=eps, elementwise_affine=False
+        )
 
         self.attn = QwenImageCrossAttention(
             dim=dim,
@@ -425,7 +427,9 @@ class QwenImageTransformerBlock(nn.Module):
             context_pre_only=False,
             head_dim=attention_head_dim,
         )
-        self.img_norm2 = LayerNorm(dim, eps=eps, elementwise_affine=False)
+        self.img_norm2 = LayerNormScaleShift(
+            hidden_size=dim, norm_type="layer", eps=eps, elementwise_affine=False
+        )
         self.img_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
@@ -437,9 +441,13 @@ class QwenImageTransformerBlock(nn.Module):
                 dim, 6 * dim, bias=True
             ),  # For scale, shift, gate for norm1 and norm2
         )
-        self.txt_norm1 = LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_norm1 = LayerNormScaleShift(
+            hidden_size=dim, norm_type="layer", eps=eps, elementwise_affine=False
+        )
         # Text doesn't need separate attention - it's handled by img_attn joint computation
-        self.txt_norm2 = LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.txt_norm2 = LayerNormScaleShift(
+            hidden_size=dim, norm_type="layer", eps=eps, elementwise_affine=False
+        )
         self.txt_mlp = FeedForward(
             dim=dim, dim_out=dim, activation_fn="gelu-approximate"
         )
@@ -467,14 +475,16 @@ class QwenImageTransformerBlock(nn.Module):
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
         # Process image stream - norm1 + modulation
-
-        img_normed = self.img_norm1(hidden_states)
-
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
+        img_shift1, img_scale1, img_gate1_raw = img_mod1.chunk(3, dim=-1)
+        img_modulated = self.img_norm1(hidden_states, shift=img_shift1, scale=img_scale1)
+        img_gate1 = img_gate1_raw.unsqueeze(1)
 
         # Process text stream - norm1 + modulation
-        txt_normed = self.txt_norm1(encoder_hidden_states)
-        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
+        txt_shift1, txt_scale1, txt_gate1_raw = txt_mod1.chunk(3, dim=-1)
+        txt_modulated = self.txt_norm1(
+            encoder_hidden_states, shift=txt_shift1, scale=txt_scale1
+        )
+        txt_gate1 = txt_gate1_raw.unsqueeze(1)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -500,14 +510,18 @@ class QwenImageTransformerBlock(nn.Module):
         encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
 
         # Process image stream - norm2 + MLP
-        img_normed2 = self.img_norm2(hidden_states)
-        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
+        img_shift2, img_scale2, img_gate2_raw = img_mod2.chunk(3, dim=-1)
+        img_modulated2 = self.img_norm2(hidden_states, shift=img_shift2, scale=img_scale2)
+        img_gate2 = img_gate2_raw.unsqueeze(1)
         img_mlp_output = self.img_mlp(img_modulated2)
         hidden_states = hidden_states + img_gate2 * img_mlp_output
 
         # Process text stream - norm2 + MLP
-        txt_normed2 = self.txt_norm2(encoder_hidden_states)
-        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
+        txt_shift2, txt_scale2, txt_gate2_raw = txt_mod2.chunk(3, dim=-1)
+        txt_modulated2 = self.txt_norm2(
+            encoder_hidden_states, shift=txt_shift2, scale=txt_scale2
+        )
+        txt_gate2 = txt_gate2_raw.unsqueeze(1)
         txt_mlp_output = self.txt_mlp(txt_modulated2)
         encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 
