@@ -11,8 +11,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerCore,
     RunnerInput,
     RunnerOutput,
-    register_post_permute,
-    register_pre_permute,
+    register_fused_func,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
@@ -126,39 +125,46 @@ class MarlinRunnerCore(MoeRunnerCore):
         return MoeRunnerBackend.MARLIN
 
 
-@register_pre_permute("standard", "marlin")
-def pre_permute_standard_to_marlin(
+@register_fused_func("none", "marlin")
+def fused_experts_none_to_marlin(
     dispatch_output: StandardDispatchOutput,
     quant_info: MarlinMoeQuantInfo,
     runner_config: MoeRunnerConfig,
-    running_state: dict,
-) -> MarlinRunnerInput:
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
+) -> StandardCombineInput:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
 
-    assert TopKOutputChecker.format_is_standard(
-        topk_output
-    ), "Marlin runner expects StandardTopKOutput"
+    assert runner_config.activation == "silu", "Only SiLU activation is supported."
 
-    return MarlinRunnerInput(
+    workspace = marlin_make_workspace(hidden_states.device, max_blocks_per_sm=4)
+
+    output = fused_marlin_moe(
         hidden_states=hidden_states,
+        w1=quant_info.w13_qweight,
+        w2=quant_info.w2_qweight,
+        w1_scale=quant_info.w13_scales,
+        w2_scale=quant_info.w2_scales,
+        gating_output=topk_output.router_logits,
         topk_weights=topk_output.topk_weights,
         topk_ids=topk_output.topk_ids,
-        router_logits=topk_output.router_logits,
-    )
-
-
-@register_post_permute("marlin", "standard")
-def post_permute_marlin_to_standard(
-    runner_output: MarlinRunnerOutput,
-    quant_info: MarlinMoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-    running_state: dict,
-) -> StandardCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+        expert_map=quant_info.expert_map,
+        g_idx1=quant_info.w13_g_idx,
+        g_idx2=quant_info.w2_g_idx,
+        sort_indices1=quant_info.w13_g_idx_sort_indices,
+        sort_indices2=quant_info.w2_g_idx_sort_indices,
+        w1_zeros=quant_info.w13_qzeros,
+        w2_zeros=quant_info.w2_qzeros,
+        workspace=workspace,
+        num_bits=quant_info.weight_bits,
+        is_k_full=quant_info.is_k_full,
+        inplace=runner_config.inplace,
+        routed_scaling_factor=runner_config.routed_scaling_factor,
+    ).to(hidden_states.dtype)
 
     return StandardCombineInput(
-        hidden_states=runner_output.hidden_states,
+        hidden_states=output,
     )
