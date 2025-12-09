@@ -1798,6 +1798,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
+        is_extend_filter = chunked_req_to_exclude is not None
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -1851,13 +1852,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
         if self.spec_info:
-            if chunked_req_to_exclude is not None and len(chunked_req_to_exclude) > 0:
-                has_been_filtered = False
-            else:
-                has_been_filtered = True
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=has_been_filtered,
+                has_been_filtered=not is_extend_filter,
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
