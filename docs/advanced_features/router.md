@@ -45,7 +45,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 ## Architecture
 
 ### Control Plane
-- **Worker Manager** discovers capabilities (`/server_info`, `/model_info`), tracks load, and registers/removes workers in the shared registry.
+- **Worker Manager** discovers capabilities (`/get_server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
 - **Job Queue** serializes add/remove requests and exposes status (`/workers/{url}`) so clients can track onboarding progress.
 - **Load Monitor** feeds cache-aware and power-of-two policies with live worker load statistics.
 - **Health Checker** continuously probes workers and updates readiness, circuit breaker state, and router metrics.
@@ -133,14 +133,13 @@ python -m sglang_router.launch_router \
 > gRPC router supports both single-stage and PD serving. Provide `--tokenizer-path` or `--model-path` (HF repo or local directory) plus optional `--chat-template`.
 
 ### Prefill/Decode Disaggregation
-Split prefill and decode workers for PD-aware caching and balancing.
+Split prefill and decode workers for PD-aware caching and balancing. Specifying `--policy A` is equivalent to `--prefill-policy A --decode-policy A`.
 
 ```bash
 python -m sglang_router.launch_router \
   --pd-disaggregation \
   --prefill http://prefill1:30001 9001 \
   --decode http://decode1:30011 \
-  --policy cache_aware \
   --prefill-policy cache_aware \
   --decode-policy power_of_two
 ```
@@ -436,6 +435,14 @@ Enable request ID propagation:
 python -m sglang_router.launch_router \
   --worker-urls http://worker1:8000 \
   --request-id-headers x-request-id x-trace-id
+```
+
+Enable opentelmetry tracing:
+```bash
+python -m sglang_router.launch_router \
+  --worker-urls http://worker1:8000 \
+  --enable-trace \
+  --otlp-traces-endpoint 0.0.0.0:4317
 ```
 
 ---

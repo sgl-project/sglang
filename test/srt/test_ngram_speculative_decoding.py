@@ -80,7 +80,7 @@ class TestNgramSpeculativeDecodingBase(CustomTestCase):
         metric_key = "accuracy"
         self.assertGreater(metrics[metric_key], self.accuracy_threshold)
 
-        server_info = requests.get(self.base_url + "/server_info")
+        server_info = requests.get(self.base_url + "/get_server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
