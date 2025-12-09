@@ -84,7 +84,7 @@ jobs:
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
           docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
           docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
           docker exec -u root "$cid" /bin/bash -c "ln -sf /home/sdp/miniforge3/envs/py3.10/bin/python3 /usr/bin/python3"
