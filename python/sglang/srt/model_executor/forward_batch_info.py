@@ -352,6 +352,9 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    # For Hunyuan-VL
+    xdrope_positions: torch.Tensor = None
+
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
@@ -496,6 +499,9 @@ class ForwardBatch:
                 ret._compute_spec_mrope_positions(model_runner, batch)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
+
+        if model_runner.model_is_xdrope:
+            ret._compute_xdrope_positions(model_runner, batch)
 
         # Init lora information
         if model_runner.server_args.enable_lora:
@@ -676,6 +682,60 @@ class ForwardBatch:
 
         self.mrope_positions = torch.cat(
             [pos.to(device=model_runner.device) for pos in mrope_positions_list],
+            dim=1,
+        ).to(dtype=torch.int64, device=model_runner.device)
+
+    def _compute_xdrope_positions(
+        self,
+        model_runner: ModelRunner,
+        batch: ModelWorkerBatch,
+    ) -> torch.Tensor:
+        # batch_size * [4* seq_len]
+        batch_size = self.seq_lens.shape[0]
+        xdrope_positions_list = [[]] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = batch.multimodal_inputs[batch_idx]
+            if self.forward_mode.is_decode():
+                # 4 * N
+                if mm_input is None:
+                    xdrope_positions_list[batch_idx] = torch.full(
+                        (4, 1),
+                        self.seq_lens[batch_idx] - 1,
+                        dtype=torch.int64,
+                        device=model_runner.device,
+                    )
+                else:
+                    xdrope_positions = (
+                        (self.seq_lens[batch_idx] - 1).unsqueeze(0).repeat(4, 1)
+                    )
+                    xdrope_positions_list[batch_idx] = xdrope_positions
+            elif self.forward_mode.is_extend():
+                extend_seq_len, extend_prefix_len = (
+                    batch.extend_seq_lens[batch_idx],
+                    batch.extend_prefix_lens[batch_idx],
+                )
+                if mm_input is None:
+                    # text only
+                    xdrope_positions = torch.tensor(
+                        [
+                            [
+                                pos
+                                for pos in range(
+                                    extend_prefix_len,
+                                    extend_prefix_len + extend_seq_len,
+                                )
+                            ]
+                        ]
+                        * 4
+                    )
+                else:
+                    xdrope_positions = mm_input.xdrope_positions[
+                        :,
+                        extend_prefix_len : extend_prefix_len + extend_seq_len,
+                    ]
+                xdrope_positions_list[batch_idx] = xdrope_positions
+        self.xdrope_positions = torch.cat(
+            [pos.to(device=model_runner.device) for pos in xdrope_positions_list],
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device)
 

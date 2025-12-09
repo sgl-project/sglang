@@ -1105,6 +1105,96 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
         return cache
 
 
+class XDRotaryEmbedding(DynamicNTKAlphaRotaryEmbedding):
+    """DynamicNTKAlphaRotaryEmbedding extended with MultiModal(XD) Sections.
+
+    Based on the original DynamicNTKAlphaRotaryEmbedding implementation.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        scaling_alpha: float,
+        dtype: torch.dtype,
+        xdrope_section: list[int],
+    ) -> None:
+        self.xdrope_section = xdrope_section
+        super().__init__(
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            scaling_alpha,
+            dtype,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass with optional Triton kernel acceleration.
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        # TODO support other backends
+        return self._forward_native(positions, query, key)
+
+    def _forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """PyTorch-native implementation equivalent to forward().
+
+        Args:
+            positions:
+                [4, num_tokens] (P/W/H/T positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 2
+        assert key is not None
+
+        num_tokens = positions.shape[-1]
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        cos = torch.cat(
+            [m[i] for i, m in enumerate(cos.split(self.xdrope_section, dim=-1))], dim=-1
+        )
+        sin = torch.cat(
+            [m[i] for i, m in enumerate(sin.split(self.xdrope_section, dim=-1))], dim=-1
+        )
+
+        query_shape = query.shape
+        query = query.view(num_tokens, -1, self.head_size)
+        query_rot = query[..., : self.rotary_dim]
+        query_pass = query[..., self.rotary_dim :]
+        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = key[..., : self.rotary_dim]
+        key_pass = key[..., self.rotary_dim :]
+        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return query, key
+
+
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list[int]) -> torch.Tensor:
     """Apply interleaved MRoPE to 3D rotary embeddings.
     Reorganizes frequency layout from chunked [TTT...HHH...WWW] to
@@ -2655,6 +2745,19 @@ def get_rope(
                     scaling_factor,
                     dtype,
                 )
+        elif scaling_type == "xdrope":
+            scaling_factor = rope_scaling["factor"]
+            xdrope_section = rope_scaling["xdrope_section"]
+            rotary_emb = XDRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                rope_scaling["alpha"],
+                dtype,
+                xdrope_section=xdrope_section,
+            )
         elif scaling_type == "yarn":
             scaling_factor = rope_scaling["factor"]
             original_max_position = rope_scaling["original_max_position_embeddings"]

@@ -514,8 +514,11 @@ class HunYuanModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.get_input_embeddings()(input_ids)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
 
     def forward(
         self,
@@ -527,7 +530,7 @@ class HunYuanModel(nn.Module):
         if input_embeds is not None:
             hidden_states = input_embeds
         else:
-            hidden_states = self.get_input_embeddings(input_ids)
+            hidden_states = self.get_input_embedding(input_ids)
         residual = None
 
         prev_kv_states = None

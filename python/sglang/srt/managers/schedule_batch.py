@@ -317,6 +317,9 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    # hunyuan-vl related
+    xdrope_positions: Optional[torch.Tensor] = None
+
     @staticmethod
     def from_dict(obj: dict):
         ret = MultimodalInputs(
@@ -363,6 +366,7 @@ class MultimodalInputs:
             "audio_start_id",
             "audio_end_id",
             "audio_token_id",
+            "xdrope_positions",
         ]
         for arg in optional_args:
             if arg in obj:

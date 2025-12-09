@@ -2817,6 +2817,15 @@ class ModelRunner:
         is_mrope_enabled = "mrope_section" in rope_scaling
         return is_mrope_enabled
 
+    @property
+    def model_is_xdrope(self) -> bool:
+        """Detect if the model has "xdrope" rope_scaling type."""
+        rope_scaling = getattr(self.model_config.hf_text_config, "rope_scaling", {})
+        if rope_scaling is None:
+            return False
+        is_xdrope_enabled = "xdrope_section" in rope_scaling
+        return is_xdrope_enabled
+
     def save_remote_model(self, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader
 
