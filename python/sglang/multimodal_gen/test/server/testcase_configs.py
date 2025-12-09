@@ -231,6 +231,21 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             output_size="1024x1024",
         ),
     ),
+    # Qwen-Image T2I LoRA test case
+    DiffusionTestCase(
+        "qwen_image_lora_1gpu",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            lora_path="starsfriday/Qwen-Image-EVA-LoRA",
+        ),
+        DiffusionSamplingParams(
+            prompt="mrx, a young female character with long hair in a traditional Japanese setting",
+            output_size="1024x1024",
+        ),
+    ),
     DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
@@ -241,6 +256,21 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt="A futuristic cityscape at sunset with flying cars",
+            output_size="1024x1024",
+        ),
+    ),
+    # FLUX T2I LoRA test case
+    DiffusionTestCase(
+        "flux_dev_lora_1gpu",
+        DiffusionServerArgs(
+            model_path="black-forest-labs/FLUX.1-dev",
+            modality="image",
+            warmup_text=1,
+            warmup_edit=0,
+            lora_path="Shakker-Labs/FLUX.1-dev-LoRA-Logo-Design",
+        ),
+        DiffusionSamplingParams(
+            prompt="wablogo, logo, Minimalist, A cat and coffee cup",
             output_size="1024x1024",
         ),
     ),
@@ -471,6 +501,24 @@ TWO_GPU_CASES_B = [
             output_size="832x1104",
             prompt="Add dynamic motion to the scene",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
+    ),
+    # I2V LoRA test case
+    DiffusionTestCase(
+        "wan2_1_i2v_14b_lora_2gpu",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=2,
+            lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
+        ),
+        DiffusionSamplingParams(
+            prompt="faxiang, the person raises hands, a giant translucent golden figure appears behind",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+            output_size="832x1104",
         ),
     ),
     DiffusionTestCase(
