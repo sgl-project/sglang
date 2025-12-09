@@ -122,7 +122,9 @@ class APIServingTimingMixin:
     received_time_perf: Optional[float] = None
 
 
-_API_SERVING_TIMING_MIXIN_FIELDS = APIServingTimingMixin.__dataclass_fields__.keys()
+_API_SERVING_TIMING_MIXIN_FIELDS = tuple(
+    APIServingTimingMixin.__dataclass_fields__.keys()
+)
 
 
 # Parameters for a session
