@@ -141,22 +141,23 @@ class DeepSeekV32Detector(BaseFormatDetector):
         xml_param_matches = re.findall(
             self.xml_parameter_regex, invoke_content, re.DOTALL
         )
-        parameters_str = "{"  # convert xml to json str
-        for i, (param_name, param_type, param_value) in enumerate(xml_param_matches):
+
+        json_parts = []
+        for param_name, param_type, param_value in xml_param_matches:
             # Convert value based on type
             if param_type == "true":  # string type
-                parameters_str += f'"{param_name}": "{param_value.strip()}"'
+                json_parts.append(f'"{param_name}": "{param_value.strip()}"')
             else:
                 # Try to parse as JSON for other types
                 try:
-                    parameters_str += (
-                        f'"{param_name}": {json.loads(param_value.strip())}'
+                    json_parts.append(
+                        f'"{param_name}": {json.dumps(json.loads(param_value.strip()), ensure_ascii=False)}'
                     )
                 except (json.JSONDecodeError, ValueError):
-                    parameters_str += f'"{param_name}": "{param_value.strip()}"'
-            if i < len(xml_param_matches) - 1:
-                parameters_str += ", "
-        return parameters_str, "xml"
+                    json_parts.append(
+                        f'"{param_name}": {json.dumps(param_value.strip(), ensure_ascii=False)}'
+                    )
+        return "{" + ", ".join(json_parts), "xml"
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -337,8 +338,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         self.current_tool_name_sent = False
 
                 if not is_tool_end:
-                    # if current tool is not end, it means the following content is definitely not a tool call
-                    # so break the loop
+                    # if current tool is not end, it means the following content is definitely not a tool call, so break the loop
                     break
 
             # No more invoke blocks found
