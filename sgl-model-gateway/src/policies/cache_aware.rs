@@ -215,7 +215,7 @@ impl CacheAwarePolicy {
         &self,
         workers: &[Arc<dyn Worker>],
         request_text: &Option<&str>,
-        healthy_indices: &Vec<usize>,
+        healthy_indices: &[usize],
         model_id: &str,
         // TODO may skip passing this arg (and compute inside function) if this is not bottleneck
         max_load: usize,
