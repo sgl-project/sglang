@@ -360,9 +360,8 @@ class ModelConfig:
                 mscale_all_dim = self.hf_config.rope_scaling.get(
                     "mscale_all_dim", False
                 )
-                scaling_factor = self.hf_config.rope_scaling.get("factor")
-                print(f"364 {scaling_factor=}", flush=True)
                 scaling_factor = self.hf_config.rope_scaling["factor"]
+                print(f"364 {scaling_factor=}", flush=True)
                 mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                 self.scaling = self.scaling * mscale * mscale
 
