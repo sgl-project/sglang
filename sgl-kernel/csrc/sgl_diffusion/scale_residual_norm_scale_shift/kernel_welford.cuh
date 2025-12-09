@@ -3,7 +3,7 @@
 
 #include <cuda_runtime.h>
 
-struct WelfoldValue {
+struct WelfordValue {
   float mean = 0.0f, m2 = 0.0f;
   int count = 0;
 };
@@ -57,10 +57,10 @@ __inline__ __device__ void store4_cast(PtrTy* ptr, const RegTy v[4]) {
 }
 
 template <NormType norm_type>
-__inline__ __device__ WelfoldValue compute_scale_residual(float x, float g, float r, WelfoldValue welf, float& out) {
+__inline__ __device__ WelfordValue compute_scale_residual(float x, float g, float r, WelfordValue welf, float& out) {
   out = fmaf(x, g, r);
   if constexpr (norm_type == LayerNorm) {
-    welf.count += 1.0;
+    welf.count += 1;
     float delta = out - welf.mean;
     welf.mean = welf.mean + delta / welf.count;
     float delta2 = (out - welf.mean);
@@ -75,8 +75,8 @@ __inline__ __device__ WelfoldValue compute_scale_residual(float x, float g, floa
 
 // Vectorized path of (x*gate + residual), computing 4 elements per thread.
 template <typename DType, typename ParamDType, NormType norm_type>
-__inline__ __device__ WelfoldValue scale_residual_aligned(
-    WelfoldValue welf,
+__inline__ __device__ WelfordValue scale_residual_aligned(
+    WelfordValue welf,
     const DType* x,
     const DType* gate,
     const DType* residual,
@@ -111,8 +111,8 @@ __inline__ __device__ WelfoldValue scale_residual_aligned(
 
 // Scalar fallback path for residual = x * gate + residual.
 template <typename DType, typename ParamDType, NormType norm_type>
-__inline__ __device__ WelfoldValue scale_residual_general(
-    WelfoldValue welf,
+__inline__ __device__ WelfordValue scale_residual_general(
+    WelfordValue welf,
     const DType* x,
     const DType* gate,
     const DType* residual,
@@ -137,7 +137,7 @@ __inline__ __device__ WelfoldValue scale_residual_general(
 
 // Warp-level mean reduction using shuffle instructions.
 template <NormType norm_type, int thread_group_width = THREADS_PER_WARP>
-__inline__ __device__ WelfoldValue warp_reduce(WelfoldValue welf) {
+__inline__ __device__ WelfordValue warp_reduce(WelfordValue welf) {
 #pragma unroll
   for (int offset = thread_group_width >> 1; offset > 0; offset >>= 1) {
     if constexpr (norm_type == LayerNorm) {
@@ -169,7 +169,7 @@ template <NormType norm_type>
 __inline__ __device__ void cta_reduce(
     int lane,
     int warp,
-    WelfoldValue welf,
+    WelfordValue welf,
     int D,
     float eps,
     float* __restrict__ shm_mean,
@@ -345,7 +345,7 @@ __global__ __launch_bounds__(THREADS_PER_CTA) void scale_residual_norm_scale_shi
   residual_output += tile_id * D;
 
   // Scale & Residual
-  WelfoldValue welf;
+  WelfordValue welf;
   if constexpr (is_d_aligned) {
     welf = scale_residual_aligned<DType, ParamDType, norm_type>(
         welf, x, gate, residual, residual_output, is_warp_reduce, has_gate_tensor, D, thr_id, lane_id);

@@ -5,6 +5,17 @@ import torch
 device = "cuda" if torch.cuda.is_available() else None
 
 
+def make_tensor_unaligned(x: torch.Tensor | None, unaligned: bool):
+    if not unaligned:
+        return x
+    if x is None:
+        return None
+    numel = x.numel()
+    buf = torch.empty(numel + 1, dtype=x.dtype, device=x.device)
+    buf[1 : numel + 1].copy_(x.view(-1))
+    return buf[1:].view_as(x)
+
+
 # Data Generation
 def datagen(
     dtype,
@@ -19,6 +30,7 @@ def datagen(
     norm_type,
     gate_shape,
     scale_shift_shape,
+    unaligned: bool = False,
 ):
     residual = torch.randn(batch, seq, hidden_dim, dtype=dtype, device=device)
     x = torch.randn(batch, seq, hidden_dim, dtype=dtype, device=device)
@@ -66,13 +78,13 @@ def datagen(
         scale = torch.randn(batch, frame, 1, hidden_dim, dtype=dtype, device=device)
         shift = torch.randn(batch, frame, 1, hidden_dim, dtype=dtype, device=device)
     return (
-        residual,
-        x,
-        gate,
-        norm_weight,
-        norm_bias,
-        shift,
-        scale,
+        make_tensor_unaligned(residual, unaligned=unaligned),
+        make_tensor_unaligned(x, unaligned=unaligned),
+        make_tensor_unaligned(gate, unaligned=unaligned),
+        make_tensor_unaligned(norm_weight, unaligned=unaligned),
+        make_tensor_unaligned(norm_bias, unaligned=unaligned),
+        make_tensor_unaligned(shift, unaligned=unaligned),
+        make_tensor_unaligned(scale, unaligned=unaligned),
         eps,
         norm_type == "rms",
     )
@@ -169,6 +181,7 @@ def _run_test(
     norm_type="layer",
     gate_shape="1D",
     scale_shift_shape="B1D",
+    unaligned: bool = False,
 ):
     if device is None:
         pytest.skip("No cuda device available for this test")
@@ -187,6 +200,7 @@ def _run_test(
         norm_type,
         gate_shape,
         scale_shift_shape,
+        unaligned,
     )
     mod_ref, resi_out_ref = compiled_scale_residual_norm(*input_data)
     mod, resi_out = sgl_kernel.scale_residual_norm_scale_shift(*input_data)
@@ -255,6 +269,12 @@ def test_scale_residual_norm_scale_shift_gate_shape(gate_shape):
 )
 def test_scale_residual_norm_scale_shift_scale_shift_shape(scale_shift_shape):
     _run_test(scale_shift_shape=scale_shift_shape)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("unaligned", [True])
+def test_scale_residual_norm_unaligned(dtype, unaligned):
+    _run_test(dtype=dtype, unaligned=unaligned)
 
 
 if __name__ == "__main__":

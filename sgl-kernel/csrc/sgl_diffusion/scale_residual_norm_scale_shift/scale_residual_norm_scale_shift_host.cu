@@ -23,6 +23,23 @@ struct BroadcastParam {
   BroadcastDesc<DType> desc;
 };
 
+bool tensor_aligned_for_vectorized_load(const at::Tensor& t) {
+  auto dt = t.scalar_type();
+  uintptr_t addr = reinterpret_cast<uintptr_t>(t.data_ptr());
+  if (dt == at::kFloat) {
+    return addr % 16 == 0;
+  }
+  if (dt == at::kHalf || dt == at::kBFloat16) {
+    return addr % 8 == 0;
+  }
+  return false;
+}
+
+bool optional_tensor_aligned_for_vectorized_load(const c10::optional<at::Tensor>& t_opt) {
+  if (!t_opt.has_value()) return true;
+  return tensor_aligned_for_vectorized_load(t_opt.value());
+}
+
 template <typename DType>
 BroadcastParam<DType> prepare_scale_shift_tensor(
     const at::Tensor& tensor, int64_t B, int64_t S, int64_t D, const at::TensorOptions& options) {
@@ -314,7 +331,11 @@ std::tuple<at::Tensor, at::Tensor> scale_residual_norm_scale_shift(
   auto act_opts_const = act_opts;
 
   bool is_warp_reduce = D <= CTA_REDUCE_THRESHOLD;
-  bool is_d_aligned = D % 4 == 0;
+  bool is_d_aligned = D % 4 == 0 && tensor_aligned_for_vectorized_load(residual) &&
+                      tensor_aligned_for_vectorized_load(x) && optional_tensor_aligned_for_vectorized_load(gate_opt) &&
+                      optional_tensor_aligned_for_vectorized_load(norm_weight_opt) &&
+                      optional_tensor_aligned_for_vectorized_load(norm_bias_opt) &&
+                      tensor_aligned_for_vectorized_load(shift) && tensor_aligned_for_vectorized_load(scale);
   dim3 block(THREADS_PER_CTA);
   uint32_t cta_per_grid = is_warp_reduce ? (B * S + WARP_PER_CTA - 1) / WARP_PER_CTA : B * S;
   dim3 grid(dim3(cta_per_grid, 1, 1));
