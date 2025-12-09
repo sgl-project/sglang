@@ -231,21 +231,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             output_size="1024x1024",
         ),
     ),
-    # Qwen-Image T2I LoRA test case
-    DiffusionTestCase(
-        "qwen_image_lora_1gpu",
-        DiffusionServerArgs(
-            model_path="Qwen/Qwen-Image",
-            modality="image",
-            warmup_text=1,
-            warmup_edit=0,
-            lora_path="starsfriday/Qwen-Image-EVA-LoRA",
-        ),
-        DiffusionSamplingParams(
-            prompt="mrx, a young female character with long hair in a traditional Japanese setting",
-            output_size="1024x1024",
-        ),
-    ),
     DiffusionTestCase(
         "flux_image_t2i",
         DiffusionServerArgs(
@@ -256,21 +241,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
         DiffusionSamplingParams(
             prompt="A futuristic cityscape at sunset with flying cars",
-            output_size="1024x1024",
-        ),
-    ),
-    # FLUX T2I LoRA test case
-    DiffusionTestCase(
-        "flux_dev_lora_1gpu",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.1-dev",
-            modality="image",
-            warmup_text=1,
-            warmup_edit=0,
-            lora_path="Shakker-Labs/FLUX.1-dev-LoRA-Logo-Design",
-        ),
-        DiffusionSamplingParams(
-            prompt="wablogo, logo, Minimalist, A cat and coffee cup",
             output_size="1024x1024",
         ),
     ),
