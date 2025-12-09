@@ -94,7 +94,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                 (3, self.max_num_token), dtype=torch.int64
             )
 
-            if self.eagle_worker.speculative_algorithm.is_eagle3():
+            if self.eagle_worker.speculative_algorithm.is_eagle3() and self.eagle_worker.eagle_use_aux_hidden_state:
                 self.hidden_states = torch.zeros(
                     (
                         self.max_num_token,
