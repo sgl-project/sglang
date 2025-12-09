@@ -417,9 +417,17 @@ def find_local_tokenizer_snapshot_dir(
     """If the tokenizer files are already local, skip downloading and return the path.
     Only applied in CI.
     """
-    if not is_in_ci() or os.path.isdir(model_name_or_path):
+    if not is_in_ci():
         return None
 
+    if os.path.isdir(model_name_or_path):
+        if is_in_ci():
+            print(
+                f"[TOKENIZER CACHE] {model_name_or_path} is already a local directory, skipping cache check"
+            )
+        return None
+
+    print(f"[TOKENIZER CACHE] Checking for cached tokenizer: {model_name_or_path}")
     found_local_snapshot_dir = None
 
     # Check custom cache_dir (if provided)
@@ -483,6 +491,11 @@ def find_local_tokenizer_snapshot_dir(
             model_name_or_path,
             found_local_snapshot_dir,
         )
+        if is_in_ci():
+            print(
+                f"[TOKENIZER CACHE] Found local snapshot for {model_name_or_path}, "
+                f"skipping HF API call. Cache: {found_local_snapshot_dir}"
+            )
         return found_local_snapshot_dir
     else:
         logger.info(
@@ -490,6 +503,11 @@ def find_local_tokenizer_snapshot_dir(
             found_local_snapshot_dir,
             allow_patterns,
         )
+        if is_in_ci():
+            print(
+                f"[TOKENIZER CACHE] No cached files for {model_name_or_path}, "
+                f"will download from HuggingFace"
+            )
     return None
 
 
