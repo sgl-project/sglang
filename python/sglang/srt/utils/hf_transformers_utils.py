@@ -14,6 +14,7 @@
 """Utilities for Huggingface Transformers."""
 
 import contextlib
+import glob
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Union
 
+import huggingface_hub
 import torch
 from huggingface_hub import snapshot_download
 
@@ -67,7 +69,14 @@ from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
+from sglang.srt.utils import (
+    find_local_repo_dir,
+    is_remote_url,
+    logger,
+    lru_cache_frozenset,
+    mistral_utils,
+)
+from sglang.utils import is_in_ci
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     ChatGLMConfig,
@@ -399,6 +408,91 @@ def get_context_length(config):
 _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 
+def find_local_tokenizer_snapshot_dir(
+    model_name_or_path: str,
+    cache_dir: Optional[str],
+    allow_patterns: List[str],
+    revision: Optional[str] = None,
+) -> Optional[str]:
+    """If the tokenizer files are already local, skip downloading and return the path.
+    Only applied in CI.
+    """
+    if not is_in_ci() or os.path.isdir(model_name_or_path):
+        return None
+
+    found_local_snapshot_dir = None
+
+    # Check custom cache_dir (if provided)
+    if cache_dir:
+        try:
+            repo_folder = os.path.join(
+                cache_dir,
+                huggingface_hub.constants.REPO_ID_SEPARATOR.join(
+                    ["models", *model_name_or_path.split("/")]
+                ),
+            )
+            rev_to_use = revision
+            if not rev_to_use:
+                ref_main = os.path.join(repo_folder, "refs", "main")
+                if os.path.isfile(ref_main):
+                    with open(ref_main) as f:
+                        rev_to_use = f.read().strip()
+            if rev_to_use:
+                rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
+                if os.path.isdir(rev_dir):
+                    found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning(
+                "Failed to find local snapshot in custom cache_dir %s: %s",
+                cache_dir,
+                e,
+            )
+
+    # Check default HF cache as well
+    if not found_local_snapshot_dir:
+        try:
+            rev_dir = find_local_repo_dir(model_name_or_path, revision)
+            if rev_dir and os.path.isdir(rev_dir):
+                found_local_snapshot_dir = rev_dir
+        except Exception as e:
+            logger.warning("Failed to find local snapshot in default HF cache: %s", e)
+
+    # If local snapshot exists, validate it contains at least one tokenizer file
+    # matching allow_patterns before skipping download.
+    if found_local_snapshot_dir is None:
+        return None
+
+    local_tokenizer_files: List[str] = []
+    try:
+        for pattern in allow_patterns:
+            local_tokenizer_files.extend(
+                glob.glob(os.path.join(found_local_snapshot_dir, pattern))
+            )
+    except Exception as e:
+        logger.warning(
+            "Failed to scan local snapshot %s with patterns %s: %s",
+            found_local_snapshot_dir,
+            allow_patterns,
+            e,
+        )
+        local_tokenizer_files = []
+
+    if len(local_tokenizer_files) > 0:
+        logger.info(
+            "Found local HF snapshot for tokenizer %s at %s; skipping download.",
+            model_name_or_path,
+            found_local_snapshot_dir,
+        )
+        return found_local_snapshot_dir
+    else:
+        logger.info(
+            "Local HF snapshot at %s has no files matching %s; will attempt download.",
+            found_local_snapshot_dir,
+            allow_patterns,
+        )
+    return None
+
+
 # Filter warnings like: https://github.com/sgl-project/sglang/issues/8082
 class TokenizerWarningsFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
@@ -440,6 +534,21 @@ def get_tokenizer(
         client = create_remote_connector(tokenizer_name)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
+
+    # Check if tokenizer files are already in local cache (CI only)
+    cache_dir = kwargs.get("cache_dir", None)
+    allow_patterns = [
+        "*.json",
+        "*.model",
+        "*.txt",
+        "tokenizer.model",
+        "tokenizer_config.json",
+    ]
+    local_path = find_local_tokenizer_snapshot_dir(
+        tokenizer_name, cache_dir, allow_patterns, tokenizer_revision
+    )
+    if local_path is not None:
+        tokenizer_name = local_path
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -507,6 +616,24 @@ def get_processor(
 ):
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
+
+    # Check if processor/tokenizer files are already in local cache (CI only)
+    cache_dir = kwargs.get("cache_dir", None)
+    allow_patterns = [
+        "*.json",
+        "*.model",
+        "*.txt",
+        "*.py",
+        "tokenizer.model",
+        "tokenizer_config.json",
+        "preprocessor_config.json",
+    ]
+    local_path = find_local_tokenizer_snapshot_dir(
+        tokenizer_name, cache_dir, allow_patterns, revision
+    )
+    if local_path is not None:
+        tokenizer_name = local_path
+
     if "mistral-large-3" in str(tokenizer_name).lower():
         config = _load_mistral_large_3_for_causal_LM(
             tokenizer_name,
