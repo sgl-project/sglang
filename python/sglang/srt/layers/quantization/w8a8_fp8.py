@@ -271,14 +271,53 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
-        layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        if self.quant_config.is_checkpoint_fp8_serialized:
+            # Case 1: Loading from an offline-quantized FP8 checkpoint.
+            # Wrap existing tensors as nn.Parameter. Weights are already in FP8 format.
+            layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
+            layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
+
+            # Handle FNUZ normalization if required for specific hardware (e.g., MI300).
+            if _is_fp8_fnuz:
+                # Normalize weights and scales from E4M3FN to E4M3FNUZ.
+                w13_weight, w13_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w13_weight, weight_scale=layer.w13_weight_scale
+                )
+                w2_weight, w2_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    weight=layer.w2_weight, weight_scale=layer.w2_weight_scale
+                )
+
+                # Replace parameters with normalized tensors.
+                layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+                layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+                layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+                layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
+            else:
+                # Ensure weight scales are registered as nn.Parameter.
+                layer.w13_weight_scale = Parameter(
+                    layer.w13_weight_scale.data, requires_grad=False
+                )
+                layer.w2_weight_scale = Parameter(
+                    layer.w2_weight_scale.data, requires_grad=False
+                )
+
+        else:
+            # Case 2: Loading from an FP16/BF16 checkpoint (Online Quantization)
+            # We always use Per-channel quantization because the Triton MoE kernel support it.
+            # No need to check for CUTLASS support or fallback to Per-Tensor
+            w13 = layer.w13_weight.contiguous()
+            qweight_w13, scale_w13 = per_token_group_quant_fp8(w13, w13.shape[-1])
+            layer.w13_weight = Parameter(qweight_w13, requires_grad=False)
+            layer.w13_weight_scale = Parameter(scale_w13, requires_grad=False)
+
+            w2 = layer.w2_weight.contiguous()
+            qweight_w2, scale_w2 = per_token_group_quant_fp8(w2, w2.shape[-1])
+            layer.w2_weight = Parameter(qweight_w2, requires_grad=False)
+            layer.w2_weight_scale = Parameter(scale_w2, requires_grad=False)
+
+            # Set input activation scales to None, indicating Dynamic Activation Scaling (runtime scaling).
+            layer.w13_input_scale = None
+            layer.w2_input_scale = None
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
