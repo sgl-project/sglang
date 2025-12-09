@@ -3305,7 +3305,7 @@ class ServerArgs:
             help="The cache capacity for ngram speculative decoding.",
         )
 
-        # # Speculative decoding (MTP)
+        # Speculative decoding (MTP)
         parser.add_argument(
             "--enable-mtp",
             action="store_true",
