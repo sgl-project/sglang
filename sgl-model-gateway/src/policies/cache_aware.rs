@@ -233,10 +233,12 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             first_model
         };
 
-        // Get current load statistics
-        let loads: Vec<usize> = workers.iter().map(|w| w.load()).collect();
-        let max_load = *loads.iter().max().unwrap_or(&0);
-        let min_load = *loads.iter().min().unwrap_or(&0);
+        // Get current load statistics - compute min/max in single pass without allocation
+        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
+            let load = w.load();
+            (min.min(load), max.max(load))
+        });
+        let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // Check if load is imbalanced
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
@@ -309,7 +311,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 matched_worker.to_string()
             } else {
                 RouterMetrics::record_cache_miss();
-                tree.get_smallest_tenant()
+                let min_load_idx = *healthy_indices
+                    .iter()
+                    .min_by_key(|&&idx| workers[idx].load())?;
+                workers[min_load_idx].url().to_string()
             };
 
             // Find the index of the selected worker
