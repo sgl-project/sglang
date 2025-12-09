@@ -678,8 +678,13 @@ class DeepseekV2MoE(nn.Module):
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
-            # and requires the output format to be standard. We use quant_config to determine the output format.
-            output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+            # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if (quant_config is None)
+                and (not get_moe_runner_backend().is_flashinfer_trtllm())
+                else None
+            ),
         )
 
         self.shared_experts_is_int8 = False
