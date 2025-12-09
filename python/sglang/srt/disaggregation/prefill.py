@@ -373,7 +373,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
-                self.notify_prefill_done(batch, batch_result)
+                self.maybe_notify_prefill_done(batch, batch_result)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
@@ -390,16 +390,20 @@ class SchedulerDisaggregationPrefillMixin:
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
     
-    def notify_prefill_done(self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult) -> None:
+    def maybe_notify_prefill_done(self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult) -> None:
         """
         Notify that prefill is done for a batch. This triggers KV transfer with overlap.
         
-        For backends that support transfer_context (e.g., Mooncake), this sets up
-        TransferContext for async metadata buffer population by transfer workers.
+        When --disaggregation-async-transfer is enabled, this sets up TransferContext
+        for async metadata buffer population by transfer workers.
         
-        For other backends (nixl, fake, etc.), this is a no-op and they fallback to
-        the old overlap mode where send_kv_chunk is called in process_batch_result_disagg_prefill.
+        Otherwise, this is a no-op and fallback to the old overlap mode where
+        send_kv_chunk is called in process_batch_result_disagg_prefill.
         """
+        # Check if async transfer is enabled via server args
+        if not self.server_args.disaggregation_async_transfer:
+            return
+        
         # Create a shared TransferContext for all requests in this batch
         # The context's lifecycle is managed by transfer_contexts dict in KVManager,
         # which will be cleaned up when transfer is complete
@@ -411,11 +415,8 @@ class SchedulerDisaggregationPrefillMixin:
         )
         for i, req in enumerate(batch.reqs):
             sender = req.disagg_kv_sender
-            # Check if sender supports transfer_context (new overlap mode)
-            # Use getattr with None default - if attr doesn't exist, we skip
+            # Check if sender supports transfer_context (required for async transfer)
             if not hasattr(sender, 'transfer_context'):
-                # This sender doesn't support new overlap mode
-                # It will fallback to old overlap mode in process_batch_result_disagg_prefill
                 continue
             ctx = sender.transfer_context
             if ctx is None:
@@ -500,10 +501,10 @@ class SchedulerDisaggregationPrefillMixin:
                     next_token_ids=[next_token_ids],
                     is_last_prefill_chunk=True,
                 )
-                # For backends that don't support transfer_context (new overlap mode),
-                # we need to call send_kv_chunk here (old overlap mode fallback)
-                use_new_overlap = self.enable_overlap and hasattr(req.disagg_kv_sender, 'transfer_context')
-                if not use_new_overlap:
+                # When async_transfer is enabled, send_kv_chunk is called in notify_prefill_done
+                # Otherwise, call it here (old overlap mode)
+                use_async_transfer = self.enable_overlap and self.server_args.disaggregation_async_transfer
+                if not use_async_transfer:
                     self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
@@ -538,10 +539,10 @@ class SchedulerDisaggregationPrefillMixin:
                     is_last_prefill_chunk=False,
                 )
 
-                # For backends that don't support transfer_context (new overlap mode),
-                # we need to call send_kv_chunk here (old overlap mode fallback)
-                use_new_overlap = self.enable_overlap and hasattr(req.disagg_kv_sender, 'transfer_context')
-                if self.enable_overlap and not use_new_overlap:
+                # When async_transfer is enabled, send_kv_chunk is called in notify_prefill_done
+                # Otherwise, call it here (old overlap mode)
+                use_async_transfer = self.server_args.disaggregation_async_transfer
+                if self.enable_overlap and not use_async_transfer:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 trace_slice(
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
@@ -706,8 +707,10 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
-            new_overlap = hasattr(req.disagg_kv_sender, 'transfer_context') and self.enable_overlap
-            if not new_overlap:
+            # When async_transfer is enabled, set_buf is called by transfer worker
+            # Otherwise, call it here synchronously
+            use_async_transfer = self.server_args.disaggregation_async_transfer and self.enable_overlap
+            if not use_async_transfer:
                 self.disagg_metadata_buffers.set_buf(req)
 
             # Prepare extra pool indices for hybrid models
