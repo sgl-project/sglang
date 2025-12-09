@@ -706,7 +706,8 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
-            if not self.enable_overlap:
+            new_overlap = hasattr(req.disagg_kv_sender, 'transfer_context') and self.enable_overlap
+            if not new_overlap:
                 self.disagg_metadata_buffers.set_buf(req)
 
             # Prepare extra pool indices for hybrid models
