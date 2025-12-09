@@ -455,7 +455,6 @@ def get_processor(
     if not mm_processor_kwargs_set:
         if config.model_type not in {"llava", "clip"}:
             kwargs["use_fast"] = use_fast
-    print("get_processor kwargs:", kwargs)
     try:
         if "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(

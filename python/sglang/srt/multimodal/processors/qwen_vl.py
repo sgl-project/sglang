@@ -289,7 +289,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     resize_image_async(image) for image in base_output.images
                 ]
                 base_output.images = await asyncio.gather(*resize_tasks)
-        print("base_output.images:", base_output.images)
         video_metadata = None
         if base_output.videos:
             video_results = await asyncio.gather(

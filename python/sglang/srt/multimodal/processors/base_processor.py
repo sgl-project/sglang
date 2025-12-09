@@ -247,7 +247,6 @@ class BaseMultimodalProcessor(ABC):
                 }:
                     # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                     kwargs["device"] = "npu"
-        print("process_mm_data kwargs:", kwargs)
         result = processor.__call__(
             text=[input_text],
             padding=True,
