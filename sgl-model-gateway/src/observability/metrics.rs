@@ -321,6 +321,15 @@ impl RouterMetrics {
         .increment(1);
     }
 
+    // TODO unify metric names
+    pub fn record_downstream_http_response(route: &str, status_code: u16) {
+        counter!("sgl_router_downstream_http_responses_total",
+            "route" => route.to_string(),
+            "status_code" => status_code.to_string()
+        )
+        .increment(1);
+    }
+
     pub fn record_retry(route: &str) {
         counter!("sgl_router_retries_total",
             "route" => route.to_string()

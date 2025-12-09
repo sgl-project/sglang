@@ -276,6 +276,8 @@ impl Router {
             RouterMetrics::record_request_error(route, "non_retryable_error");
         }
 
+        RouterMetrics::record_downstream_http_response(route, response.status().as_u16());
+
         response
     }
 
