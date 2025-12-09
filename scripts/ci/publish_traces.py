@@ -340,15 +340,15 @@ def publish_traces(traces_dir, run_id, run_number):
                 error_type = f"HTTP {e.code}"
 
             # Check for rate limit errors (non-fatal - just warn and skip)
-            if isinstance(e, HTTPError) and e.code == 403:
-                if (
-                    hasattr(e, "error_body")
-                    and "rate limit exceeded" in e.error_body.lower()
-                ):
-                    warnings.warn(
-                        "GitHub API rate limit exceeded. Skipping trace upload."
-                    )
-                    return
+            if (
+                isinstance(e, HTTPError)
+                and e.code in [403, 429]
+                and "rate limit exceeded" in getattr(e, "error_body", "").lower()
+            ):
+                warnings.warn(
+                    "GitHub API rate limit exceeded. Skipping trace upload."
+                )
+                return
 
             if is_retryable and attempt < max_retries - 1:
                 print(
