@@ -7,6 +7,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
+import jinja2
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -362,6 +363,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         else {}
                     ),
                 )
+            except jinja2.TemplateError as e:
+                # Template errors (e.g., from raise_exception in Jinja templates)
+                # should be treated as client errors (400 BadRequest)
+                raise ValueError(str(e)) from e
             except Exception:
                 # This except branch will be triggered when the chosen model
                 # has a different tools input format that is not compatible
@@ -371,18 +376,22 @@ class OpenAIServingChat(OpenAIServingBase):
                     if tools
                     else None
                 )
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                    openai_compatible_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=tools,
-                    reasoning_effort=request.reasoning_effort,
-                    **(
-                        request.chat_template_kwargs
-                        if request.chat_template_kwargs
-                        else {}
-                    ),
-                )
+                try:
+                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                        openai_compatible_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=tools,
+                        reasoning_effort=request.reasoning_effort,
+                        **(
+                            request.chat_template_kwargs
+                            if request.chat_template_kwargs
+                            else {}
+                        ),
+                    )
+                except jinja2.TemplateError as e:
+                    # Template errors should be treated as client errors
+                    raise ValueError(str(e)) from e
 
             if assistant_prefix:
                 encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
