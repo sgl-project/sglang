@@ -1219,7 +1219,6 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for call in result.calls:
-                print(f"\033[41m {call=} \033[0m")
                 if call.tool_index is not None:
                     if call.tool_index not in tool_calls_by_index:
                         tool_calls_by_index[call.tool_index] = {
@@ -1242,7 +1241,6 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         try:
             params = json.loads(tool_calls_by_index[0]["parameters"])
             self.assertEqual(params["city"], "San Francisco")
-            print(f"\033[41m {params=} \033[0m")
         except json.JSONDecodeError:
             # In streaming XML, parameters might be constructed differently or incrementally
             pass
@@ -1266,7 +1264,6 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         for chunk in chunks:
             result = self.detector.parse_streaming_increment(chunk, self.tools)
             for call in result.calls:
-                print(f"\033[41m {call=} \033[0m")
                 if call.tool_index is not None:
                     if call.tool_index not in tool_calls_by_index:
                         tool_calls_by_index[call.tool_index] = {
