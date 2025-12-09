@@ -590,30 +590,6 @@ impl Tree {
             .collect()
     }
 
-    pub fn get_smallest_tenant(&self) -> String {
-        // Return a placeholder if there are no tenants
-        if self.tenant_char_count.is_empty() {
-            return "empty".to_string();
-        }
-
-        // Find the tenant with minimum char count
-        let mut min_tenant = None;
-        let mut min_count = usize::MAX;
-
-        for entry in self.tenant_char_count.iter() {
-            let tenant = entry.key();
-            let count = *entry.value();
-
-            if count < min_count {
-                min_count = count;
-                min_tenant = Some(tenant.clone());
-            }
-        }
-
-        // Return the found tenant or "empty" if somehow none was found
-        min_tenant.unwrap_or_else(|| "empty".to_string())
-    }
-
     #[allow(dead_code)]
     pub fn get_used_size_per_tenant(&self) -> HashMap<String, usize> {
         // perform a DFS to traverse all nodes and calculate the total size used by each tenant
@@ -727,54 +703,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn test_get_smallest_tenant() {
-        let tree = Tree::new();
-
-        assert_eq!(tree.get_smallest_tenant(), "empty");
-
-        // Insert data for tenant1 - "ap" + "icot" = 6 chars
-        tree.insert("ap", "tenant1");
-        tree.insert("icot", "tenant1");
-
-        // Insert data for tenant2 - "cat" = 3 chars
-        tree.insert("cat", "tenant2");
-
-        assert_eq!(
-            tree.get_smallest_tenant(),
-            "tenant2",
-            "Expected tenant2 to be smallest with 3 characters."
-        );
-
-        // Insert overlapping data for tenant3 and tenant4 to test equal counts
-        // tenant3: "do" = 2 chars
-        // tenant4: "hi" = 2 chars
-        tree.insert("do", "tenant3");
-        tree.insert("hi", "tenant4");
-
-        let smallest = tree.get_smallest_tenant();
-        assert!(
-            smallest == "tenant3" || smallest == "tenant4",
-            "Expected either tenant3 or tenant4 (both have 2 characters), got {}",
-            smallest
-        );
-
-        // Add more text to tenant4 to make it larger
-        tree.insert("hello", "tenant4"); // Now tenant4 has "hi" + "hello" = 6 chars
-
-        // Now tenant3 should be smallest (2 chars vs 6 chars for tenant4)
-        assert_eq!(
-            tree.get_smallest_tenant(),
-            "tenant3",
-            "Expected tenant3 to be smallest with 2 characters"
-        );
-
-        tree.evict_tenant_by_size(3); // This should evict tenants with more than 3 chars
-
-        let post_eviction_smallest = tree.get_smallest_tenant();
-        println!("Smallest tenant after eviction: {}", post_eviction_smallest);
-    }
 
     #[test]
     fn test_tenant_char_count() {

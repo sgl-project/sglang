@@ -8,21 +8,25 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     popen_launch_server,
+    try_cached_model,
 )
 
-MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-FP4"
+MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"
 
 
-@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestLlama31FP4(unittest.TestCase):
+class FP8BlockwiseGemmBase:
+    backend = None
+
     @classmethod
     def setUpClass(cls):
-        cls.model = MODEL_PATH
+        if cls.backend is None:
+            raise NotImplementedError("Subclass must set 'backend' attribute")
+        cls.model = try_cached_model(MODEL_PATH)
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
             "--trust-remote-code",
-            "--quantization",
-            "modelopt_fp4",
+            "--fp8-gemm-backend",
+            cls.backend,
         ]
         cls.process = popen_launch_server(
             cls.model,
@@ -38,7 +42,7 @@ class TestLlama31FP4(unittest.TestCase):
     def test_gsm8k(self):
         parsed_url = urlparse(self.base_url)
         args = SimpleNamespace(
-            num_shots=5,
+            num_shots=8,
             data_path=None,
             num_questions=1319,
             max_new_tokens=512,
@@ -49,7 +53,20 @@ class TestLlama31FP4(unittest.TestCase):
         metrics = run_eval_few_shot_gsm8k(args)
         print(metrics)
 
-        self.assertGreater(metrics["accuracy"], 0.54)
+        self.assertGreaterEqual(metrics["accuracy"], 0.41)
+
+
+class TestFP8BlockwiseGemmTriton(FP8BlockwiseGemmBase, unittest.TestCase):
+    backend = "triton"
+
+
+class TestFP8BlockwiseGemmDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
+    backend = "deep_gemm"
+
+
+@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
+class TestFP8BlockwiseGemmFlashinferTrtllm(FP8BlockwiseGemmBase, unittest.TestCase):
+    backend = "flashinfer_trtllm"
 
 
 if __name__ == "__main__":
