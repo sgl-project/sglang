@@ -14,10 +14,8 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutputFormat,
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutput
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.utils import get_int_env_var, is_flashinfer_available, round_up
-
-if TYPE_CHECKING:
-    pass
 
 
 logger = logging.getLogger(__name__)
@@ -198,9 +196,11 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_weights = topk_weights_recv.view(-1, topk_weights_recv.shape[-1])
 
         # Provide an output tensor to fused_moe so it writes directly to our buffer
-        moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
-            self.runtime_max_tokens_per_rank, self.hidden_size, output_dtype
-        ).view(-1, self.hidden_size)
+        moe_output = None
+        if get_moe_runner_backend().is_flashinfer_cutlass():
+            moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
+                self.runtime_max_tokens_per_rank, self.hidden_size, output_dtype
+            ).view(-1, self.hidden_size)
         return FlashinferDispatchOutput(
             x,
             x_sf,
@@ -216,7 +216,7 @@ class FlashinferDispatcher(BaseDispatcher):
                 self.group.size(), self.runtime_max_tokens_per_rank, output_hidden_size
             ),
             self.runtime_max_tokens_per_rank,
-            payload_in_workspace=True,
+            payload_in_workspace=get_moe_runner_backend().is_flashinfer_cutlass(),
         )
 
         # Remove dummy token if it was added in dispatch
