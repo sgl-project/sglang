@@ -918,10 +918,10 @@ class MambaRadixCache(BasePrefixCache):
             node.mamba_value is not None
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
         self.full_evictable_size_ -= len(node.key)
         self.mamba_evictable_size_ -= len(node.mamba_value)
 
@@ -935,10 +935,10 @@ class MambaRadixCache(BasePrefixCache):
             node.mamba_value is None
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        for k, v in node.parent.children.items():
-            if v == node:
-                break
-        del node.parent.children[k]
+        key = self.get_child_key_fn(node.key)
+        v = node.parent.children.pop(key, None)
+        assert v == node, f"parent does not have child key, {key}"
+
         self.full_evictable_size_ -= len(node.key)
 
     def _collect_leaves(self) -> List[TreeNode]:

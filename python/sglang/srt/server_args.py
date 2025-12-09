@@ -131,7 +131,7 @@ ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
-LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend"]
+LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake"]
 
@@ -542,6 +542,7 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
+    enable_fused_qk_norm_rope: bool = False
 
     # Dynamic batch tokenizer
     enable_dynamic_batch_tokenizer: bool = False
@@ -1667,7 +1668,10 @@ class ServerArgs:
                     "Page first direct layout only support direct io backend"
                 )
 
-        if self.enable_hierarchical_cache and self.hicache_io_backend == "kernel":
+        if (
+            self.enable_hierarchical_cache
+            or self.disaggregation_decode_enable_offload_kvcache
+        ) and self.hicache_io_backend == "kernel":
             # fix for the compatibility issue with FlashAttention3 decoding and HiCache kernel backend
             if self.decode_attention_backend is None:
                 if not self.use_mla_backend():
@@ -2049,10 +2053,16 @@ class ServerArgs:
         if self.dllm_algorithm is None:
             return
         if not self.disable_cuda_graph:
-            logger.warning(
-                "Cuda graph is disabled because of using diffusion LLM inference"
-            )
-            self.disable_cuda_graph = True
+            if self.cuda_graph_bs != [1]:
+                logger.warning(
+                    "Cuda graph bs is set to [1] because of using diffusion LLM inference"
+                )
+                self.cuda_graph_bs = [1]
+            if self.attention_backend != "flashinfer":
+                logger.warning(
+                    "Attention backend is set to flashinfer because of enabling cuda graph in diffusion LLM inference"
+                )
+                self.attention_backend = "flashinfer"
         if not self.disable_overlap_schedule:
             logger.warning(
                 "Overlap schedule is disabled because of using diffusion LLM inference"
@@ -3738,6 +3748,11 @@ class ServerArgs:
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
+        parser.add_argument(
+            "--enable-fused-qk-norm-rope",
+            action="store_true",
+            help="Enable fused qk normalization and rope rotary embedding.",
+        )
 
         # Dynamic batch tokenizer
         parser.add_argument(
@@ -4583,6 +4598,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "GptOssForCausalLM",
+        "Glm4MoeForCausalLM",
         "BailingMoeForCausalLM",
         "BailingMoeV2ForCausalLM",
         "MistralLarge3ForCausalLM",

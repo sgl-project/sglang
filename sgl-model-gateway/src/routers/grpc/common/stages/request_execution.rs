@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::error;
+use tracing::{error, info_span, Instrument};
 
 use super::PipelineStage;
 use crate::routers::grpc::{
@@ -18,6 +18,7 @@ pub struct RequestExecutionStage {
     mode: ExecutionMode,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum ExecutionMode {
     /// Regular mode: single worker execution
     Single,
@@ -50,12 +51,39 @@ impl PipelineStage for RequestExecutionStage {
             error::internal_error("Client acquisition not completed")
         })?;
 
-        let result = match self.mode {
-            ExecutionMode::Single => self.execute_single(proto_request, clients).await?,
-            ExecutionMode::DualDispatch => {
-                self.execute_dual_dispatch(proto_request, clients).await?
+        // Extract dispatch metadata for tracing span
+        let request_id = ctx
+            .state
+            .dispatch
+            .as_ref()
+            .map(|d| d.request_id.as_str())
+            .unwrap_or("unknown");
+        let model = ctx
+            .state
+            .dispatch
+            .as_ref()
+            .map(|d| d.model.as_str())
+            .unwrap_or("unknown");
+
+        // Create OTEL span for gRPC request execution
+        let span = info_span!(
+            target: "sgl_model_gateway::otel-trace",
+            "grpc_generate",
+            request_id = %request_id,
+            model = %model,
+            mode = ?self.mode,
+        );
+
+        let result = async {
+            match self.mode {
+                ExecutionMode::Single => self.execute_single(proto_request, clients).await,
+                ExecutionMode::DualDispatch => {
+                    self.execute_dual_dispatch(proto_request, clients).await
+                }
             }
-        };
+        }
+        .instrument(span)
+        .await?;
 
         // Store result in context for ResponseProcessingStage
         ctx.state.response.execution_result = Some(result);

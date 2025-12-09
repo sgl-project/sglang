@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy};
-use crate::{core::Worker, metrics::RouterMetrics};
+use crate::{core::Worker, observability::metrics::RouterMetrics};
 
 /// Round-robin selection policy
 ///

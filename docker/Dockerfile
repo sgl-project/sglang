@@ -11,8 +11,8 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.3.18.post3
-ARG SGL_VERSION=0.5.6
+ARG SGL_KERNEL_VERSION=0.3.19
+ARG SGL_VERSION=0.5.6.post1
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
@@ -82,6 +82,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libnuma1 \
     libnuma-dev \
     numactl \
+    # transformers multimodal VLM
+    ffmpeg \
     # InfiniBand/RDMA
     libibverbs-dev \
     libibverbs1 \

@@ -25,6 +25,7 @@ suites = {
         TestFile("test_deepseek_v3_fp4_cutlass_moe.py", 900),
         TestFile("test_fp4_moe.py", 300),
         TestFile("test_qwen3_fp4_trtllm_gen_moe.py", 300),
+        TestFile("test_eagle_infer_beta_dp_attention_large.py", 600),
     ],
     "nightly-8-gpu-b200": [
         TestFile("test_deepseek_r1_fp8_trtllm_backend.py", 3600),

@@ -342,7 +342,12 @@ impl WorkerRegistry {
     /// Get worker statistics
     pub fn stats(&self) -> WorkerRegistryStats {
         let total_workers = self.workers.len();
-        let total_models = self.get_models().len();
+        // Count models directly instead of allocating Vec via get_models()
+        let total_models = self
+            .model_workers
+            .iter()
+            .filter(|entry| !entry.value().is_empty())
+            .count();
 
         let mut healthy_count = 0;
         let mut total_load = 0;
@@ -350,7 +355,9 @@ impl WorkerRegistry {
         let mut prefill_count = 0;
         let mut decode_count = 0;
 
-        for worker in self.get_all() {
+        // Iterate DashMap directly to avoid cloning all workers via get_all()
+        for entry in self.workers.iter() {
+            let worker = entry.value();
             if worker.is_healthy() {
                 healthy_count += 1;
             }

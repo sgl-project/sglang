@@ -8,8 +8,10 @@ use sgl_model_gateway::{
         RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
-    metrics::PrometheusConfig,
-    otel_trace::{is_otel_enabled, shutdown_otel},
+    observability::{
+        metrics::PrometheusConfig,
+        otel_trace::{is_otel_enabled, shutdown_otel},
+    },
     server::{self, ServerConfig},
     service_discovery::ServiceDiscoveryConfig,
     version,
