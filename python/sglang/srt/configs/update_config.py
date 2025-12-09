@@ -85,7 +85,7 @@ def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
         else:
             if is_post_update:
                 model_config.linear_num_key_heads_cpu = (
-                    model_config.hf_config.linear_num_key_heads
+                    model_config.linear_num_key_heads
                 )
                 model_config.linear_num_value_heads_cpu = (
                     model_config.linear_num_value_heads
