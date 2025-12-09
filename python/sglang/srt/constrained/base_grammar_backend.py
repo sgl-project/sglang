@@ -209,6 +209,8 @@ def create_grammar_backend(
     vocab_size: int,
     eos_token_ids: Optional[set] = None,
 ) -> Optional[BaseGrammarBackend]:
+    from sglang.srt.environ import envs
+
     name = server_args.grammar_backend
 
     # Custom grammar backend has the highest priority
@@ -250,13 +252,52 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and hasattr(tokenizer, "think_end_id"):
+    if server_args.reasoning_parser:
+        POTENTIAL_THINK_TOKEN = [
+            "</think>",
+            "<|end|>",
+            "◁/think▷",
+        ]
+
+        inferred_think_token_id = None
+        if hasattr(tokenizer, "think_end_id"):
+            inferred_think_token_id = tokenizer.think_end_id
+        elif (
+            hasattr(tokenizer, "added_tokens_decoder") 
+            and any([
+                v.content in POTENTIAL_THINK_TOKEN
+                for k, v in tokenizer.added_tokens_decoder.items()
+            ])
+        ):
+            inferred_think_token_id = list(filter(
+                lambda k, v: v.content in POTENTIAL_THINK_TOKEN,
+                tokenizer.added_tokens_decoder.items()
+            ))[0][0]
+        else:
+            inferred_think_token_id = envs.SGLANG_TOKENIZER_THINK_END_TOKEN_ID.get()
+
+            has_token_id = False
+            try:
+                has_token_id = tokenizer.convert_ids_to_tokens(inferred_think_token_id) is not None
+            except OverflowError:
+                has_token_id = False
+            
+            assert has_token_id, (
+                f"Reasoning parser is activated, but the tokenizer lacks a defined 'think end' token. "
+                f"Attempted to fallback to `SGLANG_TOKENIZER_THINK_END_TOKEN_ID`, but the provided ID "
+                f"(`{inferred_think_token_id}`) is not present in the tokenizer's vocabulary."
+            )
+
+        assert inferred_think_token_id is not None, (
+            "ReasonerGrammerBackend could not found any think token id for this model."
+        )
+
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
         grammar_backend = ReasonerGrammarBackend(
-            grammar_backend, tokenizer.think_end_id
+            grammar_backend, inferred_think_token_id
         )
 
     return grammar_backend

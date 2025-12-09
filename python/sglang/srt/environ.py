@@ -354,6 +354,9 @@ class Envs:
     # Numa
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
 
+    # Reasoning Grammar
+    SGLANG_TOKENIZER_THINK_END_TOKEN_ID = EnvInt(-1)
+
     # fmt: on
 
 
