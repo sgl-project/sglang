@@ -204,6 +204,12 @@ class GenerateReqInput(BaseReq):
     # Validation step duration
     validation_time: Optional[float] = None
 
+    # For metrics
+    received_time: Optional[float] = None
+
+    # Perf_counter equivalents for accurate time calculations
+    received_time_perf: Optional[float] = None
+
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
 
