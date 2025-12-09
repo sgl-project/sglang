@@ -19,6 +19,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  SGLANG_GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/zejunchen-zejun/sglang.git' }}
+  SGLANG_GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+
 jobs:
   benchmark:
     runs-on: sglang-mi308-8gpu
@@ -61,15 +65,14 @@ jobs:
 
           RUN echo "=== Aiter version AFTER installation ===" && pip show aiter || true
 
-          RUN git clone https://github.com/zejunchen-zejun/sglang.git /sglang-checkout && \
+          RUN git clone ${{ env.SGLANG_GITHUB_REPO_URL }} /sglang-checkout && \
               cd /sglang-checkout && \
-              git checkout dev/perf && \
+              git checkout ${{ env.SGLANG_GITHUB_COMMIT_SHA }} && \
               git rev-parse HEAD && \
               pip install --upgrade pip && \
               pip install "transformers>=4.57.0" && \
               cd sgl-kernel && \
               python3 setup_rocm.py install
-          
           EOF
 
       - name: Show dockerfile
