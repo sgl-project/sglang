@@ -128,13 +128,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return parameters
 
     def _parse_parameters_partially(self, invoke_content: str) -> str:
-        invoke_content_stripped = invoke_content.strip()
-        if not invoke_content_stripped:
-            return "", "none"
-
         # 1. check json format
-        if invoke_content_stripped.startswith("{"):
-            return invoke_content_stripped, "json"
+        if invoke_content.strip().startswith("{"):
+            return invoke_content, "json"
 
         # 2. check xml format
         xml_param_matches = re.findall(
