@@ -842,6 +842,9 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 f"The input_ids {input_ids} contains values greater than the vocab size ({vocab_size})."
             )
 
+    def _get_sampling_params(self, sampling_kwargs: Dict) -> SamplingParams:
+        return SamplingParams(**sampling_kwargs)
+
     def _create_tokenized_object(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -859,7 +862,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             sampling_kwargs = {**self.preferred_sampling_params, **obj.sampling_params}
         else:
             sampling_kwargs = obj.sampling_params
-        sampling_params = SamplingParams(**sampling_kwargs)
+        sampling_params = self._get_sampling_params(sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
 
