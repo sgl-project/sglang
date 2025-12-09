@@ -322,7 +322,7 @@ class OllamaServing:
 
         return OllamaShowResponse(
             license="",  # License info not available from SGLang
-            modelfile=f'FROM {model}\nPARAMETER num_ctx {context_len}\n',
+            modelfile=f"FROM {model}\nPARAMETER num_ctx {context_len}\n",
             parameters=f"num_ctx {context_len}",
             template="",  # Template info not easily accessible
             modified_at=self._get_timestamp(),
