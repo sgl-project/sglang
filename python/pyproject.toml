@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.5.post3"
+version = "0.5.6.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -58,18 +58,18 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "sgl-kernel==0.3.18.post2",
+  "sgl-kernel==0.3.19",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
   "torch_memory_saver==0.0.9",
   "torch==2.9.1",
   "torchaudio==2.9.1",
-  "torchcodec==0.7.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
+  "torchcodec==0.8.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec does not exist in those systems. If not provided, transformer will use torchvision instead by default.
   "torchvision",
   "torchao==0.9.0",
   "tqdm",
-  "transformers==4.57.1",
+  "transformers==5.0.0rc0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
@@ -85,7 +85,7 @@ checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle",
-  "diffusers==0.35.2",
+  "diffusers==0.36.0",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
@@ -94,6 +94,8 @@ diffusion = [
   "st_attn ==0.0.7",
   "vsa==0.0.4",
   "yunchang==0.6.3.post1",
+  "runai_model_streamer",
+  "cache-dit==1.1.6"
 ]
 
 [tool.uv.extra-build-dependencies]
