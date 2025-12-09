@@ -23,8 +23,10 @@ import shutil
 import sys
 import time
 import traceback
+import uuid
 import warnings
 from argparse import ArgumentParser
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
@@ -319,6 +321,16 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
+    # TODO put it to other functions when `pbar` logic is refactored
+    if getattr(args, "print_requests", False):
+        rid = str(uuid.uuid4())
+        input_partial = deepcopy(request_func_input)
+        input_partial.prompt = "..."
+        request_start_time = time.time()
+        print(
+            f'rid={rid} time={request_start_time} message="request start" request_func_input="{str(input_partial)}"'
+        )
+
     if request_func_input.image_data:
         # Build multi-image content: a list of image_url entries followed by the text
         content_items = [
@@ -434,6 +446,15 @@ async def async_request_openai_chat_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+
+    # TODO put it to other functions when `pbar` logic is refactored
+    if getattr(args, "print_requests", False):
+        curr_t = time.time()
+        output_partial = deepcopy(output)
+        output_partial.generated_text = "..."
+        print(
+            f'rid={rid} time={curr_t} time_delta={curr_t - request_start_time} message="request end" output="{str(output_partial)}"'
+        )
 
     if pbar:
         pbar.update(1)
@@ -2352,6 +2373,9 @@ def run_benchmark(args_: argparse.Namespace):
     if not hasattr(args, "served_model_name"):
         args.served_model_name = None
 
+    if getattr(args, "print_requests", False):
+        assert args.backend == "sglang-oai-chat"  # only support this now
+
     print(f"benchmark_args={args}")
 
     # Set global environments
@@ -2694,6 +2718,11 @@ if __name__ == "__main__":
     parser.add_argument("--output-file", type=str, help="Output JSONL file name.")
     parser.add_argument(
         "--output-details", action="store_true", help="Output details of benchmarking."
+    )
+    parser.add_argument(
+        "--print-requests",
+        action="store_true",
+        help="Print requests immediately during benchmarking. Useful to quickly realize issues.",
     )
     parser.add_argument(
         "--disable-tqdm",
