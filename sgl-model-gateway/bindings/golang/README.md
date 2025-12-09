@@ -40,6 +40,20 @@ A high-level Go SDK for interacting with SGLang gRPC API, designed with an OpenA
 go get github.com/sglang/sglang-go-grpc-sdk
 ```
 
+### Sync Dependencies
+
+After cloning the repository or when dependencies are missing, run `go mod tidy` to download and sync all required dependencies:
+
+```bash
+cd sgl-model-gateway/bindings/golang
+go mod tidy
+```
+
+This will automatically:
+- Download missing dependencies (gRPC, protobuf, etc.)
+- Update `go.sum` with checksums
+- Remove unused dependencies
+
 ### Build Requirements
 
 - Go 1.21 or later
@@ -478,6 +492,22 @@ bindings/golang/
 
 ## Troubleshooting
 
+### Missing Dependencies
+
+**Error**: `missing go.sum entry for module providing package` or `missing go.sum entry`
+
+**Solution**:
+1. Run `go mod tidy` to download and sync all dependencies:
+   ```bash
+   cd sgl-model-gateway/bindings/golang
+   go mod tidy
+   ```
+2. This will automatically:
+   - Download missing dependencies (google.golang.org/grpc, google.golang.org/protobuf, etc.)
+   - Update `go.sum` with checksums
+   - Resolve all import dependencies
+3. If errors persist, ensure you're in the correct directory and have network access
+
 ### Connection Errors
 
 **Error**: `connection refused` or `failed to dial`
@@ -498,7 +528,7 @@ bindings/golang/
 
 ### Build Failures
 
-**Error**: `library 'sglang_router_rs' not found`
+**Error**: `library 'sgl_model_gateway_go' not found`
 
 **Solution**:
 1. Rebuild Rust library: `cd sgl-model-gateway/bindings/golang && make build`
