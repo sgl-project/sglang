@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import (
     get_deepep_mode,
@@ -43,6 +44,10 @@ elif _is_npu:
 
 
 logger = logging.getLogger(__name__)
+
+
+if _is_npu:
+    import torch_npu
 
 
 class DeepEPMoE(FusedMoE):
@@ -299,8 +304,8 @@ class DeepEPMoE(FusedMoE):
     ):
         assert self.moe_runner_config.activation == "silu"
         assert isinstance(self.quant_method, W4AFp8MoEMethod)
-        assert get_bool_env_var(
-            "SGLANG_DEEPEP_BF16_DISPATCH"
+        assert (
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ), "W4AFP8 does not support FP8 dispatch; please set SGLANG_DEEPEP_BF16_DISPATCH=1."
         return self.quant_method.apply_deepep_ll(
             layer=self,
@@ -314,6 +319,9 @@ class DeepEPMoE(FusedMoE):
         assert self.quant_method is not None
         assert self.moe_runner_config.activation == "silu"
 
+        from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+            npu_fused_moe_without_routing_weights_bf16,
+        )
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
         # NOTE: Ascend's Dispatch & Combine does not support FP16
@@ -384,36 +392,144 @@ class DeepEPMoE(FusedMoE):
         return hidden_states
 
 
-def npu_fused_moe_without_routing_weights_bf16(
-    layer, hidden_states, group_list_type, group_list, output_dtype
-):
-    # gmm1: gate_up_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[layer.w13_weight.permute(0, 2, 1)],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )[0]
-    hidden_states = torch_npu.npu_swiglu(hidden_states)
-    # gmm2: down_proj
-    hidden_states = torch_npu.npu_grouped_matmul(
-        x=[hidden_states],
-        weight=[layer.w2_weight.permute(0, 2, 1)],
-        split_item=2,
-        group_list_type=group_list_type,
-        group_type=0,
-        group_list=group_list,
-        output_dtype=output_dtype,
-    )[0]
-    return hidden_states
+class NpuFuseEPMoE(DeepEPMoE):
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        num_fused_shared_experts: int = 0,
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            num_fused_shared_experts=num_fused_shared_experts,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=prefix,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
+            **kwargs,
+        )
+
+        self.quant_method.process_weights_after_loading = (
+            self._process_weights_after_loading
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+        forward_shared_experts=None,
+        alt_stream=None,
+        disable_sbo=False,
+    ):
+        return self.dispatcher.dispatch(
+            hidden_states=hidden_states,
+            topk_output=topk_output,
+            gmm1_permuted_weight=self.w13_weight,
+            gmm1_permuted_weight_scale=self.w13_weight_scale,
+            gmm2_weight=self.w2_weight,
+            gmm2_weight_scale=self.w2_weight_scale,
+        ).hidden_state
+
+    def release_weight_cache(self, weight: torch.Tensor):
+        # .contiguous() introduces additional memory overhead and needs to be released using resize_(0)
+        origin_weight = weight.data.transpose(1, 2)
+        new_weight = origin_weight.contiguous()
+        origin_weight.untyped_storage().resize_(0)
+        return new_weight
+
+    def permute_w13_weight_scale(self, w: torch.Tensor, tile_n: int):
+        if tile_n % 2 != 0:
+            raise ValueError(f"tile_n must be even, got {tile_n}")
+
+        *dims, n = w.shape
+        if n % tile_n != 0:
+            raise ValueError(f"Last dimension {n} must be divisible by tile_n {tile_n}")
+
+        w_reshaped = w.reshape(*dims, 2, n // tile_n, tile_n // 2)
+
+        # Permute the last two dimensions.
+        perm_order = list(range(len(dims))) + [-2, -3, -1]
+        w_permuted = w_reshaped.permute(perm_order)
+
+        return w_permuted.reshape(*dims, n)
+
+    def reshape_w13_weight(self, weight: torch.Tensor, dim: int, chunk_size: int = 64):
+        # Achieving greater computing power through reshape on Ascend.
+        original_shape = weight.shape
+        if dim < 0:
+            dim += len(original_shape)
+
+        if original_shape[dim] % (2 * chunk_size) != 0:
+            raise ValueError(
+                f"Dimension {dim} size {original_shape[dim]} must be divisible by {2 * chunk_size}"
+            )
+
+        new_shape = (
+            *original_shape[:dim],
+            2,
+            original_shape[dim] // (2 * chunk_size),
+            chunk_size,
+            *original_shape[dim + 1 :],
+        )
+
+        weight = weight.view(new_shape)
+        weight = weight.transpose(dim, dim + 1).contiguous()
+
+        return weight.view(*original_shape[:dim], -1, *original_shape[dim + 1 :])
+
+    def _process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        w13 = self.release_weight_cache(layer.w13_weight)
+        torch_npu.npu_format_cast_(w13, 2)
+        cpu_w13 = w13.cpu()
+        w13 = self.reshape_w13_weight(cpu_w13, -1).npu()
+        torch_npu.npu_format_cast_(w13, 29)
+        layer.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+
+        w2 = torch_npu.npu_format_cast(layer.w2_weight.data, 29)
+        layer.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+
+        w13_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
+        w13_scale = self.permute_w13_weight_scale(w13_scale, 128)
+        layer.w13_weight_scale = torch.nn.Parameter(
+            w13_scale.to(torch.float32), requires_grad=False
+        )
+
+        w2_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
+        layer.w2_weight_scale = torch.nn.Parameter(
+            w2_scale.to(torch.float32), requires_grad=False
+        )
+
+        if hasattr(layer, "w13_weight_offset"):
+            layer.w13_weight_offset = torch.nn.Parameter(
+                layer.w13_weight_offset.data.squeeze(-1).contiguous(),
+                requires_grad=False,
+            )
+        if hasattr(layer, "w2_weight_offset"):
+            layer.w2_weight_offset = torch.nn.Parameter(
+                layer.w2_weight_offset.data.squeeze(-1).contiguous(),
+                requires_grad=False,
+            )
 
 
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
         return DeepEPMoE
+    if get_moe_a2a_backend().is_ascend_fuseep():
+        return NpuFuseEPMoE
 
     # NEW: Direct FP4 detection (bypasses EP requirements)
     # Check for FP4 quantization with TRTLLM flag, regardless of EP

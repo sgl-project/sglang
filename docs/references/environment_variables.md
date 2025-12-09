@@ -30,7 +30,13 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGL_CHUNKED_PREFIX_CACHE_THRESHOLD` | Sets the threshold for enabling chunked prefix caching | `8192` |
 | `SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION` | Enable RoPE fusion in Fused Multi-Layer Attention | `1` |
 | `SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP` | Disable overlap schedule for consecutive prefill batches | `false` |
+| `SGLANG_SCHEDULER_MAX_RECV_PER_POLL` | Set the maximum number of requests per poll, with a negative value indicating no limit | `-1` |
 | `SGLANG_DISABLE_FA4_WARMUP` | Disable Flash Attention 4 warmup passes (set to `1`, `true`, `yes`, or `on` to disable) | `false` |
+| `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT` | Default weight value for scheduler recv skipper counter (used when forward mode doesn't match specific modes). Only active when `--scheduler-recv-interval > 1`. The counter accumulates weights and triggers request polling when reaching the interval threshold. | `1000` |
+| `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DECODE` | Weight increment for decode forward mode in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency during decode phase. | `1` |
+| `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_VERIFY` | Weight increment for target verify forward mode in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency during verification phase. | `1` |
+| `SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE` | Weight increment when forward mode is None in scheduler recv skipper. Works with `--scheduler-recv-interval` to control polling frequency when no specific forward mode is active. | `1` |
+
 
 ## DeepGEMM Configuration (Advanced Optimization)
 
@@ -49,7 +55,9 @@ SGLang supports various environment variables that can be used to configure its 
 | Environment Variable | Description | Default Value |
 | --- | --- | --- |
 | `SGLANG_DEEPEP_BF16_DISPATCH` | Use Bfloat16 for dispatch | `"false"` |
-| `SGLANG_MOE_NVFP4_DISPATCH` | Use nvfp4 for moe dispatch | `"false"` |
+| `SGLANG_MOE_NVFP4_DISPATCH` | Use nvfp4 for moe dispatch (on flashinfer_cutlass or flashinfer_cutedsl moe runner backend) | `"false"` |
+| `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each GPU | `"128"` |
+| `SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS` | Number of SMs used for DeepEP combine when single batch overlap is enabled | `"32"` |
 
 ## Memory Management
 
@@ -59,6 +67,8 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION` | Clip max new tokens estimation for memory planning | `4096` |
 | `SGLANG_DETOKENIZER_MAX_STATES` | Maximum states for detokenizer | Default value based on system |
 | `SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK` | Disable checks for memory imbalance across Tensor Parallel ranks | Not set (defaults to enabled check) |
+| `SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN` | Quantize q_b_proj from BF16 to FP8 when launching DeepSeek NVFP4 checkpoint | `false` |
+| `SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2` | Apply per token group quantization kernel with fused silu and mul and masked m | `false` |
 
 ## Model-Specific Options
 
@@ -113,6 +123,7 @@ SGLang supports various environment variables that can be used to configure its 
 | --- | --- | --- |
 | `SGLANG_WAIT_WEIGHTS_READY_TIMEOUT` | Timeout period for waiting on weights | `120` |
 | `SGLANG_DISABLE_OUTLINES_DISK_CACHE` | Disable Outlines disk cache | `true` |
+| `SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE` | Use SGLang's custom Triton kernel cache implementation for lower overheads (automatically enabled on CUDA) | `false` |
 
 ## Function Calling / Tool Use
 

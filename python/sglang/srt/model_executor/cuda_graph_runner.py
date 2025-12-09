@@ -28,6 +28,7 @@ import torch
 import tqdm
 from torch.profiler import ProfilerActivity, profile
 
+from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -39,6 +40,7 @@ from sglang.srt.distributed.parallel_state import (
     graph_capture,
     set_pdmux_status,
 )
+from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -50,7 +52,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
-from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -60,7 +61,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import GraphInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
-from sglang.srt.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -264,6 +264,9 @@ class CudaGraphRunner:
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
+        self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        self.is_dllm = self.dllm_config is not None
+
         # Batch sizes to capture
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(model_runner)
         log_info_on_rank0(logger, f"Capture cuda graph bs {self.capture_bs}")
@@ -284,6 +287,9 @@ class CudaGraphRunner:
                 self.num_tokens_per_bs = (
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
+        elif self.is_dllm:
+            self.capture_forward_mode = ForwardMode.DLLM_EXTEND
+            self.num_tokens_per_bs = self.dllm_config.block_size
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -300,6 +306,8 @@ class CudaGraphRunner:
         self.maybe_init_pdmux()
         self.seq_len_fill_value = (
             self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            if self.dllm_config is None
+            else self.dllm_config.block_size
         )
 
         self.encoder_len_fill_value = 0
@@ -329,6 +337,7 @@ class CudaGraphRunner:
             seq_len_fill_value=self.seq_len_fill_value,
             encoder_len_fill_value=self.encoder_len_fill_value,
             num_tokens_per_bs=self.num_tokens_per_bs,
+            cache_loc_dtype=self._cache_loc_dtype(),
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -487,9 +496,6 @@ class CudaGraphRunner:
                     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
-
-                    # Save gemlite cache after each capture
-                    save_gemlite_cache()
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -828,7 +834,14 @@ class CudaGraphRunner:
         output = self.output_buffers[graph_key]
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
+                next_token_logits=(
+                    output.next_token_logits[: self.raw_num_token]
+                    if not self.is_dllm
+                    else None
+                ),
+                full_logits=(
+                    output.full_logits[: self.raw_num_token] if self.is_dllm else None
+                ),
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None

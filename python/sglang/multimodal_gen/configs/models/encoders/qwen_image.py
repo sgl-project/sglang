@@ -46,6 +46,7 @@ class QwenImageArchConfig(TextEncoderArchConfig):
     head_dim: int | None = None
     hidden_state_skip_layer: int = 2
     text_len: int = 256
+
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
             # (param_name, shard_name, shard_id)
