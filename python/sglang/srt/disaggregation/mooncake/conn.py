@@ -9,13 +9,16 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 import numpy as np
 import numpy.typing as npt
 import requests
 import zmq
-
+import torch
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
     CommonKVBootstrapServer,
@@ -31,10 +34,12 @@ from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferE
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import DisaggregationMode, TransferContext
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import format_tcp_address, get_int_env_var, is_valid_ipv6_address
+from sglang.srt.managers.scheduler import GenerationBatchResult
 
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 logger = logging.getLogger(__name__)
 
 
@@ -226,6 +231,9 @@ class MooncakeKVManager(CommonKVManager):
 
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
+
+        self.transfer_contexts: Dict[int, TransferContext] = {}
+        # Callback function to set metadata buffer, set by PrefillBootstrapQueue
 
     def init_engine(self):
         self.engine = MooncakeTransferEngine(
@@ -695,6 +703,8 @@ class MooncakeKVManager(CommonKVManager):
             ]
         )
 
+
+
     def transfer_worker(
         self, queue: FastQueue, executor: concurrent.futures.ThreadPoolExecutor
     ):
@@ -709,6 +719,10 @@ class MooncakeKVManager(CommonKVManager):
                 polls = []
                 dst_ranks_infos = []
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                assert kv_chunk.room in self.transfer_contexts, f"kv_chunk.room {kv_chunk.room} not in transfer_contexts"
+                transfer_context = self.transfer_contexts[kv_chunk.room]
+                # Resolve the context once for all requests (thread-safe, only executes once)
+                
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -745,6 +759,9 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+
+                        transfer_context.resolve()
+
                         if self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
@@ -823,22 +840,27 @@ class MooncakeKVManager(CommonKVManager):
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
+
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint, dst_port, room, status, local_rank
                                     )
+                                # if self.attn_tp_rank == 0:
+                                #         gitf"sent_success to {req.room=}")
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
                         if kv_chunk.is_last and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                ):
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
+                    if (
+                        kv_chunk.room not in self.request_status
+                        or self.check_status(kv_chunk.room) == KVPoll.Success
+                    ):
+                        if kv_chunk.room in self.transfer_infos:
+                            self.transfer_infos.pop(kv_chunk.room)
+                        if kv_chunk.room in self.transfer_contexts:
+                            self.transfer_contexts.pop(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -978,6 +1000,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        transfer_context: Optional[TransferContext] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -1003,6 +1026,9 @@ class MooncakeKVManager(CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+        # Store transfer_context if provided (shared across all chunks for the same room)
+        if transfer_context is not None:
+            self.transfer_contexts[bootstrap_room] = transfer_context
 
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
@@ -1088,6 +1114,7 @@ class MooncakeKVSender(CommonKVSender):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.conclude_state = None
         self.init_time = time.time()
+        self.transfer_context = None
 
     def send(
         self,
@@ -1104,6 +1131,7 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                transfer_context=self.transfer_context,
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -1113,6 +1141,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                transfer_context=self.transfer_context,
             )
 
     def poll(self) -> KVPoll:

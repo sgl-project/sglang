@@ -35,12 +35,14 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    TransferContext,
     get_kv_class,
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
     poll_and_all_reduce,
     prepare_abort,
+    process_logprobs_for_request,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
@@ -177,6 +179,9 @@ class PrefillBootstrapQueue:
             self.scheduler.server_args,
             self.is_mla_backend,
         )
+        # Set callback for set_buf to avoid passing scheduler reference
+        if hasattr(kv_manager, 'set_buf_callback'):
+            kv_manager.set_buf_callback = lambda req: self.scheduler.disagg_metadata_buffers.set_buf(req)
         return kv_manager
 
     def add(self, req: Req, num_kv_heads: int) -> None:
@@ -368,6 +373,7 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+                self.maybe_notify_prefill_done(batch, batch_result)
 
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
@@ -383,6 +389,48 @@ class SchedulerDisaggregationPrefillMixin:
             # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
             # Otherwise, it hangs under high concurrency
             self.running_batch.batch_is_full = False
+    
+    def maybe_notify_prefill_done(self: Scheduler, batch: ScheduleBatch, result: GenerationBatchResult) -> None:
+        """
+        Notify that prefill is done for a batch. This triggers KV transfer with overlap.
+        
+        When --disaggregation-async-transfer is enabled, this sets up TransferContext
+        for async metadata buffer population by transfer workers.
+        
+        Otherwise, this is a no-op and fallback to the old overlap mode where
+        send_kv_chunk is called in process_batch_result_disagg_prefill.
+        """
+        # Check if async transfer is enabled via server args
+        if not self.server_args.disaggregation_async_transfer:
+            return
+        
+        # Create a shared TransferContext for all requests in this batch
+        # The context's lifecycle is managed by transfer_contexts dict in KVManager,
+        # which will be cleaned up when transfer is complete
+        transfer_context = TransferContext(
+            batch=batch,
+            result=result,
+            metadata_buffers=self.disagg_metadata_buffers,
+            scheduler=self,
+        )
+        for i, req in enumerate(batch.reqs):
+            sender = req.disagg_kv_sender
+            # Check if sender supports transfer_context (required for async transfer)
+            if not hasattr(sender, 'transfer_context'):
+                continue
+            ctx = sender.transfer_context
+            if ctx is None:
+                # First time: assign the shared context
+                sender.transfer_context = transfer_context
+                self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
+            else:
+                # Already has context (chunked prefill case)
+                if self.chunked_req is not None:
+                    assert req.rid == self.chunked_req.rid
+                else:
+                    # Last chunk: send it
+                    self.send_kv_chunk(req, last_chunk=True)
+                
 
     def process_batch_result_disagg_prefill(
         self: Scheduler,
@@ -442,22 +490,22 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 else:
                     req.hidden_states_tensor = None
-                if req.return_logprob:
-                    assert extend_logprob_start_len_per_req is not None
-                    assert extend_input_len_per_req is not None
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.add_logprob_return_values(
-                        i,
-                        req,
-                        logprob_pt,
-                        next_token_ids,
-                        num_input_logprobs,
-                        logits_output,
-                    )
-                    logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+                logprob_pt = process_logprobs_for_request(
+                    self,
+                    req,
+                    i,
+                    logits_output,
+                    extend_input_len_per_req,
+                    extend_logprob_start_len_per_req,
+                    logprob_pt,
+                    next_token_ids=[next_token_ids],
+                    is_last_prefill_chunk=True,
+                )
+                # When async_transfer is enabled, send_kv_chunk is called in notify_prefill_done
+                # Otherwise, call it here (old overlap mode)
+                use_async_transfer = self.enable_overlap and self.server_args.disaggregation_async_transfer
+                if not use_async_transfer:
+                    self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.prefill_transfer_queue_entry_time = time.perf_counter()
 
                 if req.grammar is not None:
@@ -479,23 +527,22 @@ class SchedulerDisaggregationPrefillMixin:
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
 
-                if req.return_logprob:
-                    extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                    extend_input_len = extend_input_len_per_req[i]
-                    if extend_logprob_start_len < extend_input_len:
-                        # Update input logprobs.
-                        num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_input_logprob_return_values(
-                            i,
-                            req,
-                            logits_output,
-                            logprob_pt,
-                            num_input_logprobs,
-                            last_prefill_chunk=False,
-                        )
-                        logprob_pt += num_input_logprobs
+                logprob_pt = process_logprobs_for_request(
+                    self,
+                    req,
+                    i,
+                    logits_output,
+                    extend_input_len_per_req,
+                    extend_logprob_start_len_per_req,
+                    logprob_pt,
+                    next_token_ids=None,
+                    is_last_prefill_chunk=False,
+                )
 
-                if self.enable_overlap:
+                # When async_transfer is enabled, send_kv_chunk is called in notify_prefill_done
+                # Otherwise, call it here (old overlap mode)
+                use_async_transfer = self.server_args.disaggregation_async_transfer
+                if self.enable_overlap and not use_async_transfer:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 trace_slice(
                     RequestStage.PREFILL_CHUNKED_FORWARD, req.rid, auto_next_anon=True
@@ -660,7 +707,11 @@ class SchedulerDisaggregationPrefillMixin:
         req.start_send_idx = end_idx
         state_indices = None
         if last_chunk:
-            self.disagg_metadata_buffers.set_buf(req)
+            # When async_transfer is enabled, set_buf is called by transfer worker
+            # Otherwise, call it here synchronously
+            use_async_transfer = self.server_args.disaggregation_async_transfer and self.enable_overlap
+            if not use_async_transfer:
+                self.disagg_metadata_buffers.set_buf(req)
 
             # Prepare extra pool indices for hybrid models
             if isinstance(
