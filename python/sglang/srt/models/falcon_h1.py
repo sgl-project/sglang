@@ -198,7 +198,7 @@ class FalconH1HybridAttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.mixer",
         )
 
-        # FalconH1 all layers are sparse and have no nextn now
+        # FalconH1 all layers are dense and have no nextn now
         self.is_layer_sparse = False
         is_previous_layer_sparse = False
         is_next_layer_sparse = False

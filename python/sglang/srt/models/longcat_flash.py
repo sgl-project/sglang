@@ -380,6 +380,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 num_layers=config.num_hidden_layers,
                 is_layer_sparse=False,
                 is_previous_layer_sparse=False,
+                # TODO: Check if the following is correct.
                 is_next_layer_sparse=False,
             )
             for i in range(2)
@@ -399,6 +400,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=True,
             is_previous_layer_sparse=True,
+            # TODO: Check if the following is correct.
             is_next_layer_sparse=True,
         )
         self.moe_layer_communicator = LayerCommunicator(

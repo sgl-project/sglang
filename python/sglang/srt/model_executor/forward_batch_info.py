@@ -798,6 +798,9 @@ class ForwardBatch:
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
         )
+        # TODO: The following is added to make sure sub-batch input_ids are padded
+        # to the multiple of attn_tp_size. It can likely be removed after this
+        # function is refactored and merged into the Scheduler.
         if self.tbo_children:
             for child in self.tbo_children:
                 child._pad_inputs_to_size(

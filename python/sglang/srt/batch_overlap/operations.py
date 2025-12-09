@@ -92,6 +92,9 @@ class _StageExecutor:
 
         stage = self._stages[self._index]
 
+        # TODO: We currently always call set_dp_buffer_len here because sub-batches
+        # may have different padded lengths. It can likely be removed after TBO slice &
+        # pad logic is refactored.
         set_dp_buffer_len(
             self._global_dp_buffer_len,
             self._local_dp_buffer_len,
