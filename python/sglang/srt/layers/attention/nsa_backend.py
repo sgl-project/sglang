@@ -1046,9 +1046,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
 
         # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(
-            seqlens_expanded, self.nsa_index_topk
-        )
+        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
         # NSA cumsum
@@ -1129,9 +1127,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         )
 
         # Compute NSA seqlens
-        nsa_cache_seqlens = compute_nsa_seqlens(
-            seqlens_expanded, self.nsa_index_topk
-        )
+        nsa_cache_seqlens = compute_nsa_seqlens(seqlens_expanded, self.nsa_index_topk)
         seqlens_expanded_size = seqlens_expanded.shape[0]
 
         # NSA cumsum
@@ -1194,7 +1190,7 @@ class NativeSparseAttnBackend(AttentionBackend):
         # Mode-specific copy logic
         if forward_mode.is_decode_or_idle():
             # Decode mode
-            metadata.page_table_1[:, :precomputed.max_len].copy_(
+            metadata.page_table_1[:, : precomputed.max_len].copy_(
                 precomputed.page_indices
             )
             metadata.nsa_cache_seqlens_int32.copy_(precomputed.nsa_cache_seqlens)
@@ -1202,7 +1198,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         elif forward_mode.is_target_verify():
             # Target verify mode
-            metadata.page_table_1[:, :precomputed.max_seqlen_k].copy_(
+            metadata.page_table_1[:, : precomputed.max_seqlen_k].copy_(
                 precomputed.page_indices
             )
             metadata.nsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
@@ -1220,7 +1216,9 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         # Copy NSA cu_seqlens
         size = precomputed.seqlens_expanded_size
-        metadata.nsa_cu_seqlens_k[1:1+size].copy_(precomputed.nsa_cu_seqlens_k[1:1+size])
+        metadata.nsa_cu_seqlens_k[1 : 1 + size].copy_(
+            precomputed.nsa_cu_seqlens_k[1 : 1 + size]
+        )
 
         # Copy real page table
         if precomputed.real_page_table is not None:
@@ -1232,9 +1230,7 @@ class NativeSparseAttnBackend(AttentionBackend):
 
         # Copy FlashMLA metadata
         if precomputed.flashmla_metadata is not None:
-            flashmla_metadata = metadata.flashmla_metadata.slice(
-                slice(0, size + 1)
-            )
+            flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
             flashmla_metadata.copy_(precomputed.flashmla_metadata)
 
         self.forward_metadata = metadata
@@ -1940,7 +1936,7 @@ class NativeSparseAttnMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        # NEW: Precompute metadata once (shared across all backends)
+        # Precompute metadata once (shared across all backends)
         precomputed = self.attn_backends[0]._precompute_replay_metadata(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1950,9 +1946,11 @@ class NativeSparseAttnMultiStepBackend:
             spec_info=forward_batch.spec_info,
         )
 
-        # NEW: Fast copy to each backend (1-2x faster than computing N times)
+        # Fast copy to each backend (1-2x faster than computing N times)
         for i in range(self.speculative_num_steps):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph_from_precomputed(
+            self.attn_backends[
+                i
+            ].init_forward_metadata_replay_cuda_graph_from_precomputed(
                 bs=bs,
                 precomputed=precomputed,
                 forward_mode=ForwardMode.DECODE,
