@@ -11,6 +11,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.multimodal import gpu_tensor_hash
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
@@ -34,6 +36,59 @@ _is_npu = is_npu()
 # TODO(mick): nccl
 # cuda_ipc: for intranode tensor sharing
 TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
+
+
+_GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
+_BUFFER_OFFSET = 0
+
+
+def init_feature_buffer(device):
+    global _GPU_FEATURE_BUFFER, _BUFFER_OFFSET
+    if (
+        device == "cpu"
+        or envs.SGLANG_MM_BUFFER_SIZE_MB.get() == 0
+        or _GPU_FEATURE_BUFFER is not None
+    ):
+        return
+    try:
+        size_mb = envs.SGLANG_MM_BUFFER_SIZE_MB.get()
+        num_elements = int(size_mb * 1024 * 1024 / 4)
+        _GPU_FEATURE_BUFFER = torch.empty(
+            num_elements, dtype=torch.float32, device=device
+        )
+        logger.info(f"Preallocated {size_mb}MB GPU buffer")
+    except RuntimeError as e:
+        _GPU_FEATURE_BUFFER = None
+
+
+def reset_buffer_offset():
+    global _BUFFER_OFFSET
+    _BUFFER_OFFSET = 0
+
+
+def is_feature_buffer_initialized():
+    global _GPU_FEATURE_BUFFER
+    if _GPU_FEATURE_BUFFER is None:
+        return False
+    return True
+
+
+def try_add_to_buffer(tensor: torch.Tensor) -> Optional[torch.Tensor]:
+    global _BUFFER_OFFSET
+
+    if _GPU_FEATURE_BUFFER is None:
+        return tensor
+
+    tensor_size = tensor.numel()
+
+    if _BUFFER_OFFSET + tensor_size <= _GPU_FEATURE_BUFFER.numel():
+        buffer_view = _GPU_FEATURE_BUFFER[_BUFFER_OFFSET : _BUFFER_OFFSET + tensor_size]
+        buffer_view.copy_(tensor.flatten(), non_blocking=True)
+        result = buffer_view.view(tensor.shape)
+        _BUFFER_OFFSET += tensor_size
+        return result
+    else:
+        return tensor
 
 
 class TransportProxyTensor(torch.Tensor):
@@ -493,7 +548,7 @@ def get_embedding_and_mask(
     return embedding, special_multimodal_mask
 
 
-def general_embed_mm_inputs(
+def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
     extend_seq_lens: List[int],
@@ -596,20 +651,20 @@ def general_embed_mm_inputs(
     # filled with the hash values of the multimodal for the prefix matching in the radix attention.
     # There values are useless because their embeddings will be replaced by vision embeddings anyway.
     input_ids.clamp_(min=0, max=vocab_size - 1)
-    inputs_embeds = input_embedding(input_ids)
+    input_embeds = input_embedding(input_ids)
 
     # deepstack embedding
     if use_deepstack:
         num_deepstack_embeddings = len(multimodal_model.deepstack_visual_indexes)
 
-        deepstack_embedding_shape = inputs_embeds.shape[:-1] + (
-            inputs_embeds.shape[-1] * num_deepstack_embeddings,
+        deepstack_embedding_shape = input_embeds.shape[:-1] + (
+            input_embeds.shape[-1] * num_deepstack_embeddings,
         )
-        # a zero-filled embedding, with the same length of inputs_embeds, but different hidden_size
+        # a zero-filled embedding, with the same length of input_embeds, but different hidden_size
         input_deepstack_embeds = torch.zeros(
             deepstack_embedding_shape,
-            device=inputs_embeds.device,
-            dtype=inputs_embeds.dtype,
+            device=input_embeds.device,
+            dtype=input_embeds.dtype,
         )
 
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
@@ -622,13 +677,13 @@ def general_embed_mm_inputs(
             continue
         # in-place update
         indices = torch.where(mask.squeeze(dim=-1))[0]
-        inputs_embeds[indices] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
+        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
         if use_deepstack.get(modality, None):
             input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                inputs_embeds.device, inputs_embeds.dtype
+                input_embeds.device, input_embeds.dtype
             )
 
-    return inputs_embeds, other_info
+    return input_embeds, other_info
 
 
 def general_mm_embed_routine(
@@ -658,53 +713,74 @@ def general_mm_embed_routine(
     Returns:
         Hidden states from language model forward pass
     """
-    assert hasattr(language_model, "get_input_embeddings")
-    embed_tokens = language_model.get_input_embeddings()
-    if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
+    # Lazy import to allow some monkey patch of piecewise_cuda_graph_runner
+    from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
+        use_original_ca_comm,
+    )
+
+    tp_group = get_tp_group()
+
+    with use_original_ca_comm(tp_group):
+        # We disable custom allreduce in piecewise cuda graph.
+        # However, because we only capture the language model part, the multimodal can still use custom allreduce.
+        assert hasattr(language_model, "get_input_embeddings")
+        embed_tokens = language_model.get_input_embeddings()
         if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
+            not hasattr(language_model, "pp_group")
+            or language_model.pp_group.is_first_rank
         ):
-            mm_inputs_list = [
-                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-            ]
-            extend_prefix_lens = [
-                prefix_len
-                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            extend_seq_lens = [
-                seq_len
-                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            inputs_embeds, other_info = general_embed_mm_inputs(
-                mm_inputs_list=mm_inputs_list,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_seq_lens=extend_seq_lens,
-                input_ids=input_ids,
-                multimodal_model=multimodal_model,
-                input_embedding=embed_tokens,
-                data_embedding_func_mapping=data_embedding_funcs,
-                placeholder_tokens=placeholder_tokens,
-                use_deepstack=use_deepstack,
-            )
-            # add for qwen3_vl deepstack
-            if use_deepstack:
-                kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
-            # just being defensive here
-            forward_batch.mm_inputs = None
+            if (
+                not forward_batch.forward_mode.is_decode()
+                and not forward_batch.forward_mode.is_target_verify()
+                and forward_batch.contains_mm_inputs()
+            ):
+                mm_inputs_list = [
+                    mm_input
+                    for mm_input in forward_batch.mm_inputs
+                    if mm_input is not None
+                ]
+                extend_prefix_lens = [
+                    prefix_len
+                    for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
+                    if forward_batch.mm_inputs[i] is not None
+                ]
+                extend_seq_lens = [
+                    seq_len
+                    for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
+                    if forward_batch.mm_inputs[i] is not None
+                ]
+                input_embeds, other_info = embed_mm_inputs(
+                    mm_inputs_list=mm_inputs_list,
+                    extend_prefix_lens=extend_prefix_lens,
+                    extend_seq_lens=extend_seq_lens,
+                    input_ids=input_ids,
+                    multimodal_model=multimodal_model,
+                    input_embedding=embed_tokens,
+                    data_embedding_func_mapping=data_embedding_funcs,
+                    placeholder_tokens=placeholder_tokens,
+                    use_deepstack=use_deepstack,
+                )
+                # add for qwen3_vl deepstack
+                if use_deepstack:
+                    kwargs["input_deepstack_embeds"] = other_info[
+                        "input_deepstack_embeds"
+                    ]
+                # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
+                # just being defensive here
+                forward_batch.mm_inputs = None
+            else:
+                input_embeds = embed_tokens(input_ids)
+            # Copy to pre-allocated buffer if available (for CUDA graph address stability)
+            if forward_batch.input_embeds is not None:
+                forward_batch.input_embeds.copy_(input_embeds)
+                input_embeds = forward_batch.input_embeds
         else:
-            inputs_embeds = embed_tokens(input_ids)
-    else:
-        inputs_embeds = None
+            input_embeds = None
 
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
-        input_embeds=inputs_embeds,
+        input_embeds=input_embeds,
         **kwargs,
     )
     return hidden_states
@@ -818,293 +894,43 @@ def hash_feature(f):
     return data_hash(f)
 
 
-def resolve_language_model(multimodal_model: nn.Module) -> Optional[nn.Module]:
-    # Qwen2-VL / Qwen3-VL Style
-    if hasattr(multimodal_model, "model"):
-        lm = getattr(multimodal_model, "model")
-        if hasattr(lm, "get_input_embeddings"):
-            return lm
-
-    # Llava / OneVision Style
-    if hasattr(multimodal_model, "language_model"):
-        lm = getattr(multimodal_model, "language_model")
-        if hasattr(lm, "get_input_embeddings"):
-            return lm
-
-    if hasattr(multimodal_model, "get_input_embeddings"):
-        return multimodal_model
-
-    return None
-
-
-def external_embed_mm_inputs(
-    forward_batch: ForwardBatch,
-    mm_inputs_list: List[MultimodalInputs],
-    extend_prefix_lens: List[int],
-    extend_seq_lens: List[int],
-    input_ids: torch.Tensor,
-    input_embedding: nn.Embedding,
-    multimodal_model: nn.Module = None,
-    data_embedding_func_mapping: Dict[
-        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
-    ] = None,
-) -> Optional[torch.Tensor]:
-    """
-    Embed multimodal inputs and integrate them with text token embeddings.
-
-    Args:
-        mm_inputs_list: List of multimodal inputs to process
-        extend_prefix_lens: Prefix lengths for each request
-        extend_seq_lens: Sequence lengths for each request
-        input_ids: Input token IDs tensor
-        input_embedding: Embedding layer for text tokens
-
-    Returns:
-        Combined embedding tensor with multimodal content integrated
-    """
-    if mm_inputs_list is None:
-        return None
-
-    # 1. Calculate the multimodal data which exists in input_ids, with the help of pad_values
-    # we assume that multimodal data are represented with its pad_values in input_ids
-    item_flatten_list = []
-    for mm_inputs in mm_inputs_list:
-        item_flatten_list += [item for item in mm_inputs.mm_items if item is not None]
-
-    modalities, embeddings, masks = [], [], []
-
-    # 2. Get multimodal embedding separately
-    # Try get mm embedding if any
-    for modality in Modality.all():
-        items = [
-            item for item in item_flatten_list if item.is_modality(modality=modality)
-        ]
-        embedder = (
-            None
-            if data_embedding_func_mapping is None
-            else data_embedding_func_mapping.get(modality, None)
-        )
-        if embedder is None:
-            # "image", "video", etc
-            modality_id = modality.name.lower()
-            embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
-        if len(items) != 0:
-            assert embedder is not None, f"no embedding method found for {modality}"
-            placeholder_tensor = torch.as_tensor(
-                [item.pad_value for item in items],
-                device=input_ids.device,
-            )
-            # calculate per request items length offset
-            items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
-            items_offsets = []
-            for i, mm_inputs in enumerate(mm_inputs_list):
-                mm_items = [
-                    item
-                    for item in mm_inputs.mm_items
-                    if item.is_modality(modality=modality)
-                ]
-                items_size[i + 1] = len(mm_items)
-                items_offsets.append(
-                    flatten_nested_list([item.offsets for item in mm_items])
-                )
-            items_size = torch.cumsum(items_size, dim=0).tolist()
-
-            embedding, mask = get_embedding_and_mask(
-                data_embedding_func=embedder,
-                embedding_items=items,
-                placeholder_tensor=placeholder_tensor,
-                input_ids=input_ids,
-                items_size=items_size,
-                prefix_length=extend_prefix_lens,
-                extend_length=extend_seq_lens,
-                items_offset_list=items_offsets,
-            )
-
-            modalities += [modality]
-            embeddings += [embedding]
-            masks += [mask]
-
-    # 3. Get input embeddings
-    vocab_size = input_embedding.num_embeddings
-    # Important: clamp after getting original multimodal regions
-    # Clamp input ids. This is because the input_ids for the multimodal tokens are
-    # filled with the hash values of the multimodal for the prefix matching in the radix attention.
-    # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-    input_ids.clamp_(min=0, max=vocab_size - 1)
-    inputs_embeds = input_embedding(input_ids)
-
-    indices = []
-    for mask in masks:
-        if mask is not None:
-            indices.append(torch.where(mask.squeeze(dim=-1))[0])
-        else:
-            indices.append(None)
-
-    # only for qwen3vl right now,  replace the original use_deepstack with this method.
-    if hasattr(multimodal_model, "post_process"):
-        embeddings, forward_batch = multimodal_model.post_process(
-            inputs_embeds, modalities, embeddings, indices, forward_batch
-        )
-
-    # 4. scatter embeddings into input embedding
-    for i, modality, embedding, index in zip(
-        range(len(embeddings)), modalities, embeddings, indices
-    ):
-        if embedding is None or index is None:
-            continue
-        # in-place update
-        inputs_embeds[index] = embedding.to(inputs_embeds.device, inputs_embeds.dtype)
-
-    return inputs_embeds, forward_batch
-
-
-def should_use_external_mm_preprocess(multimodal_model: nn.Module) -> bool:
-    """Decide whether we should use our generic "external_mm_preprocess_routine".
-
-    We are adapting VLM for piecewise CUDA graph. Since the encoder's forward
-    pass cannot be executed within the model's forward pass, we need to
-    precompute image embeddings using the encoder within the model runner.
-    For models that have already been adjusted, there is a member called
-    should_use_external_mm_preprocess, which is set to True. In practice,
-    the external_mm_preprocess_routine function will be called in the
-    model_runner.forward_extend to handle multimodal inputs.
-
-    For models that have not yet been adapted, the general_mm_embed_routine
-    will still be called in the model class's forward function for processing.
-
-    Current strategy:
-        - Llava family (models with vision_tower + multi_modal_projector):
-        Their forward already calls general_mm_embed_routine and includes
-        built-in multimodal processing. If we run it again in ModelRunner,
-        it will conflict with the internal logic, so we skip it here.
-        - Others (such as Qwen2-VL / Qwen2.5-VL): use the multimodal
-        preprocessing.
-    """
-
-    cls_name = multimodal_model.__class__.__name__
-
-    external_mm_preprocess_classes = {
-        "Qwen2VLForConditionalGeneration",
-        "Qwen2_5_VLForConditionalGeneration",
-        "InternVLChatModel",
-    }
-
-    return cls_name in external_mm_preprocess_classes
-
-
-def resolve_external_mm_data_embedding_funcs(
-    multimodal_model: nn.Module,
-) -> Optional[Dict[Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]]]:
-    """
-    Resolve the data_embedding_funcs mapping for external_mm_preprocess_routine
-    based on the given multimodal model. If this function returns None, the
-    external_mm_preprocess_routine will use its internal default behavior
-    (for example, for Qwen2_5_VL).
-
-    Resolution order:
-        1. If the model exposes external_mm_data_embedding_funcs explicitly,
-           adopt it.
-        2. TODO: Handle special classes with customized mm_data_embedding_funcs
-           (e.g. Qwen3_VL).
-        3. If not mapping, return None.
-    """
-
-    cls_name = multimodal_model.__class__.__name__
-
-    # High priority: model provides an explicit mapping attribute.
-    #    Example in InternVLChatModel.__init__:
-    #      self.external_mm_data_embedding_funcs = {
-    #          Modality.IMAGE: self.get_image_feature,
-    #      }
-    if hasattr(multimodal_model, "external_mm_data_embedding_funcs"):
-        funcs = getattr(multimodal_model, "external_mm_data_embedding_funcs")
-        # Allow an empty dict to mean "no data_embedding_funcs are needed".
-        return funcs or None
-
-    # If no mapping is found, return None so that external_mm_preprocess_routine
-    # can fall back to its default logic.
-    return None
-
-
-def external_mm_preprocess_routine(
-    forward_batch: ForwardBatch,
-    multimodal_model: Optional[nn.Module] = None,
-    data_embedding_funcs: Dict[
-        Modality, Callable[[List[MultimodalDataItem]], torch.Tensor]
-    ] = None,
+def extend_mrope_positions_for_retracted_request(
+    mrope_positions: torch.Tensor, output_ids_len: int
 ) -> torch.Tensor:
     """
-    Process multimodal inputs and forward through language model.
+    Extend mrope_positions for retracted requests by appending positions for output_ids.
+
+    When a request is retracted and has multimodal inputs with mrope_positions,
+    we need to extend the positions to cover the output_ids that were already generated.
+    For pure text tokens, all three dimensions use the same incremental sequence.
+
     Args:
-        input_ids: Input token IDs tensor
-        forward_batch: Batch information for model forward pass
-        data_embedding_funcs: A dictionary mapping from modality type to the corresponding embedding function.
-        **kwargs: Additional arguments passed to language model
+        mrope_positions: The original mrope positions tensor, shape (3, origin_input_ids_len)
+        output_ids_len: The number of output tokens to generate positions for
+
     Returns:
-        Hidden states from language model forward pass
+        Extended mrope_positions tensor with shape (3, origin_input_ids_len + output_ids_len)
     """
+    if output_ids_len <= 0:
+        return mrope_positions
 
-    language_model = resolve_language_model(multimodal_model)
-    if language_model is None:
-        raise ValueError(
-            f"Cannot resolve language model from {type(multimodal_model).__name__}. "
-            f"Please ensure the model has 'model' or 'language_model' attribute."
+    # Get the last position value corresponding to origin_input_ids
+    # mrope_positions shape: (3, origin_input_ids_len)
+    last_position = mrope_positions[:, -1]  # shape: (3,)
+
+    # Generate pure text mrope positions for output_ids
+    # All three dimensions for pure text are the same incremental sequence
+    start_pos = last_position[0] + 1  # Start from last position + 1
+    output_positions = (
+        torch.arange(
+            start_pos,
+            start_pos + output_ids_len,
+            dtype=torch.int64,
+            device=mrope_positions.device,
         )
+        .unsqueeze(0)
+        .expand(3, -1)
+    )  # shape: (3, output_ids_len)
 
-    assert hasattr(language_model, "get_input_embeddings")
-    embed_tokens = language_model.get_input_embeddings()
-    if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
-
-        input_ids = forward_batch.input_ids
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
-        ):
-            mm_inputs_list = [
-                mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
-            ]
-            extend_prefix_lens = [
-                prefix_len
-                for i, prefix_len in enumerate(forward_batch.extend_prefix_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            extend_seq_lens = [
-                seq_len
-                for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
-                if forward_batch.mm_inputs[i] is not None
-            ]
-            input_embeds, forward_batch = external_embed_mm_inputs(
-                forward_batch=forward_batch,
-                mm_inputs_list=mm_inputs_list,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_seq_lens=extend_seq_lens,
-                input_ids=forward_batch.input_ids,
-                multimodal_model=multimodal_model,
-                input_embedding=embed_tokens,
-                data_embedding_func_mapping=data_embedding_funcs,
-            )
-            # once used, mm_inputs is useless, considering chunked-prefill is disabled for multimodal models
-            # just being defensive here
-            forward_batch.mm_inputs = None
-        else:
-            # NOTE: This may reduce the performance for only-text inputs.
-            # Using a fixed-address buffer might be better, though it could be a bit dirty.
-            input_embeds = embed_tokens(input_ids)
-            # only for qwen3vl
-            if getattr(multimodal_model, "use_deepstack", False):
-                forward_batch.input_deepstack_embeds = torch.zeros(
-                    (
-                        len(input_ids),
-                        multimodal_model.config.hidden_size
-                        * len(multimodal_model.deepstack_visual_indexes),
-                    ),
-                    device=input_embeds.device,
-                    dtype=input_embeds.dtype,
-                )
-
-        forward_batch.input_embeds = input_embeds
-    else:
-        forward_batch.input_embeds = None
-
-    return forward_batch
+    # Concatenate to the original mrope_positions
+    return torch.cat([mrope_positions, output_positions], dim=1)
