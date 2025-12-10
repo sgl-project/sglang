@@ -26,6 +26,7 @@ class suppress_stdout_stderr:
 
         sys.stdout = self.outnull_file
         sys.stderr = self.errnull_file
+
         return self
 
     def __exit__(self, *_):
