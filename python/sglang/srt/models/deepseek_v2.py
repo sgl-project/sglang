@@ -1287,7 +1287,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
             if "factor" not in rope_scaling:
-                rope_scaling["factor"] = 40
+                rope_scaling["factor"] = 4096
             if "original_max_position_embeddings" not in rope_scaling:
                 rope_scaling["original_max_position_embeddings"] = 4096
 
