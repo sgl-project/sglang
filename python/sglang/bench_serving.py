@@ -2789,6 +2789,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Benchmark PD disaggregation server",
     )
+    parser.add_argument(
+        "--p2p-transfer",
+        action="store_true",
+        help="Enable P2P weight transfer between GPUs when updating model weights in RL training.",
+    )
 
     # Create a mutually exclusive group for profiling URLs
     # In PD separated mode, prefill and decode workers must be profiled separately

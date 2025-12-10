@@ -590,6 +590,8 @@ class ServerArgs:
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+    enable_p2p_transfer: bool = False
+    p2p_transfer_ib_device: Optional[str] = None
 
     # For PD-Multiplexing
     enable_pdmux: bool = False
@@ -3990,6 +3992,19 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.mm_enable_dp_encoder,
             help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+        )
+        parser.add_argument(
+            "--enable-p2p-transfer",
+            action="store_true",
+            help="Enable P2P weight transfer between GPUs when updating model weights in RL training.",
+        )
+        parser.add_argument(
+            "--p2p-transfer-ib-device",
+            type=str,
+            default=ServerArgs.p2p_transfer_ib_device,
+            help="The InfiniBand devices for P2P transfer, accepts single device (e.g., --p2p-transfer-ib-device mlx5_0) "
+            "or multiple comma-separated devices (e.g., --p2p-transfer-ib-device mlx5_0,mlx5_1). "
+            "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
 
         # For registering hooks

@@ -171,6 +171,7 @@ from sglang.srt.utils import (
     slow_rank_detector,
     xpu_has_xmx_support,
 )
+from sglang.srt.utils.common import get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
@@ -179,6 +180,7 @@ from sglang.srt.utils.offloader import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.weight_sync.p2p_transfer import P2PTransferManager
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
@@ -1138,19 +1140,40 @@ class ModelRunner:
             logger.error(message)
             return False, message
 
+    def init_p2p_transfer_engine(self):
+        """Establish connection to the weights update engine through p2p transfer engine
+
+        Args:
+            remote_ip: the IP address of the weights update engine.
+            remote_port: the port of the weights update engine.
+        """
+        try:
+            self.p2p_transfer_manager = P2PTransferManager(
+                hostname=get_local_ip_auto(),
+                gpu_id=self.gpu_id,
+                ib_device=self.server_args.p2p_transfer_ib_device,
+            )
+        except Exception as e:
+            message = f"Failed to init p2p transfer engine: {e}."
+            logger.error(message)
+            return False, message
+
+        return True, "Succeeded to init p2p transfer engine."
+
     def update_weights_from_distributed(
         self,
         names,
         dtypes,
         shapes,
         group_name,
+        session_id = None,
         load_format: Optional[str] = None,
     ):
         """
         Update specific parameter in the model weights online
         through `_model_update_group` process group.
 
-        Args:
+        Args:names
             name: the name of the parameter to be updated.
             dtype: the data type of the parameter to be updated.
             shape: the shape of the parameter to be updated.
@@ -1173,14 +1196,25 @@ class ModelRunner:
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
                 weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-                handles.append(
-                    torch.distributed.broadcast(
-                        weight,
-                        src=0,
-                        group=self._model_update_group[group_name],
-                        async_op=True,
+
+                if (get_global_server_args().enable_p2p_transfer):
+                    weight_length = weight.numel() * weight.element_size()
+                    handle = self.p2p_transfer_manager.submit_transfer_task(
+                        session_id=session_id if session_id is not None else "",
+                        ptr=weight.data_ptr(),
+                        length=weight_length,
                     )
-                )
+                    handles.append(handle)
+                else:
+                    handles.append(
+                        torch.distributed.broadcast(
+                            weight,
+                            src=0,
+                            group=self._model_update_group[group_name],
+                            async_op=True,
+                        )
+                    )
+
                 weights.append((name, weight))
             for handle in handles:
                 handle.wait()
