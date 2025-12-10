@@ -118,9 +118,22 @@ class SchedulerRuntimeCheckerMixin:
             full_num_used != self.tree_cache.full_protected_size()
             or mamba_num_used != self.tree_cache.mamba_protected_size()
         )
+        free_full_pages = set(
+            self.token_to_kv_pool_allocator.free_pages.tolist()
+            + self.token_to_kv_pool_allocator.release_pages.tolist()
+        )
+        cached_full_pages = set(self.tree_cache.all_values_flatten().tolist())
+        expected_full_pages = set(range(1, self.token_to_kv_pool_allocator.size + 1))
+        leaked_full_pages = expected_full_pages - free_full_pages - cached_full_pages
+        free_mamba_pages = set(self.req_to_token_pool.mamba_pool.free_slots.tolist())
+        cached_mamba_pages = set(self.tree_cache.all_mamba_values_flatten().tolist())
+        expected_mamba_pages = set(range(self.req_to_token_pool.mamba_pool.size))
+        leaked_mamba_pages = (
+            expected_mamba_pages - free_mamba_pages - cached_mamba_pages
+        )
         token_msg = (
             f"{full_available_size=}, {full_evictable_size=}, {self.token_to_kv_pool_allocator.size=}, {self.tree_cache.full_protected_size()=}\n"
-            f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}\n"
+            f"{mamba_available_size=}, {mamba_evictable_size=}, {self.req_to_token_pool.mamba_pool.size=}, {self.tree_cache.mamba_protected_size()=}, leaked_full_pages={leaked_full_pages if len(leaked_full_pages) > 0 else None}, leaked_mamba_pages={leaked_mamba_pages if len(leaked_mamba_pages) > 0 else None}\n"
         )
         return memory_leak, token_msg
 

@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
 if TYPE_CHECKING:
@@ -358,6 +359,31 @@ class SchedulerOutputProcessorMixin:
                 # Only v2 eagle's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+
+            # Update Mamba
+            seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
+            if req.mamba_ping_pong_track_buffer is not None:
+                mamba_track_interval = get_global_server_args().mamba_track_interval
+                if (
+                    batch.spec_algorithm.is_none()
+                    and seq_len % mamba_track_interval == 0
+                ):
+                    # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
+                    req.mamba_next_track_idx = 1 - req.mamba_next_track_idx
+                    req.mamba_last_track_seqlen = seq_len
+                elif batch.spec_algorithm.is_eagle():
+                    # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
+                    actual_seq_len = req.seqlen - 1
+                    if (
+                        actual_seq_len // mamba_track_interval
+                        != (actual_seq_len - result.accept_length_per_req_cpu[i])
+                        // mamba_track_interval
+                    ):
+                        req.mamba_last_track_seqlen = (
+                            actual_seq_len
+                            // mamba_track_interval
+                            * mamba_track_interval
+                        )
 
             req.check_finished(new_accepted_len)
 
