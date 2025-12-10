@@ -7,8 +7,10 @@ use std::sync::{Arc, RwLock};
 use dashmap::DashMap;
 use uuid::Uuid;
 
-use crate::core::{ConnectionMode, RuntimeType, Worker, WorkerType};
-use crate::observability::metrics::RouterMetrics;
+use crate::{
+    core::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    observability::metrics::RouterMetrics,
+};
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
