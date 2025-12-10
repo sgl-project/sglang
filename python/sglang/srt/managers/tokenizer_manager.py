@@ -33,6 +33,7 @@ from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import orjson
+import torch
 import uvloop
 import zmq
 import zmq.asyncio
