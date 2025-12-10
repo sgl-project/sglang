@@ -6,6 +6,7 @@ bash scripts/ci/ci_install_dependency.sh
 
 export GDRCOPY_HOME=/usr/src/gdrdrv-2.5.1/
 export CUDA_HOME=/usr/local/cuda
+export NCCL_DEBUG=INFO
 
 GRACE_BLACKWELL=${GRACE_BLACKWELL:-0}
 # Detect architecture

@@ -4,7 +4,7 @@ set -euxo pipefail
 
 # Set up environment variables
 IS_BLACKWELL=${IS_BLACKWELL:-0}
-CU_VERSION="cu129"
+CU_VERSION=${CU_VERSION:-cu129}
 OPTIONAL_DEPS="${1:-}"
 
 # Detect system architecture
@@ -132,7 +132,11 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ]; then
     fi
     $PIP_CMD install sgl-kernel/dist/sgl_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl --force-reinstall $PIP_INSTALL_SUFFIX
 else
-    $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+    if [ "$CU_VERSION" = "cu130" ]; then
+        $PIP_CMD install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION_FROM_SRT}/sgl_kernel-${SGL_KERNEL_VERSION_FROM_SRT}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall $PIP_INSTALL_SUFFIX
+    else
+        $PIP_CMD install sgl-kernel==${SGL_KERNEL_VERSION_FROM_SRT} --force-reinstall $PIP_INSTALL_SUFFIX
+    fi
 fi
 
 # Show current packages
