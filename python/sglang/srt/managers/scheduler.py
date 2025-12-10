@@ -1385,19 +1385,20 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
         # Validate prompt length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
+            reserved_tokens=req.sampling_params.max_new_tokens or 0,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        # initialize before returning
+        self.init_req_max_new_tokens(req)
 
         # Copy more attributes
         if recv_req.logprob_start_len == -1 or not recv_req.return_logprob:
@@ -1624,10 +1625,14 @@ class Scheduler(
             req,
             self.max_req_input_len,
             self.server_args.allow_auto_truncate,
+            reserved_tokens=req.sampling_params.max_new_tokens or 0,
         )
         if error_msg:
             self._add_request_to_queue(req)
             return
+
+        # initialize before returning
+        self.init_req_max_new_tokens(req)
 
         # Copy more attributes
         req.logprob_start_len = len(req.origin_input_ids) - 1

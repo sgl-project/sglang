@@ -87,7 +87,10 @@ class GenerationBatchResult:
 
 
 def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+    req: Req,
+    max_req_input_len: int,
+    allow_auto_truncate: bool,
+    reserved_tokens: int = 0,
 ) -> Optional[str]:
     """Validate and potentially truncate input length.
 
@@ -95,23 +98,29 @@ def validate_input_length(
         req: The request containing input_ids to validate
         max_req_input_len: Maximum allowed input length
         allow_auto_truncate: Whether to truncate long inputs
+        reserved_tokens: Tokens that must be preserved for generation
 
     Returns:
         Error message if validation fails, None if successful
     """
-    if len(req.origin_input_ids) >= max_req_input_len:
+    truncated_input_len = max_req_input_len
+    if allow_auto_truncate and reserved_tokens > 0:
+        truncated_input_len = max(max_req_input_len - reserved_tokens, 1)
+
+    if len(req.origin_input_ids) >= truncated_input_len:
         if allow_auto_truncate:
             logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated. "
-                f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
+                f"{len(req.origin_input_ids)=}, {truncated_input_len=}, "
+                f"{reserved_tokens=}."
             )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            req.origin_input_ids = req.origin_input_ids[:truncated_input_len]
             return None
         else:
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
+                f"the maximum allowed length ({truncated_input_len} tokens). "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
             return error_msg
