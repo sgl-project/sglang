@@ -809,11 +809,13 @@ class Req:
                 self.last_node,
                 self.last_host_node,
                 self.host_hit_length,
+                self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
                 match_result.last_device_node,
                 match_result.last_host_node,
                 match_result.host_hit_length,
+                match_result.mamba_branching_seqlen,
             )
             self.cache_protected_len = len(self.prefix_indices)
 
