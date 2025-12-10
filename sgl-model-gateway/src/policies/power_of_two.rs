@@ -207,4 +207,62 @@ mod tests {
         // With single worker, should always select it
         assert_eq!(policy.select_worker(&workers, None), Some(0));
     }
+    #[test]
+    fn test_reproduce_incompatible_metric_bug() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use crate::core::{BasicWorkerBuilder, WorkerType};
+
+        // 1. Setup the policy
+        let policy = PowerOfTwoPolicy::new();
+
+        // 2. Create Worker A: Idle (0 reqs), but has high token usage in cache
+        let worker_a = BasicWorkerBuilder::new("http://worker_a:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        // 3. Create Worker B: Busy (5 reqs), but missing from cache
+        let worker_b = BasicWorkerBuilder::new("http://worker_b:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        // Manually increment load on Worker B to simulate active requests
+        for _ in 0..5 {
+            worker_b.increment_load();
+        }
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(worker_a),
+            Arc::new(worker_b)
+        ];
+
+        // 4. Simulate LoadMonitor update:
+        // Only Worker A gets a token report. Worker B is missing (e.g. monitor failure).
+        let mut loads = HashMap::new();
+        loads.insert("http://worker_a:8000".to_string(), 50_000); // 50k tokens load
+        policy.update_loads(&loads);
+
+        // 5. Run selection
+        // In a 2-worker setup, Power-of-Two always picks both indices 0 and 1 to compare.
+        // Logic:
+        //   - Worker A Load = 50,000 (from cache, as tokens)
+        //   - Worker B Load = 5      (fallback to local, as requests)
+        //   - Comparison: 5 < 50,000
+        //   - Result: Worker B is selected.
+
+        let selected_idx = policy.select_worker(&workers, None).expect("Should select a worker");
+
+        // 6. Verify the Bug
+        // CORRECT behavior (if fixed) would be to see A has 0 requests and B has 5 requests, selecting A.
+        // BUGGY behavior selects B because it compares 5 (requests) against 50,000 (tokens).
+        if selected_idx == 1 {
+            println!("BUG REPRODUCED: Selected Worker B (Load: 5 reqs) over Worker A (Load: 50k tokens)");
+            println!("The router erroneously treated '5 requests' as smaller than '50,000 tokens'.");
+        } else {
+            println!("Bug NOT reproduced: System correctly identified Worker A as less loaded.");
+        }
+
+        // Assert that the buggy behavior occurs (Worker B is selected)
+        assert_eq!(selected_idx, 1, "The policy should have failed by selecting the 'busy' worker B due to metric mismatch.");
+    }
 }
