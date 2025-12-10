@@ -304,11 +304,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)
 
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024
         if (
             self.alt_stream is not None
             and hidden_states.shape[0] > 0
-            and hidden_states.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
             and get_is_capture_mode()
         ):
             final_hidden_states, shared_output = self.forward_normal_dual_stream(

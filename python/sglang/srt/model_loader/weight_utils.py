@@ -47,7 +47,6 @@ from sglang.srt.model_loader.weight_validation import (
     _validate_sharded_model,
 )
 from sglang.srt.utils import find_local_repo_dir, log_info_on_rank0, print_warning_once
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -79,13 +78,15 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
-def get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
+def get_lock(
+    model_name_or_path: str, cache_dir: Optional[str] = None, suffix: str = ""
+):
     lock_dir = cache_dir or temp_dir
     os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
     model_name = model_name_or_path.replace("/", "-")
     hash_name = hashlib.sha256(model_name.encode()).hexdigest()
     # add hash to avoid conflict with old users' lock files
-    lock_file_name = hash_name + model_name + ".lock"
+    lock_file_name = hash_name + model_name + suffix + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
@@ -262,13 +263,19 @@ def get_quant_config(
         return quant_cls.from_config(config)
 
 
-def find_local_hf_snapshot_dir(
+def _find_local_hf_snapshot_dir_unlocked(
     model_name_or_path: str,
     cache_dir: Optional[str],
     allow_patterns: List[str],
     revision: Optional[str] = None,
 ) -> Optional[str]:
-    """If the weights are already local, skip downloading and returns the path."""
+    """Find local HF snapshot directory without locking.
+
+    IMPORTANT: Caller MUST hold the model lock before calling this function
+    to prevent race conditions during validation and cleanup.
+
+    If the weights are already local, skip downloading and returns the path.
+    """
     if os.path.isdir(model_name_or_path):
         return None
 
@@ -309,34 +316,36 @@ def find_local_hf_snapshot_dir(
         except Exception as e:
             logger.warning("Failed to find local snapshot in default HF cache: %s", e)
 
-    # Check for incomplete files and clean up if found
-    if found_local_snapshot_dir:
-        repo_folder = os.path.abspath(
-            os.path.join(found_local_snapshot_dir, "..", "..")
-        )
-        blobs_dir = os.path.join(repo_folder, "blobs")
-
-        # Check for incomplete download markers
-        incomplete_files = []
-        if os.path.isdir(blobs_dir):
-            incomplete_files = glob.glob(os.path.join(blobs_dir, "*.incomplete"))
-
-        if incomplete_files:
-            log_info_on_rank0(
-                logger,
-                f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
-                f"{model_name_or_path}. Will clean up and re-download.",
-            )
-            _cleanup_corrupted_model_cache(
-                model_name_or_path,
-                found_local_snapshot_dir,
-                f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
-            )
-            return None
-
     # if local snapshot exists, validate it contains at least one weight file
     # matching allow_patterns before skipping download.
     if found_local_snapshot_dir is None:
+        return None
+
+    # Check if snapshot dir exists (might have been cleaned by another process
+    # before we acquired the lock)
+    if not os.path.isdir(found_local_snapshot_dir):
+        return None
+
+    # Check for incomplete files and clean up if found
+    repo_folder = os.path.abspath(os.path.join(found_local_snapshot_dir, "..", ".."))
+    blobs_dir = os.path.join(repo_folder, "blobs")
+
+    # Check for incomplete download markers
+    incomplete_files = []
+    if os.path.isdir(blobs_dir):
+        incomplete_files = glob.glob(os.path.join(blobs_dir, "*.incomplete"))
+
+    if incomplete_files:
+        log_info_on_rank0(
+            logger,
+            f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
+            f"{model_name_or_path}. Will clean up and re-download.",
+        )
+        _cleanup_corrupted_model_cache(
+            model_name_or_path,
+            found_local_snapshot_dir,
+            f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
+        )
         return None
 
     local_weight_files: List[str] = []
@@ -418,7 +427,84 @@ def find_local_hf_snapshot_dir(
             f"Local HF snapshot at {found_local_snapshot_dir} has no files matching "
             f"{allow_patterns}; will attempt download.",
         )
-    return None
+        return None
+
+
+def find_local_hf_snapshot_dir(
+    model_name_or_path: str,
+    cache_dir: Optional[str],
+    allow_patterns: List[str],
+    revision: Optional[str] = None,
+) -> Optional[str]:
+    """If the weights are already local, skip downloading and returns the path.
+
+    This function acquires a lock to prevent race conditions during validation
+    and cleanup. For use within download_weights_from_hf, use
+    _find_local_hf_snapshot_dir_unlocked instead with an external lock.
+    """
+    # For local paths, no locking needed
+    if os.path.isdir(model_name_or_path):
+        return None
+
+    # Use file lock to prevent multiple processes (TP ranks) from
+    # validating and cleaning up the same model cache simultaneously.
+    with get_lock(model_name_or_path, cache_dir):
+        return _find_local_hf_snapshot_dir_unlocked(
+            model_name_or_path, cache_dir, allow_patterns, revision
+        )
+
+
+def _validate_weights_after_download(
+    hf_folder: str,
+    allow_patterns: List[str],
+    model_name_or_path: str,
+) -> bool:
+    """Validate downloaded weight files to catch corruption early.
+
+    This function validates safetensors files after download to catch
+    corruption issues (truncated downloads, network errors, etc.) before
+    model loading fails with cryptic errors.
+
+    Args:
+        hf_folder: Path to the downloaded model folder
+        allow_patterns: Patterns used to match weight files
+        model_name_or_path: Model identifier for error messages
+
+    Returns:
+        True if all files are valid, False if corrupted files were found and cleaned up
+    """
+    import glob as glob_module
+
+    # Find all weight files that were downloaded
+    weight_files: List[str] = []
+    for pattern in allow_patterns:
+        weight_files.extend(glob_module.glob(os.path.join(hf_folder, pattern)))
+
+    if not weight_files:
+        return True  # No weight files to validate
+
+    # Validate safetensors files
+    corrupted_files = []
+    for f in weight_files:
+        if f.endswith(".safetensors") and os.path.exists(f):
+            if not _validate_safetensors_file(f):
+                corrupted_files.append(os.path.basename(f))
+
+    if corrupted_files:
+        # Clean up corrupted files so next attempt re-downloads them
+        _cleanup_corrupted_files_selective(
+            model_name_or_path,
+            [os.path.join(hf_folder, f) for f in corrupted_files],
+        )
+        log_info_on_rank0(
+            logger,
+            f"Downloaded model files are corrupted for {model_name_or_path}: "
+            f"{corrupted_files}. The corrupted files have been removed. "
+            "Will retry download.",
+        )
+        return False
+
+    return True
 
 
 def download_weights_from_hf(
@@ -427,6 +513,7 @@ def download_weights_from_hf(
     allow_patterns: List[str],
     revision: Optional[str] = None,
     ignore_patterns: Optional[Union[str, List[str]]] = None,
+    max_retries: int = 3,
 ) -> str:
     """Download model weights from Hugging Face Hub.
 
@@ -441,46 +528,84 @@ def download_weights_from_hf(
         ignore_patterns (Optional[Union[str, List[str]]]): The patterns to
             filter out the weight files. Files matched by any of the patterns
             will be ignored.
+        max_retries (int): Maximum number of download retries if corruption
+            is detected. Defaults to 3.
 
     Returns:
         str: The path to the downloaded model weights.
     """
+    # For local paths, no HF operations needed
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
 
-    if is_in_ci():
-        # If the weights are already local, skip downloading and returns the path.
-        # This is used to skip too-many Huggingface API calls in CI.
-        path = find_local_hf_snapshot_dir(
+    # Use a SINGLE lock for the entire operation (validation + cleanup + download)
+    # to prevent race conditions where:
+    # 1. Process A validates, finds corruption, deletes corrupted file
+    # 2. Process B validates, sees missing file, deletes ENTIRE cache
+    # 3. Process A tries to download but cache is gone
+    # By using one lock, validation/cleanup and download are atomic.
+    with get_lock(model_name_or_path, cache_dir):
+        # Check for valid local cache first (validates and cleans up if needed)
+        path = _find_local_hf_snapshot_dir_unlocked(
             model_name_or_path, cache_dir, allow_patterns, revision
         )
         if path is not None:
+            # Valid local cache found, skip download
             return path
 
-    if not huggingface_hub.constants.HF_HUB_OFFLINE:
-        # Before we download we look at that is available:
-        fs = HfFileSystem()
-        file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+        # In CI, skip HF API calls if we're in offline mode or want to avoid rate limits
+        # But we already checked for local cache above, so if we're here we need to download
+        if not huggingface_hub.constants.HF_HUB_OFFLINE:
+            # Before we download we look at what is available:
+            fs = HfFileSystem()
+            file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
 
-        # depending on what is available we download different things
-        for pattern in allow_patterns:
-            matching = fnmatch.filter(file_list, pattern)
-            if len(matching) > 0:
-                allow_patterns = [pattern]
-                break
+            # depending on what is available we download different things
+            for pattern in allow_patterns:
+                matching = fnmatch.filter(file_list, pattern)
+                if len(matching) > 0:
+                    allow_patterns = [pattern]
+                    break
 
-    log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
-    # Use file lock to prevent multiple processes from
-    # downloading the same model weights at the same time.
-    with get_lock(model_name_or_path, cache_dir):
-        hf_folder = snapshot_download(
-            model_name_or_path,
-            allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns,
-            cache_dir=cache_dir,
-            tqdm_class=DisabledTqdm,
-            revision=revision,
-            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-        )
-    return hf_folder
+        log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
+
+        # Retry loop for handling corrupted downloads
+        for attempt in range(max_retries):
+            hf_folder = snapshot_download(
+                model_name_or_path,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_patterns,
+                cache_dir=cache_dir,
+                tqdm_class=DisabledTqdm,
+                revision=revision,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+
+            # Validate downloaded files to catch corruption early
+            is_valid = _validate_weights_after_download(
+                hf_folder, allow_patterns, model_name_or_path
+            )
+
+            if is_valid:
+                return hf_folder
+
+            # Validation failed, corrupted files were cleaned up
+            if attempt < max_retries - 1:
+                log_info_on_rank0(
+                    logger,
+                    f"Retrying download for {model_name_or_path} "
+                    f"(attempt {attempt + 2}/{max_retries})...",
+                )
+            else:
+                raise RuntimeError(
+                    f"Downloaded model files are still corrupted for "
+                    f"{model_name_or_path} after {max_retries} attempts. "
+                    "This may indicate a persistent issue with the model files "
+                    "on Hugging Face Hub or network problems."
+                )
+
+        # This should never be reached, but just in case
+        return hf_folder
 
 
 def download_safetensors_index_file_from_hf(
