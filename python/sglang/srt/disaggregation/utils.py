@@ -240,6 +240,7 @@ class ReqMetadataView:
     output_ids: List[int]
     cached_tokens: int
     return_logprob: bool
+    top_logprobs_num: int = 0
     output_token_logprobs_val: Optional[List[float]] = None
     output_token_logprobs_idx: Optional[List[int]] = None
     output_top_logprobs_val: Optional[List[List[float]]] = None
@@ -259,6 +260,7 @@ class ReqMetadataView:
             output_ids=req.output_ids[:] if req.output_ids else [],  # 浅拷贝列表
             cached_tokens=req.cached_tokens,
             return_logprob=req.return_logprob,
+            top_logprobs_num=req.top_logprobs_num,
             output_token_logprobs_val=(
                 req.output_token_logprobs_val[:] 
                 if req.output_token_logprobs_val else None
@@ -428,64 +430,64 @@ class TransferContext:
         self._resolved = False
     
     def resolve(self) -> None:
-        """
-        Synchronize CUDA and populate request metadata buffers.
-        This method creates read-only snapshots of reqs to avoid race conditions
-        with the main thread. It does NOT modify the original req objects.
-        Safe to call multiple times - only executes once.
-        """
         if self._resolved:
             return
         
-        (
-            logits_output,
-            next_token_ids,
-            extend_input_len_per_req,
-            extend_logprob_start_len_per_req,
-            copy_done,
-        ) = (
-            self.result.logits_output,
-            self.result.next_token_ids,
-            self.result.extend_input_len_per_req,
-            self.result.extend_logprob_start_len_per_req,
-            self.result.copy_done,
-        )
+        # Synchronize CUDA before populating metadata buffers
+        copy_done = self.result.copy_done
         if copy_done is not None:
             copy_done.synchronize()
         
-        # Convert to list if tensor for processing
-        next_token_ids_list:List[int] = (
+        # Get logits_output for logprobs extraction
+        logits_output = self.result.logits_output
+        
+        # Convert next_token_ids to list if tensor
+        next_token_ids = self.result.next_token_ids
+        next_token_ids_list: List[int] = (
             next_token_ids.tolist()
             if isinstance(next_token_ids, torch.Tensor)
             else next_token_ids
         )
         
-        # Prepare logprobs data if needed
-        if self.batch.return_logprob:
+        # Prepare logprobs data from logits_output (convert tensors to lists)
+        # These are the OUTPUT logprobs for the first generated token
+        next_token_logprobs = None
+        next_token_top_logprobs_val = None
+        next_token_top_logprobs_idx = None
+        
+        if self.batch.return_logprob and logits_output is not None:
             if logits_output.next_token_logprobs is not None:
-                logits_output.next_token_logprobs = (
+                next_token_logprobs = (
                     logits_output.next_token_logprobs.tolist()
+                    if isinstance(logits_output.next_token_logprobs, torch.Tensor)
+                    else logits_output.next_token_logprobs
                 )
-            if logits_output.input_token_logprobs is not None:
-                logits_output.input_token_logprobs = tuple(
-                    logits_output.input_token_logprobs.tolist()
-                )
+            if logits_output.next_token_top_logprobs_val is not None:
+                next_token_top_logprobs_val = logits_output.next_token_top_logprobs_val
+            if logits_output.next_token_top_logprobs_idx is not None:
+                next_token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
         
         # Create read-only snapshots of reqs and populate metadata buffers
         # This avoids race conditions with the main thread which modifies reqs
-        logprob_pt = 0
         for i, (req, next_token_id) in enumerate(
             zip(self.batch.reqs, next_token_ids_list, strict=True)
         ):
             if req.is_chunked <= 0:
-                # Create a snapshot of the req with updated data for set_buf
-                # We need to include the next_token_id in output_ids for set_buf
                 snapshot = ReqMetadataView.from_req(req)
                 
                 snapshot.output_ids = [next_token_id]
+
+                if snapshot.return_logprob:
+                    if next_token_logprobs is not None:
+                        snapshot.output_token_logprobs_val = [next_token_logprobs[i]]
+                        snapshot.output_token_logprobs_idx = [next_token_id]
+                    if snapshot.top_logprobs_num > 0:
+                        if next_token_top_logprobs_val is not None:
+                            snapshot.output_top_logprobs_val = [next_token_top_logprobs_val[i]]
+                        if next_token_top_logprobs_idx is not None:
+                            snapshot.output_top_logprobs_idx = [next_token_top_logprobs_idx[i]]
                 
-                # Update snapshot with spec info if available
-                # This is safe because we're modifying the snapshot, not the original req
+
                 if self.batch.spec_info is not None:
                     snapshot.output_topk_p = self.batch.spec_info.topk_p[i]
                     snapshot.output_topk_index = self.batch.spec_info.topk_index[i]
@@ -495,29 +497,10 @@ class TransferContext:
                 else:
                     snapshot.hidden_states_tensor = None
                 
-                # This updates the snapshot's logprobs fields without modifying the original req
-                # Use mutable=True so modifications to minimal_req update the snapshot
-                minimal_req_for_logprobs = snapshot.to_req_like(mutable=True)
-                logprob_pt = process_logprobs_for_request(
-                    self.scheduler,
-                    minimal_req_for_logprobs,
-                    i,
-                    logits_output,
-                    extend_input_len_per_req,
-                    extend_logprob_start_len_per_req,
-                    logprob_pt,
-                    next_token_ids=[next_token_id],
-                    is_last_prefill_chunk=False,
-                )
-                
-                # Use snapshot to populate metadata buffer (read-only operation)
                 minimal_req = snapshot.to_req_like(mutable=False)
                 self.metadata_buffers.set_buf(minimal_req)
             else:
-                # Chunked prefill: skip logprobs processing here
-                # The main thread will process logprobs when the req is scheduled again.
-                # set_buf will be called only when the last chunk is processed, at which
-                # point the main thread has already filled all logprobs.
+                # Chunked prefill: set_buf will be called only when the last chunk is processed
                 pass
         
         self._resolved = True

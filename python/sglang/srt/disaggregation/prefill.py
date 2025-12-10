@@ -498,7 +498,7 @@ class SchedulerDisaggregationPrefillMixin:
                     extend_input_len_per_req,
                     extend_logprob_start_len_per_req,
                     logprob_pt,
-                    next_token_ids=[next_token_ids],
+                    next_token_ids=next_token_ids,
                     is_last_prefill_chunk=True,
                 )
                 # When async_transfer is enabled, send_kv_chunk is called in notify_prefill_done
