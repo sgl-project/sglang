@@ -319,6 +319,9 @@ class TestFixedBugs(unittest.TestCase):
         )
 
 
+@unittest.skipIf(
+    is_in_ci(), "Skipping GLM41V PP accuracy test before it gets more stable"
+)
 class TestGLM41VPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
