@@ -198,6 +198,9 @@ class NgramVerifyInput(SpecInput):
                             # al_num_tokens=462400, available_size=378013, evictable_size=84388, protec
                             # ted_size=0
                             # ```
+                            logger.error("Grammar rejected")
+                            # req.grammar.force_terminate = True
+                            req.grammar.rollback(0)
                             self.accept_index[i, j + 1:] = -1
                             break
                         is_accepting = is_accepted

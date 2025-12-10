@@ -640,6 +640,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         # FIXME: unify the length validation logic with the one in the scheduler.
         _max_req_len = self.context_len
 
+        max_new_tokens = obj.sampling_params.get("max_new_tokens", 4096)
+
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.reserve_input_token_num
         if input_token_num >= self.context_len:
@@ -649,7 +651,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     f"model's context length ({self.context_len} tokens). "
                     "Truncating the input."
                 )
-                del input_ids[_max_req_len:]
+
+                # NOTE remove middle
+                assert _max_req_len > max_new_tokens
+                prompt_len = _max_req_len - max_new_tokens
+                assert prompt_len >= 2
+                input_ids = input_ids[:prompt_len // 2] + input_ids[-(prompt_len // 2):]
+
                 input_token_num = len(input_ids)
             else:
                 raise ValueError(
@@ -664,7 +672,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             )
 
         # Check total tokens (input + max_new_tokens)
-        max_new_tokens = obj.sampling_params.get("max_new_tokens")
         if (
             max_new_tokens is not None
             and (max_new_tokens + input_token_num) >= _max_req_len
