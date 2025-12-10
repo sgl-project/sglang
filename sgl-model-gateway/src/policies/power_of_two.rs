@@ -57,13 +57,16 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         let worker1 = &workers[worker_idx1];
         let worker2 = &workers[worker_idx2];
 
-
         // Access cached loads safely
         let loads_guard = self.cached_loads.read().ok();
 
         // Try to get high-fidelity token loads for BOTH workers
-        let load1_tokens = loads_guard.as_ref().and_then(|m| m.get(worker1.url()).copied());
-        let load2_tokens = loads_guard.as_ref().and_then(|m| m.get(worker2.url()).copied());
+        let load1_tokens = loads_guard
+            .as_ref()
+            .and_then(|m| m.get(worker1.url()).copied());
+        let load2_tokens = loads_guard
+            .as_ref()
+            .and_then(|m| m.get(worker2.url()).copied());
 
         // If either worker is missing token data (e.g. monitor failure),
         // we must degrade BOTH to request counts to ensure fairness.
@@ -71,7 +74,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             (Some(t1), Some(t2)) => {
                 // Both have token data. Compare Tokens.
                 (t1, t2)
-            },
+            }
             _ => {
                 // If One or both are missing token data.
                 // Fallback to local request counts for BOTH.
@@ -218,8 +221,8 @@ mod tests {
 
     #[test]
     fn test_reproduce_incompatible_metric_bug() {
-        use std::collections::HashMap;
-        use std::sync::Arc;
+        use std::{collections::HashMap, sync::Arc};
+
         use crate::core::{BasicWorkerBuilder, WorkerType};
 
         // 1. Setup the policy
@@ -240,10 +243,7 @@ mod tests {
             worker_b.increment_load();
         }
 
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            Arc::new(worker_a),
-            Arc::new(worker_b)
-        ];
+        let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(worker_a), Arc::new(worker_b)];
 
         // 4. Simulate LoadMonitor update:
         // Only Worker A gets a token report. Worker B is missing (e.g. monitor failure).
@@ -252,7 +252,9 @@ mod tests {
         policy.update_loads(&loads);
 
         // 5. Run selection
-        let selected_idx = policy.select_worker(&workers, None).expect("Should select a worker");
+        let selected_idx = policy
+            .select_worker(&workers, None)
+            .expect("Should select a worker");
 
         // 6. Verify the Fix
         // Logic:
@@ -264,16 +266,21 @@ mod tests {
         if selected_idx == 0 {
             println!("Bug Fixed: System correctly fell back to request counts and selected idle Worker A.");
         } else {
-            println!("Bug PERSISTS: Selected Worker B (Load: 5 reqs) over Worker A (Load: 50k tokens)");
+            println!(
+                "Bug PERSISTS: Selected Worker B (Load: 5 reqs) over Worker A (Load: 50k tokens)"
+            );
         }
 
         // Assert that the CORRECT worker (A, index 0) is selected
-        assert_eq!(selected_idx, 0, "The policy failed to handle incompatible metrics. Should select idle Worker A.");
+        assert_eq!(
+            selected_idx, 0,
+            "The policy failed to handle incompatible metrics. Should select idle Worker A."
+        );
     }
     #[test]
     fn test_power_of_two_edge_cases() {
-        use std::collections::HashMap;
-        use std::sync::Arc;
+        use std::{collections::HashMap, sync::Arc};
+
         use crate::core::{BasicWorkerBuilder, WorkerType};
 
         let policy = PowerOfTwoPolicy::new();
@@ -283,7 +290,9 @@ mod tests {
             let w = BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
                 .build();
-            for _ in 0..reqs { w.increment_load(); }
+            for _ in 0..reqs {
+                w.increment_load();
+            }
             Arc::new(w)
         };
 
@@ -301,8 +310,10 @@ mod tests {
         policy.update_loads(&loads_1);
 
         let idx_1 = policy.select_worker(&workers_1, None).unwrap();
-        assert_eq!(idx_1, 0, "Happy Path Failed: Should select Worker A (fewer tokens) despite higher request count");
-
+        assert_eq!(
+            idx_1, 0,
+            "Happy Path Failed: Should select Worker A (fewer tokens) despite higher request count"
+        );
 
         // Scenario 2: Partial Failure (Worker A has tokens, Worker B is missing)
         // Worker A: 10 requests, 1,000 tokens (Cached)
@@ -320,7 +331,6 @@ mod tests {
         let idx_2 = policy.select_worker(&workers_2, None).unwrap();
         assert_eq!(idx_2, 1, "Partial Fail 1 Failed: Should fallback to requests and select Worker B (fewer requests)");
 
-
         // Scenario 3: Partial Failure (Worker A is missing, Worker B has tokens)
         // Worker A:  2 requests, MISSING cache
         // Worker B: 10 requests, 1,000 tokens (Cached)
@@ -337,7 +347,6 @@ mod tests {
         let idx_3 = policy.select_worker(&workers_3, None).unwrap();
         assert_eq!(idx_3, 0, "Partial Fail 2 Failed: Should fallback to requests and select Worker A (fewer requests)");
 
-
         // Scenario 4: Total Failure (Both missing)
         // Worker A: 5 requests
         // Worker B: 3 requests
@@ -350,7 +359,10 @@ mod tests {
         policy.update_loads(&loads_4);
 
         let idx_4 = policy.select_worker(&workers_4, None).unwrap();
-        assert_eq!(idx_4, 1, "Total Fail Failed: Should select Worker B based on request count");
+        assert_eq!(
+            idx_4, 1,
+            "Total Fail Failed: Should select Worker B based on request count"
+        );
 
         println!("All edge case tests passed successfully.");
     }
