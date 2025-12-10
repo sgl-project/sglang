@@ -417,9 +417,7 @@ class SchedulerDisaggregationPrefillMixin:
             sender = req.disagg_kv_sender
             if not hasattr(sender, "transfer_context"):
                 continue
-            ctx = sender.transfer_context
-            if ctx is None:
-                sender.transfer_context = transfer_context
+            sender.transfer_context = transfer_context
             self.send_kv_chunk(req, last_chunk=req.is_chunked <= 0)
 
     def process_batch_result_disagg_prefill(
