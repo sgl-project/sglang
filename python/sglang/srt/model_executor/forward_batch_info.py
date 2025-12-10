@@ -29,7 +29,6 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -204,16 +203,6 @@ class CaptureHiddenMode(IntEnum):
         return self.value < other.value
 
 
-def _clamp_value(
-    value: Union[torch.Tensor, int], min_val: int, max_val: int
-) -> Union[torch.Tensor, int]:
-    """Clamp a value to [min_val, max_val]. Handles both tensors and Python ints."""
-    if isinstance(value, torch.Tensor):
-        return torch.clamp(value, min_val, max_val)
-    else:
-        return math.clamp(value, min_val, max_val)
-
-
 def compute_local_num_token_non_padded(
     global_num_token_non_padded: torch.Tensor | int,
     num_tokens_per_dp: int,
@@ -227,10 +216,10 @@ def compute_local_num_token_non_padded(
     attn_tp_size = get_attention_tp_size()
     tokens_per_rank = num_tokens_per_dp // attn_tp_size
 
-    return _clamp_value(
+    return torch.clamp(
         global_num_token_non_padded - tokens_per_rank * attn_tp_rank,
-        min_val=0,
-        max_val=tokens_per_rank,
+        0,
+        tokens_per_rank,
     )
 
 
