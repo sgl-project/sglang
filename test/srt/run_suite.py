@@ -171,6 +171,7 @@ suites = {
     "per-commit-4-gpu-b200": [
         TestFile("test_deepseek_v3_fp4_4gpu.py", 1800),
         TestFile("test_flash_attention_4.py", 300),
+        TestFile("test_fp8_blockwise_gemm.py", 280),
         TestFile("test_gpt_oss_4gpu.py", 600),
         TestFile("test_llama31_fp4.py", 300),
         TestFile("test_eagle_infer_beta_dp_attention.py", 300),
@@ -201,6 +202,7 @@ suites = {
     # Nightly test suites have been moved to test/run_suite_nightly.py
     "__not_in_ci__": [
         TestFile("test_release_memory_occupation.py", 200),  # Temporarily disabled
+        TestFile("lora/test_lora_hf_sgl_logprob_diff.py"),  # Nightly test
         TestFile("models/test_dummy_grok_models.py"),
         TestFile(
             "rl/test_update_weights_from_disk.py"
