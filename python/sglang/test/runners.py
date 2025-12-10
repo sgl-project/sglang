@@ -441,6 +441,7 @@ class HFRunner:
                 )
             else:
                 model = base_model
+
             if patch_model_do_sample_false:
                 model.generation_config.do_sample = False
             outputs = model.generate(
@@ -460,6 +461,7 @@ class HFRunner:
             text = tokenizer.decode(
                 outputs[0][0][len(input_ids[0]) :], skip_special_tokens=True
             )
+
             # Check if the text is empty or only whitespace.
             if not text.strip():
                 raise ValueError(
