@@ -300,7 +300,8 @@ class TestTBOWithTPAttn(CustomTestCase):
         self.assertGreater(metrics["accuracy"], 0.60)
 
 
-class TestTBOWithTPAttnAndDenseTP(CustomTestCase):
+@unittest.skip("covered in TestMTPWithTPAttnAndTBO")
+class TestTBOWithTPAttnAndDenseDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
