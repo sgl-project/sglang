@@ -417,7 +417,7 @@ class SchedulerMetricsMixin:
 
         # Running prefill requests are neither in waiting queues nor in running batch
         running_prefill_reqs = []
-        if self.cur_batch.forward_mode.is_extend():
+        if self.cur_batch and self.cur_batch.forward_mode.is_extend():
             running_prefill_reqs = self.cur_batch.reqs
 
         num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
