@@ -119,6 +119,8 @@ class DiffusionServerArgs:
     custom_validator: str | None = None  # optional custom validator name
     # resources
     num_gpus: int = 1
+    # LoRA
+    lora_path: str | None = None  # LoRA adapter path (HF repo or local path)
 
 
 @dataclass(frozen=True)
@@ -269,18 +271,19 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
         ),
     ),
     # === Text and Image to Image (TI2I) ===
-    # TODO: Timeout with Torch2.9. Add back when it can pass CI
-    # DiffusionTestCase(
-    #     id="qwen_image_edit_ti2i",
-    #     model_path="Qwen/Qwen-Image-Edit",
-    #     modality="image",
-    #     prompt=None,  # not used for editing
-    #     output_size="1024x1536",
-    #     warmup_text=0,
-    #     warmup_edit=1,
-    #     edit_prompt="Convert 2D style to 3D style",
-    #     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-    # ),
+    DiffusionTestCase(
+        "qwen_image_edit_ti2i",
+        DiffusionServerArgs(
+            model_path="Qwen/Qwen-Image-Edit",
+            modality="image",
+            warmup_text=0,
+            warmup_edit=1,
+        ),
+        DiffusionSamplingParams(
+            prompt="Convert 2D style to 3D style",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
+    ),
 ]
 
 ONE_GPU_CASES_B: list[DiffusionTestCase] = [
@@ -297,6 +300,24 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt="A curious raccoon",
             output_size="848x480",
+        ),
+    ),
+    # LoRA test case for single transformer + merge/unmerge API test
+    DiffusionTestCase(
+        "wan2_1_t2v_1_3b_lora_1gpu",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=1,
+            lora_path="Cseti/Wan-LoRA-Arcane-Jinx-v1",
+        ),
+        DiffusionSamplingParams(
+            prompt="csetiarcane Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
+            output_size="480x320",
+            num_frames=8,
         ),
     ),
     # NOTE(mick): flaky
@@ -401,6 +422,23 @@ TWO_GPU_CASES_A = [
             output_size="720x480",
         ),
     ),
+    # LoRA test case for transformer_2 support
+    DiffusionTestCase(
+        "wan2_2_t2v_a14b_lora_2gpu",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=2,
+            lora_path="Cseti/wan2.2-14B-Arcane_Jinx-lora-v1",
+        ),
+        DiffusionSamplingParams(
+            prompt="Nfj1nx with blue hair, a woman walking in a cyberpunk city at night",
+            output_size="720x480",
+        ),
+    ),
     DiffusionTestCase(
         "wan2_1_t2v_14b_2gpu",
         DiffusionServerArgs(
@@ -433,6 +471,24 @@ TWO_GPU_CASES_B = [
             output_size="832x1104",
             prompt="Add dynamic motion to the scene",
             image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+        ),
+    ),
+    # I2V LoRA test case
+    DiffusionTestCase(
+        "wan2_1_i2v_14b_lora_2gpu",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+            num_gpus=2,
+            lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
+        ),
+        DiffusionSamplingParams(
+            prompt="faxiang, the person raises hands, a giant translucent golden figure appears behind",
+            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+            output_size="832x1104",
         ),
     ),
     DiffusionTestCase(
