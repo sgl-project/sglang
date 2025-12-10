@@ -368,6 +368,15 @@ def _print_deprecated_env(new_name: str, old_name: str):
         os.environ[new_name] = os.environ[old_name]
 
 
+def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
+    """Warn when a deprecated environment variable is used.
+
+    This is for env vars that are deprecated in favor of CLI flags.
+    """
+    if env_name in os.environ:
+        warnings.warn(f"Environment variable {env_name} is deprecated. {suggestion}")
+
+
 def _convert_SGL_to_SGLANG():
     _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
     _print_deprecated_env(
@@ -387,6 +396,19 @@ def _convert_SGL_to_SGLANG():
 
 
 _convert_SGL_to_SGLANG()
+
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_FP8_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_ENABLE_FLASHINFER_GEMM",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=flashinfer_trtllm' instead.",
+)
+_warn_deprecated_env_to_cli_flag(
+    "SGLANG_SUPPORT_CUTLASS_BLOCK_FP8",
+    "It will be completely removed in 0.5.7. Please use '--fp8-gemm-backend=cutlass' instead.",
+)
 
 
 def example_with_exit_stack():
