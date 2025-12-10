@@ -522,7 +522,6 @@ class RouterArgs:
             default=None,
             help="Specify the parser for reasoning models (e.g., deepseek-r1, qwen3)",
         )
-        # Get parser choices dynamically from the Rust implementation
         tool_call_parser_choices = get_available_tool_call_parsers()
         parser.add_argument(
             f"--{prefix}tool-call-parser",
