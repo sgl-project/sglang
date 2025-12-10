@@ -85,29 +85,31 @@ static __forceinline__ int clamp_item_per_thread(int ip_req) {
 }
 static __forceinline__ void compute_block_and_ipt(int N, int& block_x, int& ipt, int M = 1000) {
   // Adaptive strategy based on M (grid size):
-  // - Small M (<200): Prioritize block occupancy, use ipt=1 for larger blocks
-  // - Large M (>=200): Prioritize ILP, use dynamic ipt for better per-thread work
+  // - M < 200        : ipt = 1  (maximize block size for occupancy)
+  // - 200 <= M <=1000: ipt = 2  (increase moderate ILP)
+  // - 1000 < M <=10000: ipt = 4 (more ILP when there are many rows)
+  // - M > 10000      : ipt = 8  (high ILP for very large grids)
   const int n4 = N / 4;
   
-  if (M < 200) {
-    // Small grid: maximize block size for better occupancy per block
-    ipt = 1;
-    int bx = n4;
-    bx = round_up32(bx);
-    if (bx < 32) bx = 32;
-    if (bx > 1024) bx = 1024;
-    block_x = bx;
+  // Choose ipt by M ranges
+  if (M > 1000000) {
+    ipt = 16;
+  } else if (M > 100000) {
+    ipt = 8;
+  } else if (M > 10000) {
+    ipt = 4;
+  } else if (M >= 1000) {
+    ipt = 2;
   } else {
-    // Large grid: balance block size and ILP
-    const int target_block = 256; // base target; will be rounded to warp-aligned
-    int ip_req = (n4 + target_block - 1) / target_block; // how many T4 groups each thread should process
-    ipt = clamp_item_per_thread(ip_req);
-    int bx = (n4 + ipt - 1) / ipt;
-    bx = round_up32(bx);
-    if (bx < 32) bx = 32;
-    if (bx > 1024) bx = 1024;
-    block_x = bx;
+    ipt = 1;
   }
+
+  // Compute block size from chosen ipt, ensure warp alignment and bounds
+  int bx = (n4 + ipt - 1) / ipt;   // ceil(n4 / ipt)
+  bx = round_up32(bx);             // warp-align
+  if (bx < 32)  bx = 32;
+  if (bx > 1024) bx = 1024;
+  block_x = bx;
 }
 
 template<typename T4, typename T, int ITEM_PER_THREAD>
@@ -945,130 +947,28 @@ static void layernorm_fused_res_gate_scale_shift_launch_with_residual(
       shift2d = torch::zeros({M, N}, x.options());
     }
     if (std::is_same<T, float>::value) {
-      if (N <= 4096) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-          (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 8192) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-          (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 16384) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-          (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 32768) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-          (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else {
-        layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-          (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-          (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
+      switch (ipt) {
+        case 1:  layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 1 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 2:  layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 2 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 4:  layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 4 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 8:  layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 8 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        default: layernorm_e4_fused_res_gate_scale_shift_2d<float4, float, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale2d.data_ptr(), (const float4*)shift2d.data_ptr(), (gate_mode == 1) ? (const float4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
       }
     } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
-      if (N <= 4096) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-          (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 8192) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-          (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 16384) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-          (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 32768) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-          (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else {
-        layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-          (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-          (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
+      switch (ipt) {
+        case 1:  layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 1 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 2:  layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 2 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 4:  layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 4 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 8:  layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 8 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        default: layernorm_e4_fused_res_gate_scale_shift_2d<bf16_4, cutlass::bfloat16_t, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale2d.data_ptr(), (const bf16_4*)shift2d.data_ptr(), (gate_mode == 1) ? (const bf16_4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
       }
     } else {
-      if (N <= 4096) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-          (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 8192) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-          (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 16384) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-          (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else if (N <= 32768) {
-        layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-          (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
-      } else {
-        layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-          (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-          (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-          (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(),
-          (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr,
-          (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr,
-          (int)M, (int)N, gate_mode, rows_per_b);
+      switch (ipt) {
+        case 1:  layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 1 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 2:  layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 2 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 4:  layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 4 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        case 8:  layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 8 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
+        default: layernorm_e4_fused_res_gate_scale_shift_2d<half4, half, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale2d.data_ptr(), (const half4*)shift2d.data_ptr(), (gate_mode == 1) ? (const half4*)gate.data_ptr() : nullptr, (gate_mode == 2) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, rows_per_b); break;
       }
     }
     return;
@@ -1081,115 +981,28 @@ static void layernorm_fused_res_gate_scale_shift_launch_with_residual(
   TORCH_CHECK(gate_mode == 0 || gate_mode == 3, "When scale/shift are 4D, gate must be none or 4D [B,F,1,N]");
 
   if (std::is_same<T, float>::value) {
-    if (N <= 4096) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-        (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-        (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 8192) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-        (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-        (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 16384) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-        (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-        (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 32768) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-        (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-        (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else {
-      layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(),
-        (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(),
-        (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
+    switch (ipt) {
+      case 1:  layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 1 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 2:  layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 2 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 4:  layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 4 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 8:  layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 8 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      default: layernorm_e4_fused_res_gate_scale_shift_4d<float4, float, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((float4*)y.data_ptr(), (float4*)residual_out.data_ptr(), (const float4*)x.data_ptr(), (const float4*)residual.data_ptr(), (const float4*)gamma.data_ptr(), (const float4*)beta.data_ptr(), (const float4*)scale.data_ptr(), (const float4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const float4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
     }
   } else if (std::is_same<T, cutlass::bfloat16_t>::value) {
-    if (N <= 4096) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-        (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-        (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 8192) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-        (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-        (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 16384) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-        (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-        (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 32768) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-        (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-        (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else {
-      layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(),
-        (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(),
-        (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
+    switch (ipt) {
+      case 1:  layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 1 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 2:  layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 2 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 4:  layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 4 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 8:  layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 8 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      default: layernorm_e4_fused_res_gate_scale_shift_4d<bf16_4, cutlass::bfloat16_t, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((bf16_4*)y.data_ptr(), (bf16_4*)residual_out.data_ptr(), (const bf16_4*)x.data_ptr(), (const bf16_4*)residual.data_ptr(), (const bf16_4*)gamma.data_ptr(), (const bf16_4*)beta.data_ptr(), (const bf16_4*)scale.data_ptr(), (const bf16_4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const bf16_4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
     }
   } else {
-    if (N <= 4096) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 1><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-        (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-        (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 8192) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-        (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-        (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 16384) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-        (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-        (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else if (N <= 32768) {
-      layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 8><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-        (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-        (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
-    } else {
-      layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        (half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(),
-        (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(),
-        (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(),
-        nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr,
-        (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen);
+    switch (ipt) {
+      case 1:  layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 1 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 2:  layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 2 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 4:  layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 4 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      case 8:  layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 8 ><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
+      default: layernorm_e4_fused_res_gate_scale_shift_4d<half4, half, 16><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>((half4*)y.data_ptr(), (half4*)residual_out.data_ptr(), (const half4*)x.data_ptr(), (const half4*)residual.data_ptr(), (const half4*)gamma.data_ptr(), (const half4*)beta.data_ptr(), (const half4*)scale.data_ptr(), (const half4*)shift.data_ptr(), nullptr, nullptr, (gate_mode == 3) ? (const half4*)gate.data_ptr() : nullptr, (int)M, (int)N, gate_mode, (int)B, (int)F, frame_seqlen); break;
     }
   }
 }
