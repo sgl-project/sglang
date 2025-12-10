@@ -3607,11 +3607,6 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
-            "--enable-torch-air-compile",
-            action="store_true",
-            help="Optimize the model with Torch Ascend Intermediate Representation compilation. Experimental feature.",
-        )
-        parser.add_argument(
             "--enable-torch-compile-debug-mode",
             action="store_true",
             help="Enable debug mode for torch compile",
