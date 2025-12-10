@@ -28,6 +28,7 @@ from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.utils import is_npu
+from sglang.utils import get_safe_path
 
 is_npu = is_npu()
 
@@ -102,7 +103,7 @@ class NPUGraphRunner(CudaGraphRunner):
         output_dir = os.path.join(
             os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp"), "graph_capture_profile"
         )
-        if not Path(output_dir).exists():
+        if not get_safe_path(output_dir).exists():
             Path(output_dir).mkdir(parents=True, exist_ok=True)
         logger.info(
             f"Profiling starts for graph capture for NPU. Traces will be saved to: {output_dir}"

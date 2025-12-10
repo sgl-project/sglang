@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from io import BytesIO
 from json import dumps
+from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
@@ -477,6 +478,34 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)
+
+
+def get_safe_path(path_str: str, base_dir: str = None) -> Path:
+    """
+    Get a safe path by resolving the path string and checking if it is relative to the allowed directory.
+
+    Args:
+        path_str: The path string to resolve
+        base_dir: The base directory to check against. Defaults to None.
+
+    Returns:
+        The resolved path as a Path object.
+    """
+    if not path_str:
+        raise ValueError(f"Empty path is not allowed")
+
+    # Define allowed path whitelist
+    allowed_absolute_paths = {Path("/tmp")}
+    base_path = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
+    allowed_absolute_paths.add(base_path)
+
+    path = Path(path_str)
+    if not path.is_absolute():
+        path = base_path / path
+    path = path.resolve()
+    if any(path.is_relative_to(allowed) for allowed in allowed_absolute_paths):
+        return path
+    raise ValueError(f"Path '{path_str}' is not allowed.")
 
 
 class TypeBasedDispatcher:
