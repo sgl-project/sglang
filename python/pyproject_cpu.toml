@@ -1,11 +1,11 @@
-# https://docs.sglang.ai/platforms/cpu_server.html
+# https://docs.sglang.io/platforms/cpu_server.html
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang"
-version = "0.5.5.post3"
+version = "0.5.6.post1"
 description = "SGLang is a fast serving framework for large language models and vision language models."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,13 +23,13 @@ dependencies = [
   "build",
   "compressed-tensors",
   "datasets",
-  "decord",
+  "decord; platform_machine == 'x86_64'",
   "einops",
   "fastapi",
   "gguf",
   "hf_transfer",
   "huggingface_hub",
-  "intel-openmp",
+  "intel-openmp; platform_machine == 'x86_64'",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
@@ -59,7 +59,7 @@ dependencies = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "transformers==4.57.1",
+  "transformers==5.0.0rc0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.27",
