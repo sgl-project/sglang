@@ -27,18 +27,6 @@ impl PowerOfTwoPolicy {
             cached_loads: RwLock::new(HashMap::new()),
         }
     }
-
-    fn get_worker_load(&self, worker: &dyn Worker) -> isize {
-        // First check cached loads (from external monitoring)
-        if let Ok(loads) = self.cached_loads.read() {
-            if let Some(&load) = loads.get(worker.url()) {
-                return load;
-            }
-        }
-
-        // Fall back to local load counter
-        worker.load() as isize
-    }
 }
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
@@ -66,12 +54,32 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
         let worker_idx1 = healthy_indices[idx1];
         let worker_idx2 = healthy_indices[idx2];
+        let worker1 = &workers[worker_idx1];
+        let worker2 = &workers[worker_idx2];
 
-        // Compare loads and select the less loaded one
-        let load1 = self.get_worker_load(workers[worker_idx1].as_ref());
-        let load2 = self.get_worker_load(workers[worker_idx2].as_ref());
 
-        // Log selection for debugging
+        // Access cached loads safely
+        let loads_guard = self.cached_loads.read().ok();
+
+        // Try to get high-fidelity token loads for BOTH workers
+        let load1_tokens = loads_guard.as_ref().and_then(|m| m.get(worker1.url()).copied());
+        let load2_tokens = loads_guard.as_ref().and_then(|m| m.get(worker2.url()).copied());
+
+        // If either worker is missing token data (e.g. monitor failure),
+        // we must degrade BOTH to request counts to ensure fairness.
+        let (load1, load2) = match (load1_tokens, load2_tokens) {
+            (Some(t1), Some(t2)) => {
+                // Both have token data. Compare Tokens.
+                (t1, t2)
+            },
+            _ => {
+                // If One or both are missing token data.
+                // Fallback to local request counts for BOTH.
+                (worker1.load() as isize, worker2.load() as isize)
+            }
+        };
+
+        // Select worker with lower load
         let selected_idx = if load1 <= load2 {
             worker_idx1
         } else {
@@ -80,9 +88,9 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
 
         debug!(
             "Power-of-two selection: {}={} vs {}={} -> selected {}",
-            workers[worker_idx1].url(),
+            worker1.url(),
             load1,
-            workers[worker_idx2].url(),
+            worker2.url(),
             load2,
             workers[selected_idx].url()
         );
@@ -207,6 +215,7 @@ mod tests {
         // With single worker, should always select it
         assert_eq!(policy.select_worker(&workers, None), Some(0));
     }
+
     #[test]
     fn test_reproduce_incompatible_metric_bug() {
         use std::collections::HashMap;
@@ -243,26 +252,22 @@ mod tests {
         policy.update_loads(&loads);
 
         // 5. Run selection
-        // In a 2-worker setup, Power-of-Two always picks both indices 0 and 1 to compare.
-        // Logic:
-        //   - Worker A Load = 50,000 (from cache, as tokens)
-        //   - Worker B Load = 5      (fallback to local, as requests)
-        //   - Comparison: 5 < 50,000
-        //   - Result: Worker B is selected.
-
         let selected_idx = policy.select_worker(&workers, None).expect("Should select a worker");
 
-        // 6. Verify the Bug
-        // CORRECT behavior (if fixed) would be to see A has 0 requests and B has 5 requests, selecting A.
-        // BUGGY behavior selects B because it compares 5 (requests) against 50,000 (tokens).
-        if selected_idx == 1 {
-            println!("BUG REPRODUCED: Selected Worker B (Load: 5 reqs) over Worker A (Load: 50k tokens)");
-            println!("The router erroneously treated '5 requests' as smaller than '50,000 tokens'.");
+        // 6. Verify the Fix
+        // Logic:
+        // - Worker A has token load (50k) but Worker B has NO token load.
+        // - Policy should fallback to request counts for BOTH.
+        // - A has 0 requests, B has 5 requests.
+        // - 0 <= 5, so A should be selected.
+
+        if selected_idx == 0 {
+            println!("Bug Fixed: System correctly fell back to request counts and selected idle Worker A.");
         } else {
-            println!("Bug NOT reproduced: System correctly identified Worker A as less loaded.");
+            println!("Bug PERSISTS: Selected Worker B (Load: 5 reqs) over Worker A (Load: 50k tokens)");
         }
 
-        // Assert that the buggy behavior occurs (Worker B is selected)
-        assert_eq!(selected_idx, 1, "The policy should have failed by selecting the 'busy' worker B due to metric mismatch.");
+        // Assert that the CORRECT worker (A, index 0) is selected
+        assert_eq!(selected_idx, 0, "The policy failed to handle incompatible metrics. Should select idle Worker A.");
     }
 }
