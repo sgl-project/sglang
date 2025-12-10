@@ -249,6 +249,7 @@ class ReqMetadataView:
     hidden_states_tensor: Optional[torch.Tensor] = None
     output_topk_p: Optional[torch.Tensor] = None
     output_topk_index: Optional[torch.Tensor] = None
+    is_chunked: int = 0
 
     @classmethod
     def from_req(cls, req: "Req") -> "ReqMetadataView":
@@ -291,6 +292,7 @@ class ReqMetadataView:
                 if req.output_topk_index is not None
                 else None
             ),
+            is_chunked=req.is_chunked,
         )
 
     def to_req_like(self, mutable: bool = False):
@@ -438,20 +440,20 @@ class TransferContext:
         self.metadata_buffers = metadata_buffers
         self.scheduler = scheduler
         self._resolved = False
+        self.snapshots = [
+            ReqMetadataView.from_req(req) for req in self.batch.reqs
+        ]  # Create read-only snapshots of reqs and populate metadata buffers
 
     def resolve(self) -> None:
         if self._resolved:
             return
 
-        # Synchronize CUDA before populating metadata buffers
         copy_done = self.result.copy_done
         if copy_done is not None:
             copy_done.synchronize()
 
-        # Get logits_output for logprobs extraction
         logits_output = self.result.logits_output
 
-        # Convert next_token_ids to list if tensor
         next_token_ids = self.result.next_token_ids
         next_token_ids_list: List[int] = (
             next_token_ids.tolist()
@@ -459,8 +461,6 @@ class TransferContext:
             else next_token_ids
         )
 
-        # Prepare logprobs data from logits_output (convert tensors to lists)
-        # These are the OUTPUT logprobs for the first generated token
         next_token_logprobs = None
         next_token_top_logprobs_val = None
         next_token_top_logprobs_idx = None
@@ -477,14 +477,10 @@ class TransferContext:
             if logits_output.next_token_top_logprobs_idx is not None:
                 next_token_top_logprobs_idx = logits_output.next_token_top_logprobs_idx
 
-        # Create read-only snapshots of reqs and populate metadata buffers
-        # This avoids race conditions with the main thread which modifies reqs
-        for i, (req, next_token_id) in enumerate(
-            zip(self.batch.reqs, next_token_ids_list, strict=True)
+        for i, (snapshot, next_token_id) in enumerate(
+            zip(self.snapshots, next_token_ids_list, strict=True)
         ):
-            if req.is_chunked <= 0:
-                snapshot = ReqMetadataView.from_req(req)
-
+            if snapshot.is_chunked <= 0:
                 snapshot.output_ids = [next_token_id]
 
                 if snapshot.return_logprob:
@@ -514,6 +510,7 @@ class TransferContext:
                 self.metadata_buffers.set_buf(minimal_req)
             else:
                 # Chunked prefill: set_buf will be called only when the last chunk is processed
+                # This is consistent with main thread logic
                 pass
 
         self._resolved = True

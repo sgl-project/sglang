@@ -842,14 +842,14 @@ class MooncakeKVManager(CommonKVManager):
                         if kv_chunk.is_last and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
 
-                    if (
-                        kv_chunk.room not in self.request_status
-                        or self.check_status(kv_chunk.room) == KVPoll.Success
-                    ):
-                        if kv_chunk.room in self.transfer_infos:
-                            self.transfer_infos.pop(kv_chunk.room)
-                        if kv_chunk.room in self.transfer_contexts:
-                            self.transfer_contexts.pop(kv_chunk.room)
+                if (
+                    kv_chunk.room not in self.request_status
+                    or self.check_status(kv_chunk.room) == KVPoll.Success
+                ):
+                    if kv_chunk.room in self.transfer_infos:
+                        self.transfer_infos.pop(kv_chunk.room)
+                    if kv_chunk.room in self.transfer_contexts:
+                        self.transfer_contexts.pop(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
