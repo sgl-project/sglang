@@ -19,6 +19,7 @@ def run_server(server_args):
 
         launch_server(server_args)
     else:
+        # Default mode: HTTP mode.
         from sglang.srt.entrypoints.http_server import launch_server
 
         launch_server(server_args)
