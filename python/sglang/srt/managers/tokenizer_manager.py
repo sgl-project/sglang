@@ -26,7 +26,7 @@ import time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
-from enum import Enum, auto
+from enum import Enum
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
@@ -76,10 +76,10 @@ from sglang.srt.managers.schedule_batch import RequestStage
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_communicator_mixin import TokenizerCommunicatorMixin
-from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.managers.tokenizer_manager_multiitem_mixin import (
     TokenizerManagerMultiItemMixin,
 )
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.metrics.collector import TokenizerMetricsCollector
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
