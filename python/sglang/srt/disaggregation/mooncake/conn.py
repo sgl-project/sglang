@@ -713,7 +713,7 @@ class MooncakeKVManager(CommonKVManager):
                 local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
                 transfer_context = self.transfer_contexts.get(kv_chunk.room)
 
-                if transfer_context is not None:
+                if transfer_context is not None and len(transfer_context) > 0:
                     chunk_context = transfer_context.popleft()
                     chunk_context.resolve()
 
