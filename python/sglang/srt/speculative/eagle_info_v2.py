@@ -148,13 +148,13 @@ class EagleDraftInputV2Mixin:
             bs = len(batch.seq_lens)
 
             # Assign cache locations
-            if _is_cuda or _is_hip:
+            if not _is_npu:
                 batch.out_cache_loc = torch.empty(
                     (bs * topk * num_steps,),
                     dtype=torch.int64,
                     device=batch.input_ids.device,
                 )
-            elif _is_npu:
+            else:
                 batch.out_cache_loc = torch.empty(
                     (bs * topk * num_steps,),
                     dtype=torch.int32,

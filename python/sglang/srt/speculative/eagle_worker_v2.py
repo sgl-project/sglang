@@ -57,6 +57,8 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+_disable_eagle3_quant = os.getenv("DISABLE_EAGLE3_QUANT", "1")
+
 
 def _get_plan_stream(
     device: str,
@@ -98,8 +100,8 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
-        disable_eagle3_quant = os.getenv("DISABLE_EAGLE3_QUANT", "1")
-        if disable_eagle3_quant :
+        # In the Eagle3 scenario, the small model is unquantized.
+        if _disable_eagle3_quant:
             self.server_args.quantization = None
 
         # Set constant
