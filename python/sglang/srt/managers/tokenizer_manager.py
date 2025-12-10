@@ -1967,6 +1967,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 and not self.server_args.skip_tokenizer_init,
             )
 
+        # Add prompt_tokens to meta_info
+        prompt_tokens = 0
+        if hasattr(state.obj, "input_ids") and state.obj.input_ids is not None:
+            prompt_tokens = len(state.obj.input_ids)
+        meta_info["prompt_tokens"] = prompt_tokens
+
         output_ids = state.output_ids
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream:
