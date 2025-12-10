@@ -284,7 +284,7 @@ def speculative_moe_a2a_backend_context():
     global MOE_A2A_BACKEND
     original_backend = MOE_A2A_BACKEND
     try:
-        MOE_A2A_BACKEND = MoeA2ABackend.NONE
+        MOE_A2A_BACKEND = get_speculative_moe_a2a_backend()
         yield
     finally:
         MOE_A2A_BACKEND = original_backend

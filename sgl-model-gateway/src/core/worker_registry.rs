@@ -36,6 +36,7 @@ impl Default for WorkerId {
     }
 }
 
+/// Model index type for O(1) lookups (stores Arc<dyn Worker> directly)
 type ModelIndex = Arc<DashMap<String, Arc<RwLock<Vec<Arc<dyn Worker>>>>>>;
 
 /// Worker registry with model-based indexing
@@ -44,10 +45,8 @@ pub struct WorkerRegistry {
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
-    /// Workers indexed by model ID (stores WorkerId for reference)
-    model_workers: Arc<DashMap<String, Vec<WorkerId>>>,
-
-    /// Optimized model index for O(1) lookups (stores Arc<dyn Worker> directly)
+    /// Model index for O(1) lookups (stores Arc<dyn Worker> directly)
+    /// This replaces the previous dual-index approach for better memory efficiency
     model_index: ModelIndex,
 
     /// Workers indexed by worker type
@@ -55,6 +54,7 @@ pub struct WorkerRegistry {
 
     /// Workers indexed by connection mode
     connection_workers: Arc<DashMap<ConnectionMode, Vec<WorkerId>>>,
+
     /// URL to worker ID mapping
     url_to_id: Arc<DashMap<String, WorkerId>>,
 }
@@ -64,7 +64,6 @@ impl WorkerRegistry {
     pub fn new() -> Self {
         Self {
             workers: Arc::new(DashMap::new()),
-            model_workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
@@ -88,14 +87,8 @@ impl WorkerRegistry {
         self.url_to_id
             .insert(worker.url().to_string(), worker_id.clone());
 
-        // Update model index (both ID-based and optimized)
+        // Update model index for O(1) lookups
         let model_id = worker.model_id().to_string();
-        self.model_workers
-            .entry(model_id.clone())
-            .or_default()
-            .push(worker_id.clone());
-
-        // Update optimized model index for O(1) lookups
         self.model_index
             .entry(model_id)
             .or_insert_with(|| Arc::new(RwLock::new(Vec::new())))
@@ -103,15 +96,15 @@ impl WorkerRegistry {
             .expect("RwLock for model_index is poisoned")
             .push(worker.clone());
 
-        // Update type index
+        // Update type index (clone needed for DashMap key ownership)
         self.type_workers
-            .entry(worker.worker_type())
+            .entry(worker.worker_type().clone())
             .or_default()
             .push(worker_id.clone());
 
-        // Update connection mode index
+        // Update connection mode index (clone needed for DashMap key ownership)
         self.connection_workers
-            .entry(worker.connection_mode())
+            .entry(worker.connection_mode().clone())
             .or_default()
             .push(worker_id.clone());
 
@@ -124,12 +117,7 @@ impl WorkerRegistry {
             // Remove from URL mapping
             self.url_to_id.remove(worker.url());
 
-            // Remove from model index (both ID-based and optimized)
-            if let Some(mut model_workers) = self.model_workers.get_mut(worker.model_id()) {
-                model_workers.retain(|id| id != worker_id);
-            }
-
-            // Remove from optimized model index
+            // Remove from model index
             if let Some(model_index_entry) = self.model_index.get(worker.model_id()) {
                 let worker_url = worker.url();
                 model_index_entry
@@ -139,13 +127,13 @@ impl WorkerRegistry {
             }
 
             // Remove from type index
-            if let Some(mut type_workers) = self.type_workers.get_mut(&worker.worker_type()) {
+            if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
                 type_workers.retain(|id| id != worker_id);
             }
 
             // Remove from connection mode index
             if let Some(mut conn_workers) =
-                self.connection_workers.get_mut(&worker.connection_mode())
+                self.connection_workers.get_mut(worker.connection_mode())
             {
                 conn_workers.retain(|id| id != worker_id);
             }
@@ -178,17 +166,9 @@ impl WorkerRegistry {
         self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
-    /// Get all workers for a model
+    /// Get all workers for a model (O(1) optimized)
+    /// Uses the pre-indexed model_index for fast lookups
     pub fn get_by_model(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
-        self.model_workers
-            .get(model_id)
-            .map(|ids| ids.iter().filter_map(|id| self.get(id)).collect())
-            .unwrap_or_default()
-    }
-
-    /// Get all workers for a model (O(1) optimized version)
-    /// This method uses the pre-indexed model_index for fast lookups
-    pub fn get_by_model_fast(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
         self.model_index
             .get(model_id)
             .map(|workers| {
@@ -198,6 +178,12 @@ impl WorkerRegistry {
                     .clone()
             })
             .unwrap_or_default()
+    }
+
+    /// Alias for get_by_model for backwards compatibility
+    #[inline]
+    pub fn get_by_model_fast(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
+        self.get_by_model(model_id)
     }
 
     /// Get all workers by worker type
@@ -273,9 +259,15 @@ impl WorkerRegistry {
 
     /// Get all model IDs with workers
     pub fn get_models(&self) -> Vec<String> {
-        self.model_workers
+        self.model_index
             .iter()
-            .filter(|entry| !entry.value().is_empty())
+            .filter(|entry| {
+                entry
+                    .value()
+                    .read()
+                    .map(|workers| !workers.is_empty())
+                    .unwrap_or(false)
+            })
             .map(|entry| entry.key().clone())
             .collect()
     }
@@ -310,7 +302,7 @@ impl WorkerRegistry {
             .filter(|w| {
                 // Check worker_type if specified
                 if let Some(ref wtype) = worker_type {
-                    if w.worker_type() != *wtype {
+                    if *w.worker_type() != *wtype {
                         return false;
                     }
                 }
@@ -344,9 +336,15 @@ impl WorkerRegistry {
         let total_workers = self.workers.len();
         // Count models directly instead of allocating Vec via get_models()
         let total_models = self
-            .model_workers
+            .model_index
             .iter()
-            .filter(|entry| !entry.value().is_empty())
+            .filter(|entry| {
+                entry
+                    .value()
+                    .read()
+                    .map(|workers| !workers.is_empty())
+                    .unwrap_or(false)
+            })
             .count();
 
         let mut healthy_count = 0;
@@ -416,10 +414,18 @@ impl WorkerRegistry {
                     .map(|entry| entry.value().clone())
                     .collect();
 
-                // Perform health checks
-                for worker in &workers {
-                    let _ = worker.check_health_async().await; // Use async version directly
-                }
+                // Perform health checks in parallel for better performance
+                // This is especially important when there are many workers
+                let health_futures: Vec<_> = workers
+                    .iter()
+                    .map(|worker| {
+                        let worker = worker.clone();
+                        async move {
+                            let _ = worker.check_health_async().await;
+                        }
+                    })
+                    .collect();
+                futures::future::join_all(health_futures).await;
 
                 // Reset loads periodically
                 check_count += 1;

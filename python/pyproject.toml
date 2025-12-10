@@ -104,6 +104,7 @@ vsa = ["torch", "setuptools"]
 
 test = [
   "accelerate",
+  "bitsandbytes",
   "expecttest",
   "jsonlines",
   "matplotlib",
