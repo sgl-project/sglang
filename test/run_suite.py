@@ -105,9 +105,9 @@ def run_a_suite(args):
     auto_partition_id = args.auto_partition_id
     auto_partition_size = args.auto_partition_size
 
-    files = glob.glob("**/*.py", recursive=True)
+    files = glob.glob("registered/**/*.py", recursive=True)
     ci_tests = filter_tests(
-        collect_tests(files, sanity_check=False), hw, suite, nightly
+        collect_tests(files, sanity_check=True), hw, suite, nightly
     )
     test_files = [TestFile(t.filename, t.est_time) for t in ci_tests]
 
