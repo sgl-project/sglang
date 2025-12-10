@@ -710,7 +710,6 @@ class Req:
         self.dimensions = dimensions
 
         # For diffusion LLM
-        self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
 
@@ -786,22 +785,21 @@ class Req:
     def is_dllm(self):
         return self.dllm_config is not None
 
+    def _get_fill_ids_for_dllm(self):
+        if not self.fill_ids:
+            dllm_ids = (
+                self.origin_input_ids
+                + [self.dllm_config.mask_id] * self.dllm_config.block_size
+            )
+        else:
+            self.dllm_block_offset += self.dllm_config.block_size
+            dllm_ids += [self.dllm_config.mask_id] * self.dllm_config.block_size
+
+        return dllm_ids
+
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         if self.is_dllm():
-            if not self.fill_ids:
-                self.dllm_ids = (
-                    self.origin_input_ids
-                    + [
-                        self.dllm_config.mask_id,
-                    ]
-                    * self.dllm_config.block_size
-                )
-            else:
-                self.dllm_block_offset += self.dllm_config.block_size
-                self.dllm_ids += [
-                    self.dllm_config.mask_id
-                ] * self.dllm_config.block_size
-            self.fill_ids = self.dllm_ids
+            self.fill_ids = self._get_fill_ids_for_dllm()
         else:
             self.fill_ids = self.origin_input_ids + self.output_ids
 
