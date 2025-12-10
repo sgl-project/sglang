@@ -360,9 +360,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         message = f"{exc_str} {errors_str}"
     else:
         message = exc_str
-    
+
     # Filter out bootstrap information from the final message
     import re
+
     message = re.sub(r"'(bootstrap[^']*)':\s*[^,}]*", "", message)
 
     if request.url.path.startswith("/v1/responses"):
@@ -1518,7 +1519,7 @@ def _execute_server_warmup(
                     i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
                     for i in range(server_args.dp_size)
                 ],
-                "input_ids": [[0, 1, 2, 3]] * server_args.dp_size,
+                "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }
             res = requests.post(
                 url + request_name,
