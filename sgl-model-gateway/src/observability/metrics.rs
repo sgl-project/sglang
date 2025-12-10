@@ -37,6 +37,10 @@ pub fn init_metrics() {
         "Total number of request errors by route and error type"
     );
     describe_counter!(
+        "sgl_router_upstream_http_responses_total",
+        "Total number of upstream engine HTTP responses by status code"
+    );
+    describe_counter!(
         "sgl_router_retries_total",
         "Total number of request retries by route"
     );
@@ -321,6 +325,15 @@ impl RouterMetrics {
         counter!("sgl_router_request_errors_total",
             "route" => route.to_string(),
             "error_type" => error_type.to_string()
+        )
+        .increment(1);
+    }
+
+    // TODO unify metric names
+    pub fn record_upstream_http_response(route: &str, status_code: u16) {
+        counter!("sgl_router_upstream_http_responses_total",
+            "route" => route.to_string(),
+            "status_code" => status_code.to_string()
         )
         .increment(1);
     }
