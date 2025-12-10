@@ -2705,6 +2705,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.config = config
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling is not None:
+            # In transformers 5.0.0rc0+, rope_theta and rope_type are also included in rope_scaling.
+            # Therefore, if rope_scaling contains only these two keys,
+            # it effectively means there are no special rope_scaling parameters.
+            if set(rope_scaling.keys()) <= {"rope_theta", "rope_type"}:
+                rope_scaling = None
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
@@ -3213,7 +3219,6 @@ class DeepseekV2Model(nn.Module):
 class DeepseekV2ForCausalLM(nn.Module):
     # for quark model load
     packed_modules_mapping = {}
-    model_cls = DeepseekV2Model
 
     def __init__(
         self,
@@ -3239,7 +3244,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
         self.use_nsa = is_deepseek_nsa(config)
-        self.model = self.model_cls(
+        self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         if self.pp_group.is_last_rank:
