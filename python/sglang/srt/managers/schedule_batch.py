@@ -1026,7 +1026,7 @@ class Req:
         self.retraction_count += 1
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
-        self.routed_experts = []
+        self.routed_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
