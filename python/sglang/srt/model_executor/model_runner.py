@@ -95,6 +95,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
@@ -440,11 +441,6 @@ class ModelRunner:
             architectures = self.model_config.hf_config.architectures
             if architectures and not any("Llama4" in arch for arch in architectures):
                 self.is_hybrid_swa = self.model_config.is_hybrid_swa = True
-
-        if config := self.mamba2_config:
-            class_name = config.__class__.__name__
-            logger.warning(f"{class_name} model detected, disable radix cache")
-            self.server_args.disable_radix_cache = True
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -1634,19 +1630,19 @@ class ModelRunner:
                 and kv_cache_quant_algo.upper() == "FP8"
             ):
                 if _is_hip:
-                    self.kv_cache_dtype = torch.float8_e4m3fnuz
+                    self.kv_cache_dtype = fp8_dtype
                 else:
                     self.kv_cache_dtype = torch.float8_e4m3fn
             else:
                 self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = torch.float8_e5m2fnuz
+                self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
         elif self.server_args.kv_cache_dtype == "fp8_e4m3":
             if _is_hip:  # Using natively supported format
-                self.kv_cache_dtype = torch.float8_e4m3fnuz
+                self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
         elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
