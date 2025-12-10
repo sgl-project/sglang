@@ -15,10 +15,10 @@ ARG PYTORCH_VERSION="2.8.0"
 ARG TORCHVISION_VERSION="0.23.0"
 ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v7.2.0-pytorch2.8.0/torch_npu-2.8.0-cp311-cp311-manylinux_2_28_aarch64.whl"
 ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v7.2.0-pytorch2.8.0/torch_npu-2.8.0-cp311-cp311-manylinux_2_28_x86_64.whl"
-ARG BISHENG_NAME_ARM64="Ascend-BiSheng-toolkit_aarch64_20251121.run"
-ARG BISHENG_NAME_AMD64=""
-ARG BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
 ARG BISHENG_NAME=""
+ARG BISHENG_NAME_ARM64="Ascend-BiSheng-toolkit_aarch64_20251121.run"
+ARG BISHENG_NAME_AMD64="Ascend-BiSheng-toolkit_x86_20251121.run"
+ARG BISHENG_URL="https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/sglang/triton_ascend/${BISHENG_NAME}"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG=main
@@ -29,7 +29,7 @@ ARG DEVICE_TYPE
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
       echo "Using x86_64 dependencies"; \
       echo "PTA_URL=$PTA_URL_AMD64" >> /etc/environment_new; \
-      echo "BISHENG_NAME_AMD64=$BISHENG_NAME_AMD64" >> /etc/environment_new; \
+      echo "BISHENG_NAME=$BISHENG_NAME_AMD64" >> /etc/environment_new; \
     elif [ "$TARGETARCH" = "arm64" ]; then \
       echo "Using aarch64 dependencies"; \
       echo "PTA_URL=$PTA_URL_ARM64" >> /etc/environment_new; \
@@ -104,13 +104,13 @@ RUN ${PIP_INSTALL} wheel==0.45.1 && git clone --branch $SGLANG_KERNEL_NPU_TAG ht
     && cd .. && rm -rf sgl-kernel-npu \
     && cd "$(python3 -m pip show deep-ep | awk '/^Location:/ {print $2}')" && ln -s deep_ep/deep_ep_cpp*.so
 
-# Install CustomOps
-# TODO: remove this after sgl-kernel-npu contains custom_ops
-RUN wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
-    chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
-    ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp && \
-    wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl && \
-    ${PIP_INSTALL} ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
+# # Install CustomOps
+# # TODO: remove this after sgl-kernel-npu contains custom_ops
+# RUN wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
+#     chmod a+x ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run && \
+#     ./CANN-custom_ops-8.2.0.0-$DEVICE_TYPE-linux.aarch64.run --quiet --install-path=/usr/local/Ascend/ascend-toolkit/latest/opp && \
+#     wget https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com/ops/custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl && \
+#     ${PIP_INSTALL} ./custom_ops-1.0.$DEVICE_TYPE-cp311-cp311-linux_aarch64.whl
 
 # Install Bisheng
 RUN . /etc/environment_new && \
