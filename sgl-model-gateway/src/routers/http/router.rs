@@ -276,8 +276,6 @@ impl Router {
             RouterMetrics::record_request_error(route, "non_retryable_error");
         }
 
-        RouterMetrics::record_downstream_http_response(route, response.status().as_u16());
-
         response
     }
 
@@ -532,6 +530,8 @@ impl Router {
                     .into_response();
             }
         };
+
+        RouterMetrics::record_upstream_http_response(route, res.status().as_u16());
 
         let status = StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);

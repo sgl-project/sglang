@@ -31,8 +31,8 @@ pub fn init_metrics() {
         "Request duration in seconds by route"
     );
     describe_counter!(
-        "sgl_router_downstream_http_responses_total",
-        "Total number of downstream engine HTTP responses by status code"
+        "sgl_router_upstream_http_responses_total",
+        "Total number of upstream engine HTTP responses by status code"
     );
     describe_counter!(
         "sgl_router_http_responses_total",
@@ -326,8 +326,8 @@ impl RouterMetrics {
     }
 
     // TODO unify metric names
-    pub fn record_downstream_http_response(route: &str, status_code: u16) {
-        counter!("sgl_router_downstream_http_responses_total",
+    pub fn record_upstream_http_response(route: &str, status_code: u16) {
+        counter!("sgl_router_upstream_http_responses_total",
             "route" => route.to_string(),
             "status_code" => status_code.to_string()
         )
