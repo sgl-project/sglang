@@ -94,7 +94,22 @@ func main() {
 
 	// Start server
 	serverAddr := ":" + cfg.Port
-	appLogger.Info("Server starting", zap.String("address", serverAddr))
+	baseURL := fmt.Sprintf("http://localhost:%s", cfg.Port)
+
+	appLogger.Info("Server starting",
+		zap.String("address", serverAddr),
+		zap.String("base_url", baseURL),
+	)
+
+	// Print available HTTP endpoints (similar to FastAPI startup)
+	appLogger.Info("Available HTTP endpoints:")
+	appLogger.Info(fmt.Sprintf("  GET  %s/health", baseURL))
+	appLogger.Info(fmt.Sprintf("  GET  %s/v1/models", baseURL))
+	appLogger.Info(fmt.Sprintf("  GET  %s/get_model_info", baseURL))
+	appLogger.Info(fmt.Sprintf("  POST %s/v1/chat/completions", baseURL))
+	appLogger.Info(fmt.Sprintf("  POST %s/generate", baseURL))
+	appLogger.Info(fmt.Sprintf("Application startup complete. Listening on %s", baseURL))
+
 	if err := fasthttp.ListenAndServe(serverAddr, router); err != nil {
 		appLogger.Fatal("Server failed", zap.Error(err))
 	}

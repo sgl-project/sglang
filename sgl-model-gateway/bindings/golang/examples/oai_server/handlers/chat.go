@@ -463,6 +463,16 @@ func (h *ChatHandler) sendSSEError(w *bufio.Writer, err error) (StreamErrorInfo,
 
 // HandleGenerate handles POST /generate (SGLang native API)
 func (h *ChatHandler) HandleGenerate(ctx *fasthttp.RequestCtx) {
+	path := string(ctx.Path())
+
+	defer func() {
+		statusCode := ctx.Response.StatusCode()
+		if statusCode == 0 {
+			statusCode = 200
+		}
+		h.logHTTPResponse(statusCode, path)
+	}()
+
 	// Parse request body
 	var req map[string]interface{}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
