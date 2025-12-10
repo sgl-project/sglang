@@ -185,7 +185,6 @@ class MindSporeForCausalLM(torch.nn.Module):
         )
         self.key_cache = []
         self.value_cache = []
-        ms.runtime.set_kernel_launch_group(thread_num=2, kernel_group_num=8)
 
     def get_arch(self, config):
         # Get all implemented models
