@@ -43,6 +43,7 @@ pub enum Encoding {
 
 impl Encoding {
     /// Returns a reference to token IDs - zero-copy operation
+    #[inline]
     pub fn token_ids(&self) -> &[TokenIdType] {
         match self {
             Encoding::Hf(inner) => inner.get_ids(),
