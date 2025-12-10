@@ -215,16 +215,21 @@ class PerformanceSummary:
 
 
 T2I_sampling_params = DiffusionSamplingParams(
-    prompt="A futuristic cityscape at sunset with flying cars",
+    prompt="Doraemon is eating dorayaki",
     output_size="1024x1024",
 )
-T2V_sampling_params = DiffusionSamplingParams(
-    prompt="A curious racoon", output_size="848x480", seconds=1
+
+TI2I_sampling_params = DiffusionSamplingParams(
+    prompt="Convert 2D style to 3D style",
+    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
 )
+
+T2V_PROMPT = "A curious raccoon"
+
 TI2V_sampling_params = DiffusionSamplingParams(
     output_size="832x1104",
-    prompt="Add dynamic motion to the scene",
-    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
+    image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
 )
 
 # All test cases with clean default values
@@ -269,10 +274,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_text=1,
             warmup_edit=0,
         ),
-        DiffusionSamplingParams(
-            prompt="Doraemon is eating dorayaki.",
-            output_size="1024x1024",
-        ),
+        T2I_sampling_params,
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
@@ -283,10 +285,7 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             warmup_text=0,
             warmup_edit=1,
         ),
-        DiffusionSamplingParams(
-            prompt="Convert 2D style to 3D style",
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        ),
+        TI2I_sampling_params,
     ),
 ]
 
@@ -301,7 +300,10 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        T2V_sampling_params,
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="848x480",
+        ),
     ),
     # LoRA test case for single transformer + merge/unmerge API test
     DiffusionTestCase(
@@ -340,10 +342,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_text=0,
             warmup_edit=1,
         ),
-        DiffusionSamplingParams(
-            prompt="Convert 2D style to 3D style",
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-        ),
+        TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "fast_hunyuan_video",
@@ -354,7 +353,10 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
             warmup_edit=0,
             custom_validator="video",
         ),
-        T2V_sampling_params,
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="720x480",
+        ),
     ),
     # === Text and Image to Video (TI2V) ===
     DiffusionTestCase(
@@ -383,20 +385,17 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
 
 TWO_GPU_CASES_A = [
     # TODO: Timeout with Torch2.9. Add back when it can pass CI
-    # DiffusionTestCase(
-    #     id="wan2_2_i2v_a14b_2gpu",
-    #     model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
-    #     modality="video",
-    #     prompt="generate",
-    #     warmup_text=0,
-    #     warmup_edit=0,
-    #     output_size="832x1104",
-    #     edit_prompt="generate",
-    #     image_path="https://github.com/Wan-Video/Wan2.2/blob/990af50de458c19590c245151197326e208d7191/examples/i2v_input.JPG?raw=true",
-    #     custom_validator="video",
-    #     num_gpus=2,
-    #     num_frames=1,
-    # ),
+    DiffusionTestCase(
+        "wan2_2_i2v_a14b_2gpu",
+        DiffusionServerArgs(
+            model_path="Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+            modality="video",
+            warmup_text=0,
+            warmup_edit=0,
+            custom_validator="video",
+        ),
+        TI2V_sampling_params,
+    ),
     DiffusionTestCase(
         "wan2_2_t2v_a14b_2gpu",
         DiffusionServerArgs(
@@ -407,7 +406,10 @@ TWO_GPU_CASES_A = [
             custom_validator="video",
             num_gpus=2,
         ),
-        T2V_sampling_params,
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="720x480",
+        ),
     ),
     # LoRA test case for transformer_2 support
     DiffusionTestCase(
@@ -436,7 +438,10 @@ TWO_GPU_CASES_A = [
             num_gpus=2,
             custom_validator="video",
         ),
-        T2V_sampling_params,
+        DiffusionSamplingParams(
+            prompt=T2V_PROMPT,
+            output_size="720x480",
+        ),
     ),
 ]
 
@@ -465,11 +470,7 @@ TWO_GPU_CASES_B = [
             num_gpus=2,
             lora_path="starsfriday/Wan2.1-Divine-Power-LoRA",
         ),
-        DiffusionSamplingParams(
-            prompt="faxiang, the person raises hands, a giant translucent golden figure appears behind",
-            image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
-            output_size="832x1104",
-        ),
+        TI2V_sampling_params,
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_720P_2gpu",
