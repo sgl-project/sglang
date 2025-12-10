@@ -292,6 +292,7 @@ class ModelRunner:
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dcp_size = server_args.dcp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
         self.dp_size = server_args.dp_size
@@ -685,6 +686,7 @@ class ModelRunner:
                 tensor_model_parallel_size=self.tp_size,
                 pipeline_model_parallel_size=self.pp_size,
                 expert_model_parallel_size=self.moe_ep_size,
+                decode_context_parallel_size=self.dcp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 torch_compile=self.server_args.enable_piecewise_cuda_graph,
             )
@@ -2001,7 +2003,7 @@ class ModelRunner:
                     need_sort=need_sort,
                 )
             else:
-                if self.page_size == 1:
+                if self.page_size == 1 and self.dcp_size == 1:
                     if self.is_hybrid_swa:
                         self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                             self.full_max_total_num_tokens,
@@ -2022,8 +2024,8 @@ class ModelRunner:
                 else:
                     assert not self.is_hybrid_swa
                     self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
+                        self.max_total_num_tokens * self.dcp_size,
+                        page_size=self.page_size * self.dcp_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
                         kvcache=self.token_to_kv_pool,
