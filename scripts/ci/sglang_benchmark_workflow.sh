@@ -24,6 +24,7 @@ if [[ "${TYPE}" == "launch" ]]; then
     echo "========== LAUNCHING SERVER ========"
     if [[ "${model_name}" == "Qwen3-VL-235B" ]]; then
         export SGLANG_USE_AITER=1
+        export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=1
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
@@ -39,6 +40,7 @@ if [[ "${TYPE}" == "launch" ]]; then
         sglang_pid=$!
     elif [[ "${model_name}" == "Qwen3-next" ]]; then
         export SGLANG_USE_AITER=1
+        export SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=1
         python3 -m sglang.launch_server \
             --model-path "${model_path}" \
             --host localhost \
