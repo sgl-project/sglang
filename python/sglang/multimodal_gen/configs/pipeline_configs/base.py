@@ -7,8 +7,8 @@ from dataclasses import asdict, dataclass, field, fields
 from enum import Enum, auto
 from typing import Any
 
-import numpy as np
 import PIL
+import numpy as np
 import torch
 from einops import rearrange
 
@@ -664,10 +664,7 @@ class ImagePipelineConfig(PipelineConfig):
         height = 2 * (int(batch.height) // (vae_scale_factor * 2))
         width = 2 * (int(batch.width) // (vae_scale_factor * 2))
 
-        # If SP padding was applied, remove extra tokens before reshaping
-        target_tokens = (height // 2) * (width // 2)
-        if latents.shape[1] > target_tokens:
-            latents = latents[:, :target_tokens, :]
+        latents = maybe_unpad_latents(latents, batch)
 
         latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
         latents = latents.permute(0, 3, 1, 4, 2, 5)
