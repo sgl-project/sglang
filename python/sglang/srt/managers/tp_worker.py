@@ -380,6 +380,7 @@ class TpModelWorker(BaseTpWorker):
 
         if self.pp_group.is_last_rank:
             if self.is_dllm():
+                # FXIME: move dllm forward outside
                 logits_output, next_token_ids, can_run_cuda_graph = (
                     self.dllm_algorithm.run(self.model_runner, forward_batch)
                 )
@@ -403,21 +404,6 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling and return logits for target forward
                 return batch_result
 
-            if (
-                self.enable_overlap
-                and not self.enable_spec
-                and model_worker_batch.sampling_info.grammars is not None
-            ):
-
-                def sample_batch_func():
-                    batch_result.next_token_ids = self.model_runner.sample(
-                        logits_output, forward_batch
-                    )
-                    return batch_result
-
-                batch_result.delay_sample_func = sample_batch_func
-                return batch_result
-
             if model_worker_batch.is_prefill_only:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -435,8 +421,8 @@ class TpModelWorker(BaseTpWorker):
                         logits_output, model_worker_batch
                     )
             else:
-                batch_result.next_token_ids = self.model_runner.sample(
-                    logits_output, forward_batch
+                batch_result.next_token_ids, batch_result.delay_sample_func = (
+                    self.model_runner.sample(logits_output, forward_batch)
                 )
 
             return batch_result
@@ -464,7 +450,11 @@ class TpModelWorker(BaseTpWorker):
             batch.split_forward_batch, split_forward_count=batch.split_forward_count
         )
         if logits_output:
-            next_token_ids = self.model_runner.sample(logits_output, model_worker_batch)
+            next_token_ids, callback = self.model_runner.sample(
+                logits_output, model_worker_batch
+            )
+            # FIXME: split prefill does not support grammar
+            callback()
         else:
             next_token_ids = None
         batch_result = GenerationBatchResult(

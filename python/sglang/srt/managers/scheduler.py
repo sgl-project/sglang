@@ -2019,11 +2019,8 @@ class Scheduler(
                     batch_result.copy_done = torch.get_device_module(
                         self.device
                     ).Event()
-                    if batch_result.delay_sample_func is None:
-                        self.future_map.store_to_map(future_indices, batch_result)
-                        batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
-                    else:
-                        batch_result.future_indices = future_indices
+                    self.future_map.store_to_map(future_indices, batch_result)
+                    batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
 
                 # FIXME(lsyin): move this assignment elsewhere
                 future_indices_or_next_token_ids = -future_indices.indices
@@ -2103,9 +2100,9 @@ class Scheduler(
         with self.forward_stream_ctx:
             self.forward_stream.wait_stream(self.default_stream)
             _batch_result = batch_result.delay_sample_func()
-            assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
-            batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+            # assert _batch_result is batch_result
+            # self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            # batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
     def process_batch_result(
         self,
