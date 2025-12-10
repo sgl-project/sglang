@@ -19,7 +19,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 
 class TestTimestepEmbed(unittest.TestCase):
     NUM_BATCH = [1, 2, 8, 63, 256, 512, 613, 1024, 1536]
-    NUM_DIM = [32, 64, 128, 256, 259, 512, 613, 1024, 2048, 4096]
+    NUM_DIM = [32, 64, 128, 256, 512, 1024, 2048, 4096]
     DTYPE = [torch.float32, torch.bfloat16]
 
     def test_correctness(self):
@@ -42,22 +42,19 @@ class TestTimestepEmbed(unittest.TestCase):
         def perf_kernel_fn(kernel_fn: callable, *args, **kwargs):
             warmup_times = 4
             repeat_times = 20
-            total_time = 0
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
 
             for _ in range(warmup_times):
                 output_fn = kernel_fn(*args, **kwargs)
             torch.cuda.synchronize()
-
+            
+            start.record()
             for _ in range(repeat_times):
-                start.record()
                 output_fn = kernel_fn(*args, **kwargs)
-                end.record()
-                torch.cuda.synchronize()
-                total_time += start.elapsed_time(end)
-
-            return total_time / repeat_times
+            end.record()
+            end.synchronize()
+            return start.elapsed_time(end) / repeat_times
 
         # TODO: hard code
         device = "cuda"

@@ -14,32 +14,16 @@ limitations under the License.
 ==============================================================================*/
 
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <math.h>
-#include <torch/extension.h>
-
 #include <cassert>
 #include <cmath>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <torch/all.h>
+#include <torch/extension.h>
 
-// TODO: temp include for debug
-#include "utils.h"
-#include "vec_dtypes.cuh"  // #include <flashinfer/vec_dtypes.cuh>
-using namespace flashinfer;
-
-// // TODO: debug only for now
-// #include "sgl_kernel_ops.h"
-// TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
-//   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
-//   m.impl("silu_and_mul", torch::kCUDA, &silu_and_mul);
-// }
-// # TODO: namespace
-// REGISTER_EXTENSION(common_ops)
-
-// TODO: hard code for now. reuse in some where
-// at::vec::convert_to_float instead later
-template <typename T>
-__device__ float convert_to_float(T x) {
+template <typename T> __device__ float convert_to_float(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return __half2float(x);
   } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -52,8 +36,7 @@ __device__ float convert_to_float(T x) {
   }
 }
 
-template <typename T>
-__device__ __nv_bfloat16 convert_to_bfloat16(T x) {
+template <typename T> __device__ __nv_bfloat16 convert_to_bfloat16(T x) {
   if constexpr (std::is_same_v<T, __nv_bfloat16>) {
     return x;
   } else if constexpr (std::is_same_v<T, __half>) {
@@ -65,8 +48,7 @@ __device__ __nv_bfloat16 convert_to_bfloat16(T x) {
   }
 }
 
-template <typename T>
-__device__ __half convert_to_float16(T x) {
+template <typename T> __device__ __half convert_to_float16(T x) {
   if constexpr (std::is_same_v<T, __half>) {
     return x;
   } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
@@ -78,8 +60,7 @@ __device__ __half convert_to_float16(T x) {
   }
 }
 
-template <typename O, typename T>
-__device__ O cast_to(T x) {
+template <typename O, typename T> __device__ O cast_to(T x) {
   if constexpr (std::is_same_v<O, float>) {
     return convert_to_float(x);
   } else if constexpr (std::is_same_v<O, __half>) {
@@ -91,178 +72,101 @@ __device__ O cast_to(T x) {
   }
 }
 
-#define DIM_SWITCH(COND, CONST_NAME, BAD_CASE, ...) \
-  [&] {                                             \
-    if (COND == 512) {                              \
-      constexpr static int CONST_NAME = 512;        \
-      return __VA_ARGS__();                         \
-    } else if (COND == 1024) {                      \
-      constexpr static int CONST_NAME = 1024;       \
-      return __VA_ARGS__();                         \
-    } else if (COND == 2048) {                      \
-      constexpr static int CONST_NAME = 2048;       \
-      return __VA_ARGS__();                         \
-    } else if (COND == 4096) {                      \
-      constexpr static int CONST_NAME = 4096;       \
-      return __VA_ARGS__();                         \
-    } else if (COND == 8192) {                      \
-      constexpr static int CONST_NAME = 8192;       \
-      return __VA_ARGS__();                         \
-    } else {                                        \
-      constexpr static int CONST_NAME = BAD_CASE;   \
-      return __VA_ARGS__();                         \
-    }                                               \
-  }()
-
-// // TODO: remove
-// // assert operations is float??
-// __device__ float calculate_frequency_and_angle(float t_val, int freq_idx,
-//                                                int half, int max_period) {
-//   float log_max_period = logf(static_cast<float>(max_period));
-//   float freqs = expf(-log_max_period * static_cast<float>(freq_idx) / static_cast<float>(half));
-//   return t_val * freqs;
-// }
-
-template <typename T, typename O, uint32_t kBlockSizeDim, uint32_t kVecSize = 8, uint32_t kNumThr>
-__global__ void timestep_embedding_kernel(T* t_ptr, O* output_ptr, int B, int dim, int max_period, int stride_out_b) {
-  // TODO: add comments
-  int pid_b = blockIdx.x;
-  int pid_d = blockIdx.y;
-  int tid = threadIdx.x;
-  constexpr int stride_t_b = 1;
-  constexpr int stride_out_d = 1;
-
+template <typename T_IN>
+__global__ void
+timestep_embedding_kernel(T_IN* t_ptr, float* output_ptr, int dim, float neg_log_max_period) {
   // Get the timestep for this batch
-  float t_val = cast_to<float>(t_ptr[pid_b]);
+  float t_val = cast_to<float>(__ldg(&t_ptr[blockIdx.x]));
+  float* output_batch_base_ptr = output_ptr + blockIdx.x * dim;
 
   // Calculate half dimension
-  int half = dim / 2;
+  int half_dim = dim / 2;
+  float half_dimf = __int2float_rn(half_dim);
+  int thread_offset = threadIdx.x;
+  while (thread_offset * 4 < half_dim) {
+    float4* top_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
+    float4* bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
 
-  // Create range of indices for this block
-  int d_start = pid_d * kBlockSizeDim;
-  int d_end = d_start + kBlockSizeDim;
+    float4 vals;
+    vals.x = t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 0) / half_dimf);
+    vals.y = t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 1) / half_dimf);
+    vals.z = t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 2) / half_dimf);
+    vals.w = t_val * expf(neg_log_max_period * __int2float_rn(thread_offset * 4 + 3) / half_dimf);
 
-  vec_t<O, kVecSize> o_vec_cos;
-  vec_t<O, kVecSize> o_vec_sin;
+    float4 sin_vals;
+    sin_vals.x = cosf(vals.x);
+    sin_vals.y = cosf(vals.y);
+    sin_vals.z = cosf(vals.z);
+    sin_vals.w = cosf(vals.w);
+    *top_half = sin_vals; // STG.128
 
-  int end = min(d_end, half);
+    float4 cos_vals;
+    cos_vals.x = sinf(vals.x);
+    cos_vals.y = sinf(vals.y);
+    cos_vals.z = sinf(vals.z);
+    cos_vals.w = sinf(vals.w);
+    *bottom_half = cos_vals;  // STG.128
 
-  // prepare reusable
-  const float absorbed_scale = -logf(static_cast<float>(max_period)) / static_cast<float>(half);
-  const int output_row_offset = pid_b * stride_out_b;
-  constexpr int num_thread_values = kNumThr * kVecSize;
-
-  // main loop
-  int d_idx = d_start + tid * kVecSize;
-  for (; d_idx < end; d_idx += num_thread_values) {
-#pragma unroll
-    for (int i = 0; i < kVecSize; i++) {
-      if (d_idx + i >= end) {
-        continue;
-      }
-
-      // where angles = exp(-log(max_period) * freq_idx / half)
-      //    (-log(max_period) / half) can be absorbe
-      float angles = expf(absorbed_scale * static_cast<float>(d_idx + i)) * t_val;
-      o_vec_cos[i] = cast_to<O>(cosf(angles));
-      o_vec_sin[i] = cast_to<O>(sinf(angles));
-    }
-
-    // skip last write back if not align
-    if (end % num_thread_values != 0 && d_idx + num_thread_values >= end) {
-      break;
-    }
-
-    int out_idx_cos = output_row_offset + d_idx;
-    int out_idx_sin = output_row_offset + (d_idx + half);
-
-    o_vec_cos.store(output_ptr + out_idx_cos);
-    o_vec_sin.store(output_ptr + out_idx_sin);
-  }
-
-  // epilogue
-  // handle last loop inst locality warp divergence
-  if (d_idx < end) {
-    int out_idx_cos = output_row_offset + d_idx;
-    int out_idx_sin = output_row_offset + (d_idx + half);
-#pragma unroll
-    for (int i = 0; i < kVecSize; i++) {
-      if (i + d_idx >= end) {
-        continue;
-      }
-      output_ptr[out_idx_cos + i] = o_vec_cos[i];
-      output_ptr[out_idx_sin + i] = o_vec_sin[i];
-    }
-  }
-
-  // fill zero if odd
-  if (dim % 2 != 0) {
-    int out_idx_pad = output_row_offset + (dim - 1);
-    output_ptr[out_idx_pad] = 0.;
+    thread_offset += blockDim.x;
   }
 }
 
 // NOTE: output always be float32 now. According to python code:
 // timestep_embedding
-torch::Tensor timestep_embedding_kernel(torch::Tensor& t, torch::Tensor& output, int64_t dim, int64_t max_period) {
+torch::Tensor timestep_embedding_kernel_cuda(torch::Tensor &t,
+                                             torch::Tensor &output, int dim,
+                                             int max_period) {
   TORCH_CHECK(t.dim() == 1 and t.stride(0) == 1, "t should be 1D");
-  TORCH_CHECK(output.dim() == 2 and output.stride(1) == 1, "output should be a contiguous 2D tensor.");
+  TORCH_CHECK(output.dim() == 2 and output.is_contiguous(), "output should be a contiguous 2D tensor.");
 
-  const int B = t.size(0);
+  int B = static_cast<int>(t.size(0));
   TORCH_CHECK(output.size(0) == B, "Output batch size doesn't match t");
   TORCH_CHECK(output.size(1) == dim, "Output feature size doesn't match dim");
 
   TORCH_CHECK(t.device().is_cuda(), "t must be a CUDA tensor");
   TORCH_CHECK(output.device().is_cuda(), "output must be a CUDA tensor");
-  TORCH_CHECK(t.device() == output.device(), "t and output must be on the same device");
+  TORCH_CHECK(t.device() == output.device(),
+              "t and output must be on the same device");
 
-  // TODO: review
   // To align with timestep_embedding python code.
-  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float, "Output buffer should be float32.");
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float,
+              "Output buffer should be float32.");
 
+  TORCH_CHECK(dim % 2 == 0 && (dim / 2) % 4 == 0, "dim should align to 8");
   auto stream = at::cuda::getCurrentCUDAStream();
+  
+  constexpr int MAX_THREADS_PER_BLOCK = 1024;
+  int half_dim = dim / 2;
 
-  // Heuristics tuning
-  // WARN: which will generate a lot template function:
-  //  (DIM_SWITCH * DISPATCH_FLOAT_TYPES).
-  DIM_SWITCH(dim, kDim, /* bad case */ 1, [&] {
-    // if dim not in [512, 1024, 2048, 4096]:
-    //    vec_size = 1
-    constexpr int vec_size = (kDim % 16 == 0) ? 8 : (kDim % 8 == 0) ? 4 : (kDim % 4 == 0) ? 2 : 1;
-    // constexpr int num_threads = 512;
-    // constexpr int BLOCK_SIZE_DIM = vec_size * num_threads;
-    constexpr int num_threads = 128;
-    constexpr int BLOCK_SIZE_DIM = 1024 * 4;
-    // TODO: low sm usage, like 512 / 8 / 2 = 32
-    const int half = dim / 2;
+  dim3 grid(B, 1, 1);
+  dim3 block(min(MAX_THREADS_PER_BLOCK, half_dim / 4), 1, 1);
+  float neg_log_max_period = std::log(static_cast<float>(max_period)) * (-1.0f);
 
-    const dim3 grid_size(B, (half + BLOCK_SIZE_DIM - 1) / BLOCK_SIZE_DIM);
-    const dim3 block_size(num_threads);
-
-    int stride_t_b = t.stride(0);
-    int stride_out_b = output.stride(0);
-    int stride_out_d = output.stride(1);
-
-    DISPATCH_FLOAT_TYPES(t.scalar_type(), "timestep_embedding_kernel", [&] {
-      using t_type = scalar_t;
-      using o_type = float;
-      timestep_embedding_kernel<t_type, o_type, BLOCK_SIZE_DIM, vec_size, num_threads>
-          <<<grid_size, block_size, 0, stream>>>(
-              static_cast<t_type*>(t.data_ptr()),
-              static_cast<o_type*>(output.data_ptr()),
-              B,
-              dim,
-              max_period,
-              stride_out_b);
-    });
-  });
-
-  cudaDeviceSynchronize();
-  cudaError_t err = cudaGetLastError();
-  TORCH_CHECK(err == cudaSuccess, "CUDA kernel launch failed: ", cudaGetErrorString(err));
+  if (t.dtype() == torch::kBFloat16) {
+    timestep_embedding_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<__nv_bfloat16*>(t.data_ptr()),
+      reinterpret_cast<float*>(output.data_ptr()),
+      dim,
+      neg_log_max_period);
+  } else if (t.dtype() == torch::kFloat16) {
+    timestep_embedding_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<__half*>(t.data_ptr()),
+      reinterpret_cast<float*>(output.data_ptr()),
+      dim,
+      neg_log_max_period);
+  } else if (t.dtype() == torch::kFloat) {
+    timestep_embedding_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<float*>(t.data_ptr()),
+      reinterpret_cast<float*>(output.data_ptr()),
+      dim,
+      neg_log_max_period);
+  } else {
+    TORCH_CHECK(false, "Unsupported dtype.");
+  }
   return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("timestep_embedding_kernel", &timestep_embedding_kernel, "timestep_embedding_kernel");
+  m.def("timestep_embedding_kernel_cuda", &timestep_embedding_kernel_cuda,
+        "timestep_embedding_kernel_cuda");
 }
