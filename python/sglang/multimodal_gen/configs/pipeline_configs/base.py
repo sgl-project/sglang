@@ -102,6 +102,14 @@ def shard_rotary_emb_for_sp(emb):
         return emb
 
 
+def maybe_unpad_latents(latents, batch):
+    # If SP padding was applied, remove extra tokens before reshaping
+    target_tokens = batch.raw_latent_shape[-1] * batch.raw_latent_shape[-2]
+    if latents.shape[1] > target_tokens:
+        latents = latents[:, :target_tokens, :]
+    return latents
+
+
 # config for a single pipeline
 @dataclass
 class PipelineConfig:
@@ -310,6 +318,7 @@ class PipelineConfig:
         return batch.negative_prompt_embeds
 
     def post_denoising_loop(self, latents, batch):
+        latents = maybe_unpad_latents(latents, batch)
         return latents
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):

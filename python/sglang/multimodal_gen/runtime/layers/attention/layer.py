@@ -370,9 +370,9 @@ class USPAttention(nn.Module):
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
             # -> [B, S, H_local, D]
-            qkv = torch.cat([q, k, v], dim=0)
-            qkv = _usp_input_all_to_all(qkv, head_dim=2)
-            q, k, v = qkv.chunk(3, dim=0)
+            q = _usp_input_all_to_all(q, head_dim=2)
+            k = _usp_input_all_to_all(k, head_dim=2)
+            v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
