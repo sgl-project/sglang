@@ -228,7 +228,7 @@ CASES = [
 
 
 def _tol(dtype: torch.dtype):
-    return 2e-5 if dtype == torch.float32 else 2e-1
+    return 2e-5 if dtype == torch.float32 else 5e-2
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
