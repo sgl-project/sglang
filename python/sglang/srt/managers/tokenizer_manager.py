@@ -2130,7 +2130,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             await asyncio.sleep(self.server_args.load_watch_interval)
             loads = await self.get_load_communicator(GetLoadReqInput())
             load_udpate_req = WatchLoadUpdateReq(loads=loads)
-            self.send_to_scheduler.send_pyobj(load_udpate_req)
+            self._send_multi_parts(self.send_to_scheduler, load_udpate_req)
 
     async def _resolve_lora_path(self, obj: Union[GenerateReqInput, EmbeddingReqInput]):
         if isinstance(obj.lora_path, str):
