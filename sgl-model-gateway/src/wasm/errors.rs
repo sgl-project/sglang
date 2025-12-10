@@ -103,8 +103,8 @@ pub enum WasmRuntimeError {
     #[error("function not found: {0}")]
     FunctionNotFound(String),
 
-    #[error("execution timeout")]
-    Timeout,
+    #[error("execution timeout after {0}ms")]
+    Timeout(u64),
 
     #[error("execution failed: {0}")]
     CallFailed(String),

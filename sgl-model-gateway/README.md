@@ -27,7 +27,7 @@ High-performance model routing control and data plane for large-scale LLM deploy
 - Advanced load balancing with cache-aware request reuse, load-aware (power-of-two) selection, and per-model policy overrides.
 
 ## Feature Highlights
-- Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `power_of_two`) with DP-aware scheduling.
+- Multiple load balancing strategies (`random`, `round_robin`, `cache_aware`, `power_of_two`, `bucket`) with DP-aware scheduling.
 - Multi-model HTTP serving and inference gateway routing with model-specific policies.
 - Prefill/decode disaggregation, including bootstrap port handling and cache-aware merging.
 - gRPC routing with fully Rust tokenizer loading, reasoning parser selection, and tool parser integration for OpenAI-compatible endpoints—supporting streaming and non-streaming modes across DeepSeek, Llama, Kimi K2, Qwen, GPT-OSS, Mistral, Step-3, GLM4, and other reasoning-capable models.

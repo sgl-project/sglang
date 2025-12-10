@@ -192,10 +192,8 @@ class SamplingParams:
 
         if self.width is None:
             self.width_not_provided = True
-            self.width = 1280
         if self.height is None:
             self.height_not_provided = True
-            self.height = 720
 
     def check_sampling_param(self):
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
@@ -230,7 +228,7 @@ class SamplingParams:
             logger.debug(f"Setting num_frames to 1 because this is an image-gen model")
             self.num_frames = 1
             self.data_type = DataType.IMAGE
-        else:
+        elif self.adjust_frames:
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
             # If we apply it after, adjust_num_frames might modify the frame count
             # and break the divisibility constraint (alignment) required by num_gpus.
@@ -538,8 +536,8 @@ class SamplingParams:
             default=SamplingParams.adjust_frames,
             help=(
                 "Enable/disable adjusting num_frames to evenly split latent frames across GPUs "
-                "and satisfy model temporal constraints. Default: true. "
-                "Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
+                "and satisfy model temporal constraints. If disabled, tokens might be padded for SP."
+                "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
         )
         return parser
