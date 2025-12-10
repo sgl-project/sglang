@@ -128,7 +128,7 @@ impl HarmonyResponseProcessor {
                 .created(dispatch.created)
                 .choices(choices)
                 .usage(usage)
-                .maybe_system_fingerprint(dispatch.weight_version.clone())
+                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build(),
         )
     }
