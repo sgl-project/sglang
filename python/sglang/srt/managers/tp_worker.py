@@ -239,8 +239,11 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=is_draft_worker,
         )
 
+        # Init DLLM algorithm
         if server_args.dllm_algorithm is not None:
             self.dllm_algorithm = DllmAlgorithm.from_server_args(server_args)
+        else:
+            self.dllm_algorithm = None
 
         self._model_runner = ModelRunner(
             model_config=self.model_config,
@@ -349,7 +352,7 @@ class TpModelWorker(BaseTpWorker):
         )
 
     def is_dllm(self):
-        return hasattr(self, "dllm_algorithm")
+        return self.dllm_config is not None
 
     def forward_batch_generation(
         self,
