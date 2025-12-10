@@ -2449,8 +2449,19 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
-            self.last_batch = None
-            self.cur_batch = None
+
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            chunked_req_to_exclude = set()
+            if recv_req.mode == "in_place":
+                if self.chunked_req is not None:
+                    chunked_req_to_exclude.add(self.chunked_req)
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            self.running_batch.merge_batch(self.last_batch)
+
+        self.last_batch = None
+        self.cur_batch = None
 
         if recv_req.mode == "retract":
             self.running_batch.filter_batch()
