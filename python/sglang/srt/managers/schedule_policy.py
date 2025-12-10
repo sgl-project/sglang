@@ -286,7 +286,7 @@ class SchedulePolicy:
         """Sorts the waiting queue based on the shortest input length (origin_input_ids).
 
         This policy is particularly useful for prefill-only nodes in disaggregated
-        serving (PD separation), where prioritizing shorter requests can minimize
+        serving (PD disaggregation), where prioritizing shorter requests can minimize
         the average/mean TTFT by reducing overall queue waiting time.
         If using priority scheduling, sort by priority first.
         """

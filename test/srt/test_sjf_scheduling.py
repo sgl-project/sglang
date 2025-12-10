@@ -1,7 +1,7 @@
 """
 Test SJF (Shortest Job First) scheduling policy.
 
-This policy is designed for prefill-only nodes in disaggregated serving (PD separation),
+This policy is designed for prefill-only nodes in disaggregated serving (PD disaggregation),
 where prioritizing shorter requests can minimize the average/mean TTFT by reducing
 overall queue waiting time.
 """
