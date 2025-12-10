@@ -460,3 +460,83 @@ func (h *ChatHandler) sendSSEError(w *bufio.Writer, err error) (StreamErrorInfo,
 
 	return errInfo, nil
 }
+
+// HandleGenerate handles POST /generate (SGLang native API)
+func (h *ChatHandler) HandleGenerate(ctx *fasthttp.RequestCtx) {
+	// Parse request body
+	var req map[string]interface{}
+	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+		h.logger.Warn("Invalid generate request", zap.Error(err))
+		utils.RespondError(ctx, 400, fmt.Sprintf("Invalid request: %v", err), "invalid_request_error")
+		return
+	}
+
+	// Extract text and sampling_params
+	text, ok := req["text"].(string)
+	if !ok || text == "" {
+		utils.RespondError(ctx, 400, "Missing or invalid 'text' field", "invalid_request_error")
+		return
+	}
+
+	samplingParams, _ := req["sampling_params"].(map[string]interface{})
+	if samplingParams == nil {
+		samplingParams = make(map[string]interface{})
+	}
+
+	// Convert to chat completion format for processing
+	chatReq := sglang.ChatCompletionRequest{
+		Model:    "default",
+		Messages: []sglang.ChatMessage{{Role: "user", Content: text}},
+		Stream:   false,
+	}
+
+	// Copy sampling params
+	if maxNewTokens, ok := samplingParams["max_new_tokens"].(float64); ok {
+		tokens := int(maxNewTokens)
+		chatReq.MaxCompletionTokens = &tokens
+	}
+	if temp, ok := samplingParams["temperature"].(float64); ok {
+		temp32 := float32(temp)
+		chatReq.Temperature = &temp32
+	}
+	if topP, ok := samplingParams["top_p"].(float64); ok {
+		topP32 := float32(topP)
+		chatReq.TopP = &topP32
+	}
+	if topK, ok := samplingParams["top_k"].(float64); ok {
+		topKInt := int(topK)
+		chatReq.TopK = &topKInt
+	}
+
+	requestCtx := context.Background()
+
+	// Use non-streaming completion for /generate endpoint
+	resp, err := h.service.Client().CreateChatCompletion(requestCtx, chatReq)
+	if err != nil {
+		h.logger.Error("Failed to create completion",
+			zap.Error(err),
+		)
+		utils.RespondError(ctx, 500, fmt.Sprintf("Failed to create completion: %v", err), "server_error")
+		return
+	}
+
+	// Convert to SGLang /generate response format
+	response := map[string]interface{}{
+		"text": resp.Choices[0].Message.Content,
+		"meta_info": map[string]interface{}{
+			"id":      resp.ID,
+			"model":   resp.Model,
+			"created": resp.Created,
+			"usage": map[string]interface{}{
+				"prompt_tokens":     resp.Usage.PromptTokens,
+				"completion_tokens": resp.Usage.CompletionTokens,
+				"total_tokens":      resp.Usage.TotalTokens,
+			},
+		},
+	}
+
+	ctx.SetStatusCode(200)
+	ctx.SetContentType("application/json")
+	jsonData, _ := json.Marshal(response)
+	ctx.Write(jsonData)
+}

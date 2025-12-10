@@ -85,6 +85,8 @@ func main() {
 			modelsHandler.GetModelInfo(ctx)
 		case method == "POST" && path == "/v1/chat/completions":
 			chatHandler.HandleChatCompletion(ctx)
+		case (method == "POST" || method == "PUT") && path == "/generate":
+			chatHandler.HandleGenerate(ctx)
 		default:
 			ctx.Error("Not Found", fasthttp.StatusNotFound)
 		}
