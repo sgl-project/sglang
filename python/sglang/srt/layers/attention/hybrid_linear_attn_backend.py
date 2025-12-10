@@ -168,9 +168,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
-        self.conv_states_shape = model_runner.req_to_token_pool.mamba_pool.mamba_cache[
-            0
-        ].shape
+        self.conv_states_shape = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         self.query_start_loc_list = []
