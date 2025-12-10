@@ -23,8 +23,14 @@ class DraftBackendFactory:
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str
     ):
-        draft_attn_backend_override = os.environ.get("SGLANG_DRAFTER_ATTN_BACKEND", None)
-        backend_type = draft_attn_backend_override if draft_attn_backend_override else getattr(self.server_args, backend_name)
+        draft_attn_backend_override = os.environ.get(
+            "SGLANG_DRAFTER_ATTN_BACKEND", None
+        )
+        backend_type = (
+            draft_attn_backend_override
+            if draft_attn_backend_override
+            else getattr(self.server_args, backend_name)
+        )
         if backend_type is None:
             backend_type = self.server_args.attention_backend
 

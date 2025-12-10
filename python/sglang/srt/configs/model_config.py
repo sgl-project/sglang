@@ -133,7 +133,7 @@ class ModelConfig:
             revision=revision,
             **kwargs,
         )
-        
+
         if is_draft_model and speculative_algorithm == "EAGLE3":
             logger.info("Updating quantization config for draft model.")
             self.quantization = getattr(self.hf_config, "quantization_config", None)
